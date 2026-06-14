@@ -12,6 +12,7 @@ use crate::util::{safe_branch_filename, stable_hash};
 const EXISTING_SESSION_READY_WAIT: Duration = Duration::from_millis(250);
 const CREATED_SESSION_READY_WAIT: Duration = Duration::from_millis(1_200);
 const SESSION_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const AGENT_INPUT_READY_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TmuxWindow {
@@ -123,6 +124,9 @@ pub fn paste_agent_prompt(
     let name = agent_session_name(repo, &session.branch, generation);
     if !ensure_agent_session(repo, config, session, generation)? {
         return Err("agent session did not become ready".to_string());
+    }
+    if !wait_for_agent_input_ready(config, &name, AGENT_INPUT_READY_WAIT) {
+        return Err("agent prompt did not become ready".to_string());
     }
     let buffer_name = format!("{name}-prompt");
     run_tmux_status_with_stdin(
@@ -374,6 +378,39 @@ fn wait_for_agent_session_running(
         }
         std::thread::sleep(SESSION_READY_POLL_INTERVAL);
     }
+}
+
+fn wait_for_agent_input_ready(config: &Config, name: &str, timeout: Duration) -> bool {
+    if config.default_agent != "opencode" {
+        return true;
+    }
+    let started = Instant::now();
+    loop {
+        if pane_capture(config, name)
+            .map(|output| opencode_input_ready(&output))
+            .unwrap_or(false)
+        {
+            return true;
+        }
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(SESSION_READY_POLL_INTERVAL);
+    }
+}
+
+fn opencode_input_ready(output: &str) -> bool {
+    output.contains("Ask anything") || output.contains("ctrl+p commands")
+}
+
+fn pane_capture(config: &Config, name: &str) -> Option<String> {
+    run_capture(
+        Command::new(config.tool("tmux"))
+            .env_remove("TMUX")
+            .args(["capture-pane", "-p", "-t"])
+            .arg(name),
+    )
+    .ok()
 }
 
 fn run_tmux_status(command: &mut Command) -> Result<(), String> {
@@ -657,6 +694,10 @@ case "$1" in
     echo opencode
     exit 0
     ;;
+  capture-pane)
+    echo 'Ask anything'
+    exit 0
+    ;;
   load-buffer)
     cat > '{}'
     exit 0
@@ -729,6 +770,10 @@ case "$1" in
     echo opencode
     exit 0
     ;;
+  capture-pane)
+    echo 'Ask anything'
+    exit 0
+    ;;
   load-buffer)
     cat > '{}'
     exit 0
@@ -764,6 +809,83 @@ exit 1
         assert_eq!(fs::read_to_string(&prompt_file).unwrap(), "hello");
         let commands = fs::read_to_string(&log).unwrap();
         assert!(!commands.contains(":0.0"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn paste_agent_prompt_waits_for_opencode_input() {
+        let temp = unique_temp_dir("prism-tmux-input-ready-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let prompt_file = temp.join("prompt.txt");
+        let capture_count = temp.join("capture-count");
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  has-session|set-option|move-window|rename-window|new-window)
+    exit 0
+    ;;
+  list-windows)
+    exit 0
+    ;;
+  display-message)
+    echo opencode
+    exit 0
+    ;;
+  capture-pane)
+    count="$(cat '{}' 2>/dev/null || echo 0)"
+    count="$((count + 1))"
+    echo "$count" > '{}'
+    if [ "$count" -lt 3 ]; then
+      echo 'Starting OpenCode...'
+    else
+      echo 'Ask anything'
+    fi
+    exit 0
+    ;;
+  load-buffer)
+    cat > '{}'
+    exit 0
+    ;;
+  paste-buffer)
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+                log.display(),
+                capture_count.display(),
+                capture_count.display(),
+                prompt_file.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        config
+            .tools
+            .insert("opencode".to_string(), "opencode".to_string());
+        let repo = Repository { root: temp.clone() };
+        let session = test_session(temp.join("worktree"), "feature");
+
+        paste_agent_prompt(&repo, &config, &session, 0, "hello").unwrap();
+
+        assert_eq!(fs::read_to_string(&prompt_file).unwrap(), "hello");
+        assert_eq!(fs::read_to_string(&capture_count).unwrap().trim(), "3");
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(commands.find("capture-pane").unwrap() < commands.find("load-buffer").unwrap());
 
         let _ = fs::remove_dir_all(temp);
     }

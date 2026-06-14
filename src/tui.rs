@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::time::{Duration, Instant};
 
 use crate::agent::AgentState;
 use crate::config::Config;
@@ -9,7 +10,7 @@ use crate::github::{PrCache, PrSummary};
 use crate::input::{Key, KeyInput};
 use crate::repo::Repository;
 use crate::session::{Session, append_runtime_log};
-use crate::terminal::{RawTerminal, stdin_is_tty, terminal_size};
+use crate::terminal::{RawTerminal, stdin_is_tty, terminal_size, write_stdout};
 use crate::tmux::TmuxWindow;
 use crate::util::{strip_ansi, truncate_line, yes};
 use crate::view;
@@ -30,7 +31,10 @@ pub struct Tui {
     pub(crate) tmux_warmups_in_flight: BTreeSet<TmuxWarmupKey>,
     pub(crate) tmux_generations: BTreeMap<TmuxSlotKey, u64>,
     status_message: Option<String>,
+    status_message_until: Option<Instant>,
 }
+
+const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PrPollKey {
@@ -91,6 +95,7 @@ impl Tui {
             tmux_warmups_in_flight: BTreeSet::new(),
             tmux_generations: BTreeMap::new(),
             status_message: None,
+            status_message_until: None,
         }
     }
 
@@ -112,12 +117,13 @@ impl Tui {
             let agents_changed = self.poll_agents();
             let tmux_changed = self.poll_tmux_agent_warmup();
             let prs_changed = self.poll_pull_requests(false);
+            let status_changed = self.expire_status_message();
             let current_size = terminal_size();
             let resized = current_size != last_size;
             if resized {
                 last_size = current_size;
             }
-            if agents_changed || tmux_changed || prs_changed || resized {
+            if agents_changed || tmux_changed || prs_changed || status_changed || resized {
                 self.draw()?;
             }
             let count = match stdin.read(&mut buffer) {
@@ -205,8 +211,10 @@ impl Tui {
                     }
                     Key::Create => {
                         pending_g = false;
-                        if let Err(error) = self.create_session() {
-                            self.show_error("create session failed", &error)?;
+                        match self.create_session() {
+                            Ok(true) => self.enter_agent_mode(&mut raw)?,
+                            Ok(false) => {}
+                            Err(error) => self.show_error("create session failed", &error)?,
                         }
                     }
                     Key::Delete => {
@@ -307,28 +315,27 @@ impl Tui {
         let left = ((cols as usize).saturating_sub(width) / 2).saturating_add(1);
         let top = ((rows as usize).saturating_sub(height) / 2).saturating_add(1);
 
-        print!("\x1b[?25l");
-        print!(
-            "\x1b[{top};{left}H+{}+",
+        let mut frame = format!(
+            "\x1b[?25l\x1b[{top};{left}H+{}+",
             "-".repeat(width.saturating_sub(2))
         );
         for (index, line) in lines.iter().enumerate() {
             let y = top + index + 1;
             let text_width = width.saturating_sub(4);
             let text = truncate_line(line, text_width);
-            print!(
+            frame.push_str(&format!(
                 "\x1b[{y};{left}H| {:<text_width$} |",
                 text,
                 text_width = text_width
-            );
+            ));
         }
-        print!(
+        frame.push_str(&format!(
             "\x1b[{};{}H+{}+",
             top + height - 1,
             left,
             "-".repeat(width.saturating_sub(2))
-        );
-        io::stdout().flush().map_err(|error| error.to_string())?;
+        ));
+        write_stdout(&frame)?;
 
         let mut stdin = io::stdin();
         let mut byte = [0_u8; 1];
@@ -434,11 +441,164 @@ impl Tui {
         self.prompt_line_with_initial(prompt, "")
     }
 
-    fn prompt_line_with_initial(&self, prompt: &str, initial: &str) -> Result<String, String> {
-        print!("\x1b[{};1H\x1b[2K\x1b[?25h{}", terminal_size().1, prompt);
+    pub(crate) fn prompt_line_dialog(
+        &self,
+        title: &str,
+        prompt: &str,
+        initial: &str,
+    ) -> Result<Option<String>, String> {
         let mut input = initial.to_string();
-        print!("{input}");
-        io::stdout().flush().map_err(|error| error.to_string())?;
+        self.draw()?;
+        self.draw_prompt_dialog(title, prompt, &input)?;
+        let mut stdin = io::stdin();
+        let mut byte = [0_u8; 1];
+        loop {
+            match stdin.read(&mut byte) {
+                Ok(1) => {}
+                Ok(_) => {
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+            match byte[0] {
+                b'\r' | b'\n' => {
+                    write_stdout("\x1b[?25l")?;
+                    return Ok(Some(input));
+                }
+                3 | 27 => {
+                    write_stdout("\x1b[?25l")?;
+                    return Ok(None);
+                }
+                8 | 127 => {
+                    input.pop();
+                    self.draw_prompt_dialog(title, prompt, &input)?;
+                }
+                byte if !byte.is_ascii_control() => {
+                    input.push(byte as char);
+                    self.draw_prompt_dialog(title, prompt, &input)?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    pub(crate) fn show_loading_dialog(&self, title: &str, message: &str) -> Result<(), String> {
+        self.draw()?;
+        self.draw_static_dialog(title, &["[*] Please wait", message])
+    }
+
+    fn draw_prompt_dialog(&self, title: &str, prompt: &str, input: &str) -> Result<(), String> {
+        let (cols, rows) = terminal_size();
+        let prompt_len = prompt.chars().count();
+        let requested_width = title
+            .chars()
+            .count()
+            .max(prompt_len.saturating_add(input.chars().count()))
+            .saturating_add(4)
+            .max(44);
+        let width = requested_width.min((cols as usize).saturating_sub(2).max(12));
+        let text_width = width.saturating_sub(4);
+        let max_input_width = text_width.saturating_sub(prompt_len);
+        let input_display = tail_chars(input, max_input_width);
+        let input_line = format!("{prompt}{input_display}");
+        let cursor_col = prompt_len
+            .saturating_add(input_display.chars().count())
+            .min(text_width);
+        self.draw_dialog_frame(
+            title,
+            &[
+                String::new(),
+                input_line,
+                "Enter to continue, Esc to cancel".to_string(),
+            ],
+            Some((1, cursor_col)),
+            width,
+            rows,
+            cols,
+        )
+    }
+
+    fn draw_static_dialog(&self, title: &str, lines: &[&str]) -> Result<(), String> {
+        let (cols, rows) = terminal_size();
+        let requested_width = lines
+            .iter()
+            .map(|line| line.chars().count())
+            .chain(std::iter::once(title.chars().count()))
+            .max()
+            .unwrap_or(0)
+            .saturating_add(4)
+            .max(44);
+        let width = requested_width.min((cols as usize).saturating_sub(2).max(12));
+        let owned_lines = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        self.draw_dialog_frame(title, &owned_lines, None, width, rows, cols)
+    }
+
+    fn draw_dialog_frame(
+        &self,
+        title: &str,
+        lines: &[String],
+        cursor: Option<(usize, usize)>,
+        width: usize,
+        rows: u16,
+        cols: u16,
+    ) -> Result<(), String> {
+        let height = lines.len() + 3;
+        let left = ((cols as usize).saturating_sub(width) / 2).saturating_add(1);
+        let top = ((rows as usize).saturating_sub(height) / 3).saturating_add(1);
+        let text_width = width.saturating_sub(4);
+        let mut frame = format!(
+            "\x1b[?25l\x1b[{top};{left}H+{}+",
+            "-".repeat(width.saturating_sub(2))
+        );
+        let title_line = truncate_line(title, text_width);
+        frame.push_str(&format!(
+            "\x1b[{};{}H| {:<text_width$} |",
+            top + 1,
+            left,
+            title_line,
+            text_width = text_width
+        ));
+        for (index, line) in lines.iter().enumerate() {
+            let y = top + index + 2;
+            let text = truncate_line(line, text_width);
+            frame.push_str(&format!(
+                "\x1b[{y};{left}H| {:<text_width$} |",
+                text,
+                text_width = text_width
+            ));
+        }
+        frame.push_str(&format!(
+            "\x1b[{};{}H+{}+",
+            top + height - 1,
+            left,
+            "-".repeat(width.saturating_sub(2))
+        ));
+        if let Some((line_index, cursor_col)) = cursor {
+            frame.push_str(&format!(
+                "\x1b[{};{}H\x1b[?25h",
+                top + line_index + 2,
+                left + 2 + cursor_col
+            ));
+        }
+        write_stdout(&frame)
+    }
+
+    fn prompt_line_with_initial(&self, prompt: &str, initial: &str) -> Result<String, String> {
+        let mut input = initial.to_string();
+        write_stdout(&format!(
+            "\x1b[{};1H\x1b[2K\x1b[?25h{}{}",
+            terminal_size().1,
+            prompt,
+            input
+        ))?;
         let mut stdin = io::stdin();
         let mut byte = [0_u8; 1];
         loop {
@@ -456,26 +616,22 @@ impl Tui {
             }
             match byte[0] {
                 b'\r' | b'\n' => {
-                    print!("\r\n\x1b[?25l");
-                    io::stdout().flush().map_err(|error| error.to_string())?;
+                    write_stdout("\r\n\x1b[?25l")?;
                     return Ok(input);
                 }
                 3 | 27 => {
-                    print!("\r\n\x1b[?25l");
-                    io::stdout().flush().map_err(|error| error.to_string())?;
+                    write_stdout("\r\n\x1b[?25l")?;
                     return Ok(String::new());
                 }
                 8 | 127 => {
                     if input.pop().is_some() {
-                        print!("\x08 \x08");
-                        io::stdout().flush().map_err(|error| error.to_string())?;
+                        write_stdout("\x08 \x08")?;
                     }
                 }
                 byte if !byte.is_ascii_control() => {
                     let ch = byte as char;
                     input.push(ch);
-                    print!("{ch}");
-                    io::stdout().flush().map_err(|error| error.to_string())?;
+                    write_stdout(&ch.to_string())?;
                 }
                 _ => {}
             }
@@ -484,17 +640,13 @@ impl Tui {
 
     pub(crate) fn show_message(&mut self, message: &str) -> Result<(), String> {
         self.status_message = Some(message.to_string());
-        print!(
-            "\x1b[{};1H\x1b[2K{}",
-            terminal_size().1,
-            truncate_line(message, terminal_size().0 as usize)
-        );
-        io::stdout().flush().map_err(|error| error.to_string())
+        self.status_message_until = Some(Instant::now() + STATUS_MESSAGE_DURATION);
+        let _ = append_runtime_log(&self.repo, message);
+        self.draw()
     }
 
     fn show_error(&mut self, context: &str, error: &str) -> Result<(), String> {
         let message = format!("{context}: {error}");
-        let _ = append_runtime_log(&self.repo, &message);
         self.show_message(&message)
     }
 
@@ -506,6 +658,18 @@ impl Tui {
 
     fn move_up(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+
+    fn expire_status_message(&mut self) -> bool {
+        if self
+            .status_message_until
+            .is_some_and(|until| Instant::now() >= until)
+        {
+            self.status_message = None;
+            self.status_message_until = None;
+            return true;
+        }
+        false
     }
 
     fn draw(&self) -> Result<(), String> {
@@ -525,4 +689,20 @@ fn truncate_ansi_dialog_line(text: &str, max_chars: usize) -> String {
         return text.to_string();
     }
     truncate_line(&strip_ansi(text), max_chars)
+}
+
+fn tail_chars(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    if max_chars == 0 {
+        return String::new();
+    }
+    if max_chars == 1 {
+        return "~".to_string();
+    }
+    let mut out = String::from("~");
+    out.extend(text.chars().skip(count - max_chars + 1));
+    out
 }

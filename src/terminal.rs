@@ -1,5 +1,5 @@
 use std::ffi::c_ulong;
-use std::io::{self, Write};
+use std::io::{self, ErrorKind, Write};
 use std::os::fd::RawFd;
 use std::process::Command;
 
@@ -16,23 +16,20 @@ impl RawTerminal {
         let stdin_flags = get_fd_flags(0)?;
         run_status(Command::new("stty").args(raw_stty_args()))?;
         set_fd_flags(0, stdin_flags | O_NONBLOCK)?;
-        print!("\x1b[?1049h");
-        io::stdout().flush().map_err(|error| error.to_string())?;
+        write_stdout("\x1b[?1049h")?;
         Ok(Self { stdin_flags })
     }
 
     pub fn suspend(&mut self) -> Result<(), String> {
         set_fd_flags(0, self.stdin_flags)?;
         run_status(Command::new("stty").arg("sane"))?;
-        print!("\x1b[?1049l\x1b[?25h");
-        io::stdout().flush().map_err(|error| error.to_string())
+        write_stdout("\x1b[?1049l\x1b[?25h")
     }
 
     pub fn resume(&mut self) -> Result<(), String> {
         run_status(Command::new("stty").args(raw_stty_args()))?;
         set_fd_flags(0, self.stdin_flags | O_NONBLOCK)?;
-        print!("\x1b[?1049h\x1b[?25l");
-        io::stdout().flush().map_err(|error| error.to_string())
+        write_stdout("\x1b[?1049h\x1b[?25l")
     }
 }
 
@@ -40,8 +37,36 @@ impl Drop for RawTerminal {
     fn drop(&mut self) {
         let _ = set_fd_flags(0, self.stdin_flags);
         let _ = Command::new("stty").arg("sane").status();
-        print!("\x1b[?1049l\x1b[?25h");
-        let _ = io::stdout().flush();
+        let _ = write_stdout("\x1b[?1049l\x1b[?25h");
+    }
+}
+
+pub fn write_stdout(text: &str) -> Result<(), String> {
+    let stdout = io::stdout();
+    let mut stdout = stdout.lock();
+    write_all_retrying_would_block(&mut stdout, text.as_bytes())
+}
+
+fn write_all_retrying_would_block(writer: &mut impl Write, bytes: &[u8]) -> Result<(), String> {
+    let mut written = 0;
+    while written < bytes.len() {
+        match writer.write(&bytes[written..]) {
+            Ok(0) => return Err("write stdout: wrote zero bytes".to_string()),
+            Ok(count) => written += count,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    loop {
+        match writer.flush() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(error) => return Err(error.to_string()),
+        }
     }
 }
 
@@ -131,6 +156,8 @@ unsafe extern "C" {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{self, ErrorKind, Write};
+
     use super::{raw_stty_args, terminal_size_from_fd, valid_terminal_size};
 
     #[test]
@@ -154,5 +181,35 @@ mod tests {
         let args = raw_stty_args();
         assert!(args.contains(&"opost"));
         assert!(args.contains(&"onlcr"));
+    }
+
+    #[test]
+    fn stdout_writer_retries_would_block() {
+        let mut writer = WouldBlockOnce::default();
+
+        super::write_all_retrying_would_block(&mut writer, b"hello").unwrap();
+
+        assert_eq!(writer.output, b"hello");
+    }
+
+    #[derive(Default)]
+    struct WouldBlockOnce {
+        blocked: bool,
+        output: Vec<u8>,
+    }
+
+    impl Write for WouldBlockOnce {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if !self.blocked {
+                self.blocked = true;
+                return Err(io::Error::new(ErrorKind::WouldBlock, "would block"));
+            }
+            self.output.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
     }
 }
