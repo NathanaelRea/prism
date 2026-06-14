@@ -745,8 +745,14 @@ impl Tui {
         let args = if has_upstream(&path, &self.config)? {
             vec!["push".to_string()]
         } else {
-            let answer =
-                self.prompt_line(&format!("No upstream. Push -u origin {branch}? [y/N] "))?;
+            let Some(answer) = self.prompt_line_dialog(
+                "Push Branch",
+                &format!("No upstream. Push -u origin {branch}? [y/N] "),
+                "",
+            )?
+            else {
+                return Ok(());
+            };
             if !yes(&answer) {
                 return Ok(());
             }
@@ -757,8 +763,8 @@ impl Tui {
                 branch,
             ]
         };
-        self.show_message("pushing branch")?;
-        run_status(
+        self.show_loading_dialog("Push Branch", "Pushing selected branch")?;
+        run_capture(
             Command::new(self.config.tool("git"))
                 .arg("-C")
                 .arg(&path)
@@ -781,10 +787,16 @@ impl Tui {
                 .is_default_branch(&self.sessions[self.selected].branch)
         {
             run_configured_commands(&self.config.checks.pre_pr, &path, "pre_pr")?;
-            self.show_message("creating pull request")?;
-            run_status(
+            let Some(pr_body) = self.prompt_pr_description()? else {
+                return Ok(());
+            };
+            self.show_loading_dialog("Create Pull Request", "Creating pull request")?;
+            run_capture(
                 Command::new(self.config.tool("gh"))
-                    .args(create_pr_args(self.config.default_base.as_deref()))
+                    .args(create_pr_args(
+                        self.config.default_base.as_deref(),
+                        &pr_body,
+                    ))
                     .current_dir(&path),
             )?;
             let session = &mut self.sessions[self.selected];
@@ -801,6 +813,18 @@ impl Tui {
             self.show_message("push complete")?;
         }
         Ok(())
+    }
+
+    fn prompt_pr_description(&self) -> Result<Option<String>, String> {
+        let Some(answer) =
+            self.prompt_line_dialog("Create Pull Request", "Add description? [y/N] ", "")?
+        else {
+            return Ok(None);
+        };
+        if !yes(&answer) {
+            return Ok(Some(String::new()));
+        }
+        self.prompt_line_dialog("Create Pull Request", "Description (empty for none): ", "")
     }
 
     pub(crate) fn merge_selected_pr(&mut self) -> Result<(), String> {
@@ -997,8 +1021,14 @@ fn create_worktree_args(repo_root: &Path, branch: &str, default_base: Option<&st
     args
 }
 
-fn create_pr_args(default_base: Option<&str>) -> Vec<String> {
-    let mut args = vec!["pr".to_string(), "create".to_string(), "--fill".to_string()];
+fn create_pr_args(default_base: Option<&str>, body: &str) -> Vec<String> {
+    let mut args = vec![
+        "pr".to_string(),
+        "create".to_string(),
+        "--fill".to_string(),
+        "--body".to_string(),
+        body.to_string(),
+    ];
     if let Some(base) = default_base.map(str::trim).filter(|base| !base.is_empty()) {
         args.push("--base".to_string());
         args.push(base.to_string());
@@ -1280,12 +1310,15 @@ mod tests {
     }
 
     #[test]
-    fn create_pr_uses_fill_and_default_base_when_configured() {
+    fn create_pr_uses_fill_with_explicit_empty_body_and_default_base_when_configured() {
         assert_eq!(
-            create_pr_args(Some("main")),
-            vec!["pr", "create", "--fill", "--base", "main"]
+            create_pr_args(Some("main"), ""),
+            vec!["pr", "create", "--fill", "--body", "", "--base", "main"]
         );
-        assert_eq!(create_pr_args(None), vec!["pr", "create", "--fill"]);
+        assert_eq!(
+            create_pr_args(None, "manual description"),
+            vec!["pr", "create", "--fill", "--body", "manual description"]
+        );
     }
 
     #[test]
