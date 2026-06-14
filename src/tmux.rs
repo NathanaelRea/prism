@@ -14,6 +14,31 @@ const CREATED_SESSION_READY_WAIT: Duration = Duration::from_millis(1_200);
 const SESSION_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const AGENT_INPUT_READY_WAIT: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TmuxWindow {
+    Agent,
+    LazyGit,
+    Terminal,
+}
+
+impl TmuxWindow {
+    fn index(self) -> u8 {
+        match self {
+            TmuxWindow::Agent => 1,
+            TmuxWindow::LazyGit => 2,
+            TmuxWindow::Terminal => 3,
+        }
+    }
+
+    fn name(self, config: &Config) -> String {
+        match self {
+            TmuxWindow::Agent => config.default_agent.clone(),
+            TmuxWindow::LazyGit => "lazygit".to_string(),
+            TmuxWindow::Terminal => "terminal".to_string(),
+        }
+    }
+}
+
 pub fn attach_or_create_agent(
     repo: &Repository,
     config: &Config,
@@ -22,7 +47,23 @@ pub fn attach_or_create_agent(
 ) -> Result<(), String> {
     let name = agent_session_name(repo, &session.branch, generation);
     ensure_agent_session(repo, config, session, generation)?;
-    match attach(config, &name) {
+    match attach(config, &name, TmuxWindow::Agent) {
+        Ok(()) => Ok(()),
+        Err(_) if matches!(session_exists(config, &name), Ok(false)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+pub fn attach_or_create_window(
+    repo: &Repository,
+    config: &Config,
+    session: &Session,
+    generation: u64,
+    window: TmuxWindow,
+) -> Result<(), String> {
+    let name = agent_session_name(repo, &session.branch, generation);
+    ensure_agent_session(repo, config, session, generation)?;
+    match attach(config, &name, window) {
         Ok(()) => Ok(()),
         Err(_) if matches!(session_exists(config, &name), Ok(false)) => Ok(()),
         Err(error) => Err(error),
@@ -40,6 +81,7 @@ pub fn ensure_agent_session(
         if !configure_agent_session(config, &name)? {
             create_detached_agent_session(config, session, &name)?;
             configure_agent_session(config, &name)?;
+            ensure_companion_windows(config, session, &name)?;
             return Ok(wait_for_agent_session_running(
                 repo,
                 config,
@@ -55,12 +97,14 @@ pub fn ensure_agent_session(
             generation,
             EXISTING_SESSION_READY_WAIT,
         ) {
+            ensure_companion_windows(config, session, &name)?;
             return Ok(true);
         }
         kill_session(config, &name)?;
     }
     create_detached_agent_session(config, session, &name)?;
     configure_agent_session(config, &name)?;
+    ensure_companion_windows(config, session, &name)?;
     Ok(wait_for_agent_session_running(
         repo,
         config,
@@ -100,7 +144,7 @@ pub fn paste_agent_prompt(
         "-b",
         &buffer_name,
         "-t",
-        &name,
+        &window_target(&name, TmuxWindow::Agent),
     ]))
 }
 
@@ -114,7 +158,7 @@ pub fn agent_session_running(
     if !matches!(session_exists(config, &name), Ok(true)) {
         return false;
     }
-    pane_current_command(config, &name)
+    pane_current_command(config, &window_target(&name, TmuxWindow::Agent))
         .map(|command| pane_command_matches_agent(config, &command))
         .unwrap_or(false)
 }
@@ -157,11 +201,11 @@ fn agent_session_prefix(repo: &Repository, branch: &str) -> String {
     format!("prism-{hash:016x}-{branch}-")
 }
 
-fn attach(config: &Config, name: &str) -> Result<(), String> {
+fn attach(config: &Config, name: &str, window: TmuxWindow) -> Result<(), String> {
     run_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
         "attach-session",
         "-t",
-        name,
+        &window_target(name, window),
     ]))
 }
 
@@ -176,6 +220,7 @@ fn create_detached_agent_session(
             .env_remove("TMUX")
             .args(["new-session", "-d", "-s"])
             .arg(name)
+            .args(["-n", &TmuxWindow::Agent.name(config)])
             .arg("-c")
             .arg(&session.path)
             .arg(command),
@@ -194,6 +239,104 @@ fn configure_agent_session(config: &Config, name: &str) -> Result<bool, String> 
         Err(error) if tmux_missing_session_error(&error) => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+fn ensure_companion_windows(config: &Config, session: &Session, name: &str) -> Result<(), String> {
+    configure_window_indexing(config, name)?;
+    move_initial_window_to_one(config, name)?;
+    rename_window(config, name, TmuxWindow::Agent)?;
+    ensure_window(config, session, name, TmuxWindow::LazyGit)?;
+    ensure_window(config, session, name, TmuxWindow::Terminal)?;
+    Ok(())
+}
+
+fn configure_window_indexing(config: &Config, name: &str) -> Result<(), String> {
+    run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+        "set-option",
+        "-t",
+        name,
+        "base-index",
+        "1",
+    ]))?;
+    run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+        "set-option",
+        "-t",
+        name,
+        "renumber-windows",
+        "off",
+    ]))
+}
+
+fn move_initial_window_to_one(config: &Config, name: &str) -> Result<(), String> {
+    match run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+        "move-window",
+        "-s",
+        &format!("{name}:0"),
+        "-t",
+        &window_target(name, TmuxWindow::Agent),
+    ])) {
+        Ok(()) => Ok(()),
+        Err(error) if tmux_missing_session_error(&error) || error.contains("same index") => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn rename_window(config: &Config, name: &str, window: TmuxWindow) -> Result<(), String> {
+    match run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+        "rename-window",
+        "-t",
+        &window_target(name, window),
+        &window.name(config),
+    ])) {
+        Ok(()) => Ok(()),
+        Err(error) if tmux_missing_session_error(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+fn ensure_window(
+    config: &Config,
+    session: &Session,
+    name: &str,
+    window: TmuxWindow,
+) -> Result<(), String> {
+    if window_exists(config, name, window)? {
+        rename_window(config, name, window)?;
+        return Ok(());
+    }
+    let command = match window {
+        TmuxWindow::Agent => return Ok(()),
+        TmuxWindow::LazyGit => config.tool("lazygit"),
+        TmuxWindow::Terminal => std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()),
+    };
+    run_tmux_status(
+        Command::new(config.tool("tmux"))
+            .env_remove("TMUX")
+            .args(["new-window", "-d", "-t", &window_target(name, window)])
+            .args(["-n", &window.name(config)])
+            .arg("-c")
+            .arg(&session.path)
+            .arg(command),
+    )
+}
+
+fn window_exists(config: &Config, name: &str, window: TmuxWindow) -> Result<bool, String> {
+    Command::new(config.tool("tmux"))
+        .env_remove("TMUX")
+        .args(["list-windows", "-t", name, "-F", "#{window_index}"])
+        .stderr(Stdio::piped())
+        .output()
+        .map(|output| {
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .any(|line| line == window.index().to_string())
+        })
+        .map_err(|error| format!("tmux: {error}"))
+}
+
+fn window_target(name: &str, window: TmuxWindow) -> String {
+    format!("{name}:{}", window.index())
 }
 
 fn kill_session(config: &Config, name: &str) -> Result<(), String> {
@@ -411,9 +554,9 @@ mod tests {
     use crate::session::Session;
 
     use super::{
-        agent_session_name, attach_or_create_agent, ensure_agent_session,
-        latest_agent_session_generation, pane_command_matches_agent, paste_agent_prompt,
-        shell_quote,
+        TmuxWindow, agent_session_name, attach_or_create_agent, attach_or_create_window,
+        ensure_agent_session, latest_agent_session_generation, pane_command_matches_agent,
+        paste_agent_prompt, shell_quote,
     };
 
     #[test]
@@ -541,7 +684,10 @@ exit 1
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> '{}'
 case "$1" in
-  has-session|set-option)
+  has-session|set-option|move-window|rename-window|new-window)
+    exit 0
+    ;;
+  list-windows)
     exit 0
     ;;
   display-message)
@@ -614,7 +760,10 @@ for arg in "$@"; do
   esac
 done
 case "$1" in
-  has-session|set-option)
+  has-session|set-option|move-window|rename-window|new-window)
+    exit 0
+    ;;
+  list-windows)
     exit 0
     ;;
   display-message)
@@ -678,7 +827,10 @@ exit 1
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> '{}'
 case "$1" in
-  has-session|set-option)
+  has-session|set-option|move-window|rename-window|new-window)
+    exit 0
+    ;;
+  list-windows)
     exit 0
     ;;
   display-message)
@@ -786,8 +938,13 @@ exit 0
         assert_eq!(result, Ok(false));
         let commands = fs::read_to_string(&log).unwrap();
         assert!(commands.contains("new-session -d -s"));
+        assert!(commands.contains("-n opencode"));
         assert!(commands.contains("set-option -t"));
         assert!(commands.contains("detach-on-destroy on"));
+        assert!(commands.contains("base-index 1"));
+        assert!(commands.contains("new-window -d -t"));
+        assert!(commands.contains("-n lazygit"));
+        assert!(commands.contains("-n terminal"));
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -974,6 +1131,64 @@ exit 0
         let commands = fs::read_to_string(&log).unwrap();
         assert_eq!(commands.matches("new-session -d -s").count(), 1);
         assert_eq!(commands.matches("attach-session -t").count(), 1);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn attach_companion_windows_targets_named_indices() {
+        let temp = unique_temp_dir("prism-tmux-companion-attach-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  has-session)
+    exit 1
+    ;;
+  new-session|set-option|move-window|rename-window|new-window|attach-session)
+    exit 0
+    ;;
+  list-windows)
+    exit 0
+    ;;
+  display-message)
+    echo opencode
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        config
+            .tools
+            .insert("opencode".to_string(), "opencode".to_string());
+        let repo = Repository { root: temp.clone() };
+        let session = test_session(temp.join("worktree"), "feature");
+
+        attach_or_create_window(&repo, &config, &session, 0, TmuxWindow::LazyGit).unwrap();
+
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(commands.contains("new-window -d -t"));
+        assert!(commands.contains("-n lazygit"));
+        assert!(commands.contains("-n terminal"));
+        assert!(commands.contains("attach-session -t"));
+        assert!(commands.contains(":2"));
 
         let _ = fs::remove_dir_all(temp);
     }

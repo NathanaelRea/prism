@@ -98,12 +98,14 @@ impl AgentState {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct AgentAdapter {
     command: String,
     pub prompt_mode: PromptMode,
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 pub struct AgentLaunch {
     pub argv: Vec<String>,
     pub stdin_prompt: Option<String>,
@@ -111,6 +113,7 @@ pub struct AgentLaunch {
 }
 
 impl AgentAdapter {
+    #[allow(dead_code)]
     pub fn from_config(config: &Config, name: &str) -> Self {
         Self {
             command: config.agent_command(name),
@@ -118,6 +121,7 @@ impl AgentAdapter {
         }
     }
 
+    #[allow(dead_code)]
     pub fn prepare_launch(&self, prompt: &str) -> Result<AgentLaunch, String> {
         let mut argv = split_command_words(&self.command);
         let mut prompt_file = None;
@@ -159,6 +163,7 @@ impl AgentAdapter {
     }
 }
 
+#[allow(dead_code)]
 fn replace_argv_placeholder(argv: &mut [String], needle: &str, replacement: &str) -> usize {
     let mut count = 0;
     for arg in argv {
@@ -170,6 +175,7 @@ fn replace_argv_placeholder(argv: &mut [String], needle: &str, replacement: &str
     count
 }
 
+#[allow(dead_code)]
 fn write_temp_prompt_file(prompt: &str) -> Result<PathBuf, String> {
     let dir = std::env::temp_dir().join("prism-prompts");
     fs::create_dir_all(&dir).map_err(|error| format!("create prompt temp dir: {error}"))?;
@@ -190,6 +196,7 @@ pub struct AgentProcess {
 }
 
 impl AgentProcess {
+    #[allow(dead_code)]
     pub fn spawn(
         argv: &[String],
         workdir: &Path,
@@ -252,6 +259,7 @@ impl AgentProcess {
         })
     }
 
+    #[allow(dead_code)]
     pub fn write_all(&mut self, bytes: &[u8]) -> Result<(), String> {
         let mut written = 0;
         while written < bytes.len() {
@@ -320,11 +328,13 @@ fn exited_successfully(status: i32) -> bool {
 }
 
 #[repr(C)]
+#[allow(dead_code)]
 struct Termios {
     data: [u8; 60],
 }
 
 #[repr(C)]
+#[allow(dead_code)]
 struct Winsize {
     ws_row: u16,
     ws_col: u16,
@@ -334,6 +344,7 @@ struct Winsize {
 
 #[link(name = "util")]
 unsafe extern "C" {
+    #[allow(dead_code)]
     fn forkpty(
         amaster: *mut i32,
         name: *mut i8,
@@ -344,6 +355,7 @@ unsafe extern "C" {
 
 unsafe extern "C" {
     fn read(fd: i32, buf: *mut std::ffi::c_void, count: usize) -> isize;
+    #[allow(dead_code)]
     fn write(fd: i32, buf: *const std::ffi::c_void, count: usize) -> isize;
     fn close(fd: i32) -> i32;
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;

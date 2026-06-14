@@ -1,33 +1,10 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use crate::config::Config;
 use crate::process::run_status;
 use crate::repo::Repository;
-use crate::session::Session;
-use crate::util::safe_branch_filename;
-
-pub fn default_plan_path(session: &Session, config: &Config) -> PathBuf {
-    session
-        .path
-        .join(&config.plan_dir)
-        .join(format!("{}.md", safe_branch_filename(&session.branch)))
-}
-
-pub fn build_plan_prompt(session: &Session, plan_path: &Path, request: &str) -> String {
-    let request = if request.trim().is_empty() {
-        "Create an implementation plan for the current task.".to_string()
-    } else {
-        request.trim().to_string()
-    };
-    format!(
-        "Create or update the implementation plan at `{}` for branch `{}`.\n\nRequest:\n{}\n\nRequirements:\n- Number phases as `Phase 1`, `Phase 2`, and so on.\n- Make each phase independently implementable.\n- For every phase, include the goal, scoped files or areas, implementation notes, and validation commands.\n- Keep the plan as markdown in the requested file.\n- Do not run the plan yet; leave it ready for human review.",
-        plan_path.display(),
-        session.branch,
-        request
-    )
-}
 
 pub fn infer_total_phases(path: &Path) -> Result<usize, String> {
     let text = fs::read_to_string(path).map_err(|error| format!("read plan file: {error}"))?;
@@ -46,30 +23,6 @@ pub fn infer_total_phases(path: &Path) -> Result<usize, String> {
         }
     }
     Ok(max_phase)
-}
-
-pub fn run_codex_plan(
-    session: &Session,
-    config: &Config,
-    plan_path: &Path,
-    total: usize,
-    start: usize,
-    parallel: bool,
-) -> Result<(), String> {
-    run_status(
-        Command::new(config.tool("codex_plan"))
-            .arg("--file")
-            .arg(plan_path)
-            .arg("--step-name")
-            .arg("phase")
-            .arg("--total")
-            .arg(total.to_string())
-            .arg("--start")
-            .arg(start.to_string())
-            .arg("--parallel")
-            .arg(if parallel { "true" } else { "false" })
-            .current_dir(&session.path),
-    )
 }
 
 pub fn run_plan_cli(repo: &Repository, config: &Config, path: &Path) -> Result<(), String> {

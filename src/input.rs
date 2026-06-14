@@ -23,22 +23,17 @@ impl KeyInput {
                     b'\x03' => keys.push(Key::Quit),
                     b'q' => keys.push(Key::Quit),
                     b' ' => self.state = KeyInputState::Leader,
-                    b'\r' | b'\n' => keys.push(Key::AgentMode),
+                    b'\r' | b'\n' => keys.push(Key::Terminal),
                     31 => keys.push(Key::Terminal),
                     b'k' => keys.push(Key::Up),
                     b'j' => keys.push(Key::Down),
                     b'G' => keys.push(Key::Bottom),
                     b'g' => keys.push(Key::G),
                     b'r' => keys.push(Key::Refresh),
-                    b'R' => keys.push(Key::ReviewPacket),
                     b'f' => keys.push(Key::ReviewFix),
-                    b'm' => keys.push(Key::CommitReviewFix),
-                    b'u' => keys.push(Key::Push),
-                    b'n' => keys.push(Key::CreatePlan),
-                    b'x' => keys.push(Key::RunPlan),
-                    b'P' => keys.push(Key::PullRequest),
+                    b'P' => keys.push(Key::Push),
+                    b'M' => keys.push(Key::Merge),
                     b'c' => keys.push(Key::Create),
-                    b'a' => keys.push(Key::Remove),
                     b'D' => keys.push(Key::Delete),
                     b'?' => keys.push(Key::Help),
                     _ => keys.push(Key::Other),
@@ -60,6 +55,10 @@ impl KeyInput {
                     }
                 }
                 KeyInputState::Leader => match byte {
+                    b' ' => {
+                        self.state = KeyInputState::Normal;
+                        keys.push(Key::AgentMode);
+                    }
                     b'g' => self.state = KeyInputState::LeaderG,
                     _ => {
                         self.state = KeyInputState::Normal;
@@ -89,15 +88,10 @@ pub enum Key {
     Terminal,
     Help,
     Refresh,
-    PullRequest,
-    ReviewPacket,
     ReviewFix,
-    CommitReviewFix,
     Push,
-    CreatePlan,
-    RunPlan,
+    Merge,
     Create,
-    Remove,
     Delete,
     Quit,
     Other,
@@ -124,7 +118,7 @@ mod tests {
     #[test]
     fn key_input_handles_agent_mode_keys() {
         let mut input = KeyInput::default();
-        let keys = input.feed(b"i\n");
+        let keys = input.feed(b"i  ");
         assert!(matches!(keys.as_slice(), [Key::Other, Key::AgentMode]));
     }
 
@@ -138,14 +132,33 @@ mod tests {
     #[test]
     fn key_input_handles_terminal_and_help_keys() {
         let mut input = KeyInput::default();
-        let keys = input.feed(&[31, b'?']);
+        let keys = input.feed(b"\n?");
         assert!(matches!(keys.as_slice(), [Key::Terminal, Key::Help]));
     }
 
     #[test]
     fn key_input_handles_cleanup_keys() {
         let mut input = KeyInput::default();
-        let keys = input.feed(b"aD");
-        assert!(matches!(keys.as_slice(), [Key::Remove, Key::Delete]));
+        let keys = input.feed(b"D");
+        assert!(matches!(keys.as_slice(), [Key::Delete]));
+    }
+
+    #[test]
+    fn key_input_uses_lazygit_style_branch_actions() {
+        let mut input = KeyInput::default();
+        let keys = input.feed(b"PMnRxmua");
+        assert!(matches!(
+            keys.as_slice(),
+            [
+                Key::Push,
+                Key::Merge,
+                Key::Other,
+                Key::Other,
+                Key::Other,
+                Key::Other,
+                Key::Other,
+                Key::Other,
+            ]
+        ));
     }
 }

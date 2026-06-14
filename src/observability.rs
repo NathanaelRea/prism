@@ -424,6 +424,7 @@ pub fn command_display(command: &Command) -> String {
     sanitized_argv(command).join(" ")
 }
 
+#[allow(dead_code)]
 pub fn agent_spawn_data_json(argv: &[String], workdir: &Path) -> String {
     let program = argv.first().cloned().unwrap_or_default();
     json_object(vec![

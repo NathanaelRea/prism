@@ -74,7 +74,6 @@ pub struct PrDetails {
 pub struct PrComment {
     pub author: String,
     pub body: String,
-    pub created_at: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -82,7 +81,6 @@ pub struct PrReview {
     pub author: String,
     pub state: String,
     pub body: String,
-    pub submitted_at: String,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -562,12 +560,12 @@ query($owner: String!, $name: String!, $number: Int!) {
 fn parse_pr_comments(raw: &str) -> Vec<PrComment> {
     json_objects_in_array(raw, "comments")
         .into_iter()
-        .map(|object| PrComment {
-            author: json_login_field(object).unwrap_or_default(),
-            body: json_string_field(object, "body").unwrap_or_default(),
-            created_at: json_string_field(object, "createdAt")
-                .or_else(|| json_string_field(object, "created_at"))
-                .unwrap_or_default(),
+        .map(|object| {
+            let body = json_string_field(object, "body").unwrap_or_default();
+            PrComment {
+                author: json_login_field(object).unwrap_or_default(),
+                body,
+            }
         })
         .filter(|comment| !comment.body.trim().is_empty())
         .take(20)
@@ -577,13 +575,13 @@ fn parse_pr_comments(raw: &str) -> Vec<PrComment> {
 fn parse_pr_reviews(raw: &str) -> Vec<PrReview> {
     json_objects_in_array(raw, "reviews")
         .into_iter()
-        .map(|object| PrReview {
-            author: json_login_field(object).unwrap_or_default(),
-            state: json_string_field(object, "state").unwrap_or_default(),
-            body: json_string_field(object, "body").unwrap_or_default(),
-            submitted_at: json_string_field(object, "submittedAt")
-                .or_else(|| json_string_field(object, "submitted_at"))
-                .unwrap_or_default(),
+        .map(|object| {
+            let body = json_string_field(object, "body").unwrap_or_default();
+            PrReview {
+                author: json_login_field(object).unwrap_or_default(),
+                state: json_string_field(object, "state").unwrap_or_default(),
+                body,
+            }
         })
         .filter(|review| !review.state.trim().is_empty() || !review.body.trim().is_empty())
         .take(20)
@@ -594,18 +592,21 @@ fn parse_pr_reviews(raw: &str) -> Vec<PrReview> {
 fn parse_inline_review_comments(raw: &str) -> Vec<PrReviewComment> {
     crate::json::json_top_level_objects(raw)
         .into_iter()
-        .map(|object| PrReviewComment {
-            author: json_login_field(object).unwrap_or_default(),
-            path: json_string_field(object, "path").unwrap_or_default(),
-            line: json_u64_field(object, "line")
-                .or_else(|| json_u64_field(object, "original_line"))
-                .map(|line| line.to_string())
-                .unwrap_or_default(),
-            body: json_string_field(object, "body").unwrap_or_default(),
-            created_at: json_string_field(object, "created_at")
-                .or_else(|| json_string_field(object, "createdAt"))
-                .unwrap_or_default(),
-            resolved: false,
+        .map(|object| {
+            let body = json_string_field(object, "body").unwrap_or_default();
+            PrReviewComment {
+                author: json_login_field(object).unwrap_or_default(),
+                path: json_string_field(object, "path").unwrap_or_default(),
+                line: json_u64_field(object, "line")
+                    .or_else(|| json_u64_field(object, "original_line"))
+                    .map(|line| line.to_string())
+                    .unwrap_or_default(),
+                body,
+                created_at: json_string_field(object, "created_at")
+                    .or_else(|| json_string_field(object, "createdAt"))
+                    .unwrap_or_default(),
+                resolved: false,
+            }
         })
         .filter(|comment| !comment.body.trim().is_empty())
         .take(100)
@@ -626,6 +627,7 @@ pub fn parse_review_thread_comments(raw: &str) -> Vec<PrReviewComment> {
             if comments.len() >= 100 {
                 return comments;
             }
+            let body = json_string_field(object, "body").unwrap_or_default();
             let comment = PrReviewComment {
                 author: json_login_field(object).unwrap_or_default(),
                 path: json_string_field(object, "path").unwrap_or_default(),
@@ -633,7 +635,7 @@ pub fn parse_review_thread_comments(raw: &str) -> Vec<PrReviewComment> {
                     .or_else(|| json_u64_field(object, "originalLine"))
                     .map(|line| line.to_string())
                     .unwrap_or_default(),
-                body: json_string_field(object, "body").unwrap_or_default(),
+                body,
                 created_at: json_string_field(object, "createdAt")
                     .or_else(|| json_string_field(object, "created_at"))
                     .unwrap_or_default(),

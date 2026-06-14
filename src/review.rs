@@ -1,9 +1,5 @@
-use std::fs;
-use std::path::PathBuf;
-
-use crate::config::Config;
 use crate::session::Session;
-use crate::util::{empty_dash, indent_markdown_block};
+use crate::util::empty_dash;
 
 pub fn build_review_fix_prompt(session: &Session) -> Result<String, String> {
     let summary = session
@@ -11,23 +7,12 @@ pub fn build_review_fix_prompt(session: &Session) -> Result<String, String> {
         .summary
         .as_ref()
         .ok_or_else(|| "no pull request found for selected branch".to_string())?;
-    let details = session.pr.details.clone().unwrap_or_default();
+    let details = session
+        .pr
+        .details
+        .clone()
+        .ok_or_else(|| "PR comments are still loading; refresh and try again".to_string())?;
 
-    let mut comments = details.comments;
-    comments.sort_by(|a, b| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.author.cmp(&b.author))
-            .then_with(|| a.body.cmp(&b.body))
-    });
-    let mut reviews = details.reviews;
-    reviews.sort_by(|a, b| {
-        a.submitted_at
-            .cmp(&b.submitted_at)
-            .then_with(|| a.author.cmp(&b.author))
-            .then_with(|| a.state.cmp(&b.state))
-            .then_with(|| a.body.cmp(&b.body))
-    });
     let mut review_comments = details.review_comments;
     review_comments.sort_by(|a, b| {
         a.path
@@ -39,35 +24,11 @@ pub fn build_review_fix_prompt(session: &Session) -> Result<String, String> {
     });
 
     let mut prompt = format!(
-        "Here are some comments on PR {}. If they are applicable, fix them. Otherwise, say why not.\n\n",
+        "Here are review comments on PR {}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n",
         summary.number
     );
 
     let mut wrote_comment = false;
-    for comment in &comments {
-        if comment.body.trim().is_empty() {
-            continue;
-        }
-        wrote_comment = true;
-        prompt.push_str(&format!(
-            "{}\n{}\n\n",
-            empty_dash(&comment.author),
-            comment.body.trim()
-        ));
-    }
-
-    for review in &reviews {
-        if review.body.trim().is_empty() {
-            continue;
-        }
-        wrote_comment = true;
-        prompt.push_str(&format!(
-            "{}\n{}\n\n",
-            empty_dash(&review.author),
-            review.body.trim()
-        ));
-    }
-
     for comment in &review_comments {
         if comment.body.trim().is_empty() {
             continue;
@@ -81,170 +42,16 @@ pub fn build_review_fix_prompt(session: &Session) -> Result<String, String> {
             format!(" line {}", comment.line)
         };
         wrote_comment = true;
-        prompt.push_str(&format!(
-            "{}\n{}{}\n{}\n\n",
-            empty_dash(&comment.author),
-            empty_dash(&comment.path),
-            line,
-            comment.body.trim()
-        ));
+        prompt.push_str(&format!("{}{}\n\n", empty_dash(&comment.path), line));
+        prompt.push_str(comment.body.trim());
+        prompt.push_str("\n\n---\n\n");
     }
 
     if !wrote_comment {
-        prompt.push_str("No PR comments were found.\n\n");
+        prompt.push_str("No PR review comments were found.\n\n");
     }
 
     Ok(prompt)
-}
-
-pub fn write_review_packet(session: &Session, config: &Config) -> Result<PathBuf, String> {
-    let summary = session
-        .pr
-        .summary
-        .as_ref()
-        .ok_or_else(|| "no pull request found for selected branch".to_string())?;
-    let details = session.pr.details.clone().unwrap_or_default();
-    let dir = session.path.join(&config.review_packet_dir);
-    fs::create_dir_all(&dir).map_err(|error| format!("create review packet dir: {error}"))?;
-    let path = dir.join(format!("{}.md", summary.number));
-
-    let mut comments = details.comments;
-    comments.sort_by(|a, b| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.author.cmp(&b.author))
-            .then_with(|| a.body.cmp(&b.body))
-    });
-    let mut reviews = details.reviews;
-    reviews.sort_by(|a, b| {
-        a.submitted_at
-            .cmp(&b.submitted_at)
-            .then_with(|| a.author.cmp(&b.author))
-            .then_with(|| a.state.cmp(&b.state))
-            .then_with(|| a.body.cmp(&b.body))
-    });
-    let mut review_comments = details.review_comments;
-    review_comments.sort_by(|a, b| {
-        a.path
-            .cmp(&b.path)
-            .then_with(|| a.line.cmp(&b.line))
-            .then_with(|| a.created_at.cmp(&b.created_at))
-            .then_with(|| a.author.cmp(&b.author))
-            .then_with(|| a.body.cmp(&b.body))
-    });
-    let mut files = details.files;
-    files.sort();
-    files.dedup();
-    let mut failing_checks = details.failing_checks;
-    failing_checks.sort();
-    failing_checks.dedup();
-
-    let mut text = String::new();
-    text.push_str(&format!("# PR #{} Review Packet\n\n", summary.number));
-    text.push_str("## Pull Request\n\n");
-    text.push_str(&format!("- Title: {}\n", summary.title));
-    text.push_str(&format!("- URL: {}\n", summary.url));
-    text.push_str(&format!("- Branch: {}\n", summary.head_ref));
-    text.push_str(&format!("- Base: {}\n", summary.base_ref));
-    text.push_str(&format!("- State: {}\n", summary.state));
-    text.push_str(&format!("- Review decision: {}\n", summary.review_decision));
-    text.push_str(&format!("- Checks: {}\n", summary.check_status));
-    text.push_str(&format!("- Head SHA: {}\n\n", summary.head_sha));
-
-    text.push_str("## Failing Checks\n\n");
-    if failing_checks.is_empty() {
-        text.push_str("None detected.\n\n");
-    } else {
-        for check in &failing_checks {
-            text.push_str(&format!("- {check}\n"));
-        }
-        text.push('\n');
-    }
-
-    text.push_str("## Changed Files\n\n");
-    if files.is_empty() {
-        text.push_str("None detected.\n\n");
-    } else {
-        for file in &files {
-            text.push_str(&format!("- {file}\n"));
-        }
-        text.push('\n');
-    }
-
-    text.push_str("## Conversation Comments\n\n");
-    if comments.is_empty() {
-        text.push_str("None detected.\n\n");
-    } else {
-        for comment in &comments {
-            text.push_str(&format!(
-                "### {} {}\n\n{}\n\n",
-                empty_dash(&comment.author),
-                empty_dash(&comment.created_at),
-                comment.body.trim()
-            ));
-        }
-    }
-
-    text.push_str("## Reviews\n\n");
-    if reviews.is_empty() {
-        text.push_str("None detected.\n\n");
-    } else {
-        for review in &reviews {
-            text.push_str(&format!(
-                "### {} {} {}\n\n{}\n\n",
-                empty_dash(&review.state),
-                empty_dash(&review.author),
-                empty_dash(&review.submitted_at),
-                review.body.trim()
-            ));
-        }
-    }
-
-    text.push_str("## Inline Review Comments\n\n");
-    if review_comments.is_empty() {
-        text.push_str("None detected.\n\n");
-    } else {
-        let mut current_file = String::new();
-        for comment in &review_comments {
-            if comment.path != current_file {
-                current_file = comment.path.clone();
-                text.push_str(&format!("### {}\n\n", empty_dash(&current_file)));
-            }
-            let line = if comment.line.is_empty() {
-                "-".to_string()
-            } else {
-                format!("line {}", comment.line)
-            };
-            text.push_str(&format!(
-                "- {} {} {}:\n\n{}\n\n",
-                line,
-                empty_dash(&comment.author),
-                empty_dash(&comment.created_at),
-                indent_markdown_block(comment.body.trim())
-            ));
-        }
-    }
-
-    text.push_str("## Requested Changes\n\n");
-    if summary.review_decision == "CHANGES_REQUESTED"
-        || reviews
-            .iter()
-            .any(|review| review.state == "CHANGES_REQUESTED")
-    {
-        text.push_str("Changes have been requested on this pull request.\n\n");
-    } else {
-        text.push_str("No explicit changes-requested review state detected.\n\n");
-    }
-
-    text.push_str("## Suggested Agent Prompt\n\n");
-    text.push_str(&format!(
-        "Here are some comments on PR {}. If they are applicable, fix them. Otherwise, say why not.\n\n",
-        summary.number
-    ));
-    text.push_str("Make the requested changes, run relevant checks, and summarize what changed.\n");
-
-    fs::write(&path, text).map_err(|error| format!("write review packet: {error}"))?;
-    Ok(path)
 }
 
 #[cfg(test)]
@@ -258,18 +65,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn review_fix_prompt_contains_comments_without_review_packet_sections() {
+    fn review_fix_prompt_contains_unresolved_review_comments_only() {
         let session = test_session(PrDetails {
             comments: vec![PrComment {
                 author: "alice".to_string(),
                 body: "Please simplify this branch.".to_string(),
-                created_at: "2026-06-14T10:00:00Z".to_string(),
             }],
             reviews: vec![PrReview {
                 author: "bob".to_string(),
                 state: "CHANGES_REQUESTED".to_string(),
                 body: "This should mention the fallback behavior.".to_string(),
-                submitted_at: "2026-06-14T11:00:00Z".to_string(),
             }],
             review_comments: vec![
                 PrReviewComment {
@@ -296,15 +101,17 @@ mod tests {
         let prompt = build_review_fix_prompt(&session).unwrap();
 
         assert!(prompt.starts_with(
-            "Here are some comments on PR 123. If they are applicable, fix them. Otherwise, say why not."
+            "Here are review comments on PR 123.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n"
         ));
-        assert!(prompt.contains("alice\nPlease simplify this branch."));
-        assert!(prompt.contains("bob\nThis should mention the fallback behavior."));
-        assert!(prompt.contains("dana\nsrc/review.rs line 9\nCan this be a helper?"));
-        assert!(prompt.contains("Please simplify this branch."));
-        assert!(prompt.contains("This should mention the fallback behavior."));
+        assert!(prompt.contains("src/review.rs line 9\n\nCan this be a helper?"));
+        assert!(prompt.contains("\n\n---\n\n"));
+        assert!(!prompt.contains("Please simplify this branch."));
+        assert!(!prompt.contains("This should mention the fallback behavior."));
         assert!(prompt.contains("Can this be a helper?"));
         assert!(!prompt.contains("This resolved comment should stay out."));
+        assert!(!prompt.contains("Inline comment"));
+        assert!(!prompt.contains("Comment from"));
+        assert!(!prompt.contains("Review from"));
         assert!(!prompt.contains("<open>"));
         assert!(!prompt.contains("<resolved>"));
         assert!(!prompt.contains("not resolved"));

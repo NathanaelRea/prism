@@ -84,6 +84,7 @@ pub fn stdin_is_tty() -> bool {
         .unwrap_or(false)
 }
 
+#[allow(dead_code)]
 pub fn set_nonblocking(fd: RawFd) -> Result<(), String> {
     let flags = get_fd_flags(fd)?;
     set_fd_flags(fd, flags | O_NONBLOCK)

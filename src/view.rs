@@ -3,7 +3,7 @@ use crate::config::Config;
 use crate::repo::Repository;
 use crate::session::Session;
 use crate::terminal::{terminal_size, write_stdout};
-use crate::util::truncate_line;
+use crate::util::{status_count, truncate_line};
 
 pub fn draw(
     repo: &Repository,
@@ -415,16 +415,6 @@ fn git_status_color(status: &str) -> &'static str {
     } else {
         "32"
     }
-}
-
-fn status_count(status: &str, key: &str) -> Option<usize> {
-    let mut words = status.split_whitespace();
-    while let Some(word) = words.next() {
-        if word == key {
-            return words.next()?.parse().ok();
-        }
-    }
-    None
 }
 
 fn agent_state_color(state: AgentState) -> &'static str {

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
-use std::fs;
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::agent::{AgentAdapter, AgentProcess, AgentState};
@@ -10,19 +10,19 @@ use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCache, fetch_pr_summary_index, pr_details_due, refresh_pr_cache,
     refresh_pr_details_cache, refresh_pr_summary_index, remove_pr_cache,
 };
-use crate::plan::{build_plan_prompt, default_plan_path, infer_total_phases, run_codex_plan};
+use crate::process::command_exists;
 use crate::process::{run_capture, run_configured_commands, run_status};
-use crate::review::{build_review_fix_prompt, write_review_packet};
+use crate::review::build_review_fix_prompt;
 use crate::session::{
-    append_agent_log, append_runtime_log, clear_hidden, discover_sessions, mark_hidden,
-    remove_logs, remove_process_state, remove_task_metadata, save_agent_state, write_task_metadata,
+    append_agent_log, append_runtime_log, clear_hidden, discover_sessions, remove_logs,
+    remove_process_state, remove_task_metadata, save_agent_state, write_task_metadata,
 };
 use crate::tmux::{
-    agent_session_running, attach_or_create_agent, ensure_agent_session, kill_agent_session,
-    latest_agent_session_generation, paste_agent_prompt,
+    TmuxWindow, agent_session_running, attach_or_create_agent, attach_or_create_window,
+    ensure_agent_session, kill_agent_session, latest_agent_session_generation, paste_agent_prompt,
 };
 use crate::tui::{PrPollKey, PrPollResult, TmuxSlotKey, TmuxWarmupKey, TmuxWarmupResult, Tui};
-use crate::util::{truncate, yes};
+use crate::util::{status_count, truncate, yes};
 
 impl Tui {
     pub(crate) fn refresh_sessions(&mut self) -> Result<(), String> {
@@ -72,6 +72,7 @@ impl Tui {
         create_worktree_session(&self.repo, &self.config, branch.trim())?;
         clear_hidden(&self.repo, branch.trim())?;
         self.refresh_sessions()?;
+        self.start_tmux_agent_warmup();
         let index = self
             .sessions
             .iter()
@@ -94,6 +95,7 @@ impl Tui {
         Ok(true)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn launch_agent(
         &mut self,
         index: usize,
@@ -278,6 +280,21 @@ impl Tui {
         Ok(())
     }
 
+    pub(crate) fn attach_selected_tmux_window(&mut self, window: TmuxWindow) -> Result<(), String> {
+        if self.selected >= self.sessions.len() {
+            return Ok(());
+        }
+        let session = session_for_tmux_warmup(&self.sessions[self.selected]);
+        let slot = tmux_slot_key(&session);
+        let generation = self.tmux_generation_for_slot(&slot);
+        let key = tmux_warmup_key(slot.clone(), generation);
+        self.finish_tmux_warmup_for_key(&key);
+        attach_or_create_window(&self.repo, &self.config, &session, generation, window)?;
+        let running = agent_session_running(&self.repo, &self.config, &session, generation);
+        self.update_tmux_agent_state_for_slot(&slot, running);
+        Ok(())
+    }
+
     pub(crate) fn start_tmux_agent_warmup(&mut self) {
         self.poll_tmux_agent_warmup();
         let sessions = self
@@ -450,108 +467,6 @@ impl Tui {
         true
     }
 
-    pub(crate) fn create_or_update_pr(&mut self) -> Result<(), String> {
-        if self.selected >= self.sessions.len() {
-            return Ok(());
-        }
-        if self
-            .config
-            .is_default_branch(&self.sessions[self.selected].branch)
-        {
-            self.show_message("default branch is not treated as a PR branch")?;
-            return Ok(());
-        }
-        {
-            let session = &mut self.sessions[self.selected];
-            refresh_pr_cache(
-                &self.repo,
-                &session.branch,
-                &mut session.pr,
-                &session.path,
-                &self.config,
-                false,
-            );
-        }
-        if let Some(summary) = &self.sessions[self.selected].pr.summary {
-            let message = format!("PR #{} {}", summary.number, summary.url);
-            self.show_message(&message)?;
-            return Ok(());
-        }
-        let path = self.sessions[self.selected].path.clone();
-        let branch = self.sessions[self.selected].branch.clone();
-
-        if selected_dirty(&path, &self.config)? {
-            self.show_message("working tree is dirty; commit or stash before creating a PR")?;
-            return Ok(());
-        }
-
-        run_configured_commands(&self.config.checks.pre_pr, &path, "pre_pr")?;
-        run_configured_commands(&self.config.checks.pre_push, &path, "pre_push")?;
-
-        let push = self.prompt_line("No PR found. Push branch and create PR? [y/N] ")?;
-        if !yes(&push) {
-            return Ok(());
-        }
-        self.show_message("pushing branch")?;
-        run_status(
-            Command::new(self.config.tool("git"))
-                .arg("-C")
-                .arg(&path)
-                .args(["push", "-u", "origin", &branch]),
-        )?;
-        self.show_message("creating pull request")?;
-        run_status(
-            Command::new(self.config.tool("gh"))
-                .arg("pr")
-                .arg("create")
-                .arg("--fill")
-                .current_dir(&path),
-        )?;
-        {
-            let session = &mut self.sessions[self.selected];
-            refresh_pr_cache(
-                &self.repo,
-                &session.branch,
-                &mut session.pr,
-                &session.path,
-                &self.config,
-                true,
-            );
-        }
-        if let Some(summary) = &self.sessions[self.selected].pr.summary {
-            let message = format!("created PR #{} {}", summary.number, summary.url);
-            self.show_message(&message)?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn refresh_review_packet(&mut self) -> Result<(), String> {
-        if self.selected >= self.sessions.len() {
-            return Ok(());
-        }
-        if self
-            .config
-            .is_default_branch(&self.sessions[self.selected].branch)
-        {
-            self.show_message("default branch has no PR review packet")?;
-            return Ok(());
-        }
-        {
-            let session = &mut self.sessions[self.selected];
-            refresh_pr_cache(
-                &self.repo,
-                &session.branch,
-                &mut session.pr,
-                &session.path,
-                &self.config,
-                true,
-            );
-        }
-        let path = write_review_packet(&self.sessions[self.selected], &self.config)?;
-        self.show_message(&format!("wrote {}", path.display()))?;
-        Ok(())
-    }
-
     pub(crate) fn start_review_fix(&mut self) -> Result<(), String> {
         if self.selected >= self.sessions.len() {
             return Ok(());
@@ -563,26 +478,9 @@ impl Tui {
             self.show_message("default branch has no PR review comments")?;
             return Ok(());
         }
-        if self.sessions[self.selected].agent_state == AgentState::Running {
-            self.show_message("agent is already running; wait or select another session")?;
-            return Ok(());
-        }
-        {
-            let session = &mut self.sessions[self.selected];
-            refresh_pr_cache(
-                &self.repo,
-                &session.branch,
-                &mut session.pr,
-                &session.path,
-                &self.config,
-                true,
-            );
-        }
-        let path = self.sessions[self.selected].path.clone();
-        run_configured_commands(&self.config.checks.review_fix, &path, "review_fix")?;
         let prompt = build_review_fix_prompt(&self.sessions[self.selected])?;
-        self.paste_prompt_into_tmux_agent(self.selected, &prompt)?;
-        self.show_message("pasted review-fix prompt into agent session")?;
+        copy_to_clipboard(&self.config, &prompt)?;
+        self.show_message("review-fix prompt copied to clipboard")?;
         Ok(())
     }
 
@@ -599,38 +497,6 @@ impl Tui {
         paste_agent_prompt(&self.repo, &self.config, &session, generation, prompt)?;
         let running = agent_session_running(&self.repo, &self.config, &session, generation);
         self.update_tmux_agent_state_for_slot(&slot, running);
-        Ok(())
-    }
-
-    pub(crate) fn commit_review_fix(&mut self) -> Result<(), String> {
-        if self.selected >= self.sessions.len() {
-            return Ok(());
-        }
-        let path = self.sessions[self.selected].path.clone();
-        if !selected_dirty(&path, &self.config)? {
-            self.show_message("nothing to commit")?;
-            return Ok(());
-        }
-        let message = self.prompt_line_with_default("Commit message: ", "fix: code review")?;
-        let message = message.trim();
-        if message.is_empty() {
-            return Ok(());
-        }
-        run_status(
-            Command::new(self.config.tool("git"))
-                .arg("-C")
-                .arg(&path)
-                .args(["add", "-A"]),
-        )?;
-        run_status(
-            Command::new(self.config.tool("git"))
-                .arg("-C")
-                .arg(&path)
-                .args(["commit", "-m"])
-                .arg(message),
-        )?;
-        self.refresh_sessions()?;
-        self.show_message(&format!("created commit: {message}"))?;
         Ok(())
     }
 
@@ -678,92 +544,88 @@ impl Tui {
                 true,
             );
         }
-        self.show_message("push complete")?;
+        if self.sessions[self.selected].pr.summary.is_none()
+            && !self
+                .config
+                .is_default_branch(&self.sessions[self.selected].branch)
+        {
+            run_configured_commands(&self.config.checks.pre_pr, &path, "pre_pr")?;
+            self.show_message("creating pull request")?;
+            run_status(
+                Command::new(self.config.tool("gh"))
+                    .args(create_pr_args(self.config.default_base.as_deref()))
+                    .current_dir(&path),
+            )?;
+            let session = &mut self.sessions[self.selected];
+            refresh_pr_cache(
+                &self.repo,
+                &session.branch,
+                &mut session.pr,
+                &session.path,
+                &self.config,
+                true,
+            );
+            self.show_message("push complete; pull request created")?;
+        } else {
+            self.show_message("push complete")?;
+        }
         Ok(())
     }
 
-    pub(crate) fn create_plan(&mut self) -> Result<(), String> {
+    pub(crate) fn merge_selected_pr(&mut self) -> Result<(), String> {
         if self.selected >= self.sessions.len() {
             return Ok(());
         }
-        if self.sessions[self.selected].agent_state == AgentState::Running {
-            self.show_message("agent is already running; wait or select another session")?;
+        if self
+            .config
+            .is_default_branch(&self.sessions[self.selected].branch)
+        {
+            self.show_message("default branch is not treated as a PR branch")?;
             return Ok(());
         }
-        let path = default_plan_path(&self.sessions[self.selected], &self.config);
-        let request = self.prompt_line("Plan request (optional): ")?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| format!("create plan dir: {error}"))?;
-        }
-        let prompt = build_plan_prompt(&self.sessions[self.selected], &path, &request);
-        self.launch_agent(self.selected, &prompt)?;
-        self.show_message(&format!("started planning agent for {}", path.display()))?;
-        Ok(())
-    }
-
-    pub(crate) fn run_selected_plan(&mut self) -> Result<(), String> {
-        if self.selected >= self.sessions.len() {
-            return Ok(());
-        }
-        let session = &self.sessions[self.selected];
-        let plan_path = default_plan_path(session, &self.config);
-        if !plan_path.is_file() {
-            return Err(format!("plan file not found: {}", plan_path.display()));
-        }
-        let inferred_total = infer_total_phases(&plan_path)?;
-        let total = if inferred_total > 0 {
-            inferred_total
-        } else {
-            let input = self.prompt_line("Total phases: ")?;
-            input
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| "total phases must be a positive integer".to_string())?
-        };
-        if total == 0 {
-            return Err("total phases must be positive".to_string());
-        }
-        let start_input = self.prompt_line("Start phase [1]: ")?;
-        let start = if start_input.trim().is_empty() {
-            1
-        } else {
-            start_input
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| "start phase must be a positive integer".to_string())?
-        };
-        if start == 0 || start > total {
-            return Err("start phase must be between 1 and total phases".to_string());
-        }
-        let parallel_input = self.prompt_line("Run phases in parallel? [y/N] ")?;
-        let parallel = matches!(
-            parallel_input.trim(),
-            "y" | "Y" | "yes" | "YES" | "true" | "TRUE"
-        );
-        let answer = self.prompt_line(&format!(
-            "Run {} phases from {} starting at {}? [y/N] ",
-            total,
-            plan_path.display(),
-            start
-        ))?;
-        if !yes(&answer) {
-            return Ok(());
-        }
-        run_codex_plan(session, &self.config, &plan_path, total, start, parallel)
-    }
-
-    pub(crate) fn remove_session_from_board(&mut self) -> Result<(), String> {
-        if self.selected >= self.sessions.len() {
-            return Ok(());
-        }
+        let path = self.sessions[self.selected].path.clone();
         let branch = self.sessions[self.selected].branch.clone();
-        let answer = self.prompt_line(&format!("Remove {branch} from Prism board only? [y/N] "))?;
-        if !yes(&answer) {
+        {
+            let session = &mut self.sessions[self.selected];
+            refresh_pr_cache(
+                &self.repo,
+                &session.branch,
+                &mut session.pr,
+                &session.path,
+                &self.config,
+                false,
+            );
+        }
+        let Some(summary) = self.sessions[self.selected].pr.summary.clone() else {
+            self.show_message("no pull request found for selected branch")?;
+            return Ok(());
+        };
+        if summary.merged {
+            self.show_message("pull request is already merged")?;
             return Ok(());
         }
-        mark_hidden(&self.repo, &branch)?;
+        if selected_dirty(&path, &self.config)? {
+            self.show_message("working tree is dirty; commit or stash before merging")?;
+            return Ok(());
+        }
+        run_configured_commands(&self.config.checks.pre_push, &path, "pre_push")?;
+        self.show_message(&format!("merging PR #{}", summary.number))?;
+        let pr_number = summary.number.to_string();
+        run_status(
+            Command::new(self.config.tool("gh"))
+                .args(["pr", "merge", &pr_number, "--merge", "--delete-branch"])
+                .current_dir(&path),
+        )?;
+        if branch != "(detached)" {
+            let _ = run_status(
+                Command::new(self.config.tool("git"))
+                    .arg("-C")
+                    .arg(&self.repo.root)
+                    .args(["branch", "-D", &branch]),
+            );
+        }
         self.refresh_sessions()?;
-        self.show_message("session removed from board")?;
+        self.show_message("merge complete")?;
         Ok(())
     }
 
@@ -773,37 +635,29 @@ impl Tui {
         }
         let branch = self.sessions[self.selected].branch.clone();
         let path = self.sessions[self.selected].path.clone();
-        let adopted = self.sessions[self.selected].adopted;
-        let warning = if adopted {
-            "Delete local Prism data, worktree, and local branch? [y/N] "
-        } else {
-            "Untracked worktree. Type Y to delete worktree and local branch; y hides only: "
-        };
-        let answer = self.prompt_line(warning)?;
-        if answer.trim() == "Y" {
-            self.delete_local_data(&branch)?;
+        let path_display = self.sessions[self.selected].path_display.clone();
+        let warnings = delete_warnings(&self.sessions[self.selected]);
+        if !self.confirm_delete_dialog(&branch, &path_display, &warnings)? {
+            return Ok(());
+        }
+        self.delete_local_data(&branch)?;
+        run_status(
+            Command::new(self.config.tool("git"))
+                .arg("-C")
+                .arg(&self.repo.root)
+                .args(["worktree", "remove", "--force"])
+                .arg(&path),
+        )?;
+        if branch != "(detached)" {
             run_status(
                 Command::new(self.config.tool("git"))
                     .arg("-C")
                     .arg(&self.repo.root)
-                    .args(["worktree", "remove", "--force"])
-                    .arg(&path),
+                    .args(["branch", "-D", &branch]),
             )?;
-            if branch != "(detached)" {
-                run_status(
-                    Command::new(self.config.tool("git"))
-                        .arg("-C")
-                        .arg(&self.repo.root)
-                        .args(["branch", "-D", &branch]),
-                )?;
-            }
-            self.refresh_sessions()?;
-            self.show_message("deleted local session data, worktree, and branch")?;
-        } else if !adopted && yes(&answer) {
-            mark_hidden(&self.repo, &branch)?;
-            self.refresh_sessions()?;
-            self.show_message("untracked session hidden")?;
         }
+        self.refresh_sessions()?;
+        self.show_message("deleted local session data, worktree, and branch")?;
         Ok(())
     }
 
@@ -815,6 +669,54 @@ impl Tui {
         clear_hidden(&self.repo, branch)?;
         Ok(())
     }
+}
+
+fn copy_to_clipboard(config: &crate::config::Config, text: &str) -> Result<(), String> {
+    let candidates: [(&str, &[&str]); 4] = [
+        (&config.tool("wl-copy"), &[]),
+        (&config.tool("xclip"), &["-selection", "clipboard"]),
+        (&config.tool("xsel"), &["--clipboard", "--input"]),
+        (&config.tool("pbcopy"), &[]),
+    ];
+    let mut errors = Vec::new();
+    for (program, args) in candidates {
+        if !clipboard_command_exists(program) {
+            continue;
+        }
+        match write_clipboard_command(program, args, text) {
+            Ok(()) => return Ok(()),
+            Err(error) => errors.push(error),
+        }
+    }
+    if errors.is_empty() {
+        Err("no clipboard tool found; install wl-copy, xclip, xsel, or pbcopy".to_string())
+    } else {
+        Err(format!("clipboard copy failed: {}", errors.join("; ")))
+    }
+}
+
+fn clipboard_command_exists(program: &str) -> bool {
+    let program = program.split_whitespace().next().unwrap_or(program);
+    !program.is_empty() && command_exists(program)
+}
+
+fn write_clipboard_command(program: &str, args: &[&str], text: &str) -> Result<(), String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("{program}: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("{program}: stdin unavailable"))?;
+    stdin
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("{program}: {error}"))?;
+    drop(stdin);
+    Ok(())
 }
 
 fn tmux_agent_state(
@@ -854,6 +756,15 @@ fn create_worktree_args(repo_root: &Path, branch: &str) -> Vec<String> {
         "json".to_string(),
         branch.to_string(),
     ]
+}
+
+fn create_pr_args(default_base: Option<&str>) -> Vec<String> {
+    let mut args = vec!["pr".to_string(), "create".to_string(), "--fill".to_string()];
+    if let Some(base) = default_base.map(str::trim).filter(|base| !base.is_empty()) {
+        args.push("--base".to_string());
+        args.push(base.to_string());
+    }
+    args
 }
 
 fn pr_render_signature(cache: &PrCache) -> String {
@@ -901,6 +812,34 @@ fn session_for_tmux_warmup(session: &crate::session::Session) -> crate::session:
     }
 }
 
+fn delete_warnings(session: &crate::session::Session) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if status_count(&session.status_label, "dirty").is_some() {
+        warnings.push("dirty worktree: uncommitted changes will be deleted".to_string());
+    }
+    if status_count(&session.status_label, "ahead").is_some() {
+        warnings.push("branch is ahead of upstream: unpushed commits may be lost".to_string());
+    }
+    if status_count(&session.status_label, "behind").is_some() {
+        warnings.push("branch is behind upstream".to_string());
+    }
+    if !session.adopted {
+        warnings.push("session was not created by Prism".to_string());
+    }
+    if session.branch == "(detached)" {
+        warnings.push("detached worktree: no local branch will be deleted".to_string());
+    }
+    if session.agent_state == AgentState::Running {
+        warnings.push("agent is still running".to_string());
+    }
+    if let Some(summary) = &session.pr.summary
+        && !summary.merged
+    {
+        warnings.push(format!("open PR #{} still exists", summary.number));
+    }
+    warnings
+}
+
 #[cfg(test)]
 mod tests {
     use crate::agent::AgentState;
@@ -910,7 +849,9 @@ mod tests {
     use crate::session::Session;
     use crate::tui::{TmuxWarmupResult, Tui};
 
-    use super::{create_worktree_args, tmux_agent_state, tmux_slot_key, tmux_warmup_key};
+    use super::{
+        create_pr_args, create_worktree_args, tmux_agent_state, tmux_slot_key, tmux_warmup_key,
+    };
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -955,6 +896,15 @@ mod tests {
                 "feat/test",
             ]
         );
+    }
+
+    #[test]
+    fn create_pr_uses_fill_and_default_base_when_configured() {
+        assert_eq!(
+            create_pr_args(Some("main")),
+            vec!["pr", "create", "--fill", "--base", "main"]
+        );
+        assert_eq!(create_pr_args(None), vec!["pr", "create", "--fill"]);
     }
 
     #[test]
@@ -1171,7 +1121,10 @@ exit 0
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> '{}'
 case "$1" in
-  has-session|set-option)
+  has-session|set-option|move-window|rename-window|new-window)
+    exit 0
+    ;;
+  list-windows)
     exit 0
     ;;
   display-message)
