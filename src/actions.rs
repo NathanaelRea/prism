@@ -879,7 +879,7 @@ impl Tui {
         let pr_number = summary.number.to_string();
         run_status(
             Command::new(self.config.tool("gh"))
-                .args(["pr", "merge", &pr_number, "--merge", "--delete-branch"])
+                .args(merge_pr_args(&pr_number, self.config.merge_method))
                 .current_dir(&path),
         )?;
         if branch != "(detached)" {
@@ -1045,6 +1045,16 @@ fn create_pr_args(default_base: Option<&str>, body: &str) -> Vec<String> {
         args.push(base.to_string());
     }
     args
+}
+
+fn merge_pr_args(pr_number: &str, method: crate::config::MergeMethod) -> Vec<String> {
+    vec![
+        "pr".to_string(),
+        "merge".to_string(),
+        pr_number.to_string(),
+        method.gh_flag().to_string(),
+        "--delete-branch".to_string(),
+    ]
 }
 
 fn pr_render_signature(cache: &PrCache) -> String {
@@ -1258,15 +1268,15 @@ fn delete_warnings(session: &crate::session::Session) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use crate::agent::AgentState;
-    use crate::config::{Checks, Config, EscapeKey};
+    use crate::config::{Checks, Config, EscapeKey, MergeMethod};
     use crate::github::PrCache;
     use crate::repo::Repository;
     use crate::session::Session;
     use crate::tui::{TmuxWarmupResult, Tui};
 
     use super::{
-        create_pr_args, create_worktree_args, status_label_with_behind, tmux_agent_state,
-        tmux_slot_key, tmux_warmup_key,
+        create_pr_args, create_worktree_args, merge_pr_args, status_label_with_behind,
+        tmux_agent_state, tmux_slot_key, tmux_warmup_key,
     };
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
@@ -1329,6 +1339,22 @@ mod tests {
         assert_eq!(
             create_pr_args(None, "manual description"),
             vec!["pr", "create", "--fill", "--body", "manual description"]
+        );
+    }
+
+    #[test]
+    fn merge_pr_args_use_configured_method() {
+        assert_eq!(
+            merge_pr_args("42", MergeMethod::Squash),
+            vec!["pr", "merge", "42", "--squash", "--delete-branch"]
+        );
+        assert_eq!(
+            merge_pr_args("42", MergeMethod::Merge),
+            vec!["pr", "merge", "42", "--merge", "--delete-branch"]
+        );
+        assert_eq!(
+            merge_pr_args("42", MergeMethod::Rebase),
+            vec!["pr", "merge", "42", "--rebase", "--delete-branch"]
         );
     }
 
@@ -1735,6 +1761,7 @@ exit 0
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
+            merge_method: MergeMethod::Squash,
             checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools: BTreeMap::new(),

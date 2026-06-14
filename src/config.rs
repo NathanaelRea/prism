@@ -41,6 +41,40 @@ impl EscapeKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeMethod {
+    Squash,
+    Merge,
+    Rebase,
+}
+
+impl MergeMethod {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "squash" => Some(Self::Squash),
+            "merge" => Some(Self::Merge),
+            "rebase" => Some(Self::Rebase),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Squash => "squash",
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+        }
+    }
+
+    pub fn gh_flag(self) -> &'static str {
+        match self {
+            Self::Squash => "--squash",
+            Self::Merge => "--merge",
+            Self::Rebase => "--rebase",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub default_agent: String,
@@ -49,6 +83,7 @@ pub struct Config {
     pub review_packet_dir: String,
     pub worktree_command: String,
     pub escape_key: EscapeKey,
+    pub merge_method: MergeMethod,
     pub checks: Checks,
     pub worktree_columns: Vec<String>,
     pub tools: BTreeMap<String, String>,
@@ -93,6 +128,7 @@ impl Config {
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
+            merge_method: MergeMethod::Squash,
             checks: Checks::default(),
             worktree_columns: vec!["url".to_string()],
             tools,
@@ -177,6 +213,11 @@ impl Config {
                 "plan_dir" => self.plan_dir = value,
                 "review_packet_dir" => self.review_packet_dir = value,
                 "worktree_command" => self.worktree_command = value,
+                "merge_method" => {
+                    if let Some(method) = MergeMethod::parse(&value) {
+                        self.merge_method = method;
+                    }
+                }
                 "escape_key" => {
                     if let Some(key) = EscapeKey::parse(&value) {
                         self.escape_key = key;
@@ -236,6 +277,7 @@ pub fn print_config(repo: &Repository, config: &Config) {
     println!("review_packet_dir = {}", config.review_packet_dir);
     println!("worktree_command = {}", config.worktree_command);
     println!("escape_key = {}", config.escape_key.label());
+    println!("merge_method = {}", config.merge_method.label());
     println!("worktree_columns = {:?}", config.worktree_columns);
     println!(
         "prompt_templates = {:?}",
@@ -602,6 +644,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_merge_method() {
+        assert_eq!(MergeMethod::parse("squash"), Some(MergeMethod::Squash));
+        assert_eq!(MergeMethod::parse("merge"), Some(MergeMethod::Merge));
+        assert_eq!(MergeMethod::parse("rebase"), Some(MergeMethod::Rebase));
+        assert_eq!(MergeMethod::parse("unknown"), None);
+    }
+
+    #[test]
     fn defaults_to_opencode_json_run_backend() {
         let config = Config::defaults(
             PathBuf::from("/tmp/user.toml"),
@@ -611,6 +661,7 @@ mod tests {
         assert_eq!(AGENT_CANDIDATES, ["opencode"]);
         assert_eq!(config.default_agent, "opencode");
         assert_eq!(config.default_base.as_deref(), Some("main"));
+        assert_eq!(config.merge_method, MergeMethod::Squash);
         assert!(config.is_default_branch("main"));
         assert_eq!(
             config.agent_command("opencode"),
@@ -637,6 +688,26 @@ mod tests {
         assert_eq!(config.default_base.as_deref(), Some("develop"));
         assert!(config.is_default_branch("develop"));
         assert!(!config.is_default_branch("main"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn repo_config_overrides_merge_method() {
+        let path = std::env::temp_dir().join(format!(
+            "prism-config-merge-method-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, r#"merge_method = "merge""#).unwrap();
+        let mut config = Config::defaults(PathBuf::from("/tmp/user.toml"), path.clone());
+
+        config.apply_file(&path);
+
+        assert_eq!(config.merge_method, MergeMethod::Merge);
 
         let _ = fs::remove_file(path);
     }

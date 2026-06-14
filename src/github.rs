@@ -1368,6 +1368,7 @@ JSON
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
+            merge_method: crate::config::MergeMethod::Squash,
             checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools: BTreeMap::new(),

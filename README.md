@@ -40,11 +40,15 @@ Common keys:
 Prism treats `main` as the default branch by default. The default branch is not
 polled or shown as a pull request branch.
 
+Prism uses squash merges for pull requests by default. Set `merge_method` to
+`merge` or `rebase` if a repository requires a different GitHub merge method.
+
 Set `default_base` in the user config or override it per repository in
 `~/.config/prism/repos/<repo-name>-<hash>/config.toml`:
 
 ```toml
 default_base = "develop"
+merge_method = "squash"
 
 [worktrees]
 columns = ["url", "vars.localdev", "ci"]

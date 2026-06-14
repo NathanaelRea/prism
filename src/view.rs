@@ -963,7 +963,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::agent::AgentState;
-    use crate::config::{Checks, Config, EscapeKey};
+    use crate::config::{Checks, Config, EscapeKey, MergeMethod};
     use crate::github::PrCache;
     use crate::repo::Repository;
     use crate::session::Session;
@@ -982,6 +982,7 @@ mod tests {
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
+            merge_method: MergeMethod::Squash,
             checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
@@ -1028,6 +1029,7 @@ mod tests {
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
+            merge_method: MergeMethod::Squash,
             checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
@@ -1082,6 +1084,7 @@ mod tests {
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
+            merge_method: MergeMethod::Squash,
             checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
@@ -1126,6 +1129,7 @@ mod tests {
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
+            merge_method: MergeMethod::Squash,
             checks: Checks::default(),
             worktree_columns: vec!["url".to_string()],
             tools: BTreeMap::new(),
