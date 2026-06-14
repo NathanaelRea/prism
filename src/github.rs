@@ -5,8 +5,9 @@ use rusqlite::params;
 
 use crate::config::Config;
 use crate::json::{
-    collect_json_string_fields, json_bool_field, json_login_field, json_object_field,
-    json_objects_in_array, json_string_field, json_u64_field,
+    collect_json_string_fields, json_array_field, json_bool_field, json_login_field,
+    json_object_field, json_objects_in_array, json_string_field, json_top_level_objects,
+    json_u64_field,
 };
 use crate::observability;
 use crate::process::run_capture;
@@ -35,6 +36,7 @@ pub struct PrSummary {
     pub url: String,
     pub state: String,
     pub review_decision: String,
+    pub requested_reviewers: Vec<String>,
     pub head_ref: String,
     pub base_ref: String,
     pub head_sha: String,
@@ -48,10 +50,11 @@ pub struct PrSummary {
 impl PrSummary {
     pub fn signature(&self) -> String {
         format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.number,
             self.state,
             self.review_decision,
+            self.requested_reviewers.join(","),
             self.body,
             self.head_sha,
             self.updated_at,
@@ -97,10 +100,11 @@ pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
     let Ok((summary, last_refreshed)) = observability::with_writable_db(repo, |conn| {
         conn.query_row(
             "select
-                number, title, body, url, state, review_decision, head_ref, base_ref, head_sha,
-                updated_at, check_status, comment_count, merged, draft, last_refreshed
-             from pr_cache
-             where branch = ?1",
+                number, title, body, url, state, review_decision, requested_reviewers,
+                head_ref, base_ref, head_sha, updated_at, check_status, comment_count, merged,
+                draft, last_refreshed
+              from pr_cache
+              where branch = ?1",
             params![branch],
             |row| {
                 Ok((
@@ -111,16 +115,17 @@ pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
                         url: row.get(3)?,
                         state: row.get(4)?,
                         review_decision: row.get(5)?,
-                        head_ref: row.get(6)?,
-                        base_ref: row.get(7)?,
-                        head_sha: row.get(8)?,
-                        updated_at: row.get(9)?,
-                        check_status: row.get(10)?,
-                        comment_count: row_u64(row, 11)?,
-                        merged: row.get(12)?,
-                        draft: row.get(13)?,
+                        requested_reviewers: decode_requested_reviewers(&row.get::<_, String>(6)?),
+                        head_ref: row.get(7)?,
+                        base_ref: row.get(8)?,
+                        head_sha: row.get(9)?,
+                        updated_at: row.get(10)?,
+                        check_status: row.get(11)?,
+                        comment_count: row_u64(row, 12)?,
+                        merged: row.get(13)?,
+                        draft: row.get(14)?,
                     },
-                    row.get::<_, String>(14)?,
+                    row.get::<_, String>(15)?,
                 ))
             },
         )
@@ -297,6 +302,19 @@ query($owner: String!, $name: String!) {
         url
         state
         reviewDecision
+        reviewRequests(first: 10) {
+          nodes {
+            requestedReviewer {
+              __typename
+              ... on User {
+                login
+              }
+              ... on Team {
+                slug
+              }
+            }
+          }
+        }
         headRefName
         baseRefName
         headRefOid
@@ -392,6 +410,7 @@ fn parse_pr_summary_node(raw: &str) -> Option<PrSummary> {
         state: json_string_field(raw, "state").unwrap_or_default(),
         review_decision: json_string_field(raw, "reviewDecision")
             .unwrap_or_else(|| "UNKNOWN".to_string()),
+        requested_reviewers: parse_requested_reviewers(raw),
         head_ref: json_string_field(raw, "headRefName").unwrap_or_default(),
         base_ref: json_string_field(raw, "baseRefName").unwrap_or_default(),
         head_sha: json_string_field(raw, "headRefOid").unwrap_or_default(),
@@ -418,6 +437,7 @@ fn fetch_pr_summary(
         "url",
         "state",
         "reviewDecision",
+        "reviewRequests",
         "headRefName",
         "baseRefName",
         "headRefOid",
@@ -464,6 +484,7 @@ fn fetch_pr_summary(
         state: json_string_field(&raw, "state").unwrap_or_default(),
         review_decision: json_string_field(&raw, "reviewDecision")
             .unwrap_or_else(|| "UNKNOWN".to_string()),
+        requested_reviewers: parse_requested_reviewers(&raw),
         head_ref: json_string_field(&raw, "headRefName").unwrap_or_default(),
         base_ref: json_string_field(&raw, "baseRefName").unwrap_or_default(),
         head_sha: json_string_field(&raw, "headRefOid").unwrap_or_default(),
@@ -586,6 +607,34 @@ fn parse_pr_reviews(raw: &str) -> Vec<PrReview> {
         .filter(|review| !review.state.trim().is_empty() || !review.body.trim().is_empty())
         .take(20)
         .collect()
+}
+
+fn parse_requested_reviewers(raw: &str) -> Vec<String> {
+    if let Some(requests) = json_object_field(raw, "reviewRequests") {
+        return requested_reviewers_from_objects(json_objects_in_array(requests, "nodes"));
+    }
+    if let Some(requests) = json_array_field(raw, "reviewRequests") {
+        return requested_reviewers_from_objects(json_top_level_objects(requests));
+    }
+    Vec::new()
+}
+
+fn requested_reviewers_from_objects(objects: Vec<&str>) -> Vec<String> {
+    let mut reviewers: Vec<String> = Vec::new();
+    for object in objects {
+        let reviewer_object = json_object_field(object, "requestedReviewer").unwrap_or(object);
+        let Some(name) = json_login_field(reviewer_object)
+            .or_else(|| json_string_field(reviewer_object, "slug"))
+            .or_else(|| json_string_field(reviewer_object, "name"))
+        else {
+            continue;
+        };
+        let name = name.trim();
+        if !name.is_empty() && !reviewers.iter().any(|existing| existing.as_str() == name) {
+            reviewers.push(name.to_string());
+        }
+    }
+    reviewers
 }
 
 #[cfg(test)]
@@ -736,17 +785,18 @@ fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result<(),
     observability::with_writable_db(repo, |conn| {
         conn.execute(
             "insert into pr_cache (
-                branch, number, title, body, url, state, review_decision, head_ref, base_ref,
-                head_sha, updated_at, check_status, comment_count, merged, draft, last_refreshed,
-                refreshed_unix_ms
-             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
-             on conflict(branch) do update set
+                branch, number, title, body, url, state, review_decision, requested_reviewers,
+                head_ref, base_ref, head_sha, updated_at, check_status, comment_count, merged,
+                draft, last_refreshed, refreshed_unix_ms
+             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+              on conflict(branch) do update set
                 number = excluded.number,
                 title = excluded.title,
                 body = excluded.body,
                 url = excluded.url,
                 state = excluded.state,
                 review_decision = excluded.review_decision,
+                requested_reviewers = excluded.requested_reviewers,
                 head_ref = excluded.head_ref,
                 base_ref = excluded.base_ref,
                 head_sha = excluded.head_sha,
@@ -765,6 +815,7 @@ fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result<(),
                 summary.url.as_str(),
                 summary.state.as_str(),
                 summary.review_decision.as_str(),
+                encode_requested_reviewers(&summary.requested_reviewers),
                 summary.head_ref.as_str(),
                 summary.base_ref.as_str(),
                 summary.head_sha.as_str(),
@@ -780,6 +831,19 @@ fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result<(),
         .map_err(|error| format!("write PR cache: {error}"))?;
         Ok(())
     })
+}
+
+fn encode_requested_reviewers(reviewers: &[String]) -> String {
+    reviewers.join("\n")
+}
+
+fn decode_requested_reviewers(value: &str) -> Vec<String> {
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 fn row_u64(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<u64> {
@@ -845,6 +909,12 @@ mod tests {
                     "url": "https://github.com/example/repo/pull/9",
                     "state": "OPEN",
                     "reviewDecision": "REVIEW_REQUIRED",
+                    "reviewRequests": {
+                      "nodes": [
+                        {"requestedReviewer": {"__typename": "User", "login": "alice"}},
+                        {"requestedReviewer": {"__typename": "Team", "slug": "backend"}}
+                      ]
+                    },
                     "headRefName": "feature",
                     "baseRefName": "main",
                     "headRefOid": "abc123",
@@ -884,8 +954,22 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].number, 9);
         assert_eq!(summaries[0].head_ref, "feature");
+        assert_eq!(summaries[0].requested_reviewers, vec!["alice", "backend"]);
         assert_eq!(summaries[0].comment_count, 5);
         assert_eq!(summaries[0].check_status, "passed");
+    }
+
+    #[test]
+    fn parses_requested_reviewers_from_gh_pr_view() {
+        let raw = r#"{
+          "reviewRequests": [
+            {"requestedReviewer": {"login": "alice"}},
+            {"requestedReviewer": {"slug": "backend"}},
+            {"requestedReviewer": {"login": "alice"}}
+          ]
+        }"#;
+
+        assert_eq!(parse_requested_reviewers(raw), vec!["alice", "backend"]);
     }
 
     #[test]

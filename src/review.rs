@@ -191,6 +191,7 @@ mod tests {
                     url: "https://example.test/pr/123".to_string(),
                     state: "OPEN".to_string(),
                     review_decision: "CHANGES_REQUESTED".to_string(),
+                    requested_reviewers: Vec::new(),
                     head_ref: "feature".to_string(),
                     base_ref: "main".to_string(),
                     head_sha: "abc123".to_string(),

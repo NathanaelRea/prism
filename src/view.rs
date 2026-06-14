@@ -393,6 +393,7 @@ fn format_session_row(config: &Config, session: &Session, selected: bool, width:
     };
     let branch_code = if selected { "1;37" } else { "37" };
     let pr = pr_label(config, session);
+    let review = review_icon(config, session);
     let comments = comment_count_label(config, session);
     let extra = configured_column_label(config, session);
     let status_color = if config.is_default_branch(&session.branch)
@@ -403,7 +404,7 @@ fn format_session_row(config: &Config, session: &Session, selected: bool, width:
         git_status_color(&session.status_label)
     };
     let text = format!(
-        "{} {} {} {} {} {} {} {} {}",
+        "{} {} {} {} {} {} {} {} {} {}",
         marker,
         styled_cell(&session.branch, 22, branch_code),
         styled_cell(
@@ -417,6 +418,7 @@ fn format_session_row(config: &Config, session: &Session, selected: bool, width:
             agent_state_color(session.agent_state)
         ),
         styled_cell(&pr, 7, pr_color(session)),
+        styled_cell(&review, 3, review_icon_color(config, session)),
         styled_cell(ci_icon(config, session), 3, ci_color(config, session)),
         styled_cell(&comments, 4, comment_color(session)),
         extra,
@@ -467,6 +469,36 @@ fn pr_label(config: &Config, session: &Session) -> String {
         "×"
     };
     format!("{icon}#{}", summary.number)
+}
+
+fn review_icon(config: &Config, session: &Session) -> String {
+    if config.is_default_branch(&session.branch) {
+        return String::new();
+    }
+    let Some(summary) = &session.pr.summary else {
+        return String::new();
+    };
+    let review = review_decision_for_display(summary, session.pr.details.as_ref());
+    match review.as_str() {
+        "APPROVED" => "✓",
+        "CHANGES_REQUESTED" => "!",
+        "REVIEW_REQUIRED" if !summary.requested_reviewers.is_empty() => "@",
+        "REVIEW_REQUIRED" => "?",
+        "COMMENTED" => "•",
+        _ => "",
+    }
+    .to_string()
+}
+
+fn review_icon_color(config: &Config, session: &Session) -> &'static str {
+    if config.is_default_branch(&session.branch) {
+        return "90";
+    }
+    let Some(summary) = &session.pr.summary else {
+        return "90";
+    };
+    let review = review_decision_for_display(summary, session.pr.details.as_ref());
+    review_color(&review)
 }
 
 fn comment_count_label(config: &Config, session: &Session) -> String {
@@ -695,9 +727,16 @@ fn format_pr_panel_lines(config: &Config, session: Option<&Session>) -> Vec<Stri
             color(ci_icon(config, session), ci_color(config, session)),
             summary.check_status,
         ),
-        String::new(),
-        color("Description", "1;36"),
     ];
+    if !summary.requested_reviewers.is_empty() {
+        lines.push(format!(
+            "{} {}",
+            color("awaiting", "90"),
+            truncate_line(&summary.requested_reviewers.join(", "), 80),
+        ));
+    }
+    lines.push(String::new());
+    lines.push(color("Description", "1;36"));
     lines.extend(description_lines(&summary.body, 4));
     if let Some(details) = &session.pr.details {
         lines.push(String::new());
@@ -892,6 +931,9 @@ fn review_decision_for_display(
 ) -> String {
     if !matches!(summary.review_decision.as_str(), "" | "UNKNOWN") {
         return summary.review_decision.clone();
+    }
+    if !summary.requested_reviewers.is_empty() {
+        return "REVIEW_REQUIRED".to_string();
     }
     details
         .and_then(|details| {

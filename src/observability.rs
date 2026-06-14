@@ -882,6 +882,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
           url text not null,
           state text not null,
           review_decision text not null,
+          requested_reviewers text not null default '',
           head_ref text not null,
           base_ref text not null,
           head_sha text not null,
@@ -909,6 +910,13 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
             [],
         )
         .map_err(|error| format!("migrate pr_cache comment_count column: {error}"))?;
+    }
+    if !table_has_column(conn, "pr_cache", "requested_reviewers")? {
+        conn.execute(
+            "alter table pr_cache add column requested_reviewers text not null default ''",
+            [],
+        )
+        .map_err(|error| format!("migrate pr_cache requested_reviewers column: {error}"))?;
     }
     conn.pragma_update(None, "foreign_keys", true)
         .map_err(|error| format!("enable foreign keys: {error}"))?;
