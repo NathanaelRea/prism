@@ -134,7 +134,9 @@ pub fn empty_dash(value: &str) -> &str {
 mod tests {
     use std::path::Path;
 
-    use super::{safe_path_component, single_line, stable_hash, status_count, strip_ansi, truncate_line};
+    use super::{
+        safe_path_component, single_line, stable_hash, status_count, strip_ansi, truncate_line,
+    };
 
     #[test]
     fn single_line_replaces_control_characters() {
