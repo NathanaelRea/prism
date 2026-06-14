@@ -21,8 +21,12 @@ Press `?` in the TUI for the full key list.
 Common keys:
 
 - `Enter` opens the selected agent session.
+- `Space g g` opens tmux window 2: lazygit.
+- `Ctrl-/` opens tmux window 3: terminal.
 - `c` creates a worktree session.
-- `P` creates or shows the pull request.
+- `P` pushes the selected branch.
+- `M` merges the selected pull request.
+- `D` confirms and deletes the selected session.
 - `r` refreshes the board.
 - `j` / `k` or arrow keys move selection.
 - `q` or `Ctrl-C` quits.

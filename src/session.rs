@@ -49,10 +49,7 @@ pub fn discover_sessions(repo: &Repository, config: &Config) -> Result<Vec<Sessi
                 let branch = current_branch
                     .take()
                     .unwrap_or_else(|| "(detached)".to_string());
-                let session = build_session(repo, path, branch, config);
-                if !session.hidden {
-                    sessions.push(session);
-                }
+                sessions.push(build_session(repo, path, branch, config));
             }
             continue;
         }
@@ -85,7 +82,6 @@ fn build_session(repo: &Repository, path: PathBuf, branch: String, config: &Conf
         .or_else(|| read_prompt_summary(&legacy_metadata_path))
         .unwrap_or_default();
     let adopted = metadata.is_some() || legacy_metadata_path.exists();
-    let hidden = is_hidden(repo, &branch);
     let status_label = git_status_label(&path, config);
     let path_display = path.display().to_string();
     let agent_state = load_agent_state(repo, &branch).unwrap_or(AgentState::Idle);
@@ -101,7 +97,7 @@ fn build_session(repo: &Repository, path: PathBuf, branch: String, config: &Conf
         branch,
         prompt_summary,
         adopted,
-        hidden,
+        hidden: false,
         status_label,
         agent: None,
         agent_output: VecDeque::new(),
@@ -146,19 +142,6 @@ pub fn remove_task_metadata(repo: &Repository, branch: &str) -> Result<(), Strin
             params![branch],
         )
         .map_err(|error| format!("remove task metadata: {error}"))?;
-        Ok(())
-    })
-}
-
-pub fn mark_hidden(repo: &Repository, branch: &str) -> Result<(), String> {
-    observability::with_writable_db(repo, |conn| {
-        conn.execute(
-            "insert into hidden_session (branch, hidden_unix_ms)
-             values (?1, ?2)
-             on conflict(branch) do update set hidden_unix_ms = excluded.hidden_unix_ms",
-            params![branch, unix_seconds()],
-        )
-        .map_err(|error| format!("write hidden marker: {error}"))?;
         Ok(())
     })
 }
@@ -250,18 +233,6 @@ fn load_task_metadata(repo: &Repository, branch: &str) -> Option<TaskMetadata> {
         .map_err(|error| format!("read task metadata: {error}"))
     })
     .ok()
-}
-
-fn is_hidden(repo: &Repository, branch: &str) -> bool {
-    observability::with_writable_db(repo, |conn| {
-        conn.query_row(
-            "select 1 from hidden_session where branch = ?1",
-            params![branch],
-            |_| Ok(()),
-        )
-        .map_err(|error| format!("read hidden marker: {error}"))
-    })
-    .is_ok()
 }
 
 fn read_prompt_summary(path: &Path) -> Option<String> {

@@ -1,8 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
 use std::io::{self, ErrorKind, Read, Write};
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
 
 use crate::agent::AgentState;
@@ -12,7 +10,8 @@ use crate::input::{Key, KeyInput};
 use crate::repo::Repository;
 use crate::session::{Session, append_runtime_log};
 use crate::terminal::{RawTerminal, stdin_is_tty, terminal_size};
-use crate::util::{truncate_line, yes};
+use crate::tmux::TmuxWindow;
+use crate::util::{strip_ansi, truncate_line, yes};
 use crate::view;
 
 pub struct Tui {
@@ -166,13 +165,13 @@ impl Tui {
                     }
                     Key::LazyGit => {
                         pending_g = false;
-                        if let Err(error) = self.open_lazygit(&mut raw) {
+                        if let Err(error) = self.open_tmux_window(&mut raw, TmuxWindow::LazyGit) {
                             self.show_error("lazygit failed", &error)?;
                         }
                     }
                     Key::Terminal => {
                         pending_g = false;
-                        if let Err(error) = self.open_terminal(&mut raw) {
+                        if let Err(error) = self.open_tmux_window(&mut raw, TmuxWindow::Terminal) {
                             self.show_error("terminal failed", &error)?;
                         }
                     }
@@ -186,28 +185,10 @@ impl Tui {
                         self.start_tmux_agent_warmup();
                         self.poll_pull_requests(true);
                     }
-                    Key::PullRequest => {
-                        pending_g = false;
-                        if let Err(error) = self.create_or_update_pr() {
-                            self.show_error("PR action failed", &error)?;
-                        }
-                    }
-                    Key::ReviewPacket => {
-                        pending_g = false;
-                        if let Err(error) = self.refresh_review_packet() {
-                            self.show_error("review packet failed", &error)?;
-                        }
-                    }
                     Key::ReviewFix => {
                         pending_g = false;
                         if let Err(error) = self.start_review_fix() {
                             self.show_error("review fix failed", &error)?;
-                        }
-                    }
-                    Key::CommitReviewFix => {
-                        pending_g = false;
-                        if let Err(error) = self.commit_review_fix() {
-                            self.show_error("commit failed", &error)?;
                         }
                     }
                     Key::Push => {
@@ -216,35 +197,16 @@ impl Tui {
                             self.show_error("push failed", &error)?;
                         }
                     }
-                    Key::CreatePlan => {
+                    Key::Merge => {
                         pending_g = false;
-                        if let Err(error) = self.create_plan() {
-                            self.show_error("plan creation failed", &error)?;
-                        }
-                    }
-                    Key::RunPlan => {
-                        pending_g = false;
-                        raw.suspend()?;
-                        let result = self.run_selected_plan();
-                        print!("\nPress Enter to return to Prism...");
-                        io::stdout().flush().map_err(|error| error.to_string())?;
-                        let mut line = String::new();
-                        let _ = io::stdin().read_line(&mut line);
-                        raw.resume()?;
-                        if let Err(error) = result {
-                            self.show_error("plan run failed", &error)?;
+                        if let Err(error) = self.merge_selected_pr() {
+                            self.show_error("merge failed", &error)?;
                         }
                     }
                     Key::Create => {
                         pending_g = false;
                         if let Err(error) = self.create_session() {
                             self.show_error("create session failed", &error)?;
-                        }
-                    }
-                    Key::Remove => {
-                        pending_g = false;
-                        if let Err(error) = self.remove_session_from_board() {
-                            self.show_error("remove failed", &error)?;
                         }
                     }
                     Key::Delete => {
@@ -295,39 +257,16 @@ impl Tui {
         Ok(())
     }
 
-    fn open_lazygit(&mut self, raw: &mut RawTerminal) -> Result<(), String> {
-        let program = self.config.tool("lazygit");
-        self.run_in_selected_worktree(raw, program, &[])
-    }
-
-    fn open_terminal(&mut self, raw: &mut RawTerminal) -> Result<(), String> {
-        let shell = env::var("SHELL").unwrap_or_else(|_| "sh".to_string());
-        self.run_in_selected_worktree(raw, shell, &[])
-    }
-
-    fn run_in_selected_worktree(
+    fn open_tmux_window(
         &mut self,
         raw: &mut RawTerminal,
-        program: String,
-        args: &[&str],
+        window: TmuxWindow,
     ) -> Result<(), String> {
         if self.selected >= self.sessions.len() {
             return Ok(());
         }
-        let path = self.sessions[self.selected].path.clone();
         raw.suspend()?;
-        let result = Command::new(&program)
-            .args(args)
-            .current_dir(&path)
-            .status()
-            .map_err(|error| format!("run {program}: {error}"))
-            .and_then(|status| {
-                if status.success() {
-                    Ok(())
-                } else {
-                    Err(format!("{program} exited with {status}"))
-                }
-            });
+        let result = self.attach_selected_tmux_window(window);
         let resume_result = raw.resume();
         self.refresh_sessions()?;
         self.start_tmux_agent_warmup();
@@ -340,18 +279,13 @@ impl Tui {
             "Keybindings",
             "",
             "Enter        open selected agent",
-            "Space g g    open lazygit in selected worktree",
-            "Ctrl-/       open shell in selected worktree",
+            "Space g g    open tmux window 2: lazygit",
+            "Ctrl-/       open tmux window 3: terminal",
             "c            create worktree session",
-            "n            create plan",
-            "x            run plan",
-            "P            create or show PR",
-            "R            write review packet",
+            "P            push selected branch",
+            "M            merge selected PR",
             "f            stage review-fix prompt",
-            "m            commit review fix",
-            "u            push selected branch",
-            "a            remove from board",
-            "D            delete worktree",
+            "D            delete worktree/session",
             "j/k, arrows   move selection",
             "g g / G      top / bottom",
             "r            refresh",
@@ -410,16 +344,94 @@ impl Tui {
         }
     }
 
-    pub(crate) fn prompt_line(&self, prompt: &str) -> Result<String, String> {
-        self.prompt_line_with_initial(prompt, "")
+    pub(crate) fn confirm_delete_dialog(
+        &self,
+        branch: &str,
+        path: &str,
+        warnings: &[String],
+    ) -> Result<bool, String> {
+        let mut lines = vec![
+            "Delete Session".to_string(),
+            String::new(),
+            format!("branch: {branch}"),
+            format!("path: {path}"),
+            String::new(),
+        ];
+        if warnings.is_empty() {
+            lines.push("No warnings detected.".to_string());
+        } else {
+            lines.push("Warnings".to_string());
+            for warning in warnings {
+                lines.push(format!("\x1b[31m•\x1b[0m {warning}"));
+            }
+        }
+        lines.extend([
+            String::new(),
+            "Enter confirms delete. Esc/q cancels.".to_string(),
+        ]);
+
+        let (cols, rows) = terminal_size();
+        let available_width = (cols as usize).saturating_sub(2).max(4);
+        let width = lines
+            .iter()
+            .map(|line| strip_ansi(line).chars().count())
+            .max()
+            .unwrap_or(0)
+            .saturating_add(4)
+            .max(42)
+            .min(available_width);
+        let height = lines.len() + 2;
+        let left = ((cols as usize).saturating_sub(width) / 2).saturating_add(1);
+        let top = ((rows as usize).saturating_sub(height) / 2).saturating_add(1);
+
+        print!("\x1b[?25l");
+        print!(
+            "\x1b[{top};{left}H+{}+",
+            "-".repeat(width.saturating_sub(2))
+        );
+        for (index, line) in lines.iter().enumerate() {
+            let y = top + index + 1;
+            let text_width = width.saturating_sub(4);
+            let text = truncate_line(&strip_ansi(line), text_width);
+            let text = if line.contains("\x1b[") {
+                truncate_ansi_dialog_line(line, text_width)
+            } else {
+                text
+            };
+            print!(
+                "\x1b[{y};{left}H| {}{} |",
+                text,
+                " ".repeat(text_width.saturating_sub(strip_ansi(&text).chars().count()))
+            );
+        }
+        print!(
+            "\x1b[{};{}H+{}+",
+            top + height - 1,
+            left,
+            "-".repeat(width.saturating_sub(2))
+        );
+        io::stdout().flush().map_err(|error| error.to_string())?;
+
+        let mut stdin = io::stdin();
+        let mut byte = [0_u8; 1];
+        loop {
+            match stdin.read(&mut byte) {
+                Ok(1) => match byte[0] {
+                    b'\r' | b'\n' => return Ok(true),
+                    3 | 27 | b'q' => return Ok(false),
+                    _ => {}
+                },
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+        }
     }
 
-    pub(crate) fn prompt_line_with_default(
-        &self,
-        prompt: &str,
-        default: &str,
-    ) -> Result<String, String> {
-        self.prompt_line_with_initial(prompt, default)
+    pub(crate) fn prompt_line(&self, prompt: &str) -> Result<String, String> {
+        self.prompt_line_with_initial(prompt, "")
     }
 
     fn prompt_line_with_initial(&self, prompt: &str, initial: &str) -> Result<String, String> {
@@ -506,4 +518,11 @@ impl Tui {
             self.status_message.as_deref(),
         )
     }
+}
+
+fn truncate_ansi_dialog_line(text: &str, max_chars: usize) -> String {
+    if strip_ansi(text).chars().count() <= max_chars {
+        return text.to_string();
+    }
+    truncate_line(&strip_ansi(text), max_chars)
 }

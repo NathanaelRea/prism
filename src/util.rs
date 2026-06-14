@@ -23,6 +23,24 @@ pub fn single_line(text: &str) -> String {
         .collect()
 }
 
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for seq_ch in chars.by_ref() {
+                if seq_ch.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 pub fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from)
 }
@@ -101,19 +119,11 @@ pub fn empty_dash(value: &str) -> &str {
     }
 }
 
-pub fn indent_markdown_block(value: &str) -> String {
-    value
-        .lines()
-        .map(|line| format!("  {line}"))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
 
-    use super::{safe_path_component, single_line, stable_hash, truncate_line};
+    use super::{safe_path_component, single_line, stable_hash, strip_ansi, truncate_line};
 
     #[test]
     fn single_line_replaces_control_characters() {
@@ -126,6 +136,11 @@ mod tests {
     #[test]
     fn truncate_line_sanitizes_before_truncating() {
         assert_eq!(truncate_line("abc\ndef", 6), "abc d~");
+    }
+
+    #[test]
+    fn strip_ansi_removes_style_sequences() {
+        assert_eq!(strip_ansi("\x1b[31m•\x1b[0m dirty"), "• dirty");
     }
 
     #[test]

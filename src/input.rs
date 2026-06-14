@@ -30,15 +30,10 @@ impl KeyInput {
                     b'G' => keys.push(Key::Bottom),
                     b'g' => keys.push(Key::G),
                     b'r' => keys.push(Key::Refresh),
-                    b'R' => keys.push(Key::ReviewPacket),
                     b'f' => keys.push(Key::ReviewFix),
-                    b'm' => keys.push(Key::CommitReviewFix),
-                    b'u' => keys.push(Key::Push),
-                    b'n' => keys.push(Key::CreatePlan),
-                    b'x' => keys.push(Key::RunPlan),
-                    b'P' => keys.push(Key::PullRequest),
+                    b'P' => keys.push(Key::Push),
+                    b'M' => keys.push(Key::Merge),
                     b'c' => keys.push(Key::Create),
-                    b'a' => keys.push(Key::Remove),
                     b'D' => keys.push(Key::Delete),
                     b'?' => keys.push(Key::Help),
                     _ => keys.push(Key::Other),
@@ -89,15 +84,10 @@ pub enum Key {
     Terminal,
     Help,
     Refresh,
-    PullRequest,
-    ReviewPacket,
     ReviewFix,
-    CommitReviewFix,
     Push,
-    CreatePlan,
-    RunPlan,
+    Merge,
     Create,
-    Remove,
     Delete,
     Quit,
     Other,
@@ -145,7 +135,26 @@ mod tests {
     #[test]
     fn key_input_handles_cleanup_keys() {
         let mut input = KeyInput::default();
-        let keys = input.feed(b"aD");
-        assert!(matches!(keys.as_slice(), [Key::Remove, Key::Delete]));
+        let keys = input.feed(b"D");
+        assert!(matches!(keys.as_slice(), [Key::Delete]));
+    }
+
+    #[test]
+    fn key_input_uses_lazygit_style_branch_actions() {
+        let mut input = KeyInput::default();
+        let keys = input.feed(b"PMnRxmua");
+        assert!(matches!(
+            keys.as_slice(),
+            [
+                Key::Push,
+                Key::Merge,
+                Key::Other,
+                Key::Other,
+                Key::Other,
+                Key::Other,
+                Key::Other,
+                Key::Other,
+            ]
+        ));
     }
 }
