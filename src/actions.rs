@@ -559,7 +559,31 @@ impl Tui {
                 true,
             );
         }
-        self.show_message("push complete")?;
+        if self.sessions[self.selected].pr.summary.is_none()
+            && !self
+                .config
+                .is_default_branch(&self.sessions[self.selected].branch)
+        {
+            run_configured_commands(&self.config.checks.pre_pr, &path, "pre_pr")?;
+            self.show_message("creating pull request")?;
+            run_status(
+                Command::new(self.config.tool("gh"))
+                    .args(create_pr_args(self.config.default_base.as_deref()))
+                    .current_dir(&path),
+            )?;
+            let session = &mut self.sessions[self.selected];
+            refresh_pr_cache(
+                &self.repo,
+                &session.branch,
+                &mut session.pr,
+                &session.path,
+                &self.config,
+                true,
+            );
+            self.show_message("push complete; pull request created")?;
+        } else {
+            self.show_message("push complete")?;
+        }
         Ok(())
     }
 
@@ -701,6 +725,15 @@ fn create_worktree_args(repo_root: &Path, branch: &str) -> Vec<String> {
     ]
 }
 
+fn create_pr_args(default_base: Option<&str>) -> Vec<String> {
+    let mut args = vec!["pr".to_string(), "create".to_string(), "--fill".to_string()];
+    if let Some(base) = default_base.map(str::trim).filter(|base| !base.is_empty()) {
+        args.push("--base".to_string());
+        args.push(base.to_string());
+    }
+    args
+}
+
 fn pr_render_signature(cache: &PrCache) -> String {
     format!(
         "{:?}|{:?}|{:?}|{:?}",
@@ -793,7 +826,9 @@ mod tests {
     use crate::session::Session;
     use crate::tui::{TmuxWarmupResult, Tui};
 
-    use super::{create_worktree_args, tmux_agent_state, tmux_slot_key, tmux_warmup_key};
+    use super::{
+        create_pr_args, create_worktree_args, tmux_agent_state, tmux_slot_key, tmux_warmup_key,
+    };
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -838,6 +873,15 @@ mod tests {
                 "feat/test",
             ]
         );
+    }
+
+    #[test]
+    fn create_pr_uses_fill_and_default_base_when_configured() {
+        assert_eq!(
+            create_pr_args(Some("main")),
+            vec!["pr", "create", "--fill", "--base", "main"]
+        );
+        assert_eq!(create_pr_args(None), vec!["pr", "create", "--fill"]);
     }
 
     #[test]

@@ -24,7 +24,7 @@ Common keys:
 - `Space g g` opens tmux window 2: lazygit.
 - `Enter` opens tmux window 3: terminal.
 - `c` creates a worktree session.
-- `P` pushes the selected branch.
+- `P` pushes the selected branch and creates a pull request if needed.
 - `M` merges the selected pull request.
 - `D` confirms and deletes the selected session.
 - `r` refreshes the board.

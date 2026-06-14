@@ -290,7 +290,7 @@ impl Tui {
             "Space g g    open tmux window 2: lazygit",
             "Enter        open tmux window 3: terminal",
             "c            create worktree session",
-            "P            push selected branch",
+            "P            push branch, create PR if needed",
             "M            merge selected PR",
             "f            stage review-fix prompt",
             "D            delete worktree/session",
