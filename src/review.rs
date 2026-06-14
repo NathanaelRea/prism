@@ -66,10 +66,24 @@ pub fn build_review_fix_prompt(session: &Session, config: &Config) -> Result<Str
 }
 
 fn render_template(template: &str, values: &[(&str, String)]) -> String {
-    let mut out = template.to_string();
-    for (key, value) in values {
-        out = out.replace(&format!("{{{key}}}"), value);
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let Some(end) = rest[start + 1..].find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let placeholder_end = start + end + 2;
+        let key = &rest[start + 1..placeholder_end - 1];
+        if let Some((_, value)) = values.iter().find(|(name, _)| *name == key) {
+            out.push_str(value);
+        } else {
+            out.push_str(&rest[start..placeholder_end]);
+        }
+        rest = &rest[placeholder_end..];
     }
+    out.push_str(rest);
     out
 }
 
@@ -169,6 +183,19 @@ mod tests {
 
         assert!(prompt.starts_with("Fix PR 123 on feature:"));
         assert!(prompt.contains("src/review.rs line 9\n\nCan this be a helper?"));
+    }
+
+    #[test]
+    fn render_template_does_not_expand_inserted_values() {
+        let rendered = render_template(
+            "{title} {url}",
+            &[
+                ("title", "Title with {url}".to_string()),
+                ("url", "https://example.test/pr/123".to_string()),
+            ],
+        );
+
+        assert_eq!(rendered, "Title with {url} https://example.test/pr/123");
     }
 
     fn test_session(details: PrDetails) -> Session {

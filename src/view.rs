@@ -436,13 +436,14 @@ fn configured_column_label(config: &Config, session: &Session) -> String {
             labels.push(format_column_value(column, value));
         }
     }
-    truncate_line(&labels.join(" "), 24)
+    truncate_ansi_line(&labels.join(" "), 24)
 }
 
 fn format_column_value(column: &str, value: &str) -> String {
     if value.starts_with("http://") || value.starts_with("https://") {
+        let url = strip_ascii_control_chars(value);
         return format!(
-            "\x1b]8;;{value}\x1b\\{}\x1b]8;;\x1b\\",
+            "\x1b]8;;{url}\x1b\\{}\x1b]8;;\x1b\\",
             truncate_line(value, 24)
         );
     }
@@ -450,6 +451,10 @@ fn format_column_value(column: &str, value: &str) -> String {
         return if value == "true" { "url:on" } else { "url:off" }.to_string();
     }
     truncate_line(value, 24)
+}
+
+fn strip_ascii_control_chars(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_ascii_control()).collect()
 }
 
 fn pr_label(config: &Config, session: &Session) -> String {
@@ -963,7 +968,7 @@ mod tests {
     use crate::repo::Repository;
     use crate::session::Session;
 
-    use super::{git_status_indicator, render_frame};
+    use super::{configured_column_label, format_column_value, git_status_indicator, render_frame};
 
     #[test]
     fn render_frame_does_not_clear_the_whole_screen() {
@@ -1110,6 +1115,52 @@ mod tests {
         assert!(frame.contains("PR tracking disabled"));
         assert!(!frame.contains("no-pr"));
         assert!(!frame.contains("C?"));
+    }
+
+    #[test]
+    fn configured_url_column_preserves_hyperlink_and_sanitizes_target() {
+        let config = Config {
+            default_agent: "opencode".to_string(),
+            default_base: Some("main".to_string()),
+            plan_dir: "plans".to_string(),
+            review_packet_dir: ".agent/review".to_string(),
+            worktree_command: "wt".to_string(),
+            escape_key: EscapeKey::EscEsc,
+            checks: Checks::default(),
+            worktree_columns: vec!["url".to_string()],
+            tools: BTreeMap::new(),
+            agent_commands: BTreeMap::new(),
+            agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
+            user_path: PathBuf::from("/tmp/user.toml"),
+            repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
+        };
+        let mut session = Session {
+            path: PathBuf::from("/repo"),
+            path_display: "/repo".to_string(),
+            branch: "main".to_string(),
+            prompt_summary: String::new(),
+            adopted: false,
+            hidden: false,
+            status_label: "clean".to_string(),
+            agent: None,
+            agent_output: VecDeque::new(),
+            agent_state: AgentState::Idle,
+            pr: PrCache::default(),
+            wt_columns: BTreeMap::new(),
+            unseen_comments: false,
+        };
+        session
+            .wt_columns
+            .insert("url".to_string(), "https://e.test/a".to_string());
+
+        let label = configured_column_label(&config, &session);
+
+        assert!(label.contains("\x1b]8;;https://e.test/a\x1b\\"));
+        assert!(label.contains("\x1b]8;;\x1b\\"));
+
+        let linked = format_column_value("url", "https://e.test/a\x1bb");
+        assert!(linked.starts_with("\x1b]8;;https://e.test/ab\x1b\\"));
     }
 
     #[test]

@@ -6,7 +6,9 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::agent::{AgentAdapter, AgentProcess, AgentState};
-use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
+use crate::git::{
+    branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty, worktree_dirty,
+};
 use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCache, fetch_pr_summary_index, pr_details_due, refresh_pr_cache,
     refresh_pr_details_cache, refresh_pr_summary_index, remove_pr_cache,
@@ -62,6 +64,12 @@ impl Tui {
     }
 
     pub(crate) fn create_session(&mut self) -> Result<bool, String> {
+        if !self.allow_dirty && worktree_dirty(&self.repo, &self.config)? {
+            self.show_message(
+                "current worktree is dirty; restart Prism with --allow-dirty to create anyway",
+            )?;
+            return Ok(false);
+        }
         self.ensure_default_branch_ready_for_create()?;
         let Some(branch) = self.prompt_line_dialog("Create Session", "Branch name: ", "")? else {
             return Ok(false);

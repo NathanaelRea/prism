@@ -493,17 +493,35 @@ fn save_user_default_agent(config: &Config, selected: &str) -> Result<(), String
 pub fn parse_toml_string(value: &str) -> Option<String> {
     let value = value.trim();
     if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-        Some(
-            value[1..value.len() - 1]
-                .replace("\\n", "\n")
-                .replace("\\t", "\t")
-                .replace("\\\"", "\""),
-        )
+        parse_toml_basic_string(&value[1..value.len() - 1])
     } else if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
         Some(value[1..value.len() - 1].to_string())
     } else {
         Some(value.to_string())
     }
+}
+
+fn parse_toml_basic_string(value: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        let escaped = match chars.next()? {
+            'b' => '\x08',
+            't' => '\t',
+            'n' => '\n',
+            'f' => '\x0c',
+            'r' => '\r',
+            '"' => '"',
+            '\\' => '\\',
+            _ => return None,
+        };
+        out.push(escaped);
+    }
+    Some(out)
 }
 
 pub fn parse_toml_string_array(value: &str) -> Option<Vec<String>> {
@@ -559,6 +577,22 @@ mod tests {
     fn parses_toml_string_array() {
         let values = parse_toml_string_array(r#"["cargo test", 'cargo fmt --check']"#).unwrap();
         assert_eq!(values, vec!["cargo test", "cargo fmt --check"]);
+    }
+
+    #[test]
+    fn parses_toml_string_escapes_once() {
+        assert_eq!(
+            parse_toml_string(r#""line\nnext""#),
+            Some("line\nnext".to_string())
+        );
+        assert_eq!(
+            parse_toml_string(r#""literal\\n""#),
+            Some(r#"literal\n"#.to_string())
+        );
+        assert_eq!(
+            parse_toml_string(r#""carriage\rreturn""#),
+            Some("carriage\rreturn".to_string())
+        );
     }
 
     #[test]
