@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::agent::{AgentAdapter, AgentProcess, AgentState};
@@ -9,6 +10,7 @@ use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCache, fetch_pr_summary_index, pr_details_due, refresh_pr_cache,
     refresh_pr_details_cache, refresh_pr_summary_index, remove_pr_cache,
 };
+use crate::process::command_exists;
 use crate::process::{run_capture, run_configured_commands, run_status};
 use crate::review::build_review_fix_prompt;
 use crate::session::{
@@ -476,26 +478,9 @@ impl Tui {
             self.show_message("default branch has no PR review comments")?;
             return Ok(());
         }
-        if self.sessions[self.selected].agent_state == AgentState::Running {
-            self.show_message("agent is already running; wait or select another session")?;
-            return Ok(());
-        }
-        {
-            let session = &mut self.sessions[self.selected];
-            refresh_pr_cache(
-                &self.repo,
-                &session.branch,
-                &mut session.pr,
-                &session.path,
-                &self.config,
-                true,
-            );
-        }
-        let path = self.sessions[self.selected].path.clone();
-        run_configured_commands(&self.config.checks.review_fix, &path, "review_fix")?;
         let prompt = build_review_fix_prompt(&self.sessions[self.selected])?;
-        self.paste_prompt_into_tmux_agent(self.selected, &prompt)?;
-        self.show_message("pasted review-fix prompt into agent session")?;
+        copy_to_clipboard(&self.config, &prompt)?;
+        self.show_message("review-fix prompt copied to clipboard")?;
         Ok(())
     }
 
@@ -684,6 +669,54 @@ impl Tui {
         clear_hidden(&self.repo, branch)?;
         Ok(())
     }
+}
+
+fn copy_to_clipboard(config: &crate::config::Config, text: &str) -> Result<(), String> {
+    let candidates: [(&str, &[&str]); 4] = [
+        (&config.tool("wl-copy"), &[]),
+        (&config.tool("xclip"), &["-selection", "clipboard"]),
+        (&config.tool("xsel"), &["--clipboard", "--input"]),
+        (&config.tool("pbcopy"), &[]),
+    ];
+    let mut errors = Vec::new();
+    for (program, args) in candidates {
+        if !clipboard_command_exists(program) {
+            continue;
+        }
+        match write_clipboard_command(program, args, text) {
+            Ok(()) => return Ok(()),
+            Err(error) => errors.push(error),
+        }
+    }
+    if errors.is_empty() {
+        Err("no clipboard tool found; install wl-copy, xclip, xsel, or pbcopy".to_string())
+    } else {
+        Err(format!("clipboard copy failed: {}", errors.join("; ")))
+    }
+}
+
+fn clipboard_command_exists(program: &str) -> bool {
+    let program = program.split_whitespace().next().unwrap_or(program);
+    !program.is_empty() && command_exists(program)
+}
+
+fn write_clipboard_command(program: &str, args: &[&str], text: &str) -> Result<(), String> {
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("{program}: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("{program}: stdin unavailable"))?;
+    stdin
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("{program}: {error}"))?;
+    drop(stdin);
+    Ok(())
 }
 
 fn tmux_agent_state(

@@ -7,23 +7,12 @@ pub fn build_review_fix_prompt(session: &Session) -> Result<String, String> {
         .summary
         .as_ref()
         .ok_or_else(|| "no pull request found for selected branch".to_string())?;
-    let details = session.pr.details.clone().unwrap_or_default();
+    let details = session
+        .pr
+        .details
+        .clone()
+        .ok_or_else(|| "PR comments are still loading; refresh and try again".to_string())?;
 
-    let mut comments = details.comments;
-    comments.sort_by(|a, b| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.author.cmp(&b.author))
-            .then_with(|| a.body.cmp(&b.body))
-    });
-    let mut reviews = details.reviews;
-    reviews.sort_by(|a, b| {
-        a.submitted_at
-            .cmp(&b.submitted_at)
-            .then_with(|| a.author.cmp(&b.author))
-            .then_with(|| a.state.cmp(&b.state))
-            .then_with(|| a.body.cmp(&b.body))
-    });
     let mut review_comments = details.review_comments;
     review_comments.sort_by(|a, b| {
         a.path
@@ -35,35 +24,11 @@ pub fn build_review_fix_prompt(session: &Session) -> Result<String, String> {
     });
 
     let mut prompt = format!(
-        "Here are some comments on PR {}. If they are applicable, fix them. Otherwise, say why not.\n\n",
+        "Here are review comments on PR {}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n",
         summary.number
     );
 
     let mut wrote_comment = false;
-    for comment in &comments {
-        if comment.body.trim().is_empty() {
-            continue;
-        }
-        wrote_comment = true;
-        prompt.push_str(&format!(
-            "{}\n{}\n\n",
-            empty_dash(&comment.author),
-            comment.body.trim()
-        ));
-    }
-
-    for review in &reviews {
-        if review.body.trim().is_empty() {
-            continue;
-        }
-        wrote_comment = true;
-        prompt.push_str(&format!(
-            "{}\n{}\n\n",
-            empty_dash(&review.author),
-            review.body.trim()
-        ));
-    }
-
     for comment in &review_comments {
         if comment.body.trim().is_empty() {
             continue;
@@ -77,17 +42,13 @@ pub fn build_review_fix_prompt(session: &Session) -> Result<String, String> {
             format!(" line {}", comment.line)
         };
         wrote_comment = true;
-        prompt.push_str(&format!(
-            "{}\n{}{}\n{}\n\n",
-            empty_dash(&comment.author),
-            empty_dash(&comment.path),
-            line,
-            comment.body.trim()
-        ));
+        prompt.push_str(&format!("{}{}\n\n", empty_dash(&comment.path), line));
+        prompt.push_str(comment.body.trim());
+        prompt.push_str("\n\n---\n\n");
     }
 
     if !wrote_comment {
-        prompt.push_str("No PR comments were found.\n\n");
+        prompt.push_str("No PR review comments were found.\n\n");
     }
 
     Ok(prompt)
@@ -104,18 +65,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn review_fix_prompt_contains_comments_without_review_packet_sections() {
+    fn review_fix_prompt_contains_unresolved_review_comments_only() {
         let session = test_session(PrDetails {
             comments: vec![PrComment {
                 author: "alice".to_string(),
                 body: "Please simplify this branch.".to_string(),
-                created_at: "2026-06-14T10:00:00Z".to_string(),
             }],
             reviews: vec![PrReview {
                 author: "bob".to_string(),
                 state: "CHANGES_REQUESTED".to_string(),
                 body: "This should mention the fallback behavior.".to_string(),
-                submitted_at: "2026-06-14T11:00:00Z".to_string(),
             }],
             review_comments: vec![
                 PrReviewComment {
@@ -142,15 +101,17 @@ mod tests {
         let prompt = build_review_fix_prompt(&session).unwrap();
 
         assert!(prompt.starts_with(
-            "Here are some comments on PR 123. If they are applicable, fix them. Otherwise, say why not."
+            "Here are review comments on PR 123.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n"
         ));
-        assert!(prompt.contains("alice\nPlease simplify this branch."));
-        assert!(prompt.contains("bob\nThis should mention the fallback behavior."));
-        assert!(prompt.contains("dana\nsrc/review.rs line 9\nCan this be a helper?"));
-        assert!(prompt.contains("Please simplify this branch."));
-        assert!(prompt.contains("This should mention the fallback behavior."));
+        assert!(prompt.contains("src/review.rs line 9\n\nCan this be a helper?"));
+        assert!(prompt.contains("\n\n---\n\n"));
+        assert!(!prompt.contains("Please simplify this branch."));
+        assert!(!prompt.contains("This should mention the fallback behavior."));
         assert!(prompt.contains("Can this be a helper?"));
         assert!(!prompt.contains("This resolved comment should stay out."));
+        assert!(!prompt.contains("Inline comment"));
+        assert!(!prompt.contains("Comment from"));
+        assert!(!prompt.contains("Review from"));
         assert!(!prompt.contains("<open>"));
         assert!(!prompt.contains("<resolved>"));
         assert!(!prompt.contains("not resolved"));
