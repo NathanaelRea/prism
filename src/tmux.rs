@@ -598,6 +598,7 @@ mod tests {
                 "custom-agent --prompt {prompt}".to_string(),
             )]),
             agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
             user_path: PathBuf::from("/tmp/user.toml"),
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         };
@@ -621,6 +622,7 @@ mod tests {
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
             user_path: PathBuf::from("/tmp/user.toml"),
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         };
@@ -1227,6 +1229,7 @@ exit 0
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
             user_path: PathBuf::from("/tmp/user.toml"),
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         }

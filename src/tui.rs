@@ -32,6 +32,10 @@ pub struct Tui {
     pub(crate) wt_poll_tx: Sender<WtPollResult>,
     pub(crate) wt_poll_rx: Receiver<WtPollResult>,
     pub(crate) wt_poll_in_flight: bool,
+    pub(crate) default_branch_poll_tx: Sender<DefaultBranchPollResult>,
+    pub(crate) default_branch_poll_rx: Receiver<DefaultBranchPollResult>,
+    pub(crate) default_branch_poll_in_flight: bool,
+    pub(crate) default_branch_last_polled: Option<std::time::Instant>,
     pub(crate) session_filter: String,
     pub(crate) leader_hint: Option<LeaderHint>,
     status_message: Option<String>,
@@ -84,6 +88,12 @@ pub(crate) struct WtPollResult {
     pub columns: Result<BTreeMap<PathBuf, BTreeMap<String, String>>, String>,
 }
 
+pub(crate) struct DefaultBranchPollResult {
+    pub branch: String,
+    pub path: PathBuf,
+    pub status_label: Result<String, String>,
+}
+
 impl Tui {
     pub fn new(
         repo: Repository,
@@ -94,6 +104,7 @@ impl Tui {
         let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
         let (tmux_warmup_tx, tmux_warmup_rx) = mpsc::channel();
         let (wt_poll_tx, wt_poll_rx) = mpsc::channel();
+        let (default_branch_poll_tx, default_branch_poll_rx) = mpsc::channel();
         Self {
             repo,
             config,
@@ -111,6 +122,10 @@ impl Tui {
             wt_poll_tx,
             wt_poll_rx,
             wt_poll_in_flight: false,
+            default_branch_poll_tx,
+            default_branch_poll_rx,
+            default_branch_poll_in_flight: false,
+            default_branch_last_polled: None,
             session_filter: String::new(),
             leader_hint: None,
             status_message: None,
@@ -126,6 +141,7 @@ impl Tui {
         let mut raw = RawTerminal::enter()?;
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
+        self.start_default_branch_status_poll(true);
         self.draw()?;
         let mut stdin = io::stdin();
         let mut buffer = [0_u8; 64];
@@ -137,7 +153,9 @@ impl Tui {
             let agents_changed = self.poll_agents();
             let tmux_changed = self.poll_tmux_agent_warmup();
             let wt_changed = self.poll_wt_columns();
+            let default_branch_changed = self.poll_default_branch_status();
             let prs_changed = self.poll_pull_requests(false);
+            self.start_default_branch_status_poll(false);
             let status_changed = self.expire_status_message();
             let current_size = terminal_size();
             let resized = current_size != last_size;
@@ -147,6 +165,7 @@ impl Tui {
             if agents_changed
                 || tmux_changed
                 || wt_changed
+                || default_branch_changed
                 || prs_changed
                 || status_changed
                 || resized
@@ -233,6 +252,7 @@ impl Tui {
                         self.refresh_sessions()?;
                         self.start_tmux_agent_warmup();
                         self.start_wt_column_poll();
+                        self.start_default_branch_status_poll(true);
                         self.poll_pull_requests(true);
                     }
                     Key::ReviewFix => {

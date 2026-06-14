@@ -902,6 +902,11 @@ fn review_decision_for_display(
                 .find(|review| !review.state.trim().is_empty())
         })
         .map(|review| review.state.clone())
+        .or_else(|| {
+            details
+                .is_some_and(|details| !details.review_comments.is_empty())
+                .then(|| "COMMENTED".to_string())
+        })
         .unwrap_or_else(|| summary.review_decision.clone())
 }
 
@@ -935,6 +940,7 @@ mod tests {
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
             user_path: PathBuf::from("/tmp/user.toml"),
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         };
@@ -980,6 +986,7 @@ mod tests {
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
             user_path: PathBuf::from("/tmp/user.toml"),
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         };
@@ -1033,6 +1040,7 @@ mod tests {
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
             user_path: PathBuf::from("/tmp/user.toml"),
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         };

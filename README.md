@@ -48,4 +48,7 @@ default_base = "develop"
 
 [worktrees]
 columns = ["url", "vars.localdev", "ci"]
+
+[prompt_templates]
+review_fix = "Here are review comments on PR {pr_number}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n{comments}"
 ```

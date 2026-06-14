@@ -1047,6 +1047,7 @@ JSON
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
             user_path: PathBuf::from("/tmp/prism-user-config.toml"),
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         }

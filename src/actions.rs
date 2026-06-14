@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::agent::{AgentAdapter, AgentProcess, AgentState};
-use crate::git::{branch_behind, has_upstream, pull_branch, selected_dirty};
+use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
 use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCache, fetch_pr_summary_index, pr_details_due, refresh_pr_cache,
     refresh_pr_details_cache, refresh_pr_summary_index, remove_pr_cache,
@@ -24,9 +24,12 @@ use crate::tmux::{
     ensure_agent_session, kill_agent_session, latest_agent_session_generation, paste_agent_prompt,
 };
 use crate::tui::{
-    PrPollKey, PrPollResult, TmuxSlotKey, TmuxWarmupKey, TmuxWarmupResult, Tui, WtPollResult,
+    DefaultBranchPollResult, PrPollKey, PrPollResult, TmuxSlotKey, TmuxWarmupKey, TmuxWarmupResult,
+    Tui, WtPollResult,
 };
 use crate::util::{status_count, truncate, yes};
+
+const DEFAULT_BRANCH_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 impl Tui {
     pub(crate) fn refresh_sessions(&mut self) -> Result<(), String> {
@@ -170,7 +173,7 @@ impl Tui {
         if !self.config.repo_config_path.exists() {
             fs::write(
                 &self.config.repo_config_path,
-                "# Prism repository config\n# Example: [worktrees]\n# columns = [\"url\", \"vars.localdev\"]\n",
+                "# Prism repository config\n# Example:\n# [worktrees]\n# columns = [\"url\", \"vars.localdev\"]\n#\n# [prompt_templates]\n# review_fix = \"Here are review comments on PR {pr_number}.\\n\\nIf they are applicable, fix them. Otherwise, say why not.\\n\\n---\\n\\n{comments}\"\n",
             )
             .map_err(|error| format!("create config file: {error}"))?;
         }
@@ -425,6 +428,68 @@ impl Tui {
         changed
     }
 
+    pub(crate) fn start_default_branch_status_poll(&mut self, force: bool) {
+        self.poll_default_branch_status();
+        if self.default_branch_poll_in_flight {
+            return;
+        }
+        let due = self
+            .default_branch_last_polled
+            .map(|last| last.elapsed() >= DEFAULT_BRANCH_STATUS_POLL_INTERVAL)
+            .unwrap_or(true);
+        if !force && !due {
+            return;
+        }
+        let Some(branch) = self
+            .config
+            .default_base
+            .as_deref()
+            .map(str::trim)
+            .filter(|branch| !branch.is_empty())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let path = self.default_branch_path(&branch);
+        let config = self.config.clone();
+        let tx = self.default_branch_poll_tx.clone();
+        self.default_branch_poll_in_flight = true;
+        self.default_branch_last_polled = Some(std::time::Instant::now());
+        std::thread::spawn(move || {
+            let status_label = default_branch_status_label(&path, &branch, &config);
+            let _ = tx.send(DefaultBranchPollResult {
+                branch,
+                path,
+                status_label,
+            });
+        });
+    }
+
+    pub(crate) fn poll_default_branch_status(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(result) = self.default_branch_poll_rx.try_recv() {
+            self.default_branch_poll_in_flight = false;
+            match result.status_label {
+                Ok(status_label) => {
+                    if let Some(session) = self.sessions.iter_mut().find(|session| {
+                        session.branch == result.branch && session.path == result.path
+                    }) && session.status_label != status_label
+                    {
+                        session.status_label = status_label;
+                        changed = true;
+                    }
+                }
+                Err(error) => {
+                    let _ = append_runtime_log(
+                        &self.repo,
+                        &format!("default branch status refresh failed: {error}"),
+                    );
+                }
+            }
+        }
+        changed
+    }
+
     pub(crate) fn attach_selected_agent_terminal(&mut self) -> Result<(), String> {
         if self.selected >= self.sessions.len() {
             return Ok(());
@@ -644,7 +709,7 @@ impl Tui {
             self.show_message("default branch has no PR review comments")?;
             return Ok(());
         }
-        let prompt = build_review_fix_prompt(&self.sessions[self.selected])?;
+        let prompt = build_review_fix_prompt(&self.sessions[self.selected], &self.config)?;
         copy_to_clipboard(&self.config, &prompt)?;
         self.show_message("review-fix prompt copied to clipboard")?;
         Ok(())
@@ -1007,6 +1072,41 @@ fn fetch_wt_columns(
     Ok(by_path)
 }
 
+fn default_branch_status_label(
+    path: &Path,
+    branch: &str,
+    config: &crate::config::Config,
+) -> Result<String, String> {
+    let behind = branch_behind(path, branch, config)?;
+    Ok(status_label_with_behind(
+        &git_status_label(path, config),
+        behind,
+    ))
+}
+
+fn status_label_with_behind(label: &str, behind: usize) -> String {
+    let dirty = status_count(label, "dirty");
+    let ahead = status_count(label, "ahead");
+    let mut parts = Vec::new();
+    if let Some(count) = dirty {
+        parts.push(format!("dirty {count}"));
+    }
+    if let Some(count) = ahead {
+        parts.push(format!("ahead {count}"));
+    }
+    if behind > 0 {
+        parts.push(format!("behind {behind}"));
+    }
+    if !parts.is_empty() {
+        return parts.join(" ");
+    }
+    if label == "clean" || status_count(label, "behind").is_some() {
+        "clean".to_string()
+    } else {
+        label.to_string()
+    }
+}
+
 fn wt_column_value(object: &str, column: &str) -> Option<String> {
     if let Some(key) = column.strip_prefix("vars.") {
         return json_object_field(object, "vars").and_then(|vars| json_string_field(vars, key));
@@ -1124,7 +1224,8 @@ mod tests {
     use crate::tui::{TmuxWarmupResult, Tui};
 
     use super::{
-        create_pr_args, create_worktree_args, tmux_agent_state, tmux_slot_key, tmux_warmup_key,
+        create_pr_args, create_worktree_args, status_label_with_behind, tmux_agent_state,
+        tmux_slot_key, tmux_warmup_key,
     };
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
@@ -1185,6 +1286,16 @@ mod tests {
             vec!["pr", "create", "--fill", "--base", "main"]
         );
         assert_eq!(create_pr_args(None), vec!["pr", "create", "--fill"]);
+    }
+
+    #[test]
+    fn default_branch_status_replaces_stale_behind_count() {
+        assert_eq!(status_label_with_behind("clean", 2), "behind 2");
+        assert_eq!(status_label_with_behind("dirty 1 behind 9", 0), "dirty 1");
+        assert_eq!(
+            status_label_with_behind("dirty 1 ahead 3 behind 9", 2),
+            "dirty 1 ahead 3 behind 2"
+        );
     }
 
     #[test]
@@ -1585,6 +1696,7 @@ exit 0
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
             user_path: PathBuf::from("/tmp/prism-user-config.toml"),
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         }

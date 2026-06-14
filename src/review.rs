@@ -1,7 +1,10 @@
+use crate::config::Config;
 use crate::session::Session;
 use crate::util::empty_dash;
 
-pub fn build_review_fix_prompt(session: &Session) -> Result<String, String> {
+const DEFAULT_REVIEW_FIX_TEMPLATE: &str = "Here are review comments on PR {pr_number}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n{comments}";
+
+pub fn build_review_fix_prompt(session: &Session, config: &Config) -> Result<String, String> {
     let summary = session
         .pr
         .summary
@@ -23,10 +26,7 @@ pub fn build_review_fix_prompt(session: &Session) -> Result<String, String> {
             .then_with(|| a.body.cmp(&b.body))
     });
 
-    let mut prompt = format!(
-        "Here are review comments on PR {}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n",
-        summary.number
-    );
+    let mut comments = String::new();
 
     let mut wrote_comment = false;
     for comment in &review_comments {
@@ -42,16 +42,35 @@ pub fn build_review_fix_prompt(session: &Session) -> Result<String, String> {
             format!(" line {}", comment.line)
         };
         wrote_comment = true;
-        prompt.push_str(&format!("{}{}\n\n", empty_dash(&comment.path), line));
-        prompt.push_str(comment.body.trim());
-        prompt.push_str("\n\n---\n\n");
+        comments.push_str(&format!("{}{}\n\n", empty_dash(&comment.path), line));
+        comments.push_str(comment.body.trim());
+        comments.push_str("\n\n---\n\n");
     }
 
     if !wrote_comment {
-        prompt.push_str("No PR review comments were found.\n\n");
+        comments.push_str("No PR review comments were found.\n\n");
     }
 
-    Ok(prompt)
+    Ok(render_template(
+        config
+            .prompt_template("review_fix")
+            .unwrap_or(DEFAULT_REVIEW_FIX_TEMPLATE),
+        &[
+            ("pr_number", summary.number.to_string()),
+            ("branch", session.branch.clone()),
+            ("title", summary.title.clone()),
+            ("url", summary.url.clone()),
+            ("comments", comments),
+        ],
+    ))
+}
+
+fn render_template(template: &str, values: &[(&str, String)]) -> String {
+    let mut out = template.to_string();
+    for (key, value) in values {
+        out = out.replace(&format!("{{{key}}}"), value);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -60,6 +79,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::agent::AgentState;
+    use crate::config::{Checks, Config, EscapeKey};
     use crate::github::{PrCache, PrComment, PrDetails, PrReview, PrReviewComment, PrSummary};
 
     use super::*;
@@ -98,7 +118,7 @@ mod tests {
             failing_checks: vec!["cargo test".to_string()],
         });
 
-        let prompt = build_review_fix_prompt(&session).unwrap();
+        let prompt = build_review_fix_prompt(&session, &test_config()).unwrap();
 
         assert!(prompt.starts_with(
             "Here are review comments on PR 123.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n"
@@ -124,6 +144,31 @@ mod tests {
         assert!(!prompt.contains("2026-06-14"));
         assert!(!prompt.contains("Make the requested changes"));
         assert!(!prompt.contains("cargo test"));
+    }
+
+    #[test]
+    fn review_fix_prompt_uses_configured_template() {
+        let mut config = test_config();
+        config.prompt_templates.insert(
+            "review_fix".to_string(),
+            "Fix PR {pr_number} on {branch}:\n{comments}".to_string(),
+        );
+        let session = test_session(PrDetails {
+            review_comments: vec![PrReviewComment {
+                author: "dana".to_string(),
+                path: "src/review.rs".to_string(),
+                line: "9".to_string(),
+                body: "Can this be a helper?".to_string(),
+                created_at: "2026-06-14T12:05:00Z".to_string(),
+                resolved: false,
+            }],
+            ..PrDetails::default()
+        });
+
+        let prompt = build_review_fix_prompt(&session, &config).unwrap();
+
+        assert!(prompt.starts_with("Fix PR 123 on feature:"));
+        assert!(prompt.contains("src/review.rs line 9\n\nCan this be a helper?"));
     }
 
     fn test_session(details: PrDetails) -> Session {
@@ -160,6 +205,25 @@ mod tests {
             },
             wt_columns: BTreeMap::new(),
             unseen_comments: false,
+        }
+    }
+
+    fn test_config() -> Config {
+        Config {
+            default_agent: "opencode".to_string(),
+            default_base: Some("main".to_string()),
+            plan_dir: "plans".to_string(),
+            review_packet_dir: ".agent/review".to_string(),
+            worktree_command: "wt".to_string(),
+            escape_key: EscapeKey::EscEsc,
+            checks: Checks::default(),
+            worktree_columns: Vec::new(),
+            tools: BTreeMap::new(),
+            agent_commands: BTreeMap::new(),
+            agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
+            user_path: PathBuf::from("/tmp/user.toml"),
+            repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         }
     }
 }

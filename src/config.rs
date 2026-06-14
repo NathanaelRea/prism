@@ -54,6 +54,7 @@ pub struct Config {
     pub tools: BTreeMap<String, String>,
     pub agent_commands: BTreeMap<String, String>,
     pub agent_prompt_modes: BTreeMap<String, PromptMode>,
+    pub prompt_templates: BTreeMap<String, String>,
     pub user_path: PathBuf,
     pub repo_config_path: PathBuf,
 }
@@ -97,6 +98,7 @@ impl Config {
             tools,
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
             user_path,
             repo_config_path,
         }
@@ -147,6 +149,10 @@ impl Config {
             let Some(value) = parse_toml_string(raw_value) else {
                 continue;
             };
+            if section == "prompt_templates" {
+                self.prompt_templates.insert(key.to_string(), value);
+                continue;
+            }
             if section == "tools" {
                 self.tools.insert(key.to_string(), value);
                 continue;
@@ -205,6 +211,10 @@ impl Config {
             .unwrap_or_else(|| builtin_prompt_mode(name))
     }
 
+    pub fn prompt_template(&self, name: &str) -> Option<&str> {
+        self.prompt_templates.get(name).map(String::as_str)
+    }
+
     pub fn is_default_branch(&self, branch: &str) -> bool {
         self.default_base
             .as_deref()
@@ -227,6 +237,10 @@ pub fn print_config(repo: &Repository, config: &Config) {
     println!("worktree_command = {}", config.worktree_command);
     println!("escape_key = {}", config.escape_key.label());
     println!("worktree_columns = {:?}", config.worktree_columns);
+    println!(
+        "prompt_templates = {:?}",
+        config.prompt_templates.keys().collect::<Vec<_>>()
+    );
     println!("[tools]");
     for (key, value) in &config.tools {
         println!("{key} = {value}");
@@ -479,7 +493,12 @@ fn save_user_default_agent(config: &Config, selected: &str) -> Result<(), String
 pub fn parse_toml_string(value: &str) -> Option<String> {
     let value = value.trim();
     if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-        Some(value[1..value.len() - 1].replace("\\\"", "\""))
+        Some(
+            value[1..value.len() - 1]
+                .replace("\\n", "\n")
+                .replace("\\t", "\t")
+                .replace("\\\"", "\""),
+        )
     } else if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
         Some(value[1..value.len() - 1].to_string())
     } else {
