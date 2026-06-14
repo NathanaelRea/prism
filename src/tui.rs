@@ -286,9 +286,9 @@ impl Tui {
         let lines = [
             "Keybindings",
             "",
-            "Enter        open selected agent",
+            "Space Space  open selected agent",
             "Space g g    open tmux window 2: lazygit",
-            "Ctrl-/       open tmux window 3: terminal",
+            "Enter        open tmux window 3: terminal",
             "c            create worktree session",
             "P            push selected branch",
             "M            merge selected PR",

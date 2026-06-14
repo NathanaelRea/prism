@@ -93,6 +93,7 @@ impl Tui {
         Ok(true)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn launch_agent(
         &mut self,
         index: usize,
@@ -765,10 +766,10 @@ fn delete_warnings(session: &crate::session::Session) -> Vec<String> {
     if session.agent_state == AgentState::Running {
         warnings.push("agent is still running".to_string());
     }
-    if let Some(summary) = &session.pr.summary {
-        if !summary.merged {
-            warnings.push(format!("open PR #{} still exists", summary.number));
-        }
+    if let Some(summary) = &session.pr.summary
+        && !summary.merged
+    {
+        warnings.push(format!("open PR #{} still exists", summary.number));
     }
     warnings
 }

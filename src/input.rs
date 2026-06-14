@@ -23,7 +23,7 @@ impl KeyInput {
                     b'\x03' => keys.push(Key::Quit),
                     b'q' => keys.push(Key::Quit),
                     b' ' => self.state = KeyInputState::Leader,
-                    b'\r' | b'\n' => keys.push(Key::AgentMode),
+                    b'\r' | b'\n' => keys.push(Key::Terminal),
                     31 => keys.push(Key::Terminal),
                     b'k' => keys.push(Key::Up),
                     b'j' => keys.push(Key::Down),
@@ -55,6 +55,10 @@ impl KeyInput {
                     }
                 }
                 KeyInputState::Leader => match byte {
+                    b' ' => {
+                        self.state = KeyInputState::Normal;
+                        keys.push(Key::AgentMode);
+                    }
                     b'g' => self.state = KeyInputState::LeaderG,
                     _ => {
                         self.state = KeyInputState::Normal;
@@ -114,7 +118,7 @@ mod tests {
     #[test]
     fn key_input_handles_agent_mode_keys() {
         let mut input = KeyInput::default();
-        let keys = input.feed(b"i\n");
+        let keys = input.feed(b"i  ");
         assert!(matches!(keys.as_slice(), [Key::Other, Key::AgentMode]));
     }
 
@@ -128,7 +132,7 @@ mod tests {
     #[test]
     fn key_input_handles_terminal_and_help_keys() {
         let mut input = KeyInput::default();
-        let keys = input.feed(&[31, b'?']);
+        let keys = input.feed(b"\n?");
         assert!(matches!(keys.as_slice(), [Key::Terminal, Key::Help]));
     }
 

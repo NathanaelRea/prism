@@ -100,6 +100,7 @@ pub fn timestamp_label() -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn timestamp_nanos() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
