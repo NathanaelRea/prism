@@ -1,15 +1,17 @@
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::agent::{AgentAdapter, AgentProcess, AgentState};
-use crate::git::{has_upstream, selected_dirty, worktree_dirty};
+use crate::git::{branch_behind, has_upstream, pull_branch, selected_dirty};
 use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCache, fetch_pr_summary_index, pr_details_due, refresh_pr_cache,
     refresh_pr_details_cache, refresh_pr_summary_index, remove_pr_cache,
 };
+use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::process::command_exists;
 use crate::process::{run_capture, run_configured_commands, run_status};
 use crate::review::build_review_fix_prompt;
@@ -21,7 +23,9 @@ use crate::tmux::{
     TmuxWindow, agent_session_running, attach_or_create_agent, attach_or_create_window,
     ensure_agent_session, kill_agent_session, latest_agent_session_generation, paste_agent_prompt,
 };
-use crate::tui::{PrPollKey, PrPollResult, TmuxSlotKey, TmuxWarmupKey, TmuxWarmupResult, Tui};
+use crate::tui::{
+    PrPollKey, PrPollResult, TmuxSlotKey, TmuxWarmupKey, TmuxWarmupResult, Tui, WtPollResult,
+};
 use crate::util::{status_count, truncate, yes};
 
 impl Tui {
@@ -38,22 +42,24 @@ impl Tui {
                 session.agent_output = previous.agent_output;
                 session.agent_state = previous.agent_state;
                 session.pr = previous.pr;
+                session.wt_columns = previous.wt_columns;
+                session.unseen_comments = previous.unseen_comments;
             }
         }
         self.sessions = fresh;
         if self.selected >= self.sessions.len() {
             self.selected = self.sessions.len().saturating_sub(1);
         }
+        if !self.session_filter.trim().is_empty()
+            && !self.visible_session_indices().contains(&self.selected)
+        {
+            self.select_top_visible();
+        }
         Ok(())
     }
 
     pub(crate) fn create_session(&mut self) -> Result<bool, String> {
-        if !self.allow_dirty && worktree_dirty(&self.repo, &self.config)? {
-            self.show_message(
-                "current worktree is dirty; restart Prism with --allow-dirty to create anyway",
-            )?;
-            return Ok(false);
-        }
+        self.ensure_default_branch_ready_for_create()?;
         let Some(branch) = self.prompt_line_dialog("Create Session", "Branch name: ", "")? else {
             return Ok(false);
         };
@@ -73,6 +79,7 @@ impl Tui {
         clear_hidden(&self.repo, branch.trim())?;
         self.refresh_sessions()?;
         self.start_tmux_agent_warmup();
+        self.start_wt_column_poll();
         let index = self
             .sessions
             .iter()
@@ -93,6 +100,98 @@ impl Tui {
             self.show_message("pasted initial prompt into agent session")?;
         }
         Ok(true)
+    }
+
+    fn ensure_default_branch_ready_for_create(&mut self) -> Result<(), String> {
+        let Some(base) = self
+            .config
+            .default_base
+            .as_deref()
+            .map(str::trim)
+            .filter(|base| !base.is_empty())
+            .map(str::to_string)
+        else {
+            return Ok(());
+        };
+        let base_path = self.default_branch_path(&base);
+        let behind = branch_behind(&base_path, &base, &self.config)?;
+        if behind == 0 {
+            return Ok(());
+        }
+        let answer = self.prompt_line_dialog(
+            "Default Branch Behind",
+            &format!("{base} is behind origin/{base} by {behind}. Pull first? [Y/n] "),
+            "",
+        )?;
+        if answer.as_deref().map(yes_default).unwrap_or(false) {
+            self.show_loading_dialog("Pull Default Branch", &format!("Pulling {base}"))?;
+            pull_branch(&base_path, &base, &self.config)?;
+            self.refresh_sessions()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn pull_default_branch(&mut self) -> Result<(), String> {
+        let Some(base) = self
+            .config
+            .default_base
+            .as_deref()
+            .map(str::trim)
+            .filter(|base| !base.is_empty())
+            .map(str::to_string)
+        else {
+            self.show_message("no default_base configured")?;
+            return Ok(());
+        };
+        let base_path = self.default_branch_path(&base);
+        self.show_loading_dialog("Pull Default Branch", &format!("Pulling {base}"))?;
+        pull_branch(&base_path, &base, &self.config)?;
+        self.refresh_sessions()?;
+        self.start_wt_column_poll();
+        self.show_message(&format!("pulled {base}"))?;
+        Ok(())
+    }
+
+    fn default_branch_path(&self, base: &str) -> PathBuf {
+        self.sessions
+            .iter()
+            .find(|session| session.branch == base)
+            .map(|session| session.path.clone())
+            .unwrap_or_else(|| self.repo.root.clone())
+    }
+
+    pub(crate) fn edit_config(
+        &mut self,
+        raw: &mut crate::terminal::RawTerminal,
+    ) -> Result<(), String> {
+        if let Some(parent) = self.config.repo_config_path.parent() {
+            fs::create_dir_all(parent).map_err(|error| format!("create config dir: {error}"))?;
+        }
+        if !self.config.repo_config_path.exists() {
+            fs::write(
+                &self.config.repo_config_path,
+                "# Prism repository config\n# Example: [worktrees]\n# columns = [\"url\", \"vars.localdev\"]\n",
+            )
+            .map_err(|error| format!("create config file: {error}"))?;
+        }
+        let editor =
+            editor_command().ok_or_else(|| "no editor found; set VISUAL or EDITOR".to_string())?;
+        raw.suspend()?;
+        let result = Command::new(&editor)
+            .arg(&self.config.repo_config_path)
+            .status();
+        let resume_result = raw.resume();
+        resume_result?;
+        let status = result.map_err(|error| format!("{editor}: {error}"))?;
+        if !status.success() {
+            return Err(format!("{editor} exited with {status}"));
+        }
+        self.config = crate::config::Config::load(&self.repo);
+        self.refresh_sessions()?;
+        self.start_tmux_agent_warmup();
+        self.start_wt_column_poll();
+        self.show_message("config reloaded")?;
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -180,6 +279,11 @@ impl Tui {
         if let Some(session) = self.sessions.get_mut(self.selected) {
             let key = pr_poll_key(session);
             if pr_pollable(&self.config, session)
+                && !session
+                    .pr
+                    .summary
+                    .as_ref()
+                    .is_some_and(|summary| summary.merged)
                 && pr_details_due(&session.pr)
                 && !self.pr_polls_in_flight.contains(&key)
             {
@@ -214,6 +318,11 @@ impl Tui {
                         .iter()
                         .map(|session| pr_render_signature(&session.pr))
                         .collect::<Vec<_>>();
+                    let before_comments = self
+                        .sessions
+                        .iter()
+                        .map(session_comment_count)
+                        .collect::<Vec<_>>();
                     match summaries {
                         Ok(summaries) => {
                             refresh_pr_summary_index(
@@ -234,10 +343,18 @@ impl Tui {
                         .iter()
                         .map(|session| pr_render_signature(&session.pr))
                         .collect::<Vec<_>>();
+                    for (index, session) in self.sessions.iter_mut().enumerate() {
+                        let before = before_comments.get(index).copied().unwrap_or(0);
+                        let after = session_comment_count(session);
+                        if after > before && index != self.selected {
+                            session.unseen_comments = true;
+                        }
+                    }
                     changed |= before != after;
                 }
                 PrPollResult::Details { key, cache } => {
                     self.pr_polls_in_flight.remove(&key);
+                    let selected_key = self.sessions.get(self.selected).map(pr_poll_key);
                     if let Some(session) = self
                         .sessions
                         .iter_mut()
@@ -247,12 +364,61 @@ impl Tui {
                         let current_pr = session.pr.summary.as_ref().map(|summary| summary.number);
                         let result_pr = cache.summary.as_ref().map(|summary| summary.number);
                         if current_pr == result_pr {
+                            let before_comments = session_comment_count(session);
                             session.pr.details = cache.details;
                             session.pr.details_last_polled = cache.details_last_polled;
                             session.pr.error = cache.error;
+                            if session_comment_count(session) > before_comments
+                                && selected_key.as_ref() != Some(&key)
+                            {
+                                session.unseen_comments = true;
+                            }
                         }
                         changed |= before != pr_render_signature(&session.pr);
                     }
+                }
+            }
+        }
+        changed
+    }
+
+    pub(crate) fn start_wt_column_poll(&mut self) {
+        self.poll_wt_columns();
+        if self.wt_poll_in_flight || self.config.worktree_columns.is_empty() {
+            return;
+        }
+        let repo = self.repo.clone();
+        let config = self.config.clone();
+        let tx = self.wt_poll_tx.clone();
+        self.wt_poll_in_flight = true;
+        std::thread::spawn(move || {
+            let columns = fetch_wt_columns(&repo, &config);
+            let _ = tx.send(WtPollResult { columns });
+        });
+    }
+
+    pub(crate) fn poll_wt_columns(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(result) = self.wt_poll_rx.try_recv() {
+            self.wt_poll_in_flight = false;
+            match result.columns {
+                Ok(columns_by_path) => {
+                    for session in &mut self.sessions {
+                        let next = columns_by_path
+                            .get(&session.path)
+                            .cloned()
+                            .unwrap_or_default();
+                        if session.wt_columns != next {
+                            session.wt_columns = next;
+                            changed = true;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = append_runtime_log(
+                        &self.repo,
+                        &format!("wt column refresh failed: {error}"),
+                    );
                 }
             }
         }
@@ -739,14 +905,17 @@ fn create_worktree_session(
     branch: &str,
 ) -> Result<(), String> {
     run_capture(
-        Command::new(config.tool(&config.worktree_command))
-            .args(create_worktree_args(&repo.root, branch)),
+        Command::new(config.tool(&config.worktree_command)).args(create_worktree_args(
+            &repo.root,
+            branch,
+            config.default_base.as_deref(),
+        )),
     )?;
     Ok(())
 }
 
-fn create_worktree_args(repo_root: &Path, branch: &str) -> Vec<String> {
-    vec![
+fn create_worktree_args(repo_root: &Path, branch: &str, default_base: Option<&str>) -> Vec<String> {
+    let mut args = vec![
         "-C".to_string(),
         repo_root.display().to_string(),
         "switch".to_string(),
@@ -754,8 +923,13 @@ fn create_worktree_args(repo_root: &Path, branch: &str) -> Vec<String> {
         "--no-cd".to_string(),
         "--format".to_string(),
         "json".to_string(),
-        branch.to_string(),
-    ]
+    ];
+    if let Some(base) = default_base.map(str::trim).filter(|base| !base.is_empty()) {
+        args.push("--base".to_string());
+        args.push(base.to_string());
+    }
+    args.push(branch.to_string());
+    args
 }
 
 fn create_pr_args(default_base: Option<&str>) -> Vec<String> {
@@ -782,7 +956,105 @@ fn pr_poll_key(session: &crate::session::Session) -> PrPollKey {
 }
 
 fn pr_pollable(config: &crate::config::Config, session: &crate::session::Session) -> bool {
-    session.branch != "(detached)" && !config.is_default_branch(&session.branch)
+    session.branch != "(detached)"
+        && !config.is_default_branch(&session.branch)
+        && !session
+            .pr
+            .summary
+            .as_ref()
+            .is_some_and(|summary| summary.merged)
+}
+
+fn session_comment_count(session: &crate::session::Session) -> usize {
+    session
+        .pr
+        .details
+        .as_ref()
+        .map(|details| details.comments.len() + details.review_comments.len())
+        .or_else(|| {
+            session
+                .pr
+                .summary
+                .as_ref()
+                .map(|summary| summary.comment_count as usize)
+        })
+        .unwrap_or(0)
+}
+
+fn fetch_wt_columns(
+    repo: &crate::repo::Repository,
+    config: &crate::config::Config,
+) -> Result<BTreeMap<PathBuf, BTreeMap<String, String>>, String> {
+    let raw = run_capture(
+        Command::new(config.tool(&config.worktree_command))
+            .arg("-C")
+            .arg(&repo.root)
+            .args(["list", "--format=json"]),
+    )?;
+    let mut by_path = BTreeMap::new();
+    for object in json_top_level_objects(&raw) {
+        let Some(path) = json_string_field(object, "path") else {
+            continue;
+        };
+        let mut columns = BTreeMap::new();
+        for column in &config.worktree_columns {
+            if let Some(value) = wt_column_value(object, column) {
+                columns.insert(column.clone(), value);
+            }
+        }
+        by_path.insert(PathBuf::from(path), columns);
+    }
+    Ok(by_path)
+}
+
+fn wt_column_value(object: &str, column: &str) -> Option<String> {
+    if let Some(key) = column.strip_prefix("vars.") {
+        return json_object_field(object, "vars").and_then(|vars| json_string_field(vars, key));
+    }
+    if let Some((object_key, field_key)) = column.split_once('.') {
+        return json_object_field(object, object_key)
+            .and_then(|inner| json_string_field(inner, field_key));
+    }
+    json_string_field(object, column)
+        .or_else(|| json_bool_field(object, column).map(|value| value.to_string()))
+        .or_else(|| {
+            if column == "ci" {
+                json_object_field(object, "ci").map(|ci| {
+                    let status = json_string_field(ci, "status").unwrap_or_default();
+                    let number = crate::json::json_u64_field(ci, "number")
+                        .map(|number| format!("#{number}"))
+                        .unwrap_or_else(|| "ci".to_string());
+                    if status.is_empty() {
+                        number
+                    } else {
+                        format!("{number}:{status}")
+                    }
+                })
+            } else {
+                None
+            }
+        })
+}
+
+fn yes_default(answer: &str) -> bool {
+    !matches!(answer.trim(), "n" | "N" | "no" | "NO")
+}
+
+fn editor_command() -> Option<String> {
+    std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .or_else(|| {
+            ["nvim", "vim", "vi"]
+                .into_iter()
+                .find(|editor| command_exists(editor))
+                .map(str::to_string)
+        })
 }
 
 fn tmux_slot_key(session: &crate::session::Session) -> TmuxSlotKey {
@@ -809,6 +1081,8 @@ fn session_for_tmux_warmup(session: &crate::session::Session) -> crate::session:
         agent_output: std::collections::VecDeque::new(),
         agent_state: session.agent_state,
         pr: session.pr.clone(),
+        wt_columns: session.wt_columns.clone(),
+        unseen_comments: session.unseen_comments,
     }
 }
 
@@ -881,7 +1155,11 @@ mod tests {
 
     #[test]
     fn create_worktree_uses_worktrunk_without_changing_directory() {
-        let args = create_worktree_args(PathBuf::from("/repo/prism").as_path(), "feat/test");
+        let args = create_worktree_args(
+            PathBuf::from("/repo/prism").as_path(),
+            "feat/test",
+            Some("main"),
+        );
 
         assert_eq!(
             args,
@@ -893,6 +1171,8 @@ mod tests {
                 "--no-cd",
                 "--format",
                 "json",
+                "--base",
+                "main",
                 "feat/test",
             ]
         );
@@ -1287,6 +1567,8 @@ exit 0
             agent_output: VecDeque::new(),
             agent_state: AgentState::Idle,
             pr: PrCache::default(),
+            wt_columns: BTreeMap::new(),
+            unseen_comments: false,
         }
     }
 
@@ -1299,6 +1581,7 @@ exit 0
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
             checks: Checks::default(),
+            worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),

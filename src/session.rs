@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,8 @@ pub struct Session {
     pub agent_output: VecDeque<String>,
     pub agent_state: AgentState,
     pub pr: PrCache,
+    pub wt_columns: BTreeMap<String, String>,
+    pub unseen_comments: bool,
 }
 
 pub fn discover_sessions(repo: &Repository, config: &Config) -> Result<Vec<Session>, String> {
@@ -67,7 +69,14 @@ pub fn discover_sessions(repo: &Repository, config: &Config) -> Result<Vec<Sessi
         }
     }
 
-    sessions.sort_by(|a, b| a.branch.cmp(&b.branch).then_with(|| a.path.cmp(&b.path)));
+    sessions.sort_by(|a, b| {
+        let a_default = config.is_default_branch(&a.branch);
+        let b_default = config.is_default_branch(&b.branch);
+        b_default
+            .cmp(&a_default)
+            .then_with(|| a.branch.cmp(&b.branch))
+            .then_with(|| a.path.cmp(&b.path))
+    });
     Ok(sessions)
 }
 
@@ -103,6 +112,8 @@ fn build_session(repo: &Repository, path: PathBuf, branch: String, config: &Conf
         agent_output: VecDeque::new(),
         agent_state,
         pr,
+        wt_columns: BTreeMap::new(),
+        unseen_comments: false,
     }
 }
 

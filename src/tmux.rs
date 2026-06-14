@@ -591,6 +591,7 @@ mod tests {
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
             checks: Checks::default(),
+            worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::from([(
                 "custom".to_string(),
@@ -616,6 +617,7 @@ mod tests {
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
             checks: Checks::default(),
+            worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
@@ -1207,6 +1209,8 @@ exit 0
             agent_output: VecDeque::new(),
             agent_state: AgentState::Idle,
             pr: PrCache::default(),
+            wt_columns: BTreeMap::new(),
+            unseen_comments: false,
         }
     }
 
@@ -1219,6 +1223,7 @@ exit 0
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
             checks: Checks::default(),
+            worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),

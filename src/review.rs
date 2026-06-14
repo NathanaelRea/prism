@@ -56,7 +56,7 @@ pub fn build_review_fix_prompt(session: &Session) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{BTreeMap, VecDeque};
     use std::path::PathBuf;
 
     use crate::agent::AgentState;
@@ -158,6 +158,8 @@ mod tests {
                 details: Some(details),
                 ..PrCache::default()
             },
+            wt_columns: BTreeMap::new(),
+            unseen_comments: false,
         }
     }
 }

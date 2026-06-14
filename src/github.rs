@@ -1043,6 +1043,7 @@ JSON
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
             checks: Checks::default(),
+            worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),

@@ -66,6 +66,48 @@ pub fn worktree_dirty(repo: &Repository, config: &Config) -> Result<bool, String
     Ok(!status.trim().is_empty())
 }
 
+pub fn branch_behind(
+    path: &std::path::Path,
+    branch: &str,
+    config: &Config,
+) -> Result<usize, String> {
+    fetch_origin(path, config)?;
+    let upstream = format!("origin/{branch}");
+    let count = run_capture(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["rev-list", "--count"])
+            .arg(format!("{branch}..{upstream}")),
+    )?;
+    Ok(count.trim().parse().unwrap_or(0))
+}
+
+pub fn pull_branch(path: &std::path::Path, branch: &str, config: &Config) -> Result<(), String> {
+    fetch_origin(path, config)?;
+    crate::process::run_status(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["switch", branch]),
+    )?;
+    crate::process::run_status(Command::new(config.tool("git")).arg("-C").arg(path).args([
+        "pull",
+        "--ff-only",
+        "origin",
+        branch,
+    ]))
+}
+
+fn fetch_origin(path: &std::path::Path, config: &Config) -> Result<(), String> {
+    crate::process::run_status(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["fetch", "origin"]),
+    )
+}
+
 pub fn selected_dirty(path: &std::path::Path, config: &Config) -> Result<bool, String> {
     let status = run_capture(
         Command::new(config.tool("git"))

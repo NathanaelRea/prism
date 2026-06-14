@@ -50,6 +50,7 @@ pub struct Config {
     pub worktree_command: String,
     pub escape_key: EscapeKey,
     pub checks: Checks,
+    pub worktree_columns: Vec<String>,
     pub tools: BTreeMap<String, String>,
     pub agent_commands: BTreeMap<String, String>,
     pub agent_prompt_modes: BTreeMap<String, PromptMode>,
@@ -92,6 +93,7 @@ impl Config {
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
             checks: Checks::default(),
+            worktree_columns: vec!["url".to_string()],
             tools,
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
@@ -129,6 +131,15 @@ impl Config {
                     "pre_push" => self.checks.pre_push = values,
                     "review_fix" => self.checks.review_fix = values,
                     _ => {}
+                }
+                continue;
+            }
+
+            if section == "worktrees" {
+                if key == "columns"
+                    && let Some(values) = parse_toml_string_array(raw_value)
+                {
+                    self.worktree_columns = values;
                 }
                 continue;
             }
@@ -215,6 +226,7 @@ pub fn print_config(repo: &Repository, config: &Config) {
     println!("review_packet_dir = {}", config.review_packet_dir);
     println!("worktree_command = {}", config.worktree_command);
     println!("escape_key = {}", config.escape_key.label());
+    println!("worktree_columns = {:?}", config.worktree_columns);
     println!("[tools]");
     for (key, value) in &config.tools {
         println!("{key} = {value}");
