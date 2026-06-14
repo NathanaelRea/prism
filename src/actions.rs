@@ -20,7 +20,7 @@ use crate::tmux::{
     ensure_agent_session, kill_agent_session, latest_agent_session_generation, paste_agent_prompt,
 };
 use crate::tui::{PrPollKey, PrPollResult, TmuxSlotKey, TmuxWarmupKey, TmuxWarmupResult, Tui};
-use crate::util::{truncate, yes};
+use crate::util::{status_count, truncate, yes};
 
 impl Tui {
     pub(crate) fn refresh_sessions(&mut self) -> Result<(), String> {
@@ -805,16 +805,6 @@ fn delete_warnings(session: &crate::session::Session) -> Vec<String> {
         warnings.push(format!("open PR #{} still exists", summary.number));
     }
     warnings
-}
-
-fn status_count(status: &str, key: &str) -> Option<usize> {
-    let mut words = status.split_whitespace();
-    while let Some(word) = words.next() {
-        if word == key {
-            return words.next()?.parse().ok();
-        }
-    }
-    None
 }
 
 #[cfg(test)]

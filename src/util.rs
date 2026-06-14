@@ -41,6 +41,16 @@ pub fn strip_ansi(text: &str) -> String {
     out
 }
 
+pub fn status_count(status: &str, key: &str) -> Option<usize> {
+    let mut words = status.split_whitespace();
+    while let Some(word) = words.next() {
+        if word == key {
+            return words.next()?.parse().ok();
+        }
+    }
+    None
+}
+
 pub fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME").map(PathBuf::from)
 }
@@ -124,7 +134,7 @@ pub fn empty_dash(value: &str) -> &str {
 mod tests {
     use std::path::Path;
 
-    use super::{safe_path_component, single_line, stable_hash, strip_ansi, truncate_line};
+    use super::{safe_path_component, single_line, stable_hash, status_count, strip_ansi, truncate_line};
 
     #[test]
     fn single_line_replaces_control_characters() {
@@ -142,6 +152,13 @@ mod tests {
     #[test]
     fn strip_ansi_removes_style_sequences() {
         assert_eq!(strip_ansi("\x1b[31m•\x1b[0m dirty"), "• dirty");
+    }
+
+    #[test]
+    fn status_count_reads_status_label_counts() {
+        assert_eq!(status_count("dirty 2 ahead 3 behind 1", "dirty"), Some(2));
+        assert_eq!(status_count("dirty 2 ahead 3 behind 1", "ahead"), Some(3));
+        assert_eq!(status_count("clean", "dirty"), None);
     }
 
     #[test]

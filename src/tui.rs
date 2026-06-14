@@ -685,10 +685,22 @@ impl Tui {
 }
 
 fn truncate_ansi_dialog_line(text: &str, max_chars: usize) -> String {
-    if strip_ansi(text).chars().count() <= max_chars {
+    let stripped = strip_ansi(text);
+    if stripped.chars().count() <= max_chars {
         return text.to_string();
     }
-    truncate_line(&strip_ansi(text), max_chars)
+    let warning_prefix = "\x1b[31m•\x1b[0m ";
+    if let Some(rest) = text.strip_prefix(warning_prefix) {
+        let visible_prefix = "• ";
+        let prefix_width = visible_prefix.chars().count();
+        if max_chars > prefix_width {
+            return format!(
+                "{warning_prefix}{}",
+                truncate_line(rest, max_chars - prefix_width)
+            );
+        }
+    }
+    truncate_line(&stripped, max_chars)
 }
 
 fn tail_chars(text: &str, max_chars: usize) -> String {
@@ -705,4 +717,17 @@ fn tail_chars(text: &str, max_chars: usize) -> String {
     let mut out = String::from("~");
     out.extend(text.chars().skip(count - max_chars + 1));
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_ansi_dialog_line;
+
+    #[test]
+    fn truncated_warning_line_keeps_colored_bullet_prefix() {
+        assert_eq!(
+            truncate_ansi_dialog_line("\x1b[31m•\x1b[0m dirty worktree", 8),
+            "\x1b[31m•\x1b[0m dirty~"
+        );
+    }
 }
