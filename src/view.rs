@@ -1,10 +1,8 @@
-use std::io::{self, Write};
-
 use crate::agent::{AgentState, output_tail};
 use crate::config::Config;
 use crate::repo::Repository;
 use crate::session::Session;
-use crate::terminal::terminal_size;
+use crate::terminal::{terminal_size, write_stdout};
 use crate::util::truncate_line;
 
 pub fn draw(
@@ -16,20 +14,16 @@ pub fn draw(
     status_message: Option<&str>,
 ) -> Result<(), String> {
     let (cols, rows) = terminal_size();
-    print!(
-        "{}",
-        render_frame(
-            repo,
-            config,
-            sessions,
-            selected,
-            mode_label,
-            status_message,
-            cols,
-            rows,
-        )
-    );
-    io::stdout().flush().map_err(|error| error.to_string())
+    write_stdout(&render_frame(
+        repo,
+        config,
+        sessions,
+        selected,
+        mode_label,
+        status_message,
+        cols,
+        rows,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::io::{self, ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -11,7 +11,7 @@ use crate::github::{PrCache, PrSummary};
 use crate::input::{Key, KeyInput};
 use crate::repo::Repository;
 use crate::session::{Session, append_runtime_log};
-use crate::terminal::{RawTerminal, stdin_is_tty, terminal_size};
+use crate::terminal::{RawTerminal, stdin_is_tty, terminal_size, write_stdout};
 use crate::util::{truncate_line, yes};
 use crate::view;
 
@@ -226,8 +226,7 @@ impl Tui {
                         pending_g = false;
                         raw.suspend()?;
                         let result = self.run_selected_plan();
-                        print!("\nPress Enter to return to Prism...");
-                        io::stdout().flush().map_err(|error| error.to_string())?;
+                        write_stdout("\nPress Enter to return to Prism...")?;
                         let mut line = String::new();
                         let _ = io::stdin().read_line(&mut line);
                         raw.resume()?;
@@ -237,8 +236,10 @@ impl Tui {
                     }
                     Key::Create => {
                         pending_g = false;
-                        if let Err(error) = self.create_session() {
-                            self.show_error("create session failed", &error)?;
+                        match self.create_session() {
+                            Ok(true) => self.enter_agent_mode(&mut raw)?,
+                            Ok(false) => {}
+                            Err(error) => self.show_error("create session failed", &error)?,
                         }
                     }
                     Key::Remove => {
@@ -373,28 +374,27 @@ impl Tui {
         let left = ((cols as usize).saturating_sub(width) / 2).saturating_add(1);
         let top = ((rows as usize).saturating_sub(height) / 2).saturating_add(1);
 
-        print!("\x1b[?25l");
-        print!(
-            "\x1b[{top};{left}H+{}+",
+        let mut frame = format!(
+            "\x1b[?25l\x1b[{top};{left}H+{}+",
             "-".repeat(width.saturating_sub(2))
         );
         for (index, line) in lines.iter().enumerate() {
             let y = top + index + 1;
             let text_width = width.saturating_sub(4);
             let text = truncate_line(line, text_width);
-            print!(
+            frame.push_str(&format!(
                 "\x1b[{y};{left}H| {:<text_width$} |",
                 text,
                 text_width = text_width
-            );
+            ));
         }
-        print!(
+        frame.push_str(&format!(
             "\x1b[{};{}H+{}+",
             top + height - 1,
             left,
             "-".repeat(width.saturating_sub(2))
-        );
-        io::stdout().flush().map_err(|error| error.to_string())?;
+        ));
+        write_stdout(&frame)?;
 
         let mut stdin = io::stdin();
         let mut byte = [0_u8; 1];
@@ -423,10 +423,13 @@ impl Tui {
     }
 
     fn prompt_line_with_initial(&self, prompt: &str, initial: &str) -> Result<String, String> {
-        print!("\x1b[{};1H\x1b[2K\x1b[?25h{}", terminal_size().1, prompt);
         let mut input = initial.to_string();
-        print!("{input}");
-        io::stdout().flush().map_err(|error| error.to_string())?;
+        write_stdout(&format!(
+            "\x1b[{};1H\x1b[2K\x1b[?25h{}{}",
+            terminal_size().1,
+            prompt,
+            input
+        ))?;
         let mut stdin = io::stdin();
         let mut byte = [0_u8; 1];
         loop {
@@ -444,26 +447,22 @@ impl Tui {
             }
             match byte[0] {
                 b'\r' | b'\n' => {
-                    print!("\r\n\x1b[?25l");
-                    io::stdout().flush().map_err(|error| error.to_string())?;
+                    write_stdout("\r\n\x1b[?25l")?;
                     return Ok(input);
                 }
                 3 | 27 => {
-                    print!("\r\n\x1b[?25l");
-                    io::stdout().flush().map_err(|error| error.to_string())?;
+                    write_stdout("\r\n\x1b[?25l")?;
                     return Ok(String::new());
                 }
                 8 | 127 => {
                     if input.pop().is_some() {
-                        print!("\x08 \x08");
-                        io::stdout().flush().map_err(|error| error.to_string())?;
+                        write_stdout("\x08 \x08")?;
                     }
                 }
                 byte if !byte.is_ascii_control() => {
                     let ch = byte as char;
                     input.push(ch);
-                    print!("{ch}");
-                    io::stdout().flush().map_err(|error| error.to_string())?;
+                    write_stdout(&ch.to_string())?;
                 }
                 _ => {}
             }
@@ -472,17 +471,16 @@ impl Tui {
 
     pub(crate) fn show_message(&mut self, message: &str) -> Result<(), String> {
         self.status_message = Some(message.to_string());
-        print!(
+        let _ = append_runtime_log(&self.repo, message);
+        write_stdout(&format!(
             "\x1b[{};1H\x1b[2K{}",
             terminal_size().1,
             truncate_line(message, terminal_size().0 as usize)
-        );
-        io::stdout().flush().map_err(|error| error.to_string())
+        ))
     }
 
     fn show_error(&mut self, context: &str, error: &str) -> Result<(), String> {
         let message = format!("{context}: {error}");
-        let _ = append_runtime_log(&self.repo, &message);
         self.show_message(&message)
     }
 

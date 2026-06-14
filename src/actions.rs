@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use crate::github::{
     refresh_pr_details_cache, refresh_pr_summary_index, remove_pr_cache,
 };
 use crate::plan::{build_plan_prompt, default_plan_path, infer_total_phases, run_codex_plan};
-use crate::process::{run_configured_commands, run_status};
+use crate::process::{run_capture, run_configured_commands, run_status};
 use crate::review::{build_review_fix_prompt, write_review_packet};
 use crate::session::{
     append_agent_log, append_runtime_log, clear_hidden, discover_sessions, mark_hidden,
@@ -46,24 +47,20 @@ impl Tui {
         Ok(())
     }
 
-    pub(crate) fn create_session(&mut self) -> Result<(), String> {
+    pub(crate) fn create_session(&mut self) -> Result<bool, String> {
         if !self.allow_dirty && worktree_dirty(&self.repo, &self.config)? {
             self.show_message(
                 "current worktree is dirty; restart Prism with --allow-dirty to create anyway",
             )?;
-            return Ok(());
+            return Ok(false);
         }
         let branch = self.prompt_line("Branch name: ")?;
         if branch.trim().is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let initial_prompt = self.prompt_line("Initial prompt (optional): ")?;
         self.show_message(&format!("creating worktree for {branch}"))?;
-        run_status(
-            Command::new(self.config.tool(&self.config.worktree_command))
-                .current_dir(&self.repo.root)
-                .args(["switch", "-c", branch.trim()]),
-        )?;
+        create_worktree_session(&self.repo, &self.config, branch.trim())?;
         clear_hidden(&self.repo, branch.trim())?;
         self.refresh_sessions()?;
         let index = self
@@ -81,9 +78,10 @@ impl Tui {
             write_task_metadata(&self.repo, &self.sessions[index], &initial_prompt)?;
             self.sessions[index].prompt_summary = truncate(&initial_prompt.replace('\n', " "), 50);
             self.sessions[index].adopted = true;
-            self.launch_agent(index, &initial_prompt)?;
+            self.paste_prompt_into_tmux_agent(index, initial_prompt.trim())?;
+            self.show_message("pasted initial prompt into agent session")?;
         }
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn launch_agent(
@@ -573,15 +571,24 @@ impl Tui {
         let path = self.sessions[self.selected].path.clone();
         run_configured_commands(&self.config.checks.review_fix, &path, "review_fix")?;
         let prompt = build_review_fix_prompt(&self.sessions[self.selected])?;
-        let session = session_for_tmux_warmup(&self.sessions[self.selected]);
+        self.paste_prompt_into_tmux_agent(self.selected, &prompt)?;
+        self.show_message("pasted review-fix prompt into agent session")?;
+        Ok(())
+    }
+
+    fn paste_prompt_into_tmux_agent(&mut self, index: usize, prompt: &str) -> Result<(), String> {
+        let session = self
+            .sessions
+            .get(index)
+            .map(session_for_tmux_warmup)
+            .ok_or_else(|| "no selected session".to_string())?;
         let slot = tmux_slot_key(&session);
         let generation = self.tmux_generation_for_slot(&slot);
         let key = tmux_warmup_key(slot.clone(), generation);
         self.finish_tmux_warmup_for_key(&key);
-        paste_agent_prompt(&self.repo, &self.config, &session, generation, &prompt)?;
+        paste_agent_prompt(&self.repo, &self.config, &session, generation, prompt)?;
         let running = agent_session_running(&self.repo, &self.config, &session, generation);
         self.update_tmux_agent_state_for_slot(&slot, running);
-        self.show_message("pasted review-fix prompt into agent session")?;
         Ok(())
     }
 
@@ -814,6 +821,31 @@ fn tmux_agent_state(
     None
 }
 
+fn create_worktree_session(
+    repo: &crate::repo::Repository,
+    config: &crate::config::Config,
+    branch: &str,
+) -> Result<(), String> {
+    run_capture(
+        Command::new(config.tool(&config.worktree_command))
+            .args(create_worktree_args(&repo.root, branch)),
+    )?;
+    Ok(())
+}
+
+fn create_worktree_args(repo_root: &Path, branch: &str) -> Vec<String> {
+    vec![
+        "-C".to_string(),
+        repo_root.display().to_string(),
+        "switch".to_string(),
+        "--create".to_string(),
+        "--no-cd".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+        branch.to_string(),
+    ]
+}
+
 fn pr_render_signature(cache: &PrCache) -> String {
     format!(
         "{:?}|{:?}|{:?}|{:?}",
@@ -868,7 +900,7 @@ mod tests {
     use crate::session::Session;
     use crate::tui::{TmuxWarmupResult, Tui};
 
-    use super::{tmux_agent_state, tmux_slot_key, tmux_warmup_key};
+    use super::{create_worktree_args, tmux_agent_state, tmux_slot_key, tmux_warmup_key};
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -894,6 +926,25 @@ mod tests {
         let state = tmux_agent_state(AgentState::Running, true, true);
 
         assert_eq!(state, None);
+    }
+
+    #[test]
+    fn create_worktree_uses_worktrunk_without_changing_directory() {
+        let args = create_worktree_args(PathBuf::from("/repo/prism").as_path(), "feat/test");
+
+        assert_eq!(
+            args,
+            vec![
+                "-C",
+                "/repo/prism",
+                "switch",
+                "--create",
+                "--no-cd",
+                "--format",
+                "json",
+                "feat/test",
+            ]
+        );
     }
 
     #[test]
@@ -1093,6 +1144,74 @@ exit 0
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(tui.tmux_warmups_in_flight.is_empty());
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn prompt_paste_targets_tmux_agent_session() {
+        let temp = unique_temp_dir("prism-tmux-prompt-paste-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let prompt_file = temp.join("prompt.txt");
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  has-session|set-option)
+    exit 0
+    ;;
+  display-message)
+    echo opencode
+    exit 0
+    ;;
+  capture-pane)
+    echo 'Ask anything'
+    exit 0
+    ;;
+  load-buffer)
+    cat > '{}'
+    exit 0
+    ;;
+  paste-buffer)
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+                log.display(),
+                prompt_file.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+
+        let mut config = test_config();
+        config.default_agent = "opencode".to_string();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        config
+            .tools
+            .insert("opencode".to_string(), "opencode".to_string());
+        let repo = Repository { root: temp.clone() };
+        let session = test_session(temp.join("worktree"), "feature");
+        let mut tui = Tui::new(repo, config, vec![session], false);
+
+        tui.paste_prompt_into_tmux_agent(0, "build the thing")
+            .unwrap();
+
+        assert_eq!(fs::read_to_string(&prompt_file).unwrap(), "build the thing");
+        assert!(tui.sessions[0].agent.is_none());
+        assert_eq!(tui.sessions[0].agent_state, AgentState::NeedsInput);
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(commands.contains("load-buffer -b"));
+        assert!(commands.contains("paste-buffer -d -b"));
 
         let _ = fs::remove_dir_all(temp);
     }
