@@ -54,12 +54,21 @@ impl Tui {
             )?;
             return Ok(false);
         }
-        let branch = self.prompt_line("Branch name: ")?;
+        let Some(branch) = self.prompt_line_dialog("Create Session", "Branch name: ", "")? else {
+            return Ok(false);
+        };
         if branch.trim().is_empty() {
             return Ok(false);
         }
-        let initial_prompt = self.prompt_line("Initial prompt (optional): ")?;
-        self.show_message(&format!("creating worktree for {branch}"))?;
+        let Some(initial_prompt) =
+            self.prompt_line_dialog("Create Session", "Initial prompt (optional): ", "")?
+        else {
+            return Ok(false);
+        };
+        self.show_loading_dialog(
+            "Create Session",
+            &format!("Creating worktree for {}", branch.trim()),
+        )?;
         create_worktree_session(&self.repo, &self.config, branch.trim())?;
         clear_hidden(&self.repo, branch.trim())?;
         self.refresh_sessions()?;
@@ -75,6 +84,7 @@ impl Tui {
             })?;
         self.selected = index;
         if !initial_prompt.trim().is_empty() {
+            self.show_loading_dialog("Create Session", "Starting agent session")?;
             write_task_metadata(&self.repo, &self.sessions[index], &initial_prompt)?;
             self.sessions[index].prompt_summary = truncate(&initial_prompt.replace('\n', " "), 50);
             self.sessions[index].adopted = true;

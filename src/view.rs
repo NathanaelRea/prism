@@ -96,7 +96,7 @@ pub(crate) fn render_frame(
         );
     }
 
-    let visible_rows = rows.saturating_sub(5) as usize;
+    let visible_rows = rows.saturating_sub(4) as usize;
     let start = if selected >= visible_rows {
         selected + 1 - visible_rows
     } else {
@@ -157,7 +157,10 @@ pub(crate) fn render_frame(
         }
     }
 
-    let footer = format!(" {mode_label}  repo {} ", repo.root.display());
+    let footer = match status_message {
+        Some(message) => format!(" {mode_label}  repo {}  |  {message} ", repo.root.display()),
+        None => format!(" {mode_label}  repo {} ", repo.root.display()),
+    };
     if pr_width > 0 {
         push_line(
             &mut frame,
@@ -181,11 +184,6 @@ pub(crate) fn render_frame(
         );
     }
     frame.push_str(&fit_line(&footer, cols as usize));
-    frame.push('\n');
-    let status = status_message
-        .map(|message| format!(" status: {message}"))
-        .unwrap_or_else(|| " status:".to_string());
-    frame.push_str(&fit_line(&status, cols as usize));
     frame
 }
 
@@ -819,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn render_frame_keeps_status_message_visible() {
+    fn render_frame_keeps_status_message_in_footer() {
         let repo = Repository {
             root: PathBuf::from("/repo"),
         };
@@ -862,7 +860,8 @@ mod tests {
             20,
         );
 
-        assert!(frame.contains("status: current worktree is dirty"));
+        assert!(frame.contains("normal  repo /repo  |  current worktree is dirty"));
+        assert!(!frame.contains("status:"));
     }
 
     #[test]
