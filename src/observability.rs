@@ -894,6 +894,16 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
           last_refreshed text not null,
           refreshed_unix_ms integer not null
         );
+
+        create table if not exists pr_details_cache (
+          branch text primary key,
+          comments text not null,
+          reviews text not null,
+          review_comments text not null,
+          files text not null,
+          failing_checks text not null,
+          refreshed_unix_ms integer not null
+        );
         ",
     )
     .map_err(|error| format!("create schema: {error}"))?;

@@ -11,7 +11,7 @@ use crate::git::{
 };
 use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCache, fetch_pr_summary_index, pr_details_due, refresh_pr_cache,
-    refresh_pr_details_cache, refresh_pr_summary_index, remove_pr_cache,
+    refresh_pr_details_cache, refresh_pr_summary_index, remove_pr_cache, save_pr_details_cache,
 };
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::process::command_exists;
@@ -379,6 +379,9 @@ impl Tui {
                             session.pr.details = cache.details;
                             session.pr.details_last_polled = cache.details_last_polled;
                             session.pr.error = cache.error;
+                            if let Some(details) = &session.pr.details {
+                                let _ = save_pr_details_cache(&self.repo, &session.branch, details);
+                            }
                             if session_comment_count(session) > before_comments
                                 && selected_key.as_ref() != Some(&key)
                             {
