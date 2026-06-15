@@ -127,10 +127,11 @@ fn run_tui(repo_arg: Option<&std::path::Path>, allow_dirty: bool) -> Result<(), 
         if let Some(repo) = repos.get(selected_repo) {
             observability::attach_repo(&repo.repo);
         }
-        observability::phase("startup_setup_prompt", || {
-            let repo = &repos[selected_repo];
-            setup::maybe_prompt_startup_setup(&repo.repo, &repo.config)
-        })?;
+        if let Some(repo) = repos.get(selected_repo) {
+            observability::phase("startup_setup_prompt", || {
+                setup::maybe_prompt_startup_setup(&repo.repo, &repo.config)
+            })?;
+        }
         let sessions =
             observability::phase("discover_sessions", || discover_workspace_sessions(&repos))?;
         let mut tui = observability::phase("initialize_tui", || {

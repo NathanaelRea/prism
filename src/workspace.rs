@@ -1,9 +1,7 @@
 use std::fs;
-use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use crate::repo::Repository;
-use crate::terminal::stdin_is_tty;
 use crate::util::prism_config_dir;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,38 +50,11 @@ pub fn ensure_entries_for_tui(repo_arg: Option<&Path>) -> Result<(Vec<RepoEntry>
         return Ok((entries, index));
     }
 
-    let mut entries = load_entries();
+    let entries = load_entries();
     if !entries.is_empty() {
         return Ok((entries, 0));
     }
-    if !stdin_is_tty() {
-        return Err(format!(
-            "no repositories configured; add one with prism --repo <path> or edit {}",
-            repos_path().display()
-        ));
-    }
-
-    loop {
-        println!("Prism repositories");
-        println!("No repositories are configured yet.");
-        print!("Path to repository base/main checkout: ");
-        io::stdout().flush().map_err(|error| error.to_string())?;
-        let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .map_err(|error| error.to_string())?;
-        let input = input.trim();
-        if input.is_empty() {
-            return Err("no repository configured".to_string());
-        }
-        match ensure_repo_entry(Path::new(input)) {
-            Ok((_, index, loaded)) => {
-                entries = loaded;
-                return Ok((entries, index));
-            }
-            Err(error) => println!("Could not add repository: {error}"),
-        }
-    }
+    Ok((entries, 0))
 }
 
 pub fn label_for_root(root: &Path) -> String {

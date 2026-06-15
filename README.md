@@ -22,7 +22,7 @@ Requires Rust/Cargo, `git`, `gh`, `tmux`, `wt`, and `opencode`.
 
 ## Use
 
-Run `prism` from anywhere. On first launch, Prism prompts for a repository base/main checkout. You can also add/select one directly with `prism --repo <path>`.
+Run `prism` from anywhere. On first launch with no repositories configured, Prism opens and shows an add-repository dialog. You can also add/select one directly with `prism --repo <path>`.
 
 Press `?` in the TUI for the full key list.
 

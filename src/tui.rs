@@ -129,7 +129,7 @@ pub(crate) struct DefaultBranchPollResult {
 
 impl Tui {
     pub fn new(
-        mut repos: Vec<ManagedRepo>,
+        repos: Vec<ManagedRepo>,
         current_repo: usize,
         sessions: Vec<Session>,
         allow_dirty: bool,
@@ -138,15 +138,18 @@ impl Tui {
         let (tmux_warmup_tx, tmux_warmup_rx) = mpsc::channel();
         let (wt_poll_tx, wt_poll_rx) = mpsc::channel();
         let (default_branch_poll_tx, default_branch_poll_rx) = mpsc::channel();
-        if repos.is_empty() {
-            let repo = Repository {
-                root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            };
-            repos.push(ManagedRepo::new(repo.clone(), Config::load(&repo), None));
-        }
         let current_repo = current_repo.min(repos.len().saturating_sub(1));
-        let repo = repos[current_repo].repo.clone();
-        let config = repos[current_repo].config.clone();
+        let fallback_repo = Repository {
+            root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+        let repo = repos
+            .get(current_repo)
+            .map(|repo| repo.repo.clone())
+            .unwrap_or_else(|| fallback_repo.clone());
+        let config = repos
+            .get(current_repo)
+            .map(|repo| repo.config.clone())
+            .unwrap_or_else(|| Config::load(&fallback_repo));
         Self {
             repo,
             config,
@@ -212,6 +215,12 @@ impl Tui {
         self.start_wt_column_poll();
         self.start_default_branch_status_poll(true);
         self.draw()?;
+        if self.repos.is_empty() {
+            match self.add_repository() {
+                Ok(()) => {}
+                Err(error) => self.show_error("add repository failed", &error)?,
+            }
+        }
         let mut stdin = io::stdin();
         let mut buffer = [0_u8; 64];
         let mut key_input = KeyInput::default();
