@@ -19,8 +19,8 @@ pub struct Tui {
     pub(crate) repo: Repository,
     pub(crate) config: Config,
     pub(crate) sessions: Vec<Session>,
-    pub(crate) selected: usize,
     pub(crate) allow_dirty: bool,
+    pub(crate) selected: usize,
     pub(crate) pr_poll_tx: Sender<PrPollResult>,
     pub(crate) pr_poll_rx: Receiver<PrPollResult>,
     pub(crate) pr_polls_in_flight: BTreeSet<PrPollKey>,
@@ -30,6 +30,15 @@ pub struct Tui {
     pub(crate) tmux_warmup_rx: Receiver<TmuxWarmupResult>,
     pub(crate) tmux_warmups_in_flight: BTreeSet<TmuxWarmupKey>,
     pub(crate) tmux_generations: BTreeMap<TmuxSlotKey, u64>,
+    pub(crate) wt_poll_tx: Sender<WtPollResult>,
+    pub(crate) wt_poll_rx: Receiver<WtPollResult>,
+    pub(crate) wt_poll_in_flight: bool,
+    pub(crate) default_branch_poll_tx: Sender<DefaultBranchPollResult>,
+    pub(crate) default_branch_poll_rx: Receiver<DefaultBranchPollResult>,
+    pub(crate) default_branch_poll_in_flight: bool,
+    pub(crate) default_branch_last_polled: Option<std::time::Instant>,
+    pub(crate) session_filter: String,
+    pub(crate) leader_hint: Option<LeaderHint>,
     status_message: Option<String>,
     status_message_until: Option<Instant>,
 }
@@ -70,6 +79,22 @@ pub(crate) struct TmuxWarmupResult {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LeaderHint {
+    Root,
+    Git,
+}
+
+pub(crate) struct WtPollResult {
+    pub columns: Result<BTreeMap<PathBuf, BTreeMap<String, String>>, String>,
+}
+
+pub(crate) struct DefaultBranchPollResult {
+    pub branch: String,
+    pub path: PathBuf,
+    pub status_label: Result<String, String>,
+}
+
 impl Tui {
     pub fn new(
         repo: Repository,
@@ -79,12 +104,14 @@ impl Tui {
     ) -> Self {
         let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
         let (tmux_warmup_tx, tmux_warmup_rx) = mpsc::channel();
+        let (wt_poll_tx, wt_poll_rx) = mpsc::channel();
+        let (default_branch_poll_tx, default_branch_poll_rx) = mpsc::channel();
         Self {
             repo,
             config,
             sessions,
-            selected: 0,
             allow_dirty,
+            selected: 0,
             pr_poll_tx,
             pr_poll_rx,
             pr_polls_in_flight: BTreeSet::new(),
@@ -94,6 +121,15 @@ impl Tui {
             tmux_warmup_rx,
             tmux_warmups_in_flight: BTreeSet::new(),
             tmux_generations: BTreeMap::new(),
+            wt_poll_tx,
+            wt_poll_rx,
+            wt_poll_in_flight: false,
+            default_branch_poll_tx,
+            default_branch_poll_rx,
+            default_branch_poll_in_flight: false,
+            default_branch_last_polled: None,
+            session_filter: String::new(),
+            leader_hint: None,
             status_message: None,
             status_message_until: None,
         }
@@ -106,6 +142,8 @@ impl Tui {
 
         let mut raw = RawTerminal::enter()?;
         self.start_tmux_agent_warmup();
+        self.start_wt_column_poll();
+        self.start_default_branch_status_poll(true);
         self.draw()?;
         let mut stdin = io::stdin();
         let mut buffer = [0_u8; 64];
@@ -116,14 +154,24 @@ impl Tui {
         loop {
             let agents_changed = self.poll_agents();
             let tmux_changed = self.poll_tmux_agent_warmup();
+            let wt_changed = self.poll_wt_columns();
+            let default_branch_changed = self.poll_default_branch_status();
             let prs_changed = self.poll_pull_requests(false);
+            self.start_default_branch_status_poll(false);
             let status_changed = self.expire_status_message();
             let current_size = terminal_size();
             let resized = current_size != last_size;
             if resized {
                 last_size = current_size;
             }
-            if agents_changed || tmux_changed || prs_changed || status_changed || resized {
+            if agents_changed
+                || tmux_changed
+                || wt_changed
+                || default_branch_changed
+                || prs_changed
+                || status_changed
+                || resized
+            {
                 self.draw()?;
             }
             let count = match stdin.read(&mut buffer) {
@@ -142,74 +190,103 @@ impl Tui {
             for key in key_input.feed(&buffer[..count]) {
                 match key {
                     Key::Quit => {
+                        self.clear_leader_hint();
                         pending_g = false;
                         should_quit = self.confirm_quit()?;
                     }
                     Key::Down => {
-                        pending_g = false;
+                        self.clear_leader_hint();
                         self.move_down();
+                        pending_g = false;
                     }
                     Key::Up => {
-                        pending_g = false;
+                        self.clear_leader_hint();
                         self.move_up();
+                        pending_g = false;
                     }
                     Key::Bottom => {
+                        self.clear_leader_hint();
                         pending_g = false;
-                        self.selected = self.sessions.len().saturating_sub(1);
+                        self.select_bottom_visible();
                     }
                     Key::G => {
+                        self.clear_leader_hint();
                         if pending_g {
-                            self.selected = 0;
+                            self.select_top_visible();
                             pending_g = false;
                         } else {
                             pending_g = true;
                         }
                     }
+                    Key::Leader => {
+                        self.leader_hint = Some(LeaderHint::Root);
+                    }
+                    Key::LeaderGit => {
+                        self.leader_hint = Some(LeaderHint::Git);
+                    }
                     Key::AgentMode => {
+                        self.clear_leader_hint();
                         pending_g = false;
                         self.enter_agent_mode(&mut raw)?;
                     }
                     Key::LazyGit => {
+                        self.clear_leader_hint();
                         pending_g = false;
                         if let Err(error) = self.open_tmux_window(&mut raw, TmuxWindow::LazyGit) {
                             self.show_error("lazygit failed", &error)?;
                         }
                     }
                     Key::Terminal => {
+                        self.clear_leader_hint();
                         pending_g = false;
                         if let Err(error) = self.open_tmux_window(&mut raw, TmuxWindow::Terminal) {
                             self.show_error("terminal failed", &error)?;
                         }
                     }
                     Key::Help => {
+                        self.clear_leader_hint();
                         pending_g = false;
                         self.show_keybindings_dialog()?;
                     }
                     Key::Refresh => {
+                        self.clear_leader_hint();
                         pending_g = false;
                         self.refresh_sessions()?;
                         self.start_tmux_agent_warmup();
+                        self.start_wt_column_poll();
+                        self.start_default_branch_status_poll(true);
                         self.poll_pull_requests(true);
                     }
                     Key::ReviewFix => {
+                        self.clear_leader_hint();
                         pending_g = false;
                         if let Err(error) = self.start_review_fix() {
                             self.show_error("review fix failed", &error)?;
                         }
                     }
                     Key::Push => {
+                        self.clear_leader_hint();
                         pending_g = false;
                         if let Err(error) = self.push_selected_branch() {
                             self.show_error("push failed", &error)?;
                         }
                     }
                     Key::Merge => {
+                        self.clear_leader_hint();
                         pending_g = false;
                         if let Err(error) = self.merge_selected_pr() {
                             self.show_error("merge failed", &error)?;
                         }
                     }
+                    Key::PullDefault => {
+                        self.clear_leader_hint();
+                        pending_g = false;
+                        if let Err(error) = self.pull_default_branch() {
+                            self.show_error("pull failed", &error)?;
+                        }
+                    }
                     Key::Create => {
+                        self.clear_leader_hint();
                         pending_g = false;
                         match self.create_session() {
                             Ok(true) => self.enter_agent_mode(&mut raw)?,
@@ -218,12 +295,28 @@ impl Tui {
                         }
                     }
                     Key::Delete => {
+                        self.clear_leader_hint();
                         pending_g = false;
                         if let Err(error) = self.delete_session() {
                             self.show_error("delete failed", &error)?;
                         }
                     }
-                    Key::Other => pending_g = false,
+                    Key::EditConfig => {
+                        self.clear_leader_hint();
+                        pending_g = false;
+                        if let Err(error) = self.edit_config(&mut raw) {
+                            self.show_error("edit config failed", &error)?;
+                        }
+                    }
+                    Key::Search => {
+                        self.clear_leader_hint();
+                        pending_g = false;
+                        self.search_sessions()?;
+                    }
+                    Key::Other => {
+                        self.clear_leader_hint();
+                        pending_g = false;
+                    }
                 }
                 if should_quit {
                     break;
@@ -283,24 +376,87 @@ impl Tui {
     }
 
     fn show_keybindings_dialog(&self) -> Result<(), String> {
-        let lines = [
-            "Keybindings",
-            "",
+        let items = [
             "Space Space  open selected agent",
+            "Enter        open selected agent",
+            "Space Enter  open tmux window 3: terminal",
             "Space g g    open tmux window 2: lazygit",
-            "Enter        open tmux window 3: terminal",
+            "Ctrl-/       open tmux window 3: terminal",
+            "Space g P    push branch, create PR if needed",
+            "Space g M    merge selected PR",
+            "Space g f    stage review-fix prompt",
+            "Space g p    pull default branch",
+            "p            pull default branch",
             "c            create worktree session",
-            "P            push branch, create PR if needed",
-            "M            merge selected PR",
-            "f            stage review-fix prompt",
+            "e            edit Prism repo config, then reload",
+            "/            search/filter sessions",
+            "?            show keybindings; / filters this dialog",
             "D            delete worktree/session",
-            "j/k, arrows   move selection",
+            "j/k, arrows  move selection",
             "g g / G      top / bottom",
             "r            refresh",
             "q, Ctrl-C    quit",
-            "",
-            "Press any key to close",
         ];
+        let mut filter = String::new();
+        let mut editing_filter = false;
+        self.draw_keybindings_dialog(&items, &filter)?;
+
+        let mut stdin = io::stdin();
+        let mut byte = [0_u8; 1];
+        loop {
+            match stdin.read(&mut byte) {
+                Ok(1) => {}
+                Ok(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    continue;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                    continue;
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+            match byte[0] {
+                b'/' if !editing_filter => {
+                    editing_filter = true;
+                    filter.clear();
+                    self.draw_keybindings_dialog(&items, &filter)?;
+                }
+                b'\r' | b'\n' if editing_filter => editing_filter = false,
+                8 | 127 if editing_filter => {
+                    filter.pop();
+                    self.draw_keybindings_dialog(&items, &filter)?;
+                }
+                3 | 27 | b'q' => return Ok(()),
+                byte if editing_filter && !byte.is_ascii_control() => {
+                    filter.push(byte as char);
+                    self.draw_keybindings_dialog(&items, &filter)?;
+                }
+                _ if !editing_filter => return Ok(()),
+                _ => {}
+            }
+        }
+    }
+
+    fn draw_keybindings_dialog(&self, items: &[&str], filter: &str) -> Result<(), String> {
+        let query = filter.trim().to_ascii_lowercase();
+        let mut lines = vec!["Keybindings".to_string()];
+        lines.push(if filter.is_empty() {
+            "Filter: /".to_string()
+        } else {
+            format!("Filter: /{filter}")
+        });
+        lines.push(String::new());
+        lines.extend(
+            items
+                .iter()
+                .filter(|line| query.is_empty() || line.to_ascii_lowercase().contains(&query))
+                .map(|line| (*line).to_string()),
+        );
+        if lines.len() == 3 {
+            lines.push("No matching keybindings".to_string());
+        }
+        lines.extend([String::new(), "Esc/q closes. / searches.".to_string()]);
         let (cols, rows) = terminal_size();
         let available_width = (cols as usize).saturating_sub(2).max(4);
         let width = lines
@@ -335,20 +491,7 @@ impl Tui {
             left,
             "-".repeat(width.saturating_sub(2))
         ));
-        write_stdout(&frame)?;
-
-        let mut stdin = io::stdin();
-        let mut byte = [0_u8; 1];
-        loop {
-            match stdin.read(&mut byte) {
-                Ok(1) => return Ok(()),
-                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-                Err(error) => return Err(error.to_string()),
-            }
-        }
+        write_stdout(&frame)
     }
 
     pub(crate) fn confirm_delete_dialog(
@@ -651,13 +794,91 @@ impl Tui {
     }
 
     fn move_down(&mut self) {
-        if self.selected + 1 < self.sessions.len() {
-            self.selected += 1;
+        let indices = self.visible_session_indices();
+        let current = indices
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        if let Some(next) = indices.get(current + 1).copied() {
+            self.selected = next;
+            self.mark_selected_seen();
         }
     }
 
     fn move_up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
+        let indices = self.visible_session_indices();
+        let current = indices
+            .iter()
+            .position(|index| *index == self.selected)
+            .unwrap_or(0);
+        if current > 0
+            && let Some(next) = indices.get(current - 1).copied()
+        {
+            self.selected = next;
+            self.mark_selected_seen();
+        }
+    }
+
+    pub(crate) fn select_top_visible(&mut self) {
+        if let Some(index) = self.visible_session_indices().first().copied() {
+            self.selected = index;
+            self.mark_selected_seen();
+        }
+    }
+
+    fn select_bottom_visible(&mut self) {
+        if let Some(index) = self.visible_session_indices().last().copied() {
+            self.selected = index;
+            self.mark_selected_seen();
+        }
+    }
+
+    pub(crate) fn visible_session_indices(&self) -> Vec<usize> {
+        let filter = self.session_filter.trim().to_ascii_lowercase();
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, session)| {
+                (filter.is_empty()
+                    || session.branch.to_ascii_lowercase().contains(&filter)
+                    || session
+                        .prompt_summary
+                        .to_ascii_lowercase()
+                        .contains(&filter)
+                    || session.path_display.to_ascii_lowercase().contains(&filter)
+                    || session
+                        .wt_columns
+                        .values()
+                        .any(|value| value.to_ascii_lowercase().contains(&filter)))
+                .then_some(index)
+            })
+            .collect()
+    }
+
+    fn mark_selected_seen(&mut self) {
+        if let Some(session) = self.sessions.get_mut(self.selected) {
+            session.unseen_comments = false;
+        }
+    }
+
+    fn clear_leader_hint(&mut self) {
+        self.leader_hint = None;
+    }
+
+    fn search_sessions(&mut self) -> Result<(), String> {
+        let Some(input) = self.prompt_line_dialog(
+            "Search Sessions",
+            "Filter (empty clears): ",
+            &self.session_filter,
+        )?
+        else {
+            return Ok(());
+        };
+        self.session_filter = input;
+        if !self.visible_session_indices().contains(&self.selected) {
+            self.select_top_visible();
+        }
+        Ok(())
     }
 
     fn expire_status_message(&mut self) -> bool {
@@ -680,7 +901,19 @@ impl Tui {
             self.selected,
             "normal",
             self.status_message.as_deref(),
+            &self.session_filter,
+            self.leader_hint_label(),
         )
+    }
+
+    fn leader_hint_label(&self) -> Option<&'static str> {
+        match self.leader_hint {
+            Some(LeaderHint::Root) => Some("g: git  enter: terminal  space: agent"),
+            Some(LeaderHint::Git) => {
+                Some("g: lazygit  P: push/create PR  M: merge  f: review fix  p: pull")
+            }
+            None => None,
+        }
     }
 }
 

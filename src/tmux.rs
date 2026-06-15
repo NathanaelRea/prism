@@ -590,13 +590,16 @@ mod tests {
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
+            merge_method: crate::config::MergeMethod::Squash,
             checks: Checks::default(),
+            worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::from([(
                 "custom".to_string(),
                 "custom-agent --prompt {prompt}".to_string(),
             )]),
             agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
             user_path: PathBuf::from("/tmp/user.toml"),
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         };
@@ -615,10 +618,13 @@ mod tests {
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
+            merge_method: crate::config::MergeMethod::Squash,
             checks: Checks::default(),
+            worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
             user_path: PathBuf::from("/tmp/user.toml"),
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         };
@@ -1207,6 +1213,8 @@ exit 0
             agent_output: VecDeque::new(),
             agent_state: AgentState::Idle,
             pr: PrCache::default(),
+            wt_columns: BTreeMap::new(),
+            unseen_comments: false,
         }
     }
 
@@ -1218,10 +1226,13 @@ exit 0
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
+            merge_method: crate::config::MergeMethod::Squash,
             checks: Checks::default(),
+            worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
             user_path: PathBuf::from("/tmp/user.toml"),
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         }
