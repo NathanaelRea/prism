@@ -199,6 +199,16 @@ impl Tui {
                         self.move_down();
                         pending_g = false;
                     }
+                    Key::Left => {
+                        self.clear_leader_hint();
+                        self.move_left();
+                        pending_g = false;
+                    }
+                    Key::Right => {
+                        self.clear_leader_hint();
+                        self.move_right();
+                        pending_g = false;
+                    }
                     Key::Up => {
                         self.clear_leader_hint();
                         self.move_up();
@@ -816,6 +826,53 @@ impl Tui {
         {
             self.selected = next;
             self.mark_selected_seen();
+        }
+    }
+
+    fn move_left(&mut self) {
+        self.move_horizontal(-1);
+    }
+
+    fn move_right(&mut self) {
+        self.move_horizontal(1);
+    }
+
+    fn move_horizontal(&mut self, direction: isize) {
+        let Some(current_lane) = self
+            .sessions
+            .get(self.selected)
+            .and_then(|session| view::kanban_lane_index(&self.config, session))
+        else {
+            return;
+        };
+
+        let mut lanes: [Vec<usize>; view::KANBAN_LANE_COUNT] = std::array::from_fn(|_| Vec::new());
+        for index in self.visible_session_indices() {
+            if let Some(lane) = self
+                .sessions
+                .get(index)
+                .and_then(|session| view::kanban_lane_index(&self.config, session))
+            {
+                lanes[lane].push(index);
+            }
+        }
+
+        let Some(current_row) = lanes[current_lane]
+            .iter()
+            .position(|index| *index == self.selected)
+        else {
+            return;
+        };
+
+        let mut target_lane = current_lane as isize + direction;
+        while (0..view::KANBAN_LANE_COUNT as isize).contains(&target_lane) {
+            let lane = &lanes[target_lane as usize];
+            if let Some(next) = lane.get(current_row.min(lane.len().saturating_sub(1))) {
+                self.selected = *next;
+                self.mark_selected_seen();
+                return;
+            }
+            target_lane += direction;
         }
     }
 
