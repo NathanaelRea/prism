@@ -96,9 +96,10 @@ pub(crate) fn render_frame(
 
     let visible_rows = rows.saturating_sub(4) as usize;
     let visible_indices = visible_session_indices(sessions, session_filter);
-    let selected_visible = visible_indices
+    let left_rows = left_panel_rows(sessions, &visible_indices);
+    let selected_visible = left_rows
         .iter()
-        .position(|index| *index == selected)
+        .position(|row| matches!(row, LeftPanelRow::Session(index) if *index == selected))
         .unwrap_or(0);
     let start = if selected_visible >= visible_rows {
         selected_visible + 1 - visible_rows
@@ -121,9 +122,16 @@ pub(crate) fn render_frame(
 
     for row in 0..visible_rows {
         let visible_index = start + row;
-        let left = if let Some(index) = visible_indices.get(visible_index).copied() {
-            let session = &sessions[index];
-            format_session_row(config, session, index == selected, left_width as usize)
+        let left = if let Some(left_row) = left_rows.get(visible_index) {
+            match left_row {
+                LeftPanelRow::Separator { label, key } => {
+                    format_repo_separator(label, *key, left_width as usize)
+                }
+                LeftPanelRow::Session(index) => {
+                    let session = &sessions[*index];
+                    format_session_row(config, session, *index == selected, left_width as usize)
+                }
+            }
         } else {
             " ".repeat(left_width as usize)
         };
@@ -187,6 +195,44 @@ pub(crate) fn render_frame(
         append_leader_hint(&mut frame, hint, cols, rows);
     }
     frame
+}
+
+enum LeftPanelRow {
+    Separator { label: String, key: Option<char> },
+    Session(usize),
+}
+
+fn left_panel_rows(sessions: &[Session], visible_indices: &[usize]) -> Vec<LeftPanelRow> {
+    let mut rows = Vec::new();
+    let mut last_repo = None;
+    for index in visible_indices {
+        let Some(session) = sessions.get(*index) else {
+            continue;
+        };
+        if last_repo != Some(session.repo_index) {
+            rows.push(LeftPanelRow::Separator {
+                label: session.repo_label.clone(),
+                key: session.repo_key,
+            });
+            last_repo = Some(session.repo_index);
+        }
+        rows.push(LeftPanelRow::Session(*index));
+    }
+    rows
+}
+
+fn format_repo_separator(label: &str, key: Option<char>, width: usize) -> String {
+    let label = match key {
+        Some(key) => format!("--- [{key}] {label} "),
+        None => format!("--- {label} "),
+    };
+    let visible = label.chars().count();
+    let text = if visible >= width {
+        truncate_line(&label, width)
+    } else {
+        format!("{}{}", label, "-".repeat(width - visible))
+    };
+    color(&text, "90")
 }
 
 fn append_leader_hint(frame: &mut String, hint: &str, cols: u16, rows: u16) {
@@ -1163,6 +1209,9 @@ mod tests {
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         };
         let sessions = vec![Session {
+            repo_index: 0,
+            repo_label: "repo".to_string(),
+            repo_key: None,
             path: PathBuf::from("/repo"),
             path_display: "/repo".to_string(),
             branch: "main".to_string(),
@@ -1210,6 +1259,9 @@ mod tests {
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         };
         let sessions = vec![Session {
+            repo_index: 0,
+            repo_label: "repo".to_string(),
+            repo_key: None,
             path: PathBuf::from("/repo"),
             path_display: "/repo".to_string(),
             branch: "main".to_string(),
@@ -1265,6 +1317,9 @@ mod tests {
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         };
         let sessions = vec![Session {
+            repo_index: 0,
+            repo_label: "repo".to_string(),
+            repo_key: None,
             path: PathBuf::from("/repo"),
             path_display: "/repo".to_string(),
             branch: "main".to_string(),
@@ -1310,6 +1365,9 @@ mod tests {
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         };
         let mut session = Session {
+            repo_index: 0,
+            repo_label: "repo".to_string(),
+            repo_key: None,
             path: PathBuf::from("/repo"),
             path_display: "/repo".to_string(),
             branch: "main".to_string(),
@@ -1411,6 +1469,9 @@ mod tests {
         pr: PrCache,
     ) -> Session {
         Session {
+            repo_index: 0,
+            repo_label: "repo".to_string(),
+            repo_key: None,
             path: PathBuf::from(format!("/repo/{branch}")),
             path_display: format!("/repo/{branch}"),
             branch: branch.to_string(),

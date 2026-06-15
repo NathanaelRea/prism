@@ -19,6 +19,9 @@ use crate::util::{safe_branch_filename, truncate};
 
 #[derive(Debug)]
 pub struct Session {
+    pub repo_index: usize,
+    pub repo_label: String,
+    pub repo_key: Option<char>,
     pub path: PathBuf,
     pub path_display: String,
     pub branch: String,
@@ -101,6 +104,9 @@ fn build_session(repo: &Repository, path: PathBuf, branch: String, config: &Conf
         load_pr_cache(repo, &branch)
     };
     Session {
+        repo_index: 0,
+        repo_label: String::new(),
+        repo_key: None,
         path,
         path_display,
         branch,

@@ -18,11 +18,13 @@ mod tmux;
 mod tui;
 mod util;
 mod view;
+mod workspace;
 
 use args::{Args, CommandKind, DbCommand, DebugCommand};
 use config::Config;
 use observability::{LogLevel, ObserverOptions};
 use repo::Repository;
+use tui::ManagedRepo;
 
 fn main() {
     if let Err(error) = run() {
@@ -58,23 +60,39 @@ fn run() -> Result<(), String> {
         data_json: None,
     });
 
-    let repo = observability::phase("discover_repo", || {
-        Repository::discover(args.repo.as_deref())
-    })?;
-    observability::attach_repo(&repo);
-    let mut config = observability::phase("load_config", || Ok(Config::load(&repo)))?;
-
     match args.command {
         CommandKind::Config => {
+            let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
             config::print_config(&repo, &config);
             Ok(())
         }
-        CommandKind::Doctor => config::doctor(&repo, &mut config),
-        CommandKind::RunPlan(path) => plan::run_plan_cli(&repo, &config, &path),
-        CommandKind::Debug(command) => run_debug_command(command, &repo, &mut config),
-        CommandKind::Db(command) => run_db_command(command, &repo),
-        CommandKind::Tui => run_tui(repo, config, args.allow_dirty),
+        CommandKind::Doctor => {
+            let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;
+            config::doctor(&repo, &mut config)
+        }
+        CommandKind::RunPlan(path) => {
+            let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
+            plan::run_plan_cli(&repo, &config, &path)
+        }
+        CommandKind::Debug(command) => {
+            let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;
+            run_debug_command(command, &repo, &mut config)
+        }
+        CommandKind::Db(command) => {
+            let (repo, _) = load_single_repo_context(args.repo.as_deref())?;
+            run_db_command(command, &repo)
+        }
+        CommandKind::Tui => run_tui(args.repo.as_deref(), args.allow_dirty),
     }
+}
+
+fn load_single_repo_context(
+    repo_arg: Option<&std::path::Path>,
+) -> Result<(Repository, Config), String> {
+    let repo = observability::phase("discover_repo", || Repository::discover(repo_arg))?;
+    observability::attach_repo(&repo);
+    let config = observability::phase("load_config", || Ok(Config::load(&repo)))?;
+    Ok((repo, config))
 }
 
 fn observer_options(args: &Args) -> ObserverOptions {
@@ -89,22 +107,37 @@ fn observer_options(args: &Args) -> ObserverOptions {
     }
 }
 
-fn run_tui(repo: Repository, mut config: Config, allow_dirty: bool) -> Result<(), String> {
+fn run_tui(repo_arg: Option<&std::path::Path>, allow_dirty: bool) -> Result<(), String> {
     observability::start_startup_run(env!("CARGO_PKG_VERSION"));
     let result: Result<(), String> = (|| {
-        observability::phase("ensure_tools", || config::ensure_required_tools(&config))?;
-        observability::phase("ensure_default_agent", || {
-            config::ensure_default_agent(&mut config)
+        let (entries, selected_repo) = observability::phase("load_workspace", || {
+            workspace::ensure_entries_for_tui(repo_arg)
         })?;
-        observability::phase("startup_setup_prompt", || {
-            setup::maybe_prompt_startup_setup(&repo, &config)
-        })?;
-        let sessions = observability::phase("discover_sessions", || {
-            session::discover_sessions(&repo, &config)
-        })?;
+        let mut repos = Vec::new();
+        for entry in entries {
+            let repo = Repository::discover(Some(&entry.root))?;
+            let mut config = Config::load(&repo);
+            observability::phase("ensure_tools", || config::ensure_required_tools(&config))?;
+            observability::phase("ensure_default_agent", || {
+                config::ensure_default_agent(&mut config)
+            })?;
+            repos.push(ManagedRepo::new(repo, config, entry.key));
+        }
+        let selected_repo = selected_repo.min(repos.len().saturating_sub(1));
+        if let Some(repo) = repos.get(selected_repo) {
+            observability::attach_repo(&repo.repo);
+        }
+        if let Some(repo) = repos.get(selected_repo) {
+            observability::phase("startup_setup_prompt", || {
+                setup::maybe_prompt_startup_setup(&repo.repo, &repo.config)
+            })?;
+        }
+        let sessions =
+            observability::phase("discover_sessions", || discover_workspace_sessions(&repos))?;
         let mut tui = observability::phase("initialize_tui", || {
-            Ok(tui::Tui::new(repo, config, sessions, allow_dirty))
+            Ok(tui::Tui::new(repos, selected_repo, sessions, allow_dirty))
         })?;
+        tui.select_repo(selected_repo);
         observability::phase("run_tui", || tui.run())
     })();
     match &result {
@@ -112,6 +145,20 @@ fn run_tui(repo: Repository, mut config: Config, allow_dirty: bool) -> Result<()
         Err(error) => observability::finish_startup_run("error", Some(error.as_str())),
     }
     result
+}
+
+fn discover_workspace_sessions(repos: &[ManagedRepo]) -> Result<Vec<session::Session>, String> {
+    let mut all = Vec::new();
+    for (index, managed) in repos.iter().enumerate() {
+        let mut sessions = session::discover_sessions(&managed.repo, &managed.config)?;
+        for session in &mut sessions {
+            session.repo_index = index;
+            session.repo_label = managed.label.clone();
+            session.repo_key = managed.key;
+        }
+        all.extend(sessions);
+    }
+    Ok(all)
 }
 
 fn run_debug_command(
