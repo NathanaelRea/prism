@@ -1,4 +1,4 @@
-use crate::agent::{AgentState, output_tail};
+use crate::agent::AgentState;
 use crate::config::Config;
 use crate::repo::Repository;
 use crate::session::Session;
@@ -39,9 +39,9 @@ pub(crate) fn render_frame(
 ) -> String {
     let pr_width = if cols >= 118 { 36 } else { 0 };
     let left_width = if pr_width > 0 {
-        cols.saturating_sub(pr_width + 26).clamp(42, 68)
+        cols.saturating_sub(pr_width + 66).clamp(30, 42)
     } else {
-        cols.saturating_sub(25).clamp(36, 64)
+        cols.saturating_sub(58).clamp(28, 42)
     };
     let center_width =
         cols.saturating_sub(left_width + pr_width + if pr_width > 0 { 2 } else { 1 });
@@ -54,7 +54,7 @@ pub(crate) fn render_frame(
                 "{}| {}| {}",
                 styled_cell("Sessions / Worktrees", left_width as usize, "1;36"),
                 styled_cell(
-                    "Agent Session",
+                    "Kanban",
                     center_width.saturating_sub(2) as usize,
                     "1;36"
                 ),
@@ -79,7 +79,7 @@ pub(crate) fn render_frame(
                 "{}| {}",
                 styled_cell("Sessions / Worktrees", left_width as usize, "1;36"),
                 styled_cell(
-                    "Agent / PR",
+                    "Kanban",
                     center_width.saturating_sub(2) as usize,
                     "1;36"
                 ),
@@ -103,7 +103,13 @@ pub(crate) fn render_frame(
         0
     };
     let selected_session = sessions.get(selected);
-    let agent_lines = format_agent_panel_lines(selected_session, mode_label);
+    let kanban_lines = format_kanban_panel_lines(
+        config,
+        sessions,
+        selected,
+        center_width.saturating_sub(2) as usize,
+        visible_rows,
+    );
     let pr_lines = format_pr_panel_lines(config, selected_session);
 
     for row in 0..visible_rows {
@@ -113,19 +119,7 @@ pub(crate) fn render_frame(
         } else {
             " ".repeat(left_width as usize)
         };
-        let center = if index == selected || row < agent_lines.len() {
-            agent_lines.get(row).cloned().unwrap_or_default()
-        } else if row == 0 {
-            format!(
-                "default agent: {}",
-                truncate_line(
-                    &config.default_agent,
-                    center_width.saturating_sub(2) as usize
-                )
-            )
-        } else {
-            String::new()
-        };
+        let center = kanban_lines.get(row).cloned().unwrap_or_default();
         if pr_width > 0 {
             let pr = pr_lines.get(row).cloned().unwrap_or_default();
             push_line(
@@ -138,20 +132,12 @@ pub(crate) fn render_frame(
                 ),
             );
         } else {
-            let merged = if row < agent_lines.len() {
-                center
-            } else {
-                pr_lines
-                    .get(row - agent_lines.len())
-                    .cloned()
-                    .unwrap_or_default()
-            };
             push_line(
                 &mut frame,
                 cols,
                 format!(
                     "{left}| {}",
-                    ansi_cell(&merged, center_width.saturating_sub(2) as usize),
+                    ansi_cell(&center, center_width.saturating_sub(2) as usize),
                 ),
             );
         }
@@ -317,6 +303,207 @@ fn format_session_row(config: &Config, session: &Session, selected: bool, width:
     ansi_cell(&text, width)
 }
 
+#[derive(Clone, Copy)]
+enum KanbanLane {
+    Plan,
+    Impl,
+    PrCi,
+    Merged,
+}
+
+impl KanbanLane {
+    fn index(self) -> usize {
+        match self {
+            Self::Plan => 0,
+            Self::Impl => 1,
+            Self::PrCi => 2,
+            Self::Merged => 3,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Impl => "impl",
+            Self::PrCi => "pr/ci",
+            Self::Merged => "merged",
+        }
+    }
+
+    fn color(self) -> &'static str {
+        match self {
+            Self::Plan => "90",
+            Self::Impl => "33",
+            Self::PrCi => "32",
+            Self::Merged => "35",
+        }
+    }
+}
+
+const KANBAN_LANES: [KanbanLane; 4] = [
+    KanbanLane::Plan,
+    KanbanLane::Impl,
+    KanbanLane::PrCi,
+    KanbanLane::Merged,
+];
+
+fn format_kanban_panel_lines(
+    config: &Config,
+    sessions: &[Session],
+    selected: usize,
+    width: usize,
+    visible_rows: usize,
+) -> Vec<String> {
+    if width < 32 {
+        return vec![color("Kanban needs more width", "90")];
+    }
+
+    let mut lanes: [Vec<(usize, &Session)>; 4] = std::array::from_fn(|_| Vec::new());
+    for (index, session) in sessions.iter().enumerate() {
+        if let Some(lane) = kanban_lane(config, session) {
+            lanes[lane.index()].push((index, session));
+        }
+    }
+
+    if lanes.iter().all(Vec::is_empty) {
+        return vec![
+            color("No feature worktrees", "90"),
+            color("Create one with c", "33"),
+        ];
+    }
+
+    let widths = kanban_column_widths(width);
+    let mut lines = Vec::new();
+
+    lines.push(join_kanban_columns(
+        KANBAN_LANES
+            .iter()
+            .enumerate()
+            .map(|(index, lane)| {
+                let header = format!("{} {}", lane.label(), lanes[index].len());
+                ansi_cell(&color(&header, lane.color()), widths[index])
+            }),
+    ));
+    lines.push(join_kanban_columns(
+        widths.iter().map(|width| "-".repeat(*width)),
+    ));
+
+    let max_lane_rows = lanes.iter().map(Vec::len).max().unwrap_or(0);
+    let card_rows = visible_rows.saturating_sub(lines.len() + 1);
+    let shown_rows = max_lane_rows.min(card_rows);
+    for row in 0..shown_rows {
+        lines.push(join_kanban_columns(
+            lanes.iter().enumerate().map(|(lane_index, lane_sessions)| {
+                if let Some((index, session)) = lane_sessions.get(row) {
+                    format_kanban_card(config, session, *index == selected, widths[lane_index])
+                } else {
+                    " ".repeat(widths[lane_index])
+                }
+            }),
+        ));
+    }
+
+    if max_lane_rows > shown_rows && lines.len() < visible_rows {
+        lines.push(join_kanban_columns(
+            lanes.iter().enumerate().map(|(lane_index, lane_sessions)| {
+                let remaining = lane_sessions.len().saturating_sub(shown_rows);
+                if remaining > 0 {
+                    ansi_cell(&color(&format!("+{remaining} more"), "90"), widths[lane_index])
+                } else {
+                    " ".repeat(widths[lane_index])
+                }
+            }),
+        ));
+    }
+
+    lines
+}
+
+fn kanban_lane(config: &Config, session: &Session) -> Option<KanbanLane> {
+    if config.is_default_branch(&session.branch) {
+        return None;
+    }
+
+    if session
+        .pr
+        .summary
+        .as_ref()
+        .map(|summary| summary.merged)
+        .unwrap_or(false)
+    {
+        return Some(KanbanLane::Merged);
+    }
+    if session.pr.summary.is_some() {
+        return Some(KanbanLane::PrCi);
+    }
+    if status_count(&session.status_label, "dirty").is_some()
+        || status_count(&session.status_label, "ahead").is_some()
+        || matches!(
+            session.agent_state,
+            AgentState::Running
+                | AgentState::ExitedError
+                | AgentState::NeedsRestart
+                | AgentState::NeedsInput
+        )
+    {
+        return Some(KanbanLane::Impl);
+    }
+    Some(KanbanLane::Plan)
+}
+
+fn kanban_column_widths(width: usize) -> [usize; 4] {
+    let gaps = 3;
+    let available = width.saturating_sub(gaps);
+    let base = available / KANBAN_LANES.len();
+    let mut remainder = available % KANBAN_LANES.len();
+    std::array::from_fn(|_| {
+        let extra = usize::from(remainder > 0);
+        remainder = remainder.saturating_sub(1);
+        base + extra
+    })
+}
+
+fn join_kanban_columns(columns: impl IntoIterator<Item = String>) -> String {
+    columns.into_iter().collect::<Vec<_>>().join(" ")
+}
+
+fn format_kanban_card(
+    config: &Config,
+    session: &Session,
+    selected: bool,
+    width: usize,
+) -> String {
+    let marker = if selected { color("▶", "1;36") } else { " ".to_string() };
+    let mut suffix = git_status_indicator(&session.status_label);
+    if let Some(summary) = &session.pr.summary {
+        suffix = if suffix.is_empty() {
+            format!("#{}", summary.number)
+        } else {
+            format!("{suffix} #{}", summary.number)
+        };
+        let ci = ci_icon(config, session);
+        if !ci.is_empty() {
+            suffix.push(' ');
+            suffix.push_str(ci);
+        }
+    }
+
+    let label_width = width.saturating_sub(2);
+    let label = if suffix.is_empty() {
+        truncate_line(&session.branch, label_width)
+    } else {
+        let suffix_width = visible_len(&suffix);
+        let branch_width = label_width.saturating_sub(suffix_width + 1).max(1);
+        format!(
+            "{} {}",
+            truncate_line(&session.branch, branch_width),
+            truncate_line(&suffix, suffix_width),
+        )
+    };
+    let code = if selected { "1;37" } else { "37" };
+    ansi_cell(&format!("{marker} {}", color(&label, code)), width)
+}
+
 fn pr_label(config: &Config, session: &Session) -> String {
     if config.is_default_branch(&session.branch) {
         return String::new();
@@ -471,30 +658,6 @@ fn comment_color(session: &Session) -> &'static str {
     } else {
         "36"
     }
-}
-
-fn format_agent_panel_lines(session: Option<&Session>, mode_label: &str) -> Vec<String> {
-    let Some(session) = session else {
-        return vec!["No worktrees discovered".to_string()];
-    };
-    let summary = if session.prompt_summary.is_empty() {
-        "No stored prompt summary"
-    } else {
-        &session.prompt_summary
-    };
-    let output_tail = output_tail(&session.agent_output);
-    let mut lines = vec![
-        format!("branch: {}", session.branch),
-        format!("mode: {mode_label}"),
-        format!("agent: {}", session.agent_state.label()),
-        format!("git: {}", session.status_label),
-        format!("path: {}", session.path.display()),
-        format!("prompt: {summary}"),
-    ];
-    if !output_tail.is_empty() {
-        lines.push(format!("last output: {output_tail}"));
-    }
-    lines
 }
 
 fn format_pr_panel_lines(config: &Config, session: Option<&Session>) -> Vec<String> {
@@ -760,7 +923,7 @@ mod tests {
 
     use crate::agent::AgentState;
     use crate::config::{Checks, Config, EscapeKey};
-    use crate::github::PrCache;
+    use crate::github::{PrCache, PrSummary};
     use crate::repo::Repository;
     use crate::session::Session;
 
@@ -903,5 +1066,95 @@ mod tests {
         assert_eq!(git_status_indicator("behind 2"), "↓2");
         assert_eq!(git_status_indicator("ahead 3 behind 2"), "↑3↓2");
         assert_eq!(git_status_indicator("dirty 4 ahead 3 behind 2"), "✗4↑3↓2");
+    }
+
+    #[test]
+    fn kanban_panel_groups_sessions_in_workflow_order() {
+        let repo = Repository {
+            root: PathBuf::from("/repo"),
+        };
+        let config = test_config(Some("main"));
+        let sessions = vec![
+            test_session("main", "clean", AgentState::Idle, PrCache::default()),
+            test_session("planned-work", "clean", AgentState::Idle, PrCache::default()),
+            test_session("impl-work", "dirty 1", AgentState::Idle, PrCache::default()),
+            test_session("pr-work", "clean", AgentState::Idle, test_pr(12, false)),
+            test_session("merged-work", "clean", AgentState::Idle, test_pr(13, true)),
+        ];
+
+        let frame = render_frame(&repo, &config, &sessions, 2, "normal", None, 160, 20);
+        let frame = crate::util::strip_ansi(&frame);
+
+        let plan = frame.find("plan 1").expect("plan lane");
+        let implementation = frame.find("impl 1").expect("impl lane");
+        let pr_ci = frame.find("pr/ci 1").expect("pr/ci lane");
+        let merged = frame.find("merged 1").expect("merged lane");
+        assert!(plan < implementation);
+        assert!(implementation < pr_ci);
+        assert!(pr_ci < merged);
+        assert!(frame.contains("planned-work"));
+        assert!(frame.contains("impl-work"));
+        assert!(frame.contains("pr-work"));
+        assert!(frame.contains("merged-work"));
+    }
+
+    fn test_config(default_base: Option<&str>) -> Config {
+        Config {
+            default_agent: "opencode".to_string(),
+            default_base: default_base.map(str::to_string),
+            plan_dir: "plans".to_string(),
+            review_packet_dir: ".agent/review".to_string(),
+            worktree_command: "wt".to_string(),
+            escape_key: EscapeKey::EscEsc,
+            checks: Checks::default(),
+            tools: BTreeMap::new(),
+            agent_commands: BTreeMap::new(),
+            agent_prompt_modes: BTreeMap::new(),
+            user_path: PathBuf::from("/tmp/user.toml"),
+            repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
+        }
+    }
+
+    fn test_session(
+        branch: &str,
+        status_label: &str,
+        agent_state: AgentState,
+        pr: PrCache,
+    ) -> Session {
+        Session {
+            path: PathBuf::from(format!("/repo/{branch}")),
+            path_display: format!("/repo/{branch}"),
+            branch: branch.to_string(),
+            prompt_summary: String::new(),
+            adopted: false,
+            hidden: false,
+            status_label: status_label.to_string(),
+            agent: None,
+            agent_output: VecDeque::new(),
+            agent_state,
+            pr,
+        }
+    }
+
+    fn test_pr(number: u64, merged: bool) -> PrCache {
+        PrCache {
+            summary: Some(PrSummary {
+                number,
+                title: format!("PR {number}"),
+                body: String::new(),
+                url: format!("https://example.com/{number}"),
+                state: "OPEN".to_string(),
+                review_decision: "".to_string(),
+                head_ref: format!("branch-{number}"),
+                base_ref: "main".to_string(),
+                head_sha: format!("sha-{number}"),
+                updated_at: "now".to_string(),
+                check_status: "passed".to_string(),
+                comment_count: 0,
+                merged,
+                draft: false,
+            }),
+            ..PrCache::default()
+        }
     }
 }

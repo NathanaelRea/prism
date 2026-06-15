@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::fs;
 use std::os::fd::RawFd;
 use std::os::unix::process::CommandExt;
@@ -314,13 +313,6 @@ impl Drop for AgentProcess {
             let _ = fs::remove_file(path);
         }
     }
-}
-
-pub fn output_tail(output: &VecDeque<String>) -> String {
-    output
-        .back()
-        .map(|chunk| chunk.replace('\r', "").replace('\n', " "))
-        .unwrap_or_default()
 }
 
 fn exited_successfully(status: i32) -> bool {
