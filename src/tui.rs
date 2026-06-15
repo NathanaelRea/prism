@@ -378,8 +378,10 @@ impl Tui {
     fn show_keybindings_dialog(&self) -> Result<(), String> {
         let items = [
             "Space Space  open selected agent",
+            "Enter        open selected agent",
             "Space Enter  open tmux window 3: terminal",
             "Space g g    open tmux window 2: lazygit",
+            "Ctrl-/       open tmux window 3: terminal",
             "Space g P    push branch, create PR if needed",
             "Space g M    merge selected PR",
             "Space g f    stage review-fix prompt",

@@ -26,6 +26,7 @@ impl KeyInput {
                         self.state = KeyInputState::Leader;
                         keys.push(Key::Leader);
                     }
+                    b'\r' | b'\n' => keys.push(Key::AgentMode),
                     31 => keys.push(Key::Terminal),
                     b'k' => keys.push(Key::Up),
                     b'j' => keys.push(Key::Down),
@@ -154,7 +155,21 @@ mod tests {
     }
 
     #[test]
-    fn key_input_handles_terminal_and_help_keys() {
+    fn key_input_handles_enter_agent_mode_and_help_keys() {
+        let mut input = KeyInput::default();
+        let keys = input.feed(b"\n?");
+        assert!(matches!(keys.as_slice(), [Key::AgentMode, Key::Help]));
+    }
+
+    #[test]
+    fn key_input_handles_terminal_key() {
+        let mut input = KeyInput::default();
+        let keys = input.feed(&[31]);
+        assert!(matches!(keys.as_slice(), [Key::Terminal]));
+    }
+
+    #[test]
+    fn key_input_handles_leader_terminal_key() {
         let mut input = KeyInput::default();
         let keys = input.feed(b" \n?");
         assert!(matches!(
