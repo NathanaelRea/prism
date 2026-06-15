@@ -41,6 +41,40 @@ impl EscapeKey {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MergeMethod {
+    Squash,
+    Merge,
+    Rebase,
+}
+
+impl MergeMethod {
+    fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "squash" => Some(Self::Squash),
+            "merge" => Some(Self::Merge),
+            "rebase" => Some(Self::Rebase),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Squash => "squash",
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+        }
+    }
+
+    pub fn gh_flag(self) -> &'static str {
+        match self {
+            Self::Squash => "--squash",
+            Self::Merge => "--merge",
+            Self::Rebase => "--rebase",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub default_agent: String,
@@ -49,10 +83,13 @@ pub struct Config {
     pub review_packet_dir: String,
     pub worktree_command: String,
     pub escape_key: EscapeKey,
+    pub merge_method: MergeMethod,
     pub checks: Checks,
+    pub worktree_columns: Vec<String>,
     pub tools: BTreeMap<String, String>,
     pub agent_commands: BTreeMap<String, String>,
     pub agent_prompt_modes: BTreeMap<String, PromptMode>,
+    pub prompt_templates: BTreeMap<String, String>,
     pub user_path: PathBuf,
     pub repo_config_path: PathBuf,
 }
@@ -91,10 +128,13 @@ impl Config {
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
+            merge_method: MergeMethod::Squash,
             checks: Checks::default(),
+            worktree_columns: vec!["url".to_string()],
             tools,
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
             user_path,
             repo_config_path,
         }
@@ -133,9 +173,22 @@ impl Config {
                 continue;
             }
 
+            if section == "worktrees" {
+                if key == "columns"
+                    && let Some(values) = parse_toml_string_array(raw_value)
+                {
+                    self.worktree_columns = values;
+                }
+                continue;
+            }
+
             let Some(value) = parse_toml_string(raw_value) else {
                 continue;
             };
+            if section == "prompt_templates" {
+                self.prompt_templates.insert(key.to_string(), value);
+                continue;
+            }
             if section == "tools" {
                 self.tools.insert(key.to_string(), value);
                 continue;
@@ -160,6 +213,11 @@ impl Config {
                 "plan_dir" => self.plan_dir = value,
                 "review_packet_dir" => self.review_packet_dir = value,
                 "worktree_command" => self.worktree_command = value,
+                "merge_method" => {
+                    if let Some(method) = MergeMethod::parse(&value) {
+                        self.merge_method = method;
+                    }
+                }
                 "escape_key" => {
                     if let Some(key) = EscapeKey::parse(&value) {
                         self.escape_key = key;
@@ -194,6 +252,10 @@ impl Config {
             .unwrap_or_else(|| builtin_prompt_mode(name))
     }
 
+    pub fn prompt_template(&self, name: &str) -> Option<&str> {
+        self.prompt_templates.get(name).map(String::as_str)
+    }
+
     pub fn is_default_branch(&self, branch: &str) -> bool {
         self.default_base
             .as_deref()
@@ -215,6 +277,12 @@ pub fn print_config(repo: &Repository, config: &Config) {
     println!("review_packet_dir = {}", config.review_packet_dir);
     println!("worktree_command = {}", config.worktree_command);
     println!("escape_key = {}", config.escape_key.label());
+    println!("merge_method = {}", config.merge_method.label());
+    println!("worktree_columns = {:?}", config.worktree_columns);
+    println!(
+        "prompt_templates = {:?}",
+        config.prompt_templates.keys().collect::<Vec<_>>()
+    );
     println!("[tools]");
     for (key, value) in &config.tools {
         println!("{key} = {value}");
@@ -467,12 +535,35 @@ fn save_user_default_agent(config: &Config, selected: &str) -> Result<(), String
 pub fn parse_toml_string(value: &str) -> Option<String> {
     let value = value.trim();
     if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-        Some(value[1..value.len() - 1].replace("\\\"", "\""))
+        parse_toml_basic_string(&value[1..value.len() - 1])
     } else if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
         Some(value[1..value.len() - 1].to_string())
     } else {
         Some(value.to_string())
     }
+}
+
+fn parse_toml_basic_string(value: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut chars = value.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+        let escaped = match chars.next()? {
+            'b' => '\x08',
+            't' => '\t',
+            'n' => '\n',
+            'f' => '\x0c',
+            'r' => '\r',
+            '"' => '"',
+            '\\' => '\\',
+            _ => return None,
+        };
+        out.push(escaped);
+    }
+    Some(out)
 }
 
 pub fn parse_toml_string_array(value: &str) -> Option<Vec<String>> {
@@ -531,9 +622,33 @@ mod tests {
     }
 
     #[test]
+    fn parses_toml_string_escapes_once() {
+        assert_eq!(
+            parse_toml_string(r#""line\nnext""#),
+            Some("line\nnext".to_string())
+        );
+        assert_eq!(
+            parse_toml_string(r#""literal\\n""#),
+            Some(r#"literal\n"#.to_string())
+        );
+        assert_eq!(
+            parse_toml_string(r#""carriage\rreturn""#),
+            Some("carriage\rreturn".to_string())
+        );
+    }
+
+    #[test]
     fn parses_escape_key() {
         assert_eq!(EscapeKey::parse("ctrl-space"), Some(EscapeKey::CtrlSpace));
         assert_eq!(EscapeKey::parse("esc-esc"), Some(EscapeKey::EscEsc));
+    }
+
+    #[test]
+    fn parses_merge_method() {
+        assert_eq!(MergeMethod::parse("squash"), Some(MergeMethod::Squash));
+        assert_eq!(MergeMethod::parse("merge"), Some(MergeMethod::Merge));
+        assert_eq!(MergeMethod::parse("rebase"), Some(MergeMethod::Rebase));
+        assert_eq!(MergeMethod::parse("unknown"), None);
     }
 
     #[test]
@@ -546,6 +661,7 @@ mod tests {
         assert_eq!(AGENT_CANDIDATES, ["opencode"]);
         assert_eq!(config.default_agent, "opencode");
         assert_eq!(config.default_base.as_deref(), Some("main"));
+        assert_eq!(config.merge_method, MergeMethod::Squash);
         assert!(config.is_default_branch("main"));
         assert_eq!(
             config.agent_command("opencode"),
@@ -572,6 +688,26 @@ mod tests {
         assert_eq!(config.default_base.as_deref(), Some("develop"));
         assert!(config.is_default_branch("develop"));
         assert!(!config.is_default_branch("main"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn repo_config_overrides_merge_method() {
+        let path = std::env::temp_dir().join(format!(
+            "prism-config-merge-method-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, r#"merge_method = "merge""#).unwrap();
+        let mut config = Config::defaults(PathBuf::from("/tmp/user.toml"), path.clone());
+
+        config.apply_file(&path);
+
+        assert_eq!(config.merge_method, MergeMethod::Merge);
 
         let _ = fs::remove_file(path);
     }

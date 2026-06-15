@@ -12,6 +12,8 @@ pub fn draw(
     selected: usize,
     mode_label: &str,
     status_message: Option<&str>,
+    session_filter: &str,
+    leader_hint: Option<&str>,
 ) -> Result<(), String> {
     let (cols, rows) = terminal_size();
     write_stdout(&render_frame(
@@ -21,6 +23,8 @@ pub fn draw(
         selected,
         mode_label,
         status_message,
+        session_filter,
+        leader_hint,
         cols,
         rows,
     ))
@@ -34,6 +38,8 @@ pub(crate) fn render_frame(
     selected: usize,
     mode_label: &str,
     status_message: Option<&str>,
+    session_filter: &str,
+    leader_hint: Option<&str>,
     cols: u16,
     rows: u16,
 ) -> String {
@@ -97,8 +103,13 @@ pub(crate) fn render_frame(
     }
 
     let visible_rows = rows.saturating_sub(4) as usize;
-    let start = if selected >= visible_rows {
-        selected + 1 - visible_rows
+    let visible_indices = visible_session_indices(sessions, session_filter);
+    let selected_visible = visible_indices
+        .iter()
+        .position(|index| *index == selected)
+        .unwrap_or(0);
+    let start = if selected_visible >= visible_rows {
+        selected_visible + 1 - visible_rows
     } else {
         0
     };
@@ -107,13 +118,14 @@ pub(crate) fn render_frame(
     let pr_lines = format_pr_panel_lines(config, selected_session);
 
     for row in 0..visible_rows {
-        let index = start + row;
-        let left = if let Some(session) = sessions.get(index) {
+        let visible_index = start + row;
+        let left = if let Some(index) = visible_indices.get(visible_index).copied() {
+            let session = &sessions[index];
             format_session_row(config, session, index == selected, left_width as usize)
         } else {
             " ".repeat(left_width as usize)
         };
-        let center = if index == selected || row < agent_lines.len() {
+        let center = if row < agent_lines.len() {
             agent_lines.get(row).cloned().unwrap_or_default()
         } else if row == 0 {
             format!(
@@ -157,6 +169,11 @@ pub(crate) fn render_frame(
         }
     }
 
+    let mode_label = if session_filter.trim().is_empty() {
+        mode_label.to_string()
+    } else {
+        format!("{mode_label} /{}", session_filter.trim())
+    };
     let footer = match status_message {
         Some(message) => format!(" {mode_label}  repo {}  |  {message} ", repo.root.display()),
         None => format!(" {mode_label}  repo {} ", repo.root.display()),
@@ -184,7 +201,65 @@ pub(crate) fn render_frame(
         );
     }
     frame.push_str(&fit_line(&footer, cols as usize));
+    if let Some(hint) = leader_hint {
+        append_leader_hint(&mut frame, hint, cols, rows);
+    }
     frame
+}
+
+fn append_leader_hint(frame: &mut String, hint: &str, cols: u16, rows: u16) {
+    let lines = hint.split("  ").collect::<Vec<_>>();
+    let width = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or(0)
+        .saturating_add(4)
+        .max(18)
+        .min(cols.saturating_sub(2) as usize);
+    let height = lines.len() + 2;
+    let left = (cols as usize).saturating_sub(width + 1).max(1);
+    let top = (rows as usize).saturating_sub(height + 1).max(1);
+    let text_width = width.saturating_sub(4);
+    frame.push_str(&format!(
+        "\x1b[{top};{left}H+{}+",
+        "-".repeat(width.saturating_sub(2))
+    ));
+    for (index, line) in lines.iter().enumerate() {
+        let y = top + index + 1;
+        frame.push_str(&format!(
+            "\x1b[{y};{left}H| {} |",
+            ansi_cell(line, text_width)
+        ));
+    }
+    frame.push_str(&format!(
+        "\x1b[{};{}H+{}+",
+        top + height - 1,
+        left,
+        "-".repeat(width.saturating_sub(2))
+    ));
+}
+
+fn visible_session_indices(sessions: &[Session], filter: &str) -> Vec<usize> {
+    let filter = filter.trim().to_ascii_lowercase();
+    sessions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, session)| {
+            (filter.is_empty()
+                || session.branch.to_ascii_lowercase().contains(&filter)
+                || session
+                    .prompt_summary
+                    .to_ascii_lowercase()
+                    .contains(&filter)
+                || session.path_display.to_ascii_lowercase().contains(&filter)
+                || session
+                    .wt_columns
+                    .values()
+                    .any(|value| value.to_ascii_lowercase().contains(&filter)))
+            .then_some(index)
+        })
+        .collect()
 }
 
 fn push_line(frame: &mut String, cols: u16, line: String) {
@@ -211,6 +286,15 @@ fn visible_len(line: &str) -> usize {
                 if seq_ch.is_ascii_alphabetic() {
                     break;
                 }
+            }
+        } else if ch == '\x1b' && chars.peek() == Some(&']') {
+            chars.next();
+            let mut previous = '\0';
+            for seq_ch in chars.by_ref() {
+                if seq_ch == '\x07' || (previous == '\x1b' && seq_ch == '\\') {
+                    break;
+                }
+                previous = seq_ch;
             }
         } else {
             len += 1;
@@ -244,6 +328,19 @@ fn truncate_ansi_line(text: &str, max_chars: usize) -> String {
                 if seq_ch.is_ascii_alphabetic() {
                     break;
                 }
+            }
+            continue;
+        }
+        if ch == '\x1b' && chars.peek() == Some(&']') {
+            out.push(ch);
+            out.push(chars.next().unwrap());
+            let mut previous = '\0';
+            for seq_ch in chars.by_ref() {
+                out.push(seq_ch);
+                if seq_ch == '\x07' || (previous == '\x1b' && seq_ch == '\\') {
+                    break;
+                }
+                previous = seq_ch;
             }
             continue;
         }
@@ -289,20 +386,31 @@ fn format_session_row(config: &Config, session: &Session, selected: bool, width:
     };
     let marker = if selected {
         color("▶", "1;36")
+    } else if session.unseen_comments {
+        color("!", "1;36")
     } else {
         " ".to_string()
     };
     let branch_code = if selected { "1;37" } else { "37" };
     let pr = pr_label(config, session);
+    let review = review_icon(config, session);
     let comments = comment_count_label(config, session);
+    let extra = configured_column_label(config, session);
+    let status_color = if config.is_default_branch(&session.branch)
+        && status_count(&session.status_label, "behind").is_some()
+    {
+        "31"
+    } else {
+        git_status_color(&session.status_label)
+    };
     let text = format!(
-        "{} {} {} {} {} {} {} {}",
+        "{} {} {} {} {} {} {} {} {} {}",
         marker,
         styled_cell(&session.branch, 22, branch_code),
         styled_cell(
             &git_status_indicator(&session.status_label),
             9,
-            git_status_color(&session.status_label)
+            status_color
         ),
         styled_cell(
             agent_icon(session.agent_state),
@@ -310,11 +418,43 @@ fn format_session_row(config: &Config, session: &Session, selected: bool, width:
             agent_state_color(session.agent_state)
         ),
         styled_cell(&pr, 7, pr_color(session)),
+        styled_cell(&review, 3, review_icon_color(config, session)),
         styled_cell(ci_icon(config, session), 3, ci_color(config, session)),
         styled_cell(&comments, 4, comment_color(session)),
+        extra,
         truncate_line(summary, 50),
     );
     ansi_cell(&text, width)
+}
+
+fn configured_column_label(config: &Config, session: &Session) -> String {
+    let mut labels = Vec::new();
+    for column in &config.worktree_columns {
+        if let Some(value) = session.wt_columns.get(column)
+            && !value.trim().is_empty()
+        {
+            labels.push(format_column_value(column, value));
+        }
+    }
+    truncate_ansi_line(&labels.join(" "), 24)
+}
+
+fn format_column_value(column: &str, value: &str) -> String {
+    if value.starts_with("http://") || value.starts_with("https://") {
+        let url = strip_ascii_control_chars(value);
+        return format!(
+            "\x1b]8;;{url}\x1b\\{}\x1b]8;;\x1b\\",
+            truncate_line(value, 24)
+        );
+    }
+    if column == "url_active" {
+        return if value == "true" { "url:on" } else { "url:off" }.to_string();
+    }
+    truncate_line(value, 24)
+}
+
+fn strip_ascii_control_chars(text: &str) -> String {
+    text.chars().filter(|ch| !ch.is_ascii_control()).collect()
 }
 
 fn pr_label(config: &Config, session: &Session) -> String {
@@ -334,6 +474,36 @@ fn pr_label(config: &Config, session: &Session) -> String {
         "×"
     };
     format!("{icon}#{}", summary.number)
+}
+
+fn review_icon(config: &Config, session: &Session) -> String {
+    if config.is_default_branch(&session.branch) {
+        return String::new();
+    }
+    let Some(summary) = &session.pr.summary else {
+        return String::new();
+    };
+    let review = review_decision_for_display(summary, session.pr.details.as_ref());
+    match review.as_str() {
+        "APPROVED" => "✓",
+        "CHANGES_REQUESTED" => "!",
+        "REVIEW_REQUIRED" if !summary.requested_reviewers.is_empty() => "@",
+        "REVIEW_REQUIRED" => "?",
+        "COMMENTED" => "•",
+        _ => "",
+    }
+    .to_string()
+}
+
+fn review_icon_color(config: &Config, session: &Session) -> &'static str {
+    if config.is_default_branch(&session.branch) {
+        return "90";
+    }
+    let Some(summary) = &session.pr.summary else {
+        return "90";
+    };
+    let review = review_decision_for_display(summary, session.pr.details.as_ref());
+    review_color(&review)
 }
 
 fn comment_count_label(config: &Config, session: &Session) -> String {
@@ -369,8 +539,8 @@ fn ci_icon(config: &Config, session: &Session) -> &'static str {
         .map(|summary| summary.check_status.as_str())
     {
         Some("passed") => "✓",
-        Some("failed") => "✕",
-        Some("running") => "…",
+        Some("failed") => "x",
+        Some("running") => "•",
         Some("mixed") => "±",
         Some("unknown") | None => "?",
         Some(_) => "!",
@@ -535,6 +705,7 @@ fn format_pr_panel_lines(config: &Config, session: Option<&Session>) -> Vec<Stri
     } else {
         summary.state.as_str()
     };
+    let review = review_decision_for_display(summary, session.pr.details.as_ref());
     let mut lines = vec![
         color(
             &format!(
@@ -556,17 +727,21 @@ fn format_pr_panel_lines(config: &Config, session: Option<&Session>) -> Vec<Stri
         format!(
             "{} {}   {} {} {}",
             color("review", "90"),
-            color(
-                review_label(&summary.review_decision),
-                review_color(&summary.review_decision)
-            ),
+            color(review_label(&review), review_color(&review)),
             color("ci", "90"),
             color(ci_icon(config, session), ci_color(config, session)),
             summary.check_status,
         ),
-        String::new(),
-        color("Description", "1;36"),
     ];
+    if !summary.requested_reviewers.is_empty() {
+        lines.push(format!(
+            "{} {}",
+            color("awaiting", "90"),
+            truncate_line(&summary.requested_reviewers.join(", "), 80),
+        ));
+    }
+    lines.push(String::new());
+    lines.push(color("Description", "1;36"));
     lines.extend(description_lines(&summary.body, 4));
     if let Some(details) = &session.pr.details {
         lines.push(String::new());
@@ -739,6 +914,7 @@ fn review_label(decision: &str) -> &str {
         "APPROVED" => "approved",
         "CHANGES_REQUESTED" => "changes",
         "REVIEW_REQUIRED" => "needed",
+        "COMMENTED" => "commented",
         "" | "UNKNOWN" => "unknown",
         _ => decision,
     }
@@ -749,8 +925,36 @@ fn review_color(decision: &str) -> &'static str {
         "APPROVED" => "32",
         "CHANGES_REQUESTED" => "31",
         "REVIEW_REQUIRED" => "33",
+        "COMMENTED" => "36",
         _ => "90",
     }
+}
+
+fn review_decision_for_display(
+    summary: &crate::github::PrSummary,
+    details: Option<&crate::github::PrDetails>,
+) -> String {
+    if !matches!(summary.review_decision.as_str(), "" | "UNKNOWN") {
+        return summary.review_decision.clone();
+    }
+    if !summary.requested_reviewers.is_empty() {
+        return "REVIEW_REQUIRED".to_string();
+    }
+    details
+        .and_then(|details| {
+            details
+                .reviews
+                .iter()
+                .rev()
+                .find(|review| !review.state.trim().is_empty())
+        })
+        .map(|review| review.state.clone())
+        .or_else(|| {
+            details
+                .is_some_and(|details| !details.review_comments.is_empty())
+                .then(|| "COMMENTED".to_string())
+        })
+        .unwrap_or_else(|| summary.review_decision.clone())
 }
 
 #[cfg(test)]
@@ -759,12 +963,12 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::agent::AgentState;
-    use crate::config::{Checks, Config, EscapeKey};
+    use crate::config::{Checks, Config, EscapeKey, MergeMethod};
     use crate::github::PrCache;
     use crate::repo::Repository;
     use crate::session::Session;
 
-    use super::{git_status_indicator, render_frame};
+    use super::{configured_column_label, format_column_value, git_status_indicator, render_frame};
 
     #[test]
     fn render_frame_does_not_clear_the_whole_screen() {
@@ -778,10 +982,13 @@ mod tests {
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
+            merge_method: MergeMethod::Squash,
             checks: Checks::default(),
+            worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
             user_path: PathBuf::from("/tmp/user.toml"),
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         };
@@ -797,9 +1004,13 @@ mod tests {
             agent_output: VecDeque::new(),
             agent_state: AgentState::Idle,
             pr: PrCache::default(),
+            wt_columns: BTreeMap::new(),
+            unseen_comments: false,
         }];
 
-        let frame = render_frame(&repo, &config, &sessions, 0, "normal", None, 120, 20);
+        let frame = render_frame(
+            &repo, &config, &sessions, 0, "normal", None, "", None, 120, 20,
+        );
 
         assert!(frame.starts_with("\x1b[?25l\x1b[H"));
         assert!(!frame.contains("\x1b[2J"));
@@ -818,10 +1029,13 @@ mod tests {
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
+            merge_method: MergeMethod::Squash,
             checks: Checks::default(),
+            worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
             user_path: PathBuf::from("/tmp/user.toml"),
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         };
@@ -837,6 +1051,8 @@ mod tests {
             agent_output: VecDeque::new(),
             agent_state: AgentState::Idle,
             pr: PrCache::default(),
+            wt_columns: BTreeMap::new(),
+            unseen_comments: false,
         }];
 
         let frame = render_frame(
@@ -846,6 +1062,8 @@ mod tests {
             0,
             "normal",
             Some("current worktree is dirty"),
+            "",
+            None,
             120,
             20,
         );
@@ -866,10 +1084,13 @@ mod tests {
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
             escape_key: EscapeKey::EscEsc,
+            merge_method: MergeMethod::Squash,
             checks: Checks::default(),
+            worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
             user_path: PathBuf::from("/tmp/user.toml"),
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         };
@@ -885,14 +1106,65 @@ mod tests {
             agent_output: VecDeque::new(),
             agent_state: AgentState::Idle,
             pr: PrCache::default(),
+            wt_columns: BTreeMap::new(),
+            unseen_comments: false,
         }];
 
-        let frame = render_frame(&repo, &config, &sessions, 0, "normal", None, 120, 20);
+        let frame = render_frame(
+            &repo, &config, &sessions, 0, "normal", None, "", None, 120, 20,
+        );
 
         assert!(frame.contains("Default branch"));
         assert!(frame.contains("PR tracking disabled"));
         assert!(!frame.contains("no-pr"));
         assert!(!frame.contains("C?"));
+    }
+
+    #[test]
+    fn configured_url_column_preserves_hyperlink_and_sanitizes_target() {
+        let config = Config {
+            default_agent: "opencode".to_string(),
+            default_base: Some("main".to_string()),
+            plan_dir: "plans".to_string(),
+            review_packet_dir: ".agent/review".to_string(),
+            worktree_command: "wt".to_string(),
+            escape_key: EscapeKey::EscEsc,
+            merge_method: MergeMethod::Squash,
+            checks: Checks::default(),
+            worktree_columns: vec!["url".to_string()],
+            tools: BTreeMap::new(),
+            agent_commands: BTreeMap::new(),
+            agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
+            user_path: PathBuf::from("/tmp/user.toml"),
+            repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
+        };
+        let mut session = Session {
+            path: PathBuf::from("/repo"),
+            path_display: "/repo".to_string(),
+            branch: "main".to_string(),
+            prompt_summary: String::new(),
+            adopted: false,
+            hidden: false,
+            status_label: "clean".to_string(),
+            agent: None,
+            agent_output: VecDeque::new(),
+            agent_state: AgentState::Idle,
+            pr: PrCache::default(),
+            wt_columns: BTreeMap::new(),
+            unseen_comments: false,
+        };
+        session
+            .wt_columns
+            .insert("url".to_string(), "https://e.test/a".to_string());
+
+        let label = configured_column_label(&config, &session);
+
+        assert!(label.contains("\x1b]8;;https://e.test/a\x1b\\"));
+        assert!(label.contains("\x1b]8;;\x1b\\"));
+
+        let linked = format_column_value("url", "https://e.test/a\x1bb");
+        assert!(linked.starts_with("\x1b]8;;https://e.test/ab\x1b\\"));
     }
 
     #[test]

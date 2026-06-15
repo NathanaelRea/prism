@@ -22,7 +22,10 @@ impl KeyInput {
                     b'\x1b' => self.state = KeyInputState::Escape,
                     b'\x03' => keys.push(Key::Quit),
                     b'q' => keys.push(Key::Quit),
-                    b' ' => self.state = KeyInputState::Leader,
+                    b' ' => {
+                        self.state = KeyInputState::Leader;
+                        keys.push(Key::Leader);
+                    }
                     b'\r' | b'\n' => keys.push(Key::AgentMode),
                     31 => keys.push(Key::Terminal),
                     b'k' => keys.push(Key::Up),
@@ -30,12 +33,12 @@ impl KeyInput {
                     b'G' => keys.push(Key::Bottom),
                     b'g' => keys.push(Key::G),
                     b'r' => keys.push(Key::Refresh),
-                    b'f' => keys.push(Key::ReviewFix),
-                    b'P' => keys.push(Key::Push),
-                    b'M' => keys.push(Key::Merge),
+                    b'p' => keys.push(Key::PullDefault),
                     b'c' => keys.push(Key::Create),
+                    b'e' => keys.push(Key::EditConfig),
                     b'D' => keys.push(Key::Delete),
                     b'?' => keys.push(Key::Help),
+                    b'/' => keys.push(Key::Search),
                     _ => keys.push(Key::Other),
                 },
                 KeyInputState::Escape => {
@@ -59,7 +62,14 @@ impl KeyInput {
                         self.state = KeyInputState::Normal;
                         keys.push(Key::AgentMode);
                     }
-                    b'g' => self.state = KeyInputState::LeaderG,
+                    b'\r' | b'\n' => {
+                        self.state = KeyInputState::Normal;
+                        keys.push(Key::Terminal);
+                    }
+                    b'g' => {
+                        self.state = KeyInputState::LeaderG;
+                        keys.push(Key::LeaderGit);
+                    }
                     _ => {
                         self.state = KeyInputState::Normal;
                         keys.push(Key::Other);
@@ -69,6 +79,10 @@ impl KeyInput {
                     self.state = KeyInputState::Normal;
                     match byte {
                         b'g' => keys.push(Key::LazyGit),
+                        b'P' => keys.push(Key::Push),
+                        b'M' => keys.push(Key::Merge),
+                        b'f' => keys.push(Key::ReviewFix),
+                        b'p' => keys.push(Key::PullDefault),
                         _ => keys.push(Key::Other),
                     }
                 }
@@ -83,6 +97,8 @@ pub enum Key {
     Down,
     Bottom,
     G,
+    Leader,
+    LeaderGit,
     AgentMode,
     LazyGit,
     Terminal,
@@ -91,8 +107,11 @@ pub enum Key {
     ReviewFix,
     Push,
     Merge,
+    PullDefault,
     Create,
     Delete,
+    EditConfig,
+    Search,
     Quit,
     Other,
 }
@@ -119,14 +138,20 @@ mod tests {
     fn key_input_handles_agent_mode_keys() {
         let mut input = KeyInput::default();
         let keys = input.feed(b"i  ");
-        assert!(matches!(keys.as_slice(), [Key::Other, Key::AgentMode]));
+        assert!(matches!(
+            keys.as_slice(),
+            [Key::Other, Key::Leader, Key::AgentMode]
+        ));
     }
 
     #[test]
     fn key_input_handles_leader_lazygit() {
         let mut input = KeyInput::default();
         let keys = input.feed(b" gg");
-        assert!(matches!(keys.as_slice(), [Key::LazyGit]));
+        assert!(matches!(
+            keys.as_slice(),
+            [Key::Leader, Key::LeaderGit, Key::LazyGit]
+        ));
     }
 
     #[test]
@@ -144,6 +169,16 @@ mod tests {
     }
 
     #[test]
+    fn key_input_handles_leader_terminal_key() {
+        let mut input = KeyInput::default();
+        let keys = input.feed(b" \n?");
+        assert!(matches!(
+            keys.as_slice(),
+            [Key::Leader, Key::Terminal, Key::Help]
+        ));
+    }
+
+    #[test]
     fn key_input_handles_cleanup_keys() {
         let mut input = KeyInput::default();
         let keys = input.feed(b"D");
@@ -153,12 +188,14 @@ mod tests {
     #[test]
     fn key_input_uses_lazygit_style_branch_actions() {
         let mut input = KeyInput::default();
-        let keys = input.feed(b"PMnRxmua");
+        let keys = input.feed(b" gPMnRxmua");
         assert!(matches!(
             keys.as_slice(),
             [
+                Key::Leader,
+                Key::LeaderGit,
                 Key::Push,
-                Key::Merge,
+                Key::Other,
                 Key::Other,
                 Key::Other,
                 Key::Other,
