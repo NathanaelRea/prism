@@ -113,7 +113,11 @@ pub(crate) fn render_frame(
         center_width.saturating_sub(2) as usize,
         visible_rows,
     );
-    let pr_lines = format_pr_panel_lines(config, selected_session);
+    let pr_lines = if pr_width > 0 {
+        format_pr_panel_lines(config, selected_session)
+    } else {
+        Vec::new()
+    };
 
     for row in 0..visible_rows {
         let visible_index = start + row;
@@ -599,13 +603,19 @@ fn format_kanban_card(config: &Config, session: &Session, selected: bool, width:
     let label = if suffix.is_empty() {
         truncate_line(&session.branch, label_width)
     } else {
-        let suffix_width = visible_len(&suffix);
-        let branch_width = label_width.saturating_sub(suffix_width + 1).max(1);
-        format!(
-            "{} {}",
-            truncate_line(&session.branch, branch_width),
-            truncate_line(&suffix, suffix_width),
-        )
+        let available_suffix_width = label_width.saturating_sub(2);
+        if available_suffix_width == 0 {
+            truncate_line(&session.branch, label_width)
+        } else {
+            let suffix = truncate_line(&suffix, available_suffix_width);
+            let suffix_width = visible_len(&suffix);
+            let branch_width = label_width.saturating_sub(suffix_width + 1).max(1);
+            format!(
+                "{} {}",
+                truncate_line(&session.branch, branch_width),
+                suffix,
+            )
+        }
     };
     let code = if selected { "1;37" } else { "37" };
     ansi_cell(&format!("{marker} {}", color(&label, code)), width)
