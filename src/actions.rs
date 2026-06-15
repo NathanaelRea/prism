@@ -11,7 +11,7 @@ use crate::git::{
 };
 use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCache, fetch_pr_summary_index, pr_details_due, refresh_pr_cache,
-    refresh_pr_details_cache, refresh_pr_summary_index, remove_pr_cache, save_pr_details_cache,
+    refresh_pr_details_cache, remove_pr_cache, save_pr_cache, save_pr_details_cache,
 };
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::process::command_exists;
@@ -26,30 +26,44 @@ use crate::tmux::{
     ensure_agent_session, kill_agent_session, latest_agent_session_generation, paste_agent_prompt,
 };
 use crate::tui::{
-    DefaultBranchPollResult, PrPollKey, PrPollResult, TmuxSlotKey, TmuxWarmupKey, TmuxWarmupResult,
-    Tui, WtPollResult,
+    DefaultBranchPollResult, ManagedRepo, PrPollKey, PrPollResult, TmuxSlotKey, TmuxWarmupKey,
+    TmuxWarmupResult, Tui, WtPollResult,
 };
 use crate::util::{status_count, truncate, yes};
 
 const DEFAULT_BRANCH_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(60);
+const BACKGROUND_PR_SUMMARY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 impl Tui {
     pub(crate) fn refresh_sessions(&mut self) -> Result<(), String> {
+        self.sync_selected_repo_context();
+        for managed in &mut self.repos {
+            managed.config = crate::config::Config::load(&managed.repo);
+        }
         let old = std::mem::take(&mut self.sessions);
         let mut by_path = old
             .into_iter()
-            .map(|session| (session.path.clone(), session))
+            .map(|session| ((session.repo_index, session.path.clone()), session))
             .collect::<BTreeMap<_, _>>();
-        let mut fresh = discover_sessions(&self.repo, &self.config)?;
-        for session in &mut fresh {
-            if let Some(mut previous) = by_path.remove(&session.path) {
-                session.agent = previous.agent.take();
-                session.agent_output = previous.agent_output;
-                session.agent_state = previous.agent_state;
-                session.pr = previous.pr;
-                session.wt_columns = previous.wt_columns;
-                session.unseen_comments = previous.unseen_comments;
+        let mut fresh = Vec::new();
+        for (repo_index, managed) in self.repos.iter().enumerate() {
+            let mut repo_sessions = discover_sessions(&managed.repo, &managed.config)?;
+            for session in &mut repo_sessions {
+                session.repo_index = repo_index;
+                session.repo_label = managed.label.clone();
+                session.repo_key = managed.key;
+                if let Some(mut previous) =
+                    by_path.remove(&(session.repo_index, session.path.clone()))
+                {
+                    session.agent = previous.agent.take();
+                    session.agent_output = previous.agent_output;
+                    session.agent_state = previous.agent_state;
+                    session.pr = previous.pr;
+                    session.wt_columns = previous.wt_columns;
+                    session.unseen_comments = previous.unseen_comments;
+                }
             }
+            fresh.extend(repo_sessions);
         }
         self.sessions = fresh;
         if self.selected >= self.sessions.len() {
@@ -60,10 +74,12 @@ impl Tui {
         {
             self.select_top_visible();
         }
+        self.sync_selected_repo_context();
         Ok(())
     }
 
     pub(crate) fn create_session(&mut self) -> Result<bool, String> {
+        self.sync_selected_repo_context();
         if !self.allow_dirty && worktree_dirty(&self.repo, &self.config)? {
             self.show_message(
                 "current worktree is dirty; restart Prism with --allow-dirty to create anyway",
@@ -94,7 +110,9 @@ impl Tui {
         let index = self
             .sessions
             .iter()
-            .position(|session| session.branch == branch.trim())
+            .position(|session| {
+                session.repo_index == self.current_repo && session.branch == branch.trim()
+            })
             .ok_or_else(|| {
                 format!(
                     "created branch '{}' was not found in git worktree list",
@@ -143,6 +161,7 @@ impl Tui {
     }
 
     pub(crate) fn pull_default_branch(&mut self) -> Result<(), String> {
+        self.sync_selected_repo_context();
         let Some(base) = self
             .config
             .default_base
@@ -164,10 +183,19 @@ impl Tui {
     }
 
     fn default_branch_path(&self, base: &str) -> PathBuf {
+        self.default_branch_path_for_repo(self.current_repo, base)
+    }
+
+    fn default_branch_path_for_repo(&self, repo_index: usize, base: &str) -> PathBuf {
         self.sessions
             .iter()
-            .find(|session| session.branch == base)
+            .find(|session| session.repo_index == repo_index && session.branch == base)
             .map(|session| session.path.clone())
+            .or_else(|| {
+                self.repos
+                    .get(repo_index)
+                    .map(|repo| repo.repo.root.clone())
+            })
             .unwrap_or_else(|| self.repo.root.clone())
     }
 
@@ -175,6 +203,7 @@ impl Tui {
         &mut self,
         raw: &mut crate::terminal::RawTerminal,
     ) -> Result<(), String> {
+        self.sync_selected_repo_context();
         if let Some(parent) = self.config.repo_config_path.parent() {
             fs::create_dir_all(parent).map_err(|error| format!("create config dir: {error}"))?;
         }
@@ -198,10 +227,93 @@ impl Tui {
             return Err(format!("{editor} exited with {status}"));
         }
         self.config = crate::config::Config::load(&self.repo);
+        if let Some(repo) = self.repos.get_mut(self.current_repo) {
+            repo.config = self.config.clone();
+        }
         self.refresh_sessions()?;
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
         self.show_message("config reloaded")?;
+        Ok(())
+    }
+
+    pub(crate) fn add_repository(&mut self) -> Result<(), String> {
+        let Some(path) = self.prompt_line_dialog("Add Repository", "Base/main path: ", "")? else {
+            return Ok(());
+        };
+        let path = path.trim();
+        if path.is_empty() {
+            return Ok(());
+        }
+        let (_, index, entries) = crate::workspace::ensure_repo_entry(Path::new(path))?;
+        self.reload_repositories(entries)?;
+        self.select_repo(index);
+        self.start_tmux_agent_warmup();
+        self.start_wt_column_poll();
+        self.start_default_branch_status_poll(true);
+        self.show_message("repository added")?;
+        Ok(())
+    }
+
+    pub(crate) fn edit_repositories(
+        &mut self,
+        raw: &mut crate::terminal::RawTerminal,
+    ) -> Result<(), String> {
+        let path = crate::workspace::repos_path();
+        if !path.exists() {
+            let entries = self
+                .repos
+                .iter()
+                .map(|repo| crate::workspace::RepoEntry {
+                    root: repo.repo.root.clone(),
+                    key: repo.key,
+                })
+                .collect::<Vec<_>>();
+            crate::workspace::save_entries(&entries)?;
+        }
+        let editor =
+            editor_command().ok_or_else(|| "no editor found; set VISUAL or EDITOR".to_string())?;
+        raw.suspend()?;
+        let result = Command::new(&editor).arg(&path).status();
+        let resume_result = raw.resume();
+        resume_result?;
+        let status = result.map_err(|error| format!("{editor}: {error}"))?;
+        if !status.success() {
+            return Err(format!("{editor} exited with {status}"));
+        }
+        let entries = crate::workspace::load_entries();
+        if entries.is_empty() {
+            return Err("repository list is empty; add at least one [[repos]] block".to_string());
+        }
+        let current_root = self.repo.root.clone();
+        self.reload_repositories(entries)?;
+        let index = self
+            .repos
+            .iter()
+            .position(|repo| repo.repo.root == current_root)
+            .unwrap_or(0);
+        self.select_repo(index);
+        self.start_tmux_agent_warmup();
+        self.start_wt_column_poll();
+        self.start_default_branch_status_poll(true);
+        self.show_message("repositories reloaded")?;
+        Ok(())
+    }
+
+    fn reload_repositories(
+        &mut self,
+        entries: Vec<crate::workspace::RepoEntry>,
+    ) -> Result<(), String> {
+        let mut repos = Vec::new();
+        for entry in entries {
+            let repo = crate::repo::Repository::discover(Some(&entry.root))?;
+            let config = crate::config::Config::load(&repo);
+            repos.push(ManagedRepo::new(repo, config, entry.key));
+        }
+        self.repos = repos;
+        self.current_repo = self.current_repo.min(self.repos.len().saturating_sub(1));
+        self.refresh_sessions()?;
+        self.sync_selected_repo_context();
         Ok(())
     }
 
@@ -244,9 +356,14 @@ impl Tui {
     pub(crate) fn poll_agents(&mut self) -> bool {
         let mut changed = false;
         for session in &mut self.sessions {
+            let repo = self
+                .repos
+                .get(session.repo_index)
+                .map(|repo| repo.repo.clone())
+                .unwrap_or_else(|| self.repo.clone());
             if let Some(agent) = &mut session.agent {
                 for chunk in agent.drain_output() {
-                    let _ = append_agent_log(&self.repo, &session.branch, &chunk);
+                    let _ = append_agent_log(&repo, &session.branch, &chunk);
                     session.agent_output.push_back(chunk);
                     changed = true;
                 }
@@ -257,7 +374,7 @@ impl Tui {
                     && let Some(state) = agent.try_wait()
                 {
                     session.agent_state = state;
-                    let _ = save_agent_state(&self.repo, &session.branch, state);
+                    let _ = save_agent_state(&repo, &session.branch, state);
                     changed = true;
                 }
             }
@@ -267,29 +384,46 @@ impl Tui {
 
     pub(crate) fn poll_pull_requests(&mut self, force: bool) -> bool {
         let changed = self.drain_pr_poll_results();
-        let summaries_due = self
-            .pr_summary_last_polled
-            .map(|last| last.elapsed() >= PR_SUMMARY_POLL_INTERVAL)
-            .unwrap_or(true);
-        let has_pr_branches = self
-            .sessions
-            .iter()
-            .any(|session| pr_pollable(&self.config, session));
-        if has_pr_branches && (force || summaries_due) && !self.pr_summary_poll_in_flight {
-            let path = self.repo.root.clone();
-            let config = self.config.clone();
-            let tx = self.pr_poll_tx.clone();
-            self.pr_summary_last_polled = Some(std::time::Instant::now());
-            self.pr_summary_poll_in_flight = true;
-            std::thread::spawn(move || {
-                let summaries = fetch_pr_summary_index(&path, &config);
-                let _ = tx.send(PrPollResult::Summary { summaries });
+        for repo_index in 0..self.repos.len() {
+            let Some(managed) = self.repos.get(repo_index) else {
+                continue;
+            };
+            let interval = if repo_index == self.current_repo {
+                PR_SUMMARY_POLL_INTERVAL
+            } else {
+                BACKGROUND_PR_SUMMARY_POLL_INTERVAL
+            };
+            let summaries_due = managed
+                .pr_summary_last_polled
+                .map(|last| last.elapsed() >= interval)
+                .unwrap_or(true);
+            let has_pr_branches = self.sessions.iter().any(|session| {
+                session.repo_index == repo_index && pr_pollable(&managed.config, session)
             });
+            if has_pr_branches && (force || summaries_due) && !managed.pr_summary_poll_in_flight {
+                let path = managed.repo.root.clone();
+                let config = managed.config.clone();
+                let tx = self.pr_poll_tx.clone();
+                if let Some(managed) = self.repos.get_mut(repo_index) {
+                    managed.pr_summary_last_polled = Some(std::time::Instant::now());
+                    managed.pr_summary_poll_in_flight = true;
+                }
+                std::thread::spawn(move || {
+                    let summaries = fetch_pr_summary_index(&path, &config);
+                    let _ = tx.send(PrPollResult::Summary {
+                        repo_index,
+                        summaries,
+                    });
+                });
+            }
         }
 
         if let Some(session) = self.sessions.get_mut(self.selected) {
+            let Some(managed) = self.repos.get(session.repo_index) else {
+                return changed;
+            };
             let key = pr_poll_key(session);
-            if pr_pollable(&self.config, session)
+            if pr_pollable(&managed.config, session)
                 && !session
                     .pr
                     .summary
@@ -298,7 +432,7 @@ impl Tui {
                 && pr_details_due(&session.pr)
                 && !self.pr_polls_in_flight.contains(&key)
             {
-                let config = self.config.clone();
+                let config = managed.config.clone();
                 let branch = session.branch.clone();
                 let path = session.path.clone();
                 let mut cache = session.pr.clone();
@@ -322,8 +456,13 @@ impl Tui {
         let mut changed = false;
         while let Ok(result) = self.pr_poll_rx.try_recv() {
             match result {
-                PrPollResult::Summary { summaries } => {
-                    self.pr_summary_poll_in_flight = false;
+                PrPollResult::Summary {
+                    repo_index,
+                    summaries,
+                } => {
+                    if let Some(repo) = self.repos.get_mut(repo_index) {
+                        repo.pr_summary_poll_in_flight = false;
+                    }
                     let before = self
                         .sessions
                         .iter()
@@ -336,16 +475,18 @@ impl Tui {
                         .collect::<Vec<_>>();
                     match summaries {
                         Ok(summaries) => {
-                            refresh_pr_summary_index(
-                                &self.repo,
+                            refresh_pr_summary_index_for_repo(
+                                &self.repos,
                                 &mut self.sessions,
+                                repo_index,
                                 summaries,
-                                &self.config,
                             );
                         }
                         Err(error) => {
                             for session in &mut self.sessions {
-                                session.pr.error = Some(error.clone());
+                                if session.repo_index == repo_index {
+                                    session.pr.error = Some(error.clone());
+                                }
                             }
                         }
                     }
@@ -380,7 +521,10 @@ impl Tui {
                             session.pr.details_last_polled = cache.details_last_polled;
                             session.pr.error = cache.error;
                             if let Some(details) = &session.pr.details {
-                                let _ = save_pr_details_cache(&self.repo, &session.branch, details);
+                                if let Some(repo) = self.repos.get(session.repo_index) {
+                                    let _ =
+                                        save_pr_details_cache(&repo.repo, &session.branch, details);
+                                }
                             }
                             if session_comment_count(session) > before_comments
                                 && selected_key.as_ref() != Some(&key)
@@ -398,26 +542,41 @@ impl Tui {
 
     pub(crate) fn start_wt_column_poll(&mut self) {
         self.poll_wt_columns();
-        if self.wt_poll_in_flight || self.config.worktree_columns.is_empty() {
-            return;
+        for repo_index in 0..self.repos.len() {
+            let Some(managed) = self.repos.get(repo_index) else {
+                continue;
+            };
+            if managed.wt_poll_in_flight || managed.config.worktree_columns.is_empty() {
+                continue;
+            }
+            let repo = managed.repo.clone();
+            let config = managed.config.clone();
+            let tx = self.wt_poll_tx.clone();
+            if let Some(managed) = self.repos.get_mut(repo_index) {
+                managed.wt_poll_in_flight = true;
+            }
+            std::thread::spawn(move || {
+                let columns = fetch_wt_columns(&repo, &config);
+                let _ = tx.send(WtPollResult {
+                    repo_index,
+                    columns,
+                });
+            });
         }
-        let repo = self.repo.clone();
-        let config = self.config.clone();
-        let tx = self.wt_poll_tx.clone();
-        self.wt_poll_in_flight = true;
-        std::thread::spawn(move || {
-            let columns = fetch_wt_columns(&repo, &config);
-            let _ = tx.send(WtPollResult { columns });
-        });
     }
 
     pub(crate) fn poll_wt_columns(&mut self) -> bool {
         let mut changed = false;
         while let Ok(result) = self.wt_poll_rx.try_recv() {
-            self.wt_poll_in_flight = false;
+            if let Some(repo) = self.repos.get_mut(result.repo_index) {
+                repo.wt_poll_in_flight = false;
+            }
             match result.columns {
                 Ok(columns_by_path) => {
                     for session in &mut self.sessions {
+                        if session.repo_index != result.repo_index {
+                            continue;
+                        }
                         let next = columns_by_path
                             .get(&session.path)
                             .cloned()
@@ -429,10 +588,12 @@ impl Tui {
                     }
                 }
                 Err(error) => {
-                    let _ = append_runtime_log(
-                        &self.repo,
-                        &format!("wt column refresh failed: {error}"),
-                    );
+                    if let Some(repo) = self.repos.get(result.repo_index) {
+                        let _ = append_runtime_log(
+                            &repo.repo,
+                            &format!("wt column refresh failed: {error}"),
+                        );
+                    }
                 }
             }
         }
@@ -441,49 +602,61 @@ impl Tui {
 
     pub(crate) fn start_default_branch_status_poll(&mut self, force: bool) {
         self.poll_default_branch_status();
-        if self.default_branch_poll_in_flight {
-            return;
-        }
-        let due = self
-            .default_branch_last_polled
-            .map(|last| last.elapsed() >= DEFAULT_BRANCH_STATUS_POLL_INTERVAL)
-            .unwrap_or(true);
-        if !force && !due {
-            return;
-        }
-        let Some(branch) = self
-            .config
-            .default_base
-            .as_deref()
-            .map(str::trim)
-            .filter(|branch| !branch.is_empty())
-            .map(str::to_string)
-        else {
-            return;
-        };
-        let path = self.default_branch_path(&branch);
-        let config = self.config.clone();
-        let tx = self.default_branch_poll_tx.clone();
-        self.default_branch_poll_in_flight = true;
-        self.default_branch_last_polled = Some(std::time::Instant::now());
-        std::thread::spawn(move || {
-            let status_label = default_branch_status_label(&path, &branch, &config);
-            let _ = tx.send(DefaultBranchPollResult {
-                branch,
-                path,
-                status_label,
+        for repo_index in 0..self.repos.len() {
+            let Some(managed) = self.repos.get(repo_index) else {
+                continue;
+            };
+            if managed.default_branch_poll_in_flight {
+                continue;
+            }
+            let due = managed
+                .default_branch_last_polled
+                .map(|last| last.elapsed() >= DEFAULT_BRANCH_STATUS_POLL_INTERVAL)
+                .unwrap_or(true);
+            if !force && !due {
+                continue;
+            }
+            let Some(branch) = managed
+                .config
+                .default_base
+                .as_deref()
+                .map(str::trim)
+                .filter(|branch| !branch.is_empty())
+                .map(str::to_string)
+            else {
+                continue;
+            };
+            let path = self.default_branch_path_for_repo(repo_index, &branch);
+            let config = managed.config.clone();
+            let tx = self.default_branch_poll_tx.clone();
+            if let Some(managed) = self.repos.get_mut(repo_index) {
+                managed.default_branch_poll_in_flight = true;
+                managed.default_branch_last_polled = Some(std::time::Instant::now());
+            }
+            std::thread::spawn(move || {
+                let status_label = default_branch_status_label(&path, &branch, &config);
+                let _ = tx.send(DefaultBranchPollResult {
+                    repo_index,
+                    branch,
+                    path,
+                    status_label,
+                });
             });
-        });
+        }
     }
 
     pub(crate) fn poll_default_branch_status(&mut self) -> bool {
         let mut changed = false;
         while let Ok(result) = self.default_branch_poll_rx.try_recv() {
-            self.default_branch_poll_in_flight = false;
+            if let Some(repo) = self.repos.get_mut(result.repo_index) {
+                repo.default_branch_poll_in_flight = false;
+            }
             match result.status_label {
                 Ok(status_label) => {
                     if let Some(session) = self.sessions.iter_mut().find(|session| {
-                        session.branch == result.branch && session.path == result.path
+                        session.repo_index == result.repo_index
+                            && session.branch == result.branch
+                            && session.path == result.path
                     }) && session.status_label != status_label
                     {
                         session.status_label = status_label;
@@ -491,10 +664,12 @@ impl Tui {
                     }
                 }
                 Err(error) => {
-                    let _ = append_runtime_log(
-                        &self.repo,
-                        &format!("default branch status refresh failed: {error}"),
-                    );
+                    if let Some(repo) = self.repos.get(result.repo_index) {
+                        let _ = append_runtime_log(
+                            &repo.repo,
+                            &format!("default branch status refresh failed: {error}"),
+                        );
+                    }
                 }
             }
         }
@@ -502,6 +677,7 @@ impl Tui {
     }
 
     pub(crate) fn attach_selected_agent_terminal(&mut self) -> Result<(), String> {
+        self.sync_selected_repo_context();
         if self.selected >= self.sessions.len() {
             return Ok(());
         }
@@ -523,6 +699,7 @@ impl Tui {
     }
 
     pub(crate) fn attach_selected_tmux_window(&mut self, window: TmuxWindow) -> Result<(), String> {
+        self.sync_selected_repo_context();
         if self.selected >= self.sessions.len() {
             return Ok(());
         }
@@ -552,7 +729,12 @@ impl Tui {
                 let generation = self.tmux_generation_for_slot(&slot);
                 let key = tmux_warmup_key(slot, generation);
                 (!self.tmux_warmups_in_flight.contains(&key))
-                    .then(|| (key, self.repo.clone(), self.config.clone(), session))
+                    .then(|| {
+                        self.repos
+                            .get(session.repo_index)
+                            .map(|repo| (key, repo.repo.clone(), repo.config.clone(), session))
+                    })
+                    .flatten()
             })
             .collect::<Vec<_>>();
 
@@ -576,13 +758,15 @@ impl Tui {
         else {
             return;
         };
-        self.spawn_tmux_warmup_job(
-            key,
-            self.repo.clone(),
-            self.config.clone(),
-            session_for_tmux_warmup(session),
-            delay,
-        );
+        if let Some(repo) = self.repos.get(session.repo_index) {
+            self.spawn_tmux_warmup_job(
+                key,
+                repo.repo.clone(),
+                repo.config.clone(),
+                session_for_tmux_warmup(session),
+                delay,
+            );
+        }
     }
 
     fn spawn_tmux_warmup_job(
@@ -639,7 +823,11 @@ impl Tui {
         }
         if let Some(error) = result.error {
             let _ = append_runtime_log(
-                &self.repo,
+                &self
+                    .repos
+                    .get(result.key.slot.repo_index)
+                    .map(|repo| repo.repo.clone())
+                    .unwrap_or_else(|| self.repo.clone()),
                 &format!(
                     "tmux warm-up failed for {}#{}: {error}",
                     result.key.slot.branch, result.key.generation
@@ -665,7 +853,9 @@ impl Tui {
             return false;
         }
         session.agent_state = state;
-        let _ = save_agent_state(&self.repo, &session.branch, state);
+        if let Some(repo) = self.repos.get(session.repo_index) {
+            let _ = save_agent_state(&repo.repo, &session.branch, state);
+        }
         true
     }
 
@@ -673,8 +863,13 @@ impl Tui {
         if let Some(generation) = self.tmux_generations.get(slot).copied() {
             return generation;
         }
-        let generation =
-            latest_agent_session_generation(&self.repo, &self.config, &slot.branch).unwrap_or(0);
+        let generation = self
+            .repos
+            .get(slot.repo_index)
+            .and_then(|repo| {
+                latest_agent_session_generation(&repo.repo, &repo.config, &slot.branch)
+            })
+            .unwrap_or(0);
         self.tmux_generations.insert(slot.clone(), generation);
         generation
     }
@@ -705,11 +900,14 @@ impl Tui {
             return false;
         }
         session.agent_state = state;
-        let _ = save_agent_state(&self.repo, &session.branch, state);
+        if let Some(repo) = self.repos.get(session.repo_index) {
+            let _ = save_agent_state(&repo.repo, &session.branch, state);
+        }
         true
     }
 
     pub(crate) fn start_review_fix(&mut self) -> Result<(), String> {
+        self.sync_selected_repo_context();
         if self.selected >= self.sessions.len() {
             return Ok(());
         }
@@ -743,6 +941,7 @@ impl Tui {
     }
 
     pub(crate) fn push_selected_branch(&mut self) -> Result<(), String> {
+        self.sync_selected_repo_context();
         if self.selected >= self.sessions.len() {
             return Ok(());
         }
@@ -839,6 +1038,7 @@ impl Tui {
     }
 
     pub(crate) fn merge_selected_pr(&mut self) -> Result<(), String> {
+        self.sync_selected_repo_context();
         if self.selected >= self.sessions.len() {
             return Ok(());
         }
@@ -896,6 +1096,7 @@ impl Tui {
     }
 
     pub(crate) fn delete_session(&mut self) -> Result<(), String> {
+        self.sync_selected_repo_context();
         if self.selected >= self.sessions.len() {
             return Ok(());
         }
@@ -1066,6 +1267,7 @@ fn pr_render_signature(cache: &PrCache) -> String {
 
 fn pr_poll_key(session: &crate::session::Session) -> PrPollKey {
     PrPollKey {
+        repo_index: session.repo_index,
         branch: session.branch.clone(),
         path: session.path.clone(),
     }
@@ -1095,6 +1297,62 @@ fn session_comment_count(session: &crate::session::Session) -> usize {
                 .map(|summary| summary.comment_count as usize)
         })
         .unwrap_or(0)
+}
+
+fn refresh_pr_summary_index_for_repo(
+    repos: &[ManagedRepo],
+    sessions: &mut [crate::session::Session],
+    repo_index: usize,
+    summaries: Vec<crate::github::PrSummary>,
+) {
+    let Some(managed) = repos.get(repo_index) else {
+        return;
+    };
+    let now = std::time::Instant::now();
+    let refreshed = crate::util::timestamp_label();
+    for session in sessions
+        .iter_mut()
+        .filter(|session| session.repo_index == repo_index)
+    {
+        session.pr.last_polled = Some(now);
+        if session.branch == "(detached)" || managed.config.is_default_branch(&session.branch) {
+            session.pr.summary = None;
+            session.pr.details = None;
+            session.pr.signature = None;
+            session.pr.error = None;
+            session.pr.last_refreshed = Some(refreshed.clone());
+            let _ = remove_pr_cache(&managed.repo, &session.branch);
+            continue;
+        }
+        let summary = summaries
+            .iter()
+            .find(|summary| summary.head_ref == session.branch)
+            .cloned();
+        if let Some(summary) = summary {
+            let signature = summary.signature();
+            if session.pr.signature.as_deref() != Some(signature.as_str()) {
+                session.pr.details = None;
+                session.pr.details_last_polled = None;
+            }
+            session.pr.summary = Some(summary);
+            session.pr.signature = Some(signature);
+            session.pr.error = None;
+            session.pr.last_refreshed = Some(refreshed.clone());
+            let _ = save_pr_cache(&managed.repo, &session.branch, &session.pr);
+            if let Some(details) = &session.pr.details {
+                let _ = save_pr_details_cache(&managed.repo, &session.branch, details);
+            } else {
+                let _ = crate::github::remove_pr_details_cache(&managed.repo, &session.branch);
+            }
+        } else {
+            session.pr.summary = None;
+            session.pr.details = None;
+            session.pr.signature = None;
+            session.pr.error = None;
+            session.pr.last_refreshed = Some(refreshed.clone());
+            let _ = remove_pr_cache(&managed.repo, &session.branch);
+        }
+    }
 }
 
 fn fetch_wt_columns(
@@ -1210,6 +1468,7 @@ fn editor_command() -> Option<String> {
 
 fn tmux_slot_key(session: &crate::session::Session) -> TmuxSlotKey {
     TmuxSlotKey {
+        repo_index: session.repo_index,
         branch: session.branch.clone(),
         path: session.path.clone(),
     }
@@ -1221,6 +1480,9 @@ fn tmux_warmup_key(slot: TmuxSlotKey, generation: u64) -> TmuxWarmupKey {
 
 fn session_for_tmux_warmup(session: &crate::session::Session) -> crate::session::Session {
     crate::session::Session {
+        repo_index: session.repo_index,
+        repo_label: session.repo_label.clone(),
+        repo_key: session.repo_key,
         path: session.path.clone(),
         path_display: session.path_display.clone(),
         branch: session.branch.clone(),
@@ -1392,7 +1654,7 @@ exit 1
             .insert("gh".to_string(), gh.display().to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
-        let mut tui = Tui::new(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session], false);
 
         let started = Instant::now();
         let changed = tui.poll_pull_requests(false);
@@ -1416,12 +1678,12 @@ exit 1
         config.default_base = Some("main".to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "main");
-        let mut tui = Tui::new(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session], false);
 
         let changed = tui.poll_pull_requests(false);
 
         assert!(!changed);
-        assert!(!tui.pr_summary_poll_in_flight);
+        assert!(!tui.repos[0].pr_summary_poll_in_flight);
         assert!(tui.pr_polls_in_flight.is_empty());
 
         let _ = fs::remove_dir_all(temp);
@@ -1477,7 +1739,7 @@ exit 0
             .insert("opencode".to_string(), "opencode".to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
-        let mut tui = Tui::new(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session], false);
 
         let started = Instant::now();
         tui.start_tmux_agent_warmup();
@@ -1537,7 +1799,7 @@ exit 0
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
         let key = tmux_warmup_key(tmux_slot_key(&session), 0);
-        let mut tui = Tui::new(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session], false);
         tui.tmux_warmups_in_flight.insert(key.clone());
         let tx = tui.tmux_warmup_tx.clone();
 
@@ -1625,7 +1887,7 @@ exit 1
             .insert("opencode".to_string(), "opencode".to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
-        let mut tui = Tui::new(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session], false);
 
         tui.paste_prompt_into_tmux_agent(0, "build the thing")
             .unwrap();
@@ -1650,7 +1912,7 @@ exit 1
         let session = test_session(temp.join("worktree"), "feature");
         let slot = tmux_slot_key(&session);
         let stale_key = tmux_warmup_key(slot.clone(), 0);
-        let mut tui = Tui::new(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session], false);
         tui.tmux_generations.insert(slot, 1);
 
         let changed = tui.apply_tmux_warmup_result(TmuxWarmupResult {
@@ -1715,7 +1977,7 @@ exit 0
             .insert("opencode".to_string(), "opencode".to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
-        let mut tui = Tui::new(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session], false);
 
         tui.attach_selected_agent_terminal().unwrap();
 
@@ -1737,6 +1999,9 @@ exit 0
     fn test_session(path: PathBuf, branch: &str) -> Session {
         fs::create_dir_all(&path).unwrap();
         Session {
+            repo_index: 0,
+            repo_label: "repo".to_string(),
+            repo_key: None,
             path: path.clone(),
             path_display: path.display().to_string(),
             branch: branch.to_string(),

@@ -198,6 +198,7 @@ pub fn refresh_pr_cache(
     }
 }
 
+#[allow(dead_code)]
 pub fn refresh_pr_summary_index(
     repo: &Repository,
     sessions: &mut [crate::session::Session],
@@ -792,7 +793,7 @@ pub fn remove_pr_cache(repo: &Repository, branch: &str) -> Result<(), String> {
     })
 }
 
-fn remove_pr_details_cache(repo: &Repository, branch: &str) -> Result<(), String> {
+pub fn remove_pr_details_cache(repo: &Repository, branch: &str) -> Result<(), String> {
     observability::with_writable_db(repo, |conn| remove_pr_details_cache_with_conn(conn, branch))
 }
 
@@ -864,7 +865,7 @@ pub fn save_pr_details_cache(
     })
 }
 
-fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result<(), String> {
+pub fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result<(), String> {
     let Some(summary) = &cache.summary else {
         return Ok(());
     };

@@ -18,25 +18,22 @@ use crate::view;
 pub struct Tui {
     pub(crate) repo: Repository,
     pub(crate) config: Config,
+    pub(crate) repos: Vec<ManagedRepo>,
+    pub(crate) current_repo: usize,
     pub(crate) sessions: Vec<Session>,
     pub(crate) allow_dirty: bool,
     pub(crate) selected: usize,
     pub(crate) pr_poll_tx: Sender<PrPollResult>,
     pub(crate) pr_poll_rx: Receiver<PrPollResult>,
     pub(crate) pr_polls_in_flight: BTreeSet<PrPollKey>,
-    pub(crate) pr_summary_poll_in_flight: bool,
-    pub(crate) pr_summary_last_polled: Option<std::time::Instant>,
     pub(crate) tmux_warmup_tx: Sender<TmuxWarmupResult>,
     pub(crate) tmux_warmup_rx: Receiver<TmuxWarmupResult>,
     pub(crate) tmux_warmups_in_flight: BTreeSet<TmuxWarmupKey>,
     pub(crate) tmux_generations: BTreeMap<TmuxSlotKey, u64>,
     pub(crate) wt_poll_tx: Sender<WtPollResult>,
     pub(crate) wt_poll_rx: Receiver<WtPollResult>,
-    pub(crate) wt_poll_in_flight: bool,
     pub(crate) default_branch_poll_tx: Sender<DefaultBranchPollResult>,
     pub(crate) default_branch_poll_rx: Receiver<DefaultBranchPollResult>,
-    pub(crate) default_branch_poll_in_flight: bool,
-    pub(crate) default_branch_last_polled: Option<std::time::Instant>,
     pub(crate) session_filter: String,
     pub(crate) leader_hint: Option<LeaderHint>,
     status_message: Option<String>,
@@ -45,14 +42,46 @@ pub struct Tui {
 
 const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Debug)]
+pub(crate) struct ManagedRepo {
+    pub repo: Repository,
+    pub config: Config,
+    pub label: String,
+    pub key: Option<char>,
+    pub pr_summary_poll_in_flight: bool,
+    pub pr_summary_last_polled: Option<std::time::Instant>,
+    pub wt_poll_in_flight: bool,
+    pub default_branch_poll_in_flight: bool,
+    pub default_branch_last_polled: Option<std::time::Instant>,
+}
+
+impl ManagedRepo {
+    pub(crate) fn new(repo: Repository, config: Config, key: Option<char>) -> Self {
+        let label = crate::workspace::label_for_root(&repo.root);
+        Self {
+            repo,
+            config,
+            label,
+            key,
+            pr_summary_poll_in_flight: false,
+            pr_summary_last_polled: None,
+            wt_poll_in_flight: false,
+            default_branch_poll_in_flight: false,
+            default_branch_last_polled: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PrPollKey {
+    pub repo_index: usize,
     pub branch: String,
     pub path: PathBuf,
 }
 
 pub(crate) enum PrPollResult {
     Summary {
+        repo_index: usize,
         summaries: Result<Vec<PrSummary>, String>,
     },
     Details {
@@ -63,6 +92,7 @@ pub(crate) enum PrPollResult {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct TmuxSlotKey {
+    pub repo_index: usize,
     pub branch: String,
     pub path: PathBuf,
 }
@@ -86,10 +116,12 @@ pub(crate) enum LeaderHint {
 }
 
 pub(crate) struct WtPollResult {
+    pub repo_index: usize,
     pub columns: Result<BTreeMap<PathBuf, BTreeMap<String, String>>, String>,
 }
 
 pub(crate) struct DefaultBranchPollResult {
+    pub repo_index: usize,
     pub branch: String,
     pub path: PathBuf,
     pub status_label: Result<String, String>,
@@ -97,8 +129,8 @@ pub(crate) struct DefaultBranchPollResult {
 
 impl Tui {
     pub fn new(
-        repo: Repository,
-        config: Config,
+        mut repos: Vec<ManagedRepo>,
+        current_repo: usize,
         sessions: Vec<Session>,
         allow_dirty: bool,
     ) -> Self {
@@ -106,32 +138,67 @@ impl Tui {
         let (tmux_warmup_tx, tmux_warmup_rx) = mpsc::channel();
         let (wt_poll_tx, wt_poll_rx) = mpsc::channel();
         let (default_branch_poll_tx, default_branch_poll_rx) = mpsc::channel();
+        if repos.is_empty() {
+            let repo = Repository {
+                root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            };
+            repos.push(ManagedRepo::new(repo.clone(), Config::load(&repo), None));
+        }
+        let current_repo = current_repo.min(repos.len().saturating_sub(1));
+        let repo = repos[current_repo].repo.clone();
+        let config = repos[current_repo].config.clone();
         Self {
             repo,
             config,
+            repos,
+            current_repo,
             sessions,
             allow_dirty,
             selected: 0,
             pr_poll_tx,
             pr_poll_rx,
             pr_polls_in_flight: BTreeSet::new(),
-            pr_summary_poll_in_flight: false,
-            pr_summary_last_polled: None,
             tmux_warmup_tx,
             tmux_warmup_rx,
             tmux_warmups_in_flight: BTreeSet::new(),
             tmux_generations: BTreeMap::new(),
             wt_poll_tx,
             wt_poll_rx,
-            wt_poll_in_flight: false,
             default_branch_poll_tx,
             default_branch_poll_rx,
-            default_branch_poll_in_flight: false,
-            default_branch_last_polled: None,
             session_filter: String::new(),
             leader_hint: None,
             status_message: None,
             status_message_until: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_single(
+        repo: Repository,
+        config: Config,
+        sessions: Vec<Session>,
+        allow_dirty: bool,
+    ) -> Self {
+        Self::new(
+            vec![ManagedRepo::new(repo, config, None)],
+            0,
+            sessions,
+            allow_dirty,
+        )
+    }
+
+    pub(crate) fn sync_selected_repo_context(&mut self) {
+        let repo_index = self
+            .sessions
+            .get(self.selected)
+            .map(|session| session.repo_index)
+            .unwrap_or(self.current_repo)
+            .min(self.repos.len().saturating_sub(1));
+        self.current_repo = repo_index;
+        if let Some(repo) = self.repos.get(repo_index) {
+            self.repo = repo.repo.clone();
+            self.config = repo.config.clone();
         }
     }
 
@@ -267,6 +334,13 @@ impl Tui {
                         self.start_default_branch_status_poll(true);
                         self.poll_pull_requests(true);
                     }
+                    Key::RepoShortcut(key) => {
+                        self.clear_leader_hint();
+                        pending_g = false;
+                        if let Err(error) = self.select_repo_by_key(key) {
+                            self.show_error("select repository failed", &error)?;
+                        }
+                    }
                     Key::ReviewFix => {
                         self.clear_leader_hint();
                         pending_g = false;
@@ -302,6 +376,20 @@ impl Tui {
                             Ok(true) => self.enter_agent_mode(&mut raw)?,
                             Ok(false) => {}
                             Err(error) => self.show_error("create session failed", &error)?,
+                        }
+                    }
+                    Key::AddRepo => {
+                        self.clear_leader_hint();
+                        pending_g = false;
+                        if let Err(error) = self.add_repository() {
+                            self.show_error("add repository failed", &error)?;
+                        }
+                    }
+                    Key::ManageRepos => {
+                        self.clear_leader_hint();
+                        pending_g = false;
+                        if let Err(error) = self.edit_repositories(&mut raw) {
+                            self.show_error("edit repositories failed", &error)?;
                         }
                     }
                     Key::Delete => {
@@ -397,6 +485,9 @@ impl Tui {
             "Space g f    stage review-fix prompt",
             "Space g p    pull default branch",
             "p            pull default branch",
+            "1-9          switch repository",
+            "A            add repository",
+            "R            edit repositories/order/keys/remove",
             "c            create worktree session",
             "e            edit Prism repo config, then reload",
             "/            search/filter sessions",
@@ -916,6 +1007,37 @@ impl Tui {
         if let Some(session) = self.sessions.get_mut(self.selected) {
             session.unseen_comments = false;
         }
+        self.sync_selected_repo_context();
+    }
+
+    fn select_repo_by_key(&mut self, key: char) -> Result<(), String> {
+        let Some(repo_index) = self.repos.iter().position(|repo| repo.key == Some(key)) else {
+            self.show_message(&format!("no repository is bound to {key}"))?;
+            return Ok(());
+        };
+        self.select_repo(repo_index);
+        Ok(())
+    }
+
+    pub(crate) fn select_repo(&mut self, repo_index: usize) {
+        if let Some(index) = self
+            .visible_session_indices()
+            .into_iter()
+            .find(|index| {
+                self.sessions
+                    .get(*index)
+                    .is_some_and(|s| s.repo_index == repo_index)
+            })
+            .or_else(|| {
+                self.sessions
+                    .iter()
+                    .position(|session| session.repo_index == repo_index)
+            })
+        {
+            self.selected = index;
+        }
+        self.current_repo = repo_index.min(self.repos.len().saturating_sub(1));
+        self.sync_selected_repo_context();
     }
 
     fn clear_leader_hint(&mut self) {

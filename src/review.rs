@@ -200,6 +200,9 @@ mod tests {
 
     fn test_session(details: PrDetails) -> Session {
         Session {
+            repo_index: 0,
+            repo_label: "repo".to_string(),
+            repo_key: None,
             path: PathBuf::from("/repo/worktree"),
             path_display: "/repo/worktree".to_string(),
             branch: "feature".to_string(),

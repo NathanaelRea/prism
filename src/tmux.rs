@@ -1202,6 +1202,9 @@ exit 0
     fn test_session(path: PathBuf, branch: &str) -> Session {
         fs::create_dir_all(&path).unwrap();
         Session {
+            repo_index: 0,
+            repo_label: "repo".to_string(),
+            repo_key: None,
             path: path.clone(),
             path_display: path.display().to_string(),
             branch: branch.to_string(),

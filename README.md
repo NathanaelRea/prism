@@ -22,7 +22,7 @@ Requires Rust/Cargo, `git`, `gh`, `tmux`, `wt`, and `opencode`.
 
 ## Use
 
-Run `prism` from a Git repository.
+Run `prism` from anywhere. On first launch, Prism prompts for a repository base/main checkout. You can also add/select one directly with `prism --repo <path>`.
 
 Press `?` in the TUI for the full key list.
 
@@ -35,6 +35,9 @@ Common keys:
 - `Space g M` merges the selected pull request.
 - `Space g f` copies a review-fix prompt.
 - `p` or `Space g p` pulls the default branch.
+- `1`-`9` switches repositories.
+- `A` adds a repository by path.
+- `R` edits repository order, key bindings, and tracked repositories.
 - `c` creates a worktree session.
 - `e` edits the Prism repository config and reloads after save.
 - `/` filters sessions.
@@ -44,6 +47,20 @@ Common keys:
 - `q` or `Ctrl-C` quits.
 
 ## Configuration
+
+Tracked repositories live in `~/.config/prism/repos.toml`:
+
+```toml
+[[repos]]
+path = "/work/project-a"
+key = "1"
+
+[[repos]]
+path = "/work/project-b"
+key = "2"
+```
+
+Reorder blocks to change left-panel order. Remove a block to stop tracking a repository.
 
 Prism treats `main` as the default branch by default. The default branch is not
 polled or shown as a pull request branch.
