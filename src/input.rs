@@ -30,6 +30,8 @@ impl KeyInput {
                     31 => keys.push(Key::Terminal),
                     b'k' => keys.push(Key::Up),
                     b'j' => keys.push(Key::Down),
+                    b'h' => keys.push(Key::Left),
+                    b'l' => keys.push(Key::Right),
                     b'G' => keys.push(Key::Bottom),
                     b'g' => keys.push(Key::G),
                     b'r' => keys.push(Key::Refresh),
@@ -54,6 +56,8 @@ impl KeyInput {
                     match byte {
                         b'A' => keys.push(Key::Up),
                         b'B' => keys.push(Key::Down),
+                        b'C' => keys.push(Key::Right),
+                        b'D' => keys.push(Key::Left),
                         _ => keys.push(Key::Other),
                     }
                 }
@@ -95,6 +99,8 @@ impl KeyInput {
 pub enum Key {
     Up,
     Down,
+    Left,
+    Right,
     Bottom,
     G,
     Leader,
@@ -125,6 +131,13 @@ mod tests {
         let mut input = KeyInput::default();
         let keys = input.feed(b"j\x03");
         assert!(matches!(keys.as_slice(), [Key::Down, Key::Quit]));
+    }
+
+    #[test]
+    fn key_input_handles_horizontal_vim_motions() {
+        let mut input = KeyInput::default();
+        let keys = input.feed(b"hl");
+        assert!(matches!(keys.as_slice(), [Key::Left, Key::Right]));
     }
 
     #[test]

@@ -449,6 +449,12 @@ const KANBAN_LANES: [KanbanLane; 4] = [
     KanbanLane::Merged,
 ];
 
+pub(crate) const KANBAN_LANE_COUNT: usize = KANBAN_LANES.len();
+
+pub(crate) fn kanban_lane_index(config: &Config, session: &Session) -> Option<usize> {
+    kanban_lane(config, session).map(KanbanLane::index)
+}
+
 fn format_kanban_panel_lines(
     config: &Config,
     sessions: &[Session],
