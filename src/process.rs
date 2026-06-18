@@ -134,8 +134,8 @@ pub fn run_status(command: &mut Command) -> Result<(), String> {
         );
         Ok(())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let stderr = first_non_empty_line(&String::from_utf8_lossy(&output.stderr));
+        let stdout = first_non_empty_line(&String::from_utf8_lossy(&output.stdout));
         let message = if !stderr.is_empty() {
             stderr
         } else if !stdout.is_empty() {
@@ -158,6 +158,84 @@ pub fn run_status(command: &mut Command) -> Result<(), String> {
         );
         Err(format!("{command_display}: {message}"))
     }
+}
+
+pub fn run_status_inherited(command: &mut Command) -> Result<(), String> {
+    let include_argv = observability::enabled(LogLevel::Trace);
+    let command_display = observability::command_display(command);
+    let operation = observability::begin_operation(
+        LogLevel::Debug,
+        "process",
+        "start",
+        "starting subprocess",
+        Some(observability::command_data_json(
+            command,
+            include_argv,
+            None,
+            None,
+            None,
+        )),
+    );
+    let started = Instant::now();
+    let status = command.status().map_err(|error| {
+        let elapsed_ms = started.elapsed().as_millis() as i64;
+        operation.finish(
+            LogLevel::Error,
+            "process",
+            "error",
+            format!("subprocess failed to start: {error}"),
+            Some(observability::command_data_json(
+                command,
+                include_argv,
+                Some(elapsed_ms),
+                None,
+                Some(&error.to_string()),
+            )),
+        );
+        format!("{command_display}: {error}")
+    })?;
+    let elapsed_ms = started.elapsed().as_millis() as i64;
+    if status.success() {
+        operation.finish(
+            LogLevel::Debug,
+            "process",
+            "exit",
+            "subprocess exited successfully",
+            Some(observability::command_data_json(
+                command,
+                include_argv,
+                Some(elapsed_ms),
+                Some(&status.to_string()),
+                None,
+            )),
+        );
+        Ok(())
+    } else {
+        let message = format!("exited with {status}");
+        operation.finish(
+            LogLevel::Error,
+            "process",
+            "exit",
+            format!("subprocess failed: {status}"),
+            Some(observability::command_data_json(
+                command,
+                include_argv,
+                Some(elapsed_ms),
+                Some(&status.to_string()),
+                Some(&message),
+            )),
+        );
+        Err(format!("{command_display}: {message}"))
+    }
+}
+
+fn first_non_empty_line(output: &str) -> String {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string()
 }
 
 pub fn command_exists(command: &str) -> bool {
@@ -250,6 +328,14 @@ mod tests {
         assert_eq!(
             words,
             vec!["my-agent", "--mode", "two words", "three words"]
+        );
+    }
+
+    #[test]
+    fn first_non_empty_line_trims_and_discards_later_lines() {
+        assert_eq!(
+            first_non_empty_line("\n  first line  \nsecond line"),
+            "first line"
         );
     }
 }

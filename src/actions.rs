@@ -112,12 +112,13 @@ impl Tui {
                 )
             })?;
         self.selected = index;
-        write_task_metadata(&self.repo, &self.sessions[index], &initial_prompt)?;
+        let initial_prompt = initial_prompt.trim();
+        write_task_metadata(&self.repo, &self.sessions[index], initial_prompt)?;
         self.sessions[index].adopted = true;
-        if !initial_prompt.trim().is_empty() {
+        if !initial_prompt.is_empty() {
             self.show_loading_dialog("Create Session", "Starting agent session")?;
             self.sessions[index].prompt_summary = truncate(&initial_prompt.replace('\n', " "), 50);
-            self.paste_prompt_into_tmux_agent(index, initial_prompt.trim())?;
+            self.paste_prompt_into_tmux_agent(index, initial_prompt)?;
             self.show_message("pasted initial prompt into agent session")?;
         }
         Ok(true)
