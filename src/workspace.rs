@@ -246,9 +246,10 @@ key = "1"
         ];
 
         let discovered = discover_valid_entries(entries);
+        let expected_repo_path = fs::canonicalize(&repo_path).unwrap();
 
         assert_eq!(discovered.len(), 1);
-        assert_eq!(discovered[0].repo.root, repo_path);
+        assert_eq!(discovered[0].repo.root, expected_repo_path);
         assert_eq!(discovered[0].key, Some('1'));
         assert_eq!(discovered[0].source_index, 0);
 
