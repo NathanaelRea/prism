@@ -61,7 +61,8 @@ for line in raw.splitlines():
     if key == "worktree":
         current["path"] = value
     elif key == "branch":
-        current["branch"] = value.removeprefix("refs/heads/")
+        prefix = "refs/heads/"
+        current["branch"] = value[len(prefix):] if value.startswith(prefix) else value
 if current:
     items.append(current)
 

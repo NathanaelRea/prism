@@ -76,8 +76,13 @@ pub(crate) fn render_model_frame(model: &FrameModel<'_>, cols: u16, rows: u16) -
     } else {
         38
     };
-    let sidebar_width = sidebar_target.min(cols.saturating_sub(11)).max(14);
-    let main_width = cols.saturating_sub(sidebar_width + 1).max(10);
+    let min_sidebar_width = 14;
+    let min_main_width = 10;
+    let max_sidebar_width = cols.saturating_sub(min_main_width + 1);
+    let sidebar_width = sidebar_target
+        .min(max_sidebar_width)
+        .max(min_sidebar_width.min(max_sidebar_width));
+    let main_width = cols.saturating_sub(sidebar_width + 1);
     let panel_rows = rows.saturating_sub(1) as usize;
     let sidebar_content_rows = panel_rows.saturating_sub(9);
     let status_rows = sidebar_content_rows.min(4);
@@ -1710,6 +1715,27 @@ mod tests {
                     "{cols}x{rows} line {index} should fill the terminal width"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn render_model_frame_keeps_panes_within_narrow_viewport() {
+        let config = test_config(Some("main"));
+        let sessions = vec![test_session(
+            "feature/very-long-branch-name-that-must-fit",
+            "dirty 12 ahead 3",
+            AgentState::Running,
+            PrCache::default(),
+        )];
+        let model = test_model(&config, &sessions, Some(0), PanelFocus::Worktrees, None);
+        let frame = render_model_frame(&model, 20, 10);
+        let first_line = crate::util::strip_ansi(frame.lines().next().unwrap_or_default());
+        let chars = first_line.chars().collect::<Vec<_>>();
+
+        assert_eq!(chars.len(), 20);
+        assert_eq!(chars[9], '|');
+        for line in frame.lines() {
+            assert_eq!(visible_len(line), 20);
         }
     }
 
