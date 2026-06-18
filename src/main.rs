@@ -72,7 +72,7 @@ fn run() -> Result<(), String> {
         }
         CommandKind::RunPlan(path) => {
             let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
-            plan::run_plan_cli(&repo, &config, &path)
+            plan::run_plan_cli(&repo, &config, path.as_deref())
         }
         CommandKind::Debug(command) => {
             let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;

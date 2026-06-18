@@ -17,7 +17,7 @@ pub enum CommandKind {
     Tui,
     Doctor,
     Config,
-    RunPlan(PathBuf),
+    RunPlan(Option<PathBuf>),
     Debug(DebugCommand),
     Db(DbCommand),
 }
@@ -72,11 +72,8 @@ impl Args {
                 }
                 "doctor" => command = CommandKind::Doctor,
                 "config" => command = CommandKind::Config,
-                "run-plan" => {
-                    let value = iter
-                        .next()
-                        .ok_or_else(|| "run-plan requires a plan file".to_string())?;
-                    command = CommandKind::RunPlan(PathBuf::from(value));
+                "run-plan" | "plan" => {
+                    command = CommandKind::RunPlan(iter.next().map(PathBuf::from));
                 }
                 "debug" => {
                     let value = iter
@@ -128,6 +125,6 @@ impl Args {
 
 fn print_help() {
     println!(
-        "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config\n  prism [--repo <path>] run-plan <plan.md>\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>"
+        "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>"
     );
 }

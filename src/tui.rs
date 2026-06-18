@@ -466,17 +466,26 @@ impl Tui {
                             self.show_error("pull failed", &error)?;
                         }
                     }
+                    Key::PlanMode => {
+                        self.clear_leader_hint();
+                        pending_g = false;
+                        if self.focused_panel == PanelFocus::Status {
+                            self.show_message("focus repos or worktrees to run plan mode")?;
+                        } else if self.focused_panel == PanelFocus::Repos {
+                            if let Err(error) = self.open_selected_repo_plan_mode(&mut raw) {
+                                self.show_error("plan mode failed", &error)?;
+                            }
+                        } else if let Err(error) = self.open_selected_worktree_plan_mode(&mut raw) {
+                            self.show_error("plan mode failed", &error)?;
+                        }
+                    }
                     Key::Create => {
                         self.clear_leader_hint();
                         pending_g = false;
-                        if self.focused_panel != PanelFocus::Repos {
-                            self.show_message("focus repos to create a worktree session")?;
-                        } else {
-                            match self.create_session() {
-                                Ok(true) => self.focus_worktrees(),
-                                Ok(false) => {}
-                                Err(error) => self.show_error("create session failed", &error)?,
-                            }
+                        match self.create_session() {
+                            Ok(true) => self.focus_worktrees(),
+                            Ok(false) => {}
+                            Err(error) => self.show_error("create session failed", &error)?,
                         }
                     }
                     Key::AddRepo => {
@@ -603,10 +612,10 @@ impl Tui {
             "Space g f    stage review-fix prompt",
             "Space g p    repos: pull default branch",
             "p            repos: pull default branch",
-            "Space 1-9    switch repository",
+            "P            repos/worktrees: run plan mode",
             "A            add repository",
             "R            edit repositories/order/keys/remove",
-            "c            repos: create worktree session",
+            "c            create worktree session in selected repo",
             "e            repos: edit Prism repo config, then reload",
             "/            search/filter focused panel",
             "?            show keybindings; / filters this dialog",
@@ -1578,13 +1587,13 @@ impl Tui {
     fn leader_hint_label(&self) -> Option<&'static str> {
         match (self.leader_hint, self.focused_panel) {
             (Some(LeaderHint::Root), PanelFocus::Status) => {
-                Some("1-9: repo jump  g: git  space/enter: focus repos")
+                Some("g: git  space/enter: focus repos")
             }
             (Some(LeaderHint::Root), PanelFocus::Repos) => {
-                Some("1-9: repo jump  g: git  space/enter: focus worktrees")
+                Some("g: git  space/enter: focus worktrees")
             }
             (Some(LeaderHint::Root), PanelFocus::Worktrees) => {
-                Some("1-9: repo jump  g: git  enter: terminal  space: agent if valid")
+                Some("g: git  enter: terminal  space: agent if valid")
             }
             (Some(LeaderHint::Git), PanelFocus::Status) => {
                 Some("g: lazygit after focusing repos/worktrees")

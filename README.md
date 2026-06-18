@@ -30,7 +30,7 @@ See [docs/prism-demo.md](docs/prism-demo.md) for regeneration notes.
 ./install.sh
 ```
 
-Requires Rust/Cargo, `git`, `gh`, `tmux`, `wt`, and `opencode`.
+Requires Rust/Cargo, `git`, `gh`, `tmux`, `wt`, and `opencode`. Plan mode also requires `fzf`.
 
 ## Use
 
@@ -49,6 +49,7 @@ Common keys:
 - `Space g P` pushes the selected branch and creates a pull request if needed.
 - `Space g M` merges the selected pull request.
 - `Space g f` copies a review-fix prompt.
+- `P` opens plan mode in tmux from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through `opencode run`.
 - `p` or `Space g p` pulls the default branch from the repos panel.
 - `Space 1`-`Space 9` switches repositories using configured repo keys.
 - `A` adds a repository by path from the repos panel.
