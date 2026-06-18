@@ -318,8 +318,8 @@ fn format_repo_row(row: &RepoRow, width: usize) -> String {
     };
     let key = row
         .key
-        .map(|key| format!("s{key}"))
-        .unwrap_or_else(|| "  ".to_string());
+        .map(|key| format!("Space {key}"))
+        .unwrap_or_else(|| "       ".to_string());
     let label = if row.label.trim().is_empty() {
         row.root.as_str()
     } else {
@@ -328,7 +328,7 @@ fn format_repo_row(row: &RepoRow, width: usize) -> String {
     let text = format!(
         "{} {} {} {}",
         marker,
-        styled_cell(&key, 3, "90"),
+        styled_cell(&key, 7, "90"),
         styled_cell(label, 18, if row.selected { "1;37" } else { "37" }),
         color(&row.health, "90"),
     );
@@ -1444,7 +1444,8 @@ mod tests {
 
     use super::{
         FrameModel, RepoRow, StatusRow, WorktreeKind, WorktreeRow, configured_column_label,
-        format_column_value, git_status_indicator, render_model_frame, visible_len,
+        format_column_value, format_repo_row, git_status_indicator, render_model_frame,
+        visible_len,
     };
 
     #[test]
@@ -1485,6 +1486,21 @@ mod tests {
         assert!(frame.contains("normal  repo /repo"));
         assert!(frame.contains("current worktree is dirty"));
         assert!(!frame.contains("status:"));
+    }
+
+    #[test]
+    fn repo_row_displays_leader_shortcut() {
+        let row = RepoRow {
+            label: "repo".to_string(),
+            root: "/repo".to_string(),
+            key: Some('1'),
+            health: "ok".to_string(),
+            selected: false,
+        };
+        let row = crate::util::strip_ansi(&format_repo_row(&row, 80));
+
+        assert!(row.contains("Space 1"));
+        assert!(!row.contains("s1"));
     }
 
     #[test]
