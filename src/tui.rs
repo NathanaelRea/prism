@@ -613,7 +613,6 @@ impl Tui {
             "Space g p    repos: pull default branch",
             "p            repos: pull default branch",
             "P            repos/worktrees: run plan mode",
-            "Space 1-9    switch repository",
             "A            add repository",
             "R            edit repositories/order/keys/remove",
             "c            create worktree session in selected repo",
@@ -1588,13 +1587,13 @@ impl Tui {
     fn leader_hint_label(&self) -> Option<&'static str> {
         match (self.leader_hint, self.focused_panel) {
             (Some(LeaderHint::Root), PanelFocus::Status) => {
-                Some("1-9: repo jump  g: git  space/enter: focus repos")
+                Some("g: git  space/enter: focus repos")
             }
             (Some(LeaderHint::Root), PanelFocus::Repos) => {
-                Some("1-9: repo jump  g: git  space/enter: focus worktrees")
+                Some("g: git  space/enter: focus worktrees")
             }
             (Some(LeaderHint::Root), PanelFocus::Worktrees) => {
-                Some("1-9: repo jump  g: git  enter: terminal  space: agent if valid")
+                Some("g: git  enter: terminal  space: agent if valid")
             }
             (Some(LeaderHint::Git), PanelFocus::Status) => {
                 Some("g: lazygit after focusing repos/worktrees")

@@ -289,8 +289,7 @@ fn footer_actions(model: &FrameModel<'_>) -> String {
             actions.extend([
                 "c create",
                 "p pull",
-                "Space Enter terminal",
-                "Space g g lazygit",
+                "<Space> for more options",
                 "A add",
                 "R repos",
                 "/ search",
@@ -301,16 +300,9 @@ fn footer_actions(model: &FrameModel<'_>) -> String {
             let Some(row) = model.worktrees.iter().find(|row| row.selected) else {
                 return "c create  / search".to_string();
             };
-            let mut actions = vec!["Space Enter terminal", "Space g g lazygit"];
+            let mut actions = vec!["<Space> for more options"];
             if row.kind != WorktreeKind::DefaultBranch {
                 actions.insert(0, "Enter open");
-            }
-            if row.kind == WorktreeKind::FeatureWorktree {
-                actions.push("Space g P push");
-                if row.pr.summary.is_some() {
-                    actions.push("Space g M merge");
-                    actions.push("Space g f review");
-                }
             }
             if row.kind != WorktreeKind::DefaultBranch {
                 actions.push("D delete");
@@ -450,7 +442,6 @@ fn format_status_dashboard_lines(model: &FrameModel<'_>, width: usize) -> Vec<St
         color("Navigation", "1;37"),
         "1 status  2 repos  3 worktrees".to_string(),
         "Tab or h/l moves focus".to_string(),
-        "Space 1-9 jumps to configured repos".to_string(),
         String::new(),
         color("Documentation", "1;37"),
         dashboard_link("GitHub repository", "https://github.com/NathanaelRea/prism"),
@@ -1569,7 +1560,7 @@ mod tests {
         let frame = crate::util::strip_ansi(&render_model_frame(&model, 140, 20));
 
         assert!(frame.contains("Enter open"));
-        assert!(frame.contains("Space g P push"));
+        assert!(frame.contains("<Space> for more options"));
         assert!(frame.contains("D delete"));
     }
 
