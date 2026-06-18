@@ -127,12 +127,7 @@ pub(crate) struct DefaultBranchPollResult {
 }
 
 impl Tui {
-    pub fn new(
-        repos: Vec<ManagedRepo>,
-        current_repo: usize,
-        sessions: Vec<Session>,
-        _allow_dirty: bool,
-    ) -> Self {
+    pub fn new(repos: Vec<ManagedRepo>, current_repo: usize, sessions: Vec<Session>) -> Self {
         let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
         let (tmux_warmup_tx, tmux_warmup_rx) = mpsc::channel();
         let (wt_poll_tx, wt_poll_rx) = mpsc::channel();
@@ -175,18 +170,8 @@ impl Tui {
     }
 
     #[cfg(test)]
-    pub(crate) fn new_single(
-        repo: Repository,
-        config: Config,
-        sessions: Vec<Session>,
-        allow_dirty: bool,
-    ) -> Self {
-        Self::new(
-            vec![ManagedRepo::new(repo, config, None)],
-            0,
-            sessions,
-            allow_dirty,
-        )
+    pub(crate) fn new_single(repo: Repository, config: Config, sessions: Vec<Session>) -> Self {
+        Self::new(vec![ManagedRepo::new(repo, config, None)], 0, sessions)
     }
 
     pub(crate) fn sync_selected_repo_context(&mut self) {

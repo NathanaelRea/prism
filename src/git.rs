@@ -167,9 +167,12 @@ mod tests {
         let remote = temp.join("remote");
         fs::create_dir_all(&temp).unwrap();
 
-        run(Command::new("git")
-            .args(["init", "--bare", "--initial-branch=main"])
-            .arg(&origin));
+        run(Command::new("git").args(["init", "--bare"]).arg(&origin));
+        run(Command::new("git").arg("--git-dir").arg(&origin).args([
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ]));
         run(Command::new("git").arg("clone").arg(&origin).arg(&work));
         configure_user(&work);
         fs::write(work.join("tracked.txt"), "base\n").unwrap();

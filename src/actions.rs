@@ -1646,7 +1646,7 @@ exit 1
             .insert("gh".to_string(), gh.display().to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
 
         let started = Instant::now();
         let changed = tui.poll_pull_requests(false);
@@ -1670,7 +1670,7 @@ exit 1
         config.default_base = Some("main".to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "main");
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
 
         let changed = tui.poll_pull_requests(false);
 
@@ -1731,7 +1731,7 @@ exit 0
             .insert("opencode".to_string(), "opencode".to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
 
         let started = Instant::now();
         tui.start_tmux_agent_warmup();
@@ -1791,7 +1791,7 @@ exit 0
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
         let key = tmux_warmup_key(tmux_slot_key(&session), 0);
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
         tui.tmux_warmups_in_flight.insert(key.clone());
         let tx = tui.tmux_warmup_tx.clone();
 
@@ -1879,7 +1879,7 @@ exit 1
             .insert("opencode".to_string(), "opencode".to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
 
         tui.paste_prompt_into_tmux_agent(0, "build the thing")
             .unwrap();
@@ -1904,7 +1904,7 @@ exit 1
         let session = test_session(temp.join("worktree"), "feature");
         let slot = tmux_slot_key(&session);
         let stale_key = tmux_warmup_key(slot.clone(), 0);
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
         tui.tmux_generations.insert(slot, 1);
 
         let changed = tui.apply_tmux_warmup_result(TmuxWarmupResult {
@@ -1969,7 +1969,7 @@ exit 0
             .insert("opencode".to_string(), "opencode".to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
 
         tui.attach_selected_agent_terminal().unwrap();
 
