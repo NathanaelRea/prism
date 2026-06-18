@@ -111,9 +111,9 @@ impl Tui {
         let initial_prompt = initial_prompt.trim();
         write_task_metadata(&context.repo, &self.sessions[index], initial_prompt)?;
         self.sessions[index].adopted = true;
+        self.sessions[index].prompt_summary = truncate(&initial_prompt.replace('\n', " "), 50);
         if !initial_prompt.is_empty() {
             self.show_loading_dialog("Create Session", "Starting agent session")?;
-            self.sessions[index].prompt_summary = truncate(&initial_prompt.replace('\n', " "), 50);
             self.paste_prompt_into_tmux_agent(index, initial_prompt)?;
             self.show_message("pasted initial prompt into agent session")?;
         }

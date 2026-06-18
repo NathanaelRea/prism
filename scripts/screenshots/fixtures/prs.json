@@ -1,0 +1,98 @@
+{
+  "next_number": 42,
+  "prs": [
+    {
+      "number": 17,
+      "branch": "feat/review-fix",
+      "title": "Tighten review prompt flow",
+      "body": "Collect unresolved review comments and stage a fix prompt.",
+      "state": "OPEN",
+      "reviewDecision": "CHANGES_REQUESTED",
+      "requestedReviewers": ["octo-reviewers"],
+      "checkStatus": "failed",
+      "draft": false,
+      "merged": false,
+      "baseRefName": "main",
+      "updatedAt": "2026-01-15T10:30:00Z",
+      "comments": [
+        {
+          "author": "mona",
+          "body": "Please keep the prompt focused on unresolved comments."
+        }
+      ],
+      "reviews": [
+        {
+          "author": "mona",
+          "state": "CHANGES_REQUESTED",
+          "body": "Needs one tighter pass before merge."
+        }
+      ],
+      "reviewComments": [
+        {
+          "author": "hubot",
+          "path": "src/review.js",
+          "line": 1,
+          "body": "Can this skip resolved threads?",
+          "resolved": false
+        }
+      ],
+      "files": ["src/review.js"],
+      "failingChecks": ["cargo test"]
+    },
+    {
+      "number": 28,
+      "branch": "feat/ci-green",
+      "title": "Add storefront health check",
+      "body": "Expose a small health helper for release readiness.",
+      "state": "OPEN",
+      "reviewDecision": "APPROVED",
+      "requestedReviewers": [],
+      "checkStatus": "passed",
+      "draft": false,
+      "merged": false,
+      "baseRefName": "main",
+      "updatedAt": "2026-01-15T11:00:00Z",
+      "comments": [
+        {
+          "author": "octocat",
+          "body": "Looks good after the final health annotation."
+        }
+      ],
+      "reviews": [
+        {
+          "author": "octocat",
+          "state": "APPROVED",
+          "body": "Approved."
+        }
+      ],
+      "reviewComments": [],
+      "files": ["src/health.js"],
+      "failingChecks": []
+    },
+    {
+      "number": 33,
+      "branch": "feat/merged-cleanup",
+      "title": "Refresh storefront copy",
+      "body": "Clean up demo storefront copy for the docs.",
+      "state": "MERGED",
+      "reviewDecision": "APPROVED",
+      "requestedReviewers": [],
+      "checkStatus": "passed",
+      "draft": false,
+      "merged": true,
+      "baseRefName": "main",
+      "updatedAt": "2026-01-15T11:30:00Z",
+      "comments": [],
+      "reviews": [
+        {
+          "author": "mona",
+          "state": "APPROVED",
+          "body": "Merged."
+        }
+      ],
+      "reviewComments": [],
+      "files": ["docs/copy.md"],
+      "failingChecks": []
+    }
+  ]
+}

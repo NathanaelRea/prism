@@ -1,6 +1,6 @@
 use std::io::{self, ErrorKind, Write};
 use std::os::fd::RawFd;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use crate::process::run_status;
 
@@ -13,7 +13,7 @@ pub struct RawTerminal {
 impl RawTerminal {
     pub fn enter() -> Result<Self, String> {
         let stdin_flags = get_fd_flags(0)?;
-        run_status(Command::new("stty").args(raw_stty_args()))?;
+        run_stty(raw_stty_args())?;
         set_fd_flags(0, stdin_flags | O_NONBLOCK)?;
         write_stdout("\x1b[?1049h")?;
         Ok(Self { stdin_flags })
@@ -21,12 +21,12 @@ impl RawTerminal {
 
     pub fn suspend(&mut self) -> Result<(), String> {
         set_fd_flags(0, self.stdin_flags)?;
-        run_status(Command::new("stty").arg("sane"))?;
+        run_stty(["sane"])?;
         write_stdout("\x1b[?1049l\x1b[?25h")
     }
 
     pub fn resume(&mut self) -> Result<(), String> {
-        run_status(Command::new("stty").args(raw_stty_args()))?;
+        run_stty(raw_stty_args())?;
         set_fd_flags(0, self.stdin_flags | O_NONBLOCK)?;
         write_stdout("\x1b[?1049h\x1b[?25l")
     }
@@ -146,6 +146,10 @@ fn valid_terminal_size(cols: u16, rows: u16) -> Option<(u16, u16)> {
 
 fn raw_stty_args() -> [&'static str; 4] {
     ["raw", "-echo", "opost", "onlcr"]
+}
+
+fn run_stty<const N: usize>(args: [&str; N]) -> Result<(), String> {
+    run_status(Command::new("stty").args(args).stdin(Stdio::inherit()))
 }
 
 #[cfg(test)]

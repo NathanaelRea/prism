@@ -12,6 +12,18 @@ Prism is a terminal board for running agent-backed coding sessions across Git wo
 
 Use it to create branch worktrees, open persistent agent sessions, watch pull request state, and keep multiple coding tasks moving from one TUI.
 
+## Demo
+
+![Prism demo](docs/prism-demo.gif)
+
+Refresh the demo GIF with:
+
+```sh
+./scripts/screenshot.sh
+```
+
+See [docs/prism-demo.md](docs/prism-demo.md) for regeneration notes.
+
 ## Install
 
 ```sh

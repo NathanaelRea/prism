@@ -69,135 +69,66 @@ pub(crate) fn draw_model(model: &FrameModel<'_>) -> Result<(), String> {
 }
 
 pub(crate) fn render_model_frame(model: &FrameModel<'_>, cols: u16, rows: u16) -> String {
-    let status_width = if cols >= 160 { 22 } else { 16 }
-        .min(cols.saturating_sub(62))
-        .max(14);
-    let repo_width = if cols >= 160 { 28 } else { 20 }
-        .min(cols.saturating_sub(status_width + 44))
-        .max(16);
-    let worktree_width = if cols >= 160 {
+    let sidebar_target = if cols >= 160 {
         50
     } else if cols >= 120 {
-        40
+        44
     } else {
-        30
-    }
-    .min(cols.saturating_sub(status_width + repo_width + 22))
-    .max(24);
-    let main_width = cols
-        .saturating_sub(status_width + repo_width + worktree_width + 3)
-        .max(10);
-    let mut frame = String::from("\x1b[?25l\x1b[H");
-    push_line(
-        &mut frame,
-        cols,
-        format!(
-            "{}|{}|{}|{}",
-            panel_title(
-                "1 Status",
-                model.focus == PanelFocus::Status,
-                status_width as usize,
-            ),
-            panel_title(
-                "2 Repos",
-                model.focus == PanelFocus::Repos,
-                repo_width as usize
-            ),
-            panel_title(
-                "3 Worktrees / Sessions",
-                model.focus == PanelFocus::Worktrees,
-                worktree_width as usize,
-            ),
-            styled_cell("Main", main_width as usize, "1;36"),
-        ),
-    );
-    push_line(
-        &mut frame,
-        cols,
-        format!(
-            "{}+{}+{}+{}",
-            "-".repeat(status_width as usize),
-            "-".repeat(repo_width as usize),
-            "-".repeat(worktree_width as usize),
-            "-".repeat(main_width as usize),
-        ),
-    );
-
-    let visible_rows = rows.saturating_sub(4) as usize;
+        38
+    };
+    let sidebar_width = sidebar_target.min(cols.saturating_sub(11)).max(14);
+    let main_width = cols.saturating_sub(sidebar_width + 1).max(10);
+    let panel_rows = rows.saturating_sub(1) as usize;
+    let sidebar_content_rows = panel_rows.saturating_sub(9);
+    let status_rows = sidebar_content_rows.min(4);
+    let remaining_sidebar_rows = sidebar_content_rows.saturating_sub(status_rows);
+    let repo_rows = remaining_sidebar_rows.saturating_mul(2) / 5;
+    let worktree_rows = remaining_sidebar_rows.saturating_sub(repo_rows);
+    let main_rows = panel_rows.saturating_sub(3);
     let repo_selected = model.repos.iter().position(|row| row.selected).unwrap_or(0);
-    let repo_start = scroll_start(repo_selected, visible_rows);
+    let repo_start = scroll_start(repo_selected, repo_rows);
     let worktree_selected = model
         .worktrees
         .iter()
         .position(|row| row.selected)
         .unwrap_or(0);
-    let worktree_start = scroll_start(worktree_selected, visible_rows);
+    let worktree_start = scroll_start(worktree_selected, worktree_rows);
     let main_lines = match model.focus {
         PanelFocus::Status => format_status_dashboard_lines(model, main_width as usize),
-        PanelFocus::Repos => format_repo_overview_lines(model, main_width as usize, visible_rows),
+        PanelFocus::Repos => format_repo_overview_lines(model, main_width as usize, main_rows),
         PanelFocus::Worktrees => format_worktree_detail_lines(model, main_width as usize),
     };
-
-    for row in 0..visible_rows {
-        let status = model
-            .status
-            .get(row)
-            .map(|status| format_status_row(status, status_width as usize))
-            .unwrap_or_else(|| " ".repeat(status_width as usize));
-        let repo = model
-            .repos
-            .get(repo_start + row)
-            .map(|repo| format_repo_row(repo, repo_width as usize))
-            .unwrap_or_else(|| {
-                empty_state_cell(
-                    row,
-                    model.repos.is_empty(),
-                    if model.repo_filter.trim().is_empty() {
-                        "No repos"
-                    } else {
-                        "No matches"
-                    },
-                    repo_width as usize,
-                )
-            });
-        let worktree = model
-            .worktrees
-            .get(worktree_start + row)
-            .map(|worktree| format_worktree_row(model.config, worktree, worktree_width as usize))
-            .unwrap_or_else(|| {
-                empty_state_cell(
-                    row,
-                    model.worktrees.is_empty(),
-                    if model.worktree_filter.trim().is_empty() {
-                        "No worktrees"
-                    } else {
-                        "No matches"
-                    },
-                    worktree_width as usize,
-                )
-            });
-        let main = main_lines.get(row).cloned().unwrap_or_default();
-        push_line(
-            &mut frame,
-            cols,
-            format!(
-                "{status}|{repo}|{worktree}|{}",
-                ansi_cell(&main, main_width as usize),
-            ),
-        );
-    }
-
-    push_line(
-        &mut frame,
-        cols,
-        format!(
-            "{}+{}+{}+{}",
-            "-".repeat(status_width as usize),
-            "-".repeat(repo_width as usize),
-            "-".repeat(worktree_width as usize),
-            "-".repeat(main_width as usize),
-        ),
+    let sidebar_lines = format_sidebar_lines(
+        model,
+        sidebar_width as usize,
+        panel_rows,
+        status_rows,
+        repo_rows,
+        worktree_rows,
+        repo_start,
+        worktree_start,
     );
+    let mut frame = String::from("\x1b[?25l\x1b[H");
+    for row in 0..panel_rows {
+        let sidebar = sidebar_lines
+            .get(row)
+            .cloned()
+            .unwrap_or_else(|| " ".repeat(sidebar_width as usize));
+        let main = if row == 0 {
+            styled_cell("Main", main_width as usize, "1;36")
+        } else if row == 1 || row + 1 == panel_rows {
+            "-".repeat(main_width as usize)
+        } else {
+            ansi_cell(
+                main_lines
+                    .get(row - 2)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+                main_width as usize,
+            )
+        };
+        push_line(&mut frame, cols, format!("{sidebar}|{main}"));
+    }
     let mode_label = scoped_mode_label(model);
     let actions = footer_actions(model);
     let footer = match model.status_message {
@@ -223,6 +154,100 @@ fn panel_title(title: &str, focused: bool, width: usize) -> String {
     } else {
         styled_cell(title, width, "36")
     }
+}
+
+fn format_sidebar_lines(
+    model: &FrameModel<'_>,
+    width: usize,
+    total_rows: usize,
+    status_rows: usize,
+    repo_rows: usize,
+    worktree_rows: usize,
+    repo_start: usize,
+    worktree_start: usize,
+) -> Vec<String> {
+    let mut lines = Vec::with_capacity(total_rows);
+
+    append_sidebar_section(
+        &mut lines,
+        "1 Status",
+        model.focus == PanelFocus::Status,
+        width,
+        (0..status_rows).map(|row| {
+            model
+                .status
+                .get(row)
+                .map(|status| format_status_row(status, width))
+                .unwrap_or_else(|| " ".repeat(width))
+        }),
+    );
+    append_sidebar_section(
+        &mut lines,
+        "2 Repos",
+        model.focus == PanelFocus::Repos,
+        width,
+        (0..repo_rows).map(|row| {
+            model
+                .repos
+                .get(repo_start + row)
+                .map(|repo| format_repo_row(repo, width))
+                .unwrap_or_else(|| {
+                    empty_state_cell(
+                        row,
+                        model.repos.is_empty(),
+                        if model.repo_filter.trim().is_empty() {
+                            "No repos"
+                        } else {
+                            "No matches"
+                        },
+                        width,
+                    )
+                })
+        }),
+    );
+    append_sidebar_section(
+        &mut lines,
+        "3 Worktrees / Sessions",
+        model.focus == PanelFocus::Worktrees,
+        width,
+        (0..worktree_rows).map(|row| {
+            model
+                .worktrees
+                .get(worktree_start + row)
+                .map(|worktree| format_worktree_row(model.config, worktree, width))
+                .unwrap_or_else(|| {
+                    empty_state_cell(
+                        row,
+                        model.worktrees.is_empty(),
+                        if model.worktree_filter.trim().is_empty() {
+                            "No worktrees"
+                        } else {
+                            "No matches"
+                        },
+                        width,
+                    )
+                })
+        }),
+    );
+
+    lines.truncate(total_rows);
+    while lines.len() < total_rows {
+        lines.push(" ".repeat(width));
+    }
+    lines
+}
+
+fn append_sidebar_section(
+    lines: &mut Vec<String>,
+    title: &str,
+    focused: bool,
+    width: usize,
+    rows: impl IntoIterator<Item = String>,
+) {
+    lines.push(panel_title(title, focused, width));
+    lines.push("-".repeat(width));
+    lines.extend(rows);
+    lines.push("-".repeat(width));
 }
 
 fn scroll_start(selected: usize, visible_rows: usize) -> usize {
@@ -401,12 +426,13 @@ fn format_worktree_row(config: &Config, row: &WorktreeRow, width: usize) -> Stri
 }
 
 fn format_status_dashboard_lines(model: &FrameModel<'_>, width: usize) -> Vec<String> {
+    let logo_color = "38;2;0;255;255";
     let mut lines = vec![
-        color("      ____       _               ", "1;36"),
-        color("     / __ \\_____(_)________ ___ ", "1;36"),
-        color("    / /_/ / ___/ / ___/ __ `__ \\", "1;36"),
-        color("   / ____/ /  / (__  ) / / / / /", "1;36"),
-        color("  /_/   /_/  /_/____/_/ /_/ /_/ ", "1;36"),
+        color("░▒▓█▓▒░ P ◤◥◣◢◤◥◣", logo_color),
+        color("▒▓█▓▒░▒ R ◥◣◢◤◥◣◢", logo_color),
+        color("▓█▓▒░▒▓ I ◣◢◤◥◣◢◤", logo_color),
+        color("█▓▒░▒▓█ S ◢◤◥◣◢◤◥", logo_color),
+        color("▓▒░▒▓█▓ M ◤◥◣◢◤◥◣", logo_color),
         String::new(),
         format!("version {}", env!("CARGO_PKG_VERSION")),
         format!(
@@ -1732,10 +1758,12 @@ mod tests {
 
         let frame = render_model_frame(&model, 100, 24);
         let stripped = crate::util::strip_ansi(&frame);
+        let lines = stripped.lines().collect::<Vec<_>>();
 
-        assert!(stripped.contains("1 Status"));
-        assert!(stripped.contains("2 Repos"));
-        assert!(stripped.contains("3 Worktrees / Sessions"));
+        assert!(lines[0].contains("1 Status"));
+        assert!(lines[0].contains("Main"));
+        assert!(lines[7].contains("2 Repos"));
+        assert!(lines[14].contains("3 Worktrees / Sessions"));
         assert!(stripped.contains("feature"));
         for line in frame.lines() {
             assert_eq!(visible_len(line), 100);
@@ -1772,9 +1800,9 @@ mod tests {
         let separator = crate::util::strip_ansi(frame.lines().nth(1).unwrap_or_default());
         let chars = separator.chars().collect::<Vec<_>>();
 
-        assert_eq!(chars[22], '+');
-        assert_eq!(chars[51], '+');
-        assert_eq!(chars[102], '+');
+        assert_eq!(chars[50], '|');
+        assert!(chars[..50].iter().all(|ch| *ch == '-'));
+        assert!(chars[51..].iter().all(|ch| *ch == '-'));
         assert_eq!(chars.len(), 160);
     }
 

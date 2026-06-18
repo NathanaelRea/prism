@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tool="$(basename "$0")"
+root="${PRISM_DEMO_ROOT:?PRISM_DEMO_ROOT is required}"
+log_dir="$root/logs"
+mkdir -p "$log_dir"
+{
+  printf 'tool=%s\n' "$tool"
+  printf 'cwd=%s\n' "$(pwd)"
+  printf 'argv='
+  printf '%q ' "$@"
+  printf '\n'
+  printf 'TMUX=%s\n' "${TMUX:-}"
+  printf 'PRISM_DEMO_ROOT=%s\n\n' "$root"
+} >>"$log_dir/$tool.log"
+
+real_path="${PATH#"$root/bin:"}"
+
+if [[ "${1:-}" == "--version" || "${1:-}" == "-V" ]]; then
+  PATH="$real_path" command tmux -V
+  exit 0
+fi
+
+PATH="$real_path" exec tmux -S "$root/tmux.sock" "$@"
