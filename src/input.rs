@@ -26,6 +26,7 @@ impl KeyInput {
                         self.state = KeyInputState::Leader;
                         keys.push(Key::Leader);
                     }
+                    b'\t' => keys.push(Key::FocusNext),
                     b'\r' | b'\n' => keys.push(Key::AgentMode),
                     31 => keys.push(Key::Terminal),
                     b'k' => keys.push(Key::Up),
@@ -35,7 +36,10 @@ impl KeyInput {
                     b'G' => keys.push(Key::Bottom),
                     b'g' => keys.push(Key::G),
                     b'r' => keys.push(Key::Refresh),
-                    b'1'..=b'9' => keys.push(Key::RepoShortcut(*byte as char)),
+                    b'1' => keys.push(Key::FocusStatus),
+                    b'2' => keys.push(Key::FocusRepos),
+                    b'3' => keys.push(Key::FocusWorktrees),
+                    b'4'..=b'9' => keys.push(Key::Other),
                     b'p' => keys.push(Key::PullDefault),
                     b'c' => keys.push(Key::Create),
                     b'A' => keys.push(Key::AddRepo),
@@ -77,6 +81,10 @@ impl KeyInput {
                         self.state = KeyInputState::LeaderG;
                         keys.push(Key::LeaderGit);
                     }
+                    b'1'..=b'9' => {
+                        self.state = KeyInputState::Normal;
+                        keys.push(Key::RepoShortcut(*byte as char));
+                    }
                     _ => {
                         self.state = KeyInputState::Normal;
                         keys.push(Key::Other);
@@ -104,6 +112,10 @@ pub enum Key {
     Down,
     Left,
     Right,
+    FocusNext,
+    FocusStatus,
+    FocusRepos,
+    FocusWorktrees,
     Bottom,
     G,
     Leader,
@@ -144,6 +156,37 @@ mod tests {
         let mut input = KeyInput::default();
         let keys = input.feed(b"hl");
         assert!(matches!(keys.as_slice(), [Key::Left, Key::Right]));
+    }
+
+    #[test]
+    fn key_input_uses_top_digits_for_panel_focus() {
+        let mut input = KeyInput::default();
+        let keys = input.feed(b"123\t4");
+        assert!(matches!(
+            keys.as_slice(),
+            [
+                Key::FocusStatus,
+                Key::FocusRepos,
+                Key::FocusWorktrees,
+                Key::FocusNext,
+                Key::Other
+            ]
+        ));
+    }
+
+    #[test]
+    fn key_input_uses_leader_digits_for_repo_shortcuts() {
+        let mut input = KeyInput::default();
+        let keys = input.feed(b" 1 9");
+        assert!(matches!(
+            keys.as_slice(),
+            [
+                Key::Leader,
+                Key::RepoShortcut('1'),
+                Key::Leader,
+                Key::RepoShortcut('9')
+            ]
+        ));
     }
 
     #[test]

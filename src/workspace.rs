@@ -115,7 +115,7 @@ fn push_entry(entries: &mut Vec<RepoEntry>, path: &mut Option<PathBuf>, key: &mu
 
 fn format_entries(entries: &[RepoEntry]) -> String {
     let mut out = String::from(
-        "# Prism repositories. Reorder [[repos]] blocks to change the left-panel order.\n# Remove a block to stop tracking a repository. Keys are single digits.\n\n",
+        "# Prism repositories. Reorder [[repos]] blocks to change the repo panel order.\n# Remove a block to stop tracking a repository. Keys are Space <digit> shortcuts.\n\n",
     );
     for entry in entries {
         out.push_str("[[repos]]\n");
