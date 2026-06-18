@@ -310,10 +310,10 @@ impl Tui {
                     Key::LeaderGit => {
                         self.leader_hint = Some(LeaderHint::Git);
                     }
-                    Key::AgentMode => {
+                    Key::OpenTmuxSession => {
                         self.clear_leader_hint();
                         pending_g = false;
-                        self.enter_agent_mode(&mut raw)?;
+                        self.open_tmux_session(&mut raw)?;
                     }
                     Key::LazyGit => {
                         self.clear_leader_hint();
@@ -382,7 +382,7 @@ impl Tui {
                         self.clear_leader_hint();
                         pending_g = false;
                         match self.create_session() {
-                            Ok(true) => self.enter_agent_mode(&mut raw)?,
+                            Ok(true) => self.open_tmux_session(&mut raw)?,
                             Ok(false) => {}
                             Err(error) => self.show_error("create session failed", &error)?,
                         }
@@ -449,7 +449,7 @@ impl Tui {
         Ok(yes(&answer))
     }
 
-    fn enter_agent_mode(&mut self, raw: &mut RawTerminal) -> Result<(), String> {
+    fn open_tmux_session(&mut self, raw: &mut RawTerminal) -> Result<(), String> {
         if self.selected >= self.sessions.len() {
             return Ok(());
         }
