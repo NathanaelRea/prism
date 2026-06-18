@@ -21,7 +21,6 @@ pub struct Tui {
     pub(crate) repos: Vec<ManagedRepo>,
     pub(crate) current_repo: usize,
     pub(crate) sessions: Vec<Session>,
-    pub(crate) allow_dirty: bool,
     pub(crate) selected: usize,
     pub(crate) pr_poll_tx: Sender<PrPollResult>,
     pub(crate) pr_poll_rx: Receiver<PrPollResult>,
@@ -132,7 +131,7 @@ impl Tui {
         repos: Vec<ManagedRepo>,
         current_repo: usize,
         sessions: Vec<Session>,
-        allow_dirty: bool,
+        _allow_dirty: bool,
     ) -> Self {
         let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
         let (tmux_warmup_tx, tmux_warmup_rx) = mpsc::channel();
@@ -156,7 +155,6 @@ impl Tui {
             repos,
             current_repo,
             sessions,
-            allow_dirty,
             selected: 0,
             pr_poll_tx,
             pr_poll_rx,

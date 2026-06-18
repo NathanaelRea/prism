@@ -132,6 +132,13 @@ pub fn has_upstream(path: &std::path::Path, config: &Config) -> Result<bool, Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::PromptMode;
+    use crate::config::{Checks, EscapeKey, MergeMethod};
+
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn git_status_label_reports_clean_ahead_and_dirty() {
@@ -150,5 +157,91 @@ mod tests {
             ),
             "dirty 2 ahead 3 behind 2"
         );
+    }
+
+    #[test]
+    fn branch_behind_fetches_origin_even_when_worktree_is_dirty() {
+        let temp = unique_temp_dir("prism-dirty-behind-test");
+        let origin = temp.join("origin.git");
+        let work = temp.join("work");
+        let remote = temp.join("remote");
+        fs::create_dir_all(&temp).unwrap();
+
+        run(Command::new("git")
+            .args(["init", "--bare", "--initial-branch=main"])
+            .arg(&origin));
+        run(Command::new("git").arg("clone").arg(&origin).arg(&work));
+        configure_user(&work);
+        fs::write(work.join("tracked.txt"), "base\n").unwrap();
+        run_git(&work, &["add", "tracked.txt"]);
+        run_git(&work, &["commit", "-m", "initial"]);
+        run_git(&work, &["push", "-u", "origin", "main"]);
+
+        let config = test_config();
+        assert_eq!(branch_behind(&work, "main", &config).unwrap(), 0);
+
+        fs::write(work.join("tracked.txt"), "dirty\n").unwrap();
+        run(Command::new("git").arg("clone").arg(&origin).arg(&remote));
+        configure_user(&remote);
+        fs::write(remote.join("remote.txt"), "remote\n").unwrap();
+        run_git(&remote, &["add", "remote.txt"]);
+        run_git(&remote, &["commit", "-m", "remote change"]);
+        run_git(&remote, &["push", "origin", "main"]);
+
+        assert_eq!(branch_behind(&work, "main", &config).unwrap(), 1);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    fn configure_user(path: &Path) {
+        run_git(path, &["config", "user.email", "test@example.com"]);
+        run_git(path, &["config", "user.name", "Test User"]);
+    }
+
+    fn run_git(path: &Path, args: &[&str]) {
+        run(Command::new("git").arg("-C").arg(path).args(args));
+    }
+
+    fn run(command: &mut Command) {
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "command failed: {:?}\nstdout: {}\nstderr: {}",
+            command,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn test_config() -> Config {
+        let tools = [("git", "git")]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect();
+        Config {
+            default_agent: "opencode".to_string(),
+            default_base: Some("main".to_string()),
+            plan_dir: "plans".to_string(),
+            review_packet_dir: ".agent/review".to_string(),
+            worktree_command: "wt".to_string(),
+            escape_key: EscapeKey::EscEsc,
+            merge_method: MergeMethod::Squash,
+            checks: Checks::default(),
+            worktree_columns: vec!["url".to_string()],
+            tools,
+            agent_commands: BTreeMap::new(),
+            agent_prompt_modes: BTreeMap::<String, PromptMode>::new(),
+            prompt_templates: BTreeMap::new(),
+            user_path: PathBuf::from("/tmp/prism-test-user-config.toml"),
+            repo_config_path: PathBuf::from("/tmp/prism-test-repo-config.toml"),
+        }
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{nanos}"))
     }
 }
