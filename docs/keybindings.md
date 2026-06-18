@@ -13,6 +13,7 @@ Prism uses a lazygit-style panel model.
 - `Space g P` pushes the selected branch and creates a pull request if needed.
 - `Space g M` merges the selected pull request.
 - `Space g f` stages a review-fix prompt.
+- `P` opens plan mode in tmux from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through `opencode run`.
 - `p` or `Space g p` pulls the default branch from the Repos panel.
 - `Space 1` through `Space 9` jump to configured repositories.
 - `A` adds a repository by path from the Repos panel.

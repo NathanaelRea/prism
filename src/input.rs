@@ -41,6 +41,7 @@ impl KeyInput {
                     b'3' => keys.push(Key::FocusWorktrees),
                     b'4'..=b'9' => keys.push(Key::Other),
                     b'p' => keys.push(Key::PullDefault),
+                    b'P' => keys.push(Key::PlanMode),
                     b'c' => keys.push(Key::Create),
                     b'A' => keys.push(Key::AddRepo),
                     b'R' => keys.push(Key::ManageRepos),
@@ -132,6 +133,7 @@ pub enum Key {
     Push,
     Merge,
     PullDefault,
+    PlanMode,
     Create,
     Delete,
     EditConfig,
@@ -243,8 +245,8 @@ mod tests {
     #[test]
     fn key_input_handles_cleanup_keys() {
         let mut input = KeyInput::default();
-        let keys = input.feed(b"D");
-        assert!(matches!(keys.as_slice(), [Key::Delete]));
+        let keys = input.feed(b"DP");
+        assert!(matches!(keys.as_slice(), [Key::Delete, Key::PlanMode]));
     }
 
     #[test]

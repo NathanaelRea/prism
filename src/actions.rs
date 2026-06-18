@@ -20,8 +20,9 @@ use crate::session::{
     remove_process_state, remove_task_metadata, save_agent_state, write_task_metadata,
 };
 use crate::tmux::{
-    TmuxWindow, agent_session_running, attach_or_create_agent, attach_or_create_window,
-    ensure_agent_session, kill_agent_session, latest_agent_session_generation, paste_agent_prompt,
+    TmuxWindow, agent_session_running, attach_or_create_agent, attach_or_create_plan_mode,
+    attach_or_create_window, ensure_agent_session, kill_agent_session,
+    latest_agent_session_generation, paste_agent_prompt,
 };
 use crate::tui::{
     DefaultBranchPollResult, ManagedRepo, PrPollKey, PrPollResult, TmuxSlotKey, TmuxWarmupKey,
@@ -777,6 +778,48 @@ impl Tui {
             return Err(format!("{shell} exited with {status}"));
         }
         self.show_message("returned from repository terminal")?;
+        Ok(())
+    }
+
+    pub(crate) fn open_selected_repo_plan_mode(
+        &mut self,
+        raw: &mut crate::terminal::RawTerminal,
+    ) -> Result<(), String> {
+        let context = self
+            .selected_repo_context()
+            .ok_or_else(|| "no selected repository".to_string())?;
+        let root = context.repo.root.clone();
+        let config = context.config.clone();
+        raw.suspend()?;
+        let result = attach_or_create_plan_mode(&config, &root);
+        let resume_result = raw.resume();
+        self.refresh_sessions()?;
+        self.start_tmux_agent_warmup();
+        self.start_wt_column_poll();
+        resume_result?;
+        result?;
+        self.show_message("returned from plan mode")?;
+        Ok(())
+    }
+
+    pub(crate) fn open_selected_worktree_plan_mode(
+        &mut self,
+        raw: &mut crate::terminal::RawTerminal,
+    ) -> Result<(), String> {
+        let Some(context) = self.selected_worktree_context() else {
+            return Ok(());
+        };
+        let path = self.sessions[context.session_index].path.clone();
+        let config = context.config.clone();
+        raw.suspend()?;
+        let result = attach_or_create_plan_mode(&config, &path);
+        let resume_result = raw.resume();
+        self.refresh_sessions()?;
+        self.start_tmux_agent_warmup();
+        self.start_wt_column_poll();
+        resume_result?;
+        result?;
+        self.show_message("returned from plan mode")?;
         Ok(())
     }
 

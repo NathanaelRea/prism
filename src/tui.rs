@@ -466,6 +466,19 @@ impl Tui {
                             self.show_error("pull failed", &error)?;
                         }
                     }
+                    Key::PlanMode => {
+                        self.clear_leader_hint();
+                        pending_g = false;
+                        if self.focused_panel == PanelFocus::Status {
+                            self.show_message("focus repos or worktrees to run plan mode")?;
+                        } else if self.focused_panel == PanelFocus::Repos {
+                            if let Err(error) = self.open_selected_repo_plan_mode(&mut raw) {
+                                self.show_error("plan mode failed", &error)?;
+                            }
+                        } else if let Err(error) = self.open_selected_worktree_plan_mode(&mut raw) {
+                            self.show_error("plan mode failed", &error)?;
+                        }
+                    }
                     Key::Create => {
                         self.clear_leader_hint();
                         pending_g = false;
@@ -599,6 +612,7 @@ impl Tui {
             "Space g f    stage review-fix prompt",
             "Space g p    repos: pull default branch",
             "p            repos: pull default branch",
+            "P            repos/worktrees: run plan mode",
             "Space 1-9    switch repository",
             "A            add repository",
             "R            edit repositories/order/keys/remove",

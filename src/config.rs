@@ -114,8 +114,8 @@ impl Config {
             ("git", "git"),
             ("tmux", "tmux"),
             ("lazygit", "lazygit"),
+            ("fzf", "fzf"),
             ("opencode", "opencode"),
-            ("codex_plan", "codex-plan"),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -318,7 +318,7 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
         &config.tool(&config.worktree_command),
         true,
     );
-    print_tool_status("codex-plan", &config.tool("codex_plan"), false);
+    print_tool_status("fzf", &config.tool("fzf"), false);
     println!();
 
     let detected = detected_agents(config);

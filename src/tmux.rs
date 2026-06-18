@@ -70,6 +70,19 @@ pub fn attach_or_create_window(
     }
 }
 
+pub fn attach_or_create_plan_mode(config: &Config, cwd: &Path) -> Result<(), String> {
+    let name = plan_mode_session_name(cwd);
+    if !session_exists(config, &name)? {
+        create_detached_plan_mode_session(config, cwd, &name)?;
+        configure_detach_on_destroy(config, &name)?;
+    }
+    match attach_session(config, &name) {
+        Ok(()) => Ok(()),
+        Err(_) if matches!(session_exists(config, &name), Ok(false)) => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 pub fn ensure_agent_session(
     repo: &Repository,
     config: &Config,
@@ -236,17 +249,58 @@ fn create_detached_agent_session(
 }
 
 fn configure_agent_session(config: &Config, name: &str) -> Result<bool, String> {
-    match run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+    match configure_detach_on_destroy(config, name) {
+        Ok(()) => Ok(true),
+        Err(error) if tmux_missing_session_error(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn configure_detach_on_destroy(config: &Config, name: &str) -> Result<(), String> {
+    run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
         "set-option",
         "-t",
         name,
         "detach-on-destroy",
         "on",
-    ])) {
-        Ok(()) => Ok(true),
-        Err(error) if tmux_missing_session_error(&error) => Ok(false),
-        Err(error) => Err(error),
-    }
+    ]))
+}
+
+fn create_detached_plan_mode_session(
+    config: &Config,
+    cwd: &Path,
+    name: &str,
+) -> Result<(), String> {
+    let command = plan_mode_shell_command(cwd)?;
+    run_tmux_status(
+        Command::new(config.tool("tmux"))
+            .env_remove("TMUX")
+            .args(["new-session", "-d", "-s"])
+            .arg(name)
+            .args(["-n", "plan"])
+            .arg("-c")
+            .arg(cwd)
+            .arg(command),
+    )
+}
+
+fn plan_mode_shell_command(cwd: &Path) -> Result<String, String> {
+    let exe =
+        std::env::current_exe().map_err(|error| format!("resolve prism executable: {error}"))?;
+    let command = [
+        shell_quote(&exe.to_string_lossy()),
+        "--repo".to_string(),
+        shell_quote(&cwd.to_string_lossy()),
+        "plan".to_string(),
+    ]
+    .join(" ");
+    Ok(format!(
+        "{command}; status=$?; printf '\\n[prism plan mode exited with status %s]\\nPress Enter to close this tmux session. ' \"$status\"; read _; exit \"$status\""
+    ))
+}
+
+fn plan_mode_session_name(cwd: &Path) -> String {
+    format!("prism-plan-{:016x}", stable_hash(cwd))
 }
 
 fn ensure_companion_windows(config: &Config, session: &Session, name: &str) -> Result<(), String> {
@@ -562,9 +616,9 @@ mod tests {
     use crate::session::Session;
 
     use super::{
-        TmuxWindow, agent_session_name, attach_or_create_agent, attach_or_create_window,
-        ensure_agent_session, latest_agent_session_generation, pane_command_matches_agent,
-        paste_agent_prompt, shell_quote,
+        TmuxWindow, agent_session_name, attach_or_create_agent, attach_or_create_plan_mode,
+        attach_or_create_window, ensure_agent_session, latest_agent_session_generation,
+        pane_command_matches_agent, paste_agent_prompt, shell_quote,
     };
 
     #[test]
@@ -587,6 +641,55 @@ mod tests {
         assert_eq!(shell_quote(""), "''");
         assert_eq!(shell_quote("two words"), "'two words'");
         assert_eq!(shell_quote("that's"), "'that'\"'\"'s'");
+    }
+
+    #[test]
+    fn plan_mode_runs_in_detachable_tmux_session() {
+        let temp = unique_temp_dir("prism-tmux-plan-mode-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  has-session)
+    exit 1
+    ;;
+  new-session|set-option|attach-session)
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+
+        attach_or_create_plan_mode(&config, &temp).unwrap();
+
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(commands.contains("new-session -d -s prism-plan-"));
+        assert!(commands.contains("-n plan"));
+        assert!(commands.contains("--repo"));
+        assert!(commands.contains(" plan; status=$?;"));
+        assert!(commands.contains("set-option -t prism-plan-"));
+        assert!(commands.contains("detach-on-destroy on"));
+        assert!(commands.contains("attach-session -t prism-plan-"));
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
