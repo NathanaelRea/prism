@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tool="$(basename "$0")"
+root="${PRISM_DEMO_ROOT:?PRISM_DEMO_ROOT is required}"
+log_dir="$root/logs"
+mkdir -p "$log_dir"
+{
+  printf 'tool=%s\n' "$tool"
+  printf 'cwd=%s\n' "$(pwd)"
+  printf 'argv='
+  printf '%q ' "$@"
+  printf '\n'
+  printf 'PRISM_DEMO_ROOT=%s\n\n' "$root"
+} >>"$log_dir/$tool.log"
+
+unsupported() {
+  {
+    printf 'UNSUPPORTED argv='
+    printf '%q ' "$@"
+    printf '\n'
+  } >>"$log_dir/$tool.log"
+  printf 'wt shim: unsupported command:' >&2
+  printf ' %q' "$@" >&2
+  printf '\n' >&2
+  exit 64
+}
+
+if [[ "${1:-}" == "--version" ]]; then
+  printf 'wt 0.0.0-prism-demo\n'
+  exit 0
+fi
+
+repo=""
+if [[ "${1:-}" == "-C" ]]; then
+  [[ $# -ge 3 ]] || unsupported "$@"
+  repo="$2"
+  shift 2
+else
+  repo="$PWD"
+fi
+
+case "${1:-}" in
+  list)
+    shift
+    [[ "${1:-}" == "--format=json" ]] || unsupported list "$@"
+    python3 - "$repo" <<'PY'
+import json, subprocess, sys
+
+repo = sys.argv[1]
+raw = subprocess.check_output(["git", "-C", repo, "worktree", "list", "--porcelain"], text=True)
+items = []
+current = {}
+for line in raw.splitlines():
+    if not line:
+        if current:
+            items.append(current)
+            current = {}
+        continue
+    key, _, value = line.partition(" ")
+    if key == "worktree":
+        current["path"] = value
+    elif key == "branch":
+        prefix = "refs/heads/"
+        current["branch"] = value[len(prefix):] if value.startswith(prefix) else value
+if current:
+    items.append(current)
+
+def columns(branch):
+    if branch == "main":
+        return ("shop.local", "ready", {"number": 118, "status": "passed"})
+    if branch == "feat/idea-board":
+        return ("idea.local", "design", {"number": 121, "status": "queued"})
+    if branch == "feat/agent-session":
+        return ("agent.local", "dirty", {"number": 122, "status": "running"})
+    if branch == "feat/review-fix":
+        return ("review.local", "fix", {"number": 123, "status": "failed"})
+    if branch == "feat/ci-green":
+        return ("green.local", "ready", {"number": 124, "status": "passed"})
+    if branch == "feat/merged-cleanup":
+        return ("merged.local", "done", {"number": 125, "status": "passed"})
+    return ("demo.local", "new", {"number": 126, "status": "running"})
+
+result = []
+for item in items:
+    branch = item.get("branch", "")
+    url, localdev, ci = columns(branch)
+    result.append({"path": item.get("path", ""), "branch": branch, "url": url, "vars": {"localdev": localdev}, "ci": ci})
+print(json.dumps(result))
+PY
+    ;;
+  switch)
+    shift
+    create=0
+    no_cd=0
+    format=""
+    base="main"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --create)
+          create=1
+          shift
+          ;;
+        --no-cd)
+          no_cd=1
+          shift
+          ;;
+        --format)
+          [[ $# -ge 2 ]] || unsupported switch "$@"
+          format="$2"
+          shift 2
+          ;;
+        --base)
+          [[ $# -ge 2 ]] || unsupported switch "$@"
+          base="$2"
+          shift 2
+          ;;
+        -*)
+          unsupported switch "$@"
+          ;;
+        *)
+          branch="$1"
+          shift
+          ;;
+      esac
+    done
+    [[ "$create" -eq 1 && "$no_cd" -eq 1 && "$format" == "json" && -n "${branch:-}" ]] || unsupported switch
+    safe_branch="$(printf '%s' "$branch" | tr '/\\:*?"<>|' '-')"
+    path="$root/worktrees/$safe_branch"
+    git -C "$repo" worktree add -b "$branch" "$path" "$base" >/dev/null
+    mkdir -p "$path/.agent/tasks"
+    safe_task="$(printf '%s' "$branch" | tr '/\\:*?"<>|' '_')"
+    printf '{ "prompt_summary": "" }\n' >"$path/.agent/tasks/$safe_task.json"
+    python3 - "$path" "$branch" <<'PY'
+import json, sys
+print(json.dumps({"path": sys.argv[1], "branch": sys.argv[2]}))
+PY
+    ;;
+  *)
+    unsupported "$@"
+    ;;
+esac

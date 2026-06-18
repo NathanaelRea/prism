@@ -177,7 +177,7 @@ impl Tui {
             sessions,
             selected: 0,
             selected_repo_root: None,
-            focused_panel: PanelFocus::Status,
+            focused_panel: PanelFocus::Repos,
             selected_worktree_by_repo: BTreeMap::new(),
             pr_poll_tx,
             pr_poll_rx,
@@ -473,7 +473,7 @@ impl Tui {
                             self.show_message("focus repos to create a worktree session")?;
                         } else {
                             match self.create_session() {
-                                Ok(true) => self.enter_agent_mode(&mut raw)?,
+                                Ok(true) => self.focus_worktrees(),
                                 Ok(false) => {}
                                 Err(error) => self.show_error("create session failed", &error)?,
                             }
@@ -1644,7 +1644,7 @@ mod tests {
     use crate::repo::Repository;
     use crate::session::Session;
 
-    use super::{ManagedRepo, Tui, truncate_ansi_dialog_line};
+    use super::{ManagedRepo, PanelFocus, Tui, truncate_ansi_dialog_line};
 
     #[test]
     fn truncated_warning_line_keeps_colored_bullet_prefix() {
@@ -1652,6 +1652,13 @@ mod tests {
             truncate_ansi_dialog_line("\x1b[31m•\x1b[0m dirty worktree", 8),
             "\x1b[31m•\x1b[0m dirty~"
         );
+    }
+
+    #[test]
+    fn tui_defaults_to_repos_panel_focus() {
+        let tui = test_tui();
+
+        assert_eq!(tui.focused_panel, PanelFocus::Repos);
     }
 
     #[test]
