@@ -34,7 +34,6 @@ const BACKGROUND_PR_SUMMARY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 impl Tui {
     pub(crate) fn refresh_sessions(&mut self) -> Result<(), String> {
-        self.sync_selected_repo_context();
         for managed in &mut self.repos {
             managed.config = crate::config::Config::load(&managed.repo);
         }
@@ -64,20 +63,14 @@ impl Tui {
             fresh.extend(repo_sessions);
         }
         self.sessions = fresh;
-        if self.selected >= self.sessions.len() {
-            self.selected = self.sessions.len().saturating_sub(1);
-        }
-        if !self.session_filter.trim().is_empty()
-            && !self.visible_session_indices().contains(&self.selected)
-        {
-            self.select_top_visible();
-        }
-        self.sync_selected_repo_context();
+        self.ensure_navigation_valid();
         Ok(())
     }
 
     pub(crate) fn create_session(&mut self) -> Result<bool, String> {
-        self.sync_selected_repo_context();
+        let context = self
+            .selected_repo_context()
+            .ok_or_else(|| "no selected repository".to_string())?;
         self.ensure_default_branch_ready_for_create()?;
         let Some(branch) = self.prompt_line_dialog("Create Session", "Branch name: ", "")? else {
             return Ok(false);
@@ -94,8 +87,8 @@ impl Tui {
             "Create Session",
             &format!("Creating worktree for {}", branch.trim()),
         )?;
-        create_worktree_session(&self.repo, &self.config, branch.trim())?;
-        clear_hidden(&self.repo, branch.trim())?;
+        create_worktree_session(&context.repo, &context.config, branch.trim())?;
+        clear_hidden(&context.repo, branch.trim())?;
         self.refresh_sessions()?;
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
@@ -103,7 +96,7 @@ impl Tui {
             .sessions
             .iter()
             .position(|session| {
-                session.repo_index == self.current_repo && session.branch == branch.trim()
+                session.repo_index == context.repo_index && session.branch == branch.trim()
             })
             .ok_or_else(|| {
                 format!(
@@ -111,9 +104,12 @@ impl Tui {
                     branch.trim()
                 )
             })?;
-        self.selected = index;
+        if !self.visible_session_indices().contains(&index) {
+            self.worktree_filter.clear();
+        }
+        self.select_worktree(index);
         let initial_prompt = initial_prompt.trim();
-        write_task_metadata(&self.repo, &self.sessions[index], initial_prompt)?;
+        write_task_metadata(&context.repo, &self.sessions[index], initial_prompt)?;
         self.sessions[index].adopted = true;
         if !initial_prompt.is_empty() {
             self.show_loading_dialog("Create Session", "Starting agent session")?;
@@ -125,7 +121,10 @@ impl Tui {
     }
 
     fn ensure_default_branch_ready_for_create(&mut self) -> Result<(), String> {
-        let Some(base) = self
+        let context = self
+            .selected_repo_context()
+            .ok_or_else(|| "no selected repository".to_string())?;
+        let Some(base) = context
             .config
             .default_base
             .as_deref()
@@ -135,8 +134,8 @@ impl Tui {
         else {
             return Ok(());
         };
-        let base_path = self.default_branch_path(&base);
-        let behind = branch_behind(&base_path, &base, &self.config)?;
+        let base_path = self.default_branch_path_for_repo(context.repo_index, &base);
+        let behind = branch_behind(&base_path, &base, &context.config)?;
         if behind == 0 {
             return Ok(());
         }
@@ -147,15 +146,17 @@ impl Tui {
         )?;
         if answer.as_deref().map(yes_default).unwrap_or(false) {
             self.show_loading_dialog("Pull Default Branch", &format!("Pulling {base}"))?;
-            pull_branch(&base_path, &base, &self.config)?;
+            pull_branch(&base_path, &base, &context.config)?;
             self.refresh_sessions()?;
         }
         Ok(())
     }
 
     pub(crate) fn pull_default_branch(&mut self) -> Result<(), String> {
-        self.sync_selected_repo_context();
-        let Some(base) = self
+        let context = self
+            .selected_repo_context()
+            .ok_or_else(|| "no selected repository".to_string())?;
+        let Some(base) = context
             .config
             .default_base
             .as_deref()
@@ -166,17 +167,13 @@ impl Tui {
             self.show_message("no default_base configured")?;
             return Ok(());
         };
-        let base_path = self.default_branch_path(&base);
+        let base_path = self.default_branch_path_for_repo(context.repo_index, &base);
         self.show_loading_dialog("Pull Default Branch", &format!("Pulling {base}"))?;
-        pull_branch(&base_path, &base, &self.config)?;
+        pull_branch(&base_path, &base, &context.config)?;
         self.refresh_sessions()?;
         self.start_wt_column_poll();
         self.show_message(&format!("pulled {base}"))?;
         Ok(())
-    }
-
-    fn default_branch_path(&self, base: &str) -> PathBuf {
-        self.default_branch_path_for_repo(self.current_repo, base)
     }
 
     fn default_branch_path_for_repo(&self, repo_index: usize, base: &str) -> PathBuf {
@@ -196,13 +193,15 @@ impl Tui {
         &mut self,
         raw: &mut crate::terminal::RawTerminal,
     ) -> Result<(), String> {
-        self.sync_selected_repo_context();
-        if let Some(parent) = self.config.repo_config_path.parent() {
+        let context = self
+            .selected_repo_context()
+            .ok_or_else(|| "no selected repository".to_string())?;
+        if let Some(parent) = context.config.repo_config_path.parent() {
             fs::create_dir_all(parent).map_err(|error| format!("create config dir: {error}"))?;
         }
-        if !self.config.repo_config_path.exists() {
+        if !context.config.repo_config_path.exists() {
             fs::write(
-                &self.config.repo_config_path,
+                &context.config.repo_config_path,
                 "# Prism repository config\n# Example:\n# [worktrees]\n# columns = [\"url\", \"vars.localdev\"]\n#\n# [prompt_templates]\n# review_fix = \"Here are review comments on PR {pr_number}.\\n\\nIf they are applicable, fix them. Otherwise, say why not.\\n\\n---\\n\\n{comments}\"\n",
             )
             .map_err(|error| format!("create config file: {error}"))?;
@@ -211,7 +210,7 @@ impl Tui {
             editor_command().ok_or_else(|| "no editor found; set VISUAL or EDITOR".to_string())?;
         raw.suspend()?;
         let result = Command::new(&editor)
-            .arg(&self.config.repo_config_path)
+            .arg(&context.config.repo_config_path)
             .status();
         let resume_result = raw.resume();
         resume_result?;
@@ -219,10 +218,11 @@ impl Tui {
         if !status.success() {
             return Err(format!("{editor} exited with {status}"));
         }
-        self.config = crate::config::Config::load(&self.repo);
-        if let Some(repo) = self.repos.get_mut(self.current_repo) {
-            repo.config = self.config.clone();
+        let config = crate::config::Config::load(&context.repo);
+        if let Some(repo) = self.repos.get_mut(context.repo_index) {
+            repo.config = config.clone();
         }
+        self.sync_selected_repo_context();
         self.refresh_sessions()?;
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
@@ -278,7 +278,10 @@ impl Tui {
         if entries.is_empty() {
             return Err("repository list is empty; add at least one [[repos]] block".to_string());
         }
-        let current_root = self.repo.root.clone();
+        let current_root = self
+            .selected_repo_context()
+            .map(|context| context.repo.root)
+            .unwrap_or_else(|| self.repo.root.clone());
         self.reload_repositories(entries)?;
         let index = self
             .repos
@@ -305,6 +308,10 @@ impl Tui {
         }
         self.repos = repos;
         self.current_repo = self.current_repo.min(self.repos.len().saturating_sub(1));
+        self.selected_repo_root = self
+            .repos
+            .get(self.current_repo)
+            .map(|repo| repo.repo.root.clone());
         self.refresh_sessions()?;
         self.sync_selected_repo_context();
         Ok(())
@@ -320,14 +327,20 @@ impl Tui {
             .sessions
             .get_mut(index)
             .ok_or_else(|| "no selected session".to_string())?;
-        let adapter = AgentAdapter::from_config(&self.config, &self.config.default_agent);
+        let managed = self
+            .repos
+            .get(session.repo_index)
+            .ok_or_else(|| "selected session repository no longer exists".to_string())?;
+        let repo = managed.repo.clone();
+        let config = managed.config.clone();
+        let adapter = AgentAdapter::from_config(&config, &config.default_agent);
         let prompt = initial_prompt.trim();
         let launch = adapter.prepare_launch(prompt)?;
         let argv = launch.argv;
         if argv.is_empty() {
             return Err(format!(
                 "agent '{}' has an empty command",
-                self.config.default_agent
+                config.default_agent
             ));
         }
         let mut agent = AgentProcess::spawn(&argv, &session.path, launch.prompt_file)?;
@@ -336,11 +349,11 @@ impl Tui {
         }
         session.agent = Some(agent);
         session.agent_state = AgentState::Running;
-        let _ = save_agent_state(&self.repo, &session.branch, session.agent_state);
+        let _ = save_agent_state(&repo, &session.branch, session.agent_state);
         session.agent_output.clear();
         session.agent_output.push_back(format!(
             "started {} ({})",
-            self.config.default_agent,
+            config.default_agent,
             adapter.prompt_mode.label()
         ));
         Ok(())
@@ -411,7 +424,8 @@ impl Tui {
             }
         }
 
-        if let Some(session) = self.sessions.get_mut(self.selected) {
+        let selected = self.selected_worktree_index();
+        if let Some(session) = selected.and_then(|index| self.sessions.get_mut(index)) {
             let Some(managed) = self.repos.get(session.repo_index) else {
                 return changed;
             };
@@ -447,6 +461,7 @@ impl Tui {
 
     fn drain_pr_poll_results(&mut self) -> bool {
         let mut changed = false;
+        let selected = self.selected_worktree_index();
         while let Ok(result) = self.pr_poll_rx.try_recv() {
             match result {
                 PrPollResult::Summary {
@@ -491,7 +506,7 @@ impl Tui {
                     for (index, session) in self.sessions.iter_mut().enumerate() {
                         let before = before_comments.get(index).copied().unwrap_or(0);
                         let after = session_comment_count(session);
-                        if after > before && index != self.selected {
+                        if after > before && Some(index) != selected {
                             session.unseen_comments = true;
                         }
                     }
@@ -499,7 +514,8 @@ impl Tui {
                 }
                 PrPollResult::Details { key, cache } => {
                     self.pr_polls_in_flight.remove(&key);
-                    let selected_key = self.sessions.get(self.selected).map(pr_poll_key);
+                    let selected_key =
+                        selected.and_then(|index| self.sessions.get(index).map(pr_poll_key));
                     if let Some(session) = self
                         .sessions
                         .iter_mut()
@@ -670,20 +686,26 @@ impl Tui {
     }
 
     pub(crate) fn attach_selected_tmux_session(&mut self) -> Result<(), String> {
-        self.sync_selected_repo_context();
-        if self.selected >= self.sessions.len() {
+        let Some(context) = self.selected_worktree_context() else {
+            return Ok(());
+        };
+        if context
+            .config
+            .is_default_branch(&self.sessions[context.session_index].branch)
+        {
+            self.show_message("default branch does not have an agent session")?;
             return Ok(());
         }
-        let session = session_for_tmux_warmup(&self.sessions[self.selected]);
+        let session = session_for_tmux_warmup(&self.sessions[context.session_index]);
         let slot = tmux_slot_key(&session);
         let generation = self.tmux_generation_for_slot(&slot);
         let key = tmux_warmup_key(slot.clone(), generation);
         self.finish_tmux_warmup_for_key(&key);
-        attach_or_create_agent(&self.repo, &self.config, &session, generation)?;
-        let running = agent_session_running(&self.repo, &self.config, &session, generation);
+        attach_or_create_agent(&context.repo, &context.config, &session, generation)?;
+        let running = agent_session_running(&context.repo, &context.config, &session, generation);
         self.update_tmux_agent_state_for_slot(&slot, running);
         if !running {
-            let _ = kill_agent_session(&self.repo, &self.config, &session.branch, generation);
+            let _ = kill_agent_session(&context.repo, &context.config, &session.branch, generation);
             let next_generation = self.rotate_tmux_generation(slot.clone());
             let next_key = tmux_warmup_key(slot, next_generation);
             self.start_tmux_agent_warmup_for_key(next_key, Duration::from_millis(250));
@@ -692,18 +714,63 @@ impl Tui {
     }
 
     pub(crate) fn attach_selected_tmux_window(&mut self, window: TmuxWindow) -> Result<(), String> {
-        self.sync_selected_repo_context();
-        if self.selected >= self.sessions.len() {
+        let Some(context) = self.selected_worktree_context() else {
             return Ok(());
-        }
-        let session = session_for_tmux_warmup(&self.sessions[self.selected]);
+        };
+        let session = session_for_tmux_warmup(&self.sessions[context.session_index]);
         let slot = tmux_slot_key(&session);
         let generation = self.tmux_generation_for_slot(&slot);
         let key = tmux_warmup_key(slot.clone(), generation);
         self.finish_tmux_warmup_for_key(&key);
-        attach_or_create_window(&self.repo, &self.config, &session, generation, window)?;
-        let running = agent_session_running(&self.repo, &self.config, &session, generation);
+        attach_or_create_window(&context.repo, &context.config, &session, generation, window)?;
+        let running = agent_session_running(&context.repo, &context.config, &session, generation);
         self.update_tmux_agent_state_for_slot(&slot, running);
+        Ok(())
+    }
+
+    pub(crate) fn open_selected_repo_lazygit(
+        &mut self,
+        raw: &mut crate::terminal::RawTerminal,
+    ) -> Result<(), String> {
+        let context = self
+            .selected_repo_context()
+            .ok_or_else(|| "no selected repository".to_string())?;
+        raw.suspend()?;
+        let result = Command::new(context.config.tool("lazygit"))
+            .current_dir(&context.repo.root)
+            .status();
+        let resume_result = raw.resume();
+        resume_result?;
+        let status = result.map_err(|error| format!("lazygit: {error}"))?;
+        if !status.success() {
+            return Err(format!("lazygit exited with {status}"));
+        }
+        self.show_message("returned from repository lazygit")?;
+        Ok(())
+    }
+
+    pub(crate) fn open_selected_repo_terminal(
+        &mut self,
+        raw: &mut crate::terminal::RawTerminal,
+    ) -> Result<(), String> {
+        let context = self
+            .selected_repo_context()
+            .ok_or_else(|| "no selected repository".to_string())?;
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|shell| !shell.trim().is_empty())
+            .unwrap_or_else(|| "/bin/sh".to_string());
+        raw.suspend()?;
+        let result = Command::new(&shell)
+            .current_dir(&context.repo.root)
+            .status();
+        let resume_result = raw.resume();
+        resume_result?;
+        let status = result.map_err(|error| format!("{shell}: {error}"))?;
+        if !status.success() {
+            return Err(format!("{shell} exited with {status}"));
+        }
+        self.show_message("returned from repository terminal")?;
         Ok(())
     }
 
@@ -900,19 +967,19 @@ impl Tui {
     }
 
     pub(crate) fn start_review_fix(&mut self) -> Result<(), String> {
-        self.sync_selected_repo_context();
-        if self.selected >= self.sessions.len() {
+        let Some(context) = self.selected_worktree_context() else {
             return Ok(());
-        }
-        if self
+        };
+        if context
             .config
-            .is_default_branch(&self.sessions[self.selected].branch)
+            .is_default_branch(&self.sessions[context.session_index].branch)
         {
             self.show_message("default branch has no PR review comments")?;
             return Ok(());
         }
-        let prompt = build_review_fix_prompt(&self.sessions[self.selected], &self.config)?;
-        copy_to_clipboard(&self.config, &prompt)?;
+        let prompt =
+            build_review_fix_prompt(&self.sessions[context.session_index], &context.config)?;
+        copy_to_clipboard(&context.config, &prompt)?;
         self.show_message("review-fix prompt copied to clipboard")?;
         Ok(())
     }
@@ -923,29 +990,39 @@ impl Tui {
             .get(index)
             .map(session_for_tmux_warmup)
             .ok_or_else(|| "no selected session".to_string())?;
+        let managed = self
+            .repos
+            .get(session.repo_index)
+            .ok_or_else(|| "selected session repository no longer exists".to_string())?;
+        let repo = managed.repo.clone();
+        let config = managed.config.clone();
         let slot = tmux_slot_key(&session);
         let generation = self.tmux_generation_for_slot(&slot);
         let key = tmux_warmup_key(slot.clone(), generation);
         self.finish_tmux_warmup_for_key(&key);
-        paste_agent_prompt(&self.repo, &self.config, &session, generation, prompt)?;
-        let running = agent_session_running(&self.repo, &self.config, &session, generation);
+        paste_agent_prompt(&repo, &config, &session, generation, prompt)?;
+        let running = agent_session_running(&repo, &config, &session, generation);
         self.update_tmux_agent_state_for_slot(&slot, running);
         Ok(())
     }
 
     pub(crate) fn push_selected_branch(&mut self) -> Result<(), String> {
-        self.sync_selected_repo_context();
-        if self.selected >= self.sessions.len() {
+        let Some(context) = self.selected_worktree_context() else {
+            return Ok(());
+        };
+        let selected = context.session_index;
+        let path = self.sessions[selected].path.clone();
+        let branch = self.sessions[selected].branch.clone();
+        if context.config.is_default_branch(&branch) {
+            self.show_message("default branch is not treated as a PR branch")?;
             return Ok(());
         }
-        let path = self.sessions[self.selected].path.clone();
-        let branch = self.sessions[self.selected].branch.clone();
         if branch == "(detached)" {
             self.show_message("cannot push a detached worktree")?;
             return Ok(());
         }
-        run_configured_commands(&self.config.checks.pre_push, &path, "pre_push")?;
-        let args = if has_upstream(&path, &self.config)? {
+        run_configured_commands(&context.config.checks.pre_push, &path, "pre_push")?;
+        let args = if has_upstream(&path, &context.config)? {
             vec!["push".to_string()]
         } else {
             let Some(answer) = self.prompt_line_dialog(
@@ -968,47 +1045,47 @@ impl Tui {
         };
         self.show_loading_dialog("Push Branch", "Pushing selected branch")?;
         run_capture(
-            Command::new(self.config.tool("git"))
+            Command::new(context.config.tool("git"))
                 .arg("-C")
                 .arg(&path)
                 .args(args),
         )?;
         {
-            let session = &mut self.sessions[self.selected];
+            let session = &mut self.sessions[selected];
             refresh_pr_cache(
-                &self.repo,
+                &context.repo,
                 &session.branch,
                 &mut session.pr,
                 &session.path,
-                &self.config,
+                &context.config,
                 true,
             );
         }
-        if self.sessions[self.selected].pr.summary.is_none()
-            && !self
+        if self.sessions[selected].pr.summary.is_none()
+            && !context
                 .config
-                .is_default_branch(&self.sessions[self.selected].branch)
+                .is_default_branch(&self.sessions[selected].branch)
         {
-            run_configured_commands(&self.config.checks.pre_pr, &path, "pre_pr")?;
+            run_configured_commands(&context.config.checks.pre_pr, &path, "pre_pr")?;
             let Some(pr_body) = self.prompt_pr_description()? else {
                 return Ok(());
             };
             self.show_loading_dialog("Create Pull Request", "Creating pull request")?;
             run_capture(
-                Command::new(self.config.tool("gh"))
+                Command::new(context.config.tool("gh"))
                     .args(create_pr_args(
-                        self.config.default_base.as_deref(),
+                        context.config.default_base.as_deref(),
                         &pr_body,
                     ))
                     .current_dir(&path),
             )?;
-            let session = &mut self.sessions[self.selected];
+            let session = &mut self.sessions[selected];
             refresh_pr_cache(
-                &self.repo,
+                &context.repo,
                 &session.branch,
                 &mut session.pr,
                 &session.path,
-                &self.config,
+                &context.config,
                 true,
             );
             self.show_message("push complete; pull request created")?;
@@ -1023,31 +1100,31 @@ impl Tui {
     }
 
     pub(crate) fn merge_selected_pr(&mut self) -> Result<(), String> {
-        self.sync_selected_repo_context();
-        if self.selected >= self.sessions.len() {
+        let Some(context) = self.selected_worktree_context() else {
             return Ok(());
-        }
-        if self
+        };
+        let selected = context.session_index;
+        if context
             .config
-            .is_default_branch(&self.sessions[self.selected].branch)
+            .is_default_branch(&self.sessions[selected].branch)
         {
             self.show_message("default branch is not treated as a PR branch")?;
             return Ok(());
         }
-        let path = self.sessions[self.selected].path.clone();
-        let branch = self.sessions[self.selected].branch.clone();
+        let path = self.sessions[selected].path.clone();
+        let branch = self.sessions[selected].branch.clone();
         {
-            let session = &mut self.sessions[self.selected];
+            let session = &mut self.sessions[selected];
             refresh_pr_cache(
-                &self.repo,
+                &context.repo,
                 &session.branch,
                 &mut session.pr,
                 &session.path,
-                &self.config,
+                &context.config,
                 false,
             );
         }
-        let Some(summary) = self.sessions[self.selected].pr.summary.clone() else {
+        let Some(summary) = self.sessions[selected].pr.summary.clone() else {
             self.show_message("no pull request found for selected branch")?;
             return Ok(());
         };
@@ -1055,26 +1132,26 @@ impl Tui {
             self.show_message("pull request is already merged")?;
             return Ok(());
         }
-        if selected_dirty(&path, &self.config)? {
+        if selected_dirty(&path, &context.config)? {
             self.show_message("working tree is dirty; commit or stash before merging")?;
             return Ok(());
         }
-        run_configured_commands(&self.config.checks.pre_push, &path, "pre_push")?;
+        run_configured_commands(&context.config.checks.pre_push, &path, "pre_push")?;
         self.show_loading_dialog(
             "Merge Pull Request",
             &format!("Merging PR #{}", summary.number),
         )?;
         let pr_number = summary.number.to_string();
         run_status(
-            Command::new(self.config.tool("gh"))
-                .args(merge_pr_args(&pr_number, self.config.merge_method))
+            Command::new(context.config.tool("gh"))
+                .args(merge_pr_args(&pr_number, context.config.merge_method))
                 .current_dir(&path),
         )?;
         if branch != "(detached)" {
             let _ = run_status(
-                Command::new(self.config.tool("git"))
+                Command::new(context.config.tool("git"))
                     .arg("-C")
-                    .arg(&self.repo.root)
+                    .arg(&context.repo.root)
                     .args(["branch", "-D", &branch]),
             );
         }
@@ -1084,30 +1161,34 @@ impl Tui {
     }
 
     pub(crate) fn delete_session(&mut self) -> Result<(), String> {
-        self.sync_selected_repo_context();
-        if self.selected >= self.sessions.len() {
+        let Some(context) = self.selected_worktree_context() else {
+            return Ok(());
+        };
+        let selected = context.session_index;
+        let branch = self.sessions[selected].branch.clone();
+        if context.config.is_default_branch(&branch) {
+            self.show_message("default branch worktree cannot be deleted from Prism")?;
             return Ok(());
         }
-        let branch = self.sessions[self.selected].branch.clone();
-        let path = self.sessions[self.selected].path.clone();
-        let path_display = self.sessions[self.selected].path_display.clone();
-        let warnings = delete_warnings(&self.sessions[self.selected]);
+        let path = self.sessions[selected].path.clone();
+        let path_display = self.sessions[selected].path_display.clone();
+        let warnings = delete_warnings(&self.sessions[selected]);
         if !self.confirm_delete_dialog(&branch, &path_display, &warnings)? {
             return Ok(());
         }
-        self.delete_local_data(&branch)?;
+        self.delete_local_data(&context.repo, &branch)?;
         run_status(
-            Command::new(self.config.tool("git"))
+            Command::new(context.config.tool("git"))
                 .arg("-C")
-                .arg(&self.repo.root)
+                .arg(&context.repo.root)
                 .args(["worktree", "remove", "--force"])
                 .arg(&path),
         )?;
         if branch != "(detached)" {
             run_status(
-                Command::new(self.config.tool("git"))
+                Command::new(context.config.tool("git"))
                     .arg("-C")
-                    .arg(&self.repo.root)
+                    .arg(&context.repo.root)
                     .args(["branch", "-D", &branch]),
             )?;
         }
@@ -1116,12 +1197,16 @@ impl Tui {
         Ok(())
     }
 
-    fn delete_local_data(&self, branch: &str) -> Result<(), String> {
-        remove_task_metadata(&self.repo, branch)?;
-        remove_pr_cache(&self.repo, branch)?;
-        remove_logs(&self.repo, branch)?;
-        remove_process_state(&self.repo, branch)?;
-        clear_hidden(&self.repo, branch)?;
+    fn delete_local_data(
+        &self,
+        repo: &crate::repo::Repository,
+        branch: &str,
+    ) -> Result<(), String> {
+        remove_task_metadata(repo, branch)?;
+        remove_pr_cache(repo, branch)?;
+        remove_logs(repo, branch)?;
+        remove_process_state(repo, branch)?;
+        clear_hidden(repo, branch)?;
         Ok(())
     }
 }

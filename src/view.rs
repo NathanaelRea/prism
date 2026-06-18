@@ -1,248 +1,520 @@
+use std::collections::BTreeMap;
+
 use crate::agent::AgentState;
 use crate::config::Config;
-use crate::repo::Repository;
+use crate::github::PrCache;
 use crate::session::Session;
 use crate::terminal::{terminal_size, write_stdout};
+use crate::tui::PanelFocus;
 use crate::util::{status_count, truncate_line};
 
-pub fn draw(
-    repo: &Repository,
-    config: &Config,
-    sessions: &[Session],
-    selected: usize,
-    mode_label: &str,
-    status_message: Option<&str>,
-    session_filter: &str,
-    leader_hint: Option<&str>,
-) -> Result<(), String> {
-    let (cols, rows) = terminal_size();
-    write_stdout(&render_frame(
-        repo,
-        config,
-        sessions,
-        selected,
-        mode_label,
-        status_message,
-        session_filter,
-        leader_hint,
-        cols,
-        rows,
-    ))
+pub(crate) struct FrameModel<'a> {
+    pub config: &'a Config,
+    pub sessions: &'a [Session],
+    pub status: Vec<StatusRow>,
+    pub repos: Vec<RepoRow>,
+    pub worktrees: Vec<WorktreeRow>,
+    pub current_repo_index: usize,
+    pub selected_repo_label: String,
+    pub selected_repo_root: String,
+    pub selected_session: Option<usize>,
+    pub focus: PanelFocus,
+    pub mode_label: &'a str,
+    pub status_message: Option<&'a str>,
+    pub repo_filter: &'a str,
+    pub worktree_filter: &'a str,
+    pub leader_hint: Option<&'a str>,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn render_frame(
-    _repo: &Repository,
-    config: &Config,
-    sessions: &[Session],
-    selected: usize,
-    mode_label: &str,
-    status_message: Option<&str>,
-    session_filter: &str,
-    leader_hint: Option<&str>,
-    cols: u16,
-    rows: u16,
-) -> String {
-    let pr_width = if cols >= 118 { 36 } else { 0 };
-    let left_width = if pr_width > 0 {
-        cols.saturating_sub(pr_width + 66).clamp(30, 42)
+pub(crate) struct StatusRow {
+    pub label: String,
+    pub value: String,
+    pub attention: bool,
+}
+
+pub(crate) struct RepoRow {
+    pub label: String,
+    pub root: String,
+    pub key: Option<char>,
+    pub health: String,
+    pub selected: bool,
+}
+
+pub(crate) struct WorktreeRow {
+    pub session_index: usize,
+    pub repo_root: String,
+    pub worktree_path: String,
+    pub branch: String,
+    pub kind: WorktreeKind,
+    pub adopted: bool,
+    pub status_label: String,
+    pub agent_state: AgentState,
+    pub pr: PrCache,
+    pub wt_columns: BTreeMap<String, String>,
+    pub unseen_comments: bool,
+    pub prompt_summary: String,
+    pub selected: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorktreeKind {
+    DefaultBranch,
+    FeatureWorktree,
+    Detached,
+}
+
+pub(crate) fn draw_model(model: &FrameModel<'_>) -> Result<(), String> {
+    let (cols, rows) = terminal_size();
+    write_stdout(&render_model_frame(model, cols, rows))
+}
+
+pub(crate) fn render_model_frame(model: &FrameModel<'_>, cols: u16, rows: u16) -> String {
+    let status_width = if cols >= 160 { 22 } else { 16 }
+        .min(cols.saturating_sub(62))
+        .max(14);
+    let repo_width = if cols >= 160 { 28 } else { 20 }
+        .min(cols.saturating_sub(status_width + 44))
+        .max(16);
+    let worktree_width = if cols >= 160 {
+        50
+    } else if cols >= 120 {
+        40
     } else {
-        cols.saturating_sub(58).clamp(28, 42)
-    };
-    let center_width =
-        cols.saturating_sub(left_width + pr_width + if pr_width > 0 { 2 } else { 1 });
-    let mut frame = String::from("\x1b[?25l\x1b[H");
-    if pr_width > 0 {
-        push_line(
-            &mut frame,
-            cols,
-            format!(
-                "{}| {}| {}",
-                styled_cell("Sessions / Worktrees", left_width as usize, "1;36"),
-                styled_cell("Kanban", center_width.saturating_sub(2) as usize, "1;36"),
-                styled_cell("PR", pr_width.saturating_sub(2) as usize, "1;36"),
-            ),
-        );
-        push_line(
-            &mut frame,
-            cols,
-            format!(
-                "{}+{}+{}",
-                "-".repeat(left_width as usize),
-                "-".repeat(center_width as usize),
-                "-".repeat(pr_width as usize)
-            ),
-        );
-    } else {
-        push_line(
-            &mut frame,
-            cols,
-            format!(
-                "{}| {}",
-                styled_cell("Sessions / Worktrees", left_width as usize, "1;36"),
-                styled_cell("Kanban", center_width.saturating_sub(2) as usize, "1;36"),
-            ),
-        );
-        push_line(
-            &mut frame,
-            cols,
-            format!(
-                "{}+{}",
-                "-".repeat(left_width as usize),
-                "-".repeat(center_width as usize)
-            ),
-        );
+        30
     }
+    .min(cols.saturating_sub(status_width + repo_width + 22))
+    .max(24);
+    let main_width = cols
+        .saturating_sub(status_width + repo_width + worktree_width + 3)
+        .max(10);
+    let mut frame = String::from("\x1b[?25l\x1b[H");
+    push_line(
+        &mut frame,
+        cols,
+        format!(
+            "{}|{}|{}|{}",
+            panel_title(
+                "1 Status",
+                model.focus == PanelFocus::Status,
+                status_width as usize,
+            ),
+            panel_title(
+                "2 Repos",
+                model.focus == PanelFocus::Repos,
+                repo_width as usize
+            ),
+            panel_title(
+                "3 Worktrees / Sessions",
+                model.focus == PanelFocus::Worktrees,
+                worktree_width as usize,
+            ),
+            styled_cell("Main", main_width as usize, "1;36"),
+        ),
+    );
+    push_line(
+        &mut frame,
+        cols,
+        format!(
+            "{}+{}+{}+{}",
+            "-".repeat(status_width as usize),
+            "-".repeat(repo_width as usize),
+            "-".repeat(worktree_width as usize),
+            "-".repeat(main_width as usize),
+        ),
+    );
 
     let visible_rows = rows.saturating_sub(4) as usize;
-    let visible_indices = visible_session_indices(sessions, session_filter);
-    let left_rows = left_panel_rows(sessions, &visible_indices);
-    let selected_visible = left_rows
+    let repo_selected = model.repos.iter().position(|row| row.selected).unwrap_or(0);
+    let repo_start = scroll_start(repo_selected, visible_rows);
+    let worktree_selected = model
+        .worktrees
         .iter()
-        .position(|row| matches!(row, LeftPanelRow::Session(index) if *index == selected))
+        .position(|row| row.selected)
         .unwrap_or(0);
-    let start = if selected_visible >= visible_rows {
-        selected_visible + 1 - visible_rows
-    } else {
-        0
-    };
-    let selected_session = sessions.get(selected);
-    let kanban_lines = format_kanban_panel_lines(
-        config,
-        sessions,
-        selected,
-        center_width.saturating_sub(2) as usize,
-        visible_rows,
-    );
-    let pr_lines = if pr_width > 0 {
-        format_pr_panel_lines(config, selected_session)
-    } else {
-        Vec::new()
+    let worktree_start = scroll_start(worktree_selected, visible_rows);
+    let main_lines = match model.focus {
+        PanelFocus::Status => format_status_dashboard_lines(model, main_width as usize),
+        PanelFocus::Repos => format_repo_overview_lines(model, main_width as usize, visible_rows),
+        PanelFocus::Worktrees => format_worktree_detail_lines(model, main_width as usize),
     };
 
     for row in 0..visible_rows {
-        let visible_index = start + row;
-        let left = if let Some(left_row) = left_rows.get(visible_index) {
-            match left_row {
-                LeftPanelRow::Separator { label, key } => {
-                    format_repo_separator(label, *key, left_width as usize)
-                }
-                LeftPanelRow::Session(index) => {
-                    let session = &sessions[*index];
-                    format_session_row(config, session, *index == selected, left_width as usize)
-                }
-            }
-        } else {
-            " ".repeat(left_width as usize)
-        };
-        let center = kanban_lines.get(row).cloned().unwrap_or_default();
-        if pr_width > 0 {
-            let pr = pr_lines.get(row).cloned().unwrap_or_default();
-            push_line(
-                &mut frame,
-                cols,
-                format!(
-                    "{left}| {}| {}",
-                    ansi_cell(&center, center_width.saturating_sub(2) as usize),
-                    ansi_cell(&pr, pr_width.saturating_sub(2) as usize),
-                ),
-            );
-        } else {
-            push_line(
-                &mut frame,
-                cols,
-                format!(
-                    "{left}| {}",
-                    ansi_cell(&center, center_width.saturating_sub(2) as usize),
-                ),
-            );
-        }
+        let status = model
+            .status
+            .get(row)
+            .map(|status| format_status_row(status, status_width as usize))
+            .unwrap_or_else(|| " ".repeat(status_width as usize));
+        let repo = model
+            .repos
+            .get(repo_start + row)
+            .map(|repo| format_repo_row(repo, repo_width as usize))
+            .unwrap_or_else(|| {
+                empty_state_cell(
+                    row,
+                    model.repos.is_empty(),
+                    if model.repo_filter.trim().is_empty() {
+                        "No repos"
+                    } else {
+                        "No matches"
+                    },
+                    repo_width as usize,
+                )
+            });
+        let worktree = model
+            .worktrees
+            .get(worktree_start + row)
+            .map(|worktree| format_worktree_row(model.config, worktree, worktree_width as usize))
+            .unwrap_or_else(|| {
+                empty_state_cell(
+                    row,
+                    model.worktrees.is_empty(),
+                    if model.worktree_filter.trim().is_empty() {
+                        "No worktrees"
+                    } else {
+                        "No matches"
+                    },
+                    worktree_width as usize,
+                )
+            });
+        let main = main_lines.get(row).cloned().unwrap_or_default();
+        push_line(
+            &mut frame,
+            cols,
+            format!(
+                "{status}|{repo}|{worktree}|{}",
+                ansi_cell(&main, main_width as usize),
+            ),
+        );
     }
 
-    let filter = session_filter.trim();
-    let mode_label = if filter.is_empty() {
-        if mode_label == "normal" {
-            ""
-        } else {
-            mode_label
-        }
-        .to_string()
-    } else if mode_label == "normal" {
-        format!("/{filter}")
-    } else {
-        format!("{mode_label} /{filter}")
+    push_line(
+        &mut frame,
+        cols,
+        format!(
+            "{}+{}+{}+{}",
+            "-".repeat(status_width as usize),
+            "-".repeat(repo_width as usize),
+            "-".repeat(worktree_width as usize),
+            "-".repeat(main_width as usize),
+        ),
+    );
+    let mode_label = scoped_mode_label(model);
+    let actions = footer_actions(model);
+    let footer = match model.status_message {
+        Some(message) => format!(
+            " {mode_label}  repo {}  |  {actions}  |  {message} ",
+            model.selected_repo_root
+        ),
+        None => format!(
+            " {mode_label}  repo {}  |  {actions} ",
+            model.selected_repo_root
+        ),
     };
-    let footer = match (status_message, mode_label.is_empty()) {
-        (Some(message), true) => format!(" {message} "),
-        (Some(message), false) => format!(" {mode_label}  |  {message} "),
-        (None, true) => " ".to_string(),
-        (None, false) => format!(" {mode_label} "),
-    };
-    if pr_width > 0 {
-        push_line(
-            &mut frame,
-            cols,
-            format!(
-                "{}+{}+{}",
-                "-".repeat(left_width as usize),
-                "-".repeat(center_width as usize),
-                "-".repeat(pr_width as usize)
-            ),
-        );
-    } else {
-        push_line(
-            &mut frame,
-            cols,
-            format!(
-                "{}+{}",
-                "-".repeat(left_width as usize),
-                "-".repeat(center_width as usize)
-            ),
-        );
-    }
     frame.push_str(&fit_line(&footer, cols as usize));
-    if let Some(hint) = leader_hint {
+    if let Some(hint) = model.leader_hint {
         append_leader_hint(&mut frame, hint, cols, rows);
     }
     frame
 }
 
-enum LeftPanelRow {
-    Separator { label: String, key: Option<char> },
-    Session(usize),
-}
-
-fn left_panel_rows(sessions: &[Session], visible_indices: &[usize]) -> Vec<LeftPanelRow> {
-    let mut rows = Vec::new();
-    let mut last_repo = None;
-    for index in visible_indices {
-        let Some(session) = sessions.get(*index) else {
-            continue;
-        };
-        if last_repo != Some(session.repo_index) {
-            rows.push(LeftPanelRow::Separator {
-                label: session.repo_label.clone(),
-                key: session.repo_key,
-            });
-            last_repo = Some(session.repo_index);
-        }
-        rows.push(LeftPanelRow::Session(*index));
-    }
-    rows
-}
-
-fn format_repo_separator(label: &str, key: Option<char>, width: usize) -> String {
-    let label = match key {
-        Some(key) => format!("--- [{key}] {label} "),
-        None => format!("--- {label} "),
-    };
-    let visible = label.chars().count();
-    let text = if visible >= width {
-        truncate_line(&label, width)
+fn panel_title(title: &str, focused: bool, width: usize) -> String {
+    if focused {
+        styled_cell(&format!("[{title}]"), width, "1;36")
     } else {
-        format!("{}{}", label, "-".repeat(width - visible))
+        styled_cell(title, width, "36")
+    }
+}
+
+fn scroll_start(selected: usize, visible_rows: usize) -> usize {
+    if selected >= visible_rows {
+        selected + 1 - visible_rows
+    } else {
+        0
+    }
+}
+
+fn scoped_mode_label(model: &FrameModel<'_>) -> String {
+    let filter = match model.focus {
+        PanelFocus::Status => "",
+        PanelFocus::Repos => model.repo_filter.trim(),
+        PanelFocus::Worktrees => model.worktree_filter.trim(),
     };
-    color(&text, "90")
+    if filter.is_empty() {
+        model.mode_label.to_string()
+    } else {
+        format!("{} /{}", model.mode_label, filter)
+    }
+}
+
+fn footer_actions(model: &FrameModel<'_>) -> String {
+    match model.focus {
+        PanelFocus::Status => {
+            "Enter focus repos  ? help  Tab next  2 repos  3 worktrees".to_string()
+        }
+        PanelFocus::Repos => {
+            let mut actions = Vec::new();
+            if !model.worktrees.is_empty() {
+                actions.push("Enter focus worktrees");
+            }
+            actions.extend([
+                "c create",
+                "p pull",
+                "Space Enter terminal",
+                "Space g g lazygit",
+                "A add",
+                "R repos",
+                "/ search",
+            ]);
+            actions.join("  ")
+        }
+        PanelFocus::Worktrees => {
+            let Some(row) = model.worktrees.iter().find(|row| row.selected) else {
+                return "/ search".to_string();
+            };
+            let mut actions = vec!["Space Enter terminal", "Space g g lazygit"];
+            if row.kind != WorktreeKind::DefaultBranch {
+                actions.insert(0, "Enter open");
+            }
+            if row.kind == WorktreeKind::FeatureWorktree {
+                actions.push("Space g P push");
+                if row.pr.summary.is_some() {
+                    actions.push("Space g M merge");
+                    actions.push("Space g f review");
+                }
+            }
+            if row.kind != WorktreeKind::DefaultBranch {
+                actions.push("D delete");
+            }
+            actions.push("/ search");
+            actions.join("  ")
+        }
+    }
+}
+
+fn format_status_row(row: &StatusRow, width: usize) -> String {
+    let code = if row.attention { "1;33" } else { "37" };
+    let label_width = width.saturating_sub(row.value.chars().count() + 2).max(1);
+    let text = format!(
+        "{} {}",
+        styled_cell(&row.label, label_width, code),
+        color(&row.value, if row.attention { "1;33" } else { "90" }),
+    );
+    ansi_cell(&text, width)
+}
+
+fn empty_state_cell(row: usize, empty: bool, label: &str, width: usize) -> String {
+    if empty && row == 0 {
+        ansi_cell(&color(label, "90"), width)
+    } else {
+        " ".repeat(width)
+    }
+}
+
+fn format_repo_row(row: &RepoRow, width: usize) -> String {
+    let marker = if row.selected {
+        color("▶", "1;36")
+    } else {
+        " ".to_string()
+    };
+    let key = row
+        .key
+        .map(|key| format!("Space {key}"))
+        .unwrap_or_else(|| "       ".to_string());
+    let label = if row.label.trim().is_empty() {
+        row.root.as_str()
+    } else {
+        row.label.as_str()
+    };
+    let text = format!(
+        "{} {} {} {}",
+        marker,
+        styled_cell(&key, 7, "90"),
+        styled_cell(label, 18, if row.selected { "1;37" } else { "37" }),
+        color(&row.health, "90"),
+    );
+    ansi_cell(&text, width)
+}
+
+fn format_worktree_row(config: &Config, row: &WorktreeRow, width: usize) -> String {
+    let path_hint = row
+        .worktree_path
+        .strip_prefix(&row.repo_root)
+        .unwrap_or(&row.worktree_path)
+        .trim_start_matches('/');
+    let summary = if !row.prompt_summary.is_empty() {
+        row.prompt_summary.as_str()
+    } else if !path_hint.is_empty() {
+        path_hint
+    } else {
+        "-"
+    };
+    let row_number = row.session_index.saturating_add(1).to_string();
+    let marker = if row.selected {
+        color("▶", "1;36")
+    } else if row.unseen_comments {
+        color("!", "1;36")
+    } else {
+        " ".to_string()
+    };
+    let branch_code = if row.selected { "1;37" } else { "37" };
+    let kind = match row.kind {
+        WorktreeKind::DefaultBranch => "base",
+        WorktreeKind::FeatureWorktree if row.adopted => "wt",
+        WorktreeKind::FeatureWorktree => "unadopted",
+        WorktreeKind::Detached => "detached",
+    };
+    let pr = pr_label_for_row(config, row);
+    let review = review_icon_for_row(config, row);
+    let comments = comment_count_label_for_row(config, row);
+    let extra = configured_column_label_for_values(config, &row.wt_columns);
+    let status_color = if row.kind == WorktreeKind::DefaultBranch
+        && status_count(&row.status_label, "behind").is_some()
+    {
+        "31"
+    } else {
+        git_status_color(&row.status_label)
+    };
+    let text = format!(
+        "{} {} {} {} {} {} {} {} {} {} {} {}",
+        marker,
+        styled_cell(&row_number, 3, "90"),
+        styled_cell(kind, 9, "90"),
+        styled_cell(&row.branch, 22, branch_code),
+        styled_cell(&git_status_indicator(&row.status_label), 9, status_color),
+        styled_cell(
+            agent_icon(row.agent_state),
+            3,
+            agent_state_color(row.agent_state)
+        ),
+        styled_cell(&pr, 7, pr_color_for_cache(&row.pr)),
+        styled_cell(&review, 3, review_icon_color_for_row(config, row)),
+        styled_cell(
+            ci_icon_for_row(config, row),
+            3,
+            ci_color_for_row(config, row)
+        ),
+        styled_cell(&comments, 4, comment_color_for_cache(&row.pr)),
+        extra,
+        truncate_line(summary, 50),
+    );
+    ansi_cell(&text, width)
+}
+
+fn format_status_dashboard_lines(model: &FrameModel<'_>, width: usize) -> Vec<String> {
+    let mut lines = vec![
+        color("      ____       _               ", "1;36"),
+        color("     / __ \\_____(_)________ ___ ", "1;36"),
+        color("    / /_/ / ___/ / ___/ __ `__ \\", "1;36"),
+        color("   / ____/ /  / (__  ) / / / / /", "1;36"),
+        color("  /_/   /_/  /_/____/_/ /_/ /_/ ", "1;36"),
+        String::new(),
+        format!("version {}", env!("CARGO_PKG_VERSION")),
+        format!(
+            "selected repo {}",
+            truncate_line(&model.selected_repo_label, width)
+        ),
+        truncate_line(&model.selected_repo_root, width),
+        String::new(),
+        color("Navigation", "1;37"),
+        "1 status  2 repos  3 worktrees".to_string(),
+        "Tab or h/l moves focus".to_string(),
+        "Space 1-9 jumps to configured repos".to_string(),
+        String::new(),
+        color("Documentation", "1;37"),
+        dashboard_link("GitHub repository", "https://github.com/NathanaelRea/prism"),
+        dashboard_link(
+            "Keybindings",
+            "https://github.com/NathanaelRea/prism/blob/main/docs/keybindings.md",
+        ),
+        dashboard_link(
+            "Configuration",
+            "https://github.com/NathanaelRea/prism/blob/main/docs/config.md",
+        ),
+        dashboard_link(
+            "README",
+            "https://github.com/NathanaelRea/prism/blob/main/README.md",
+        ),
+    ];
+    if width < 46 {
+        lines.retain(|line| visible_len(line) <= width || !line.contains("github.com"));
+    }
+    lines
+}
+
+fn dashboard_link(label: &str, url: &str) -> String {
+    format!("\x1b]8;;{url}\x1b\\{label}\x1b]8;;\x1b\\  {url}")
+}
+
+fn format_repo_overview_lines(
+    model: &FrameModel<'_>,
+    width: usize,
+    visible_rows: usize,
+) -> Vec<String> {
+    let mut lines = vec![
+        color(&model.selected_repo_label, "1;36"),
+        truncate_line(&model.selected_repo_root, width),
+    ];
+    if let Some(row) = model.repos.iter().find(|row| row.selected) {
+        lines.push(format!("health {}", row.health));
+    }
+    if let Some(index) = model.selected_session {
+        if let Some(session) = model.sessions.get(index) {
+            lines.push(format!(
+                "remembered {} {}",
+                truncate_line(&session.branch, 28),
+                git_status_indicator(&session.status_label),
+            ));
+        }
+    }
+    lines.push(String::new());
+    let indices = model
+        .sessions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, session)| {
+            (session.repo_index == model.current_repo_index).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    lines.extend(format_kanban_panel_lines(
+        model.config,
+        model.sessions,
+        &indices,
+        model.selected_session,
+        width,
+        visible_rows.saturating_sub(lines.len()),
+    ));
+    lines
+}
+
+fn format_worktree_detail_lines(model: &FrameModel<'_>, width: usize) -> Vec<String> {
+    let Some(index) = model.selected_session else {
+        return vec![color("No selected worktree", "90")];
+    };
+    let Some(session) = model.sessions.get(index) else {
+        return vec![color("No selected worktree", "90")];
+    };
+    let mut lines = vec![
+        color(&session.branch, "1;36"),
+        truncate_line(&session.path_display, width),
+        format!(
+            "status {}  agent {}  adopted {}",
+            git_status_indicator(&session.status_label),
+            agent_icon(session.agent_state),
+            if session.adopted { "yes" } else { "no" },
+        ),
+    ];
+    if !session.prompt_summary.trim().is_empty() {
+        lines.push(format!(
+            "prompt {}",
+            truncate_line(&session.prompt_summary, width)
+        ));
+    }
+    if let Some(line) = session.agent_output.back() {
+        lines.push(format!("agent {}", truncate_line(line, width)));
+    }
+    lines.push(String::new());
+    lines.extend(format_pr_panel_lines(model.config, Some(session)));
+    lines
 }
 
 fn append_leader_hint(frame: &mut String, hint: &str, cols: u16, rows: u16) {
@@ -276,28 +548,6 @@ fn append_leader_hint(frame: &mut String, hint: &str, cols: u16, rows: u16) {
         left,
         "-".repeat(width.saturating_sub(2))
     ));
-}
-
-fn visible_session_indices(sessions: &[Session], filter: &str) -> Vec<usize> {
-    let filter = filter.trim().to_ascii_lowercase();
-    sessions
-        .iter()
-        .enumerate()
-        .filter_map(|(index, session)| {
-            (filter.is_empty()
-                || session.branch.to_ascii_lowercase().contains(&filter)
-                || session
-                    .prompt_summary
-                    .to_ascii_lowercase()
-                    .contains(&filter)
-                || session.path_display.to_ascii_lowercase().contains(&filter)
-                || session
-                    .wt_columns
-                    .values()
-                    .any(|value| value.to_ascii_lowercase().contains(&filter)))
-            .then_some(index)
-        })
-        .collect()
 }
 
 fn push_line(frame: &mut String, cols: u16, line: String) {
@@ -416,70 +666,6 @@ fn ansi_cell(text: &str, width: usize) -> String {
     text
 }
 
-fn format_session_row(config: &Config, session: &Session, selected: bool, width: usize) -> String {
-    let summary = if session.prompt_summary.is_empty() {
-        "-"
-    } else {
-        &session.prompt_summary
-    };
-    let marker = if selected {
-        color("▶", "1;36")
-    } else if session.unseen_comments {
-        color("!", "1;36")
-    } else {
-        " ".to_string()
-    };
-    let branch_code = if selected { "1;37" } else { "37" };
-    let pr = pr_label(config, session);
-    let review = review_icon(config, session);
-    let comments = comment_count_label(config, session);
-    let extra = configured_column_label(config, session);
-    let status_color = if config.is_default_branch(&session.branch)
-        && status_count(&session.status_label, "behind").is_some()
-    {
-        "31"
-    } else {
-        git_status_color(&session.status_label)
-    };
-    let git_status = git_status_indicator(&session.status_label);
-    let mut indicators = Vec::new();
-    if !git_status.is_empty() {
-        indicators.push(color(&git_status, status_color));
-    }
-    indicators.push(color(
-        agent_icon(session.agent_state),
-        agent_state_color(session.agent_state),
-    ));
-    if !pr.is_empty() {
-        indicators.push(color(&pr, pr_color(session)));
-    }
-    if !review.is_empty() {
-        indicators.push(color(&review, review_icon_color(config, session)));
-    }
-    let ci = ci_icon(config, session);
-    if !ci.is_empty() {
-        indicators.push(color(ci, ci_color(config, session)));
-    }
-    if !comments.is_empty() {
-        indicators.push(color(&comments, comment_color(session)));
-    }
-    let mut metadata = indicators.join(" ");
-    if !extra.is_empty() {
-        if !metadata.is_empty() {
-            metadata.push(' ');
-        }
-        metadata.push_str(&extra);
-    }
-    let text = format!(
-        "{} {} {} {}",
-        marker,
-        styled_cell(&session.branch, 22, branch_code),
-        metadata,
-        truncate_line(summary, 50),
-    );
-    ansi_cell(&text, width)
-}
-
 #[derive(Clone, Copy)]
 enum KanbanLane {
     Plan,
@@ -524,16 +710,11 @@ const KANBAN_LANES: [KanbanLane; 4] = [
     KanbanLane::Merged,
 ];
 
-pub(crate) const KANBAN_LANE_COUNT: usize = KANBAN_LANES.len();
-
-pub(crate) fn kanban_lane_index(config: &Config, session: &Session) -> Option<usize> {
-    kanban_lane(config, session).map(KanbanLane::index)
-}
-
 fn format_kanban_panel_lines(
     config: &Config,
     sessions: &[Session],
-    selected: usize,
+    session_indices: &[usize],
+    selected: Option<usize>,
     width: usize,
     visible_rows: usize,
 ) -> Vec<String> {
@@ -542,9 +723,12 @@ fn format_kanban_panel_lines(
     }
 
     let mut lanes: [Vec<(usize, &Session)>; 4] = std::array::from_fn(|_| Vec::new());
-    for (index, session) in sessions.iter().enumerate() {
+    for index in session_indices {
+        let Some(session) = sessions.get(*index) else {
+            continue;
+        };
         if let Some(lane) = kanban_lane(config, session) {
-            lanes[lane.index()].push((index, session));
+            lanes[lane.index()].push((*index, session));
         }
     }
 
@@ -575,7 +759,12 @@ fn format_kanban_panel_lines(
         lines.push(join_kanban_columns(lanes.iter().enumerate().map(
             |(lane_index, lane_sessions)| {
                 if let Some((index, session)) = lane_sessions.get(row) {
-                    format_kanban_card(config, session, *index == selected, widths[lane_index])
+                    format_kanban_card(
+                        config,
+                        session,
+                        Some(*index) == selected,
+                        widths[lane_index],
+                    )
                 } else {
                     " ".repeat(widths[lane_index])
                 }
@@ -692,10 +881,18 @@ fn format_kanban_card(config: &Config, session: &Session, selected: bool, width:
     ansi_cell(&format!("{marker} {}", color(&label, code)), width)
 }
 
+#[cfg(test)]
 fn configured_column_label(config: &Config, session: &Session) -> String {
+    configured_column_label_for_values(config, &session.wt_columns)
+}
+
+fn configured_column_label_for_values(
+    config: &Config,
+    values: &BTreeMap<String, String>,
+) -> String {
     let mut labels = Vec::new();
     for column in &config.worktree_columns {
-        if let Some(value) = session.wt_columns.get(column)
+        if let Some(value) = values.get(column)
             && !value.trim().is_empty()
         {
             labels.push(format_column_value(column, value));
@@ -722,11 +919,11 @@ fn strip_ascii_control_chars(text: &str) -> String {
     text.chars().filter(|ch| !ch.is_ascii_control()).collect()
 }
 
-fn pr_label(config: &Config, session: &Session) -> String {
-    if config.is_default_branch(&session.branch) {
+fn pr_label_for_row(config: &Config, row: &WorktreeRow) -> String {
+    if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
         return String::new();
     }
-    let Some(summary) = &session.pr.summary else {
+    let Some(summary) = &row.pr.summary else {
         return "no-pr".to_string();
     };
     let icon = if summary.merged {
@@ -741,14 +938,14 @@ fn pr_label(config: &Config, session: &Session) -> String {
     format!("{icon}#{}", summary.number)
 }
 
-fn review_icon(config: &Config, session: &Session) -> String {
-    if config.is_default_branch(&session.branch) {
+fn review_icon_for_row(config: &Config, row: &WorktreeRow) -> String {
+    if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
         return String::new();
     }
-    let Some(summary) = &session.pr.summary else {
+    let Some(summary) = &row.pr.summary else {
         return String::new();
     };
-    let review = review_decision_for_display(summary, session.pr.details.as_ref());
+    let review = review_decision_for_display(summary, row.pr.details.as_ref());
     match review.as_str() {
         "APPROVED" => "✓",
         "CHANGES_REQUESTED" => "!",
@@ -760,29 +957,28 @@ fn review_icon(config: &Config, session: &Session) -> String {
     .to_string()
 }
 
-fn review_icon_color(config: &Config, session: &Session) -> &'static str {
-    if config.is_default_branch(&session.branch) {
+fn review_icon_color_for_row(config: &Config, row: &WorktreeRow) -> &'static str {
+    if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
         return "90";
     }
-    let Some(summary) = &session.pr.summary else {
+    let Some(summary) = &row.pr.summary else {
         return "90";
     };
-    let review = review_decision_for_display(summary, session.pr.details.as_ref());
+    let review = review_decision_for_display(summary, row.pr.details.as_ref());
     review_color(&review)
 }
 
-fn comment_count_label(config: &Config, session: &Session) -> String {
-    if config.is_default_branch(&session.branch) {
+fn comment_count_label_for_row(config: &Config, row: &WorktreeRow) -> String {
+    if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
         return String::new();
     }
-    let count = session
+    let count = row
         .pr
         .details
         .as_ref()
         .map(|details| details.comments.len() + details.review_comments.len())
         .or_else(|| {
-            session
-                .pr
+            row.pr
                 .summary
                 .as_ref()
                 .map(|summary| summary.comment_count as usize)
@@ -798,6 +994,25 @@ fn ci_icon(config: &Config, session: &Session) -> &'static str {
         return "";
     }
     match session
+        .pr
+        .summary
+        .as_ref()
+        .map(|summary| summary.check_status.as_str())
+    {
+        Some("passed") => "✓",
+        Some("failed") => "x",
+        Some("running") => "•",
+        Some("mixed") => "±",
+        Some("unknown") | None => "?",
+        Some(_) => "!",
+    }
+}
+
+fn ci_icon_for_row(config: &Config, row: &WorktreeRow) -> &'static str {
+    if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
+        return "";
+    }
+    match row
         .pr
         .summary
         .as_ref()
@@ -863,8 +1078,8 @@ fn agent_state_color(state: AgentState) -> &'static str {
     }
 }
 
-fn pr_color(session: &Session) -> &'static str {
-    let Some(summary) = &session.pr.summary else {
+fn pr_color_for_cache(pr: &PrCache) -> &'static str {
+    let Some(summary) = &pr.summary else {
         return "90";
     };
     if summary.merged {
@@ -897,8 +1112,27 @@ fn ci_color(config: &Config, session: &Session) -> &'static str {
     }
 }
 
-fn comment_color(session: &Session) -> &'static str {
-    let Some(details) = &session.pr.details else {
+fn ci_color_for_row(config: &Config, row: &WorktreeRow) -> &'static str {
+    if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
+        return "90";
+    }
+    match row
+        .pr
+        .summary
+        .as_ref()
+        .map(|summary| summary.check_status.as_str())
+    {
+        Some("passed") => "32",
+        Some("failed") => "31",
+        Some("running") => "33",
+        Some("mixed") => "35",
+        Some("unknown") | None => "90",
+        Some(_) => "33",
+    }
+}
+
+fn comment_color_for_cache(pr: &PrCache) -> &'static str {
+    let Some(details) = &pr.details else {
         return "90";
     };
     if details.comments.is_empty() && details.review_comments.is_empty() {
@@ -1206,55 +1440,26 @@ mod tests {
     use crate::agent::AgentState;
     use crate::config::{Checks, Config, EscapeKey, MergeMethod};
     use crate::github::{PrCache, PrSummary};
-    use crate::repo::Repository;
     use crate::session::Session;
+    use crate::tui::PanelFocus;
 
-    use super::{configured_column_label, format_column_value, git_status_indicator, render_frame};
+    use super::{
+        FrameModel, RepoRow, StatusRow, WorktreeKind, WorktreeRow, configured_column_label,
+        format_column_value, format_repo_row, git_status_indicator, render_model_frame,
+        visible_len,
+    };
 
     #[test]
-    fn render_frame_does_not_clear_the_whole_screen() {
-        let repo = Repository {
-            root: PathBuf::from("/repo"),
-        };
-        let config = Config {
-            default_agent: "opencode".to_string(),
-            default_base: None,
-            plan_dir: "plans".to_string(),
-            review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
-            escape_key: EscapeKey::EscEsc,
-            merge_method: MergeMethod::Squash,
-            checks: Checks::default(),
-            worktree_columns: Vec::new(),
-            tools: BTreeMap::new(),
-            agent_commands: BTreeMap::new(),
-            agent_prompt_modes: BTreeMap::new(),
-            prompt_templates: BTreeMap::new(),
-            user_path: PathBuf::from("/tmp/user.toml"),
-            repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
-        };
-        let sessions = vec![Session {
-            repo_index: 0,
-            repo_label: "repo".to_string(),
-            repo_key: None,
-            path: PathBuf::from("/repo"),
-            path_display: "/repo".to_string(),
-            branch: "main".to_string(),
-            prompt_summary: "summary".to_string(),
-            adopted: true,
-            hidden: false,
-            status_label: "clean".to_string(),
-            agent: None,
-            agent_output: VecDeque::new(),
-            agent_state: AgentState::Idle,
-            pr: PrCache::default(),
-            wt_columns: BTreeMap::new(),
-            unseen_comments: false,
-        }];
-
-        let frame = render_frame(
-            &repo, &config, &sessions, 0, "normal", None, "", None, 120, 20,
-        );
+    fn render_model_frame_does_not_clear_the_whole_screen() {
+        let config = test_config(Some("main"));
+        let sessions = vec![test_session(
+            "main",
+            "clean",
+            AgentState::Idle,
+            PrCache::default(),
+        )];
+        let model = test_model(&config, &sessions, Some(0), PanelFocus::Repos, None);
+        let frame = render_model_frame(&model, 180, 20);
 
         assert!(frame.starts_with("\x1b[?25l\x1b[H"));
         assert!(!frame.contains("\x1b[2J"));
@@ -1262,114 +1467,78 @@ mod tests {
     }
 
     #[test]
-    fn render_frame_keeps_status_message_in_footer() {
-        let repo = Repository {
-            root: PathBuf::from("/repo"),
-        };
-        let config = Config {
-            default_agent: "opencode".to_string(),
-            default_base: None,
-            plan_dir: "plans".to_string(),
-            review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
-            escape_key: EscapeKey::EscEsc,
-            merge_method: MergeMethod::Squash,
-            checks: Checks::default(),
-            worktree_columns: Vec::new(),
-            tools: BTreeMap::new(),
-            agent_commands: BTreeMap::new(),
-            agent_prompt_modes: BTreeMap::new(),
-            prompt_templates: BTreeMap::new(),
-            user_path: PathBuf::from("/tmp/user.toml"),
-            repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
-        };
-        let sessions = vec![Session {
-            repo_index: 0,
-            repo_label: "repo".to_string(),
-            repo_key: None,
-            path: PathBuf::from("/repo"),
-            path_display: "/repo".to_string(),
-            branch: "main".to_string(),
-            prompt_summary: "summary".to_string(),
-            adopted: true,
-            hidden: false,
-            status_label: "clean".to_string(),
-            agent: None,
-            agent_output: VecDeque::new(),
-            agent_state: AgentState::Idle,
-            pr: PrCache::default(),
-            wt_columns: BTreeMap::new(),
-            unseen_comments: false,
-        }];
-
-        let frame = render_frame(
-            &repo,
+    fn render_model_frame_keeps_status_message_in_footer() {
+        let config = test_config(Some("main"));
+        let sessions = vec![test_session(
+            "main",
+            "clean",
+            AgentState::Idle,
+            PrCache::default(),
+        )];
+        let model = test_model(
             &config,
             &sessions,
-            0,
-            "normal",
+            Some(0),
+            PanelFocus::Repos,
             Some("current worktree is dirty"),
-            "",
-            None,
-            120,
-            20,
         );
+        let frame = render_model_frame(&model, 180, 20);
 
-        assert!(frame.contains(" current worktree is dirty "));
-        assert!(!frame.contains("normal"));
-        assert!(!frame.contains("repo /repo"));
+        assert!(frame.contains("normal  repo /repo"));
+        assert!(frame.contains("current worktree is dirty"));
         assert!(!frame.contains("status:"));
     }
 
     #[test]
-    fn default_branch_does_not_render_pr_placeholders() {
-        let repo = Repository {
-            root: PathBuf::from("/repo"),
+    fn repo_row_displays_leader_shortcut() {
+        let row = RepoRow {
+            label: "repo".to_string(),
+            root: "/repo".to_string(),
+            key: Some('1'),
+            health: "ok".to_string(),
+            selected: false,
         };
-        let config = Config {
-            default_agent: "opencode".to_string(),
-            default_base: Some("main".to_string()),
-            plan_dir: "plans".to_string(),
-            review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
-            escape_key: EscapeKey::EscEsc,
-            merge_method: MergeMethod::Squash,
-            checks: Checks::default(),
-            worktree_columns: Vec::new(),
-            tools: BTreeMap::new(),
-            agent_commands: BTreeMap::new(),
-            agent_prompt_modes: BTreeMap::new(),
-            prompt_templates: BTreeMap::new(),
-            user_path: PathBuf::from("/tmp/user.toml"),
-            repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
-        };
-        let sessions = vec![Session {
-            repo_index: 0,
-            repo_label: "repo".to_string(),
-            repo_key: None,
-            path: PathBuf::from("/repo"),
-            path_display: "/repo".to_string(),
-            branch: "main".to_string(),
-            prompt_summary: String::new(),
-            adopted: false,
-            hidden: false,
-            status_label: "clean".to_string(),
-            agent: None,
-            agent_output: VecDeque::new(),
-            agent_state: AgentState::Idle,
-            pr: PrCache::default(),
-            wt_columns: BTreeMap::new(),
-            unseen_comments: false,
-        }];
+        let row = crate::util::strip_ansi(&format_repo_row(&row, 80));
 
-        let frame = render_frame(
-            &repo, &config, &sessions, 0, "normal", None, "", None, 120, 20,
-        );
+        assert!(row.contains("Space 1"));
+        assert!(!row.contains("s1"));
+    }
+
+    #[test]
+    fn default_branch_does_not_render_pr_placeholders() {
+        let config = test_config(Some("main"));
+        let sessions = vec![test_session(
+            "main",
+            "clean",
+            AgentState::Idle,
+            PrCache::default(),
+        )];
+        let model = test_model(&config, &sessions, Some(0), PanelFocus::Worktrees, None);
+        let frame = render_model_frame(&model, 120, 20);
 
         assert!(frame.contains("Default branch"));
         assert!(frame.contains("PR tracking disabled"));
+        assert!(!frame.contains("Enter open"));
+        assert!(!frame.contains("D delete"));
         assert!(!frame.contains("no-pr"));
         assert!(!frame.contains("C?"));
+    }
+
+    #[test]
+    fn feature_worktree_footer_advertises_worktree_actions() {
+        let config = test_config(Some("main"));
+        let sessions = vec![test_session(
+            "feature",
+            "clean",
+            AgentState::Idle,
+            PrCache::default(),
+        )];
+        let model = test_model(&config, &sessions, Some(0), PanelFocus::Worktrees, None);
+        let frame = crate::util::strip_ansi(&render_model_frame(&model, 140, 20));
+
+        assert!(frame.contains("Enter open"));
+        assert!(frame.contains("Space g P push"));
+        assert!(frame.contains("D delete"));
     }
 
     #[test]
@@ -1434,9 +1603,6 @@ mod tests {
 
     #[test]
     fn kanban_panel_groups_sessions_in_workflow_order() {
-        let repo = Repository {
-            root: PathBuf::from("/repo"),
-        };
         let config = test_config(Some("main"));
         let sessions = vec![
             test_session("main", "clean", AgentState::Idle, PrCache::default()),
@@ -1450,10 +1616,8 @@ mod tests {
             test_session("pr-work", "clean", AgentState::Idle, test_pr(12, false)),
             test_session("merged-work", "clean", AgentState::Idle, test_pr(13, true)),
         ];
-
-        let frame = render_frame(
-            &repo, &config, &sessions, 2, "normal", None, "", None, 160, 20,
-        );
+        let model = test_model(&config, &sessions, Some(2), PanelFocus::Repos, None);
+        let frame = render_model_frame(&model, 160, 20);
         let frame = crate::util::strip_ansi(&frame);
 
         let plan = frame.find("plan 1").expect("plan lane");
@@ -1467,6 +1631,151 @@ mod tests {
         assert!(frame.contains("impl-work"));
         assert!(frame.contains("pr-work"));
         assert!(frame.contains("merged-work"));
+    }
+
+    #[test]
+    fn render_model_frame_fits_common_terminal_viewports() {
+        let config = test_config(Some("main"));
+        let sessions = vec![
+            test_session("main", "clean", AgentState::Idle, PrCache::default()),
+            test_session(
+                "feature/very-long-branch-name-that-must-fit",
+                "dirty 12 ahead 3",
+                AgentState::Running,
+                PrCache::default(),
+            ),
+            test_session(
+                "review-work",
+                "clean",
+                AgentState::Idle,
+                test_pr(1234, false),
+            ),
+            test_session(
+                "merged-work",
+                "clean",
+                AgentState::Idle,
+                test_pr(5678, true),
+            ),
+        ];
+
+        for (cols, rows) in [
+            (80, 24),
+            (100, 30),
+            (117, 30),
+            (118, 30),
+            (120, 30),
+            (140, 40),
+            (160, 40),
+            (200, 60),
+        ] {
+            let model = test_model(&config, &sessions, Some(1), PanelFocus::Worktrees, None);
+            let frame = render_model_frame(&model, cols, rows);
+            let lines = frame.lines().collect::<Vec<_>>();
+
+            assert_eq!(
+                lines.len(),
+                rows as usize,
+                "{cols}x{rows} should render exactly one line per terminal row"
+            );
+            for (index, line) in lines.iter().enumerate() {
+                assert_eq!(
+                    visible_len(line),
+                    cols as usize,
+                    "{cols}x{rows} line {index} should fill the terminal width"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn render_model_frame_uses_repo_and_worktree_panels() {
+        let config = test_config(Some("main"));
+        let sessions = vec![
+            test_session("main", "clean", AgentState::Idle, PrCache::default()),
+            test_session(
+                "feature",
+                "dirty 1",
+                AgentState::Running,
+                PrCache::default(),
+            ),
+        ];
+        let model = FrameModel {
+            config: &config,
+            sessions: &sessions,
+            status: vec![StatusRow {
+                label: "repos".to_string(),
+                value: "1".to_string(),
+                attention: false,
+            }],
+            repos: vec![RepoRow {
+                label: "repo".to_string(),
+                root: "/repo".to_string(),
+                key: Some('1'),
+                health: "D1 A1".to_string(),
+                selected: true,
+            }],
+            worktrees: vec![
+                test_worktree_row(&config, &sessions[0], 0, false),
+                test_worktree_row(&config, &sessions[1], 1, true),
+            ],
+            current_repo_index: 0,
+            selected_repo_label: "repo".to_string(),
+            selected_repo_root: "/repo".to_string(),
+            selected_session: Some(1),
+            focus: PanelFocus::Worktrees,
+            mode_label: "normal",
+            status_message: None,
+            repo_filter: "",
+            worktree_filter: "",
+            leader_hint: None,
+        };
+
+        let frame = render_model_frame(&model, 100, 24);
+        let stripped = crate::util::strip_ansi(&frame);
+
+        assert!(stripped.contains("1 Status"));
+        assert!(stripped.contains("2 Repos"));
+        assert!(stripped.contains("3 Worktrees / Sessions"));
+        assert!(stripped.contains("feature"));
+        for line in frame.lines() {
+            assert_eq!(visible_len(line), 100);
+        }
+    }
+
+    #[test]
+    fn worktree_footer_omits_pr_actions_for_default_branch() {
+        let config = test_config(Some("main"));
+        let sessions = vec![test_session(
+            "main",
+            "clean",
+            AgentState::Idle,
+            PrCache::default(),
+        )];
+        let model = test_model(&config, &sessions, Some(0), PanelFocus::Worktrees, None);
+        let frame = crate::util::strip_ansi(&render_model_frame(&model, 140, 24));
+
+        assert!(!frame.contains("Enter open"));
+        assert!(!frame.contains("push"));
+        assert!(!frame.contains("merge"));
+        assert!(!frame.contains("review"));
+    }
+
+    #[test]
+    fn render_model_frame_places_panel_boundaries_from_viewport_width() {
+        let config = test_config(Some("main"));
+        let sessions = vec![
+            test_session("main", "clean", AgentState::Idle, PrCache::default()),
+            test_session("review-work", "clean", AgentState::Idle, test_pr(12, false)),
+        ];
+        let model = test_model(&config, &sessions, Some(1), PanelFocus::Worktrees, None);
+        let frame = render_model_frame(&model, 160, 30);
+        let separator = crate::util::strip_ansi(frame.lines().nth(1).unwrap_or_default());
+        let chars = separator.chars().collect::<Vec<_>>();
+
+        assert_eq!(chars[22], '+');
+        assert_eq!(chars[51], '+');
+        assert_eq!(chars[102], '+');
+        assert_eq!(chars.len(), 160);
     }
 
     fn test_config(default_base: Option<&str>) -> Config {
@@ -1512,6 +1821,77 @@ mod tests {
             pr,
             wt_columns: BTreeMap::new(),
             unseen_comments: false,
+        }
+    }
+
+    fn test_model<'a>(
+        config: &'a Config,
+        sessions: &'a [Session],
+        selected_session: Option<usize>,
+        focus: PanelFocus,
+        status_message: Option<&'a str>,
+    ) -> FrameModel<'a> {
+        FrameModel {
+            config,
+            sessions,
+            status: vec![StatusRow {
+                label: "repos".to_string(),
+                value: "1".to_string(),
+                attention: false,
+            }],
+            repos: vec![RepoRow {
+                label: "repo".to_string(),
+                root: "/repo".to_string(),
+                key: Some('1'),
+                health: "ok".to_string(),
+                selected: true,
+            }],
+            worktrees: sessions
+                .iter()
+                .enumerate()
+                .map(|(index, session)| {
+                    test_worktree_row(config, session, index, Some(index) == selected_session)
+                })
+                .collect(),
+            current_repo_index: 0,
+            selected_repo_label: "repo".to_string(),
+            selected_repo_root: "/repo".to_string(),
+            selected_session,
+            focus,
+            mode_label: "normal",
+            status_message,
+            repo_filter: "",
+            worktree_filter: "",
+            leader_hint: None,
+        }
+    }
+
+    fn test_worktree_row(
+        config: &Config,
+        session: &Session,
+        session_index: usize,
+        selected: bool,
+    ) -> WorktreeRow {
+        WorktreeRow {
+            session_index,
+            repo_root: "/repo".to_string(),
+            worktree_path: session.path_display.clone(),
+            branch: session.branch.clone(),
+            kind: if config.is_default_branch(&session.branch) {
+                WorktreeKind::DefaultBranch
+            } else if session.branch == "(detached)" {
+                WorktreeKind::Detached
+            } else {
+                WorktreeKind::FeatureWorktree
+            },
+            adopted: session.adopted,
+            status_label: session.status_label.clone(),
+            agent_state: session.agent_state,
+            pr: session.pr.clone(),
+            wt_columns: session.wt_columns.clone(),
+            unseen_comments: session.unseen_comments,
+            prompt_summary: session.prompt_summary.clone(),
+            selected,
         }
     }
 

@@ -28,20 +28,23 @@ Press `?` in the TUI for the full key list.
 
 Common keys:
 
-- `Space Space` or `Enter` opens the selected tmux session.
+- `Space Space` focuses repos from the status panel, focuses worktrees from the repos panel, or opens the selected agent from the worktrees panel when valid.
+- `Enter` focuses repos from the status panel, focuses worktrees from the repos panel, or opens the selected agent from the worktrees panel when valid.
+- `1`, `2`, and `3` focus the status, repos, and worktrees panels.
+- `h` / `l` or `Tab` moves focus between panels.
 - `Space Enter` or `Ctrl-/` opens tmux window 3: terminal.
 - `Space g g` opens tmux window 2: lazygit.
 - `Space g P` pushes the selected branch and creates a pull request if needed.
 - `Space g M` merges the selected pull request.
 - `Space g f` copies a review-fix prompt.
-- `p` or `Space g p` pulls the default branch.
-- `1`-`9` switches repositories.
-- `A` adds a repository by path.
+- `p` or `Space g p` pulls the default branch from the repos panel.
+- `Space 1`-`Space 9` switches repositories using configured repo keys.
+- `A` adds a repository by path from the repos panel.
 - `R` edits repository order, key bindings, and tracked repositories.
-- `c` creates a worktree session.
-- `e` edits the Prism repository config and reloads after save.
-- `/` filters sessions.
-- `D` confirms and deletes the selected session.
+- `c` creates a worktree session from the repos panel.
+- `e` edits the Prism repository config from the repos panel and reloads after save.
+- `/` filters the focused panel.
+- `D` confirms and deletes the selected non-default worktree/session.
 - `r` refreshes the board.
 - `j` / `k` or arrow keys move selection.
 - `q` or `Ctrl-C` quits.
@@ -60,7 +63,8 @@ path = "/work/project-b"
 key = "2"
 ```
 
-Reorder blocks to change left-panel order. Remove a block to stop tracking a repository.
+Reorder blocks to change repo panel order. Remove a block to stop tracking a repository.
+Repository keys are used as `Space <key>` shortcuts in the TUI.
 
 Prism treats `main` as the default branch by default. The default branch is not
 polled or shown as a pull request branch.
