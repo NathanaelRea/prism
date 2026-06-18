@@ -279,7 +279,7 @@ fn scoped_mode_label(model: &FrameModel<'_>) -> String {
 fn footer_actions(model: &FrameModel<'_>) -> String {
     match model.focus {
         PanelFocus::Status => {
-            "Enter focus repos  ? help  Tab next  2 repos  3 worktrees".to_string()
+            "c create  Enter focus repos  ? help  Tab next  2 repos  3 worktrees".to_string()
         }
         PanelFocus::Repos => {
             let mut actions = Vec::new();
@@ -299,7 +299,7 @@ fn footer_actions(model: &FrameModel<'_>) -> String {
         }
         PanelFocus::Worktrees => {
             let Some(row) = model.worktrees.iter().find(|row| row.selected) else {
-                return "/ search".to_string();
+                return "c create  / search".to_string();
             };
             let mut actions = vec!["Space Enter terminal", "Space g g lazygit"];
             if row.kind != WorktreeKind::DefaultBranch {
@@ -315,6 +315,7 @@ fn footer_actions(model: &FrameModel<'_>) -> String {
             if row.kind != WorktreeKind::DefaultBranch {
                 actions.push("D delete");
             }
+            actions.push("c create");
             actions.push("/ search");
             actions.join("  ")
         }

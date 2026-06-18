@@ -469,14 +469,10 @@ impl Tui {
                     Key::Create => {
                         self.clear_leader_hint();
                         pending_g = false;
-                        if self.focused_panel != PanelFocus::Repos {
-                            self.show_message("focus repos to create a worktree session")?;
-                        } else {
-                            match self.create_session() {
-                                Ok(true) => self.focus_worktrees(),
-                                Ok(false) => {}
-                                Err(error) => self.show_error("create session failed", &error)?,
-                            }
+                        match self.create_session() {
+                            Ok(true) => self.focus_worktrees(),
+                            Ok(false) => {}
+                            Err(error) => self.show_error("create session failed", &error)?,
                         }
                     }
                     Key::AddRepo => {
@@ -606,7 +602,7 @@ impl Tui {
             "Space 1-9    switch repository",
             "A            add repository",
             "R            edit repositories/order/keys/remove",
-            "c            repos: create worktree session",
+            "c            create worktree session in selected repo",
             "e            repos: edit Prism repo config, then reload",
             "/            search/filter focused panel",
             "?            show keybindings; / filters this dialog",

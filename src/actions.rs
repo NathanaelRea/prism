@@ -72,7 +72,13 @@ impl Tui {
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
         self.ensure_default_branch_ready_for_create()?;
-        let Some(branch) = self.prompt_line_dialog("Create Session", "Branch name: ", "")? else {
+        let repo_label = self
+            .repos
+            .get(context.repo_index)
+            .map(|repo| repo.label.clone())
+            .unwrap_or_else(|| context.repo.root.display().to_string());
+        let branch_prompt = format!("Branch name for {repo_label}: ");
+        let Some(branch) = self.prompt_line_dialog("Create Session", &branch_prompt, "")? else {
             return Ok(false);
         };
         if branch.trim().is_empty() {
