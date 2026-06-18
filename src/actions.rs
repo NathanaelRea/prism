@@ -676,7 +676,7 @@ impl Tui {
         changed
     }
 
-    pub(crate) fn attach_selected_agent_terminal(&mut self) -> Result<(), String> {
+    pub(crate) fn attach_selected_tmux_session(&mut self) -> Result<(), String> {
         self.sync_selected_repo_context();
         if self.selected >= self.sessions.len() {
             return Ok(());
@@ -1813,7 +1813,7 @@ exit 0
         });
 
         let started = Instant::now();
-        tui.attach_selected_agent_terminal().unwrap();
+        tui.attach_selected_tmux_session().unwrap();
 
         assert!(
             started.elapsed() >= Duration::from_millis(100),
@@ -1979,7 +1979,7 @@ exit 0
         let session = test_session(temp.join("worktree"), "feature");
         let mut tui = Tui::new_single(repo, config, vec![session], false);
 
-        tui.attach_selected_agent_terminal().unwrap();
+        tui.attach_selected_tmux_session().unwrap();
 
         let wait_started = Instant::now();
         while !tui.tmux_warmups_in_flight.is_empty()

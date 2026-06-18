@@ -454,13 +454,13 @@ impl Tui {
             return Ok(());
         }
         raw.suspend()?;
-        let result = self.attach_selected_agent_terminal();
+        let result = self.attach_selected_tmux_session();
         let resume_result = raw.resume();
         self.refresh_sessions()?;
         self.start_tmux_agent_warmup();
         resume_result?;
         if let Err(error) = result {
-            self.show_error("agent terminal failed", &error)?;
+            self.show_error("tmux session failed", &error)?;
         }
         Ok(())
     }
@@ -484,8 +484,8 @@ impl Tui {
 
     fn show_keybindings_dialog(&self) -> Result<(), String> {
         let items = [
-            "Space Space  open selected agent",
-            "Enter        open selected agent",
+            "Space Space  open selected tmux session",
+            "Enter        open selected tmux session",
             "Space Enter  open tmux window 3: terminal",
             "Space g g    open tmux window 2: lazygit",
             "Ctrl-/       open tmux window 3: terminal",
