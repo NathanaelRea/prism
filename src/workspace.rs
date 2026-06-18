@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::observability::{self, LogLevel};
 use crate::repo::Repository;
 use crate::util::prism_config_dir;
 
@@ -8,6 +9,13 @@ use crate::util::prism_config_dir;
 pub struct RepoEntry {
     pub root: PathBuf,
     pub key: Option<char>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DiscoveredRepoEntry {
+    pub repo: Repository,
+    pub key: Option<char>,
+    pub source_index: usize,
 }
 
 pub fn repos_path() -> PathBuf {
@@ -55,6 +63,34 @@ pub fn ensure_entries_for_tui(repo_arg: Option<&Path>) -> Result<(Vec<RepoEntry>
         return Ok((entries, 0));
     }
     Ok((entries, 0))
+}
+
+pub fn discover_valid_entries(entries: Vec<RepoEntry>) -> Vec<DiscoveredRepoEntry> {
+    let mut discovered = Vec::new();
+    for (source_index, entry) in entries.into_iter().enumerate() {
+        match Repository::discover(Some(&entry.root)) {
+            Ok(repo) => discovered.push(DiscoveredRepoEntry {
+                repo,
+                key: entry.key,
+                source_index,
+            }),
+            Err(error) => observability::emit(observability::EventInput {
+                level: LogLevel::Warn,
+                target: "workspace",
+                action: "skip_repo",
+                operation_id: None,
+                parent_operation_id: None,
+                branch: None,
+                session: None,
+                message: format!(
+                    "skipping configured repository {}: {error}",
+                    entry.root.display()
+                ),
+                data_json: None,
+            }),
+        }
+    }
+    discovered
 }
 
 pub fn label_for_root(root: &Path) -> String {
@@ -158,6 +194,9 @@ fn escape_string(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn parses_repos_toml_in_order() {
@@ -186,5 +225,53 @@ key = "1"
         }];
 
         assert_eq!(next_key(&entries), Some('2'));
+    }
+
+    #[test]
+    fn discover_valid_entries_skips_missing_repositories() {
+        let temp = unique_temp_dir("prism-workspace-discover-test");
+        let repo_path = temp.join("repo");
+        fs::create_dir_all(&repo_path).unwrap();
+        run(Command::new("git").arg("-C").arg(&repo_path).args(["init"]));
+
+        let entries = vec![
+            RepoEntry {
+                root: repo_path.clone(),
+                key: Some('1'),
+            },
+            RepoEntry {
+                root: temp.join("missing"),
+                key: Some('2'),
+            },
+        ];
+
+        let discovered = discover_valid_entries(entries);
+        let expected_repo_path = fs::canonicalize(&repo_path).unwrap();
+
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].repo.root, expected_repo_path);
+        assert_eq!(discovered[0].key, Some('1'));
+        assert_eq!(discovered[0].source_index, 0);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    fn run(command: &mut Command) {
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "command failed: {:?}\nstdout: {}\nstderr: {}",
+            command,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
     }
 }

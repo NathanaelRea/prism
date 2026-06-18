@@ -12,7 +12,7 @@ use crate::config::Config;
 use crate::git::git_status_label;
 use crate::github::{PrCache, load_pr_cache};
 use crate::json::json_string_field;
-use crate::observability;
+use crate::observability::{self, LogLevel};
 use crate::process::run_capture;
 use crate::repo::Repository;
 use crate::util::{safe_branch_filename, truncate};
@@ -54,7 +54,21 @@ pub fn discover_sessions(repo: &Repository, config: &Config) -> Result<Vec<Sessi
                 let branch = current_branch
                     .take()
                     .unwrap_or_else(|| "(detached)".to_string());
-                sessions.push(build_session(repo, path, branch, config));
+                if path.exists() {
+                    sessions.push(build_session(repo, path, branch, config));
+                } else {
+                    observability::emit(observability::EventInput {
+                        level: LogLevel::Warn,
+                        target: "session",
+                        action: "skip_missing_worktree",
+                        operation_id: None,
+                        parent_operation_id: None,
+                        branch: Some(branch),
+                        session: Some(path.display().to_string()),
+                        message: format!("skipping missing worktree {}", path.display()),
+                        data_json: None,
+                    });
+                }
             }
             continue;
         }
@@ -280,4 +294,102 @@ fn unix_seconds() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::PromptMode;
+    use crate::config::{Checks, EscapeKey, MergeMethod};
+
+    use std::collections::BTreeMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn discover_sessions_skips_missing_worktree_paths() {
+        let temp = unique_temp_dir("prism-session-missing-worktree-test");
+        let repo_path = temp.join("repo");
+        let missing = temp.join("missing");
+        fs::create_dir_all(&repo_path).unwrap();
+        let git = temp.join("git");
+        fs::write(
+            &git,
+            format!(
+                r###"#!/bin/sh
+case "$*" in
+  *"worktree list --porcelain"*)
+    cat <<'EOF'
+worktree {}
+HEAD abc
+branch refs/heads/main
+
+worktree {}
+HEAD def
+branch refs/heads/feat/missing
+
+EOF
+    exit 0
+    ;;
+  *"status --short --branch"*)
+    echo "## main"
+    exit 0
+    ;;
+esac
+exit 0
+"###,
+                repo_path.display(),
+                missing.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&git, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        let repo = Repository {
+            root: repo_path.clone(),
+        };
+
+        let sessions = discover_sessions(&repo, &config).unwrap();
+
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].path, repo_path);
+        assert_eq!(sessions[0].branch, "main");
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    fn test_config() -> Config {
+        Config {
+            default_agent: "ask".to_string(),
+            default_base: None,
+            plan_dir: "plans".to_string(),
+            review_packet_dir: ".agent/review".to_string(),
+            worktree_command: "wt".to_string(),
+            escape_key: EscapeKey::EscEsc,
+            merge_method: MergeMethod::Squash,
+            checks: Checks::default(),
+            worktree_columns: Vec::new(),
+            tools: BTreeMap::new(),
+            agent_commands: BTreeMap::new(),
+            agent_prompt_modes: BTreeMap::<String, PromptMode>::new(),
+            prompt_templates: BTreeMap::new(),
+            user_path: PathBuf::from("/tmp/prism-test-user-config.toml"),
+            repo_config_path: PathBuf::from("/tmp/prism-test-repo-config.toml"),
+        }
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
 }

@@ -301,8 +301,8 @@ impl Tui {
         entries: Vec<crate::workspace::RepoEntry>,
     ) -> Result<(), String> {
         let mut repos = Vec::new();
-        for entry in entries {
-            let repo = crate::repo::Repository::discover(Some(&entry.root))?;
+        for entry in crate::workspace::discover_valid_entries(entries) {
+            let repo = entry.repo;
             let config = crate::config::Config::load(&repo);
             repos.push(ManagedRepo::new(repo, config, entry.key));
         }
@@ -1177,13 +1177,7 @@ impl Tui {
             return Ok(());
         }
         self.delete_local_data(&context.repo, &branch)?;
-        run_status(
-            Command::new(context.config.tool("git"))
-                .arg("-C")
-                .arg(&context.repo.root)
-                .args(["worktree", "remove", "--force"])
-                .arg(&path),
-        )?;
+        remove_worktree(&context.repo, &context.config, &path)?;
         if branch != "(detached)" {
             run_status(
                 Command::new(context.config.tool("git"))
@@ -1329,6 +1323,39 @@ fn merge_pr_args(pr_number: &str, method: crate::config::MergeMethod) -> Vec<Str
         method.gh_flag().to_string(),
         "--delete-branch".to_string(),
     ]
+}
+
+fn remove_worktree(
+    repo: &crate::repo::Repository,
+    config: &crate::config::Config,
+    path: &Path,
+) -> Result<(), String> {
+    let remove_result = run_status(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(&repo.root)
+            .args(["worktree", "remove", "--force"])
+            .arg(path),
+    );
+    match remove_result {
+        Ok(()) => prune_worktrees(repo, config),
+        Err(error) if !path.exists() => prune_worktrees(repo, config).map_err(|prune_error| {
+            format!("{error}; also failed to prune worktrees: {prune_error}")
+        }),
+        Err(error) => Err(error),
+    }
+}
+
+fn prune_worktrees(
+    repo: &crate::repo::Repository,
+    config: &crate::config::Config,
+) -> Result<(), String> {
+    run_status(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(&repo.root)
+            .args(["worktree", "prune"]),
+    )
 }
 
 fn pr_render_signature(cache: &PrCache) -> String {
@@ -1610,8 +1637,8 @@ mod tests {
     use crate::tui::{TmuxWarmupResult, Tui};
 
     use super::{
-        create_pr_args, create_worktree_args, merge_pr_args, status_label_with_behind,
-        tmux_agent_state, tmux_slot_key, tmux_warmup_key,
+        create_pr_args, create_worktree_args, merge_pr_args, remove_worktree,
+        status_label_with_behind, tmux_agent_state, tmux_slot_key, tmux_warmup_key,
     };
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
@@ -1691,6 +1718,51 @@ mod tests {
             merge_pr_args("42", MergeMethod::Rebase),
             vec!["pr", "merge", "42", "--rebase", "--delete-branch"]
         );
+    }
+
+    #[test]
+    fn remove_worktree_prunes_when_missing_path_cannot_be_removed() {
+        let temp = unique_temp_dir("prism-remove-worktree-prune-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("git.log");
+        let git = temp.join("git");
+        fs::write(
+            &git,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"worktree remove"*)
+    echo "not a working tree" >&2
+    exit 1
+    ;;
+  *"worktree prune"*)
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&git, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        let repo = Repository { root: temp.clone() };
+        let missing = temp.join("missing");
+
+        remove_worktree(&repo, &config, &missing).unwrap();
+
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(commands.contains("worktree prune"));
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
