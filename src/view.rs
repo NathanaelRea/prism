@@ -881,6 +881,7 @@ fn format_kanban_card(config: &Config, session: &Session, selected: bool, width:
     ansi_cell(&format!("{marker} {}", color(&label, code)), width)
 }
 
+#[cfg(test)]
 fn configured_column_label(config: &Config, session: &Session) -> String {
     configured_column_label_for_values(config, &session.wt_columns)
 }
