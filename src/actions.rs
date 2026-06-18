@@ -6,9 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::agent::{AgentAdapter, AgentProcess, AgentState};
-use crate::git::{
-    branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty, worktree_dirty,
-};
+use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
 use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCache, fetch_pr_summary_index, pr_details_due, refresh_pr_cache,
     refresh_pr_details_cache, remove_pr_cache, save_pr_cache, save_pr_details_cache,
@@ -80,12 +78,6 @@ impl Tui {
 
     pub(crate) fn create_session(&mut self) -> Result<bool, String> {
         self.sync_selected_repo_context();
-        if !self.allow_dirty && worktree_dirty(&self.repo, &self.config)? {
-            self.show_message(
-                "current worktree is dirty; restart Prism with --allow-dirty to create anyway",
-            )?;
-            return Ok(false);
-        }
         self.ensure_default_branch_ready_for_create()?;
         let Some(branch) = self.prompt_line_dialog("Create Session", "Branch name: ", "")? else {
             return Ok(false);
@@ -1654,7 +1646,7 @@ exit 1
             .insert("gh".to_string(), gh.display().to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
 
         let started = Instant::now();
         let changed = tui.poll_pull_requests(false);
@@ -1678,7 +1670,7 @@ exit 1
         config.default_base = Some("main".to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "main");
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
 
         let changed = tui.poll_pull_requests(false);
 
@@ -1739,7 +1731,7 @@ exit 0
             .insert("opencode".to_string(), "opencode".to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
 
         let started = Instant::now();
         tui.start_tmux_agent_warmup();
@@ -1799,7 +1791,7 @@ exit 0
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
         let key = tmux_warmup_key(tmux_slot_key(&session), 0);
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
         tui.tmux_warmups_in_flight.insert(key.clone());
         let tx = tui.tmux_warmup_tx.clone();
 
@@ -1887,7 +1879,7 @@ exit 1
             .insert("opencode".to_string(), "opencode".to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
 
         tui.paste_prompt_into_tmux_agent(0, "build the thing")
             .unwrap();
@@ -1912,7 +1904,7 @@ exit 1
         let session = test_session(temp.join("worktree"), "feature");
         let slot = tmux_slot_key(&session);
         let stale_key = tmux_warmup_key(slot.clone(), 0);
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
         tui.tmux_generations.insert(slot, 1);
 
         let changed = tui.apply_tmux_warmup_result(TmuxWarmupResult {
@@ -1977,7 +1969,7 @@ exit 0
             .insert("opencode".to_string(), "opencode".to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
 
         tui.attach_selected_tmux_session().unwrap();
 
