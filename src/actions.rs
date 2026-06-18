@@ -112,11 +112,11 @@ impl Tui {
                 )
             })?;
         self.selected = index;
+        write_task_metadata(&self.repo, &self.sessions[index], &initial_prompt)?;
+        self.sessions[index].adopted = true;
         if !initial_prompt.trim().is_empty() {
             self.show_loading_dialog("Create Session", "Starting agent session")?;
-            write_task_metadata(&self.repo, &self.sessions[index], &initial_prompt)?;
             self.sessions[index].prompt_summary = truncate(&initial_prompt.replace('\n', " "), 50);
-            self.sessions[index].adopted = true;
             self.paste_prompt_into_tmux_agent(index, initial_prompt.trim())?;
             self.show_message("pasted initial prompt into agent session")?;
         }
@@ -1018,15 +1018,7 @@ impl Tui {
     }
 
     fn prompt_pr_description(&self) -> Result<Option<String>, String> {
-        let Some(answer) =
-            self.prompt_line_dialog("Create Pull Request", "Add description? [y/N] ", "")?
-        else {
-            return Ok(None);
-        };
-        if !yes(&answer) {
-            return Ok(Some(String::new()));
-        }
-        self.prompt_line_dialog("Create Pull Request", "Description (empty for none): ", "")
+        self.prompt_line_dialog("Create Pull Request", "Description: ", "")
     }
 
     pub(crate) fn merge_selected_pr(&mut self) -> Result<(), String> {
@@ -1067,7 +1059,10 @@ impl Tui {
             return Ok(());
         }
         run_configured_commands(&self.config.checks.pre_push, &path, "pre_push")?;
-        self.show_message(&format!("merging PR #{}", summary.number))?;
+        self.show_loading_dialog(
+            "Merge Pull Request",
+            &format!("Merging PR #{}", summary.number),
+        )?;
         let pr_number = summary.number.to_string();
         run_status(
             Command::new(self.config.tool("gh"))

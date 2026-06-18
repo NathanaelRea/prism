@@ -95,23 +95,28 @@ pub fn run_status(command: &mut Command) -> Result<(), String> {
         )),
     );
     let started = Instant::now();
-    let status = command.status().map_err(|error| {
-        let elapsed_ms = started.elapsed().as_millis() as i64;
-        operation.finish(
-            LogLevel::Error,
-            "process",
-            "error",
-            format!("subprocess failed to start: {error}"),
-            Some(observability::command_data_json(
-                command,
-                include_argv,
-                Some(elapsed_ms),
-                None,
-                Some(&error.to_string()),
-            )),
-        );
-        format!("{command_display}: {error}")
-    })?;
+    let output = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|error| {
+            let elapsed_ms = started.elapsed().as_millis() as i64;
+            operation.finish(
+                LogLevel::Error,
+                "process",
+                "error",
+                format!("subprocess failed to start: {error}"),
+                Some(observability::command_data_json(
+                    command,
+                    include_argv,
+                    Some(elapsed_ms),
+                    None,
+                    Some(&error.to_string()),
+                )),
+            );
+            format!("{command_display}: {error}")
+        })?;
+    let status = output.status;
     let elapsed_ms = started.elapsed().as_millis() as i64;
     if status.success() {
         operation.finish(
@@ -129,6 +134,15 @@ pub fn run_status(command: &mut Command) -> Result<(), String> {
         );
         Ok(())
     } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let message = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("exited with {status}")
+        };
         operation.finish(
             LogLevel::Error,
             "process",
@@ -139,10 +153,10 @@ pub fn run_status(command: &mut Command) -> Result<(), String> {
                 include_argv,
                 Some(elapsed_ms),
                 Some(&status.to_string()),
-                None,
+                Some(&message),
             )),
         );
-        Err(format!("{command_display}: exited with {status}"))
+        Err(format!("{command_display}: {message}"))
     }
 }
 

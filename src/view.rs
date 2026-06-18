@@ -32,7 +32,7 @@ pub fn draw(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn render_frame(
-    repo: &Repository,
+    _repo: &Repository,
     config: &Config,
     sessions: &[Session],
     selected: usize,
@@ -159,14 +159,24 @@ pub(crate) fn render_frame(
         }
     }
 
-    let mode_label = if session_filter.trim().is_empty() {
-        mode_label.to_string()
+    let filter = session_filter.trim();
+    let mode_label = if filter.is_empty() {
+        if mode_label == "normal" {
+            ""
+        } else {
+            mode_label
+        }
+        .to_string()
+    } else if mode_label == "normal" {
+        format!("/{filter}")
     } else {
-        format!("{mode_label} /{}", session_filter.trim())
+        format!("{mode_label} /{filter}")
     };
-    let footer = match status_message {
-        Some(message) => format!(" {mode_label}  repo {}  |  {message} ", repo.root.display()),
-        None => format!(" {mode_label}  repo {} ", repo.root.display()),
+    let footer = match (status_message, mode_label.is_empty()) {
+        (Some(message), true) => format!(" {message} "),
+        (Some(message), false) => format!(" {mode_label}  |  {message} "),
+        (None, true) => " ".to_string(),
+        (None, false) => format!(" {mode_label} "),
     };
     if pr_width > 0 {
         push_line(
@@ -431,25 +441,40 @@ fn format_session_row(config: &Config, session: &Session, selected: bool, width:
     } else {
         git_status_color(&session.status_label)
     };
+    let git_status = git_status_indicator(&session.status_label);
+    let mut indicators = Vec::new();
+    if !git_status.is_empty() {
+        indicators.push(color(&git_status, status_color));
+    }
+    indicators.push(color(
+        agent_icon(session.agent_state),
+        agent_state_color(session.agent_state),
+    ));
+    if !pr.is_empty() {
+        indicators.push(color(&pr, pr_color(session)));
+    }
+    if !review.is_empty() {
+        indicators.push(color(&review, review_icon_color(config, session)));
+    }
+    let ci = ci_icon(config, session);
+    if !ci.is_empty() {
+        indicators.push(color(ci, ci_color(config, session)));
+    }
+    if !comments.is_empty() {
+        indicators.push(color(&comments, comment_color(session)));
+    }
+    let mut metadata = indicators.join(" ");
+    if !extra.is_empty() {
+        if !metadata.is_empty() {
+            metadata.push(' ');
+        }
+        metadata.push_str(&extra);
+    }
     let text = format!(
-        "{} {} {} {} {} {} {} {} {} {}",
+        "{} {} {} {}",
         marker,
         styled_cell(&session.branch, 22, branch_code),
-        styled_cell(
-            &git_status_indicator(&session.status_label),
-            9,
-            status_color
-        ),
-        styled_cell(
-            agent_icon(session.agent_state),
-            3,
-            agent_state_color(session.agent_state)
-        ),
-        styled_cell(&pr, 7, pr_color(session)),
-        styled_cell(&review, 3, review_icon_color(config, session)),
-        styled_cell(ci_icon(config, session), 3, ci_color(config, session)),
-        styled_cell(&comments, 4, comment_color(session)),
-        extra,
+        metadata,
         truncate_line(summary, 50),
     );
     ansi_cell(&text, width)
@@ -1290,7 +1315,9 @@ mod tests {
             20,
         );
 
-        assert!(frame.contains("normal  repo /repo  |  current worktree is dirty"));
+        assert!(frame.contains(" current worktree is dirty "));
+        assert!(!frame.contains("normal"));
+        assert!(!frame.contains("repo /repo"));
         assert!(!frame.contains("status:"));
     }
 
