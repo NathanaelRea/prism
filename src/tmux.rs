@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::process::{run_capture, run_status, split_command_words};
+use crate::process::{run_capture, run_status_inherited, split_command_words};
 use crate::repo::Repository;
 use crate::session::Session;
 use crate::util::{safe_branch_filename, stable_hash};
@@ -202,7 +202,7 @@ fn agent_session_prefix(repo: &Repository, branch: &str) -> String {
 }
 
 fn attach(config: &Config, name: &str, window: TmuxWindow) -> Result<(), String> {
-    run_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+    run_status_inherited(Command::new(config.tool("tmux")).env_remove("TMUX").args([
         "attach-session",
         "-t",
         &window_target(name, window),
@@ -210,7 +210,7 @@ fn attach(config: &Config, name: &str, window: TmuxWindow) -> Result<(), String>
 }
 
 fn attach_session(config: &Config, name: &str) -> Result<(), String> {
-    run_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+    run_status_inherited(Command::new(config.tool("tmux")).env_remove("TMUX").args([
         "attach-session",
         "-t",
         name,
