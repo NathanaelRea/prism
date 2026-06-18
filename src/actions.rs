@@ -6,9 +6,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::agent::{AgentAdapter, AgentProcess, AgentState};
-use crate::git::{
-    branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty, worktree_dirty,
-};
+use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
 use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCache, fetch_pr_summary_index, pr_details_due, refresh_pr_cache,
     refresh_pr_details_cache, remove_pr_cache, save_pr_cache, save_pr_details_cache,
@@ -73,12 +71,6 @@ impl Tui {
         let context = self
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
-        if !self.allow_dirty && worktree_dirty(&context.repo, &context.config)? {
-            self.show_message(
-                "current worktree is dirty; restart Prism with --allow-dirty to create anyway",
-            )?;
-            return Ok(false);
-        }
         self.ensure_default_branch_ready_for_create()?;
         let Some(branch) = self.prompt_line_dialog("Create Session", "Branch name: ", "")? else {
             return Ok(false);
@@ -116,12 +108,13 @@ impl Tui {
             self.worktree_filter.clear();
         }
         self.select_worktree(index);
-        if !initial_prompt.trim().is_empty() {
+        let initial_prompt = initial_prompt.trim();
+        write_task_metadata(&context.repo, &self.sessions[index], initial_prompt)?;
+        self.sessions[index].adopted = true;
+        if !initial_prompt.is_empty() {
             self.show_loading_dialog("Create Session", "Starting agent session")?;
-            write_task_metadata(&context.repo, &self.sessions[index], &initial_prompt)?;
             self.sessions[index].prompt_summary = truncate(&initial_prompt.replace('\n', " "), 50);
-            self.sessions[index].adopted = true;
-            self.paste_prompt_into_tmux_agent(index, initial_prompt.trim())?;
+            self.paste_prompt_into_tmux_agent(index, initial_prompt)?;
             self.show_message("pasted initial prompt into agent session")?;
         }
         Ok(true)
@@ -692,7 +685,7 @@ impl Tui {
         changed
     }
 
-    pub(crate) fn attach_selected_agent_terminal(&mut self) -> Result<(), String> {
+    pub(crate) fn attach_selected_tmux_session(&mut self) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
@@ -1103,15 +1096,7 @@ impl Tui {
     }
 
     fn prompt_pr_description(&self) -> Result<Option<String>, String> {
-        let Some(answer) =
-            self.prompt_line_dialog("Create Pull Request", "Add description? [y/N] ", "")?
-        else {
-            return Ok(None);
-        };
-        if !yes(&answer) {
-            return Ok(Some(String::new()));
-        }
-        self.prompt_line_dialog("Create Pull Request", "Description (empty for none): ", "")
+        self.prompt_line_dialog("Create Pull Request", "Description: ", "")
     }
 
     pub(crate) fn merge_selected_pr(&mut self) -> Result<(), String> {
@@ -1152,7 +1137,10 @@ impl Tui {
             return Ok(());
         }
         run_configured_commands(&context.config.checks.pre_push, &path, "pre_push")?;
-        self.show_message(&format!("merging PR #{}", summary.number))?;
+        self.show_loading_dialog(
+            "Merge Pull Request",
+            &format!("Merging PR #{}", summary.number),
+        )?;
         let pr_number = summary.number.to_string();
         run_status(
             Command::new(context.config.tool("gh"))
@@ -1739,7 +1727,7 @@ exit 1
             .insert("gh".to_string(), gh.display().to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
 
         let started = Instant::now();
         let changed = tui.poll_pull_requests(false);
@@ -1763,7 +1751,7 @@ exit 1
         config.default_base = Some("main".to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "main");
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
 
         let changed = tui.poll_pull_requests(false);
 
@@ -1824,7 +1812,7 @@ exit 0
             .insert("opencode".to_string(), "opencode".to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
 
         let started = Instant::now();
         tui.start_tmux_agent_warmup();
@@ -1884,7 +1872,7 @@ exit 0
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
         let key = tmux_warmup_key(tmux_slot_key(&session), 0);
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
         tui.tmux_warmups_in_flight.insert(key.clone());
         let tx = tui.tmux_warmup_tx.clone();
 
@@ -1898,7 +1886,7 @@ exit 0
         });
 
         let started = Instant::now();
-        tui.attach_selected_agent_terminal().unwrap();
+        tui.attach_selected_tmux_session().unwrap();
 
         assert!(
             started.elapsed() >= Duration::from_millis(100),
@@ -1972,7 +1960,7 @@ exit 1
             .insert("opencode".to_string(), "opencode".to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
 
         tui.paste_prompt_into_tmux_agent(0, "build the thing")
             .unwrap();
@@ -1997,7 +1985,7 @@ exit 1
         let session = test_session(temp.join("worktree"), "feature");
         let slot = tmux_slot_key(&session);
         let stale_key = tmux_warmup_key(slot.clone(), 0);
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
         tui.tmux_generations.insert(slot, 1);
 
         let changed = tui.apply_tmux_warmup_result(TmuxWarmupResult {
@@ -2062,9 +2050,9 @@ exit 0
             .insert("opencode".to_string(), "opencode".to_string());
         let repo = Repository { root: temp.clone() };
         let session = test_session(temp.join("worktree"), "feature");
-        let mut tui = Tui::new_single(repo, config, vec![session], false);
+        let mut tui = Tui::new_single(repo, config, vec![session]);
 
-        tui.attach_selected_agent_terminal().unwrap();
+        tui.attach_selected_tmux_session().unwrap();
 
         let wait_started = Instant::now();
         while !tui.tmux_warmups_in_flight.is_empty()

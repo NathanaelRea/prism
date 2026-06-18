@@ -21,7 +21,6 @@ pub struct Tui {
     pub(crate) repos: Vec<ManagedRepo>,
     pub(crate) current_repo: usize,
     pub(crate) sessions: Vec<Session>,
-    pub(crate) allow_dirty: bool,
     pub(crate) selected: usize,
     pub(crate) selected_repo_root: Option<PathBuf>,
     pub(crate) focused_panel: PanelFocus,
@@ -153,12 +152,7 @@ pub(crate) struct DefaultBranchPollResult {
 }
 
 impl Tui {
-    pub fn new(
-        repos: Vec<ManagedRepo>,
-        current_repo: usize,
-        sessions: Vec<Session>,
-        allow_dirty: bool,
-    ) -> Self {
+    pub fn new(repos: Vec<ManagedRepo>, current_repo: usize, sessions: Vec<Session>) -> Self {
         let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
         let (tmux_warmup_tx, tmux_warmup_rx) = mpsc::channel();
         let (wt_poll_tx, wt_poll_rx) = mpsc::channel();
@@ -181,7 +175,6 @@ impl Tui {
             repos,
             current_repo,
             sessions,
-            allow_dirty,
             selected: 0,
             selected_repo_root: None,
             focused_panel: PanelFocus::Status,
@@ -212,18 +205,8 @@ impl Tui {
     }
 
     #[cfg(test)]
-    pub(crate) fn new_single(
-        repo: Repository,
-        config: Config,
-        sessions: Vec<Session>,
-        allow_dirty: bool,
-    ) -> Self {
-        Self::new(
-            vec![ManagedRepo::new(repo, config, None)],
-            0,
-            sessions,
-            allow_dirty,
-        )
+    pub(crate) fn new_single(repo: Repository, config: Config, sessions: Vec<Session>) -> Self {
+        Self::new(vec![ManagedRepo::new(repo, config, None)], 0, sessions)
     }
 
     pub(crate) fn sync_selected_repo_context(&mut self) {
@@ -379,7 +362,7 @@ impl Tui {
                     Key::LeaderGit => {
                         self.leader_hint = Some(LeaderHint::Git);
                     }
-                    Key::AgentMode => {
+                    Key::OpenTmuxSession => {
                         self.clear_leader_hint();
                         pending_g = false;
                         match self.focused_panel {
@@ -578,13 +561,13 @@ impl Tui {
             return Ok(());
         }
         raw.suspend()?;
-        let result = self.attach_selected_agent_terminal();
+        let result = self.attach_selected_tmux_session();
         let resume_result = raw.resume();
         self.refresh_sessions()?;
         self.start_tmux_agent_warmup();
         resume_result?;
         if let Err(error) = result {
-            self.show_error("agent terminal failed", &error)?;
+            self.show_error("tmux session failed", &error)?;
         }
         Ok(())
     }
@@ -1744,7 +1727,7 @@ mod tests {
             test_session(1, "/repo-two", "main"),
             test_session(1, "/repo-two", "feature-two"),
         ];
-        Tui::new(repos, 0, sessions, false)
+        Tui::new(repos, 0, sessions)
     }
 
     fn test_session(repo_index: usize, root: &str, branch: &str) -> Session {

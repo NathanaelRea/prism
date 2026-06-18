@@ -27,7 +27,7 @@ impl KeyInput {
                         keys.push(Key::Leader);
                     }
                     b'\t' => keys.push(Key::FocusNext),
-                    b'\r' | b'\n' => keys.push(Key::AgentMode),
+                    b'\r' | b'\n' => keys.push(Key::OpenTmuxSession),
                     31 => keys.push(Key::Terminal),
                     b'k' => keys.push(Key::Up),
                     b'j' => keys.push(Key::Down),
@@ -71,7 +71,7 @@ impl KeyInput {
                 KeyInputState::Leader => match byte {
                     b' ' => {
                         self.state = KeyInputState::Normal;
-                        keys.push(Key::AgentMode);
+                        keys.push(Key::OpenTmuxSession);
                     }
                     b'\r' | b'\n' => {
                         self.state = KeyInputState::Normal;
@@ -120,7 +120,7 @@ pub enum Key {
     G,
     Leader,
     LeaderGit,
-    AgentMode,
+    OpenTmuxSession,
     LazyGit,
     Terminal,
     Help,
@@ -197,12 +197,12 @@ mod tests {
     }
 
     #[test]
-    fn key_input_handles_agent_mode_keys() {
+    fn key_input_handles_open_tmux_session_keys() {
         let mut input = KeyInput::default();
         let keys = input.feed(b"i  ");
         assert!(matches!(
             keys.as_slice(),
-            [Key::Other, Key::Leader, Key::AgentMode]
+            [Key::Other, Key::Leader, Key::OpenTmuxSession]
         ));
     }
 
@@ -217,10 +217,10 @@ mod tests {
     }
 
     #[test]
-    fn key_input_handles_enter_agent_mode_and_help_keys() {
+    fn key_input_handles_enter_open_tmux_session_and_help_keys() {
         let mut input = KeyInput::default();
         let keys = input.feed(b"\n?");
-        assert!(matches!(keys.as_slice(), [Key::AgentMode, Key::Help]));
+        assert!(matches!(keys.as_slice(), [Key::OpenTmuxSession, Key::Help]));
     }
 
     #[test]

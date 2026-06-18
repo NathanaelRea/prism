@@ -6,7 +6,6 @@ use crate::observability::LogLevel;
 #[derive(Debug)]
 pub struct Args {
     pub repo: Option<PathBuf>,
-    pub allow_dirty: bool,
     pub debug: bool,
     pub print_logs: bool,
     pub log_level: Option<LogLevel>,
@@ -43,7 +42,6 @@ impl Args {
         I: IntoIterator<Item = OsString>,
     {
         let mut repo = None;
-        let mut allow_dirty = false;
         let mut debug = false;
         let mut print_logs = false;
         let mut log_level = None;
@@ -59,7 +57,6 @@ impl Args {
                         .ok_or_else(|| "--repo requires a path".to_string())?;
                     repo = Some(PathBuf::from(value));
                 }
-                "--allow-dirty" => allow_dirty = true,
                 "--debug" => debug = true,
                 "--print-logs" => print_logs = true,
                 "--log-level" => {
@@ -121,7 +118,6 @@ impl Args {
 
         Ok(Self {
             repo,
-            allow_dirty,
             debug,
             print_logs,
             log_level,
@@ -132,6 +128,6 @@ impl Args {
 
 fn print_help() {
     println!(
-        "Usage:\n  prism [--repo <path>] [--allow-dirty] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config\n  prism [--repo <path>] run-plan <plan.md>\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>"
+        "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config\n  prism [--repo <path>] run-plan <plan.md>\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>"
     );
 }

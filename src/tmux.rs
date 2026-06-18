@@ -4,7 +4,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::process::{run_capture, run_status, split_command_words};
+use crate::process::{run_capture, run_status_inherited, split_command_words};
 use crate::repo::Repository;
 use crate::session::Session;
 use crate::util::{safe_branch_filename, stable_hash};
@@ -47,7 +47,7 @@ pub fn attach_or_create_agent(
 ) -> Result<(), String> {
     let name = agent_session_name(repo, &session.branch, generation);
     ensure_agent_session(repo, config, session, generation)?;
-    match attach(config, &name, TmuxWindow::Agent) {
+    match attach_session(config, &name) {
         Ok(()) => Ok(()),
         Err(_) if matches!(session_exists(config, &name), Ok(false)) => Ok(()),
         Err(error) => Err(error),
@@ -202,10 +202,18 @@ fn agent_session_prefix(repo: &Repository, branch: &str) -> String {
 }
 
 fn attach(config: &Config, name: &str, window: TmuxWindow) -> Result<(), String> {
-    run_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+    run_status_inherited(Command::new(config.tool("tmux")).env_remove("TMUX").args([
         "attach-session",
         "-t",
         &window_target(name, window),
+    ]))
+}
+
+fn attach_session(config: &Config, name: &str) -> Result<(), String> {
+    run_status_inherited(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+        "attach-session",
+        "-t",
+        name,
     ]))
 }
 
@@ -1137,6 +1145,11 @@ exit 0
         let commands = fs::read_to_string(&log).unwrap();
         assert_eq!(commands.matches("new-session -d -s").count(), 1);
         assert_eq!(commands.matches("attach-session -t").count(), 1);
+        let attach = commands
+            .lines()
+            .find(|line| line.starts_with("attach-session -t "))
+            .unwrap();
+        assert!(!attach.contains(":1"));
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -1193,8 +1206,11 @@ exit 0
         assert!(commands.contains("new-window -d -t"));
         assert!(commands.contains("-n lazygit"));
         assert!(commands.contains("-n terminal"));
-        assert!(commands.contains("attach-session -t"));
-        assert!(commands.contains(":2"));
+        let attach = commands
+            .lines()
+            .find(|line| line.starts_with("attach-session -t "))
+            .unwrap();
+        assert!(attach.contains(":2"));
 
         let _ = fs::remove_dir_all(temp);
     }

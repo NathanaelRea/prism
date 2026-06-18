@@ -82,7 +82,7 @@ fn run() -> Result<(), String> {
             let (repo, _) = load_single_repo_context(args.repo.as_deref())?;
             run_db_command(command, &repo)
         }
-        CommandKind::Tui => run_tui(args.repo.as_deref(), args.allow_dirty),
+        CommandKind::Tui => run_tui(args.repo.as_deref()),
     }
 }
 
@@ -107,7 +107,7 @@ fn observer_options(args: &Args) -> ObserverOptions {
     }
 }
 
-fn run_tui(repo_arg: Option<&std::path::Path>, allow_dirty: bool) -> Result<(), String> {
+fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
     observability::start_startup_run(env!("CARGO_PKG_VERSION"));
     let result: Result<(), String> = (|| {
         let (entries, selected_repo) = observability::phase("load_workspace", || {
@@ -135,7 +135,7 @@ fn run_tui(repo_arg: Option<&std::path::Path>, allow_dirty: bool) -> Result<(), 
         let sessions =
             observability::phase("discover_sessions", || discover_workspace_sessions(&repos))?;
         let mut tui = observability::phase("initialize_tui", || {
-            Ok(tui::Tui::new(repos, selected_repo, sessions, allow_dirty))
+            Ok(tui::Tui::new(repos, selected_repo, sessions))
         })?;
         tui.select_repo(selected_repo);
         observability::phase("run_tui", || tui.run())
