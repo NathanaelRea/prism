@@ -1184,7 +1184,10 @@ mod tests {
     use crate::repo::Repository;
     use crate::session::Session;
 
-    use super::{configured_column_label, format_column_value, git_status_indicator, render_frame};
+    use super::{
+        configured_column_label, format_column_value, git_status_indicator, render_frame,
+        visible_len,
+    };
 
     #[test]
     fn render_frame_does_not_clear_the_whole_screen() {
@@ -1440,6 +1443,113 @@ mod tests {
         assert!(frame.contains("impl-work"));
         assert!(frame.contains("pr-work"));
         assert!(frame.contains("merged-work"));
+    }
+
+    #[test]
+    fn render_frame_fits_common_terminal_viewports() {
+        let repo = Repository {
+            root: PathBuf::from("/repo"),
+        };
+        let config = test_config(Some("main"));
+        let sessions = vec![
+            test_session("main", "clean", AgentState::Idle, PrCache::default()),
+            test_session(
+                "feature/very-long-branch-name-that-must-fit",
+                "dirty 12 ahead 3",
+                AgentState::Running,
+                PrCache::default(),
+            ),
+            test_session(
+                "review-work",
+                "clean",
+                AgentState::Idle,
+                test_pr(1234, false),
+            ),
+            test_session(
+                "merged-work",
+                "clean",
+                AgentState::Idle,
+                test_pr(5678, true),
+            ),
+        ];
+
+        for (cols, rows) in [
+            (80, 24),
+            (100, 30),
+            (117, 30),
+            (118, 30),
+            (120, 30),
+            (140, 40),
+            (160, 40),
+            (200, 60),
+        ] {
+            let frame = render_frame(
+                &repo, &config, &sessions, 1, "normal", None, "", None, cols, rows,
+            );
+            let lines = frame.lines().collect::<Vec<_>>();
+
+            assert_eq!(
+                lines.len(),
+                rows as usize,
+                "{cols}x{rows} should render exactly one line per terminal row"
+            );
+            for (index, line) in lines.iter().enumerate() {
+                assert_eq!(
+                    visible_len(line),
+                    cols as usize,
+                    "{cols}x{rows} line {index} should fill the terminal width"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn render_frame_switches_pr_panel_at_width_threshold() {
+        let repo = Repository {
+            root: PathBuf::from("/repo"),
+        };
+        let config = test_config(Some("main"));
+        let sessions = vec![
+            test_session("main", "clean", AgentState::Idle, PrCache::default()),
+            test_session("review-work", "clean", AgentState::Idle, test_pr(12, false)),
+        ];
+
+        let narrow = render_frame(
+            &repo, &config, &sessions, 1, "normal", None, "", None, 117, 30,
+        );
+        let wide = render_frame(
+            &repo, &config, &sessions, 1, "normal", None, "", None, 118, 30,
+        );
+
+        let narrow_header = crate::util::strip_ansi(narrow.lines().next().unwrap_or_default());
+        let wide_header = crate::util::strip_ansi(wide.lines().next().unwrap_or_default());
+
+        assert!(narrow_header.starts_with("Sessions / Worktrees"));
+        assert!(!narrow_header.contains("| PR"));
+        assert!(wide_header.starts_with("Sessions / Worktrees"));
+        assert!(wide_header.contains("| PR"));
+    }
+
+    #[test]
+    fn render_frame_places_panel_boundaries_from_viewport_width() {
+        let repo = Repository {
+            root: PathBuf::from("/repo"),
+        };
+        let config = test_config(Some("main"));
+        let sessions = vec![
+            test_session("main", "clean", AgentState::Idle, PrCache::default()),
+            test_session("review-work", "clean", AgentState::Idle, test_pr(12, false)),
+        ];
+
+        let frame = render_frame(
+            &repo, &config, &sessions, 1, "normal", None, "", None, 160, 30,
+        );
+        let separator = crate::util::strip_ansi(frame.lines().nth(1).unwrap_or_default());
+        let chars = separator.chars().collect::<Vec<_>>();
+
+        assert_eq!(chars[42], '+');
+        assert_eq!(chars[123], '+');
+        assert_eq!(chars.len(), 160);
     }
 
     fn test_config(default_base: Option<&str>) -> Config {
