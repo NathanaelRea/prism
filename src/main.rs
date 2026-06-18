@@ -114,8 +114,13 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
             workspace::ensure_entries_for_tui(repo_arg)
         })?;
         let mut repos = Vec::new();
-        for entry in entries {
-            let repo = Repository::discover(Some(&entry.root))?;
+        let discovered_entries = workspace::discover_valid_entries(entries);
+        let selected_repo = discovered_entries
+            .iter()
+            .position(|entry| entry.source_index == selected_repo)
+            .unwrap_or_else(|| selected_repo.min(discovered_entries.len().saturating_sub(1)));
+        for entry in discovered_entries {
+            let repo = entry.repo;
             let mut config = Config::load(&repo);
             observability::phase("ensure_tools", || config::ensure_required_tools(&config))?;
             observability::phase("ensure_default_agent", || {
