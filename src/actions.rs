@@ -1061,7 +1061,7 @@ impl Tui {
                 false,
             );
         }
-        let Some(summary) = self.sessions[selected].pr.summary.clone() else {
+        let Some(summary) = pr_summary_or_error(&self.sessions[selected].pr)? else {
             self.show_message("no pull request found for selected branch")?;
             return Ok(());
         };
@@ -1322,6 +1322,16 @@ fn copy_to_clipboard(config: &crate::config::Config, text: &str) -> Result<(), S
 
 fn open_url_in_browser(url: &str) -> Result<(), String> {
     run_browser_opener(&browser_opener_candidates(), url).map(|_| ())
+}
+
+fn pr_summary_or_error(cache: &PrCache) -> Result<Option<crate::github::PrSummary>, String> {
+    if let Some(summary) = &cache.summary {
+        Ok(Some(summary.clone()))
+    } else if let Some(error) = &cache.error {
+        Err(error.clone())
+    } else {
+        Ok(None)
+    }
 }
 
 const NO_BROWSER_ARGS: &[&str] = &[];
@@ -1781,8 +1791,9 @@ mod tests {
     use crate::tui::{TmuxWarmupResult, Tui};
 
     use super::{
-        create_pr_args, create_worktree_args, merge_pr_args, remove_worktree, run_browser_opener,
-        status_label_with_behind, tmux_agent_state, tmux_slot_key, tmux_warmup_key,
+        create_pr_args, create_worktree_args, merge_pr_args, pr_summary_or_error, remove_worktree,
+        run_browser_opener, status_label_with_behind, tmux_agent_state, tmux_slot_key,
+        tmux_warmup_key,
     };
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
@@ -1901,6 +1912,18 @@ exit 0
             "--flag\nhttps://example.test/pr/42\n"
         );
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn pr_summary_or_error_returns_refresh_error() {
+        let cache = PrCache {
+            error: Some("gh pr view: authentication failed".to_string()),
+            ..PrCache::default()
+        };
+
+        let error = pr_summary_or_error(&cache).unwrap_err();
+
+        assert_eq!(error, "gh pr view: authentication failed");
     }
 
     #[test]
