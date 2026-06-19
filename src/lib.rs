@@ -9,6 +9,7 @@ mod input;
 mod json;
 mod lifecycle;
 mod observability;
+mod opencode;
 mod plan;
 mod process;
 mod repo;

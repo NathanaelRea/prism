@@ -20,6 +20,7 @@ Prism uses a lazygit-style panel model.
 - `A` adds a repository by path from the Repos panel.
 - `R` edits repository order, key bindings, and tracked repositories.
 - `c` creates a worktree session from the Repos panel.
+- `x` aborts the selected OpenCode session from the Worktrees panel.
 - `e` edits the Prism repository config from the Repos panel and reloads after save.
 - `/` filters the focused Repos or Worktrees panel.
 - `?` opens the in-app keybinding dialog.

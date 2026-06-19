@@ -365,7 +365,7 @@ exit 0
         config
             .tools
             .insert("git".to_string(), git.display().to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let missing = temp.join("missing");
 
         remove_worktree(&repo, &config, &missing).unwrap();
@@ -401,7 +401,7 @@ exit 0
         config
             .tools
             .insert("git".to_string(), git.display().to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let path = temp.join("worktree");
         fs::create_dir_all(&path).unwrap();
 
@@ -421,6 +421,9 @@ exit 0
             plan_dir: "plans".to_string(),
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
+            opencode_port_base: 41_000,
+            opencode_port_span: 1_000,
+            opencode_shutdown_owned_servers: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             checks: Checks::default(),

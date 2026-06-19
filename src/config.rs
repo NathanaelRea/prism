@@ -84,6 +84,9 @@ pub struct Config {
     pub plan_dir: String,
     pub review_packet_dir: String,
     pub worktree_command: String,
+    pub opencode_port_base: u16,
+    pub opencode_port_span: u16,
+    pub opencode_shutdown_owned_servers: bool,
     pub escape_key: EscapeKey,
     pub merge_method: MergeMethod,
     pub checks: Checks,
@@ -103,6 +106,9 @@ struct RawConfig {
     plan_dir: Option<String>,
     review_packet_dir: Option<String>,
     worktree_command: Option<String>,
+    opencode_port_base: Option<u16>,
+    opencode_port_span: Option<u16>,
+    opencode_shutdown_owned_servers: Option<bool>,
     escape_key: Option<String>,
     merge_method: Option<String>,
     checks: Option<RawChecks>,
@@ -163,6 +169,9 @@ impl Config {
             plan_dir: "plans".to_string(),
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
+            opencode_port_base: 41_000,
+            opencode_port_span: 1_000,
+            opencode_shutdown_owned_servers: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             checks: Checks::default(),
@@ -201,6 +210,15 @@ impl Config {
         }
         if let Some(value) = raw.worktree_command {
             self.worktree_command = value;
+        }
+        if let Some(port) = raw.opencode_port_base {
+            self.opencode_port_base = port;
+        }
+        if let Some(span) = raw.opencode_port_span.filter(|span| *span > 0) {
+            self.opencode_port_span = span;
+        }
+        if let Some(shutdown) = raw.opencode_shutdown_owned_servers {
+            self.opencode_shutdown_owned_servers = shutdown;
         }
         if let Some(value) = raw
             .merge_method
@@ -296,6 +314,12 @@ pub fn print_config(repo: &Repository, config: &Config) {
     println!("plan_dir = {}", config.plan_dir);
     println!("review_packet_dir = {}", config.review_packet_dir);
     println!("worktree_command = {}", config.worktree_command);
+    println!("opencode_port_base = {}", config.opencode_port_base);
+    println!("opencode_port_span = {}", config.opencode_port_span);
+    println!(
+        "opencode_shutdown_owned_servers = {}",
+        config.opencode_shutdown_owned_servers
+    );
     println!("escape_key = {}", config.escape_key.label());
     println!("merge_method = {}", config.merge_method.label());
     println!("worktree_columns = {:?}", config.worktree_columns);
@@ -581,6 +605,9 @@ mod tests {
         assert_eq!(config.default_agent, "opencode");
         assert_eq!(config.default_base.as_deref(), Some("main"));
         assert_eq!(config.merge_method, MergeMethod::Squash);
+        assert_eq!(config.opencode_port_base, 41_000);
+        assert_eq!(config.opencode_port_span, 1_000);
+        assert!(!config.opencode_shutdown_owned_servers);
         assert!(config.is_default_branch("main"));
         assert_eq!(
             config.agent_command("opencode"),
@@ -607,6 +634,32 @@ mod tests {
         assert_eq!(config.default_base.as_deref(), Some("develop"));
         assert!(config.is_default_branch("develop"));
         assert!(!config.is_default_branch("main"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn repo_config_overrides_opencode_runtime_settings() {
+        let path = std::env::temp_dir().join(format!(
+            "prism-config-opencode-runtime-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            "opencode_port_base = 42000\nopencode_port_span = 50\nopencode_shutdown_owned_servers = true\n",
+        )
+        .unwrap();
+        let mut config = Config::defaults(PathBuf::from("/tmp/user.toml"), path.clone());
+
+        config.apply_file(&path);
+
+        assert_eq!(config.opencode_port_base, 42_000);
+        assert_eq!(config.opencode_port_span, 50);
+        assert!(config.opencode_shutdown_owned_servers);
 
         let _ = fs::remove_file(path);
     }

@@ -18,6 +18,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - run: cargo fmt --check
-      - run: cargo test
-      - run: cargo clippy --all-targets -- -D warnings
+          targets: aarch64-apple-darwin
+      - name: Install Linux cross-check dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang pkg-config libsqlite3-dev
+      - run: scripts/full-check.sh

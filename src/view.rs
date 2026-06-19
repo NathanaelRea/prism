@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use crate::agent::AgentState;
 use crate::config::Config;
 use crate::github::PrCache;
+use crate::opencode::OpencodeStatus;
 use crate::session::Session;
 use crate::terminal::{terminal_size, write_stdout};
 use crate::tui::PanelFocus;
@@ -520,9 +521,66 @@ fn format_worktree_detail_lines(model: &FrameModel<'_>, width: usize) -> Vec<Str
     if let Some(line) = session.agent_output.back() {
         lines.push(format!("agent {}", truncate_line(line, width)));
     }
+    if let Some(status) = &session.opencode_status {
+        lines.extend(format_opencode_status_lines(status, width));
+    }
     lines.push(String::new());
     lines.extend(format_pr_panel_lines(model.config, Some(session)));
     lines
+}
+
+fn format_opencode_status_lines(status: &OpencodeStatus, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let session = status.session_id.as_deref().map(short_id).unwrap_or("none");
+    let title = status.title.as_deref().filter(|title| !title.is_empty());
+    lines.push(match title {
+        Some(title) => format!(
+            "opencode {}  session {}  {}",
+            status.state.label(),
+            session,
+            truncate_line(title, width)
+        ),
+        None => format!("opencode {}  session {}", status.state.label(), session),
+    });
+    if let Some(tool) = &status.active_tool {
+        lines.push(format!("tool {}", truncate_line(tool, width)));
+    }
+    if let Some(message) = &status.latest_message {
+        lines.push(format!("latest {}", truncate_line(message, width)));
+    }
+    let todo = todo_summary(&status.todos);
+    if !todo.is_empty() {
+        lines.push(format!("todos {todo}"));
+    }
+    lines
+}
+
+fn short_id(id: &str) -> &str {
+    id.get(..8).unwrap_or(id)
+}
+
+fn todo_summary(todos: &[crate::opencode::OpencodeTodo]) -> String {
+    let mut pending = 0;
+    let mut active = 0;
+    let mut completed = 0;
+    for todo in todos {
+        match todo.status.as_str() {
+            "completed" | "complete" | "done" => completed += 1,
+            "in_progress" | "in-progress" | "active" | "running" => active += 1,
+            _ => pending += 1,
+        }
+    }
+    let mut parts = Vec::new();
+    if pending > 0 {
+        parts.push(format!("pending {pending}"));
+    }
+    if active > 0 {
+        parts.push(format!("active {active}"));
+    }
+    if completed > 0 {
+        parts.push(format!("done {completed}"));
+    }
+    parts.join("  ")
 }
 
 fn append_leader_hint(frame: &mut String, hint: &str, cols: u16, rows: u16) {
@@ -1406,6 +1464,7 @@ mod tests {
     use crate::agent::AgentState;
     use crate::config::{Checks, Config, EscapeKey, MergeMethod};
     use crate::github::{PrCache, PrComment, PrDetails, PrReviewComment, PrSummary};
+    use crate::opencode::{OpencodeState, OpencodeStatus, OpencodeTodo};
     use crate::session::Session;
     use crate::tui::PanelFocus;
 
@@ -1515,6 +1574,9 @@ mod tests {
             plan_dir: "plans".to_string(),
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
+            opencode_port_base: 41_000,
+            opencode_port_span: 1_000,
+            opencode_shutdown_owned_servers: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             checks: Checks::default(),
@@ -1540,6 +1602,7 @@ mod tests {
             agent: None,
             agent_output: VecDeque::new(),
             agent_state: AgentState::Idle,
+            opencode_status: None,
             pr: PrCache::default(),
             wt_columns: BTreeMap::new(),
             unseen_comments: false,
@@ -1769,6 +1832,39 @@ mod tests {
     }
 
     #[test]
+    fn worktree_detail_renders_opencode_status_snapshot() {
+        let config = test_config(Some("main"));
+        let mut session = test_session("feature", "clean", AgentState::Running, PrCache::default());
+        session.opencode_status = Some(OpencodeStatus {
+            server_url: Some("http://127.0.0.1:41000".to_string()),
+            session_id: Some("ses_123456789".to_string()),
+            title: Some("feature work".to_string()),
+            state: OpencodeState::Busy,
+            latest_message: Some("implementing phase five".to_string()),
+            active_tool: Some("bash running".to_string()),
+            todos: vec![
+                OpencodeTodo {
+                    text: "poll".to_string(),
+                    status: "in_progress".to_string(),
+                },
+                OpencodeTodo {
+                    text: "render".to_string(),
+                    status: "pending".to_string(),
+                },
+            ],
+            last_updated_unix_ms: Some(42),
+        });
+        let sessions = vec![session];
+        let model = test_model(&config, &sessions, Some(0), PanelFocus::Worktrees, None);
+        let frame = crate::util::strip_ansi(&render_model_frame(&model, 140, 24));
+
+        assert!(frame.contains("opencode busy  session ses_1234"));
+        assert!(frame.contains("tool bash running"));
+        assert!(frame.contains("latest implementing phase five"));
+        assert!(frame.contains("todos pending 1  active 1"));
+    }
+
+    #[test]
     fn worktree_footer_omits_pr_actions_for_default_branch() {
         let config = test_config(Some("main"));
         let sessions = vec![test_session(
@@ -1811,6 +1907,9 @@ mod tests {
             plan_dir: "plans".to_string(),
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
+            opencode_port_base: 41_000,
+            opencode_port_span: 1_000,
+            opencode_shutdown_owned_servers: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             checks: Checks::default(),
@@ -1844,6 +1943,7 @@ mod tests {
             agent: None,
             agent_output: VecDeque::new(),
             agent_state,
+            opencode_status: None,
             pr,
             wt_columns: BTreeMap::new(),
             unseen_comments: false,
