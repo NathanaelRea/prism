@@ -1375,8 +1375,6 @@ impl Tui {
                     } else {
                         view::WorktreeKind::FeatureWorktree
                     },
-                    adopted: session.adopted,
-                    status_label: session.status_label.clone(),
                     agent_state: session.agent_state,
                     pr: session.pr.clone(),
                     wt_columns: session.wt_columns.clone(),
