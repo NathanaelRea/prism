@@ -170,7 +170,7 @@ pub fn paste_agent_prompt(
 }
 
 fn paste_prompt_into_tmux(config: &Config, name: &str, prompt: &str) -> Result<(), String> {
-    if !wait_for_agent_input_ready(config, &name, AGENT_INPUT_READY_WAIT) {
+    if !wait_for_agent_input_ready(config, name, AGENT_INPUT_READY_WAIT) {
         return Err("agent prompt did not become ready".to_string());
     }
     let buffer_name = format!("{name}-prompt");
@@ -189,7 +189,7 @@ fn paste_prompt_into_tmux(config: &Config, name: &str, prompt: &str) -> Result<(
         "-b",
         &buffer_name,
         "-t",
-        &window_target(&name, TmuxWindow::Agent),
+        &window_target(name, TmuxWindow::Agent),
     ]))
 }
 
@@ -675,7 +675,7 @@ mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1702,7 +1702,7 @@ exit 0
 
     fn handle_fake_opencode_request(
         mut stream: TcpStream,
-        worktree: &PathBuf,
+        worktree: &Path,
         append_status: u16,
         request_log: Option<&PathBuf>,
     ) {

@@ -149,7 +149,7 @@ pub fn ensure_opencode_server(
         existing.as_ref().map(|runtime| runtime.server_port),
         config.opencode_port_base,
         config.opencode_port_span,
-        |port| port_status(port),
+        port_status,
     )?;
     let server_url = server_url(port);
     let server_pid = if check_health(&server_url) {
