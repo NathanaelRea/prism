@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -18,6 +19,7 @@ const RUNTIME_LOG_RETAINED_FILES: usize = 3;
 
 static OBSERVER: OnceLock<Mutex<ObserverState>> = OnceLock::new();
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+static INITIALIZED_DB_PATHS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogLevel {
@@ -509,13 +511,35 @@ pub fn with_writable_db<T>(
     run: impl FnOnce(&Connection) -> Result<T, String>,
 ) -> Result<T, String> {
     let path = db_path(repo);
+    let existed_before_open = path.exists();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("create db dir: {error}"))?;
     }
     let conn =
         Connection::open(&path).map_err(|error| format!("open {}: {error}", path.display()))?;
-    create_schema(&conn)?;
+    ensure_schema_for_path(&conn, &path, existed_before_open)?;
     run(&conn)
+}
+
+fn ensure_schema_for_path(
+    conn: &Connection,
+    path: &Path,
+    existed_before_open: bool,
+) -> Result<(), String> {
+    let initialized_paths = INITIALIZED_DB_PATHS.get_or_init(|| Mutex::new(BTreeSet::new()));
+    let already_initialized = existed_before_open
+        && initialized_paths
+            .lock()
+            .map(|paths| paths.contains(path))
+            .unwrap_or(false);
+    if already_initialized {
+        return Ok(());
+    }
+    create_schema(conn)?;
+    if let Ok(mut paths) = initialized_paths.lock() {
+        paths.insert(path.to_path_buf());
+    }
+    Ok(())
 }
 
 fn record_panic(message: String) {

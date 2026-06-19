@@ -17,7 +17,7 @@ use crate::process::{run_capture, run_configured_commands, run_status};
 use crate::review::build_review_fix_prompt;
 use crate::session::{
     append_agent_log, append_runtime_log, clear_hidden, discover_sessions, remove_logs,
-    remove_process_state, remove_task_metadata, save_agent_state, write_task_metadata,
+    remove_session_db_records, save_agent_state, write_task_metadata,
 };
 use crate::tmux::{
     TmuxWindow, agent_session_running, attach_or_create_agent, attach_or_create_plan_mode,
@@ -1107,7 +1107,7 @@ impl Tui {
                 &mut session.pr,
                 &session.path,
                 &context.config,
-                true,
+                false,
             );
         }
         if self.sessions[selected].pr.summary.is_none()
@@ -1135,7 +1135,7 @@ impl Tui {
                 &mut session.pr,
                 &session.path,
                 &context.config,
-                true,
+                false,
             );
             self.show_message("push complete; pull request created")?;
         } else {
@@ -1235,7 +1235,11 @@ impl Tui {
                     .args(["branch", "-D", &branch]),
             )?;
         }
-        self.refresh_sessions()?;
+        if self.selected_worktree_by_repo.get(&context.repo.root) == Some(&path) {
+            self.selected_worktree_by_repo.remove(&context.repo.root);
+        }
+        self.sessions.remove(selected);
+        self.ensure_navigation_valid();
         self.show_message("deleted local session data, worktree, and branch")?;
         Ok(())
     }
@@ -1245,11 +1249,8 @@ impl Tui {
         repo: &crate::repo::Repository,
         branch: &str,
     ) -> Result<(), String> {
-        remove_task_metadata(repo, branch)?;
-        remove_pr_cache(repo, branch)?;
+        remove_session_db_records(repo, branch)?;
         remove_logs(repo, branch)?;
-        remove_process_state(repo, branch)?;
-        clear_hidden(repo, branch)?;
         Ok(())
     }
 }
@@ -1387,7 +1388,7 @@ fn remove_worktree(
             .arg(path),
     );
     match remove_result {
-        Ok(()) => prune_worktrees(repo, config),
+        Ok(()) => Ok(()),
         Err(error) if !path.exists() => prune_worktrees(repo, config).map_err(|prune_error| {
             format!("{error}; also failed to prune worktrees: {prune_error}")
         }),
@@ -1810,6 +1811,44 @@ exit 0
 
         let commands = fs::read_to_string(&log).unwrap();
         assert!(commands.contains("worktree prune"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn remove_worktree_does_not_prune_after_successful_remove() {
+        let temp = unique_temp_dir("prism-remove-worktree-no-prune-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("git.log");
+        let git = temp.join("git");
+        fs::write(
+            &git,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+exit 0
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&git, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        let repo = Repository { root: temp.clone() };
+        let path = temp.join("worktree");
+        fs::create_dir_all(&path).unwrap();
+
+        remove_worktree(&repo, &config, &path).unwrap();
+
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(commands.contains("worktree remove --force"));
+        assert!(!commands.contains("worktree prune"));
 
         let _ = fs::remove_dir_all(temp);
     }
