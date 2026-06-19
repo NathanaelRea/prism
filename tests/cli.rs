@@ -55,6 +55,13 @@ fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
+fn canonical_display(path: &Path) -> String {
+    fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .display()
+        .to_string()
+}
+
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
@@ -107,7 +114,7 @@ fn config_prints_effective_repo_config() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     let stdout = stdout(&output);
-    assert!(stdout.contains(&format!("repo_root = {}", repo.display())));
+    assert!(stdout.contains(&format!("repo_root = {}", canonical_display(&repo))));
     assert!(stdout.contains("default_agent = opencode"));
     assert!(stdout.contains("default_base = main"));
 }
@@ -143,7 +150,7 @@ fn doctor_reports_repository_and_tool_status() {
     assert!(output.status.success(), "{}", stderr(&output));
     let stdout = stdout(&output);
     assert!(stdout.contains("Prism doctor"));
-    assert!(stdout.contains(&format!("repo: {}", repo.display())));
+    assert!(stdout.contains(&format!("repo: {}", canonical_display(&repo))));
     assert!(stdout.contains("default agent: opencode"));
     assert!(stdout.contains("checks: pre_pr=0 pre_push=0 review_fix=0"));
 }
