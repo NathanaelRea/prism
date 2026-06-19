@@ -1382,7 +1382,7 @@ mod tests {
     fn pr_cache_round_trips_details() {
         let temp = unique_temp_dir("prism-pr-details-cache-test");
         fs::create_dir_all(&temp).unwrap();
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let summary = PrSummary {
             number: 42,
             title: "Fix review".to_string(),

@@ -365,7 +365,7 @@ exit 0
         config
             .tools
             .insert("git".to_string(), git.display().to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let missing = temp.join("missing");
 
         remove_worktree(&repo, &config, &missing).unwrap();
@@ -401,7 +401,7 @@ exit 0
         config
             .tools
             .insert("git".to_string(), git.display().to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let path = temp.join("worktree");
         fs::create_dir_all(&path).unwrap();
 

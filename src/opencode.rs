@@ -1282,7 +1282,7 @@ mod tests {
     fn runtime_metadata_round_trips_session_mapping() {
         let temp = unique_temp_dir("prism-opencode-runtime-test");
         fs::create_dir_all(&temp).unwrap();
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let worktree = temp.join("feature");
         let runtime = OpencodeRuntime {
             repo_root: temp.display().to_string(),

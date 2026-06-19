@@ -2057,7 +2057,7 @@ exit 1
         config
             .tools
             .insert("gh".to_string(), gh.display().to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
         let mut tui = Tui::new_single(repo, config, vec![session]);
 
@@ -2081,7 +2081,7 @@ exit 1
 
         let mut config = test_config();
         config.default_base = Some("main".to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "main");
         let mut tui = Tui::new_single(repo, config, vec![session]);
 
@@ -2145,7 +2145,7 @@ exit 0
         config
             .tools
             .insert("opencode".to_string(), "opencode".to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
         let mut tui = Tui::new_single(repo, config, vec![session]);
 
@@ -2207,7 +2207,7 @@ exit 0
         config
             .tools
             .insert("opencode".to_string(), "opencode".to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
         let key = tmux_warmup_key(tmux_slot_key(&session), 0);
         let mut tui = Tui::new_single(repo, config, vec![session]);
@@ -2299,7 +2299,7 @@ exit 1
         config
             .tools
             .insert("opencode".to_string(), "opencode".to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
         let mut tui = Tui::new_single(repo, config, vec![session]);
 
@@ -2322,7 +2322,7 @@ exit 1
         fs::create_dir_all(&temp).unwrap();
         let mut config = test_config();
         config.default_agent = "opencode".to_string();
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
         let slot = tmux_slot_key(&session);
         let stale_key = tmux_warmup_key(slot.clone(), 0);
@@ -2392,7 +2392,7 @@ exit 0
         config
             .tools
             .insert("opencode".to_string(), "opencode".to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
         let mut tui = Tui::new_single(repo, config, vec![session]);
 

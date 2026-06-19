@@ -204,11 +204,11 @@ mod tests {
         let pty = TestPty::open();
         pty.set_size(173, 41);
 
-        assert_eq!(terminal_size_from_fd(pty.master), Some((173, 41)));
+        assert_eq!(terminal_size_from_fd(pty.slave), Some((173, 41)));
 
         pty.set_size(92, 27);
 
-        assert_eq!(terminal_size_from_fd(pty.master), Some((92, 27)));
+        assert_eq!(terminal_size_from_fd(pty.slave), Some((92, 27)));
     }
 
     #[test]
@@ -277,7 +277,7 @@ mod tests {
                 ws_xpixel: 0,
                 ws_ypixel: 0,
             };
-            let result = unsafe { libc::ioctl(self.master, libc::TIOCSWINSZ, &size) };
+            let result = unsafe { libc::ioctl(self.slave, libc::TIOCSWINSZ, &size) };
             assert_eq!(result, 0, "TIOCSWINSZ failed");
         }
     }

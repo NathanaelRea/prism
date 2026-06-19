@@ -380,9 +380,7 @@ exit 0
         config
             .tools
             .insert("git".to_string(), git.display().to_string());
-        let repo = Repository {
-            root: repo_path.clone(),
-        };
+        let repo = Repository::with_config_dir_for_test(repo_path.clone(), temp.join("config"));
 
         let sessions = discover_sessions(&repo, &config).unwrap();
 

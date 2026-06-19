@@ -839,7 +839,7 @@ exit 0
         config
             .tools
             .insert("opencode".to_string(), "/usr/bin/opencode".to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
         save_runtime(
             &repo,
@@ -910,7 +910,7 @@ exit 0
         config
             .tools
             .insert("opencode".to_string(), "/usr/bin/opencode".to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
         let port = start_fake_opencode_server(session.path.clone(), 200, None, 4);
         save_runtime(
@@ -976,7 +976,7 @@ exit 0
         let temp = unique_temp_dir("prism-tmux-latest-generation-test");
         fs::create_dir_all(&temp).unwrap();
         let tmux = temp.join("tmux");
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let expected_prefix = super::agent_session_prefix(&repo, "feature");
         fs::write(
             &tmux,
@@ -1068,7 +1068,7 @@ exit 1
         config
             .tools
             .insert("opencode".to_string(), "opencode".to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
         paste_agent_prompt(&repo, &config, &session, 0, "hello\nworld").unwrap();
@@ -1144,7 +1144,7 @@ exit 1
         config
             .tools
             .insert("opencode".to_string(), "opencode".to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
         paste_agent_prompt(&repo, &config, &session, 0, "hello").unwrap();
@@ -1220,7 +1220,7 @@ exit 1
         config
             .tools
             .insert("opencode".to_string(), "opencode".to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
         paste_agent_prompt(&repo, &config, &session, 0, "hello").unwrap();
@@ -1289,7 +1289,7 @@ exit 1
         config
             .tools
             .insert("opencode".to_string(), "opencode".to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
         let port = start_fake_opencode_server(session.path.clone(), 200, Some(api_log.clone()), 4);
         save_runtime(
@@ -1362,7 +1362,7 @@ exit 0
         config
             .tools
             .insert("opencode".to_string(), "opencode".to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
         let result = ensure_agent_session(&repo, &config, &session, 0);
@@ -1418,7 +1418,7 @@ exit 0
         config
             .tools
             .insert("opencode".to_string(), "opencode".to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
         let result = ensure_agent_session(&repo, &config, &session, 0);
@@ -1482,7 +1482,7 @@ exit 0
         config
             .tools
             .insert("opencode".to_string(), "opencode".to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
         let result = ensure_agent_session(&repo, &config, &session, 0);
@@ -1554,7 +1554,7 @@ exit 0
         config
             .tools
             .insert("opencode".to_string(), "opencode".to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
         let result = attach_or_create_agent(&repo, &config, &session, 0);
@@ -1615,7 +1615,7 @@ exit 0
         config
             .tools
             .insert("opencode".to_string(), "opencode".to_string());
-        let repo = Repository { root: temp.clone() };
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
         attach_or_create_window(&repo, &config, &session, 0, TmuxWindow::LazyGit).unwrap();
