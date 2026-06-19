@@ -1,2 +1,2 @@
-[post-start]
+[pre-start]
 copy = "wt step copy-ignored"
