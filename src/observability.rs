@@ -527,18 +527,14 @@ fn ensure_schema_for_path(
     existed_before_open: bool,
 ) -> Result<(), String> {
     let initialized_paths = INITIALIZED_DB_PATHS.get_or_init(|| Mutex::new(BTreeSet::new()));
-    let already_initialized = existed_before_open
-        && initialized_paths
-            .lock()
-            .map(|paths| paths.contains(path))
-            .unwrap_or(false);
-    if already_initialized {
+    let mut initialized_paths = initialized_paths
+        .lock()
+        .map_err(|_| "schema initialization lock poisoned".to_string())?;
+    if existed_before_open && initialized_paths.contains(path) {
         return Ok(());
     }
     create_schema(conn)?;
-    if let Ok(mut paths) = initialized_paths.lock() {
-        paths.insert(path.to_path_buf());
-    }
+    initialized_paths.insert(path.to_path_buf());
     Ok(())
 }
 
