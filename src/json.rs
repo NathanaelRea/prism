@@ -1,76 +1,40 @@
 pub fn json_escape(value: &str) -> String {
-    let mut output = String::new();
-    for ch in value.chars() {
-        match ch {
-            '"' => output.push_str("\\\""),
-            '\\' => output.push_str("\\\\"),
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            other => output.push(other),
-        }
-    }
-    output
+    let encoded = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+    encoded
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(&encoded)
+        .to_string()
 }
 
 pub fn json_string_field(text: &str, key: &str) -> Option<String> {
-    let needle = format!("\"{key}\"");
-    let start = text.find(&needle)?;
-    let rest = &text[start + needle.len()..];
-    let colon = rest.find(':')?;
-    let value = rest[colon + 1..].trim_start();
-    if !value.starts_with('"') {
-        return None;
-    }
-    let mut output = String::new();
-    let mut escaped = false;
-    for ch in value[1..].chars() {
-        if escaped {
-            output.push(match ch {
-                'n' => '\n',
-                't' => '\t',
-                'r' => '\r',
-                '"' => '"',
-                '\\' => '\\',
-                other => other,
-            });
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if ch == '"' {
-            return Some(output);
-        } else {
-            output.push(ch);
-        }
-    }
-    None
+    json_field(text, key).and_then(|value| value.as_str().map(str::to_string))
 }
 
 pub fn json_u64_field(text: &str, key: &str) -> Option<u64> {
-    let needle = format!("\"{key}\"");
-    let start = text.find(&needle)?;
-    let rest = &text[start + needle.len()..];
-    let colon = rest.find(':')?;
-    let value = rest[colon + 1..].trim_start();
-    let digits = value
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect::<String>();
-    digits.parse().ok()
+    json_field(text, key).and_then(|value| value.as_u64())
 }
 
 pub fn json_bool_field(text: &str, key: &str) -> Option<bool> {
-    let needle = format!("\"{key}\"");
-    let start = text.find(&needle)?;
-    let rest = &text[start + needle.len()..];
-    let colon = rest.find(':')?;
-    let value = rest[colon + 1..].trim_start();
-    if value.starts_with("true") {
-        Some(true)
-    } else if value.starts_with("false") {
-        Some(false)
-    } else {
-        None
+    json_field(text, key).and_then(|value| value.as_bool())
+}
+
+fn json_field(text: &str, key: &str) -> Option<serde_json::Value> {
+    let value = serde_json::from_str::<serde_json::Value>(text).ok()?;
+    find_json_field(&value, key).cloned()
+}
+
+fn find_json_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
+    match value {
+        serde_json::Value::Object(object) => object.get(key).or_else(|| {
+            object
+                .values()
+                .find_map(|value| find_json_field(value, key))
+        }),
+        serde_json::Value::Array(values) => {
+            values.iter().find_map(|value| find_json_field(value, key))
+        }
+        _ => None,
     }
 }
 
@@ -80,6 +44,7 @@ pub fn json_array_object_count(text: &str, key: &str) -> Option<usize> {
     Some(array.matches('{').count())
 }
 
+#[cfg(test)]
 pub fn json_array_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let needle = format!("\"{key}\"");
     let start = text.find(&needle)?;
@@ -160,6 +125,8 @@ pub fn json_object_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn json_objects_in_array<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
     json_array_field(text, key)
         .map(json_top_level_objects)
@@ -207,29 +174,59 @@ pub fn json_top_level_objects(text: &str) -> Vec<&str> {
     objects
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn json_login_field(text: &str) -> Option<String> {
     json_string_field(text, "login")
         .or_else(|| json_string_field(text, "author"))
         .or_else(|| json_string_field(text, "user"))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn collect_json_string_fields(text: &str, key: &str, limit: usize) -> Vec<String> {
-    let needle = format!("\"{key}\"");
     let mut values = Vec::new();
-    let mut offset = 0;
-    while values.len() < limit {
-        let Some(relative) = text[offset..].find(&needle) else {
-            break;
-        };
-        let start = offset + relative;
-        if let Some(value) = json_string_field(&text[start..], key)
-            && !value.trim().is_empty()
-        {
-            values.push(value);
-        }
-        offset = start + needle.len();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        collect_json_string_values(&value, key, limit, &mut values);
     }
     values
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+fn collect_json_string_values(
+    value: &serde_json::Value,
+    key: &str,
+    limit: usize,
+    values: &mut Vec<String>,
+) {
+    if values.len() >= limit {
+        return;
+    }
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(value) = object.get(key).and_then(|value| value.as_str())
+                && !value.trim().is_empty()
+            {
+                values.push(value.to_string());
+            }
+            for value in object.values() {
+                collect_json_string_values(value, key, limit, values);
+                if values.len() >= limit {
+                    break;
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for value in items {
+                collect_json_string_values(value, key, limit, values);
+                if values.len() >= limit {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +248,15 @@ mod tests {
         assert_eq!(json_u64_field(raw, "number"), Some(42));
         assert_eq!(json_bool_field(raw, "isDraft"), Some(true));
         assert_eq!(json_array_object_count(raw, "comments"), Some(1));
+    }
+
+    #[test]
+    fn json_escape_strips_only_outer_quotes() {
+        let escaped = json_escape("\"");
+        let parsed = serde_json::from_str::<String>(&format!("\"{escaped}\"")).unwrap();
+
+        assert_eq!(escaped, "\\\"");
+        assert_eq!(parsed, "\"");
     }
 
     #[test]

@@ -15,6 +15,8 @@ pub struct Args {
 #[derive(Debug)]
 pub enum CommandKind {
     Tui,
+    Help,
+    Version,
     Doctor,
     Config,
     RunPlan(Option<PathBuf>),
@@ -101,14 +103,8 @@ impl Args {
                     }
                     break;
                 }
-                "-h" | "--help" => {
-                    print_help();
-                    std::process::exit(0);
-                }
-                "--version" => {
-                    println!("prism {}", env!("CARGO_PKG_VERSION"));
-                    std::process::exit(0);
-                }
+                "-h" | "--help" => command = CommandKind::Help,
+                "--version" => command = CommandKind::Version,
                 other => return Err(format!("unknown argument: {other}")),
             }
         }
@@ -123,8 +119,6 @@ impl Args {
     }
 }
 
-fn print_help() {
-    println!(
-        "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>"
-    );
+pub fn help_text() -> &'static str {
+    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>"
 }

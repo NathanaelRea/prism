@@ -1,10 +1,12 @@
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::process::{run_capture, run_status_inherited, split_command_words};
+use crate::process::{
+    run_capture, run_output, run_output_allow_failure, run_status_inherited, run_status_with_stdin,
+    split_command_words,
+};
 use crate::repo::Repository;
 use crate::session::Session;
 use crate::util::{safe_branch_filename, stable_hash};
@@ -383,18 +385,20 @@ fn ensure_window(
 }
 
 fn window_exists(config: &Config, name: &str, window: TmuxWindow) -> Result<bool, String> {
-    Command::new(config.tool("tmux"))
-        .env_remove("TMUX")
-        .args(["list-windows", "-t", name, "-F", "#{window_index}"])
-        .stderr(Stdio::piped())
-        .output()
-        .map(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .any(|line| line == window.index().to_string())
-        })
-        .map_err(|error| format!("tmux: {error}"))
+    run_output_allow_failure(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+        "list-windows",
+        "-t",
+        name,
+        "-F",
+        "#{window_index}",
+    ]))
+    .map(|output| {
+        output.status.success()
+            && output
+                .stdout
+                .lines()
+                .any(|line| line == window.index().to_string())
+    })
 }
 
 fn window_target(name: &str, window: TmuxWindow) -> String {
@@ -414,13 +418,12 @@ fn kill_session(config: &Config, name: &str) -> Result<(), String> {
 }
 
 fn session_exists(config: &Config, name: &str) -> Result<bool, String> {
-    Command::new(config.tool("tmux"))
-        .env_remove("TMUX")
-        .args(["has-session", "-t", name])
-        .stderr(Stdio::piped())
-        .output()
-        .map(|output| output.status.success())
-        .map_err(|error| format!("tmux: {error}"))
+    run_output_allow_failure(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+        "has-session",
+        "-t",
+        name,
+    ]))
+    .map(|output| output.status.success())
 }
 
 fn wait_for_agent_session_running(
@@ -476,14 +479,11 @@ fn pane_capture(config: &Config, name: &str) -> Option<String> {
 }
 
 fn run_tmux_status(command: &mut Command) -> Result<(), String> {
-    let output = command
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| format!("tmux: {error}"))?;
+    let output = run_output(command)?;
     if output.status.success() {
         return Ok(());
     }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stderr = output.stderr.trim().to_string();
     if stderr.is_empty() {
         Err(format!("tmux exited with {}", output.status))
     } else {
@@ -492,28 +492,7 @@ fn run_tmux_status(command: &mut Command) -> Result<(), String> {
 }
 
 fn run_tmux_status_with_stdin(command: &mut Command, stdin: &str) -> Result<(), String> {
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("tmux: {error}"))?;
-    if let Some(mut child_stdin) = child.stdin.take() {
-        child_stdin
-            .write_all(stdin.as_bytes())
-            .map_err(|error| format!("tmux: {error}"))?;
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("tmux: {error}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if stderr.is_empty() {
-        Err(format!("tmux exited with {}", output.status))
-    } else {
-        Err(stderr)
-    }
+    run_status_with_stdin(command, stdin)
 }
 
 fn tmux_missing_session_error(error: &str) -> bool {

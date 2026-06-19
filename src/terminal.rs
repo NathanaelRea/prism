@@ -2,7 +2,7 @@ use std::io::{self, ErrorKind, Write};
 use std::os::fd::RawFd;
 use std::process::{Command, Stdio};
 
-use crate::process::run_status;
+use crate::process::{run_status, run_status_inherited};
 
 pub const WNOHANG: i32 = 1;
 
@@ -35,7 +35,7 @@ impl RawTerminal {
 impl Drop for RawTerminal {
     fn drop(&mut self) {
         let _ = set_fd_flags(0, self.stdin_flags);
-        let _ = Command::new("stty").arg("sane").status();
+        let _ = run_status_inherited(Command::new("stty").arg("sane"));
         let _ = write_stdout("\x1b[?1049l\x1b[?25h");
     }
 }
@@ -74,11 +74,7 @@ pub fn terminal_size() -> (u16, u16) {
 }
 
 pub fn stdin_is_tty() -> bool {
-    Command::new("test")
-        .args(["-t", "0"])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    unsafe { libc::isatty(0) == 1 }
 }
 
 #[allow(dead_code)]

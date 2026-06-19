@@ -3,6 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use serde::Deserialize;
+
 use crate::agent::{PromptMode, agent_command_exists, builtin_prompt_mode, detected_agents};
 use crate::process::{command_exists, command_version, run_capture};
 use crate::repo::Repository;
@@ -94,6 +96,40 @@ pub struct Config {
     pub repo_config_path: PathBuf,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct RawConfig {
+    default_agent: Option<String>,
+    default_base: Option<String>,
+    plan_dir: Option<String>,
+    review_packet_dir: Option<String>,
+    worktree_command: Option<String>,
+    escape_key: Option<String>,
+    merge_method: Option<String>,
+    checks: Option<RawChecks>,
+    worktrees: Option<RawWorktrees>,
+    tools: Option<BTreeMap<String, String>>,
+    agents: Option<BTreeMap<String, RawAgentConfig>>,
+    prompt_templates: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawChecks {
+    pre_pr: Option<Vec<String>>,
+    pre_push: Option<Vec<String>>,
+    review_fix: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawWorktrees {
+    columns: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawAgentConfig {
+    command: Option<String>,
+    prompt_mode: Option<String>,
+}
+
 impl Config {
     pub fn load(repo: &Repository) -> Self {
         let user_path = prism_config_dir().join("config.toml");
@@ -144,86 +180,70 @@ impl Config {
         let Ok(text) = fs::read_to_string(path) else {
             return;
         };
-        let mut section = String::new();
-        for raw in text.lines() {
-            let line = raw.split('#').next().unwrap_or("").trim();
-            if line.is_empty() {
-                continue;
-            }
-            if line.starts_with('[') && line.ends_with(']') {
-                section = line.trim_matches(&['[', ']'][..]).to_string();
-                continue;
-            }
-            let Some((key, raw_value)) = line.split_once('=') else {
-                continue;
-            };
-            let key = key.trim();
-            let raw_value = raw_value.trim();
+        let Ok(raw) = toml::from_str::<RawConfig>(&text) else {
+            return;
+        };
+        self.apply_raw_config(raw);
+    }
 
-            if section == "checks" {
-                let Some(values) = parse_toml_string_array(raw_value) else {
-                    continue;
-                };
-                match key {
-                    "pre_pr" => self.checks.pre_pr = values,
-                    "pre_push" => self.checks.pre_push = values,
-                    "review_fix" => self.checks.review_fix = values,
-                    _ => {}
+    fn apply_raw_config(&mut self, raw: RawConfig) {
+        if let Some(value) = raw.default_agent {
+            self.default_agent = value;
+        }
+        if let Some(value) = raw.default_base {
+            self.default_base = Some(value);
+        }
+        if let Some(value) = raw.plan_dir {
+            self.plan_dir = value;
+        }
+        if let Some(value) = raw.review_packet_dir {
+            self.review_packet_dir = value;
+        }
+        if let Some(value) = raw.worktree_command {
+            self.worktree_command = value;
+        }
+        if let Some(value) = raw
+            .merge_method
+            .and_then(|value| MergeMethod::parse(&value))
+        {
+            self.merge_method = value;
+        }
+        if let Some(value) = raw.escape_key.and_then(|value| EscapeKey::parse(&value)) {
+            self.escape_key = value;
+        }
+        if let Some(checks) = raw.checks {
+            if let Some(values) = checks.pre_pr {
+                self.checks.pre_pr = values;
+            }
+            if let Some(values) = checks.pre_push {
+                self.checks.pre_push = values;
+            }
+            if let Some(values) = checks.review_fix {
+                self.checks.review_fix = values;
+            }
+        }
+        if let Some(worktrees) = raw.worktrees
+            && let Some(values) = worktrees.columns
+        {
+            self.worktree_columns = values;
+        }
+        if let Some(tools) = raw.tools {
+            self.tools.extend(tools);
+        }
+        if let Some(templates) = raw.prompt_templates {
+            self.prompt_templates.extend(templates);
+        }
+        if let Some(agents) = raw.agents {
+            for (name, agent) in agents {
+                if let Some(command) = agent.command {
+                    self.agent_commands.insert(name.clone(), command);
                 }
-                continue;
-            }
-
-            if section == "worktrees" {
-                if key == "columns"
-                    && let Some(values) = parse_toml_string_array(raw_value)
+                if let Some(mode) = agent
+                    .prompt_mode
+                    .and_then(|value| PromptMode::parse(&value))
                 {
-                    self.worktree_columns = values;
+                    self.agent_prompt_modes.insert(name, mode);
                 }
-                continue;
-            }
-
-            let Some(value) = parse_toml_string(raw_value) else {
-                continue;
-            };
-            if section == "prompt_templates" {
-                self.prompt_templates.insert(key.to_string(), value);
-                continue;
-            }
-            if section == "tools" {
-                self.tools.insert(key.to_string(), value);
-                continue;
-            }
-            if let Some(agent) = section.strip_prefix("agents.") {
-                match key {
-                    "command" => {
-                        self.agent_commands.insert(agent.to_string(), value);
-                    }
-                    "prompt_mode" => {
-                        if let Some(mode) = PromptMode::parse(&value) {
-                            self.agent_prompt_modes.insert(agent.to_string(), mode);
-                        }
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-            match key {
-                "default_agent" => self.default_agent = value,
-                "default_base" => self.default_base = Some(value),
-                "plan_dir" => self.plan_dir = value,
-                "review_packet_dir" => self.review_packet_dir = value,
-                "worktree_command" => self.worktree_command = value,
-                "merge_method" => {
-                    if let Some(method) = MergeMethod::parse(&value) {
-                        self.merge_method = method;
-                    }
-                }
-                "escape_key" => {
-                    if let Some(key) = EscapeKey::parse(&value) {
-                        self.escape_key = key;
-                    }
-                }
-                _ => {}
             }
         }
     }
@@ -532,110 +552,9 @@ fn save_user_default_agent(config: &Config, selected: &str) -> Result<(), String
     fs::write(&config.user_path, text).map_err(|error| format!("write config: {error}"))
 }
 
-pub fn parse_toml_string(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.starts_with('"') && value.ends_with('"') && value.len() >= 2 {
-        parse_toml_basic_string(&value[1..value.len() - 1])
-    } else if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
-        Some(value[1..value.len() - 1].to_string())
-    } else {
-        Some(value.to_string())
-    }
-}
-
-fn parse_toml_basic_string(value: &str) -> Option<String> {
-    let mut out = String::new();
-    let mut chars = value.chars();
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
-            continue;
-        }
-        let escaped = match chars.next()? {
-            'b' => '\x08',
-            't' => '\t',
-            'n' => '\n',
-            'f' => '\x0c',
-            'r' => '\r',
-            '"' => '"',
-            '\\' => '\\',
-            _ => return None,
-        };
-        out.push(escaped);
-    }
-    Some(out)
-}
-
-pub fn parse_toml_string_array(value: &str) -> Option<Vec<String>> {
-    let value = value.trim();
-    if !value.starts_with('[') || !value.ends_with(']') {
-        return None;
-    }
-    let inner = &value[1..value.len() - 1];
-    let mut values = Vec::new();
-    let mut current = String::new();
-    let mut quote = None;
-    let mut escaped = false;
-    for ch in inner.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-            continue;
-        }
-        if let Some(active) = quote {
-            if ch == active {
-                quote = None;
-            } else {
-                current.push(ch);
-            }
-            continue;
-        }
-        match ch {
-            '\'' | '"' => quote = Some(ch),
-            ',' => {
-                if !current.trim().is_empty() {
-                    values.push(current.trim().to_string());
-                    current.clear();
-                }
-            }
-            ch => current.push(ch),
-        }
-    }
-    if !current.trim().is_empty() {
-        values.push(current.trim().to_string());
-    }
-    Some(values)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_toml_string_array() {
-        let values = parse_toml_string_array(r#"["cargo test", 'cargo fmt --check']"#).unwrap();
-        assert_eq!(values, vec!["cargo test", "cargo fmt --check"]);
-    }
-
-    #[test]
-    fn parses_toml_string_escapes_once() {
-        assert_eq!(
-            parse_toml_string(r#""line\nnext""#),
-            Some("line\nnext".to_string())
-        );
-        assert_eq!(
-            parse_toml_string(r#""literal\\n""#),
-            Some(r#"literal\n"#.to_string())
-        );
-        assert_eq!(
-            parse_toml_string(r#""carriage\rreturn""#),
-            Some("carriage\rreturn".to_string())
-        );
-    }
 
     #[test]
     fn parses_escape_key() {
@@ -708,6 +627,58 @@ mod tests {
         config.apply_file(&path);
 
         assert_eq!(config.merge_method, MergeMethod::Merge);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn config_toml_supports_comments_escaped_strings_arrays_and_agent_tables() {
+        let path = std::env::temp_dir().join(format!(
+            "prism-config-structured-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            r#"
+# top-level comment
+default_agent = "opencode"
+default_base = "release/main"
+review_packet_dir = ".agent/review \"packets\""
+escape_key = "ctrl-space"
+
+[checks]
+pre_pr = ["cargo test", "printf \"done\""] # trailing comment
+
+[worktrees]
+columns = ["url", "ci.status"]
+
+[tools]
+gh = "/opt/tools/gh"
+
+[agents.opencode]
+command = "opencode run --format json"
+prompt_mode = "argument"
+
+[prompt_templates]
+review = "fix\nreview"
+"#,
+        )
+        .unwrap();
+        let mut config = Config::defaults(PathBuf::from("/tmp/user.toml"), path.clone());
+
+        config.apply_file(&path);
+
+        assert_eq!(config.default_base.as_deref(), Some("release/main"));
+        assert_eq!(config.review_packet_dir, ".agent/review \"packets\"");
+        assert_eq!(config.escape_key, EscapeKey::CtrlSpace);
+        assert_eq!(config.checks.pre_pr, vec!["cargo test", "printf \"done\""]);
+        assert_eq!(config.worktree_columns, vec!["url", "ci.status"]);
+        assert_eq!(config.tool("gh"), "/opt/tools/gh");
+        assert_eq!(config.prompt_template("review"), Some("fix\nreview"));
 
         let _ = fs::remove_file(path);
     }
