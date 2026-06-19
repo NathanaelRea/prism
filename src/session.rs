@@ -13,6 +13,7 @@ use crate::git::git_status_label;
 use crate::github::{PrCache, load_pr_cache};
 use crate::json::json_string_field;
 use crate::observability::{self, LogLevel};
+use crate::opencode::OpencodeStatus;
 use crate::process::run_capture;
 use crate::repo::Repository;
 use crate::util::{safe_branch_filename, truncate};
@@ -32,6 +33,7 @@ pub struct Session {
     pub agent: Option<AgentProcess>,
     pub agent_output: VecDeque<String>,
     pub agent_state: AgentState,
+    pub opencode_status: Option<OpencodeStatus>,
     pub pr: PrCache,
     pub wt_columns: BTreeMap<String, String>,
     pub unseen_comments: bool,
@@ -131,6 +133,7 @@ fn build_session(repo: &Repository, path: PathBuf, branch: String, config: &Conf
         agent: None,
         agent_output: VecDeque::new(),
         agent_state,
+        opencode_status: None,
         pr,
         wt_columns: BTreeMap::new(),
         unseen_comments: false,
@@ -185,6 +188,11 @@ pub fn remove_session_db_records(repo: &Repository, branch: &str) -> Result<(), 
             .map_err(|error| format!("remove PR details cache: {error}"))?;
             conn.execute("delete from agent_state where branch = ?1", params![branch])
                 .map_err(|error| format!("remove process state: {error}"))?;
+            conn.execute(
+                "delete from opencode_runtime where branch = ?1",
+                params![branch],
+            )
+            .map_err(|error| format!("remove opencode runtime: {error}"))?;
             conn.execute(
                 "delete from hidden_session where branch = ?1",
                 params![branch],
@@ -366,6 +374,7 @@ exit 0
         let mut permissions = fs::metadata(&git).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&git, permissions).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
 
         let mut config = test_config();
         config
@@ -391,6 +400,9 @@ exit 0
             plan_dir: "plans".to_string(),
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
+            opencode_port_base: 41_000,
+            opencode_port_span: 1_000,
+            opencode_shutdown_owned_servers: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             checks: Checks::default(),

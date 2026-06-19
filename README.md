@@ -56,6 +56,7 @@ Common keys:
 - `A` adds a repository by path from the repos panel.
 - `R` edits repository order, key bindings, and tracked repositories.
 - `c` creates a worktree session from the repos panel.
+- `x` aborts the selected OpenCode session from the worktrees panel.
 - `e` edits the Prism repository config from the repos panel and reloads after save.
 - `/` filters the focused panel.
 - `D` confirms and deletes the selected non-default worktree/session.
@@ -92,6 +93,9 @@ Set `default_base` in the user config or override it per repository in
 ```toml
 default_base = "develop"
 merge_method = "squash"
+opencode_port_base = 41000
+opencode_port_span = 1000
+opencode_shutdown_owned_servers = false
 
 [worktrees]
 columns = ["url", "vars.localdev", "ci"]
@@ -99,3 +103,9 @@ columns = ["url", "vars.localdev", "ci"]
 [prompt_templates]
 review_fix = "Here are review comments on PR {pr_number}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n{comments}"
 ```
+
+Prism manages one local OpenCode server per worktree session. `opencode_port_base`
+and `opencode_port_span` define the deterministic local port range used for
+those servers. By default Prism keeps servers warm after the TUI exits; set
+`opencode_shutdown_owned_servers = true` to send SIGTERM to OpenCode servers
+that Prism spawned during the session.

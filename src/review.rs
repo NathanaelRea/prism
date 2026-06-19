@@ -213,6 +213,7 @@ mod tests {
             agent: None,
             agent_output: VecDeque::new(),
             agent_state: AgentState::Idle,
+            opencode_status: None,
             pr: PrCache {
                 summary: Some(PrSummary {
                     number: 123,
@@ -246,6 +247,9 @@ mod tests {
             plan_dir: "plans".to_string(),
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
+            opencode_port_base: 41_000,
+            opencode_port_span: 1_000,
+            opencode_shutdown_owned_servers: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: crate::config::MergeMethod::Squash,
             checks: Checks::default(),

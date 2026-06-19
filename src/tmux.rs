@@ -3,6 +3,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
+use crate::opencode::{OpencodeRuntime, ensure_opencode_session, load_runtime, submit_prompt};
 use crate::process::{
     run_capture, run_output, run_output_allow_failure, run_status_inherited, run_status_with_stdin,
     split_command_words,
@@ -92,9 +93,10 @@ pub fn ensure_agent_session(
     generation: u64,
 ) -> Result<bool, String> {
     let name = agent_session_name(repo, &session.branch, generation);
+    let runtime = opencode_runtime_for_session(repo, config, session)?;
     if session_exists(config, &name)? {
         if !configure_agent_session(config, &name)? {
-            create_detached_agent_session(config, session, &name)?;
+            create_detached_agent_session(repo, config, session, &name, runtime.as_ref())?;
             configure_agent_session(config, &name)?;
             ensure_companion_windows(config, session, &name)?;
             return Ok(wait_for_agent_session_running(
@@ -117,7 +119,7 @@ pub fn ensure_agent_session(
         }
         kill_session(config, &name)?;
     }
-    create_detached_agent_session(config, session, &name)?;
+    create_detached_agent_session(repo, config, session, &name, runtime.as_ref())?;
     configure_agent_session(config, &name)?;
     ensure_companion_windows(config, session, &name)?;
     Ok(wait_for_agent_session_running(
@@ -137,9 +139,37 @@ pub fn paste_agent_prompt(
     prompt: &str,
 ) -> Result<(), String> {
     let name = agent_session_name(repo, &session.branch, generation);
+    if config.default_agent == "opencode" && !config.is_default_branch(&session.branch) {
+        let runtime = ensure_opencode_session(repo, config, &session.branch, &session.path)
+            .map_err(|error| format!("prepare opencode runtime for prompt: {error}"))?;
+        let session_id = runtime
+            .opencode_session_id
+            .as_deref()
+            .ok_or_else(|| "OpenCode session ID is not available".to_string())?;
+        match submit_prompt(&runtime.server_url, session_id, prompt) {
+            Ok(()) => return Ok(()),
+            Err(api_error) => {
+                if !ensure_agent_session(repo, config, session, generation)? {
+                    return Err(format!(
+                        "submit opencode prompt through API failed: {api_error}; agent session did not become ready for paste fallback"
+                    ));
+                }
+                paste_prompt_into_tmux(config, &name, prompt).map_err(|paste_error| {
+                    format!(
+                        "submit opencode prompt through API failed: {api_error}; paste fallback failed: {paste_error}"
+                    )
+                })?;
+                return Ok(());
+            }
+        }
+    }
     if !ensure_agent_session(repo, config, session, generation)? {
         return Err("agent session did not become ready".to_string());
     }
+    paste_prompt_into_tmux(config, &name, prompt)
+}
+
+fn paste_prompt_into_tmux(config: &Config, name: &str, prompt: &str) -> Result<(), String> {
     if !wait_for_agent_input_ready(config, &name, AGENT_INPUT_READY_WAIT) {
         return Err("agent prompt did not become ready".to_string());
     }
@@ -233,11 +263,13 @@ fn attach_session(config: &Config, name: &str) -> Result<(), String> {
 }
 
 fn create_detached_agent_session(
+    repo: &Repository,
     config: &Config,
     session: &Session,
     name: &str,
+    runtime: Option<&OpencodeRuntime>,
 ) -> Result<(), String> {
-    let command = agent_shell_command(config)?;
+    let command = agent_shell_command(repo, config, session, runtime)?;
     run_tmux_status(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
@@ -501,8 +533,13 @@ fn tmux_missing_session_error(error: &str) -> bool {
         || error.contains("can't find pane")
 }
 
-fn agent_shell_command(config: &Config) -> Result<String, String> {
-    let argv = interactive_agent_argv(config);
+fn agent_shell_command(
+    repo: &Repository,
+    config: &Config,
+    session: &Session,
+    runtime: Option<&OpencodeRuntime>,
+) -> Result<String, String> {
+    let argv = interactive_agent_argv(repo, config, session, runtime);
     if argv.is_empty() {
         return Err(format!(
             "agent '{}' has an empty command",
@@ -522,12 +559,45 @@ fn agent_shell_command(config: &Config) -> Result<String, String> {
         .join(" "))
 }
 
-fn interactive_agent_argv(config: &Config) -> Vec<String> {
+fn interactive_agent_argv(
+    repo: &Repository,
+    config: &Config,
+    session: &Session,
+    runtime: Option<&OpencodeRuntime>,
+) -> Vec<String> {
     if config.default_agent == "opencode" {
+        if let Some(runtime) = runtime
+            .cloned()
+            .or_else(|| usable_opencode_runtime(repo, session))
+            && let Some(session_id) = runtime.opencode_session_id
+        {
+            return vec![
+                config.tool("opencode"),
+                "attach".to_string(),
+                runtime.server_url,
+                "--dir".to_string(),
+                session.path.display().to_string(),
+                "--session".to_string(),
+                session_id,
+            ];
+        }
         vec![config.tool("opencode")]
     } else {
         split_command_words(&config.agent_command(&config.default_agent))
     }
+}
+
+fn opencode_runtime_for_session(
+    repo: &Repository,
+    config: &Config,
+    session: &Session,
+) -> Result<Option<OpencodeRuntime>, String> {
+    if config.default_agent != "opencode" || config.is_default_branch(&session.branch) {
+        return Ok(None);
+    }
+    ensure_opencode_session(repo, config, &session.branch, &session.path)
+        .map(Some)
+        .map_err(|error| format!("prepare opencode runtime: {error}"))
 }
 
 fn pane_current_command(config: &Config, name: &str) -> Option<String> {
@@ -544,14 +614,32 @@ fn pane_current_command(config: &Config, name: &str) -> Option<String> {
 }
 
 fn pane_command_matches_agent(config: &Config, pane_command: &str) -> bool {
-    let Some(expected) = interactive_agent_argv(config).first().cloned() else {
-        return false;
+    let expected = if config.default_agent == "opencode" {
+        config.tool("opencode")
+    } else {
+        let Some(expected) = split_command_words(&config.agent_command(&config.default_agent))
+            .first()
+            .cloned()
+        else {
+            return false;
+        };
+        expected
     };
     let expected = Path::new(&expected)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(&expected);
     pane_command == expected
+}
+
+fn usable_opencode_runtime(repo: &Repository, session: &Session) -> Option<OpencodeRuntime> {
+    load_runtime(repo, &session.branch, &session.path)
+        .ok()
+        .flatten()
+        .filter(|runtime| {
+            !runtime.server_url.is_empty()
+                && runtime.worktree_path == session.path.display().to_string()
+        })
 }
 
 fn shell_quote(value: &str) -> String {
@@ -584,13 +672,17 @@ fn safe_tmux_name(value: &str) -> String {
 mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::agent::AgentState;
     use crate::config::{Checks, Config, EscapeKey};
     use crate::github::PrCache;
+    use crate::opencode::{OpencodeRuntime, save_runtime, server_url};
     use crate::repo::Repository;
     use crate::session::Session;
 
@@ -659,7 +751,7 @@ exit 1
 
         attach_or_create_plan_mode(&config, &temp).unwrap();
 
-        let commands = fs::read_to_string(&log).unwrap();
+        let commands = fs::read_to_string(&log).unwrap_or_default();
         assert!(commands.contains("new-session -d -s prism-plan-"));
         assert!(commands.contains("-n plan"));
         assert!(commands.contains("--repo"));
@@ -679,6 +771,9 @@ exit 1
             plan_dir: "plans".to_string(),
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
+            opencode_port_base: 41_000,
+            opencode_port_span: 1_000,
+            opencode_shutdown_owned_servers: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: crate::config::MergeMethod::Squash,
             checks: Checks::default(),
@@ -694,9 +789,158 @@ exit 1
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         };
 
-        let error = super::agent_shell_command(&config).unwrap_err();
+        let repo = Repository {
+            root: PathBuf::from("/repo"),
+        };
+        let session = test_session(unique_temp_dir("prism-tmux-placeholder-test"), "feature");
+
+        let error = super::agent_shell_command(&repo, &config, &session, None).unwrap_err();
 
         assert!(error.contains("prompt placeholder"));
+    }
+
+    #[test]
+    fn opencode_runtime_uses_attach_command_for_agent_window() {
+        let temp = unique_temp_dir("prism-tmux-opencode-attach-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  has-session)
+    exit 1
+    ;;
+  new-session|set-option)
+    exit 0
+    ;;
+  display-message)
+    echo opencode
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        config
+            .tools
+            .insert("opencode".to_string(), "/usr/bin/opencode".to_string());
+        let repo = Repository { root: temp.clone() };
+        let session = test_session(temp.join("worktree"), "feature");
+        save_runtime(
+            &repo,
+            &OpencodeRuntime {
+                repo_root: temp.display().to_string(),
+                branch: "feature".to_string(),
+                worktree_path: session.path.display().to_string(),
+                server_port: 41_234,
+                server_url: server_url(41_234),
+                server_pid: Some(123),
+                opencode_session_id: Some("ses_123".to_string()),
+                generation: 1,
+                updated_unix_ms: 42,
+            },
+        )
+        .unwrap();
+
+        let result = ensure_agent_session(&repo, &config, &session, 0);
+
+        assert_eq!(result, Ok(false));
+        let commands = fs::read_to_string(&log).unwrap_or_default();
+        assert!(commands.contains("/usr/bin/opencode attach http://127.0.0.1:41234"));
+        assert!(commands.contains("--dir"));
+        assert!(commands.contains(&session.path.display().to_string()));
+        assert!(commands.contains("--session ses_123"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn ensure_agent_session_resolves_opencode_session_before_tmux_attach() {
+        let temp = unique_temp_dir("prism-tmux-opencode-resolve-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  has-session)
+    exit 1
+    ;;
+  new-session|set-option)
+    exit 0
+    ;;
+  display-message)
+    echo opencode
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+
+        let mut config = test_config();
+        config.default_base = Some("main".to_string());
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        config
+            .tools
+            .insert("opencode".to_string(), "/usr/bin/opencode".to_string());
+        let repo = Repository { root: temp.clone() };
+        let session = test_session(temp.join("worktree"), "feature");
+        let port = start_fake_opencode_server(session.path.clone(), 200, None, 4);
+        save_runtime(
+            &repo,
+            &OpencodeRuntime {
+                repo_root: temp.display().to_string(),
+                branch: "feature".to_string(),
+                worktree_path: session.path.display().to_string(),
+                server_port: port,
+                server_url: server_url(port),
+                server_pid: Some(123),
+                opencode_session_id: None,
+                generation: 1,
+                updated_unix_ms: 42,
+            },
+        )
+        .unwrap();
+
+        let result = ensure_agent_session(&repo, &config, &session, 0);
+
+        assert_eq!(result, Ok(false));
+        let runtime = crate::opencode::load_runtime(&repo, "feature", &session.path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(runtime.opencode_session_id.as_deref(), Some("ses_123"));
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(commands.contains(&format!("/usr/bin/opencode attach http://127.0.0.1:{port}")));
+        assert!(commands.contains("--session ses_123"));
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -707,6 +951,9 @@ exit 1
             plan_dir: "plans".to_string(),
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
+            opencode_port_base: 41_000,
+            opencode_port_span: 1_000,
+            opencode_shutdown_owned_servers: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: crate::config::MergeMethod::Squash,
             checks: Checks::default(),
@@ -982,6 +1229,95 @@ exit 1
         assert_eq!(fs::read_to_string(&capture_count).unwrap().trim(), "3");
         let commands = fs::read_to_string(&log).unwrap();
         assert!(commands.find("capture-pane").unwrap() < commands.find("load-buffer").unwrap());
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn paste_agent_prompt_uses_opencode_api_when_runtime_exists() {
+        let temp = unique_temp_dir("prism-tmux-api-paste-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let prompt_file = temp.join("prompt.txt");
+        let api_log = temp.join("api.log");
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  has-session|set-option|move-window|rename-window|new-window)
+    exit 0
+    ;;
+  list-windows)
+    exit 0
+    ;;
+  display-message)
+    echo opencode
+    exit 0
+    ;;
+  capture-pane)
+    echo 'Starting OpenCode...'
+    exit 0
+    ;;
+  load-buffer)
+    cat > '{}'
+    exit 0
+    ;;
+  paste-buffer)
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+                log.display(),
+                prompt_file.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+
+        let mut config = test_config();
+        config.default_base = Some("main".to_string());
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        config
+            .tools
+            .insert("opencode".to_string(), "opencode".to_string());
+        let repo = Repository { root: temp.clone() };
+        let session = test_session(temp.join("worktree"), "feature");
+        let port = start_fake_opencode_server(session.path.clone(), 200, Some(api_log.clone()), 4);
+        save_runtime(
+            &repo,
+            &OpencodeRuntime {
+                repo_root: temp.display().to_string(),
+                branch: "feature".to_string(),
+                worktree_path: session.path.display().to_string(),
+                server_port: port,
+                server_url: server_url(port),
+                server_pid: Some(123),
+                opencode_session_id: Some("ses_123".to_string()),
+                generation: 1,
+                updated_unix_ms: 42,
+            },
+        )
+        .unwrap();
+
+        paste_agent_prompt(&repo, &config, &session, 0, "hello").unwrap();
+
+        assert!(!prompt_file.exists());
+        let api_requests = fs::read_to_string(&api_log).unwrap();
+        assert!(api_requests.contains("POST /tui/append-prompt"));
+        assert!(api_requests.contains("POST /tui/submit-prompt"));
+        let commands = fs::read_to_string(&log).unwrap_or_default();
+        assert!(!commands.contains("capture-pane"));
+        assert!(!commands.contains("load-buffer"));
+        assert!(!commands.contains("paste-buffer"));
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -1313,6 +1649,7 @@ exit 0
             agent: None,
             agent_output: VecDeque::new(),
             agent_state: AgentState::Idle,
+            opencode_status: None,
             pr: PrCache::default(),
             wt_columns: BTreeMap::new(),
             unseen_comments: false,
@@ -1322,10 +1659,13 @@ exit 0
     fn test_config() -> Config {
         Config {
             default_agent: "opencode".to_string(),
-            default_base: None,
+            default_base: Some("feature".to_string()),
             plan_dir: "plans".to_string(),
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
+            opencode_port_base: 41_000,
+            opencode_port_span: 1_000,
+            opencode_shutdown_owned_servers: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: crate::config::MergeMethod::Squash,
             checks: Checks::default(),
@@ -1337,6 +1677,88 @@ exit 0
             user_path: PathBuf::from("/tmp/user.toml"),
             repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
         }
+    }
+
+    fn start_fake_opencode_server(
+        worktree: PathBuf,
+        append_status: u16,
+        request_log: Option<PathBuf>,
+        request_limit: usize,
+    ) -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        thread::spawn(move || {
+            for stream in listener.incoming().take(request_limit).flatten() {
+                handle_fake_opencode_request(
+                    stream,
+                    &worktree,
+                    append_status,
+                    request_log.as_ref(),
+                );
+            }
+        });
+        port
+    }
+
+    fn handle_fake_opencode_request(
+        mut stream: TcpStream,
+        worktree: &PathBuf,
+        append_status: u16,
+        request_log: Option<&PathBuf>,
+    ) {
+        let mut reader = BufReader::new(&mut stream);
+        let mut request_line = String::new();
+        if reader.read_line(&mut request_line).is_err() || request_line.trim().is_empty() {
+            return;
+        }
+        let mut content_length = 0_usize;
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() || line == "\r\n" || line == "\n" {
+                break;
+            }
+            if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                content_length = value.trim().parse().unwrap_or_default();
+            }
+        }
+        if content_length > 0 {
+            let mut body = vec![0; content_length];
+            let _ = reader.read_exact(&mut body);
+        }
+        drop(reader);
+
+        if let Some(path) = request_log {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .unwrap();
+            let _ = writeln!(file, "{}", request_line.trim_end());
+        }
+
+        let session = format!(
+            r#"{{"id":"ses_123","directory":"{}","title":"feature"}}"#,
+            worktree.display()
+        );
+        let (status, body) = if request_line.starts_with("GET /global/health ") {
+            (200, "{}".to_string())
+        } else if request_line.starts_with("GET /session/ses_123 ") {
+            (200, session)
+        } else if request_line.starts_with("GET /session ") {
+            (200, format!(r#"{{"data":[{session}]}}"#))
+        } else if request_line.starts_with("POST /tui/append-prompt ") {
+            (append_status, "{}".to_string())
+        } else if request_line.starts_with("POST /tui/submit-prompt ") {
+            (200, "{}".to_string())
+        } else {
+            (404, "{}".to_string())
+        };
+        let reason = if status == 200 { "OK" } else { "ERROR" };
+        let response = format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

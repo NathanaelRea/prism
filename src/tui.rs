@@ -8,6 +8,7 @@ use crate::agent::AgentState;
 use crate::config::Config;
 use crate::github::{PrCache, PrSummary};
 use crate::input::{Key, KeyInput};
+use crate::opencode::{OpencodeEvent, OpencodeStatus};
 use crate::repo::Repository;
 use crate::session::{Session, append_runtime_log};
 use crate::terminal::{RawTerminal, stdin_is_tty, terminal_size, write_stdout};
@@ -36,6 +37,13 @@ pub struct Tui {
     pub(crate) wt_poll_rx: Receiver<WtPollResult>,
     pub(crate) default_branch_poll_tx: Sender<DefaultBranchPollResult>,
     pub(crate) default_branch_poll_rx: Receiver<DefaultBranchPollResult>,
+    pub(crate) opencode_poll_tx: Sender<OpencodePollResult>,
+    pub(crate) opencode_poll_rx: Receiver<OpencodePollResult>,
+    pub(crate) opencode_polls_in_flight: BTreeSet<OpencodePollKey>,
+    pub(crate) opencode_last_polled: BTreeMap<OpencodePollKey, Instant>,
+    pub(crate) opencode_event_tx: Sender<OpencodeEventResult>,
+    pub(crate) opencode_event_rx: Receiver<OpencodeEventResult>,
+    pub(crate) opencode_sse_servers: BTreeSet<String>,
     pub(crate) repo_filter: String,
     pub(crate) worktree_filter: String,
     pub(crate) leader_hint: Option<LeaderHint>,
@@ -151,12 +159,31 @@ pub(crate) struct DefaultBranchPollResult {
     pub status_label: Result<String, String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct OpencodePollKey {
+    pub repo_index: usize,
+    pub branch: String,
+    pub path: PathBuf,
+}
+
+pub(crate) struct OpencodePollResult {
+    pub key: OpencodePollKey,
+    pub status: Result<OpencodeStatus, String>,
+}
+
+pub(crate) struct OpencodeEventResult {
+    pub server_url: String,
+    pub event: Result<OpencodeEvent, String>,
+}
+
 impl Tui {
     pub fn new(repos: Vec<ManagedRepo>, current_repo: usize, sessions: Vec<Session>) -> Self {
         let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
         let (tmux_warmup_tx, tmux_warmup_rx) = mpsc::channel();
         let (wt_poll_tx, wt_poll_rx) = mpsc::channel();
         let (default_branch_poll_tx, default_branch_poll_rx) = mpsc::channel();
+        let (opencode_poll_tx, opencode_poll_rx) = mpsc::channel();
+        let (opencode_event_tx, opencode_event_rx) = mpsc::channel();
         let current_repo = current_repo.min(repos.len().saturating_sub(1));
         let fallback_repo = Repository {
             root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -190,6 +217,13 @@ impl Tui {
             wt_poll_rx,
             default_branch_poll_tx,
             default_branch_poll_rx,
+            opencode_poll_tx,
+            opencode_poll_rx,
+            opencode_polls_in_flight: BTreeSet::new(),
+            opencode_last_polled: BTreeMap::new(),
+            opencode_event_tx,
+            opencode_event_rx,
+            opencode_sse_servers: BTreeSet::new(),
             repo_filter: String::new(),
             worktree_filter: String::new(),
             leader_hint: None,
@@ -246,6 +280,8 @@ impl Tui {
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
         self.start_default_branch_status_poll(true);
+        self.start_opencode_status_poll(true);
+        self.start_opencode_event_listeners();
         self.draw()?;
         if self.repos.is_empty() {
             match self.add_repository() {
@@ -264,8 +300,12 @@ impl Tui {
             let tmux_changed = self.poll_tmux_agent_warmup();
             let wt_changed = self.poll_wt_columns();
             let default_branch_changed = self.poll_default_branch_status();
+            let opencode_changed = self.poll_opencode_status();
+            let opencode_event_changed = self.poll_opencode_events();
             let prs_changed = self.poll_pull_requests(false);
             self.start_default_branch_status_poll(false);
+            self.start_opencode_status_poll(false);
+            self.start_opencode_event_listeners();
             let status_changed = self.expire_status_message();
             let current_size = terminal_size();
             let resized = current_size != last_size;
@@ -276,6 +316,8 @@ impl Tui {
                 || tmux_changed
                 || wt_changed
                 || default_branch_changed
+                || opencode_changed
+                || opencode_event_changed
                 || prs_changed
                 || status_changed
                 || resized
@@ -430,6 +472,8 @@ impl Tui {
                         self.start_tmux_agent_warmup();
                         self.start_wt_column_poll();
                         self.start_default_branch_status_poll(true);
+                        self.start_opencode_status_poll(true);
+                        self.start_opencode_event_listeners();
                         self.poll_pull_requests(true);
                     }
                     Key::RepoShortcut(key) => {
@@ -497,6 +541,15 @@ impl Tui {
                             Err(error) => self.show_error("create session failed", &error)?,
                         }
                     }
+                    Key::AbortOpencode => {
+                        self.clear_leader_hint();
+                        pending_g = false;
+                        if self.focused_panel != PanelFocus::Worktrees {
+                            self.show_message("focus worktrees to abort an OpenCode session")?;
+                        } else if let Err(error) = self.abort_selected_opencode_session() {
+                            self.show_error("abort failed", &error)?;
+                        }
+                    }
                     Key::AddRepo => {
                         self.clear_leader_hint();
                         pending_g = false;
@@ -552,6 +605,7 @@ impl Tui {
             }
             self.draw()?;
         }
+        self.shutdown_owned_opencode_servers();
         Ok(())
     }
 
@@ -626,6 +680,7 @@ impl Tui {
             "A            add repository",
             "R            edit repositories/order/keys/remove",
             "c            create worktree session in selected repo",
+            "x            worktrees: abort selected OpenCode session",
             "e            repos: edit Prism repo config, then reload",
             "/            search/filter focused panel",
             "?            show keybindings; / filters this dialog",
@@ -1769,6 +1824,7 @@ mod tests {
             agent: None,
             agent_output: VecDeque::new(),
             agent_state: AgentState::Idle,
+            opencode_status: None,
             pr: PrCache::default(),
             wt_columns: BTreeMap::new(),
             unseen_comments: false,
@@ -1782,6 +1838,9 @@ mod tests {
             plan_dir: "plans".to_string(),
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
+            opencode_port_base: 41_000,
+            opencode_port_span: 1_000,
+            opencode_shutdown_owned_servers: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             checks: Checks::default(),

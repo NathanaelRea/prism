@@ -1351,10 +1351,7 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
-    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn pr_json_parser_reads_summary_details_and_missing_fields() {
@@ -1383,13 +1380,8 @@ mod tests {
 
     #[test]
     fn pr_cache_round_trips_details() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let temp = unique_temp_dir("prism-pr-details-cache-test");
         fs::create_dir_all(&temp).unwrap();
-        let previous_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", temp.join("config"));
-        }
         let repo = Repository { root: temp.clone() };
         let summary = PrSummary {
             number: 42,
@@ -1451,15 +1443,6 @@ mod tests {
         assert_eq!(loaded_details.files, vec!["src/main.rs"]);
         assert_eq!(loaded_details.failing_checks, vec!["test"]);
 
-        if let Some(value) = previous_xdg_config_home {
-            unsafe {
-                std::env::set_var("XDG_CONFIG_HOME", value);
-            }
-        } else {
-            unsafe {
-                std::env::remove_var("XDG_CONFIG_HOME");
-            }
-        }
         let _ = fs::remove_dir_all(prism_dir);
         let _ = fs::remove_dir_all(temp);
     }
@@ -1694,6 +1677,9 @@ JSON
             plan_dir: "plans".to_string(),
             review_packet_dir: ".agent/review".to_string(),
             worktree_command: "wt".to_string(),
+            opencode_port_base: 41_000,
+            opencode_port_span: 1_000,
+            opencode_shutdown_owned_servers: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: crate::config::MergeMethod::Squash,
             checks: Checks::default(),

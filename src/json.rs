@@ -44,7 +44,6 @@ pub fn json_array_object_count(text: &str, key: &str) -> Option<usize> {
     Some(array.matches('{').count())
 }
 
-#[cfg(test)]
 pub fn json_array_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let needle = format!("\"{key}\"");
     let start = text.find(&needle)?;
@@ -125,8 +124,6 @@ pub fn json_object_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
 pub fn json_objects_in_array<'a>(text: &'a str, key: &str) -> Vec<&'a str> {
     json_array_field(text, key)
         .map(json_top_level_objects)

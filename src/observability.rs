@@ -894,6 +894,22 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
           updated_unix_ms integer not null
         );
 
+        create table if not exists opencode_runtime (
+          repo_root text not null,
+          branch text not null,
+          worktree_path text not null,
+          server_port integer not null,
+          server_url text not null,
+          server_pid integer,
+          opencode_session_id text,
+          generation integer not null,
+          updated_unix_ms integer not null,
+          primary key (repo_root, branch, worktree_path)
+        );
+
+        create index if not exists opencode_runtime_branch_idx
+          on opencode_runtime(repo_root, branch);
+
         create table if not exists pr_cache (
           branch text primary key,
           number integer not null,
