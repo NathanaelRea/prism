@@ -1,7 +1,9 @@
 pub fn json_escape(value: &str) -> String {
-    serde_json::to_string(value)
-        .unwrap_or_else(|_| "\"\"".to_string())
-        .trim_matches('"')
+    let encoded = serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string());
+    encoded
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(&encoded)
         .to_string()
 }
 
@@ -246,6 +248,15 @@ mod tests {
         assert_eq!(json_u64_field(raw, "number"), Some(42));
         assert_eq!(json_bool_field(raw, "isDraft"), Some(true));
         assert_eq!(json_array_object_count(raw, "comments"), Some(1));
+    }
+
+    #[test]
+    fn json_escape_strips_only_outer_quotes() {
+        let escaped = json_escape("\"");
+        let parsed = serde_json::from_str::<String>(&format!("\"{escaped}\"")).unwrap();
+
+        assert_eq!(escaped, "\\\"");
+        assert_eq!(parsed, "\"");
     }
 
     #[test]

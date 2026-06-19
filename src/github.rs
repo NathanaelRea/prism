@@ -784,9 +784,12 @@ pub fn parse_pr_details(raw: &str) -> PrDetails {
     let Ok(details) = serde_json::from_str::<GhPrViewDetails>(raw) else {
         return PrDetails::default();
     };
+    let comments = parse_pr_comments(&details);
+    let reviews = parse_pr_reviews(&details);
+    let failing_checks = collect_failing_checks(&details.status_check_rollup);
     PrDetails {
-        comments: parse_pr_comments(&details),
-        reviews: parse_pr_reviews(&details),
+        comments,
+        reviews,
         review_comments: Vec::new(),
         files: details
             .files
@@ -795,7 +798,7 @@ pub fn parse_pr_details(raw: &str) -> PrDetails {
             .filter(|path| !path.trim().is_empty())
             .take(8)
             .collect(),
-        failing_checks: collect_failing_checks(&details.status_check_rollup),
+        failing_checks,
     }
 }
 

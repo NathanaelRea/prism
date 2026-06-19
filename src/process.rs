@@ -164,17 +164,61 @@ pub fn run_status_with_stdin(command: &mut Command, stdin: &str) -> Result<(), S
             );
             format!("{command_display}: {error}")
         })?;
-    let mut child_stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| format!("{command_display}: stdin unavailable"))?;
-    child_stdin
-        .write_all(stdin.as_bytes())
-        .map_err(|error| format!("{command_display}: {error}"))?;
+    let mut child_stdin = child.stdin.take().ok_or_else(|| {
+        let elapsed_ms = started.elapsed().as_millis() as i64;
+        let error = "stdin unavailable".to_string();
+        operation.finish(
+            LogLevel::Error,
+            "process",
+            "error",
+            format!("subprocess {error}"),
+            Some(observability::command_data_json(
+                command,
+                include_argv,
+                Some(elapsed_ms),
+                None,
+                Some(&error),
+            )),
+        );
+        format!("{command_display}: {error}")
+    })?;
+    child_stdin.write_all(stdin.as_bytes()).map_err(|error| {
+        let elapsed_ms = started.elapsed().as_millis() as i64;
+        let error = error.to_string();
+        operation.finish(
+            LogLevel::Error,
+            "process",
+            "error",
+            format!("subprocess stdin write failed: {error}"),
+            Some(observability::command_data_json(
+                command,
+                include_argv,
+                Some(elapsed_ms),
+                None,
+                Some(&error),
+            )),
+        );
+        format!("{command_display}: {error}")
+    })?;
     drop(child_stdin);
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("{command_display}: {error}"))?;
+    let output = child.wait_with_output().map_err(|error| {
+        let elapsed_ms = started.elapsed().as_millis() as i64;
+        let error = error.to_string();
+        operation.finish(
+            LogLevel::Error,
+            "process",
+            "error",
+            format!("subprocess wait failed: {error}"),
+            Some(observability::command_data_json(
+                command,
+                include_argv,
+                Some(elapsed_ms),
+                None,
+                Some(&error),
+            )),
+        );
+        format!("{command_display}: {error}")
+    })?;
     let elapsed_ms = started.elapsed().as_millis() as i64;
     let process_output = ProcessOutput {
         status: output.status,

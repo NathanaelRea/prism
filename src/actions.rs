@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::agent::{AgentAdapter, AgentProcess, AgentState};
 use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
 use crate::github::{
-    PR_SUMMARY_POLL_INTERVAL, PrCache, fetch_pr_summary_index, pr_details_due,
+    PR_SUMMARY_POLL_INTERVAL, PrCache, fetch_pr_summary_index, pr_details_due, refresh_pr_cache,
     refresh_pr_details_cache, save_pr_details_cache,
 };
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
@@ -16,8 +16,7 @@ use crate::lifecycle::{
     merge_pull_request, push_branch, refresh_branch_pr_cache, refresh_pr_summary_index_for_repo,
     run_pre_pr_checks, run_pre_push_checks,
 };
-use crate::process::command_exists;
-use crate::process::run_status_with_stdin;
+use crate::process::{command_exists, run_capture, run_status_with_stdin};
 use crate::review::build_review_fix_prompt;
 use crate::session::{
     append_agent_log, append_runtime_log, clear_hidden, discover_sessions, save_agent_state,
