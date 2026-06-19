@@ -1,8 +1,15 @@
+#[cfg(test)]
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 use crate::process::run_capture;
 use crate::util::{prism_config_dir, safe_path_component, stable_hash};
+
+#[cfg(test)]
+static TEST_CONFIG_DIRS: OnceLock<Mutex<BTreeMap<PathBuf, PathBuf>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub struct Repository {
@@ -31,8 +38,32 @@ impl Repository {
     }
 
     pub fn prism_dir(&self) -> PathBuf {
+        #[cfg(test)]
+        if let Some(config_dir) = test_config_dir(&self.root) {
+            return prism_repo_dir(&self.root, &config_dir);
+        }
         prism_repo_dir(&self.root, &prism_config_dir())
     }
+
+    #[cfg(test)]
+    pub fn with_config_dir_for_test(root: PathBuf, config_dir: PathBuf) -> Self {
+        let repo = Self { root };
+        test_config_dirs()
+            .lock()
+            .expect("test config dir lock poisoned")
+            .insert(repo.root.clone(), config_dir);
+        repo
+    }
+}
+
+#[cfg(test)]
+fn test_config_dirs() -> &'static Mutex<BTreeMap<PathBuf, PathBuf>> {
+    TEST_CONFIG_DIRS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn test_config_dir(root: &Path) -> Option<PathBuf> {
+    test_config_dirs().lock().ok()?.get(root).cloned()
 }
 
 fn prism_repo_dir(root: &Path, config_dir: &Path) -> PathBuf {
