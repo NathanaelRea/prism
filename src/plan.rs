@@ -164,12 +164,11 @@ fn select_plan_file(cwd: &Path, config: &Config, path: Option<&Path>) -> Result<
 }
 
 fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
-    let plan_path = if path.is_absolute() {
+    if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
-    };
-    plan_path
+    }
 }
 
 fn list_markdown_files(cwd: &Path) -> Result<Vec<PathBuf>, String> {

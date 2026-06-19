@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde::Deserialize;
+
 use crate::observability::{self, LogLevel};
 use crate::repo::Repository;
 use crate::util::prism_config_dir;
@@ -16,6 +18,17 @@ pub struct DiscoveredRepoEntry {
     pub repo: Repository,
     pub key: Option<char>,
     pub source_index: usize,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawRepos {
+    repos: Option<Vec<RawRepoEntry>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRepoEntry {
+    path: Option<PathBuf>,
+    key: Option<String>,
 }
 
 pub fn repos_path() -> PathBuf {
@@ -106,47 +119,23 @@ pub fn next_key(entries: &[RepoEntry]) -> Option<char> {
 }
 
 fn parse_entries(text: &str) -> Vec<RepoEntry> {
-    let mut entries = Vec::new();
-    let mut path: Option<PathBuf> = None;
-    let mut key: Option<char> = None;
-
-    for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        if line == "[[repos]]" {
-            push_entry(&mut entries, &mut path, &mut key);
-            continue;
-        }
-        let Some((name, value)) = line.split_once('=') else {
-            continue;
-        };
-        let Some(value) = parse_string(value.trim()) else {
-            continue;
-        };
-        match name.trim() {
-            "path" => path = Some(PathBuf::from(value)),
-            "key" => key = value.chars().next(),
-            _ => {}
-        }
-    }
-    push_entry(&mut entries, &mut path, &mut key);
-    entries
-}
-
-fn push_entry(entries: &mut Vec<RepoEntry>, path: &mut Option<PathBuf>, key: &mut Option<char>) {
-    let Some(root) = path.take() else {
-        *key = None;
-        return;
+    let Ok(raw) = toml::from_str::<RawRepos>(text) else {
+        return Vec::new();
     };
-    if !entries.iter().any(|entry| entry.root == root) {
-        entries.push(RepoEntry {
-            root,
-            key: key.take(),
-        });
-    }
-    *key = None;
+    raw.repos
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|entry| {
+            let root = entry.path?;
+            let key = entry.key.and_then(|value| value.chars().next());
+            Some(RepoEntry { root, key })
+        })
+        .fold(Vec::new(), |mut entries, entry| {
+            if !entries.iter().any(|existing| existing.root == entry.root) {
+                entries.push(entry);
+            }
+            entries
+        })
 }
 
 fn format_entries(entries: &[RepoEntry]) -> String {
@@ -167,26 +156,6 @@ fn format_entries(entries: &[RepoEntry]) -> String {
     out
 }
 
-fn parse_string(value: &str) -> Option<String> {
-    let value = value.trim();
-    if value.len() < 2 || !value.starts_with('"') || !value.ends_with('"') {
-        return None;
-    }
-    let mut out = String::new();
-    let mut escaped = false;
-    for ch in value[1..value.len() - 1].chars() {
-        if escaped {
-            out.push(ch);
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else {
-            out.push(ch);
-        }
-    }
-    Some(out)
-}
-
 fn escape_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -201,7 +170,8 @@ mod tests {
     #[test]
     fn parses_repos_toml_in_order() {
         let entries = parse_entries(
-            r#"[[repos]]
+            r#"# comment
+[[repos]]
 path = "/one"
 key = "2"
 
@@ -215,6 +185,27 @@ key = "1"
         assert_eq!(entries[0].key, Some('2'));
         assert_eq!(entries[1].root, PathBuf::from("/two"));
         assert_eq!(entries[1].key, Some('1'));
+    }
+
+    #[test]
+    fn parses_repos_toml_escaped_strings_and_skips_missing_fields() {
+        let entries = parse_entries(
+            r#"[[repos]]
+path = "/tmp/repo \"quoted\""
+key = "9"
+
+[[repos]]
+key = "1"
+
+[[repos]]
+path = "/tmp/repo \"quoted\""
+key = "8"
+"#,
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].root, PathBuf::from("/tmp/repo \"quoted\""));
+        assert_eq!(entries[0].key, Some('9'));
     }
 
     #[test]

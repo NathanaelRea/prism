@@ -3,7 +3,7 @@ use std::process::Command;
 
 use crate::config::Config;
 use crate::git::worktree_dirty;
-use crate::process::{run_capture, run_status};
+use crate::process::{run_capture, run_output_allow_failure, run_status};
 use crate::repo::Repository;
 use crate::session::append_runtime_log;
 use crate::terminal::stdin_is_tty;
@@ -182,18 +182,19 @@ fn default_base(repo: &Repository, config: &Config) -> Option<String> {
 }
 
 fn local_branch_exists(repo: &Repository, config: &Config, branch: &str) -> bool {
-    Command::new(config.tool("git"))
-        .arg("-C")
-        .arg(&repo.root)
-        .args([
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ])
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    run_output_allow_failure(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(&repo.root)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ]),
+    )
+    .map(|output| output.status.success())
+    .unwrap_or(false)
 }
 
 fn worktree_count(repo: &Repository, config: &Config) -> Result<usize, String> {

@@ -105,13 +105,15 @@ pub(crate) fn render_model_frame(model: &FrameModel<'_>, cols: u16, rows: u16) -
     };
     let sidebar_lines = format_sidebar_lines(
         model,
-        sidebar_width as usize,
-        panel_rows,
-        status_rows,
-        repo_rows,
-        worktree_rows,
-        repo_start,
-        worktree_start,
+        SidebarLayout {
+            width: sidebar_width as usize,
+            total_rows: panel_rows,
+            status_rows,
+            repo_rows,
+            worktree_rows,
+            repo_start,
+            worktree_start,
+        },
     );
     let mut frame = String::from("\x1b[?25l\x1b[H");
     for row in 0..panel_rows {
@@ -161,8 +163,7 @@ fn panel_title(title: &str, focused: bool, width: usize) -> String {
     }
 }
 
-fn format_sidebar_lines(
-    model: &FrameModel<'_>,
+struct SidebarLayout {
     width: usize,
     total_rows: usize,
     status_rows: usize,
@@ -170,32 +171,34 @@ fn format_sidebar_lines(
     worktree_rows: usize,
     repo_start: usize,
     worktree_start: usize,
-) -> Vec<String> {
-    let mut lines = Vec::with_capacity(total_rows);
+}
+
+fn format_sidebar_lines(model: &FrameModel<'_>, layout: SidebarLayout) -> Vec<String> {
+    let mut lines = Vec::with_capacity(layout.total_rows);
 
     append_sidebar_section(
         &mut lines,
         "1 Status",
         model.focus == PanelFocus::Status,
-        width,
-        (0..status_rows).map(|row| {
+        layout.width,
+        (0..layout.status_rows).map(|row| {
             model
                 .status
                 .get(row)
-                .map(|status| format_status_row(status, width))
-                .unwrap_or_else(|| " ".repeat(width))
+                .map(|status| format_status_row(status, layout.width))
+                .unwrap_or_else(|| " ".repeat(layout.width))
         }),
     );
     append_sidebar_section(
         &mut lines,
         "2 Repos",
         model.focus == PanelFocus::Repos,
-        width,
-        (0..repo_rows).map(|row| {
+        layout.width,
+        (0..layout.repo_rows).map(|row| {
             model
                 .repos
-                .get(repo_start + row)
-                .map(|repo| format_repo_row(repo, width))
+                .get(layout.repo_start + row)
+                .map(|repo| format_repo_row(repo, layout.width))
                 .unwrap_or_else(|| {
                     empty_state_cell(
                         row,
@@ -205,7 +208,7 @@ fn format_sidebar_lines(
                         } else {
                             "No matches"
                         },
-                        width,
+                        layout.width,
                     )
                 })
         }),
@@ -214,12 +217,12 @@ fn format_sidebar_lines(
         &mut lines,
         "3 Worktrees / Sessions",
         model.focus == PanelFocus::Worktrees,
-        width,
-        (0..worktree_rows).map(|row| {
+        layout.width,
+        (0..layout.worktree_rows).map(|row| {
             model
                 .worktrees
-                .get(worktree_start + row)
-                .map(|worktree| format_worktree_row(model.config, worktree, width))
+                .get(layout.worktree_start + row)
+                .map(|worktree| format_worktree_row(model.config, worktree, layout.width))
                 .unwrap_or_else(|| {
                     empty_state_cell(
                         row,
@@ -229,15 +232,15 @@ fn format_sidebar_lines(
                         } else {
                             "No matches"
                         },
-                        width,
+                        layout.width,
                     )
                 })
         }),
     );
 
-    lines.truncate(total_rows);
-    while lines.len() < total_rows {
-        lines.push(" ".repeat(width));
+    lines.truncate(layout.total_rows);
+    while lines.len() < layout.total_rows {
+        lines.push(" ".repeat(layout.width));
     }
     lines
 }
@@ -480,14 +483,14 @@ fn format_repo_overview_lines(
     if let Some(row) = model.repos.iter().find(|row| row.selected) {
         lines.push(format!("health {}", row.health));
     }
-    if let Some(index) = model.selected_session {
-        if let Some(session) = model.sessions.get(index) {
-            lines.push(format!(
-                "remembered {} {}",
-                truncate_line(&session.branch, 28),
-                git_status_indicator(&session.status_label),
-            ));
-        }
+    if let Some(index) = model.selected_session
+        && let Some(session) = model.sessions.get(index)
+    {
+        lines.push(format!(
+            "remembered {} {}",
+            truncate_line(&session.branch, 28),
+            git_status_indicator(&session.status_label),
+        ));
     }
     lines.push(String::new());
     let indices = model

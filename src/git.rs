@@ -1,7 +1,7 @@
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use crate::config::Config;
-use crate::process::run_capture;
+use crate::process::{run_capture, run_output_allow_failure};
 use crate::repo::Repository;
 
 pub fn git_status_label(path: &std::path::Path, config: &Config) -> String {
@@ -119,13 +119,13 @@ pub fn selected_dirty(path: &std::path::Path, config: &Config) -> Result<bool, S
 }
 
 pub fn has_upstream(path: &std::path::Path, config: &Config) -> Result<bool, String> {
-    let upstream = Command::new(config.tool("git"))
-        .arg("-C")
-        .arg(path)
-        .args(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"])
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|error| format!("git upstream check: {error}"))?;
+    let upstream =
+        run_output_allow_failure(Command::new(config.tool("git")).arg("-C").arg(path).args([
+            "rev-parse",
+            "--abbrev-ref",
+            "--symbolic-full-name",
+            "@{u}",
+        ]))?;
     Ok(upstream.status.success())
 }
 

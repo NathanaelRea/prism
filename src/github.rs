@@ -1,16 +1,12 @@
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Instant;
 
 use rusqlite::{OptionalExtension, params};
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::json::{
-    collect_json_string_fields, json_array_field, json_bool_field, json_escape, json_login_field,
-    json_object_field, json_objects_in_array, json_string_field, json_top_level_objects,
-    json_u64_field,
-};
 use crate::observability;
-use crate::process::run_capture;
+use crate::process::{run_capture, run_output_allow_failure};
 use crate::repo::Repository;
 use crate::util::timestamp_label;
 
@@ -73,20 +69,20 @@ pub struct PrDetails {
     pub failing_checks: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PrComment {
     pub author: String,
     pub body: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PrReview {
     pub author: String,
     pub state: String,
     pub body: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PrReviewComment {
     pub author: String,
     pub path: String,
@@ -94,6 +90,267 @@ pub struct PrReviewComment {
     pub body: String,
     pub created_at: String,
     pub resolved: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubPrSummaryIndexResponse {
+    data: GithubPrSummaryIndexData,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubPrSummaryIndexData {
+    repository: GithubRepository,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubRepository {
+    #[serde(default, rename = "pullRequests")]
+    pull_requests: GithubPullRequestConnection,
+    #[serde(default, rename = "pullRequest")]
+    pull_request: GithubPullRequest,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubPullRequestConnection {
+    #[serde(default)]
+    nodes: Vec<GithubPullRequest>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubPullRequest {
+    number: Option<u64>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default, rename = "reviewDecision")]
+    review_decision: String,
+    #[serde(default, rename = "reviewRequests")]
+    review_requests: GithubReviewRequests,
+    #[serde(default, rename = "headRefName")]
+    head_ref_name: String,
+    #[serde(default, rename = "baseRefName")]
+    base_ref_name: String,
+    #[serde(default, rename = "headRefOid")]
+    head_ref_oid: String,
+    #[serde(default, rename = "updatedAt")]
+    updated_at: String,
+    #[serde(default)]
+    comments: GithubCount,
+    #[serde(default, rename = "reviewThreads")]
+    review_threads: GithubReviewThreadConnection,
+    #[serde(default)]
+    commits: GithubCommitConnection,
+    #[serde(
+        default,
+        rename = "statusCheckRollup",
+        deserialize_with = "deserialize_status_rollup"
+    )]
+    status_check_rollup: GithubStatusCheckRollup,
+    #[serde(default)]
+    merged: Option<bool>,
+    #[serde(default, rename = "mergedAt")]
+    merged_at: Option<String>,
+    #[serde(default, rename = "isDraft")]
+    is_draft: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(untagged)]
+enum GithubReviewRequests {
+    Connection {
+        nodes: Vec<GithubReviewRequest>,
+    },
+    List(Vec<GithubReviewRequest>),
+    #[default]
+    Missing,
+}
+
+impl GithubReviewRequests {
+    fn nodes(&self) -> &[GithubReviewRequest] {
+        match self {
+            Self::Connection { nodes } | Self::List(nodes) => nodes,
+            Self::Missing => &[],
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubReviewRequest {
+    #[serde(default, rename = "requestedReviewer")]
+    requested_reviewer: GithubReviewer,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubReviewer {
+    login: Option<String>,
+    slug: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubCount {
+    #[serde(default, rename = "totalCount")]
+    total_count: u64,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubReviewThreadConnection {
+    #[serde(default, rename = "totalCount")]
+    total_count: u64,
+    #[serde(default)]
+    nodes: Vec<GithubReviewThread>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubReviewThread {
+    #[serde(default, rename = "isResolved")]
+    is_resolved: bool,
+    #[serde(default)]
+    comments: GithubReviewThreadCommentConnection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubReviewThreadCommentConnection {
+    #[serde(default)]
+    nodes: Vec<GithubReviewThreadComment>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubReviewThreadComment {
+    #[serde(default)]
+    author: GithubLogin,
+    #[serde(default)]
+    path: String,
+    line: Option<u64>,
+    #[serde(default, rename = "originalLine")]
+    original_line: Option<u64>,
+    #[serde(default)]
+    body: String,
+    #[serde(default, rename = "createdAt")]
+    created_at: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubLogin {
+    #[serde(default)]
+    login: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GhPrViewDetails {
+    #[serde(default)]
+    comments: Vec<GhPrComment>,
+    #[serde(default)]
+    reviews: Vec<GhPrReview>,
+    #[serde(default)]
+    files: Vec<GhPrFile>,
+    #[serde(
+        default,
+        rename = "statusCheckRollup",
+        deserialize_with = "deserialize_status_rollup"
+    )]
+    status_check_rollup: GithubStatusCheckRollup,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GhPrComment {
+    #[serde(default)]
+    author: GhActor,
+    #[serde(default)]
+    user: GhActor,
+    #[serde(default)]
+    body: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GhPrReview {
+    #[serde(default)]
+    author: GhActor,
+    #[serde(default)]
+    user: GhActor,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    body: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GhActor {
+    #[serde(default)]
+    login: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GhPrFile {
+    #[serde(default)]
+    path: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubCommitConnection {
+    #[serde(default)]
+    nodes: Vec<GithubCommitNode>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubCommitNode {
+    #[serde(default)]
+    commit: GithubCommit,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubCommit {
+    #[serde(
+        default,
+        rename = "statusCheckRollup",
+        deserialize_with = "deserialize_status_rollup"
+    )]
+    status_check_rollup: GithubStatusCheckRollup,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubStatusCheckRollup {
+    #[serde(default)]
+    contexts: GithubStatusContextConnection,
+    #[serde(default)]
+    nodes: Vec<GithubStatusContext>,
+}
+
+fn deserialize_status_rollup<'de, D>(deserializer: D) -> Result<GithubStatusCheckRollup, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    if value.is_null() {
+        return Ok(GithubStatusCheckRollup::default());
+    }
+    if let Ok(nodes) = serde_json::from_value::<Vec<GithubStatusContext>>(value.clone()) {
+        return Ok(GithubStatusCheckRollup {
+            contexts: GithubStatusContextConnection::default(),
+            nodes,
+        });
+    }
+    serde_json::from_value(value).map_err(serde::de::Error::custom)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubStatusContextConnection {
+    #[serde(default)]
+    nodes: Vec<GithubStatusContext>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct GithubStatusContext {
+    name: Option<String>,
+    context: Option<String>,
+    status: Option<String>,
+    conclusion: Option<String>,
+    state: Option<String>,
 }
 
 pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
@@ -404,37 +661,41 @@ fn parse_github_remote(remote: &str) -> Option<(String, String)> {
 }
 
 pub fn parse_pr_summary_index(raw: &str) -> Vec<PrSummary> {
-    json_objects_in_array(raw, "nodes")
-        .into_iter()
-        .filter_map(parse_pr_summary_node)
+    let Ok(response) = serde_json::from_str::<GithubPrSummaryIndexResponse>(raw) else {
+        return Vec::new();
+    };
+    response
+        .data
+        .repository
+        .pull_requests
+        .nodes
+        .iter()
+        .filter_map(pr_summary_from_node)
         .collect()
 }
 
-fn parse_pr_summary_node(raw: &str) -> Option<PrSummary> {
-    let number = json_u64_field(raw, "number")?;
-    let comments = json_object_field(raw, "comments")
-        .and_then(|object| json_u64_field(object, "totalCount"))
-        .unwrap_or(0);
-    let review_threads = json_object_field(raw, "reviewThreads")
-        .and_then(|object| json_u64_field(object, "totalCount"))
-        .unwrap_or(0);
+fn pr_summary_from_node(node: &GithubPullRequest) -> Option<PrSummary> {
+    let number = node.number?;
     Some(PrSummary {
         number,
-        title: json_string_field(raw, "title").unwrap_or_default(),
-        body: json_string_field(raw, "body").unwrap_or_default(),
-        url: json_string_field(raw, "url").unwrap_or_default(),
-        state: json_string_field(raw, "state").unwrap_or_default(),
-        review_decision: json_string_field(raw, "reviewDecision")
-            .unwrap_or_else(|| "UNKNOWN".to_string()),
-        requested_reviewers: parse_requested_reviewers(raw),
-        head_ref: json_string_field(raw, "headRefName").unwrap_or_default(),
-        base_ref: json_string_field(raw, "baseRefName").unwrap_or_default(),
-        head_sha: json_string_field(raw, "headRefOid").unwrap_or_default(),
-        updated_at: json_string_field(raw, "updatedAt").unwrap_or_default(),
-        check_status: parse_check_status(raw),
-        comment_count: comments + review_threads,
-        merged: parse_merged_status(raw),
-        draft: json_bool_field(raw, "isDraft").unwrap_or(false),
+        title: node.title.clone(),
+        body: node.body.clone(),
+        url: node.url.clone(),
+        state: node.state.clone(),
+        review_decision: if node.review_decision.trim().is_empty() {
+            "UNKNOWN".to_string()
+        } else {
+            node.review_decision.clone()
+        },
+        requested_reviewers: requested_reviewers_from_requests(&node.review_requests),
+        head_ref: node.head_ref_name.clone(),
+        base_ref: node.base_ref_name.clone(),
+        head_sha: node.head_ref_oid.clone(),
+        updated_at: node.updated_at.clone(),
+        check_status: check_status_from_contexts(&status_contexts_for_pr(node)),
+        comment_count: node.comments.total_count + node.review_threads.total_count,
+        merged: merged_status_from_node(node),
+        draft: node.is_draft,
     })
 }
 
@@ -463,18 +724,17 @@ fn fetch_pr_summary(
         "isDraft",
     ]
     .join(",");
-    let output = Command::new(config.tool("gh"))
-        .arg("pr")
-        .arg("view")
-        .arg(branch)
-        .arg("--json")
-        .arg(fields)
-        .current_dir(path)
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| format!("gh pr view: {error}"))?;
+    let output = run_output_allow_failure(
+        Command::new(config.tool("gh"))
+            .arg("pr")
+            .arg("view")
+            .arg(branch)
+            .arg("--json")
+            .arg(fields)
+            .current_dir(path),
+    )?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = output.stderr.trim().to_string();
         if stderr.contains("no pull requests found")
             || stderr.contains("not found")
             || stderr.contains("Could not resolve to a PullRequest")
@@ -488,27 +748,12 @@ fn fetch_pr_summary(
         };
         return Err(format!("gh pr view: {message}"));
     }
-    let raw = String::from_utf8_lossy(&output.stdout).to_string();
-    let Some(number) = json_u64_field(&raw, "number") else {
+    let raw = output.stdout;
+    let Ok(node) = serde_json::from_str::<GithubPullRequest>(&raw) else {
         return Ok(None);
     };
-    let summary = PrSummary {
-        number,
-        title: json_string_field(&raw, "title").unwrap_or_default(),
-        body: json_string_field(&raw, "body").unwrap_or_default(),
-        url: json_string_field(&raw, "url").unwrap_or_default(),
-        state: json_string_field(&raw, "state").unwrap_or_default(),
-        review_decision: json_string_field(&raw, "reviewDecision")
-            .unwrap_or_else(|| "UNKNOWN".to_string()),
-        requested_reviewers: parse_requested_reviewers(&raw),
-        head_ref: json_string_field(&raw, "headRefName").unwrap_or_default(),
-        base_ref: json_string_field(&raw, "baseRefName").unwrap_or_default(),
-        head_sha: json_string_field(&raw, "headRefOid").unwrap_or_default(),
-        updated_at: json_string_field(&raw, "updatedAt").unwrap_or_default(),
-        check_status: parse_check_status(&raw),
-        comment_count: 0,
-        merged: parse_merged_status(&raw),
-        draft: json_bool_field(&raw, "isDraft").unwrap_or(false),
+    let Some(summary) = pr_summary_from_node(&node) else {
+        return Ok(None);
     };
     Ok(Some((summary, raw)))
 }
@@ -536,12 +781,21 @@ fn fetch_pr_details(
 }
 
 pub fn parse_pr_details(raw: &str) -> PrDetails {
+    let Ok(details) = serde_json::from_str::<GhPrViewDetails>(raw) else {
+        return PrDetails::default();
+    };
     PrDetails {
-        comments: parse_pr_comments(raw),
-        reviews: parse_pr_reviews(raw),
+        comments: parse_pr_comments(&details),
+        reviews: parse_pr_reviews(&details),
         review_comments: Vec::new(),
-        files: collect_json_string_fields(raw, "path", 8),
-        failing_checks: collect_failing_checks(raw),
+        files: details
+            .files
+            .into_iter()
+            .map(|file| file.path)
+            .filter(|path| !path.trim().is_empty())
+            .take(8)
+            .collect(),
+        failing_checks: collect_failing_checks(&details.status_check_rollup),
     }
 }
 
@@ -594,84 +848,91 @@ query($owner: String!, $name: String!, $number: Int!) {
 }
 "#;
 
-fn parse_pr_comments(raw: &str) -> Vec<PrComment> {
-    json_objects_in_array(raw, "comments")
-        .into_iter()
-        .map(|object| {
-            let body = json_string_field(object, "body").unwrap_or_default();
-            PrComment {
-                author: json_login_field(object).unwrap_or_default(),
-                body,
-            }
+fn parse_pr_comments(details: &GhPrViewDetails) -> Vec<PrComment> {
+    details
+        .comments
+        .iter()
+        .map(|object| PrComment {
+            author: first_non_empty([object.author.login.as_str(), object.user.login.as_str()]),
+            body: object.body.clone(),
         })
         .filter(|comment| !comment.body.trim().is_empty())
         .take(20)
         .collect()
 }
 
-fn parse_pr_reviews(raw: &str) -> Vec<PrReview> {
-    json_objects_in_array(raw, "reviews")
-        .into_iter()
-        .map(|object| {
-            let body = json_string_field(object, "body").unwrap_or_default();
-            PrReview {
-                author: json_login_field(object).unwrap_or_default(),
-                state: json_string_field(object, "state").unwrap_or_default(),
-                body,
-            }
+fn parse_pr_reviews(details: &GhPrViewDetails) -> Vec<PrReview> {
+    details
+        .reviews
+        .iter()
+        .map(|object| PrReview {
+            author: first_non_empty([object.author.login.as_str(), object.user.login.as_str()]),
+            state: object.state.clone(),
+            body: object.body.clone(),
         })
         .filter(|review| !review.state.trim().is_empty() || !review.body.trim().is_empty())
         .take(20)
         .collect()
 }
 
+#[cfg(test)]
 fn parse_requested_reviewers(raw: &str) -> Vec<String> {
-    if let Some(requests) = json_object_field(raw, "reviewRequests") {
-        return requested_reviewers_from_objects(json_objects_in_array(requests, "nodes"));
-    }
-    if let Some(requests) = json_array_field(raw, "reviewRequests") {
-        return requested_reviewers_from_objects(json_top_level_objects(requests));
-    }
-    Vec::new()
+    serde_json::from_str::<GithubPullRequest>(raw)
+        .map(|node| requested_reviewers_from_requests(&node.review_requests))
+        .unwrap_or_default()
 }
 
-fn requested_reviewers_from_objects(objects: Vec<&str>) -> Vec<String> {
+fn requested_reviewers_from_requests(requests: &GithubReviewRequests) -> Vec<String> {
     let mut reviewers: Vec<String> = Vec::new();
-    for object in objects {
-        let reviewer_object = json_object_field(object, "requestedReviewer").unwrap_or(object);
-        let Some(name) = json_login_field(reviewer_object)
-            .or_else(|| json_string_field(reviewer_object, "slug"))
-            .or_else(|| json_string_field(reviewer_object, "name"))
-        else {
+    for request in requests.nodes() {
+        let name = request
+            .requested_reviewer
+            .login
+            .as_deref()
+            .or(request.requested_reviewer.slug.as_deref())
+            .or(request.requested_reviewer.name.as_deref())
+            .unwrap_or_default()
+            .trim();
+        if name.is_empty() || reviewers.iter().any(|existing| existing == name) {
             continue;
-        };
-        let name = name.trim();
-        if !name.is_empty() && !reviewers.iter().any(|existing| existing.as_str() == name) {
-            reviewers.push(name.to_string());
         }
+        reviewers.push(name.to_string());
     }
     reviewers
 }
 
 #[cfg(test)]
 fn parse_inline_review_comments(raw: &str) -> Vec<PrReviewComment> {
-    crate::json::json_top_level_objects(raw)
+    #[derive(Default, Deserialize)]
+    struct InlineComment {
+        #[serde(default)]
+        user: GhActor,
+        #[serde(default)]
+        path: String,
+        line: Option<u64>,
+        #[serde(default, rename = "original_line")]
+        original_line: Option<u64>,
+        #[serde(default)]
+        body: String,
+        #[serde(default, rename = "created_at")]
+        created_at: String,
+    }
+    let Ok(comments) = serde_json::from_str::<Vec<InlineComment>>(raw) else {
+        return Vec::new();
+    };
+    comments
         .into_iter()
-        .map(|object| {
-            let body = json_string_field(object, "body").unwrap_or_default();
-            PrReviewComment {
-                author: json_login_field(object).unwrap_or_default(),
-                path: json_string_field(object, "path").unwrap_or_default(),
-                line: json_u64_field(object, "line")
-                    .or_else(|| json_u64_field(object, "original_line"))
-                    .map(|line| line.to_string())
-                    .unwrap_or_default(),
-                body,
-                created_at: json_string_field(object, "created_at")
-                    .or_else(|| json_string_field(object, "createdAt"))
-                    .unwrap_or_default(),
-                resolved: false,
-            }
+        .map(|object| PrReviewComment {
+            author: object.user.login,
+            path: object.path,
+            line: object
+                .line
+                .or(object.original_line)
+                .map(|line| line.to_string())
+                .unwrap_or_default(),
+            body: object.body,
+            created_at: object.created_at,
+            resolved: false,
         })
         .filter(|comment| !comment.body.trim().is_empty())
         .take(100)
@@ -679,32 +940,26 @@ fn parse_inline_review_comments(raw: &str) -> Vec<PrReviewComment> {
 }
 
 pub fn parse_review_thread_comments(raw: &str) -> Vec<PrReviewComment> {
-    let Some(review_threads) = json_object_field(raw, "reviewThreads") else {
+    let Ok(response) = serde_json::from_str::<GithubPrSummaryIndexResponse>(raw) else {
         return Vec::new();
     };
     let mut comments = Vec::new();
-    for thread in json_objects_in_array(review_threads, "nodes") {
-        let resolved = json_bool_field(thread, "isResolved").unwrap_or(false);
-        let Some(thread_comments) = json_object_field(thread, "comments") else {
-            continue;
-        };
-        for object in json_objects_in_array(thread_comments, "nodes") {
+    for thread in response.data.repository.pull_request.review_threads.nodes {
+        for object in thread.comments.nodes {
             if comments.len() >= 100 {
                 return comments;
             }
-            let body = json_string_field(object, "body").unwrap_or_default();
             let comment = PrReviewComment {
-                author: json_login_field(object).unwrap_or_default(),
-                path: json_string_field(object, "path").unwrap_or_default(),
-                line: json_u64_field(object, "line")
-                    .or_else(|| json_u64_field(object, "originalLine"))
+                author: object.author.login,
+                path: object.path,
+                line: object
+                    .line
+                    .or(object.original_line)
                     .map(|line| line.to_string())
                     .unwrap_or_default(),
-                body,
-                created_at: json_string_field(object, "createdAt")
-                    .or_else(|| json_string_field(object, "created_at"))
-                    .unwrap_or_default(),
-                resolved,
+                body: object.body,
+                created_at: object.created_at,
+                resolved: thread.is_resolved,
             };
             if !comment.body.trim().is_empty() {
                 comments.push(comment);
@@ -714,37 +969,52 @@ pub fn parse_review_thread_comments(raw: &str) -> Vec<PrReviewComment> {
     comments
 }
 
+#[cfg(test)]
 pub fn parse_check_status(raw: &str) -> String {
-    let statuses = collect_json_string_fields(raw, "status", 64);
-    let conclusions = collect_json_string_fields(raw, "conclusion", 64);
-    let states = collect_json_string_fields(raw, "state", 64)
-        .into_iter()
-        .filter(|value| !matches!(value.as_str(), "OPEN" | "CLOSED" | "MERGED"))
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return "unknown".to_string();
+    };
+    let mut contexts = Vec::new();
+    collect_status_contexts_from_value(&value, &mut contexts);
+    check_status_from_contexts(&contexts)
+}
+
+fn check_status_from_contexts(contexts: &[GithubStatusContext]) -> String {
+    let statuses = contexts
+        .iter()
+        .filter_map(|context| context.status.as_deref())
+        .collect::<Vec<_>>();
+    let conclusions = contexts
+        .iter()
+        .filter_map(|context| context.conclusion.as_deref())
+        .collect::<Vec<_>>();
+    let states = contexts
+        .iter()
+        .filter_map(|context| context.state.as_deref())
+        .filter(|value| !matches!(*value, "OPEN" | "CLOSED" | "MERGED"))
         .collect::<Vec<_>>();
     if conclusions.iter().any(|value| {
         matches!(
-            value.as_str(),
+            *value,
             "FAILURE" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED"
         )
     }) || states
         .iter()
-        .any(|value| matches!(value.as_str(), "ERROR" | "FAILURE"))
+        .any(|value| matches!(*value, "ERROR" | "FAILURE"))
     {
         return "failed".to_string();
     }
-    if statuses.iter().any(|value| {
-        matches!(
-            value.as_str(),
-            "QUEUED" | "IN_PROGRESS" | "PENDING" | "REQUESTED"
-        )
-    }) || states.iter().any(|value| value == "PENDING")
+    if statuses
+        .iter()
+        .any(|value| matches!(*value, "QUEUED" | "IN_PROGRESS" | "PENDING" | "REQUESTED"))
+        || states.contains(&"PENDING")
     {
         return "running".to_string();
     }
     let conclusions_pass = conclusions
         .iter()
-        .all(|value| matches!(value.as_str(), "SUCCESS" | "SKIPPED" | "NEUTRAL"));
-    let states_pass = states.iter().all(|value| value == "SUCCESS");
+        .all(|value| matches!(*value, "SUCCESS" | "SKIPPED" | "NEUTRAL"));
+    let states_pass = states.iter().all(|value| *value == "SUCCESS");
     if (!conclusions.is_empty() || !states.is_empty()) && conclusions_pass && states_pass {
         return "passed".to_string();
     }
@@ -755,33 +1025,120 @@ pub fn parse_check_status(raw: &str) -> String {
     }
 }
 
-fn collect_failing_checks(raw: &str) -> Vec<String> {
-    let names = collect_json_string_fields(raw, "name", 64);
-    let conclusions = collect_json_string_fields(raw, "conclusion", 64);
-    names
+fn collect_failing_checks(rollup: &GithubStatusCheckRollup) -> Vec<String> {
+    status_contexts_from_rollup(rollup)
         .into_iter()
-        .zip(conclusions)
-        .filter_map(|(name, conclusion)| {
+        .filter_map(|context| {
             matches!(
-                conclusion.as_str(),
+                context.conclusion.as_deref().unwrap_or_default(),
                 "FAILURE" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED"
             )
-            .then_some(name)
+            .then(|| context.name.or(context.context))
+            .flatten()
         })
         .take(8)
         .collect()
 }
 
+#[cfg(test)]
 fn parse_merged_status(raw: &str) -> bool {
-    json_bool_field(raw, "merged").unwrap_or_else(|| {
-        json_string_field(raw, "mergedAt")
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return false;
+    };
+    value
+        .get("merged")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or_else(|| {
+            value
+                .get("mergedAt")
+                .and_then(serde_json::Value::as_str)
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| {
+                    value
+                        .get("state")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|state| state == "MERGED")
+                        .unwrap_or(false)
+                })
+        })
+}
+
+fn merged_status_from_node(node: &GithubPullRequest) -> bool {
+    node.merged.unwrap_or_else(|| {
+        node.merged_at
+            .as_deref()
             .map(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| {
-                json_string_field(raw, "state")
-                    .map(|state| state == "MERGED")
-                    .unwrap_or(false)
-            })
+            .unwrap_or_else(|| node.state == "MERGED")
     })
+}
+
+fn status_contexts_for_pr(node: &GithubPullRequest) -> Vec<GithubStatusContext> {
+    if !node.status_check_rollup.contexts.nodes.is_empty()
+        || !node.status_check_rollup.nodes.is_empty()
+    {
+        return status_contexts_from_rollup(&node.status_check_rollup);
+    }
+    node.commits
+        .nodes
+        .iter()
+        .flat_map(|node| status_contexts_from_rollup(&node.commit.status_check_rollup))
+        .collect()
+}
+
+fn status_contexts_from_rollup(rollup: &GithubStatusCheckRollup) -> Vec<GithubStatusContext> {
+    rollup
+        .contexts
+        .nodes
+        .iter()
+        .chain(rollup.nodes.iter())
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+fn collect_status_contexts_from_value(
+    value: &serde_json::Value,
+    contexts: &mut Vec<GithubStatusContext>,
+) {
+    if contexts.len() >= 64 {
+        return;
+    }
+    match value {
+        serde_json::Value::Object(object)
+            if object.contains_key("status")
+                || object.contains_key("conclusion")
+                || object.contains_key("state") =>
+        {
+            if let Ok(context) = serde_json::from_value::<GithubStatusContext>(value.clone()) {
+                contexts.push(context);
+            }
+        }
+        serde_json::Value::Object(object) => {
+            for value in object.values() {
+                collect_status_contexts_from_value(value, contexts);
+                if contexts.len() >= 64 {
+                    break;
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_status_contexts_from_value(value, contexts);
+                if contexts.len() >= 64 {
+                    break;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn first_non_empty<const N: usize>(values: [&str; N]) -> String {
+    values
+        .into_iter()
+        .find(|value| !value.trim().is_empty())
+        .unwrap_or_default()
+        .to_string()
 }
 
 pub fn remove_pr_cache(repo: &Repository, branch: &str) -> Result<(), String> {
@@ -936,89 +1293,35 @@ fn decode_requested_reviewers(value: &str) -> Vec<String> {
 }
 
 fn encode_pr_comments(comments: &[PrComment]) -> String {
-    encode_json_objects(comments.iter().map(|comment| {
-        format!(
-            r#"{{"author":"{}","body":"{}"}}"#,
-            json_escape(&comment.author),
-            json_escape(&comment.body)
-        )
-    }))
+    serde_json::to_string(comments).unwrap_or_else(|_| "[]".to_string())
 }
 
 fn decode_pr_comments(raw: &str) -> Vec<PrComment> {
-    json_top_level_objects(raw)
-        .into_iter()
-        .map(|object| PrComment {
-            author: json_string_field(object, "author").unwrap_or_default(),
-            body: json_string_field(object, "body").unwrap_or_default(),
-        })
-        .collect()
+    serde_json::from_str(raw).unwrap_or_default()
 }
 
 fn encode_pr_reviews(reviews: &[PrReview]) -> String {
-    encode_json_objects(reviews.iter().map(|review| {
-        format!(
-            r#"{{"author":"{}","state":"{}","body":"{}"}}"#,
-            json_escape(&review.author),
-            json_escape(&review.state),
-            json_escape(&review.body)
-        )
-    }))
+    serde_json::to_string(reviews).unwrap_or_else(|_| "[]".to_string())
 }
 
 fn decode_pr_reviews(raw: &str) -> Vec<PrReview> {
-    json_top_level_objects(raw)
-        .into_iter()
-        .map(|object| PrReview {
-            author: json_string_field(object, "author").unwrap_or_default(),
-            state: json_string_field(object, "state").unwrap_or_default(),
-            body: json_string_field(object, "body").unwrap_or_default(),
-        })
-        .collect()
+    serde_json::from_str(raw).unwrap_or_default()
 }
 
 fn encode_pr_review_comments(comments: &[PrReviewComment]) -> String {
-    encode_json_objects(comments.iter().map(|comment| {
-        format!(
-            r#"{{"author":"{}","path":"{}","line":"{}","body":"{}","created_at":"{}","resolved":{}}}"#,
-            json_escape(&comment.author),
-            json_escape(&comment.path),
-            json_escape(&comment.line),
-            json_escape(&comment.body),
-            json_escape(&comment.created_at),
-            comment.resolved
-        )
-    }))
+    serde_json::to_string(comments).unwrap_or_else(|_| "[]".to_string())
 }
 
 fn decode_pr_review_comments(raw: &str) -> Vec<PrReviewComment> {
-    json_top_level_objects(raw)
-        .into_iter()
-        .map(|object| PrReviewComment {
-            author: json_string_field(object, "author").unwrap_or_default(),
-            path: json_string_field(object, "path").unwrap_or_default(),
-            line: json_string_field(object, "line").unwrap_or_default(),
-            body: json_string_field(object, "body").unwrap_or_default(),
-            created_at: json_string_field(object, "created_at").unwrap_or_default(),
-            resolved: json_bool_field(object, "resolved").unwrap_or(false),
-        })
-        .collect()
+    serde_json::from_str(raw).unwrap_or_default()
 }
 
 fn encode_string_values(values: &[String]) -> String {
-    encode_json_objects(
-        values
-            .iter()
-            .map(|value| format!(r#"{{"value":"{}"}}"#, json_escape(value))),
-    )
+    serde_json::to_string(values).unwrap_or_else(|_| "[]".to_string())
 }
 
 fn decode_string_values(raw: &str) -> Vec<String> {
-    collect_json_string_fields(raw, "value", usize::MAX)
-}
-
-fn encode_json_objects(objects: impl Iterator<Item = String>) -> String {
-    format!("[{}]", objects.collect::<Vec<_>>().join(","))
+    serde_json::from_str(raw).unwrap_or_default()
 }
 
 fn row_u64(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<u64> {
@@ -1045,22 +1348,27 @@ mod tests {
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
-    fn pr_json_helpers_parse_summary_fields() {
+    fn pr_json_parser_reads_summary_details_and_missing_fields() {
         let raw = r#"{
             "number": 42,
             "title": "Fix review",
             "mergedAt": "2026-01-01T00:00:00Z",
             "isDraft": true,
-            "comments": [{"body": "hello"}],
-            "reviews": [{"state": "CHANGES_REQUESTED"}],
+            "comments": [{"author": {"login": "reviewer"}, "body": "hello"}],
+            "reviews": [{"author": {"login": "maintainer"}, "state": "CHANGES_REQUESTED"}],
             "files": [{"path": "src/main.rs"}],
-            "statusCheckRollup": [{"name": "test", "status": "COMPLETED", "conclusion": "FAILURE"}]
+            "statusCheckRollup": {
+                "contexts": {
+                    "nodes": [{"name": "test", "status": "COMPLETED", "conclusion": "FAILURE"}]
+                }
+            }
         }"#;
-        assert_eq!(json_u64_field(raw, "number"), Some(42));
-        assert_eq!(json_bool_field(raw, "isDraft"), Some(true));
         assert!(parse_merged_status(raw));
         assert_eq!(parse_check_status(raw), "failed");
         let details = parse_pr_details(raw);
@@ -1072,8 +1380,13 @@ mod tests {
 
     #[test]
     fn pr_cache_round_trips_details() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let temp = unique_temp_dir("prism-pr-details-cache-test");
         fs::create_dir_all(&temp).unwrap();
+        let previous_xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.join("config"));
+        }
         let repo = Repository { root: temp.clone() };
         let summary = PrSummary {
             number: 42,
@@ -1123,6 +1436,7 @@ mod tests {
         save_pr_cache(&repo, "feature", &cache).unwrap();
         save_pr_details_cache(&repo, "feature", cache.details.as_ref().unwrap()).unwrap();
         let loaded = load_pr_cache(&repo, "feature");
+        let prism_dir = repo.prism_dir();
 
         assert_eq!(loaded.summary.as_ref().unwrap().number, 42);
         let loaded_details = loaded.details.as_ref().unwrap();
@@ -1134,7 +1448,16 @@ mod tests {
         assert_eq!(loaded_details.files, vec!["src/main.rs"]);
         assert_eq!(loaded_details.failing_checks, vec!["test"]);
 
-        let _ = fs::remove_dir_all(repo.prism_dir());
+        if let Some(value) = previous_xdg_config_home {
+            unsafe {
+                std::env::set_var("XDG_CONFIG_HOME", value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("XDG_CONFIG_HOME");
+            }
+        }
+        let _ = fs::remove_dir_all(prism_dir);
         let _ = fs::remove_dir_all(temp);
     }
 

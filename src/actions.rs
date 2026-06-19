@@ -1,23 +1,27 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 use crate::agent::{AgentAdapter, AgentProcess, AgentState};
 use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
 use crate::github::{
-    PR_SUMMARY_POLL_INTERVAL, PrCache, fetch_pr_summary_index, pr_details_due, refresh_pr_cache,
-    refresh_pr_details_cache, remove_pr_cache, save_pr_cache, save_pr_details_cache,
+    PR_SUMMARY_POLL_INTERVAL, PrCache, fetch_pr_summary_index, pr_details_due,
+    refresh_pr_details_cache, save_pr_details_cache,
 };
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
+use crate::lifecycle::{
+    PrSummaryRepository, create_pull_request, create_worktree_session, delete_worktree_session,
+    merge_pull_request, push_branch, refresh_branch_pr_cache, refresh_pr_summary_index_for_repo,
+    run_pre_pr_checks, run_pre_push_checks,
+};
 use crate::process::command_exists;
-use crate::process::{run_capture, run_configured_commands, run_status};
+use crate::process::{run_capture, run_status_with_stdin};
 use crate::review::build_review_fix_prompt;
 use crate::session::{
-    append_agent_log, append_runtime_log, clear_hidden, discover_sessions, remove_logs,
-    remove_process_state, remove_task_metadata, save_agent_state, write_task_metadata,
+    append_agent_log, append_runtime_log, clear_hidden, discover_sessions, save_agent_state,
+    write_task_metadata,
 };
 use crate::tmux::{
     TmuxWindow, agent_session_running, attach_or_create_agent, attach_or_create_plan_mode,
@@ -490,8 +494,16 @@ impl Tui {
                         .collect::<Vec<_>>();
                     match summaries {
                         Ok(summaries) => {
+                            let repos = self
+                                .repos
+                                .iter()
+                                .map(|managed| PrSummaryRepository {
+                                    repo: &managed.repo,
+                                    config: &managed.config,
+                                })
+                                .collect::<Vec<_>>();
                             refresh_pr_summary_index_for_repo(
-                                &self.repos,
+                                &repos,
                                 &mut self.sessions,
                                 repo_index,
                                 summaries,
@@ -536,11 +548,10 @@ impl Tui {
                             session.pr.details = cache.details;
                             session.pr.details_last_polled = cache.details_last_polled;
                             session.pr.error = cache.error;
-                            if let Some(details) = &session.pr.details {
-                                if let Some(repo) = self.repos.get(session.repo_index) {
-                                    let _ =
-                                        save_pr_details_cache(&repo.repo, &session.branch, details);
-                                }
+                            if let Some(details) = &session.pr.details
+                                && let Some(repo) = self.repos.get(session.repo_index)
+                            {
+                                let _ = save_pr_details_cache(&repo.repo, &session.branch, details);
                             }
                             if session_comment_count(session) > before_comments
                                 && selected_key.as_ref() != Some(&key)
@@ -1070,9 +1081,9 @@ impl Tui {
             self.show_message("cannot push a detached worktree")?;
             return Ok(());
         }
-        run_configured_commands(&context.config.checks.pre_push, &path, "pre_push")?;
-        let args = if has_upstream(&path, &context.config)? {
-            vec!["push".to_string()]
+        run_pre_push_checks(&context.config, &path)?;
+        let set_upstream = if has_upstream(&path, &context.config)? {
+            false
         } else {
             let Some(answer) = self.prompt_line_dialog(
                 "Push Branch",
@@ -1085,28 +1096,18 @@ impl Tui {
             if !yes(&answer) {
                 return Ok(());
             }
-            vec![
-                "push".to_string(),
-                "-u".to_string(),
-                "origin".to_string(),
-                branch,
-            ]
+            true
         };
         self.show_loading_dialog("Push Branch", "Pushing selected branch")?;
-        run_capture(
-            Command::new(context.config.tool("git"))
-                .arg("-C")
-                .arg(&path)
-                .args(args),
-        )?;
+        push_branch(&context.config, &path, &branch, set_upstream)?;
         {
             let session = &mut self.sessions[selected];
-            refresh_pr_cache(
+            refresh_branch_pr_cache(
                 &context.repo,
-                &session.branch,
-                &mut session.pr,
-                &session.path,
                 &context.config,
+                &session.branch,
+                &session.path,
+                &mut session.pr,
                 true,
             );
         }
@@ -1115,28 +1116,20 @@ impl Tui {
                 .config
                 .is_default_branch(&self.sessions[selected].branch)
         {
-            run_configured_commands(&context.config.checks.pre_pr, &path, "pre_pr")?;
+            run_pre_pr_checks(&context.config, &path)?;
             let Some(pr_body) = self.prompt_pr_description()? else {
                 return Ok(());
             };
             self.show_loading_dialog("Create Pull Request", "Creating pull request")?;
-            run_capture(
-                Command::new(context.config.tool("gh"))
-                    .args(create_pr_args(
-                        context.config.default_base.as_deref(),
-                        &pr_body,
-                    ))
-                    .current_dir(&path),
-            )?;
             let session = &mut self.sessions[selected];
-            refresh_pr_cache(
+            create_pull_request(
                 &context.repo,
-                &session.branch,
-                &mut session.pr,
-                &session.path,
                 &context.config,
-                true,
-            );
+                &session.branch,
+                &session.path,
+                &pr_body,
+                &mut session.pr,
+            )?;
             self.show_message("push complete; pull request created")?;
         } else {
             self.show_message("push complete")?;
@@ -1164,12 +1157,12 @@ impl Tui {
         let branch = self.sessions[selected].branch.clone();
         {
             let session = &mut self.sessions[selected];
-            refresh_pr_cache(
+            refresh_branch_pr_cache(
                 &context.repo,
-                &session.branch,
-                &mut session.pr,
-                &session.path,
                 &context.config,
+                &session.branch,
+                &session.path,
+                &mut session.pr,
                 false,
             );
         }
@@ -1185,25 +1178,18 @@ impl Tui {
             self.show_message("working tree is dirty; commit or stash before merging")?;
             return Ok(());
         }
-        run_configured_commands(&context.config.checks.pre_push, &path, "pre_push")?;
+        run_pre_push_checks(&context.config, &path)?;
         self.show_loading_dialog(
             "Merge Pull Request",
             &format!("Merging PR #{}", summary.number),
         )?;
-        let pr_number = summary.number.to_string();
-        run_status(
-            Command::new(context.config.tool("gh"))
-                .args(merge_pr_args(&pr_number, context.config.merge_method))
-                .current_dir(&path),
+        merge_pull_request(
+            &context.repo,
+            &context.config,
+            &path,
+            &branch,
+            summary.number,
         )?;
-        if branch != "(detached)" {
-            let _ = run_status(
-                Command::new(context.config.tool("git"))
-                    .arg("-C")
-                    .arg(&context.repo.root)
-                    .args(["branch", "-D", &branch]),
-            );
-        }
         self.refresh_sessions()?;
         self.show_message("merge complete")?;
         Ok(())
@@ -1225,31 +1211,9 @@ impl Tui {
         if !self.confirm_delete_dialog(&branch, &path_display, &warnings)? {
             return Ok(());
         }
-        self.delete_local_data(&context.repo, &branch)?;
-        remove_worktree(&context.repo, &context.config, &path)?;
-        if branch != "(detached)" {
-            run_status(
-                Command::new(context.config.tool("git"))
-                    .arg("-C")
-                    .arg(&context.repo.root)
-                    .args(["branch", "-D", &branch]),
-            )?;
-        }
+        delete_worktree_session(&context.repo, &context.config, &path, &branch)?;
         self.refresh_sessions()?;
         self.show_message("deleted local session data, worktree, and branch")?;
-        Ok(())
-    }
-
-    fn delete_local_data(
-        &self,
-        repo: &crate::repo::Repository,
-        branch: &str,
-    ) -> Result<(), String> {
-        remove_task_metadata(repo, branch)?;
-        remove_pr_cache(repo, branch)?;
-        remove_logs(repo, branch)?;
-        remove_process_state(repo, branch)?;
-        clear_hidden(repo, branch)?;
         Ok(())
     }
 }
@@ -1284,22 +1248,7 @@ fn clipboard_command_exists(program: &str) -> bool {
 }
 
 fn write_clipboard_command(program: &str, args: &[&str], text: &str) -> Result<(), String> {
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("{program}: {error}"))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| format!("{program}: stdin unavailable"))?;
-    stdin
-        .write_all(text.as_bytes())
-        .map_err(|error| format!("{program}: {error}"))?;
-    drop(stdin);
-    Ok(())
+    run_status_with_stdin(Command::new(program).args(args), text)
 }
 
 fn tmux_agent_state(
@@ -1314,97 +1263,6 @@ fn tmux_agent_state(
         return Some(AgentState::ExitedOk);
     }
     None
-}
-
-fn create_worktree_session(
-    repo: &crate::repo::Repository,
-    config: &crate::config::Config,
-    branch: &str,
-) -> Result<(), String> {
-    run_capture(
-        Command::new(config.tool(&config.worktree_command)).args(create_worktree_args(
-            &repo.root,
-            branch,
-            config.default_base.as_deref(),
-        )),
-    )?;
-    Ok(())
-}
-
-fn create_worktree_args(repo_root: &Path, branch: &str, default_base: Option<&str>) -> Vec<String> {
-    let mut args = vec![
-        "-C".to_string(),
-        repo_root.display().to_string(),
-        "switch".to_string(),
-        "--create".to_string(),
-        "--no-cd".to_string(),
-        "--format".to_string(),
-        "json".to_string(),
-    ];
-    if let Some(base) = default_base.map(str::trim).filter(|base| !base.is_empty()) {
-        args.push("--base".to_string());
-        args.push(base.to_string());
-    }
-    args.push(branch.to_string());
-    args
-}
-
-fn create_pr_args(default_base: Option<&str>, body: &str) -> Vec<String> {
-    let mut args = vec![
-        "pr".to_string(),
-        "create".to_string(),
-        "--fill".to_string(),
-        "--body".to_string(),
-        body.to_string(),
-    ];
-    if let Some(base) = default_base.map(str::trim).filter(|base| !base.is_empty()) {
-        args.push("--base".to_string());
-        args.push(base.to_string());
-    }
-    args
-}
-
-fn merge_pr_args(pr_number: &str, method: crate::config::MergeMethod) -> Vec<String> {
-    vec![
-        "pr".to_string(),
-        "merge".to_string(),
-        pr_number.to_string(),
-        method.gh_flag().to_string(),
-        "--delete-branch".to_string(),
-    ]
-}
-
-fn remove_worktree(
-    repo: &crate::repo::Repository,
-    config: &crate::config::Config,
-    path: &Path,
-) -> Result<(), String> {
-    let remove_result = run_status(
-        Command::new(config.tool("git"))
-            .arg("-C")
-            .arg(&repo.root)
-            .args(["worktree", "remove", "--force"])
-            .arg(path),
-    );
-    match remove_result {
-        Ok(()) => prune_worktrees(repo, config),
-        Err(error) if !path.exists() => prune_worktrees(repo, config).map_err(|prune_error| {
-            format!("{error}; also failed to prune worktrees: {prune_error}")
-        }),
-        Err(error) => Err(error),
-    }
-}
-
-fn prune_worktrees(
-    repo: &crate::repo::Repository,
-    config: &crate::config::Config,
-) -> Result<(), String> {
-    run_status(
-        Command::new(config.tool("git"))
-            .arg("-C")
-            .arg(&repo.root)
-            .args(["worktree", "prune"]),
-    )
 }
 
 fn pr_render_signature(cache: &PrCache) -> String {
@@ -1446,62 +1304,6 @@ fn session_comment_count(session: &crate::session::Session) -> usize {
                 .map(|summary| summary.comment_count as usize)
         })
         .unwrap_or(0)
-}
-
-fn refresh_pr_summary_index_for_repo(
-    repos: &[ManagedRepo],
-    sessions: &mut [crate::session::Session],
-    repo_index: usize,
-    summaries: Vec<crate::github::PrSummary>,
-) {
-    let Some(managed) = repos.get(repo_index) else {
-        return;
-    };
-    let now = std::time::Instant::now();
-    let refreshed = crate::util::timestamp_label();
-    for session in sessions
-        .iter_mut()
-        .filter(|session| session.repo_index == repo_index)
-    {
-        session.pr.last_polled = Some(now);
-        if session.branch == "(detached)" || managed.config.is_default_branch(&session.branch) {
-            session.pr.summary = None;
-            session.pr.details = None;
-            session.pr.signature = None;
-            session.pr.error = None;
-            session.pr.last_refreshed = Some(refreshed.clone());
-            let _ = remove_pr_cache(&managed.repo, &session.branch);
-            continue;
-        }
-        let summary = summaries
-            .iter()
-            .find(|summary| summary.head_ref == session.branch)
-            .cloned();
-        if let Some(summary) = summary {
-            let signature = summary.signature();
-            if session.pr.signature.as_deref() != Some(signature.as_str()) {
-                session.pr.details = None;
-                session.pr.details_last_polled = None;
-            }
-            session.pr.summary = Some(summary);
-            session.pr.signature = Some(signature);
-            session.pr.error = None;
-            session.pr.last_refreshed = Some(refreshed.clone());
-            let _ = save_pr_cache(&managed.repo, &session.branch, &session.pr);
-            if let Some(details) = &session.pr.details {
-                let _ = save_pr_details_cache(&managed.repo, &session.branch, details);
-            } else {
-                let _ = crate::github::remove_pr_details_cache(&managed.repo, &session.branch);
-            }
-        } else {
-            session.pr.summary = None;
-            session.pr.details = None;
-            session.pr.signature = None;
-            session.pr.error = None;
-            session.pr.last_refreshed = Some(refreshed.clone());
-            let _ = remove_pr_cache(&managed.repo, &session.branch);
-        }
-    }
 }
 
 fn fetch_wt_columns(
@@ -1685,10 +1487,7 @@ mod tests {
     use crate::session::Session;
     use crate::tui::{TmuxWarmupResult, Tui};
 
-    use super::{
-        create_pr_args, create_worktree_args, merge_pr_args, remove_worktree,
-        status_label_with_behind, tmux_agent_state, tmux_slot_key, tmux_warmup_key,
-    };
+    use super::{status_label_with_behind, tmux_agent_state, tmux_slot_key, tmux_warmup_key};
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1714,104 +1513,6 @@ mod tests {
         let state = tmux_agent_state(AgentState::Running, true, true);
 
         assert_eq!(state, None);
-    }
-
-    #[test]
-    fn create_worktree_uses_worktrunk_without_changing_directory() {
-        let args = create_worktree_args(
-            PathBuf::from("/repo/prism").as_path(),
-            "feat/test",
-            Some("main"),
-        );
-
-        assert_eq!(
-            args,
-            vec![
-                "-C",
-                "/repo/prism",
-                "switch",
-                "--create",
-                "--no-cd",
-                "--format",
-                "json",
-                "--base",
-                "main",
-                "feat/test",
-            ]
-        );
-    }
-
-    #[test]
-    fn create_pr_uses_fill_with_explicit_empty_body_and_default_base_when_configured() {
-        assert_eq!(
-            create_pr_args(Some("main"), ""),
-            vec!["pr", "create", "--fill", "--body", "", "--base", "main"]
-        );
-        assert_eq!(
-            create_pr_args(None, "manual description"),
-            vec!["pr", "create", "--fill", "--body", "manual description"]
-        );
-    }
-
-    #[test]
-    fn merge_pr_args_use_configured_method() {
-        assert_eq!(
-            merge_pr_args("42", MergeMethod::Squash),
-            vec!["pr", "merge", "42", "--squash", "--delete-branch"]
-        );
-        assert_eq!(
-            merge_pr_args("42", MergeMethod::Merge),
-            vec!["pr", "merge", "42", "--merge", "--delete-branch"]
-        );
-        assert_eq!(
-            merge_pr_args("42", MergeMethod::Rebase),
-            vec!["pr", "merge", "42", "--rebase", "--delete-branch"]
-        );
-    }
-
-    #[test]
-    fn remove_worktree_prunes_when_missing_path_cannot_be_removed() {
-        let temp = unique_temp_dir("prism-remove-worktree-prune-test");
-        fs::create_dir_all(&temp).unwrap();
-        let log = temp.join("git.log");
-        let git = temp.join("git");
-        fs::write(
-            &git,
-            format!(
-                r#"#!/bin/sh
-printf '%s\n' "$*" >> '{}'
-case "$*" in
-  *"worktree remove"*)
-    echo "not a working tree" >&2
-    exit 1
-    ;;
-  *"worktree prune"*)
-    exit 0
-    ;;
-esac
-exit 0
-"#,
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&git).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&git, permissions).unwrap();
-
-        let mut config = test_config();
-        config
-            .tools
-            .insert("git".to_string(), git.display().to_string());
-        let repo = Repository { root: temp.clone() };
-        let missing = temp.join("missing");
-
-        remove_worktree(&repo, &config, &missing).unwrap();
-
-        let commands = fs::read_to_string(&log).unwrap();
-        assert!(commands.contains("worktree prune"));
-
-        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
