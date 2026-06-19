@@ -1,9 +1,12 @@
 #![allow(dead_code)]
 
+use std::collections::BTreeMap;
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{OptionalExtension, params};
@@ -23,6 +26,13 @@ const SSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SSE_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_START_POLL: Duration = Duration::from_millis(100);
+
+static OWNED_SERVER_PROCESSES: OnceLock<Mutex<BTreeMap<u32, OwnedServerProcess>>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug)]
+struct OwnedServerProcess {
+    start_time_ticks: Option<u64>,
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpencodeRuntime {
@@ -165,6 +175,7 @@ pub fn ensure_opencode_server(
             .stderr(Stdio::null())
             .spawn()
             .map_err(|error| format!("start opencode server: {error}"))?;
+        record_owned_server_process(child.id());
         wait_for_health(&server_url)?;
         Some(child.id())
     };
@@ -279,14 +290,23 @@ pub fn shutdown_owned_server(runtime: &OpencodeRuntime) -> Result<(), String> {
     let Some(pid) = runtime.server_pid else {
         return Ok(());
     };
+    let Some(owned) = owned_server_process(pid) else {
+        return Ok(());
+    };
+    if !process_matches_owned_start(pid, owned) {
+        forget_owned_server_process(pid);
+        return Ok(());
+    }
     #[cfg(unix)]
     {
         let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         if result == 0 {
+            forget_owned_server_process(pid);
             Ok(())
         } else {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::ESRCH) {
+                forget_owned_server_process(pid);
                 Ok(())
             } else {
                 Err(format!("stop opencode server {pid}: {error}"))
@@ -297,6 +317,53 @@ pub fn shutdown_owned_server(runtime: &OpencodeRuntime) -> Result<(), String> {
     {
         let _ = pid;
         Ok(())
+    }
+}
+
+fn owned_server_processes() -> &'static Mutex<BTreeMap<u32, OwnedServerProcess>> {
+    OWNED_SERVER_PROCESSES.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn record_owned_server_process(pid: u32) {
+    if let Ok(mut processes) = owned_server_processes().lock() {
+        processes.insert(
+            pid,
+            OwnedServerProcess {
+                start_time_ticks: process_start_time_ticks(pid),
+            },
+        );
+    }
+}
+
+fn owned_server_process(pid: u32) -> Option<OwnedServerProcess> {
+    owned_server_processes().lock().ok()?.get(&pid).copied()
+}
+
+fn forget_owned_server_process(pid: u32) {
+    if let Ok(mut processes) = owned_server_processes().lock() {
+        processes.remove(&pid);
+    }
+}
+
+fn process_matches_owned_start(pid: u32, owned: OwnedServerProcess) -> bool {
+    match (owned.start_time_ticks, process_start_time_ticks(pid)) {
+        (Some(expected), Some(actual)) => expected == actual,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
+fn process_start_time_ticks(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let fields_after_comm = stat.rsplit_once(") ")?.1;
+        fields_after_comm.split_whitespace().nth(19)?.parse().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
     }
 }
 

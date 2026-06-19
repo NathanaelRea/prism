@@ -480,9 +480,40 @@ impl Tui {
             else {
                 continue;
             };
-            if runtime.opencode_session_id.is_none()
-                || !self.opencode_sse_servers.insert(runtime.server_url.clone())
-            {
+            let Some(session_id) = runtime.opencode_session_id.clone() else {
+                continue;
+            };
+            if let Some(session) = self.sessions.get_mut(session_index) {
+                let current = session.opencode_status.clone();
+                if current
+                    .as_ref()
+                    .and_then(|status| status.server_url.as_deref())
+                    != Some(runtime.server_url.as_str())
+                    || current
+                        .as_ref()
+                        .and_then(|status| status.session_id.as_deref())
+                        != Some(session_id.as_str())
+                {
+                    session.opencode_status = Some(OpencodeStatus {
+                        server_url: Some(runtime.server_url.clone()),
+                        session_id: Some(session_id.clone()),
+                        title: current.as_ref().and_then(|status| status.title.clone()),
+                        state: opencode::OpencodeState::Unknown,
+                        latest_message: current
+                            .as_ref()
+                            .and_then(|status| status.latest_message.clone()),
+                        active_tool: current
+                            .as_ref()
+                            .and_then(|status| status.active_tool.clone()),
+                        todos: current
+                            .as_ref()
+                            .map(|status| status.todos.clone())
+                            .unwrap_or_default(),
+                        last_updated_unix_ms: None,
+                    });
+                }
+            }
+            if !self.opencode_sse_servers.insert(runtime.server_url.clone()) {
                 continue;
             }
             let server_url = runtime.server_url;
