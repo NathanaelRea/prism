@@ -95,6 +95,7 @@ impl KeyInput {
                     self.state = KeyInputState::Normal;
                     match byte {
                         b'g' => keys.push(Key::LazyGit),
+                        b'o' => keys.push(Key::OpenPr),
                         b'P' => keys.push(Key::Push),
                         b'M' => keys.push(Key::Merge),
                         b'f' => keys.push(Key::ReviewFix),
@@ -123,6 +124,7 @@ pub enum Key {
     LeaderGit,
     OpenTmuxSession,
     LazyGit,
+    OpenPr,
     Terminal,
     Help,
     Refresh,
@@ -215,6 +217,16 @@ mod tests {
         assert!(matches!(
             keys.as_slice(),
             [Key::Leader, Key::LeaderGit, Key::LazyGit]
+        ));
+    }
+
+    #[test]
+    fn key_input_handles_leader_open_pr() {
+        let mut input = KeyInput::default();
+        let keys = input.feed(b" go");
+        assert!(matches!(
+            keys.as_slice(),
+            [Key::Leader, Key::LeaderGit, Key::OpenPr]
         ));
     }
 

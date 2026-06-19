@@ -394,6 +394,15 @@ impl Tui {
                             self.show_error("lazygit failed", &error)?;
                         }
                     }
+                    Key::OpenPr => {
+                        self.clear_leader_hint();
+                        pending_g = false;
+                        if self.focused_panel != PanelFocus::Worktrees {
+                            self.show_message("focus worktrees to open a PR")?;
+                        } else if let Err(error) = self.open_selected_pr() {
+                            self.show_error("open PR failed", &error)?;
+                        }
+                    }
                     Key::Terminal => {
                         self.clear_leader_hint();
                         pending_g = false;
@@ -607,6 +616,7 @@ impl Tui {
             "Space Enter  open tmux window 3: terminal",
             "Space g g    open tmux window 2: lazygit",
             "Ctrl-/       open tmux window 3: terminal",
+            "Space g o    open selected PR in browser",
             "Space g P    push branch, create PR if needed",
             "Space g M    merge selected PR",
             "Space g f    stage review-fix prompt",
@@ -1598,7 +1608,7 @@ impl Tui {
             }
             (Some(LeaderHint::Git), PanelFocus::Repos) => Some("p: pull default branch"),
             (Some(LeaderHint::Git), PanelFocus::Worktrees) => {
-                Some("g: lazygit  P: push/create PR  M: merge  f: review fix")
+                Some("g: lazygit  o: open PR  P: push/create PR  M: merge  f: review fix")
             }
             (None, _) => None,
         }
