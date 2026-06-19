@@ -46,8 +46,6 @@ pub(crate) struct WorktreeRow {
     pub worktree_path: String,
     pub branch: String,
     pub kind: WorktreeKind,
-    pub adopted: bool,
-    pub status_label: String,
     pub agent_state: AgentState,
     pub pr: PrCache,
     pub wt_columns: BTreeMap<String, String>,
@@ -383,43 +381,27 @@ fn format_worktree_row(config: &Config, row: &WorktreeRow, width: usize) -> Stri
         " ".to_string()
     };
     let branch_code = if row.selected { "1;37" } else { "37" };
-    let kind = match row.kind {
-        WorktreeKind::DefaultBranch => "base",
-        WorktreeKind::FeatureWorktree if row.adopted => "wt",
-        WorktreeKind::FeatureWorktree => "unadopted",
-        WorktreeKind::Detached => "detached",
-    };
-    let pr = pr_label_for_row(config, row);
-    let review = review_icon_for_row(config, row);
-    let comments = comment_count_label_for_row(config, row);
-    let extra = configured_column_label_for_values(config, &row.wt_columns);
-    let status_color = if row.kind == WorktreeKind::DefaultBranch
-        && status_count(&row.status_label, "behind").is_some()
-    {
-        "31"
+    let status_icons = worktree_status_icons(config, row);
+    let name = if status_icons.is_empty() {
+        styled_cell(&row.branch, 22, branch_code)
     } else {
-        git_status_color(&row.status_label)
+        format!(
+            "{} {}",
+            status_icons,
+            styled_cell(&row.branch, 22, branch_code)
+        )
     };
+    let extra = configured_column_label_for_values(config, &row.wt_columns);
     let text = format!(
-        "{} {} {} {} {} {} {} {} {} {} {} {}",
+        "{} {} {} {} {} {}",
         marker,
         styled_cell(&row_number, 3, "90"),
-        styled_cell(kind, 9, "90"),
-        styled_cell(&row.branch, 22, branch_code),
-        styled_cell(&git_status_indicator(&row.status_label), 9, status_color),
+        name,
         styled_cell(
             agent_icon(row.agent_state),
             3,
             agent_state_color(row.agent_state)
         ),
-        styled_cell(&pr, 7, pr_color_for_cache(&row.pr)),
-        styled_cell(&review, 3, review_icon_color_for_row(config, row)),
-        styled_cell(
-            ci_icon_for_row(config, row),
-            3,
-            ci_color_for_row(config, row)
-        ),
-        styled_cell(&comments, 4, comment_color_for_cache(&row.pr)),
         extra,
         truncate_line(summary, 50),
     );
@@ -945,74 +927,70 @@ fn strip_ascii_control_chars(text: &str) -> String {
     text.chars().filter(|ch| !ch.is_ascii_control()).collect()
 }
 
-fn pr_label_for_row(config: &Config, row: &WorktreeRow) -> String {
+fn worktree_status_icons(config: &Config, row: &WorktreeRow) -> String {
     if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
         return String::new();
     }
-    let Some(summary) = &row.pr.summary else {
-        return "no-pr".to_string();
-    };
-    let icon = if summary.merged {
-        "◆"
-    } else if summary.draft {
-        "◌"
-    } else if summary.state == "OPEN" {
-        "●"
-    } else {
-        "×"
-    };
-    format!("{icon}#{}", summary.number)
-}
 
-fn review_icon_for_row(config: &Config, row: &WorktreeRow) -> String {
-    if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
-        return String::new();
-    }
+    let mut icons = String::new();
     let Some(summary) = &row.pr.summary else {
-        return String::new();
+        icons.push_str(&color("◇", "90"));
+        return icons;
     };
-    let review = review_decision_for_display(summary, row.pr.details.as_ref());
-    match review.as_str() {
-        "APPROVED" => "✓",
-        "CHANGES_REQUESTED" => "!",
-        "REVIEW_REQUIRED" if !summary.requested_reviewers.is_empty() => "@",
-        "REVIEW_REQUIRED" => "?",
-        "COMMENTED" => "•",
-        _ => "",
-    }
-    .to_string()
-}
 
-fn review_icon_color_for_row(config: &Config, row: &WorktreeRow) -> &'static str {
-    if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
-        return "90";
-    }
-    let Some(summary) = &row.pr.summary else {
-        return "90";
-    };
-    let review = review_decision_for_display(summary, row.pr.details.as_ref());
-    review_color(&review)
+    icons.push_str(&color(pr_state_icon(summary), pr_state_color(summary)));
+    icons.push_str(&color(
+        ci_icon_for_row(config, row),
+        ci_color_for_row(config, row),
+    ));
+    icons.push_str(&color(
+        &comment_count_label_for_row(config, row),
+        comment_count_color_for_row(row),
+    ));
+    icons
 }
 
 fn comment_count_label_for_row(config: &Config, row: &WorktreeRow) -> String {
     if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
         return String::new();
     }
-    let count = row
+
+    if let Some(details) = &row.pr.details {
+        let open = details.comments.len()
+            + details
+                .review_comments
+                .iter()
+                .filter(|comment| !comment.resolved)
+                .count();
+        let resolved = details
+            .review_comments
+            .iter()
+            .filter(|comment| comment.resolved)
+            .count();
+        return format!("#{open}✓{resolved}");
+    }
+
+    row.pr
+        .summary
+        .as_ref()
+        .map(|summary| format!("#{}", summary.comment_count))
+        .unwrap_or_else(|| "#?".to_string())
+}
+
+fn comment_count_color_for_row(row: &WorktreeRow) -> &'static str {
+    let has_comments = row
         .pr
         .details
         .as_ref()
-        .map(|details| details.comments.len() + details.review_comments.len())
+        .map(|details| !details.comments.is_empty() || !details.review_comments.is_empty())
         .or_else(|| {
             row.pr
                 .summary
                 .as_ref()
-                .map(|summary| summary.comment_count as usize)
-        });
-    let Some(count) = count else {
-        return "C?".to_string();
-    };
-    format!("C{count}")
+                .map(|summary| summary.comment_count > 0)
+        })
+        .unwrap_or(false);
+    if has_comments { "36" } else { "90" }
 }
 
 fn ci_icon(config: &Config, session: &Session) -> &'static str {
@@ -1026,7 +1004,7 @@ fn ci_icon(config: &Config, session: &Session) -> &'static str {
         .map(|summary| summary.check_status.as_str())
     {
         Some("passed") => "✓",
-        Some("failed") => "x",
+        Some("failed") => "✕",
         Some("running") => "•",
         Some("mixed") => "±",
         Some("unknown") | None => "?",
@@ -1045,7 +1023,7 @@ fn ci_icon_for_row(config: &Config, row: &WorktreeRow) -> &'static str {
         .map(|summary| summary.check_status.as_str())
     {
         Some("passed") => "✓",
-        Some("failed") => "x",
+        Some("failed") => "✕",
         Some("running") => "•",
         Some("mixed") => "±",
         Some("unknown") | None => "?",
@@ -1081,18 +1059,6 @@ fn git_status_indicator(status: &str) -> String {
     out
 }
 
-fn git_status_color(status: &str) -> &'static str {
-    if status_count(status, "dirty").is_some() {
-        "31"
-    } else if status_count(status, "behind").is_some() {
-        "33"
-    } else if status_count(status, "ahead").is_some() {
-        "36"
-    } else {
-        "32"
-    }
-}
-
 fn agent_state_color(state: AgentState) -> &'static str {
     match state {
         AgentState::Idle => "90",
@@ -1101,21 +1067,6 @@ fn agent_state_color(state: AgentState) -> &'static str {
         AgentState::ExitedError => "31",
         AgentState::NeedsRestart => "35",
         AgentState::NeedsInput => "35",
-    }
-}
-
-fn pr_color_for_cache(pr: &PrCache) -> &'static str {
-    let Some(summary) = &pr.summary else {
-        return "90";
-    };
-    if summary.merged {
-        "35"
-    } else if summary.draft {
-        "90"
-    } else if summary.state == "OPEN" {
-        "32"
-    } else {
-        "31"
     }
 }
 
@@ -1154,17 +1105,6 @@ fn ci_color_for_row(config: &Config, row: &WorktreeRow) -> &'static str {
         Some("mixed") => "35",
         Some("unknown") | None => "90",
         Some(_) => "33",
-    }
-}
-
-fn comment_color_for_cache(pr: &PrCache) -> &'static str {
-    let Some(details) = &pr.details else {
-        return "90";
-    };
-    if details.comments.is_empty() && details.review_comments.is_empty() {
-        "90"
-    } else {
-        "36"
     }
 }
 
@@ -1388,11 +1328,11 @@ fn description_lines(body: &str, max_lines: usize) -> Vec<String> {
 
 fn pr_state_icon(summary: &crate::github::PrSummary) -> &'static str {
     if summary.merged {
-        "◆"
+        "⋈"
     } else if summary.draft {
-        "◌"
+        "◐"
     } else if summary.state == "OPEN" {
-        "●"
+        "⇄"
     } else {
         "×"
     }
@@ -1465,14 +1405,14 @@ mod tests {
 
     use crate::agent::AgentState;
     use crate::config::{Checks, Config, EscapeKey, MergeMethod};
-    use crate::github::{PrCache, PrSummary};
+    use crate::github::{PrCache, PrComment, PrDetails, PrReviewComment, PrSummary};
     use crate::session::Session;
     use crate::tui::PanelFocus;
 
     use super::{
         FrameModel, RepoRow, StatusRow, WorktreeKind, WorktreeRow, configured_column_label,
         format_column_value, format_repo_row, git_status_indicator, render_model_frame,
-        visible_len,
+        visible_len, worktree_status_icons,
     };
 
     #[test]
@@ -1625,6 +1565,43 @@ mod tests {
         assert_eq!(git_status_indicator("behind 2"), "↓2");
         assert_eq!(git_status_indicator("ahead 3 behind 2"), "↑3↓2");
         assert_eq!(git_status_indicator("dirty 4 ahead 3 behind 2"), "✗4↑3↓2");
+    }
+
+    #[test]
+    fn worktree_status_icons_show_pr_ci_and_comment_counts() {
+        let config = test_config(Some("main"));
+        let mut pr = test_pr(12, false);
+        pr.details = Some(PrDetails {
+            comments: vec![PrComment {
+                author: "a".to_string(),
+                body: "top-level".to_string(),
+            }],
+            review_comments: vec![
+                PrReviewComment {
+                    author: "b".to_string(),
+                    path: "src/lib.rs".to_string(),
+                    line: "1".to_string(),
+                    body: "open".to_string(),
+                    created_at: "now".to_string(),
+                    resolved: false,
+                },
+                PrReviewComment {
+                    author: "c".to_string(),
+                    path: "src/lib.rs".to_string(),
+                    line: "2".to_string(),
+                    body: "resolved".to_string(),
+                    created_at: "now".to_string(),
+                    resolved: true,
+                },
+            ],
+            ..PrDetails::default()
+        });
+        let session = test_session("feature", "clean", AgentState::Idle, pr);
+        let row = test_worktree_row(&config, &session, 0, true);
+
+        let icons = crate::util::strip_ansi(&worktree_status_icons(&config, &row));
+
+        assert_eq!(icons, "⇄✓#2✓1");
     }
 
     #[test]
@@ -1933,8 +1910,6 @@ mod tests {
             } else {
                 WorktreeKind::FeatureWorktree
             },
-            adopted: session.adopted,
-            status_label: session.status_label.clone(),
             agent_state: session.agent_state,
             pr: session.pr.clone(),
             wt_columns: session.wt_columns.clone(),

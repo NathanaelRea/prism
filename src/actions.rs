@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
@@ -17,7 +17,7 @@ use crate::lifecycle::{
     run_pre_pr_checks, run_pre_push_checks,
 };
 use crate::process::command_exists;
-use crate::process::{run_capture, run_status_with_stdin};
+use crate::process::run_status_with_stdin;
 use crate::review::build_review_fix_prompt;
 use crate::session::{
     append_agent_log, append_runtime_log, clear_hidden, discover_sessions, save_agent_state,
@@ -1044,6 +1044,47 @@ impl Tui {
         Ok(())
     }
 
+    pub(crate) fn open_selected_pr(&mut self) -> Result<(), String> {
+        let Some(context) = self.selected_worktree_context() else {
+            return Ok(());
+        };
+        let selected = context.session_index;
+        if context
+            .config
+            .is_default_branch(&self.sessions[selected].branch)
+        {
+            self.show_message("default branch is not treated as a PR branch")?;
+            return Ok(());
+        }
+        if self.sessions[selected].branch == "(detached)" {
+            self.show_message("cannot open a PR for a detached worktree")?;
+            return Ok(());
+        }
+        if self.sessions[selected].pr.summary.is_none() {
+            self.show_loading_dialog("Open Pull Request", "Refreshing pull request")?;
+            let session = &mut self.sessions[selected];
+            refresh_pr_cache(
+                &context.repo,
+                &session.branch,
+                &mut session.pr,
+                &session.path,
+                &context.config,
+                false,
+            );
+        }
+        let Some(summary) = pr_summary_or_error(&self.sessions[selected].pr)? else {
+            self.show_message("no pull request found for selected branch")?;
+            return Ok(());
+        };
+        let url = summary.url.trim();
+        if url.is_empty() {
+            return Err(format!("PR #{} has no URL", summary.number));
+        }
+        open_url_in_browser(url)?;
+        self.show_message(&format!("opened PR #{} in browser", summary.number))?;
+        Ok(())
+    }
+
     fn paste_prompt_into_tmux_agent(&mut self, index: usize, prompt: &str) -> Result<(), String> {
         let session = self
             .sessions
@@ -1212,6 +1253,9 @@ impl Tui {
             return Ok(());
         }
         delete_worktree_session(&context.repo, &context.config, &path, &branch)?;
+        if self.selected_worktree_by_repo.get(&context.repo.root) == Some(&path) {
+            self.selected_worktree_by_repo.remove(&context.repo.root);
+        }
         self.refresh_sessions()?;
         self.show_message("deleted local session data, worktree, and branch")?;
         Ok(())
@@ -1239,6 +1283,69 @@ fn copy_to_clipboard(config: &crate::config::Config, text: &str) -> Result<(), S
         Err("no clipboard tool found; install wl-copy, xclip, xsel, or pbcopy".to_string())
     } else {
         Err(format!("clipboard copy failed: {}", errors.join("; ")))
+    }
+}
+
+fn open_url_in_browser(url: &str) -> Result<(), String> {
+    run_browser_opener(&browser_opener_candidates(), url).map(|_| ())
+}
+
+fn pr_summary_or_error(cache: &PrCache) -> Result<Option<crate::github::PrSummary>, String> {
+    if let Some(summary) = &cache.summary {
+        Ok(Some(summary.clone()))
+    } else if let Some(error) = &cache.error {
+        Err(error.clone())
+    } else {
+        Ok(None)
+    }
+}
+
+const NO_BROWSER_ARGS: &[&str] = &[];
+const GIO_BROWSER_ARGS: &[&str] = &["open"];
+const WINDOWS_BROWSER_ARGS: &[&str] = &["/C", "start", ""];
+
+fn browser_opener_candidates() -> Vec<(&'static str, &'static [&'static str])> {
+    if cfg!(target_os = "macos") {
+        vec![("open", NO_BROWSER_ARGS)]
+    } else if cfg!(target_os = "windows") {
+        vec![("cmd", WINDOWS_BROWSER_ARGS)]
+    } else {
+        vec![
+            ("xdg-open", NO_BROWSER_ARGS),
+            ("gio", GIO_BROWSER_ARGS),
+            ("wslview", NO_BROWSER_ARGS),
+        ]
+    }
+}
+
+fn run_browser_opener(candidates: &[(&str, &[&str])], url: &str) -> Result<String, String> {
+    let mut errors = Vec::new();
+    for (program, args) in candidates {
+        if !command_exists(program) {
+            continue;
+        }
+        match Command::new(program)
+            .args(*args)
+            .arg(url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+        {
+            Ok(status) if status.success() => return Ok((*program).to_string()),
+            Ok(status) => errors.push(format!("{program}: exited with {status}")),
+            Err(error) => errors.push(format!("{program}: {error}")),
+        }
+    }
+    if errors.is_empty() {
+        let names = candidates
+            .iter()
+            .map(|(program, _)| *program)
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(format!("no browser opener found; tried {names}"))
+    } else {
+        Err(format!("browser open failed: {}", errors.join("; ")))
     }
 }
 
@@ -1487,7 +1594,10 @@ mod tests {
     use crate::session::Session;
     use crate::tui::{TmuxWarmupResult, Tui};
 
-    use super::{status_label_with_behind, tmux_agent_state, tmux_slot_key, tmux_warmup_key};
+    use super::{
+        pr_summary_or_error, run_browser_opener, status_label_with_behind, tmux_agent_state,
+        tmux_slot_key, tmux_warmup_key,
+    };
     use std::collections::{BTreeMap, VecDeque};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1513,6 +1623,57 @@ mod tests {
         let state = tmux_agent_state(AgentState::Running, true, true);
 
         assert_eq!(state, None);
+    }
+
+    #[test]
+    fn browser_opener_invokes_first_available_candidate() {
+        let temp = unique_temp_dir("prism-browser-opener-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("open.log");
+        let opener = temp.join("opener");
+        fs::write(
+            &opener,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$@" > '{}'
+exit 0
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&opener).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&opener, permissions).unwrap();
+        let opener = opener.display().to_string();
+
+        let no_args: &[&str] = &[];
+        let flag_args: &[&str] = &["--flag"];
+        let candidates = [
+            ("/definitely/missing", no_args),
+            (opener.as_str(), flag_args),
+        ];
+
+        let used = run_browser_opener(&candidates, "https://example.test/pr/42").unwrap();
+
+        assert_eq!(used, opener);
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            "--flag\nhttps://example.test/pr/42\n"
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn pr_summary_or_error_returns_refresh_error() {
+        let cache = PrCache {
+            error: Some("gh pr view: authentication failed".to_string()),
+            ..PrCache::default()
+        };
+
+        let error = pr_summary_or_error(&cache).unwrap_err();
+
+        assert_eq!(error, "gh pr view: authentication failed");
     }
 
     #[test]

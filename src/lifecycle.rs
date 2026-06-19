@@ -9,7 +9,7 @@ use crate::github::{
 };
 use crate::process::{run_capture, run_configured_commands, run_status};
 use crate::repo::Repository;
-use crate::session::{remove_logs, remove_process_state, remove_task_metadata};
+use crate::session::{remove_logs, remove_session_db_records};
 
 pub(crate) struct PrSummaryRepository<'a> {
     pub repo: &'a Repository,
@@ -109,11 +109,8 @@ pub(crate) fn merge_pull_request(
 }
 
 pub(crate) fn delete_session_local_data(repo: &Repository, branch: &str) -> Result<(), String> {
-    remove_task_metadata(repo, branch)?;
-    remove_pr_cache(repo, branch)?;
+    remove_session_db_records(repo, branch)?;
     remove_logs(repo, branch)?;
-    remove_process_state(repo, branch)?;
-    crate::session::clear_hidden(repo, branch)?;
     Ok(())
 }
 
@@ -253,7 +250,7 @@ fn remove_worktree(repo: &Repository, config: &Config, path: &Path) -> Result<()
             .arg(path),
     );
     match remove_result {
-        Ok(()) => prune_worktrees(repo, config),
+        Ok(()) => Ok(()),
         Err(error) if !path.exists() => prune_worktrees(repo, config).map_err(|prune_error| {
             format!("{error}; also failed to prune worktrees: {prune_error}")
         }),
@@ -375,6 +372,44 @@ exit 0
 
         let commands = fs::read_to_string(&log).unwrap();
         assert!(commands.contains("worktree prune"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn remove_worktree_does_not_prune_after_successful_remove() {
+        let temp = unique_temp_dir("prism-remove-worktree-no-prune-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("git.log");
+        let git = temp.join("git");
+        fs::write(
+            &git,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+exit 0
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&git, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        let repo = Repository { root: temp.clone() };
+        let path = temp.join("worktree");
+        fs::create_dir_all(&path).unwrap();
+
+        remove_worktree(&repo, &config, &path).unwrap();
+
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(commands.contains("worktree remove --force"));
+        assert!(!commands.contains("worktree prune"));
 
         let _ = fs::remove_dir_all(temp);
     }

@@ -46,6 +46,7 @@ Common keys:
 - `h` / `l` or `Tab` moves focus between panels.
 - `Space Enter` or `Ctrl-/` opens tmux window 3: terminal.
 - `Space g g` opens tmux window 2: lazygit.
+- `Space g o` opens the selected pull request in a browser.
 - `Space g P` pushes the selected branch and creates a pull request if needed.
 - `Space g M` merges the selected pull request.
 - `Space g f` copies a review-fix prompt.

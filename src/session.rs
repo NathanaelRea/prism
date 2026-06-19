@@ -166,14 +166,41 @@ pub fn write_task_metadata(
     })
 }
 
-pub fn remove_task_metadata(repo: &Repository, branch: &str) -> Result<(), String> {
+pub fn remove_session_db_records(repo: &Repository, branch: &str) -> Result<(), String> {
     observability::with_writable_db(repo, |conn| {
-        conn.execute(
-            "delete from task_metadata where branch = ?1",
-            params![branch],
-        )
-        .map_err(|error| format!("remove task metadata: {error}"))?;
-        Ok(())
+        conn.execute_batch("begin transaction")
+            .map_err(|error| format!("begin session cleanup transaction: {error}"))?;
+        let result = (|| -> Result<(), String> {
+            conn.execute(
+                "delete from task_metadata where branch = ?1",
+                params![branch],
+            )
+            .map_err(|error| format!("remove task metadata: {error}"))?;
+            conn.execute("delete from pr_cache where branch = ?1", params![branch])
+                .map_err(|error| format!("remove PR cache: {error}"))?;
+            conn.execute(
+                "delete from pr_details_cache where branch = ?1",
+                params![branch],
+            )
+            .map_err(|error| format!("remove PR details cache: {error}"))?;
+            conn.execute("delete from agent_state where branch = ?1", params![branch])
+                .map_err(|error| format!("remove process state: {error}"))?;
+            conn.execute(
+                "delete from hidden_session where branch = ?1",
+                params![branch],
+            )
+            .map_err(|error| format!("remove hidden marker: {error}"))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn
+                .execute_batch("commit")
+                .map_err(|error| format!("commit session cleanup transaction: {error}")),
+            Err(error) => {
+                let _ = conn.execute_batch("rollback");
+                Err(error)
+            }
+        }
     })
 }
 
@@ -221,14 +248,6 @@ pub fn save_agent_state(repo: &Repository, branch: &str, state: AgentState) -> R
             params![branch, state.label(), unix_seconds()],
         )
         .map_err(|error| format!("write process state: {error}"))?;
-        Ok(())
-    })
-}
-
-pub fn remove_process_state(repo: &Repository, branch: &str) -> Result<(), String> {
-    observability::with_writable_db(repo, |conn| {
-        conn.execute("delete from agent_state where branch = ?1", params![branch])
-            .map_err(|error| format!("remove process state: {error}"))?;
         Ok(())
     })
 }
