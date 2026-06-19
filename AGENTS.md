@@ -1,3 +1,3 @@
 # AGENTS.md
 
-- after completing all tasks, be sure to run formatting, build, and tests
+- before completing any task, run `scripts/full-check.sh`; this is the local gate for fmt/build/test/etc

@@ -32,6 +32,20 @@ See [docs/prism-demo.md](docs/prism-demo.md) for regeneration notes.
 
 Requires Rust/Cargo, `git`, `gh`, `tmux`, `wt`, and `opencode`. Plan mode also requires `fzf`.
 
+## Development
+
+Run the local CI gate before pushing:
+
+```sh
+scripts/full-check.sh
+```
+
+To enforce the same gate as a pre-push hook, opt into the versioned hooks:
+
+```sh
+git config core.hooksPath .githooks
+```
+
 ## Use
 
 Run `prism` from anywhere. On first launch with no repositories configured, Prism opens and shows an add-repository dialog. You can also add/select one directly with `prism --repo <path>`.
