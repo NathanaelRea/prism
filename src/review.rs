@@ -89,7 +89,7 @@ fn render_template(template: &str, values: &[(&str, String)]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use crate::agent::AgentState;
@@ -210,8 +210,6 @@ mod tests {
             adopted: false,
             hidden: false,
             status_label: "clean".to_string(),
-            agent: None,
-            agent_output: VecDeque::new(),
             agent_state: AgentState::Idle,
             opencode_status: None,
             pr: PrCache {

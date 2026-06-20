@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use crate::agent::{AgentAdapter, AgentProcess, AgentState};
+use crate::agent::AgentState;
 use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
 use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCache, fetch_pr_summary_index, pr_details_due, refresh_pr_cache,
@@ -20,8 +20,7 @@ use crate::opencode::{self, OpencodeStatus, load_runtime};
 use crate::process::{command_exists, run_capture, run_status_with_stdin};
 use crate::review::build_review_fix_prompt;
 use crate::session::{
-    append_agent_log, append_runtime_log, clear_hidden, discover_sessions, save_agent_state,
-    write_task_metadata,
+    append_runtime_log, clear_hidden, discover_sessions, save_agent_state, write_task_metadata,
 };
 use crate::tmux::{
     TmuxWindow, agent_session_running, attach_or_create_agent, attach_or_create_plan_mode,
@@ -58,11 +57,8 @@ impl Tui {
                 session.repo_index = repo_index;
                 session.repo_label = managed.label.clone();
                 session.repo_key = managed.key;
-                if let Some(mut previous) =
-                    by_path.remove(&(session.repo_index, session.path.clone()))
+                if let Some(previous) = by_path.remove(&(session.repo_index, session.path.clone()))
                 {
-                    session.agent = previous.agent.take();
-                    session.agent_output = previous.agent_output;
                     session.agent_state = previous.agent_state;
                     session.opencode_status = previous.opencode_status;
                     session.pr = previous.pr;
@@ -331,77 +327,6 @@ impl Tui {
         self.refresh_sessions()?;
         self.sync_selected_repo_context();
         Ok(())
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn launch_agent(
-        &mut self,
-        index: usize,
-        initial_prompt: &str,
-    ) -> Result<(), String> {
-        let session = self
-            .sessions
-            .get_mut(index)
-            .ok_or_else(|| "no selected session".to_string())?;
-        let managed = self
-            .repos
-            .get(session.repo_index)
-            .ok_or_else(|| "selected session repository no longer exists".to_string())?;
-        let repo = managed.repo.clone();
-        let config = managed.config.clone();
-        let adapter = AgentAdapter::from_config(&config, &config.default_agent);
-        let prompt = initial_prompt.trim();
-        let launch = adapter.prepare_launch(prompt)?;
-        let argv = launch.argv;
-        if argv.is_empty() {
-            return Err(format!(
-                "agent '{}' has an empty command",
-                config.default_agent
-            ));
-        }
-        let mut agent = AgentProcess::spawn(&argv, &session.path, launch.prompt_file)?;
-        if let Some(stdin_prompt) = launch.stdin_prompt {
-            agent.write_all(format!("{stdin_prompt}\n").as_bytes())?;
-        }
-        session.agent = Some(agent);
-        session.agent_state = AgentState::Running;
-        let _ = save_agent_state(&repo, &session.branch, session.agent_state);
-        session.agent_output.clear();
-        session.agent_output.push_back(format!(
-            "started {} ({})",
-            config.default_agent,
-            adapter.prompt_mode.label()
-        ));
-        Ok(())
-    }
-
-    pub(crate) fn poll_agents(&mut self) -> bool {
-        let mut changed = false;
-        for session in &mut self.sessions {
-            let repo = self
-                .repos
-                .get(session.repo_index)
-                .map(|repo| repo.repo.clone())
-                .unwrap_or_else(|| self.repo.clone());
-            if let Some(agent) = &mut session.agent {
-                for chunk in agent.drain_output() {
-                    let _ = append_agent_log(&repo, &session.branch, &chunk);
-                    session.agent_output.push_back(chunk);
-                    changed = true;
-                }
-                while session.agent_output.len() > 200 {
-                    session.agent_output.pop_front();
-                }
-                if session.agent_state == AgentState::Running
-                    && let Some(state) = agent.try_wait()
-                {
-                    session.agent_state = state;
-                    let _ = save_agent_state(&repo, &session.branch, state);
-                    changed = true;
-                }
-            }
-        }
-        changed
     }
 
     pub(crate) fn start_opencode_status_poll(&mut self, force: bool) {
@@ -1108,7 +1033,6 @@ impl Tui {
         let sessions = self
             .sessions
             .iter()
-            .filter(|session| session.agent.is_none())
             .map(session_for_tmux_warmup)
             .collect::<Vec<_>>();
         let jobs = sessions
@@ -1234,8 +1158,7 @@ impl Tui {
         else {
             return false;
         };
-        let Some(state) = tmux_agent_state(session.agent_state, session.agent.is_some(), running)
-        else {
+        let Some(state) = tmux_agent_state(session.agent_state, running) else {
             return false;
         };
         if session.agent_state == state {
@@ -1281,8 +1204,7 @@ impl Tui {
         else {
             return false;
         };
-        let Some(state) = tmux_agent_state(session.agent_state, session.agent.is_some(), running)
-        else {
+        let Some(state) = tmux_agent_state(session.agent_state, running) else {
             return false;
         };
         if session.agent_state == state {
@@ -1722,15 +1644,11 @@ fn write_clipboard_command(program: &str, args: &[&str], text: &str) -> Result<(
     run_status_with_stdin(Command::new(program).args(args), text)
 }
 
-fn tmux_agent_state(
-    current: AgentState,
-    has_embedded_agent: bool,
-    tmux_agent_running: bool,
-) -> Option<AgentState> {
-    if tmux_agent_running && !has_embedded_agent {
+fn tmux_agent_state(current: AgentState, tmux_agent_running: bool) -> Option<AgentState> {
+    if tmux_agent_running {
         return Some(AgentState::NeedsInput);
     }
-    if !has_embedded_agent && matches!(current, AgentState::Running | AgentState::NeedsRestart) {
+    if matches!(current, AgentState::Running | AgentState::NeedsRestart) {
         return Some(AgentState::ExitedOk);
     }
     None
@@ -1927,8 +1845,6 @@ fn session_for_tmux_warmup(session: &crate::session::Session) -> crate::session:
         adopted: session.adopted,
         hidden: session.hidden,
         status_label: session.status_label.clone(),
-        agent: None,
-        agent_output: std::collections::VecDeque::new(),
         agent_state: session.agent_state,
         opencode_status: session.opencode_status.clone(),
         pr: session.pr.clone(),
@@ -1978,7 +1894,7 @@ mod tests {
         pr_summary_or_error, run_browser_opener, status_label_with_behind, tmux_agent_state,
         tmux_slot_key, tmux_warmup_key,
     };
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -1986,23 +1902,16 @@ mod tests {
 
     #[test]
     fn idle_tmux_opencode_session_does_not_count_as_running_agent() {
-        let state = tmux_agent_state(AgentState::Idle, false, true);
+        let state = tmux_agent_state(AgentState::Idle, true);
 
         assert_eq!(state, Some(AgentState::NeedsInput));
     }
 
     #[test]
     fn stale_running_state_without_process_is_cleared() {
-        let state = tmux_agent_state(AgentState::Running, false, false);
+        let state = tmux_agent_state(AgentState::Running, false);
 
         assert_eq!(state, Some(AgentState::ExitedOk));
-    }
-
-    #[test]
-    fn embedded_agent_process_owns_running_state() {
-        let state = tmux_agent_state(AgentState::Running, true, true);
-
-        assert_eq!(state, None);
     }
 
     #[test]
@@ -2338,7 +2247,6 @@ exit 1
             .unwrap();
 
         assert_eq!(fs::read_to_string(&prompt_file).unwrap(), "build the thing");
-        assert!(tui.sessions[0].agent.is_none());
         assert_eq!(tui.sessions[0].agent_state, AgentState::NeedsInput);
         let commands = fs::read_to_string(&log).unwrap();
         assert!(commands.contains("load-buffer -b"));
@@ -2457,8 +2365,6 @@ exit 0
             adopted: false,
             hidden: false,
             status_label: "clean".to_string(),
-            agent: None,
-            agent_output: VecDeque::new(),
             agent_state: AgentState::Idle,
             opencode_status: None,
             pr: PrCache::default(),

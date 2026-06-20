@@ -32,5 +32,7 @@ detach from the board and keep terminal ownership simple.
   process helpers.
 - Tests should cover command construction, naming, readiness, and lifecycle
   behavior without requiring broad TUI setup.
+- Prism does not keep an embedded PTY agent runtime in `Session`; tmux is the
+  only interactive Agent Session runtime.
 - Supporting a non-tmux backend would be a new architecture decision, not a
   local refactor.

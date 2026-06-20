@@ -670,7 +670,7 @@ fn safe_tmux_name(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::BTreeMap;
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -1646,8 +1646,6 @@ exit 0
             adopted: false,
             hidden: false,
             status_label: "clean".to_string(),
-            agent: None,
-            agent_output: VecDeque::new(),
             agent_state: AgentState::Idle,
             opencode_status: None,
             pr: PrCache::default(),

@@ -1,13 +1,12 @@
-use std::collections::{BTreeMap, VecDeque};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::collections::BTreeMap;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::params;
 
-use crate::agent::{AgentProcess, AgentState};
+use crate::agent::AgentState;
 use crate::config::Config;
 use crate::git::git_status_label;
 use crate::github::{PrCache, load_pr_cache};
@@ -30,8 +29,6 @@ pub struct Session {
     pub adopted: bool,
     pub hidden: bool,
     pub status_label: String,
-    pub agent: Option<AgentProcess>,
-    pub agent_output: VecDeque<String>,
     pub agent_state: AgentState,
     pub opencode_status: Option<OpencodeStatus>,
     pub pr: PrCache,
@@ -130,8 +127,6 @@ fn build_session(repo: &Repository, path: PathBuf, branch: String, config: &Conf
         adopted,
         hidden: false,
         status_label,
-        agent: None,
-        agent_output: VecDeque::new(),
         agent_state,
         opencode_status: None,
         pr,
@@ -221,20 +216,6 @@ pub fn clear_hidden(repo: &Repository, branch: &str) -> Result<(), String> {
         .map_err(|error| format!("remove hidden marker: {error}"))?;
         Ok(())
     })
-}
-
-pub fn append_agent_log(repo: &Repository, branch: &str, chunk: &str) -> Result<(), String> {
-    let path = log_path(repo, branch);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("create log dir: {error}"))?;
-    }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| format!("open agent log: {error}"))?;
-    file.write_all(chunk.as_bytes())
-        .map_err(|error| format!("write agent log: {error}"))
 }
 
 pub fn append_runtime_log(repo: &Repository, message: &str) -> Result<(), String> {

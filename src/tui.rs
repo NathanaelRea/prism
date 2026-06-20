@@ -296,7 +296,6 @@ impl Tui {
         let mut last_size = terminal_size();
 
         loop {
-            let agents_changed = self.poll_agents();
             let tmux_changed = self.poll_tmux_agent_warmup();
             let wt_changed = self.poll_wt_columns();
             let default_branch_changed = self.poll_default_branch_status();
@@ -312,8 +311,7 @@ impl Tui {
             if resized {
                 last_size = current_size;
             }
-            if agents_changed
-                || tmux_changed
+            if tmux_changed
                 || wt_changed
                 || default_branch_changed
                 || opencode_changed
@@ -1707,7 +1705,7 @@ fn tail_chars(text: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use crate::agent::AgentState;
@@ -1821,8 +1819,6 @@ mod tests {
             adopted: false,
             hidden: false,
             status_label: "clean".to_string(),
-            agent: None,
-            agent_output: VecDeque::new(),
             agent_state: AgentState::Idle,
             opencode_status: None,
             pr: PrCache::default(),

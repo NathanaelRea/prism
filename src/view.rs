@@ -518,9 +518,6 @@ fn format_worktree_detail_lines(model: &FrameModel<'_>, width: usize) -> Vec<Str
             truncate_line(&session.prompt_summary, width)
         ));
     }
-    if let Some(line) = session.agent_output.back() {
-        lines.push(format!("agent {}", truncate_line(line, width)));
-    }
     if let Some(status) = &session.opencode_status {
         lines.extend(format_opencode_status_lines(status, width));
     }
@@ -1458,7 +1455,7 @@ fn review_decision_for_display(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{BTreeMap, VecDeque};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     use crate::agent::AgentState;
@@ -1599,8 +1596,6 @@ mod tests {
             adopted: false,
             hidden: false,
             status_label: "clean".to_string(),
-            agent: None,
-            agent_output: VecDeque::new(),
             agent_state: AgentState::Idle,
             opencode_status: None,
             pr: PrCache::default(),
@@ -1940,8 +1935,6 @@ mod tests {
             adopted: false,
             hidden: false,
             status_label: status_label.to_string(),
-            agent: None,
-            agent_output: VecDeque::new(),
             agent_state,
             opencode_status: None,
             pr,

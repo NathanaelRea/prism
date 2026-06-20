@@ -4,8 +4,6 @@ use std::process::{Command, Stdio};
 
 use crate::process::{run_status, run_status_inherited};
 
-pub const WNOHANG: i32 = 1;
-
 pub struct RawTerminal {
     stdin_flags: i32,
 }
