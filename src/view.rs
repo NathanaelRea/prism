@@ -20,6 +20,7 @@ pub(crate) struct FrameModel<'a> {
     pub selected_repo_root: String,
     pub selected_session: Option<usize>,
     pub focus: PanelFocus,
+    pub repo_main_view: RepoMainView,
     pub mode_label: &'a str,
     pub status_message: Option<&'a str>,
     pub repo_filter: &'a str,
@@ -53,6 +54,21 @@ pub(crate) struct WorktreeRow {
     pub unseen_comments: bool,
     pub prompt_summary: String,
     pub selected: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RepoMainView {
+    Github,
+    Kanban,
+}
+
+impl RepoMainView {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Github => "github",
+            Self::Kanban => "kanban",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -291,6 +307,7 @@ fn footer_actions(model: &FrameModel<'_>) -> String {
             actions.extend([
                 "c create",
                 "p pull",
+                "h/l view",
                 "<Space> for more options",
                 "A add",
                 "R repos",
@@ -427,7 +444,7 @@ fn format_status_dashboard_lines(model: &FrameModel<'_>, width: usize) -> Vec<St
         String::new(),
         color("Navigation", "1;37"),
         "1 status  2 repos  3 worktrees".to_string(),
-        "Tab or h/l moves focus".to_string(),
+        "Tab cycles focus; h/l switches repo views".to_string(),
         String::new(),
         color("Documentation", "1;37"),
         dashboard_link("GitHub repository", "https://github.com/NathanaelRea/prism"),
@@ -459,23 +476,6 @@ fn format_repo_overview_lines(
     width: usize,
     visible_rows: usize,
 ) -> Vec<String> {
-    let mut lines = vec![
-        color(&model.selected_repo_label, "1;36"),
-        truncate_line(&model.selected_repo_root, width),
-    ];
-    if let Some(row) = model.repos.iter().find(|row| row.selected) {
-        lines.push(format!("health {}", row.health));
-    }
-    if let Some(index) = model.selected_session
-        && let Some(session) = model.sessions.get(index)
-    {
-        lines.push(format!(
-            "remembered {} {}",
-            truncate_line(&session.branch, 28),
-            git_status_indicator(&session.status_label),
-        ));
-    }
-    lines.push(String::new());
     let indices = model
         .sessions
         .iter()
@@ -484,15 +484,83 @@ fn format_repo_overview_lines(
             (session.repo_index == model.current_repo_index).then_some(index)
         })
         .collect::<Vec<_>>();
-    lines.extend(format_kanban_panel_lines(
-        model.config,
-        model.sessions,
-        &indices,
-        model.selected_session,
-        width,
-        visible_rows.saturating_sub(lines.len()),
+    let summary = repo_github_summary(model.config, model.sessions, &indices);
+    let mut lines = vec![
+        color(&model.selected_repo_label, "1;36"),
+        truncate_line(&model.selected_repo_root, width),
+    ];
+    if let Some(row) = model.repos.iter().find(|row| row.selected) {
+        lines.push(format!("health {}", row.health));
+    }
+    lines.push(format!(
+        "view {}  prs {}  review needed {}  ci failed {}  local {}",
+        model.repo_main_view.label(),
+        summary.open_prs,
+        summary.review_needed,
+        summary.ci_failed,
+        summary.local_branches,
     ));
+    lines.push(String::new());
+    let remaining_rows = visible_rows.saturating_sub(lines.len());
+    match model.repo_main_view {
+        RepoMainView::Github => lines.extend(format_repo_github_panel_lines(
+            model.config,
+            model.sessions,
+            &indices,
+            model.selected_session,
+            width,
+            remaining_rows,
+        )),
+        RepoMainView::Kanban => lines.extend(format_kanban_panel_lines(
+            model.config,
+            model.sessions,
+            &indices,
+            model.selected_session,
+            width,
+            remaining_rows,
+        )),
+    }
     lines
+}
+
+#[derive(Default)]
+struct RepoGithubSummary {
+    open_prs: usize,
+    review_needed: usize,
+    ci_failed: usize,
+    local_branches: usize,
+}
+
+fn repo_github_summary(
+    config: &Config,
+    sessions: &[Session],
+    session_indices: &[usize],
+) -> RepoGithubSummary {
+    let mut summary = RepoGithubSummary::default();
+    for index in session_indices {
+        let Some(session) = sessions.get(*index) else {
+            continue;
+        };
+        if config.is_default_branch(&session.branch) {
+            continue;
+        }
+        match &session.pr.summary {
+            Some(pr) => {
+                if !pr.merged && pr.state == "OPEN" {
+                    summary.open_prs += 1;
+                }
+                if review_decision_for_display(pr, session.pr.details.as_ref()) == "REVIEW_REQUIRED"
+                {
+                    summary.review_needed += 1;
+                }
+                if pr.check_status == "failed" {
+                    summary.ci_failed += 1;
+                }
+            }
+            None => summary.local_branches += 1,
+        }
+    }
+    summary
 }
 
 fn format_worktree_detail_lines(model: &FrameModel<'_>, width: usize) -> Vec<String> {
@@ -727,6 +795,305 @@ fn ansi_cell(text: &str, width: usize) -> String {
         text.push_str(&" ".repeat(width - len));
     }
     text
+}
+
+fn format_repo_github_panel_lines(
+    config: &Config,
+    sessions: &[Session],
+    session_indices: &[usize],
+    selected: Option<usize>,
+    width: usize,
+    visible_rows: usize,
+) -> Vec<String> {
+    if width >= 96 && visible_rows >= 8 {
+        let left_width = (width * 58 / 100).max(42).min(width.saturating_sub(36));
+        let right_width = width.saturating_sub(left_width + 1);
+        let left = format_repo_work_list_lines(
+            config,
+            sessions,
+            session_indices,
+            selected,
+            left_width,
+            visible_rows,
+        );
+        let preview = selected.and_then(|index| sessions.get(index));
+        let right = format_repo_preview_lines(config, preview, right_width);
+        let row_count = left.len().max(right.len()).min(visible_rows);
+        return (0..row_count)
+            .map(|row| {
+                format!(
+                    "{} {}",
+                    ansi_cell(
+                        left.get(row).map(String::as_str).unwrap_or_default(),
+                        left_width
+                    ),
+                    ansi_cell(
+                        right.get(row).map(String::as_str).unwrap_or_default(),
+                        right_width
+                    ),
+                )
+            })
+            .collect();
+    }
+
+    let mut lines = format_repo_work_list_lines(
+        config,
+        sessions,
+        session_indices,
+        selected,
+        width,
+        visible_rows,
+    );
+    if lines.len() < visible_rows {
+        lines.push(String::new());
+    }
+    let preview = selected.and_then(|index| sessions.get(index));
+    lines.extend(format_repo_preview_lines(config, preview, width));
+    lines.truncate(visible_rows);
+    lines
+}
+
+fn format_repo_work_list_lines(
+    config: &Config,
+    sessions: &[Session],
+    session_indices: &[usize],
+    selected: Option<usize>,
+    width: usize,
+    visible_rows: usize,
+) -> Vec<String> {
+    if visible_rows == 0 {
+        return Vec::new();
+    }
+    let mut lines = vec![color("PRs / Work", "1;36")];
+    if session_indices.is_empty() {
+        lines.push(color("No worktrees discovered", "90"));
+        lines.push(color("Create one with c", "33"));
+        lines.truncate(visible_rows);
+        return lines;
+    }
+    for index in session_indices {
+        if lines.len() >= visible_rows {
+            break;
+        }
+        let Some(session) = sessions.get(*index) else {
+            continue;
+        };
+        lines.push(format_repo_work_item_line(
+            config,
+            session,
+            Some(*index) == selected,
+            width,
+        ));
+    }
+    lines
+}
+
+fn format_repo_work_item_line(
+    config: &Config,
+    session: &Session,
+    selected: bool,
+    width: usize,
+) -> String {
+    let marker = if selected {
+        color("▶", "1;36")
+    } else {
+        " ".to_string()
+    };
+    let code = if selected { "1;37" } else { "37" };
+    let kind = repo_work_kind_label(config, session);
+    let detail = repo_work_detail_label(config, session);
+    let label_width = width.saturating_sub(20);
+    let label = session
+        .pr
+        .summary
+        .as_ref()
+        .map(|summary| format!("{} - {}", session.branch, summary.title))
+        .unwrap_or_else(|| session.branch.clone());
+    let text = format!(
+        "{} {} {} {}",
+        marker,
+        styled_cell(&kind, 8, "90"),
+        styled_cell(&truncate_line(&label, label_width), label_width, code),
+        color(&detail, "90"),
+    );
+    ansi_cell(&text, width)
+}
+
+fn repo_work_kind_label(config: &Config, session: &Session) -> String {
+    if config.is_default_branch(&session.branch) {
+        "default".to_string()
+    } else if let Some(summary) = &session.pr.summary {
+        format!("#{}", summary.number)
+    } else {
+        "local".to_string()
+    }
+}
+
+fn repo_work_detail_label(config: &Config, session: &Session) -> String {
+    let mut parts = Vec::new();
+    if config.is_default_branch(&session.branch) {
+        parts.push("tracking off".to_string());
+    } else if let Some(summary) = &session.pr.summary {
+        parts.push(pr_state_label(summary).to_string());
+        parts.push(
+            review_label(&review_decision_for_display(
+                summary,
+                session.pr.details.as_ref(),
+            ))
+            .to_string(),
+        );
+        parts.push(format!(
+            "ci {} {}",
+            ci_icon(config, session),
+            summary.check_status
+        ));
+        parts.push(pr_comment_count_label(&session.pr));
+    } else {
+        parts.push("no PR".to_string());
+    }
+    let git = git_status_indicator(&session.status_label);
+    if !git.is_empty() {
+        parts.push(git);
+    }
+    if matches!(
+        session.agent_state,
+        AgentState::Running | AgentState::NeedsInput | AgentState::NeedsRestart
+    ) {
+        parts.push(format!("agent {}", agent_icon(session.agent_state)));
+    }
+    truncate_line(&parts.join("  "), 48)
+}
+
+fn format_repo_preview_lines(
+    config: &Config,
+    session: Option<&Session>,
+    width: usize,
+) -> Vec<String> {
+    let Some(session) = session else {
+        return vec![
+            color("Preview", "1;36"),
+            color("No selected worktree", "90"),
+            color("Enter focuses worktrees", "33"),
+        ];
+    };
+    let mut lines = vec![color("Preview", "1;36")];
+    if config.is_default_branch(&session.branch) {
+        lines.push(color("Default branch", "1;37"));
+        lines.push(format!("branch {}", truncate_line(&session.branch, width)));
+        lines.push(format!(
+            "status {}",
+            truncate_line(&session.status_label, width.saturating_sub(7))
+        ));
+        lines.push(color("PR tracking disabled", "90"));
+        return lines;
+    }
+    if let Some(error) = &session.pr.error {
+        lines.push(color("✕ PR refresh error", "1;31"));
+        lines.push(truncate_line(error, width));
+        return lines;
+    }
+    let Some(summary) = &session.pr.summary else {
+        lines.push(color("○ No PR detected", "90"));
+        lines.push(format!("branch {}", truncate_line(&session.branch, width)));
+        lines.push(format!(
+            "status {}",
+            truncate_line(&session.status_label, width.saturating_sub(7))
+        ));
+        lines.push(color("Space g P creates one", "33"));
+        return lines;
+    };
+    let review = review_decision_for_display(summary, session.pr.details.as_ref());
+    lines.push(color(
+        &format!(
+            "{} PR #{} {}",
+            pr_state_icon(summary),
+            summary.number,
+            pr_state_label(summary),
+        ),
+        pr_state_color(summary),
+    ));
+    lines.push(color(&truncate_line(&summary.title, width), "1;37"));
+    lines.push(format!(
+        "{} {}  {} {}",
+        color("review", "90"),
+        color(review_label(&review), review_color(&review)),
+        color("ci", "90"),
+        color(&summary.check_status, ci_color(config, session)),
+    ));
+    lines.push(format!(
+        "{} {}  {} {}",
+        color("base", "90"),
+        truncate_line(&summary.base_ref, 18),
+        color("head", "90"),
+        truncate_line(&summary.head_ref, 18),
+    ));
+    if !summary.requested_reviewers.is_empty() {
+        lines.push(format!(
+            "{} {}",
+            color("awaiting", "90"),
+            truncate_line(&summary.requested_reviewers.join(", "), width),
+        ));
+    }
+    lines.push(String::new());
+    if let Some(details) = &session.pr.details {
+        lines.push(format!(
+            "{} {}  {} {}  {} {}",
+            color("comments", "90"),
+            details.comments.len() + details.review_comments.len(),
+            color("reviews", "90"),
+            details.reviews.len(),
+            color("files", "90"),
+            details.files.len(),
+        ));
+        lines.extend(pr_comment_lines(details, 3));
+        if !details.failing_checks.is_empty() {
+            lines.push(color("Failing checks", "1;31"));
+            for check in details.failing_checks.iter().take(2) {
+                lines.push(format!(
+                    "{} {}",
+                    color("✕", "31"),
+                    truncate_line(check, width)
+                ));
+            }
+        }
+    } else {
+        lines.push(color("Activity pending", "90"));
+    }
+    lines
+}
+
+fn pr_state_label(summary: &crate::github::PrSummary) -> &'static str {
+    if summary.merged {
+        "merged"
+    } else if summary.draft {
+        "draft"
+    } else if summary.state == "OPEN" {
+        "open"
+    } else {
+        "closed"
+    }
+}
+
+fn pr_comment_count_label(cache: &PrCache) -> String {
+    if let Some(details) = &cache.details {
+        let open = details.comments.len()
+            + details
+                .review_comments
+                .iter()
+                .filter(|comment| !comment.resolved)
+                .count();
+        let resolved = details
+            .review_comments
+            .iter()
+            .filter(|comment| comment.resolved)
+            .count();
+        return format!("#{open}✓{resolved}");
+    }
+    cache
+        .summary
+        .as_ref()
+        .map(|summary| format!("#{}", summary.comment_count))
+        .unwrap_or_else(|| "#?".to_string())
 }
 
 #[derive(Clone, Copy)]
@@ -1466,9 +1833,9 @@ mod tests {
     use crate::tui::PanelFocus;
 
     use super::{
-        FrameModel, RepoRow, StatusRow, WorktreeKind, WorktreeRow, configured_column_label,
-        format_column_value, format_repo_row, git_status_indicator, render_model_frame,
-        visible_len, worktree_status_icons,
+        FrameModel, RepoMainView, RepoRow, StatusRow, WorktreeKind, WorktreeRow,
+        configured_column_label, format_column_value, format_repo_row, git_status_indicator,
+        render_model_frame, visible_len, worktree_status_icons,
     };
 
     #[test]
@@ -1663,7 +2030,55 @@ mod tests {
     }
 
     #[test]
-    fn kanban_panel_groups_sessions_in_workflow_order() {
+    fn repo_overview_lists_pr_work_and_preview_comments() {
+        let config = test_config(Some("main"));
+        let mut reviewed_pr = test_pr(12, false);
+        reviewed_pr.details = Some(PrDetails {
+            comments: vec![PrComment {
+                author: "reviewer".to_string(),
+                body: "please tighten this panel".to_string(),
+            }],
+            review_comments: vec![PrReviewComment {
+                author: "reviewer".to_string(),
+                path: "src/view.rs".to_string(),
+                line: "120".to_string(),
+                body: "this should stay readable".to_string(),
+                created_at: "now".to_string(),
+                resolved: false,
+            }],
+            files: vec!["src/view.rs".to_string()],
+            ..PrDetails::default()
+        });
+        let sessions = vec![
+            test_session("main", "clean", AgentState::Idle, PrCache::default()),
+            test_session(
+                "planned-work",
+                "clean",
+                AgentState::Idle,
+                PrCache::default(),
+            ),
+            test_session("impl-work", "dirty 1", AgentState::Idle, PrCache::default()),
+            test_session("pr-work", "clean", AgentState::Idle, reviewed_pr),
+            test_session("merged-work", "clean", AgentState::Idle, test_pr(13, true)),
+        ];
+        let model = test_model(&config, &sessions, Some(3), PanelFocus::Repos, None);
+        let frame = render_model_frame(&model, 160, 20);
+        let frame = crate::util::strip_ansi(&frame);
+
+        assert!(frame.contains("prs 1"));
+        assert!(frame.contains("local 2"));
+        assert!(frame.contains("PRs / Work"));
+        assert!(frame.contains("planned-work"));
+        assert!(frame.contains("impl-work"));
+        assert!(frame.contains("#12"));
+        assert!(frame.contains("Preview"));
+        assert!(frame.contains("PR #12 open"));
+        assert!(frame.contains("please tighten this panel"));
+        assert!(frame.contains("merged-work"));
+    }
+
+    #[test]
+    fn repo_overview_can_show_kanban_view() {
         let config = test_config(Some("main"));
         let sessions = vec![
             test_session("main", "clean", AgentState::Idle, PrCache::default()),
@@ -1677,9 +2092,9 @@ mod tests {
             test_session("pr-work", "clean", AgentState::Idle, test_pr(12, false)),
             test_session("merged-work", "clean", AgentState::Idle, test_pr(13, true)),
         ];
-        let model = test_model(&config, &sessions, Some(2), PanelFocus::Repos, None);
-        let frame = render_model_frame(&model, 160, 20);
-        let frame = crate::util::strip_ansi(&frame);
+        let mut model = test_model(&config, &sessions, Some(2), PanelFocus::Repos, None);
+        model.repo_main_view = RepoMainView::Kanban;
+        let frame = crate::util::strip_ansi(&render_model_frame(&model, 160, 20));
 
         let plan = frame.find("plan 1").expect("plan lane");
         let implementation = frame.find("impl 1").expect("impl lane");
@@ -1688,6 +2103,7 @@ mod tests {
         assert!(plan < implementation);
         assert!(implementation < pr_ci);
         assert!(pr_ci < merged);
+        assert!(frame.contains("view kanban"));
         assert!(frame.contains("planned-work"));
         assert!(frame.contains("impl-work"));
         assert!(frame.contains("pr-work"));
@@ -1805,6 +2221,7 @@ mod tests {
             selected_repo_root: "/repo".to_string(),
             selected_session: Some(1),
             focus: PanelFocus::Worktrees,
+            repo_main_view: RepoMainView::Github,
             mode_label: "normal",
             status_message: None,
             repo_filter: "",
@@ -1977,6 +2394,7 @@ mod tests {
             selected_repo_root: "/repo".to_string(),
             selected_session,
             focus,
+            repo_main_view: RepoMainView::Github,
             mode_label: "normal",
             status_message,
             repo_filter: "",
