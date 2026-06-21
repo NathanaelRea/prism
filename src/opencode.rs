@@ -14,12 +14,10 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::agent::AgentState;
 use crate::config::Config;
-use crate::json::{
-    json_array_field, json_escape, json_object_field, json_objects_in_array, json_string_field,
-    json_top_level_objects,
-};
+use crate::json::json_escape;
 use crate::observability;
 use crate::repo::Repository;
+use serde_json::Value;
 
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(250);
 const API_TIMEOUT: Duration = Duration::from_secs(2);
@@ -571,41 +569,35 @@ impl<R: BufRead> Read for ChunkedBodyReader<R> {
 }
 
 pub fn parse_event_payload(payload: &str) -> Option<OpencodeEvent> {
-    let event_type = json_string_field(payload, "type")
-        .or_else(|| json_string_field(payload, "event"))
-        .unwrap_or_default();
-    let object = json_object_field(payload, "properties")
-        .or_else(|| json_object_field(payload, "data"))
-        .or_else(|| json_object_field(payload, "session"))
-        .unwrap_or(payload);
-    let session_id = event_session_id(payload).or_else(|| event_session_id(object));
-    let state = json_string_field(object, "status")
-        .or_else(|| json_string_field(object, "state"))
-        .or_else(|| json_string_field(payload, "status"))
-        .or_else(|| json_string_field(payload, "state"))
+    let value = serde_json::from_str::<Value>(payload).ok()?;
+    let event_type = string_field(&value, &["type", "event"]).unwrap_or_default();
+    let object = event_body(&value).unwrap_or(&value);
+    let session_id = session_id_field(&value).or_else(|| session_id_field(object));
+    let state = string_field(object, &["status", "state"])
+        .or_else(|| string_field(&value, &["status", "state"]))
         .and_then(|value| parse_state_label(&value))
         .or_else(|| event_type_state(&event_type));
-    let todos = if event_type.contains("todo") || json_array_field(object, "todos").is_some() {
-        Some(parse_todos(object))
+    let todos = if event_type.contains("todo") || object.get("todos").is_some() {
+        Some(parse_todos_value(object))
     } else {
         None
     };
     let latest_message = if event_type.contains("message") || event_type.contains("part") {
-        message_text(object).or_else(|| message_text(payload))
+        message_text(object).or_else(|| message_text(&value))
     } else {
         None
     };
     let active_tool = if event_type.contains("tool")
         || is_active_tool(object)
-        || json_object_field(object, "tool").is_some()
+        || object.get("tool").is_some_and(Value::is_object)
     {
         tool_label(object)
-            .or_else(|| json_object_field(object, "tool").and_then(tool_label))
-            .or_else(|| tool_label(payload))
+            .or_else(|| object.get("tool").and_then(tool_label))
+            .or_else(|| tool_label(&value))
     } else {
         None
     };
-    let title = json_string_field(object, "title").or_else(|| json_string_field(payload, "title"));
+    let title = string_field(object, &["title"]).or_else(|| string_field(&value, &["title"]));
 
     let event = OpencodeEvent {
         session_id,
@@ -807,6 +799,42 @@ pub fn save_runtime(repo: &Repository, runtime: &OpencodeRuntime) -> Result<(), 
     })
 }
 
+pub(crate) fn migrate_runtime_schema(conn: &rusqlite::Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "
+        create table if not exists opencode_runtime (
+          repo_root text not null,
+          branch text not null,
+          worktree_path text not null,
+          server_port integer not null,
+          server_url text not null,
+          server_pid integer,
+          opencode_session_id text,
+          generation integer not null,
+          updated_unix_ms integer not null,
+          primary key (repo_root, branch, worktree_path)
+        );
+
+        create index if not exists opencode_runtime_branch_idx
+          on opencode_runtime(repo_root, branch);
+        ",
+    )
+    .map_err(|error| format!("create opencode runtime schema: {error}"))?;
+    Ok(())
+}
+
+pub(crate) fn remove_runtime_for_branch_with_conn(
+    conn: &rusqlite::Connection,
+    branch: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "delete from opencode_runtime where branch = ?1",
+        params![branch],
+    )
+    .map_err(|error| format!("remove opencode runtime: {error}"))?;
+    Ok(())
+}
+
 pub fn allocate_port(
     repo_root: &str,
     worktree_path: &str,
@@ -998,74 +1026,42 @@ fn parse_response(response: &str) -> Result<HttpResponse, String> {
 }
 
 fn parse_sessions(body: &str) -> Vec<OpencodeSession> {
-    let objects = if body.trim_start().starts_with('[') {
-        json_top_level_objects(body)
-    } else {
-        let mut objects = json_objects_in_array(body, "data");
-        if objects.is_empty() {
-            objects = json_objects_in_array(body, "sessions");
-        }
-        if objects.is_empty() {
-            objects = json_objects_in_array(body, "items");
-        }
-        objects
+    let Some(value) = parse_json_value(body) else {
+        return Vec::new();
     };
-    objects
+    collection_items(&value, &["data", "sessions", "items"])
         .into_iter()
         .filter_map(parse_session_object)
         .collect()
 }
 
 fn parse_session(body: &str) -> Option<OpencodeSession> {
-    if let Some(object) = json_object_field(body, "data") {
-        parse_session_object(object)
-    } else if let Some(object) = json_object_field(body, "session") {
-        parse_session_object(object)
-    } else {
-        parse_session_object(body)
-    }
+    let value = parse_json_value(body)?;
+    let object = object_field(&value, &["data", "session"]).unwrap_or(&value);
+    parse_session_object(object)
 }
 
-fn parse_session_object(object: &str) -> Option<OpencodeSession> {
-    let id = json_string_field(object, "id").or_else(|| json_string_field(object, "sessionID"))?;
+fn parse_session_object(object: &Value) -> Option<OpencodeSession> {
+    let id = string_field(object, &["id", "sessionID"])?;
     Some(OpencodeSession {
         id,
-        directory: json_string_field(object, "directory")
-            .or_else(|| json_string_field(object, "cwd"))
-            .or_else(|| json_string_field(object, "path")),
-        title: json_string_field(object, "title"),
-        time_updated: json_string_field(object, "timeUpdated")
-            .or_else(|| json_string_field(object, "updatedAt"))
-            .or_else(|| json_string_field(object, "updated_at")),
+        directory: string_field(object, &["directory", "cwd", "path"]),
+        title: string_field(object, &["title"]),
+        time_updated: string_field(object, &["timeUpdated", "updatedAt", "updated_at"]),
     })
 }
 
 fn parse_session_state(body: &str, session_id: &str) -> Option<OpencodeState> {
-    let objects = if body.trim_start().starts_with('[') {
-        json_top_level_objects(body)
-    } else {
-        let mut objects = json_objects_in_array(body, "data");
-        if objects.is_empty() {
-            objects = json_objects_in_array(body, "sessions");
-        }
-        if objects.is_empty() {
-            objects = json_objects_in_array(body, "items");
-        }
-        objects
-    };
+    let value = parse_json_value(body)?;
+    let objects = collection_items(&value, &["data", "sessions", "items"]);
     if !objects.is_empty() {
         for object in objects {
-            let object_session_id = json_string_field(object, "sessionID")
-                .or_else(|| json_string_field(object, "sessionId"))
-                .or_else(|| json_string_field(object, "session_id"))
-                .or_else(|| json_string_field(object, "id"));
+            let object_session_id = session_id_field(object);
             if object_session_id
                 .as_deref()
                 .is_none_or(|id| id == session_id)
-                && let Some(state) = parse_state_label(
-                    &json_string_field(object, "status")
-                        .or_else(|| json_string_field(object, "state"))?,
-                )
+                && let Some(state) = string_field(object, &["status", "state"])
+                    .and_then(|value| parse_state_label(&value))
             {
                 return Some(state);
             }
@@ -1073,30 +1069,15 @@ fn parse_session_state(body: &str, session_id: &str) -> Option<OpencodeState> {
         return None;
     }
 
-    for object in json_top_level_objects(body) {
-        let object_session_id = json_string_field(object, "sessionID")
-            .or_else(|| json_string_field(object, "sessionId"))
-            .or_else(|| json_string_field(object, "session_id"))
-            .or_else(|| json_string_field(object, "id"));
-        if object_session_id
-            .as_deref()
-            .is_none_or(|id| id == session_id)
-            && let Some(state) = parse_state_label(
-                &json_string_field(object, "status")
-                    .or_else(|| json_string_field(object, "state"))?,
-            )
-        {
-            return Some(state);
-        }
-    }
-    if let Some(object) = json_object_field(body, session_id) {
-        return json_string_field(object, "status")
-            .or_else(|| json_string_field(object, "state"))
+    if let Some(object) = value.get(session_id).filter(|value| value.is_object()) {
+        return string_field(object, &["status", "state"])
             .and_then(|value| parse_state_label(&value));
     }
-    json_string_field(body, session_id)
-        .or_else(|| json_string_field(body, "status"))
-        .or_else(|| json_string_field(body, "state"))
+    value
+        .get(session_id)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| string_field(&value, &["status", "state"]))
         .and_then(|value| parse_state_label(&value))
 }
 
@@ -1120,28 +1101,16 @@ fn event_type_state(event_type: &str) -> Option<OpencodeState> {
     }
 }
 
-fn event_session_id(object: &str) -> Option<String> {
-    json_string_field(object, "sessionID")
-        .or_else(|| json_string_field(object, "sessionId"))
-        .or_else(|| json_string_field(object, "session_id"))
-        .or_else(|| json_string_field(object, "id"))
+fn session_id_field(object: &Value) -> Option<String> {
+    string_field(object, &["sessionID", "sessionId", "session_id", "id"])
 }
 
 fn parse_message_summary(body: &str) -> MessageSummary {
-    let objects = if body.trim_start().starts_with('[') {
-        json_top_level_objects(body)
-    } else {
-        let mut objects = json_objects_in_array(body, "data");
-        if objects.is_empty() {
-            objects = json_objects_in_array(body, "messages");
-        }
-        if objects.is_empty() {
-            objects = json_objects_in_array(body, "items");
-        }
-        objects
+    let Some(value) = parse_json_value(body) else {
+        return MessageSummary::default();
     };
     let mut summary = MessageSummary::default();
-    for object in objects {
+    for object in collection_items(&value, &["data", "messages", "items"]) {
         if summary.latest_message.is_none()
             && is_assistant_like(object)
             && let Some(text) = message_text(object)
@@ -1158,26 +1127,22 @@ fn parse_message_summary(body: &str) -> MessageSummary {
     summary
 }
 
-fn is_assistant_like(object: &str) -> bool {
-    json_string_field(object, "role").is_some_and(|role| role == "assistant")
-        || json_string_field(object, "type").is_some_and(|event_type| event_type.contains("text"))
-        || json_string_field(object, "partType").is_some_and(|part_type| part_type == "text")
+fn is_assistant_like(object: &Value) -> bool {
+    string_field(object, &["role"]).is_some_and(|role| role == "assistant")
+        || string_field(object, &["type"]).is_some_and(|event_type| event_type.contains("text"))
+        || string_field(object, &["partType"]).is_some_and(|part_type| part_type == "text")
 }
 
-fn message_text(object: &str) -> Option<String> {
-    json_string_field(object, "text")
-        .or_else(|| json_string_field(object, "content"))
-        .or_else(|| json_string_field(object, "message"))
+fn message_text(object: &Value) -> Option<String> {
+    string_field(object, &["text", "content", "message"])
         .map(|text| text.replace('\n', " ").trim().to_string())
         .filter(|text| !text.is_empty())
 }
 
-fn is_active_tool(object: &str) -> bool {
-    let type_is_tool = json_string_field(object, "type")
-        .or_else(|| json_string_field(object, "partType"))
+fn is_active_tool(object: &Value) -> bool {
+    let type_is_tool = string_field(object, &["type", "partType"])
         .is_some_and(|event_type| event_type.contains("tool"));
-    let status_is_active = json_string_field(object, "status")
-        .or_else(|| json_string_field(object, "state"))
+    let status_is_active = string_field(object, &["status", "state"])
         .map(|status| {
             matches!(
                 status.as_str(),
@@ -1188,11 +1153,9 @@ fn is_active_tool(object: &str) -> bool {
     type_is_tool && status_is_active
 }
 
-fn tool_label(object: &str) -> Option<String> {
-    let name = json_string_field(object, "tool")
-        .or_else(|| json_string_field(object, "name"))
-        .or_else(|| json_string_field(object, "title"))?;
-    let status = json_string_field(object, "status").or_else(|| json_string_field(object, "state"));
+fn tool_label(object: &Value) -> Option<String> {
+    let name = string_field(object, &["tool", "name", "title"])?;
+    let status = string_field(object, &["status", "state"]);
     Some(match status {
         Some(status) if !status.is_empty() => format!("{name} {status}"),
         _ => name,
@@ -1200,38 +1163,55 @@ fn tool_label(object: &str) -> Option<String> {
 }
 
 fn parse_todos(body: &str) -> Vec<OpencodeTodo> {
-    let objects = if body.trim_start().starts_with('[') {
-        json_top_level_objects(body)
-    } else {
-        let mut objects = json_objects_in_array(body, "data");
-        if objects.is_empty() {
-            objects = json_objects_in_array(body, "todos");
-        }
-        if objects.is_empty() {
-            objects = json_objects_in_array(body, "items");
-        }
-        if objects.is_empty()
-            && let Some(array) = json_array_field(body, "todo")
-        {
-            objects = json_top_level_objects(array);
-        }
-        objects
+    let Some(value) = parse_json_value(body) else {
+        return Vec::new();
     };
-    objects
+    parse_todos_value(&value)
+}
+
+fn parse_todos_value(value: &Value) -> Vec<OpencodeTodo> {
+    collection_items(value, &["data", "todos", "items", "todo"])
         .into_iter()
         .filter_map(|object| {
-            let text = json_string_field(object, "content")
-                .or_else(|| json_string_field(object, "text"))
-                .or_else(|| json_string_field(object, "title"))?;
+            let text = string_field(object, &["content", "text", "title"])?;
             Some(OpencodeTodo {
                 text: text.replace('\n', " ").trim().to_string(),
-                status: json_string_field(object, "status")
-                    .or_else(|| json_string_field(object, "state"))
+                status: string_field(object, &["status", "state"])
                     .unwrap_or_else(|| "pending".to_string()),
             })
         })
         .filter(|todo| !todo.text.is_empty())
         .collect()
+}
+
+fn parse_json_value(body: &str) -> Option<Value> {
+    serde_json::from_str(body).ok()
+}
+
+fn collection_items<'a>(value: &'a Value, envelope_keys: &[&str]) -> Vec<&'a Value> {
+    if let Value::Array(items) = value {
+        return items.iter().filter(|item| item.is_object()).collect();
+    }
+    envelope_keys
+        .iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_array))
+        .map(|items| items.iter().filter(|item| item.is_object()).collect())
+        .unwrap_or_default()
+}
+
+fn event_body(value: &Value) -> Option<&Value> {
+    object_field(value, &["properties", "data", "session"])
+}
+
+fn object_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    keys.iter()
+        .find_map(|key| value.get(*key).filter(|value| value.is_object()))
+}
+
+fn string_field(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_str))
+        .map(str::to_string)
 }
 
 fn newest_session_for_worktree<'a>(
@@ -1512,6 +1492,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(todo.todos.unwrap()[0].text, "ship it");
+    }
+
+    #[test]
+    fn ignores_malformed_opencode_events() {
+        assert_eq!(parse_event_payload("not json"), None);
+        assert_eq!(parse_event_payload(r#"{"type":"session.status"}"#), None);
+    }
+
+    #[test]
+    fn opencode_event_schema_drift_does_not_read_unrelated_nested_status() {
+        let event = parse_event_payload(
+            r#"{"type":"session.status","properties":{"sessionID":"ses_1","metadata":{"status":"busy"}}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(event.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(event.state, None);
+    }
+
+    #[test]
+    fn opencode_status_schema_drift_does_not_read_unrelated_nested_status() {
+        assert_eq!(
+            parse_session_state(
+                r#"{"sessionID":"ses_1","metadata":{"status":"busy"}}"#,
+                "ses_1",
+            ),
+            None
+        );
     }
 
     #[test]

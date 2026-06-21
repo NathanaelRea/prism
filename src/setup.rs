@@ -1,11 +1,9 @@
 use std::io::{self, Write};
-use std::process::Command;
 
 use crate::config::Config;
-use crate::git::worktree_dirty;
-use crate::process::{run_capture, run_output_allow_failure, run_status};
+use crate::git::{RepositoryCheckout, inspect_repository_checkout, worktree_dirty};
+use crate::lifecycle::move_current_branch_to_worktree;
 use crate::repo::Repository;
-use crate::session::append_runtime_log;
 use crate::terminal::stdin_is_tty;
 use crate::util::yes;
 
@@ -16,6 +14,21 @@ pub(crate) struct StartupSetup {
     pub no_extra_worktrees: bool,
     pub needs_prompt: bool,
     pub can_move_branch: bool,
+    pub branch_move: BranchMoveDecision,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BranchMoveDecision {
+    Ready,
+    NotNeeded,
+    Refused(BranchMoveRefusal),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BranchMoveRefusal {
+    UnknownCurrentBranch,
+    UnknownDefaultBranch,
+    DirtyCheckout,
 }
 
 pub(crate) fn maybe_prompt_startup_setup(repo: &Repository, config: &Config) -> Result<(), String> {
@@ -35,34 +48,48 @@ pub(crate) fn inspect_startup_setup(
     repo: &Repository,
     config: &Config,
 ) -> Result<StartupSetup, String> {
-    let current_branch = current_branch(repo, config)?;
-    let default_base = default_base(repo, config);
-    let worktree_count = worktree_count(repo, config)?;
-    Ok(classify_startup(
-        current_branch.as_deref(),
-        default_base.as_deref(),
-        worktree_count,
-    ))
+    Ok(classify_startup(&inspect_repository_checkout(
+        repo, config,
+    )?))
 }
 
-pub(crate) fn classify_startup(
-    current_branch: Option<&str>,
-    default_base: Option<&str>,
-    worktree_count: usize,
-) -> StartupSetup {
-    let on_default_branch = current_branch
-        .zip(default_base)
+pub(crate) fn classify_startup(checkout: &RepositoryCheckout) -> StartupSetup {
+    let on_default_branch = checkout
+        .current_branch
+        .as_deref()
+        .zip(checkout.default_base.as_deref())
         .map(|(current, base)| current == base)
         .unwrap_or(true);
-    let no_extra_worktrees = worktree_count <= 1;
-    let can_move_branch = !on_default_branch && current_branch.is_some() && default_base.is_some();
+    let no_extra_worktrees = checkout.worktree_count <= 1;
+    let branch_move = classify_branch_move(checkout, on_default_branch);
+    let can_move_branch = branch_move == BranchMoveDecision::Ready;
     StartupSetup {
-        current_branch: current_branch.map(ToString::to_string),
-        default_base: default_base.map(ToString::to_string),
+        current_branch: checkout.current_branch.clone(),
+        default_base: checkout.default_base.clone(),
         no_extra_worktrees,
         needs_prompt: !on_default_branch,
         can_move_branch,
+        branch_move,
     }
+}
+
+fn classify_branch_move(
+    checkout: &RepositoryCheckout,
+    on_default_branch: bool,
+) -> BranchMoveDecision {
+    if on_default_branch {
+        return BranchMoveDecision::NotNeeded;
+    }
+    if checkout.current_branch.is_none() {
+        return BranchMoveDecision::Refused(BranchMoveRefusal::UnknownCurrentBranch);
+    }
+    if checkout.default_base.is_none() {
+        return BranchMoveDecision::Refused(BranchMoveRefusal::UnknownDefaultBranch);
+    }
+    if checkout.dirty {
+        return BranchMoveDecision::Refused(BranchMoveRefusal::DirtyCheckout);
+    }
+    BranchMoveDecision::Ready
 }
 
 fn prompt_setup_loop(
@@ -83,14 +110,18 @@ fn prompt_setup_loop(
             println!("No additional worktree sessions are set up yet.");
         }
         println!();
-        if setup.can_move_branch {
-            let dirty = worktree_dirty(repo, config)?;
-            let branch = setup.current_branch.as_deref().unwrap_or("current branch");
-            if dirty {
-                println!("  w  move {branch} to a worktree (requires clean checkout)");
-            } else {
+        match setup.branch_move {
+            BranchMoveDecision::Ready => {
+                let branch = setup.current_branch.as_deref().unwrap_or("current branch");
                 println!("  w  move {branch} to a worktree");
             }
+            BranchMoveDecision::Refused(BranchMoveRefusal::DirtyCheckout) => {
+                let branch = setup.current_branch.as_deref().unwrap_or("current branch");
+                println!("  w  move {branch} to a worktree (requires clean checkout)");
+            }
+            BranchMoveDecision::NotNeeded
+            | BranchMoveDecision::Refused(BranchMoveRefusal::UnknownCurrentBranch)
+            | BranchMoveDecision::Refused(BranchMoveRefusal::UnknownDefaultBranch) => {}
         }
         println!("  o  open Prism anyway");
         print!("Choice [o]: ");
@@ -100,12 +131,24 @@ fn prompt_setup_loop(
         match choice.as_str() {
             "" | "o" => return Ok(()),
             "w" if setup.can_move_branch => {
+                // Re-check immediately before moving; the prompt decision may be stale.
                 if worktree_dirty(repo, config)? {
                     println!("Cannot move branch while this checkout is dirty.");
                     println!("Commit or stash changes, then reopen Prism.");
                     continue;
                 }
-                move_current_branch_to_worktree(repo, config, &setup)?;
+                move_current_branch_to_worktree_from_setup(repo, config, &setup)?;
+                return Ok(());
+            }
+            "w" if setup.branch_move
+                == BranchMoveDecision::Refused(BranchMoveRefusal::DirtyCheckout) =>
+            {
+                if worktree_dirty(repo, config)? {
+                    println!("Cannot move branch while this checkout is dirty.");
+                    println!("Commit or stash changes, then reopen Prism.");
+                    continue;
+                }
+                move_current_branch_to_worktree_from_setup(repo, config, &setup)?;
                 return Ok(());
             }
             _ => {
@@ -115,7 +158,7 @@ fn prompt_setup_loop(
     }
 }
 
-fn move_current_branch_to_worktree(
+fn move_current_branch_to_worktree_from_setup(
     repo: &Repository,
     config: &Config,
     setup: &StartupSetup,
@@ -139,75 +182,7 @@ fn move_current_branch_to_worktree(
         return Ok(());
     }
 
-    run_status(
-        Command::new(config.tool("git"))
-            .arg("-C")
-            .arg(&repo.root)
-            .args(["switch", base]),
-    )?;
-    run_status(
-        Command::new(config.tool(&config.worktree_command))
-            .arg("-C")
-            .arg(&repo.root)
-            .args(["switch", "--no-cd", "--format", "json", branch]),
-    )?;
-    let _ = append_runtime_log(
-        repo,
-        &format!("moved {branch} into Worktrunk worktree and switched checkout to {base}"),
-    );
-    Ok(())
-}
-
-fn current_branch(repo: &Repository, config: &Config) -> Result<Option<String>, String> {
-    let output = run_capture(
-        Command::new(config.tool("git"))
-            .arg("-C")
-            .arg(&repo.root)
-            .args(["branch", "--show-current"]),
-    )?;
-    let branch = output.trim();
-    if branch.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(branch.to_string()))
-    }
-}
-
-fn default_base(repo: &Repository, config: &Config) -> Option<String> {
-    config
-        .default_base
-        .clone()
-        .or_else(|| local_branch_exists(repo, config, "main").then(|| "main".to_string()))
-        .or_else(|| local_branch_exists(repo, config, "master").then(|| "master".to_string()))
-}
-
-fn local_branch_exists(repo: &Repository, config: &Config, branch: &str) -> bool {
-    run_output_allow_failure(
-        Command::new(config.tool("git"))
-            .arg("-C")
-            .arg(&repo.root)
-            .args([
-                "show-ref",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ]),
-    )
-    .map(|output| output.status.success())
-    .unwrap_or(false)
-}
-
-fn worktree_count(repo: &Repository, config: &Config) -> Result<usize, String> {
-    let output = run_capture(
-        Command::new(config.tool("git"))
-            .arg("-C")
-            .arg(&repo.root)
-            .args(["worktree", "list", "--porcelain"]),
-    )?;
-    Ok(output
-        .lines()
-        .filter(|line| line.starts_with("worktree "))
-        .count())
+    move_current_branch_to_worktree(repo, config, branch, base)
 }
 
 fn read_line() -> Result<String, String> {
@@ -224,26 +199,74 @@ mod tests {
 
     #[test]
     fn startup_prompts_for_single_branch_worktree() {
-        let setup = classify_startup(Some("feature"), Some("main"), 1);
+        let setup = classify_startup(&checkout(Some("feature"), Some("main"), 1, false));
 
         assert!(setup.needs_prompt);
         assert!(setup.no_extra_worktrees);
         assert!(setup.can_move_branch);
+        assert_eq!(setup.branch_move, BranchMoveDecision::Ready);
     }
 
     #[test]
     fn startup_does_not_prompt_for_default_branch_without_extra_worktrees() {
-        let setup = classify_startup(Some("main"), Some("main"), 1);
+        let setup = classify_startup(&checkout(Some("main"), Some("main"), 1, false));
 
         assert!(!setup.needs_prompt);
         assert!(!setup.can_move_branch);
+        assert_eq!(setup.branch_move, BranchMoveDecision::NotNeeded);
     }
 
     #[test]
     fn startup_does_not_prompt_for_configured_multi_worktree_default_checkout() {
-        let setup = classify_startup(Some("main"), Some("main"), 2);
+        let setup = classify_startup(&checkout(Some("main"), Some("main"), 2, false));
+
+        assert!(!setup.needs_prompt);
+        assert!(!setup.no_extra_worktrees);
+        assert!(!setup.can_move_branch);
+        assert_eq!(setup.branch_move, BranchMoveDecision::NotNeeded);
+    }
+
+    #[test]
+    fn startup_prompts_but_refuses_dirty_branch_move() {
+        let setup = classify_startup(&checkout(Some("feature"), Some("main"), 1, true));
+
+        assert!(setup.needs_prompt);
+        assert!(!setup.can_move_branch);
+        assert_eq!(
+            setup.branch_move,
+            BranchMoveDecision::Refused(BranchMoveRefusal::DirtyCheckout)
+        );
+    }
+
+    #[test]
+    fn startup_without_default_branch_is_not_actionable() {
+        let setup = classify_startup(&checkout(Some("feature"), None, 1, false));
 
         assert!(!setup.needs_prompt);
         assert!(!setup.can_move_branch);
+        assert_eq!(setup.branch_move, BranchMoveDecision::NotNeeded);
+    }
+
+    #[test]
+    fn startup_without_current_branch_is_not_actionable() {
+        let setup = classify_startup(&checkout(None, Some("main"), 1, false));
+
+        assert!(!setup.needs_prompt);
+        assert!(!setup.can_move_branch);
+        assert_eq!(setup.branch_move, BranchMoveDecision::NotNeeded);
+    }
+
+    fn checkout(
+        current_branch: Option<&str>,
+        default_base: Option<&str>,
+        worktree_count: usize,
+        dirty: bool,
+    ) -> RepositoryCheckout {
+        RepositoryCheckout {
+            current_branch: current_branch.map(ToString::to_string),
+            default_base: default_base.map(ToString::to_string),
+            worktree_count,
+            dirty,
+        }
     }
 }

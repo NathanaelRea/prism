@@ -30,7 +30,11 @@ detach from the board and keep terminal ownership simple.
   reattach behavior.
 - Interactive terminal behavior belongs in the tmux module, not in generic
   process helpers.
+- The tmux adapter exposes the Agent Session runtime identity: session name,
+  window targets, prompt buffer naming, and readiness checks.
 - Tests should cover command construction, naming, readiness, and lifecycle
   behavior without requiring broad TUI setup.
+- Prism does not keep an embedded PTY agent runtime in `Session`; tmux is the
+  only interactive Agent Session runtime.
 - Supporting a non-tmux backend would be a new architecture decision, not a
   local refactor.

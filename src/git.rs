@@ -4,6 +4,26 @@ use crate::config::Config;
 use crate::process::{run_capture, run_output_allow_failure};
 use crate::repo::Repository;
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct RepositoryCheckout {
+    pub current_branch: Option<String>,
+    pub default_base: Option<String>,
+    pub worktree_count: usize,
+    pub dirty: bool,
+}
+
+pub(crate) fn inspect_repository_checkout(
+    repo: &Repository,
+    config: &Config,
+) -> Result<RepositoryCheckout, String> {
+    Ok(RepositoryCheckout {
+        current_branch: current_branch(repo, config)?,
+        default_base: default_base(repo, config),
+        worktree_count: worktree_count(repo, config)?,
+        dirty: worktree_dirty(repo, config)?,
+    })
+}
+
 pub fn git_status_label(path: &std::path::Path, config: &Config) -> String {
     match run_capture(
         Command::new(config.tool("git"))
@@ -64,6 +84,58 @@ pub fn worktree_dirty(repo: &Repository, config: &Config) -> Result<bool, String
             .args(["status", "--short"]),
     )?;
     Ok(!status.trim().is_empty())
+}
+
+fn current_branch(repo: &Repository, config: &Config) -> Result<Option<String>, String> {
+    let output = run_capture(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(&repo.root)
+            .args(["branch", "--show-current"]),
+    )?;
+    let branch = output.trim();
+    if branch.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(branch.to_string()))
+    }
+}
+
+fn default_base(repo: &Repository, config: &Config) -> Option<String> {
+    config
+        .default_base
+        .clone()
+        .or_else(|| local_branch_exists(repo, config, "main").then(|| "main".to_string()))
+        .or_else(|| local_branch_exists(repo, config, "master").then(|| "master".to_string()))
+}
+
+fn local_branch_exists(repo: &Repository, config: &Config, branch: &str) -> bool {
+    run_output_allow_failure(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(&repo.root)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ]),
+    )
+    .map(|output| output.status.success())
+    .unwrap_or(false)
+}
+
+fn worktree_count(repo: &Repository, config: &Config) -> Result<usize, String> {
+    let output = run_capture(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(&repo.root)
+            .args(["worktree", "list", "--porcelain"]),
+    )?;
+    Ok(output
+        .lines()
+        .filter(|line| line.starts_with("worktree "))
+        .count())
 }
 
 pub fn branch_behind(
@@ -134,6 +206,7 @@ mod tests {
     use super::*;
     use crate::agent::PromptMode;
     use crate::config::{Checks, EscapeKey, MergeMethod};
+    use crate::repo::Repository;
 
     use std::collections::BTreeMap;
     use std::fs;
@@ -192,6 +265,41 @@ mod tests {
         run_git(&remote, &["push", "origin", "main"]);
 
         assert_eq!(branch_behind(&work, "main", &config).unwrap(), 1);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn inspect_repository_checkout_reports_startup_facts() {
+        let temp = unique_temp_dir("prism-startup-checkout-test");
+        let work = temp.join("work");
+        fs::create_dir_all(&temp).unwrap();
+
+        run(Command::new("git").args(["init"]).arg(&work));
+        configure_user(&work);
+        run_git(&work, &["branch", "-M", "main"]);
+        fs::write(work.join("tracked.txt"), "base\n").unwrap();
+        run_git(&work, &["add", "tracked.txt"]);
+        run_git(&work, &["commit", "-m", "initial"]);
+
+        let mut config = test_config();
+        config.default_base = None;
+        let repo = Repository { root: work.clone() };
+
+        let checkout = inspect_repository_checkout(&repo, &config).unwrap();
+        assert_eq!(checkout.current_branch.as_deref(), Some("main"));
+        assert_eq!(checkout.default_base.as_deref(), Some("main"));
+        assert_eq!(checkout.worktree_count, 1);
+        assert!(!checkout.dirty);
+
+        run_git(&work, &["switch", "-c", "feature"]);
+        fs::write(work.join("untracked.txt"), "dirty\n").unwrap();
+
+        let checkout = inspect_repository_checkout(&repo, &config).unwrap();
+        assert_eq!(checkout.current_branch.as_deref(), Some("feature"));
+        assert_eq!(checkout.default_base.as_deref(), Some("main"));
+        assert_eq!(checkout.worktree_count, 1);
+        assert!(checkout.dirty);
 
         let _ = fs::remove_dir_all(temp);
     }

@@ -7,7 +7,150 @@ use std::process::{Command, Stdio};
 use crate::config::Config;
 use crate::json::json_string_field;
 use crate::process::command_exists;
-use crate::repo::Repository;
+use crate::util::stable_hash;
+
+const DEFAULT_STEP_NAME: &str = "phase";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlanFileSource {
+    Explicit,
+    Selected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedPlanFile {
+    path: PathBuf,
+    source: PlanFileSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanExecution {
+    cwd: PathBuf,
+    plan_path: PathBuf,
+    plan_file: String,
+    step_name: String,
+    start: usize,
+    total: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanModeLaunch {
+    cwd: PathBuf,
+    tmux_session_name: String,
+    shell_command: String,
+}
+
+impl PlanModeLaunch {
+    fn prepare(cwd: &Path) -> Result<Self, String> {
+        let exe = std::env::current_exe()
+            .map_err(|error| format!("resolve prism executable: {error}"))?;
+        let command = [
+            shell_quote(&exe.to_string_lossy()),
+            "--repo".to_string(),
+            shell_quote(&cwd.to_string_lossy()),
+            "plan".to_string(),
+        ]
+        .join(" ");
+        Ok(Self {
+            cwd: cwd.to_path_buf(),
+            tmux_session_name: plan_mode_session_name(cwd),
+            shell_command: format!(
+                "{command}; status=$?; printf '\\n[prism plan mode exited with status %s]\\nPress Enter to close this tmux session. ' \"$status\"; read _; exit \"$status\""
+            ),
+        })
+    }
+}
+
+impl PlanExecution {
+    fn prepare(cwd: &Path, config: &Config, path: Option<&Path>) -> Result<Self, String> {
+        let selected = select_plan_file(cwd, config, path)?;
+        let inferred_total = infer_total_phases(&selected.path)?;
+        let plan_file = display_plan_path(cwd, &selected.path);
+
+        let step_range = match selected.source {
+            PlanFileSource::Explicit => StepRange::inferred(inferred_total)?,
+            PlanFileSource::Selected => StepRange::prompt(inferred_total)?,
+        };
+
+        Ok(Self {
+            cwd: cwd.to_path_buf(),
+            plan_path: selected.path,
+            plan_file,
+            step_name: step_range.name,
+            start: step_range.start,
+            total: step_range.total,
+        })
+    }
+
+    fn tasks(&self) -> Vec<String> {
+        (self.start..=self.total)
+            .map(|step| build_task(&self.plan_file, &self.step_name, step))
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StepRange {
+    name: String,
+    start: usize,
+    total: usize,
+}
+
+impl StepRange {
+    fn inferred(total: usize) -> Result<Self, String> {
+        if total == 0 {
+            return Err("could not infer phases; add headings like 'Phase 1'".to_string());
+        }
+        Ok(Self {
+            name: DEFAULT_STEP_NAME.to_string(),
+            start: 1,
+            total,
+        })
+    }
+
+    fn prompt(inferred_total: usize) -> Result<Self, String> {
+        let name = prompt_string("Step name", DEFAULT_STEP_NAME)?;
+        let total = prompt_usize(
+            "How many total steps",
+            (inferred_total > 0).then_some(inferred_total),
+        )?;
+        let start = prompt_usize("Where to start", Some(1))?;
+        if start > total {
+            return Err("start step cannot be greater than total steps".to_string());
+        }
+        Ok(Self { name, start, total })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpencodeRunCommand {
+    program: String,
+    args: Vec<String>,
+}
+
+impl OpencodeRunCommand {
+    fn new(config: &Config, task: &str) -> Self {
+        Self {
+            program: config.tool("opencode"),
+            args: vec![
+                "run".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                task.to_string(),
+            ],
+        }
+    }
+
+    fn display(&self) -> String {
+        format!("$ {} {}", self.program, self.args.join(" "))
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command.args(&self.args);
+        command
+    }
+}
 
 pub fn infer_total_phases(path: &Path) -> Result<usize, String> {
     let text = fs::read_to_string(path).map_err(|error| format!("read plan file: {error}"))?;
@@ -28,48 +171,30 @@ pub fn infer_total_phases(path: &Path) -> Result<usize, String> {
     Ok(max_phase)
 }
 
-pub fn run_plan_cli(repo: &Repository, config: &Config, path: Option<&Path>) -> Result<(), String> {
-    run_plan_mode(&repo.root, config, path)
-}
-
 pub fn run_plan_mode(cwd: &Path, config: &Config, path: Option<&Path>) -> Result<(), String> {
-    let plan_path = select_plan_file(cwd, config, path)?;
-    let plan_file = display_plan_path(cwd, &plan_path);
-    let inferred_total = infer_total_phases(&plan_path)?;
-
-    let (step_name, total, start) = if path.is_some() {
-        if inferred_total == 0 {
-            return Err("could not infer phases; add headings like 'Phase 1'".to_string());
-        }
-        ("phase".to_string(), inferred_total, 1)
-    } else {
-        let step_name = prompt_string("Step name", "phase")?;
-        let total = prompt_usize(
-            "How many total steps",
-            (inferred_total > 0).then_some(inferred_total),
-        )?;
-        let start = prompt_usize("Where to start", Some(1))?;
-        if start > total {
-            return Err("start step cannot be greater than total steps".to_string());
-        }
-        (step_name, total, start)
-    };
-
-    for step in start..=total {
-        let task = build_task(&plan_file, &step_name, step);
+    let execution = PlanExecution::prepare(cwd, config, path)?;
+    for task in execution.tasks() {
         println!("\n==> {task}\n");
-        run_opencode_step(config, cwd, &task)?;
+        run_opencode_step(config, &execution.cwd, &task)?;
     }
     Ok(())
 }
 
+pub fn open_plan_mode(config: &Config, cwd: &Path) -> Result<(), String> {
+    let launch = PlanModeLaunch::prepare(cwd)?;
+    crate::tmux::attach_or_create_plan_mode(
+        config,
+        &launch.tmux_session_name,
+        &launch.cwd,
+        &launch.shell_command,
+    )
+}
+
 fn run_opencode_step(config: &Config, cwd: &Path, task: &str) -> Result<(), String> {
-    println!("$ opencode run --format json {task}");
-    let mut child = Command::new(config.tool("opencode"))
-        .arg("run")
-        .arg("--format")
-        .arg("json")
-        .arg(task)
+    let invocation = OpencodeRunCommand::new(config, task);
+    println!("{}", invocation.display());
+    let mut child = invocation
+        .command()
         .current_dir(cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -143,13 +268,20 @@ fn event_should_include_raw(raw: &str, event_type: &str) -> bool {
         || raw.contains("\"arguments\"")
 }
 
-fn select_plan_file(cwd: &Path, config: &Config, path: Option<&Path>) -> Result<PathBuf, String> {
+fn select_plan_file(
+    cwd: &Path,
+    config: &Config,
+    path: Option<&Path>,
+) -> Result<SelectedPlanFile, String> {
     if let Some(path) = path {
         let plan_path = resolve_path(cwd, path);
         if !plan_path.is_file() {
             return Err(format!("plan file not found: {}", plan_path.display()));
         }
-        return Ok(plan_path);
+        return Ok(SelectedPlanFile {
+            path: plan_path,
+            source: PlanFileSource::Explicit,
+        });
     }
 
     if !command_exists(&config.tool("fzf")) {
@@ -160,7 +292,10 @@ fn select_plan_file(cwd: &Path, config: &Config, path: Option<&Path>) -> Result<
         return Err("no markdown files found under the selected directory".to_string());
     }
     let selected = choose_with_fzf(config, &files)?;
-    Ok(cwd.join(selected))
+    Ok(SelectedPlanFile {
+        path: cwd.join(selected),
+        source: PlanFileSource::Selected,
+    })
 }
 
 fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
@@ -251,6 +386,23 @@ fn build_task(plan_file: &str, step_name: &str, step: usize) -> String {
     format!("Implement {plan_file} {step_name} {step}")
 }
 
+fn plan_mode_session_name(cwd: &Path) -> String {
+    format!("prism-plan-{:016x}", stable_hash(cwd))
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '='))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 fn prompt_string(label: &str, default: &str) -> Result<String, String> {
     print!("{label} [{default}]: ");
     io::stdout()
@@ -299,6 +451,8 @@ fn prompt_usize(label: &str, default: Option<usize>) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Checks, EscapeKey, MergeMethod};
+    use std::collections::BTreeMap;
 
     #[test]
     fn infers_total_phases_from_markdown_headings() {
@@ -311,6 +465,101 @@ mod tests {
         let total = infer_total_phases(&path).unwrap();
         let _ = fs::remove_file(&path);
         assert_eq!(total, 3);
+    }
+
+    #[test]
+    fn prepares_explicit_plan_execution_from_inferred_phases() {
+        let dir = unique_temp_dir("prism-plan-execution-test");
+        let path = dir.join("plan-arch.md");
+        fs::write(
+            &path,
+            "# Plan\n\n## Phase 1\n\nDo one.\n\n## Phase 2\n\nDo two.\n",
+        )
+        .unwrap();
+        let config = test_config();
+
+        let execution = PlanExecution::prepare(&dir, &config, Some(Path::new("plan-arch.md")))
+            .expect("explicit plan execution");
+
+        assert_eq!(execution.plan_path, path);
+        assert_eq!(
+            execution.tasks(),
+            vec![
+                "Implement plan-arch.md phase 1".to_string(),
+                "Implement plan-arch.md phase 2".to_string(),
+            ]
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn rejects_explicit_plan_without_phase_headings() {
+        let dir = unique_temp_dir("prism-plan-empty-test");
+        let path = dir.join("notes.md");
+        fs::write(&path, "# Notes\n\nNo numbered phases.\n").unwrap();
+        let config = test_config();
+
+        let error = PlanExecution::prepare(&dir, &config, Some(Path::new("notes.md")))
+            .expect_err("explicit phase inference should fail");
+
+        assert_eq!(error, "could not infer phases; add headings like 'Phase 1'");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn builds_opencode_json_run_invocation() {
+        let mut config = test_config();
+        config
+            .tools
+            .insert("opencode".to_string(), "/bin/opencode-test".to_string());
+
+        let command = OpencodeRunCommand::new(&config, "Implement plan.md phase 3");
+
+        assert_eq!(command.program, "/bin/opencode-test");
+        assert_eq!(
+            command.args,
+            vec![
+                "run".to_string(),
+                "--format".to_string(),
+                "json".to_string(),
+                "Implement plan.md phase 3".to_string(),
+            ]
+        );
+        assert_eq!(
+            command.display(),
+            "$ /bin/opencode-test run --format json Implement plan.md phase 3"
+        );
+    }
+
+    #[test]
+    fn prepares_plan_mode_launch_for_cli_execution_in_tmux() {
+        let dir = PathBuf::from("/repo/my project");
+
+        let launch = PlanModeLaunch::prepare(&dir).expect("plan mode launch");
+
+        assert!(launch.tmux_session_name.starts_with("prism-plan-"));
+        assert_eq!(launch.cwd, dir);
+        assert!(
+            launch
+                .shell_command
+                .contains("--repo '/repo/my project' plan")
+        );
+        assert!(launch.shell_command.contains("status=$?"));
+        assert!(
+            launch
+                .shell_command
+                .contains("[prism plan mode exited with status %s]")
+        );
+    }
+
+    #[test]
+    fn shell_quote_preserves_plan_launch_argument_boundaries() {
+        assert_eq!(shell_quote("opencode"), "opencode");
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("two words"), "'two words'");
+        assert_eq!(shell_quote("that's"), "'that'\"'\"'s'");
     }
 
     #[test]
@@ -335,5 +584,52 @@ mod tests {
                 .iter()
                 .any(|line| line == &format!("[tool.call] json: {raw}"))
         );
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn test_config() -> Config {
+        let tools = [
+            ("wt", "wt"),
+            ("gh", "gh"),
+            ("git", "git"),
+            ("tmux", "tmux"),
+            ("lazygit", "lazygit"),
+            ("fzf", "fzf"),
+            ("opencode", "opencode"),
+        ]
+        .into_iter()
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect();
+
+        Config {
+            default_agent: "opencode".to_string(),
+            default_base: Some("main".to_string()),
+            plan_dir: "plans".to_string(),
+            review_packet_dir: ".agent/review".to_string(),
+            worktree_command: "wt".to_string(),
+            opencode_port_base: 41_000,
+            opencode_port_span: 1_000,
+            opencode_shutdown_owned_servers: false,
+            escape_key: EscapeKey::EscEsc,
+            merge_method: MergeMethod::Squash,
+            checks: Checks::default(),
+            worktree_columns: vec!["url".to_string()],
+            tools,
+            agent_commands: BTreeMap::new(),
+            agent_prompt_modes: BTreeMap::new(),
+            prompt_templates: BTreeMap::new(),
+            user_path: PathBuf::from("user-config.toml"),
+            repo_config_path: PathBuf::from("repo-config.toml"),
+        }
     }
 }

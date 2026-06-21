@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::observability;
 use crate::process::{run_capture, run_output_allow_failure};
 use crate::repo::Repository;
+use crate::session::Session;
 use crate::util::timestamp_label;
 
 pub const PR_SUMMARY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
@@ -22,6 +23,17 @@ pub struct PrCache {
     pub last_refreshed: Option<String>,
     pub signature: Option<String>,
     pub error: Option<String>,
+}
+
+pub(crate) struct PrCacheRepository<'a> {
+    pub repo: &'a Repository,
+    pub config: &'a Config,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrCacheSummaryMutation {
+    SaveSummary,
+    RemoveSummary,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -410,98 +422,26 @@ pub fn refresh_pr_cache(
     force_details: bool,
 ) {
     cache.last_polled = Some(Instant::now());
-    if config.is_default_branch(branch) {
-        cache.summary = None;
-        cache.details = None;
-        cache.signature = None;
-        cache.error = None;
-        cache.last_refreshed = Some(timestamp_label());
-        let _ = remove_pr_cache(repo, branch);
+    if pr_cache_excluded_branch(config, branch) {
+        let mutation = apply_pr_summary_refresh(cache, None, timestamp_label());
+        persist_pr_summary_mutation(repo, branch, cache, mutation);
         return;
     }
     let result = fetch_pr_summary(path, branch, config);
     match result {
         Ok(Some((summary, _raw))) => {
-            let signature = summary.signature();
-            if cache.signature.as_deref() != Some(signature.as_str()) {
-                cache.details = None;
-                cache.details_last_polled = None;
-            }
-            cache.summary = Some(summary);
-            cache.error = None;
-            cache.last_refreshed = Some(timestamp_label());
+            apply_pr_summary_refresh(cache, Some(summary), timestamp_label());
             if force_details && pr_details_due(cache) {
                 refresh_pr_details_cache(branch, cache, path, config);
             }
-            cache.signature = Some(signature);
-            let _ = save_pr_cache(repo, branch, cache);
-            if let Some(details) = &cache.details {
-                let _ = save_pr_details_cache(repo, branch, details);
-            } else {
-                let _ = remove_pr_details_cache(repo, branch);
-            }
+            persist_pr_summary_mutation(repo, branch, cache, PrCacheSummaryMutation::SaveSummary);
         }
         Ok(None) => {
-            cache.summary = None;
-            cache.details = None;
-            cache.signature = None;
-            cache.error = None;
-            cache.last_refreshed = Some(timestamp_label());
-            let _ = remove_pr_cache(repo, branch);
+            let mutation = apply_pr_summary_refresh(cache, None, timestamp_label());
+            persist_pr_summary_mutation(repo, branch, cache, mutation);
         }
         Err(error) => {
             cache.error = Some(error);
-        }
-    }
-}
-
-#[allow(dead_code)]
-pub fn refresh_pr_summary_index(
-    repo: &Repository,
-    sessions: &mut [crate::session::Session],
-    summaries: Vec<PrSummary>,
-    config: &Config,
-) {
-    let now = Instant::now();
-    let refreshed = timestamp_label();
-    for session in sessions {
-        session.pr.last_polled = Some(now);
-        if session.branch == "(detached)" || config.is_default_branch(&session.branch) {
-            session.pr.summary = None;
-            session.pr.details = None;
-            session.pr.signature = None;
-            session.pr.error = None;
-            session.pr.last_refreshed = Some(refreshed.clone());
-            let _ = remove_pr_cache(repo, &session.branch);
-            continue;
-        }
-        let summary = summaries
-            .iter()
-            .find(|summary| summary.head_ref == session.branch)
-            .cloned();
-        if let Some(summary) = summary {
-            let signature = summary.signature();
-            if session.pr.signature.as_deref() != Some(signature.as_str()) {
-                session.pr.details = None;
-                session.pr.details_last_polled = None;
-            }
-            session.pr.summary = Some(summary);
-            session.pr.signature = Some(signature);
-            session.pr.error = None;
-            session.pr.last_refreshed = Some(refreshed.clone());
-            let _ = save_pr_cache(repo, &session.branch, &session.pr);
-            if let Some(details) = &session.pr.details {
-                let _ = save_pr_details_cache(repo, &session.branch, details);
-            } else {
-                let _ = remove_pr_details_cache(repo, &session.branch);
-            }
-        } else {
-            session.pr.summary = None;
-            session.pr.details = None;
-            session.pr.signature = None;
-            session.pr.error = None;
-            session.pr.last_refreshed = Some(refreshed.clone());
-            let _ = remove_pr_cache(repo, &session.branch);
         }
     }
 }
@@ -513,7 +453,7 @@ pub fn refresh_pr_details_cache(
     config: &Config,
 ) {
     cache.details_last_polled = Some(Instant::now());
-    if config.is_default_branch(branch) {
+    if pr_cache_excluded_branch(config, branch) {
         cache.details = None;
         cache.error = None;
         return;
@@ -531,6 +471,55 @@ pub fn refresh_pr_details_cache(
     }
 }
 
+pub(crate) fn apply_pr_details_poll_result(
+    repo: &Repository,
+    branch: &str,
+    cache: &mut PrCache,
+    poll_result: PrCache,
+) -> bool {
+    let current_pr = cache.summary.as_ref().map(|summary| summary.number);
+    let result_pr = poll_result.summary.as_ref().map(|summary| summary.number);
+    if current_pr != result_pr {
+        return false;
+    }
+    cache.details = poll_result.details;
+    cache.details_last_polled = poll_result.details_last_polled;
+    cache.error = poll_result.error;
+    if let Some(details) = &cache.details {
+        let _ = save_pr_details_cache(repo, branch, details);
+    }
+    true
+}
+
+pub(crate) fn refresh_pr_summary_index_for_sessions(
+    repos: &[PrCacheRepository<'_>],
+    sessions: &mut [Session],
+    repo_index: usize,
+    summaries: Vec<PrSummary>,
+) {
+    let Some(managed) = repos.get(repo_index) else {
+        return;
+    };
+    let now = Instant::now();
+    let refreshed = timestamp_label();
+    for session in sessions
+        .iter_mut()
+        .filter(|session| session.repo_index == repo_index)
+    {
+        session.pr.last_polled = Some(now);
+        let summary = if pr_cache_excluded_branch(managed.config, &session.branch) {
+            None
+        } else {
+            summaries
+                .iter()
+                .find(|summary| summary.head_ref == session.branch)
+                .cloned()
+        };
+        let mutation = apply_pr_summary_refresh(&mut session.pr, summary, refreshed.clone());
+        persist_pr_summary_mutation(managed.repo, &session.branch, &session.pr, mutation);
+    }
+}
+
 pub fn pr_details_due(cache: &PrCache) -> bool {
     if cache.summary.is_none() {
         return false;
@@ -542,6 +531,61 @@ pub fn pr_details_due(cache: &PrCache) -> bool {
         .details_last_polled
         .map(|last| last.elapsed() >= PR_DETAIL_POLL_INTERVAL)
         .unwrap_or(true)
+}
+
+fn pr_cache_excluded_branch(config: &Config, branch: &str) -> bool {
+    branch == "(detached)" || config.is_default_branch(branch)
+}
+
+fn apply_pr_summary_refresh(
+    cache: &mut PrCache,
+    summary: Option<PrSummary>,
+    refreshed: String,
+) -> PrCacheSummaryMutation {
+    match summary {
+        Some(summary) => {
+            let signature = summary.signature();
+            if cache.signature.as_deref() != Some(signature.as_str()) {
+                cache.details = None;
+                cache.details_last_polled = None;
+            }
+            cache.summary = Some(summary);
+            cache.signature = Some(signature);
+            cache.error = None;
+            cache.last_refreshed = Some(refreshed);
+            PrCacheSummaryMutation::SaveSummary
+        }
+        None => {
+            cache.summary = None;
+            cache.details = None;
+            cache.details_last_polled = None;
+            cache.signature = None;
+            cache.error = None;
+            cache.last_refreshed = Some(refreshed);
+            PrCacheSummaryMutation::RemoveSummary
+        }
+    }
+}
+
+fn persist_pr_summary_mutation(
+    repo: &Repository,
+    branch: &str,
+    cache: &PrCache,
+    mutation: PrCacheSummaryMutation,
+) {
+    match mutation {
+        PrCacheSummaryMutation::SaveSummary => {
+            let _ = save_pr_cache(repo, branch, cache);
+            if let Some(details) = &cache.details {
+                let _ = save_pr_details_cache(repo, branch, details);
+            } else {
+                let _ = remove_pr_details_cache(repo, branch);
+            }
+        }
+        PrCacheSummaryMutation::RemoveSummary => {
+            let _ = remove_pr_cache(repo, branch);
+        }
+    }
 }
 
 pub fn fetch_pr_summary_index(
@@ -1144,13 +1188,103 @@ fn first_non_empty<const N: usize>(values: [&str; N]) -> String {
         .to_string()
 }
 
+pub(crate) fn migrate_pr_cache_schema(conn: &rusqlite::Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "
+        create table if not exists pr_cache (
+          branch text primary key,
+          number integer not null,
+          title text not null,
+          body text not null default '',
+          url text not null,
+          state text not null,
+          review_decision text not null,
+          requested_reviewers text not null default '',
+          head_ref text not null,
+          base_ref text not null,
+          head_sha text not null,
+          updated_at text not null,
+          check_status text not null,
+          comment_count integer not null default 0,
+          merged integer not null,
+          draft integer not null,
+          last_refreshed text not null,
+          refreshed_unix_ms integer not null
+        );
+
+        create table if not exists pr_details_cache (
+          branch text primary key,
+          comments text not null,
+          reviews text not null,
+          review_comments text not null,
+          files text not null,
+          failing_checks text not null,
+          refreshed_unix_ms integer not null
+        );
+        ",
+    )
+    .map_err(|error| format!("create PR cache schema: {error}"))?;
+    if !table_has_column(conn, "pr_cache", "body")? {
+        conn.execute(
+            "alter table pr_cache add column body text not null default ''",
+            [],
+        )
+        .map_err(|error| format!("migrate pr_cache body column: {error}"))?;
+    }
+    if !table_has_column(conn, "pr_cache", "comment_count")? {
+        conn.execute(
+            "alter table pr_cache add column comment_count integer not null default 0",
+            [],
+        )
+        .map_err(|error| format!("migrate pr_cache comment_count column: {error}"))?;
+    }
+    if !table_has_column(conn, "pr_cache", "requested_reviewers")? {
+        conn.execute(
+            "alter table pr_cache add column requested_reviewers text not null default ''",
+            [],
+        )
+        .map_err(|error| format!("migrate pr_cache requested_reviewers column: {error}"))?;
+    }
+    Ok(())
+}
+
+fn table_has_column(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, String> {
+    let mut statement = conn
+        .prepare(&format!("pragma table_info({table})"))
+        .map_err(|error| format!("prepare table info: {error}"))?;
+    let mut rows = statement
+        .query([])
+        .map_err(|error| format!("read table info: {error}"))?;
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| format!("read column info: {error}"))?
+    {
+        let name = row
+            .get::<_, String>(1)
+            .map_err(|error| format!("read column name: {error}"))?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn remove_pr_cache(repo: &Repository, branch: &str) -> Result<(), String> {
-    observability::with_writable_db(repo, |conn| {
-        conn.execute("delete from pr_cache where branch = ?1", params![branch])
-            .map_err(|error| format!("remove PR cache: {error}"))?;
-        remove_pr_details_cache_with_conn(conn, branch)?;
-        Ok(())
-    })
+    observability::with_writable_db(repo, |conn| remove_pr_cache_with_conn(conn, branch))
+}
+
+pub(crate) fn remove_pr_cache_with_conn(
+    conn: &rusqlite::Connection,
+    branch: &str,
+) -> Result<(), String> {
+    conn.execute("delete from pr_cache where branch = ?1", params![branch])
+        .map_err(|error| format!("remove PR cache: {error}"))?;
+    remove_pr_details_cache_with_conn(conn, branch)?;
+    Ok(())
 }
 
 pub fn remove_pr_details_cache(repo: &Repository, branch: &str) -> Result<(), String> {
@@ -1448,6 +1582,158 @@ mod tests {
     }
 
     #[test]
+    fn pr_summary_refresh_preserves_details_when_signature_matches() {
+        let summary = test_summary("feature", "abc123", 2);
+        let details = PrDetails {
+            review_comments: vec![PrReviewComment {
+                author: "reviewer".to_string(),
+                path: "src/main.rs".to_string(),
+                line: "12".to_string(),
+                body: "inline note".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                resolved: false,
+            }],
+            ..PrDetails::default()
+        };
+        let mut cache = PrCache {
+            summary: Some(summary.clone()),
+            details: Some(details),
+            details_last_polled: Some(Instant::now()),
+            signature: Some(summary.signature()),
+            error: Some("previous error".to_string()),
+            ..PrCache::default()
+        };
+
+        let mutation = apply_pr_summary_refresh(&mut cache, Some(summary), "now".to_string());
+
+        assert_eq!(mutation, PrCacheSummaryMutation::SaveSummary);
+        assert!(cache.details.is_some());
+        assert!(cache.details_last_polled.is_some());
+        assert_eq!(cache.error, None);
+        assert_eq!(cache.last_refreshed.as_deref(), Some("now"));
+    }
+
+    #[test]
+    fn pr_summary_refresh_drops_details_when_signature_changes() {
+        let old_summary = test_summary("feature", "abc123", 2);
+        let new_summary = test_summary("feature", "def456", 2);
+        let mut cache = PrCache {
+            summary: Some(old_summary.clone()),
+            details: Some(PrDetails::default()),
+            details_last_polled: Some(Instant::now()),
+            signature: Some(old_summary.signature()),
+            ..PrCache::default()
+        };
+
+        let mutation =
+            apply_pr_summary_refresh(&mut cache, Some(new_summary.clone()), "now".to_string());
+
+        assert_eq!(mutation, PrCacheSummaryMutation::SaveSummary);
+        assert_eq!(cache.summary.as_ref(), Some(&new_summary));
+        assert_eq!(
+            cache.signature.as_deref(),
+            Some(new_summary.signature().as_str())
+        );
+        assert!(cache.details.is_none());
+        assert!(cache.details_last_polled.is_none());
+    }
+
+    #[test]
+    fn pr_summary_refresh_clears_cache_when_branch_has_no_pr() {
+        let summary = test_summary("feature", "abc123", 2);
+        let mut cache = PrCache {
+            summary: Some(summary.clone()),
+            details: Some(PrDetails::default()),
+            details_last_polled: Some(Instant::now()),
+            signature: Some(summary.signature()),
+            error: Some("previous error".to_string()),
+            ..PrCache::default()
+        };
+
+        let mutation = apply_pr_summary_refresh(&mut cache, None, "now".to_string());
+
+        assert_eq!(mutation, PrCacheSummaryMutation::RemoveSummary);
+        assert!(cache.summary.is_none());
+        assert!(cache.details.is_none());
+        assert!(cache.details_last_polled.is_none());
+        assert!(cache.signature.is_none());
+        assert!(cache.error.is_none());
+        assert_eq!(cache.last_refreshed.as_deref(), Some("now"));
+    }
+
+    #[test]
+    fn pr_summary_index_refresh_updates_sessions_and_pr_cache_storage() {
+        let temp = unique_temp_dir("prism-pr-summary-index-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut config = test_config();
+        config.default_base = Some("main".to_string());
+        let feature_summary = test_summary("feature", "abc123", 2);
+        let stale_summary = test_summary("stale", "old", 1);
+        let details = PrDetails {
+            comments: vec![PrComment {
+                author: "reviewer".to_string(),
+                body: "new comment".to_string(),
+            }],
+            ..PrDetails::default()
+        };
+        let mut sessions = vec![
+            test_session(
+                "main",
+                PrCache {
+                    summary: Some(test_summary("main", "main", 0)),
+                    signature: Some(test_summary("main", "main", 0).signature()),
+                    ..PrCache::default()
+                },
+            ),
+            test_session(
+                "feature",
+                PrCache {
+                    summary: Some(feature_summary.clone()),
+                    details: Some(details.clone()),
+                    details_last_polled: Some(Instant::now()),
+                    signature: Some(feature_summary.signature()),
+                    ..PrCache::default()
+                },
+            ),
+            test_session(
+                "stale",
+                PrCache {
+                    summary: Some(stale_summary.clone()),
+                    signature: Some(stale_summary.signature()),
+                    ..PrCache::default()
+                },
+            ),
+        ];
+
+        refresh_pr_summary_index_for_sessions(
+            &[PrCacheRepository {
+                repo: &repo,
+                config: &config,
+            }],
+            &mut sessions,
+            0,
+            vec![feature_summary.clone()],
+        );
+
+        assert!(sessions[0].pr.summary.is_none());
+        assert!(sessions[2].pr.summary.is_none());
+        assert_eq!(sessions[1].pr.summary.as_ref(), Some(&feature_summary));
+        assert!(sessions[1].pr.details.is_some());
+
+        let loaded = load_pr_cache(&repo, "feature");
+        assert_eq!(loaded.summary.as_ref(), Some(&feature_summary));
+        assert_eq!(
+            loaded.details.as_ref().unwrap().comments[0].body,
+            "new comment"
+        );
+        assert!(load_pr_cache(&repo, "stale").summary.is_none());
+
+        let _ = fs::remove_dir_all(repo.prism_dir());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn parses_graphql_pr_summary_index() {
         let raw = r#"{
           "data": {
@@ -1699,5 +1985,45 @@ JSON
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    fn test_summary(head_ref: &str, head_sha: &str, comment_count: u64) -> PrSummary {
+        PrSummary {
+            number: 42,
+            title: "Fix review".to_string(),
+            body: "Body".to_string(),
+            url: "https://github.com/example/repo/pull/42".to_string(),
+            state: "OPEN".to_string(),
+            review_decision: "CHANGES_REQUESTED".to_string(),
+            requested_reviewers: vec!["alice".to_string()],
+            head_ref: head_ref.to_string(),
+            base_ref: "main".to_string(),
+            head_sha: head_sha.to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+            check_status: "failed".to_string(),
+            comment_count,
+            merged: false,
+            draft: false,
+        }
+    }
+
+    fn test_session(branch: &str, pr: PrCache) -> Session {
+        Session {
+            repo_index: 0,
+            repo_label: "repo".to_string(),
+            repo_key: None,
+            path: PathBuf::from("/tmp").join(branch),
+            path_display: format!("/tmp/{branch}"),
+            branch: branch.to_string(),
+            prompt_summary: String::new(),
+            adopted: false,
+            hidden: false,
+            status_label: String::new(),
+            agent_state: crate::agent::AgentState::Idle,
+            opencode_status: None,
+            pr,
+            wt_columns: BTreeMap::new(),
+            unseen_comments: false,
+        }
     }
 }
