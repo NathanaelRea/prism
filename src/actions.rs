@@ -5,31 +5,29 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use crate::agent::AgentState;
+use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
 use crate::github::{
-    PR_SUMMARY_POLL_INTERVAL, PrCache, fetch_pr_summary_index, pr_details_due, refresh_pr_cache,
-    refresh_pr_details_cache, save_pr_details_cache,
+    PR_SUMMARY_POLL_INTERVAL, PrCache, PrCacheRepository, apply_pr_details_poll_result,
+    fetch_pr_summary_index, pr_details_due, refresh_pr_cache, refresh_pr_details_cache,
+    refresh_pr_summary_index_for_sessions,
 };
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::lifecycle::{
-    PrSummaryRepository, create_pull_request, create_worktree_session, delete_worktree_session,
-    merge_pull_request, push_branch, refresh_branch_pr_cache, refresh_pr_summary_index_for_repo,
-    run_pre_pr_checks, run_pre_push_checks,
+    create_pull_request, create_worktree_session, delete_worktree_session, merge_pull_request,
+    push_branch, refresh_branch_pr_cache, run_pre_pr_checks, run_pre_push_checks,
 };
 use crate::opencode::{self, OpencodeStatus, load_runtime};
+use crate::plan::open_plan_mode;
 use crate::process::{command_exists, run_capture, run_status_with_stdin};
 use crate::review::build_review_fix_prompt;
 use crate::session::{
-    append_runtime_log, clear_hidden, discover_sessions, save_agent_state, write_task_metadata,
+    append_runtime_log, discover_sessions, save_agent_state, write_task_metadata,
 };
-use crate::tmux::{
-    TmuxWindow, agent_session_running, attach_or_create_agent, attach_or_create_plan_mode,
-    attach_or_create_window, ensure_agent_session, kill_agent_session,
-    latest_agent_session_generation, paste_agent_prompt,
-};
+use crate::tmux::TmuxWindow;
 use crate::tui::{
     DefaultBranchPollResult, ManagedRepo, OpencodeEventResult, OpencodePollKey, OpencodePollResult,
-    PrPollKey, PrPollResult, TmuxSlotKey, TmuxWarmupKey, TmuxWarmupResult, Tui, WtPollResult,
+    PrPollKey, PrPollResult, Tui, WtPollResult,
 };
 use crate::util::{status_count, truncate, yes};
 
@@ -100,7 +98,6 @@ impl Tui {
             &format!("Creating worktree for {}", branch.trim()),
         )?;
         create_worktree_session(&context.repo, &context.config, branch.trim())?;
-        clear_hidden(&context.repo, branch.trim())?;
         self.refresh_sessions()?;
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
@@ -691,12 +688,12 @@ impl Tui {
                             let repos = self
                                 .repos
                                 .iter()
-                                .map(|managed| PrSummaryRepository {
+                                .map(|managed| PrCacheRepository {
                                     repo: &managed.repo,
                                     config: &managed.config,
                                 })
                                 .collect::<Vec<_>>();
-                            refresh_pr_summary_index_for_repo(
+                            refresh_pr_summary_index_for_sessions(
                                 &repos,
                                 &mut self.sessions,
                                 repo_index,
@@ -735,23 +732,18 @@ impl Tui {
                         .find(|session| pr_poll_key(session) == key)
                     {
                         let before = pr_render_signature(&session.pr);
-                        let current_pr = session.pr.summary.as_ref().map(|summary| summary.number);
-                        let result_pr = cache.summary.as_ref().map(|summary| summary.number);
-                        if current_pr == result_pr {
-                            let before_comments = session_comment_count(session);
-                            session.pr.details = cache.details;
-                            session.pr.details_last_polled = cache.details_last_polled;
-                            session.pr.error = cache.error;
-                            if let Some(details) = &session.pr.details
-                                && let Some(repo) = self.repos.get(session.repo_index)
-                            {
-                                let _ = save_pr_details_cache(&repo.repo, &session.branch, details);
-                            }
-                            if session_comment_count(session) > before_comments
-                                && selected_key.as_ref() != Some(&key)
-                            {
-                                session.unseen_comments = true;
-                            }
+                        let before_comments = session_comment_count(session);
+                        if let Some(repo) = self.repos.get(session.repo_index)
+                            && apply_pr_details_poll_result(
+                                &repo.repo,
+                                &session.branch,
+                                &mut session.pr,
+                                *cache,
+                            )
+                            && session_comment_count(session) > before_comments
+                            && selected_key.as_ref() != Some(&key)
+                        {
+                            session.unseen_comments = true;
                         }
                         changed |= before != pr_render_signature(&session.pr);
                     }
@@ -908,18 +900,28 @@ impl Tui {
             self.show_message("default branch does not have an agent session")?;
             return Ok(());
         }
-        let session = session_for_tmux_warmup(&self.sessions[context.session_index]);
-        let slot = tmux_slot_key(&session);
+        let session =
+            crate::agent_session::background_snapshot(&self.sessions[context.session_index]);
+        let slot = crate::agent_session::slot_for_session(&session);
         let generation = self.tmux_generation_for_slot(&slot);
-        let key = tmux_warmup_key(slot.clone(), generation);
+        let key = crate::agent_session::warmup_key(slot.clone(), generation);
         self.finish_tmux_warmup_for_key(&key);
-        attach_or_create_agent(&context.repo, &context.config, &session, generation)?;
-        let running = agent_session_running(&context.repo, &context.config, &session, generation);
+        let running = crate::agent_session::attach_session(
+            &context.repo,
+            &context.config,
+            &session,
+            generation,
+        )?;
         self.update_tmux_agent_state_for_slot(&slot, running);
         if !running {
-            let _ = kill_agent_session(&context.repo, &context.config, &session.branch, generation);
+            crate::agent_session::retire_generation(
+                &context.repo,
+                &context.config,
+                &session.branch,
+                generation,
+            );
             let next_generation = self.rotate_tmux_generation(slot.clone());
-            let next_key = tmux_warmup_key(slot, next_generation);
+            let next_key = crate::agent_session::warmup_key(slot, next_generation);
             self.start_tmux_agent_warmup_for_key(next_key, Duration::from_millis(250));
         }
         Ok(())
@@ -929,13 +931,19 @@ impl Tui {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
-        let session = session_for_tmux_warmup(&self.sessions[context.session_index]);
-        let slot = tmux_slot_key(&session);
+        let session =
+            crate::agent_session::background_snapshot(&self.sessions[context.session_index]);
+        let slot = crate::agent_session::slot_for_session(&session);
         let generation = self.tmux_generation_for_slot(&slot);
-        let key = tmux_warmup_key(slot.clone(), generation);
+        let key = crate::agent_session::warmup_key(slot.clone(), generation);
         self.finish_tmux_warmup_for_key(&key);
-        attach_or_create_window(&context.repo, &context.config, &session, generation, window)?;
-        let running = agent_session_running(&context.repo, &context.config, &session, generation);
+        let running = crate::agent_session::attach_window(
+            &context.repo,
+            &context.config,
+            &session,
+            generation,
+            window,
+        )?;
         self.update_tmux_agent_state_for_slot(&slot, running);
         Ok(())
     }
@@ -996,7 +1004,7 @@ impl Tui {
         let root = context.repo.root.clone();
         let config = context.config.clone();
         raw.suspend()?;
-        let result = attach_or_create_plan_mode(&config, &root);
+        let result = open_plan_mode(&config, &root);
         let resume_result = raw.resume();
         self.refresh_sessions()?;
         self.start_tmux_agent_warmup();
@@ -1017,7 +1025,7 @@ impl Tui {
         let path = self.sessions[context.session_index].path.clone();
         let config = context.config.clone();
         raw.suspend()?;
-        let result = attach_or_create_plan_mode(&config, &path);
+        let result = open_plan_mode(&config, &path);
         let resume_result = raw.resume();
         self.refresh_sessions()?;
         self.start_tmux_agent_warmup();
@@ -1033,14 +1041,14 @@ impl Tui {
         let sessions = self
             .sessions
             .iter()
-            .map(session_for_tmux_warmup)
+            .map(crate::agent_session::background_snapshot)
             .collect::<Vec<_>>();
         let jobs = sessions
             .into_iter()
             .filter_map(|session| {
-                let slot = tmux_slot_key(&session);
+                let slot = crate::agent_session::slot_for_session(&session);
                 let generation = self.tmux_generation_for_slot(&slot);
-                let key = tmux_warmup_key(slot, generation);
+                let key = crate::agent_session::warmup_key(slot, generation);
                 (!self.tmux_warmups_in_flight.contains(&key))
                     .then(|| {
                         self.repos
@@ -1056,7 +1064,7 @@ impl Tui {
         }
     }
 
-    fn start_tmux_agent_warmup_for_key(&mut self, key: TmuxWarmupKey, delay: Duration) {
+    fn start_tmux_agent_warmup_for_key(&mut self, key: AgentSessionWarmupKey, delay: Duration) {
         self.poll_tmux_agent_warmup();
         if self.tmux_warmups_in_flight.contains(&key) {
             return;
@@ -1067,7 +1075,7 @@ impl Tui {
         let Some(session) = self
             .sessions
             .iter()
-            .find(|session| tmux_slot_key(session) == key.slot)
+            .find(|session| crate::agent_session::slot_for_session(session) == key.slot)
         else {
             return;
         };
@@ -1076,7 +1084,7 @@ impl Tui {
                 key,
                 repo.repo.clone(),
                 repo.config.clone(),
-                session_for_tmux_warmup(session),
+                crate::agent_session::background_snapshot(session),
                 delay,
             );
         }
@@ -1084,7 +1092,7 @@ impl Tui {
 
     fn spawn_tmux_warmup_job(
         &mut self,
-        key: TmuxWarmupKey,
+        key: AgentSessionWarmupKey,
         repo: crate::repo::Repository,
         config: crate::config::Config,
         session: crate::session::Session,
@@ -1096,12 +1104,13 @@ impl Tui {
             if !delay.is_zero() {
                 std::thread::sleep(delay);
             }
-            let result = ensure_agent_session(&repo, &config, &session, key.generation);
+            let result =
+                crate::agent_session::ensure_session(&repo, &config, &session, key.generation);
             let (running, error) = match result {
                 Ok(running) => (Some(running), None),
                 Err(error) => (None, Some(error)),
             };
-            let _ = tx.send(TmuxWarmupResult {
+            let _ = tx.send(AgentSessionWarmupResult {
                 key,
                 running,
                 error,
@@ -1117,7 +1126,7 @@ impl Tui {
         changed
     }
 
-    fn finish_tmux_warmup_for_key(&mut self, key: &TmuxWarmupKey) -> bool {
+    fn finish_tmux_warmup_for_key(&mut self, key: &AgentSessionWarmupKey) -> bool {
         let mut changed = self.poll_tmux_agent_warmup();
         while self.tmux_warmups_in_flight.contains(key) {
             let Ok(result) = self.tmux_warmup_rx.recv() else {
@@ -1129,92 +1138,31 @@ impl Tui {
         changed
     }
 
-    fn apply_tmux_warmup_result(&mut self, result: TmuxWarmupResult) -> bool {
+    fn apply_tmux_warmup_result(&mut self, result: AgentSessionWarmupResult) -> bool {
         self.tmux_warmups_in_flight.remove(&result.key);
-        if !self.tmux_warmup_key_is_current(&result.key) {
-            return false;
-        }
-        if let Some(error) = result.error {
-            let _ = append_runtime_log(
-                &self
-                    .repos
-                    .get(result.key.slot.repo_index)
-                    .map(|repo| repo.repo.clone())
-                    .unwrap_or_else(|| self.repo.clone()),
-                &format!(
-                    "tmux warm-up failed for {}#{}: {error}",
-                    result.key.slot.branch, result.key.generation
-                ),
-            );
-            return false;
-        }
-        let Some(running) = result.running else {
-            return false;
-        };
-        let Some(session) = self
-            .sessions
-            .iter_mut()
-            .find(|session| tmux_slot_key(session) == result.key.slot)
-        else {
-            return false;
-        };
-        let Some(state) = tmux_agent_state(session.agent_state, running) else {
-            return false;
-        };
-        if session.agent_state == state {
-            return false;
-        }
-        session.agent_state = state;
-        if let Some(repo) = self.repos.get(session.repo_index) {
-            let _ = save_agent_state(&repo.repo, &session.branch, state);
-        }
-        true
+        crate::agent_session::apply_warmup_result(
+            &self.repos,
+            &self.repo,
+            &mut self.sessions,
+            &self.tmux_generations,
+            result,
+        )
     }
 
-    fn tmux_generation_for_slot(&mut self, slot: &TmuxSlotKey) -> u64 {
-        if let Some(generation) = self.tmux_generations.get(slot).copied() {
-            return generation;
-        }
-        let generation = self
-            .repos
-            .get(slot.repo_index)
-            .and_then(|repo| {
-                latest_agent_session_generation(&repo.repo, &repo.config, &slot.branch)
-            })
-            .unwrap_or(0);
-        self.tmux_generations.insert(slot.clone(), generation);
-        generation
+    fn tmux_generation_for_slot(&mut self, slot: &AgentSessionSlot) -> u64 {
+        crate::agent_session::generation_for_slot(&self.repos, &mut self.tmux_generations, slot)
     }
 
-    fn rotate_tmux_generation(&mut self, slot: TmuxSlotKey) -> u64 {
-        let generation = self.tmux_generation_for_slot(&slot).saturating_add(1);
-        self.tmux_generations.insert(slot, generation);
-        generation
+    fn rotate_tmux_generation(&mut self, slot: AgentSessionSlot) -> u64 {
+        crate::agent_session::rotate_generation(&self.repos, &mut self.tmux_generations, slot)
     }
 
-    fn tmux_warmup_key_is_current(&self, key: &TmuxWarmupKey) -> bool {
-        self.tmux_generations.get(&key.slot).copied().unwrap_or(0) == key.generation
+    fn tmux_warmup_key_is_current(&self, key: &AgentSessionWarmupKey) -> bool {
+        crate::agent_session::key_is_current(&self.tmux_generations, key)
     }
 
-    fn update_tmux_agent_state_for_slot(&mut self, slot: &TmuxSlotKey, running: bool) -> bool {
-        let Some(session) = self
-            .sessions
-            .iter_mut()
-            .find(|session| tmux_slot_key(session) == *slot)
-        else {
-            return false;
-        };
-        let Some(state) = tmux_agent_state(session.agent_state, running) else {
-            return false;
-        };
-        if session.agent_state == state {
-            return false;
-        }
-        session.agent_state = state;
-        if let Some(repo) = self.repos.get(session.repo_index) {
-            let _ = save_agent_state(&repo.repo, &session.branch, state);
-        }
-        true
+    fn update_tmux_agent_state_for_slot(&mut self, slot: &AgentSessionSlot, running: bool) -> bool {
+        crate::agent_session::update_observed_state(&self.repos, &mut self.sessions, slot, running)
     }
 
     pub(crate) fn start_review_fix(&mut self) -> Result<(), String> {
@@ -1375,7 +1323,7 @@ impl Tui {
         let session = self
             .sessions
             .get(index)
-            .map(session_for_tmux_warmup)
+            .map(crate::agent_session::background_snapshot)
             .ok_or_else(|| "no selected session".to_string())?;
         let managed = self
             .repos
@@ -1383,12 +1331,12 @@ impl Tui {
             .ok_or_else(|| "selected session repository no longer exists".to_string())?;
         let repo = managed.repo.clone();
         let config = managed.config.clone();
-        let slot = tmux_slot_key(&session);
+        let slot = crate::agent_session::slot_for_session(&session);
         let generation = self.tmux_generation_for_slot(&slot);
-        let key = tmux_warmup_key(slot.clone(), generation);
+        let key = crate::agent_session::warmup_key(slot.clone(), generation);
         self.finish_tmux_warmup_for_key(&key);
-        paste_agent_prompt(&repo, &config, &session, generation, prompt)?;
-        let running = agent_session_running(&repo, &config, &session, generation);
+        let running =
+            crate::agent_session::submit_prompt(&repo, &config, &session, generation, prompt)?;
         self.update_tmux_agent_state_for_slot(&slot, running);
         Ok(())
     }
@@ -1644,16 +1592,6 @@ fn write_clipboard_command(program: &str, args: &[&str], text: &str) -> Result<(
     run_status_with_stdin(Command::new(program).args(args), text)
 }
 
-fn tmux_agent_state(current: AgentState, tmux_agent_running: bool) -> Option<AgentState> {
-    if tmux_agent_running {
-        return Some(AgentState::NeedsInput);
-    }
-    if matches!(current, AgentState::Running | AgentState::NeedsRestart) {
-        return Some(AgentState::ExitedOk);
-    }
-    None
-}
-
 fn pr_render_signature(cache: &PrCache) -> String {
     format!(
         "{:?}|{:?}|{:?}|{:?}",
@@ -1662,11 +1600,7 @@ fn pr_render_signature(cache: &PrCache) -> String {
 }
 
 fn pr_poll_key(session: &crate::session::Session) -> PrPollKey {
-    PrPollKey {
-        repo_index: session.repo_index,
-        branch: session.branch.clone(),
-        path: session.path.clone(),
-    }
+    PrPollKey::for_session(session)
 }
 
 fn pr_pollable(config: &crate::config::Config, session: &crate::session::Session) -> bool {
@@ -1813,44 +1747,8 @@ fn editor_command() -> Option<String> {
         })
 }
 
-fn tmux_slot_key(session: &crate::session::Session) -> TmuxSlotKey {
-    TmuxSlotKey {
-        repo_index: session.repo_index,
-        branch: session.branch.clone(),
-        path: session.path.clone(),
-    }
-}
-
 fn opencode_poll_key(session: &crate::session::Session) -> OpencodePollKey {
-    OpencodePollKey {
-        repo_index: session.repo_index,
-        branch: session.branch.clone(),
-        path: session.path.clone(),
-    }
-}
-
-fn tmux_warmup_key(slot: TmuxSlotKey, generation: u64) -> TmuxWarmupKey {
-    TmuxWarmupKey { slot, generation }
-}
-
-fn session_for_tmux_warmup(session: &crate::session::Session) -> crate::session::Session {
-    crate::session::Session {
-        repo_index: session.repo_index,
-        repo_label: session.repo_label.clone(),
-        repo_key: session.repo_key,
-        path: session.path.clone(),
-        path_display: session.path_display.clone(),
-        branch: session.branch.clone(),
-        prompt_summary: session.prompt_summary.clone(),
-        adopted: session.adopted,
-        hidden: session.hidden,
-        status_label: session.status_label.clone(),
-        agent_state: session.agent_state,
-        opencode_status: session.opencode_status.clone(),
-        pr: session.pr.clone(),
-        wt_columns: session.wt_columns.clone(),
-        unseen_comments: session.unseen_comments,
-    }
+    OpencodePollKey::for_session(session)
 }
 
 fn delete_warnings(session: &crate::session::Session) -> Vec<String> {
@@ -1884,35 +1782,19 @@ fn delete_warnings(session: &crate::session::Session) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use crate::agent::AgentState;
+    use crate::agent_session::{AgentSessionWarmupResult, slot_for_session, warmup_key};
     use crate::config::{Checks, Config, EscapeKey, MergeMethod};
     use crate::github::PrCache;
     use crate::repo::Repository;
     use crate::session::Session;
-    use crate::tui::{TmuxWarmupResult, Tui};
+    use crate::tui::Tui;
 
-    use super::{
-        pr_summary_or_error, run_browser_opener, status_label_with_behind, tmux_agent_state,
-        tmux_slot_key, tmux_warmup_key,
-    };
+    use super::{pr_summary_or_error, run_browser_opener, status_label_with_behind};
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn idle_tmux_opencode_session_does_not_count_as_running_agent() {
-        let state = tmux_agent_state(AgentState::Idle, true);
-
-        assert_eq!(state, Some(AgentState::NeedsInput));
-    }
-
-    #[test]
-    fn stale_running_state_without_process_is_cleared() {
-        let state = tmux_agent_state(AgentState::Running, false);
-
-        assert_eq!(state, Some(AgentState::ExitedOk));
-    }
 
     #[test]
     fn browser_opener_invokes_first_available_candidate() {
@@ -2149,14 +2031,14 @@ exit 0
             .insert("opencode".to_string(), "opencode".to_string());
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
-        let key = tmux_warmup_key(tmux_slot_key(&session), 0);
+        let key = warmup_key(slot_for_session(&session), 0);
         let mut tui = Tui::new_single(repo, config, vec![session]);
         tui.tmux_warmups_in_flight.insert(key.clone());
         let tx = tui.tmux_warmup_tx.clone();
 
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
-            let _ = tx.send(TmuxWarmupResult {
+            let _ = tx.send(AgentSessionWarmupResult {
                 key,
                 running: Some(true),
                 error: None,
@@ -2263,12 +2145,12 @@ exit 1
         config.default_agent = "opencode".to_string();
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
-        let slot = tmux_slot_key(&session);
-        let stale_key = tmux_warmup_key(slot.clone(), 0);
+        let slot = slot_for_session(&session);
+        let stale_key = warmup_key(slot.clone(), 0);
         let mut tui = Tui::new_single(repo, config, vec![session]);
         tui.tmux_generations.insert(slot, 1);
 
-        let changed = tui.apply_tmux_warmup_result(TmuxWarmupResult {
+        let changed = tui.apply_tmux_warmup_result(AgentSessionWarmupResult {
             key: stale_key,
             running: Some(true),
             error: None,

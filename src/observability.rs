@@ -110,7 +110,6 @@ struct ObserverState {
     stderr_level: Option<LogLevel>,
     repo_root: Option<PathBuf>,
     prism_dir: Option<PathBuf>,
-    db_ready: bool,
     buffered: Vec<Event>,
     next_operation_id: u64,
     startup_run_id: Option<String>,
@@ -510,15 +509,36 @@ pub fn with_writable_db<T>(
     repo: &Repository,
     run: impl FnOnce(&Connection) -> Result<T, String>,
 ) -> Result<T, String> {
-    let path = db_path(repo);
+    writable_db(repo).run(run)
+}
+
+pub fn writable_db(repo: &Repository) -> WritableDb {
+    WritableDb {
+        path: db_path(repo),
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WritableDb {
+    path: PathBuf,
+}
+
+impl WritableDb {
+    pub fn run<T>(&self, run: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
+        let conn = open_writable_db_path(&self.path)?;
+        run(&conn)
+    }
+}
+
+fn open_writable_db_path(path: &Path) -> Result<Connection, String> {
     let existed_before_open = path.exists();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("create db dir: {error}"))?;
     }
     let conn =
-        Connection::open(&path).map_err(|error| format!("open {}: {error}", path.display()))?;
-    ensure_schema_for_path(&conn, &path, existed_before_open)?;
-    run(&conn)
+        Connection::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    ensure_schema_for_path(&conn, path, existed_before_open)?;
+    Ok(conn)
 }
 
 fn ensure_schema_for_path(
@@ -576,7 +596,6 @@ impl ObserverState {
             stderr_level: options.print_logs.then_some(options.log_level),
             repo_root: None,
             prism_dir: None,
-            db_ready: false,
             buffered: Vec::new(),
             next_operation_id: 0,
             startup_run_id: None,
@@ -690,16 +709,7 @@ impl ObserverState {
     }
 
     fn open_writable_db(&mut self, path: &Path) -> Result<Connection, String> {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| format!("create db dir: {error}"))?;
-        }
-        let conn =
-            Connection::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
-        if !self.db_ready {
-            create_schema(&conn)?;
-            self.db_ready = true;
-        }
-        Ok(conn)
+        open_writable_db_path(path)
     }
 
     fn insert_startup_run(&mut self, run_id: &str, version: &str) {
@@ -875,119 +885,15 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
           error text
         );
 
-        create table if not exists task_metadata (
-          branch text primary key,
-          prompt_summary text not null,
-          initial_prompt text not null,
-          worktree text not null,
-          updated_unix_ms integer not null
-        );
-
-        create table if not exists hidden_session (
-          branch text primary key,
-          hidden_unix_ms integer not null
-        );
-
-        create table if not exists agent_state (
-          branch text primary key,
-          state text not null,
-          updated_unix_ms integer not null
-        );
-
-        create table if not exists opencode_runtime (
-          repo_root text not null,
-          branch text not null,
-          worktree_path text not null,
-          server_port integer not null,
-          server_url text not null,
-          server_pid integer,
-          opencode_session_id text,
-          generation integer not null,
-          updated_unix_ms integer not null,
-          primary key (repo_root, branch, worktree_path)
-        );
-
-        create index if not exists opencode_runtime_branch_idx
-          on opencode_runtime(repo_root, branch);
-
-        create table if not exists pr_cache (
-          branch text primary key,
-          number integer not null,
-          title text not null,
-          body text not null default '',
-          url text not null,
-          state text not null,
-          review_decision text not null,
-          requested_reviewers text not null default '',
-          head_ref text not null,
-          base_ref text not null,
-          head_sha text not null,
-          updated_at text not null,
-          check_status text not null,
-          comment_count integer not null default 0,
-          merged integer not null,
-          draft integer not null,
-          last_refreshed text not null,
-          refreshed_unix_ms integer not null
-        );
-
-        create table if not exists pr_details_cache (
-          branch text primary key,
-          comments text not null,
-          reviews text not null,
-          review_comments text not null,
-          files text not null,
-          failing_checks text not null,
-          refreshed_unix_ms integer not null
-        );
         ",
     )
     .map_err(|error| format!("create schema: {error}"))?;
-    if !table_has_column(conn, "pr_cache", "body")? {
-        conn.execute(
-            "alter table pr_cache add column body text not null default ''",
-            [],
-        )
-        .map_err(|error| format!("migrate pr_cache body column: {error}"))?;
-    }
-    if !table_has_column(conn, "pr_cache", "comment_count")? {
-        conn.execute(
-            "alter table pr_cache add column comment_count integer not null default 0",
-            [],
-        )
-        .map_err(|error| format!("migrate pr_cache comment_count column: {error}"))?;
-    }
-    if !table_has_column(conn, "pr_cache", "requested_reviewers")? {
-        conn.execute(
-            "alter table pr_cache add column requested_reviewers text not null default ''",
-            [],
-        )
-        .map_err(|error| format!("migrate pr_cache requested_reviewers column: {error}"))?;
-    }
+    crate::session::migrate_worktree_session_schema(conn)?;
+    crate::opencode::migrate_runtime_schema(conn)?;
+    crate::github::migrate_pr_cache_schema(conn)?;
     conn.pragma_update(None, "foreign_keys", true)
         .map_err(|error| format!("enable foreign keys: {error}"))?;
     Ok(())
-}
-
-fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
-    let mut statement = conn
-        .prepare(&format!("pragma table_info({table})"))
-        .map_err(|error| format!("prepare table info: {error}"))?;
-    let mut rows = statement
-        .query([])
-        .map_err(|error| format!("read table info: {error}"))?;
-    while let Some(row) = rows
-        .next()
-        .map_err(|error| format!("read column info: {error}"))?
-    {
-        let name = row
-            .get::<_, String>(1)
-            .map_err(|error| format!("read column name: {error}"))?;
-        if name == column {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 fn append_text_line(path: &Path, line: &str) -> Result<(), String> {
@@ -1189,9 +1095,15 @@ fn sqlite_value_to_string(value: ValueRef<'_>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
     use std::process::Command;
 
-    use super::{sanitize_command_text, sanitized_argv};
+    use crate::repo::Repository;
+
+    use super::{
+        db_path, now_ms, open_writable_db_path, sanitize_command_text, sanitized_argv, writable_db,
+    };
 
     #[test]
     fn sanitizes_secret_command_arguments() {
@@ -1228,5 +1140,63 @@ mod tests {
         let argv = sanitized_argv(&command);
 
         assert_eq!(argv, vec!["tmux", "agent --token <redacted>"]);
+    }
+
+    #[test]
+    fn writable_db_exposes_repo_db_path_and_initializes_schema() {
+        let root = test_path("writable-db-repo");
+        let config_dir = test_path("writable-db-config");
+        let _ = fs::remove_dir_all(&config_dir);
+        let repo = Repository::with_config_dir_for_test(root, config_dir.clone());
+        let db = writable_db(&repo);
+
+        let path = db_path(&repo);
+        assert_eq!(path, repo.prism_dir().join("prism.db"));
+
+        db.run(|conn| {
+            conn.execute(
+                "insert into metadata (key, value) values ('phase', 'six')",
+                [],
+            )
+            .map_err(|error| format!("insert metadata: {error}"))?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(table_exists(&path, "metadata"));
+        let _ = fs::remove_dir_all(config_dir);
+    }
+
+    #[test]
+    fn writable_db_initializes_schema_for_each_path() {
+        let base = test_path("writable-db-multi-path");
+        let _ = fs::remove_dir_all(&base);
+        let first = base.join("one").join("prism.db");
+        let second = base.join("two").join("prism.db");
+
+        open_writable_db_path(&first).unwrap();
+        open_writable_db_path(&second).unwrap();
+
+        assert!(table_exists(&first, "event"));
+        assert!(table_exists(&second, "event"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    fn table_exists(path: &Path, table: &str) -> bool {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.query_row(
+            "select exists(select 1 from sqlite_master where type = 'table' and name = ?1)",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap()
+    }
+
+    fn test_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "prism-observability-{label}-{}-{}",
+            std::process::id(),
+            now_ms()
+        ))
     }
 }

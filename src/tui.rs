@@ -5,6 +5,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use crate::agent::AgentState;
+use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::config::Config;
 use crate::github::{PrCache, PrSummary};
 use crate::input::{Key, KeyInput};
@@ -29,10 +30,10 @@ pub struct Tui {
     pub(crate) pr_poll_tx: Sender<PrPollResult>,
     pub(crate) pr_poll_rx: Receiver<PrPollResult>,
     pub(crate) pr_polls_in_flight: BTreeSet<PrPollKey>,
-    pub(crate) tmux_warmup_tx: Sender<TmuxWarmupResult>,
-    pub(crate) tmux_warmup_rx: Receiver<TmuxWarmupResult>,
-    pub(crate) tmux_warmups_in_flight: BTreeSet<TmuxWarmupKey>,
-    pub(crate) tmux_generations: BTreeMap<TmuxSlotKey, u64>,
+    pub(crate) tmux_warmup_tx: Sender<AgentSessionWarmupResult>,
+    pub(crate) tmux_warmup_rx: Receiver<AgentSessionWarmupResult>,
+    pub(crate) tmux_warmups_in_flight: BTreeSet<AgentSessionWarmupKey>,
+    pub(crate) tmux_generations: BTreeMap<AgentSessionSlot, u64>,
     pub(crate) wt_poll_tx: Sender<WtPollResult>,
     pub(crate) wt_poll_rx: Receiver<WtPollResult>,
     pub(crate) default_branch_poll_tx: Sender<DefaultBranchPollResult>,
@@ -115,23 +116,14 @@ pub(crate) enum PrPollResult {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct TmuxSlotKey {
-    pub repo_index: usize,
-    pub branch: String,
-    pub path: PathBuf,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct TmuxWarmupKey {
-    pub slot: TmuxSlotKey,
-    pub generation: u64,
-}
-
-pub(crate) struct TmuxWarmupResult {
-    pub key: TmuxWarmupKey,
-    pub running: Option<bool>,
-    pub error: Option<String>,
+impl PrPollKey {
+    pub(crate) fn for_session(session: &Session) -> Self {
+        Self {
+            repo_index: session.repo_index,
+            branch: session.branch.clone(),
+            path: session.path.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,6 +166,41 @@ pub(crate) struct OpencodePollResult {
 pub(crate) struct OpencodeEventResult {
     pub server_url: String,
     pub event: Result<OpencodeEvent, String>,
+}
+
+impl OpencodePollKey {
+    pub(crate) fn for_session(session: &Session) -> Self {
+        Self {
+            repo_index: session.repo_index,
+            branch: session.branch.clone(),
+            path: session.path.clone(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct TuiBackgroundChanges {
+    tmux: bool,
+    worktree_columns: bool,
+    default_branch: bool,
+    opencode_status: bool,
+    opencode_events: bool,
+    pull_requests: bool,
+    status_message: bool,
+    resized: bool,
+}
+
+impl TuiBackgroundChanges {
+    fn any(&self) -> bool {
+        self.tmux
+            || self.worktree_columns
+            || self.default_branch
+            || self.opencode_status
+            || self.opencode_events
+            || self.pull_requests
+            || self.status_message
+            || self.resized
+    }
 }
 
 impl Tui {
@@ -296,30 +323,7 @@ impl Tui {
         let mut last_size = terminal_size();
 
         loop {
-            let tmux_changed = self.poll_tmux_agent_warmup();
-            let wt_changed = self.poll_wt_columns();
-            let default_branch_changed = self.poll_default_branch_status();
-            let opencode_changed = self.poll_opencode_status();
-            let opencode_event_changed = self.poll_opencode_events();
-            let prs_changed = self.poll_pull_requests(false);
-            self.start_default_branch_status_poll(false);
-            self.start_opencode_status_poll(false);
-            self.start_opencode_event_listeners();
-            let status_changed = self.expire_status_message();
-            let current_size = terminal_size();
-            let resized = current_size != last_size;
-            if resized {
-                last_size = current_size;
-            }
-            if tmux_changed
-                || wt_changed
-                || default_branch_changed
-                || opencode_changed
-                || opencode_event_changed
-                || prs_changed
-                || status_changed
-                || resized
-            {
+            if self.tick_tui_action_jobs(&mut last_size).any() {
                 self.draw()?;
             }
             let count = match stdin.read(&mut buffer) {
@@ -605,6 +609,28 @@ impl Tui {
         }
         self.shutdown_owned_opencode_servers();
         Ok(())
+    }
+
+    fn tick_tui_action_jobs(&mut self, last_size: &mut (u16, u16)) -> TuiBackgroundChanges {
+        let mut changes = TuiBackgroundChanges {
+            tmux: self.poll_tmux_agent_warmup(),
+            worktree_columns: self.poll_wt_columns(),
+            default_branch: self.poll_default_branch_status(),
+            opencode_status: self.poll_opencode_status(),
+            opencode_events: self.poll_opencode_events(),
+            pull_requests: self.poll_pull_requests(false),
+            status_message: self.expire_status_message(),
+            ..TuiBackgroundChanges::default()
+        };
+        self.start_default_branch_status_poll(false);
+        self.start_opencode_status_poll(false);
+        self.start_opencode_event_listeners();
+        let current_size = terminal_size();
+        changes.resized = current_size != *last_size;
+        if changes.resized {
+            *last_size = current_size;
+        }
+        changes
     }
 
     fn confirm_quit(&self) -> Result<bool, String> {

@@ -1,8 +1,15 @@
 use crate::config::Config;
+use crate::github::{PrDetails, PrSummary};
 use crate::session::Session;
 use crate::util::empty_dash;
 
 const DEFAULT_REVIEW_FIX_TEMPLATE: &str = "Here are review comments on PR {pr_number}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n{comments}";
+
+pub struct ReviewFixPromptInput<'a> {
+    pub branch: &'a str,
+    pub summary: &'a PrSummary,
+    pub details: &'a PrDetails,
+}
 
 pub fn build_review_fix_prompt(session: &Session, config: &Config) -> Result<String, String> {
     let summary = session
@@ -13,10 +20,24 @@ pub fn build_review_fix_prompt(session: &Session, config: &Config) -> Result<Str
     let details = session
         .pr
         .details
-        .clone()
+        .as_ref()
         .ok_or_else(|| "PR comments are still loading; refresh and try again".to_string())?;
 
-    let mut review_comments = details.review_comments;
+    Ok(build_review_fix_prompt_from_input(
+        ReviewFixPromptInput {
+            branch: &session.branch,
+            summary,
+            details,
+        },
+        config,
+    ))
+}
+
+pub fn build_review_fix_prompt_from_input(
+    input: ReviewFixPromptInput<'_>,
+    config: &Config,
+) -> String {
+    let mut review_comments = input.details.review_comments.clone();
     review_comments.sort_by(|a, b| {
         a.path
             .cmp(&b.path)
@@ -51,18 +72,18 @@ pub fn build_review_fix_prompt(session: &Session, config: &Config) -> Result<Str
         comments.push_str("No PR review comments were found.\n\n");
     }
 
-    Ok(render_template(
+    render_template(
         config
             .prompt_template("review_fix")
             .unwrap_or(DEFAULT_REVIEW_FIX_TEMPLATE),
         &[
-            ("pr_number", summary.number.to_string()),
-            ("branch", session.branch.clone()),
-            ("title", summary.title.clone()),
-            ("url", summary.url.clone()),
+            ("pr_number", input.summary.number.to_string()),
+            ("branch", input.branch.to_string()),
+            ("title", input.summary.title.clone()),
+            ("url", input.summary.url.clone()),
             ("comments", comments),
         ],
-    ))
+    )
 }
 
 fn render_template(template: &str, values: &[(&str, String)]) -> String {

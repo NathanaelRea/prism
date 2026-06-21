@@ -36,6 +36,28 @@ pub struct Session {
     pub unseen_comments: bool,
 }
 
+impl Session {
+    pub(crate) fn background_job_snapshot(&self) -> Self {
+        Self {
+            repo_index: self.repo_index,
+            repo_label: self.repo_label.clone(),
+            repo_key: self.repo_key,
+            path: self.path.clone(),
+            path_display: self.path_display.clone(),
+            branch: self.branch.clone(),
+            prompt_summary: self.prompt_summary.clone(),
+            adopted: self.adopted,
+            hidden: self.hidden,
+            status_label: self.status_label.clone(),
+            agent_state: self.agent_state,
+            opencode_status: self.opencode_status.clone(),
+            pr: self.pr.clone(),
+            wt_columns: self.wt_columns.clone(),
+            unseen_comments: self.unseen_comments,
+        }
+    }
+}
+
 pub fn discover_sessions(repo: &Repository, config: &Config) -> Result<Vec<Session>, String> {
     let output = run_capture(
         Command::new(config.tool("git"))
@@ -164,66 +186,65 @@ pub fn write_task_metadata(
     })
 }
 
-pub fn remove_session_db_records(repo: &Repository, branch: &str) -> Result<(), String> {
-    observability::with_writable_db(repo, |conn| {
-        conn.execute_batch("begin transaction")
-            .map_err(|error| format!("begin session cleanup transaction: {error}"))?;
-        let result = (|| -> Result<(), String> {
-            conn.execute(
-                "delete from task_metadata where branch = ?1",
-                params![branch],
-            )
-            .map_err(|error| format!("remove task metadata: {error}"))?;
-            conn.execute("delete from pr_cache where branch = ?1", params![branch])
-                .map_err(|error| format!("remove PR cache: {error}"))?;
-            conn.execute(
-                "delete from pr_details_cache where branch = ?1",
-                params![branch],
-            )
-            .map_err(|error| format!("remove PR details cache: {error}"))?;
-            conn.execute("delete from agent_state where branch = ?1", params![branch])
-                .map_err(|error| format!("remove process state: {error}"))?;
-            conn.execute(
-                "delete from opencode_runtime where branch = ?1",
-                params![branch],
-            )
-            .map_err(|error| format!("remove opencode runtime: {error}"))?;
-            conn.execute(
-                "delete from hidden_session where branch = ?1",
-                params![branch],
-            )
-            .map_err(|error| format!("remove hidden marker: {error}"))?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => conn
-                .execute_batch("commit")
-                .map_err(|error| format!("commit session cleanup transaction: {error}")),
-            Err(error) => {
-                let _ = conn.execute_batch("rollback");
-                Err(error)
-            }
-        }
-    })
+pub(crate) fn migrate_worktree_session_schema(conn: &rusqlite::Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "
+        create table if not exists task_metadata (
+          branch text primary key,
+          prompt_summary text not null,
+          initial_prompt text not null,
+          worktree text not null,
+          updated_unix_ms integer not null
+        );
+
+        create table if not exists hidden_session (
+          branch text primary key,
+          hidden_unix_ms integer not null
+        );
+
+        create table if not exists agent_state (
+          branch text primary key,
+          state text not null,
+          updated_unix_ms integer not null
+        );
+        ",
+    )
+    .map_err(|error| format!("create worktree session schema: {error}"))?;
+    Ok(())
 }
 
-pub fn clear_hidden(repo: &Repository, branch: &str) -> Result<(), String> {
+pub(crate) fn remove_task_metadata_with_conn(
+    conn: &rusqlite::Connection,
+    branch: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "delete from task_metadata where branch = ?1",
+        params![branch],
+    )
+    .map_err(|error| format!("remove task metadata: {error}"))?;
+    Ok(())
+}
+
+pub(crate) fn clear_hidden_session_marker_with_conn(
+    conn: &rusqlite::Connection,
+    branch: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "delete from hidden_session where branch = ?1",
+        params![branch],
+    )
+    .map_err(|error| format!("remove hidden marker: {error}"))?;
+    Ok(())
+}
+
+pub(crate) fn clear_hidden_session_marker(repo: &Repository, branch: &str) -> Result<(), String> {
     observability::with_writable_db(repo, |conn| {
-        conn.execute(
-            "delete from hidden_session where branch = ?1",
-            params![branch],
-        )
-        .map_err(|error| format!("remove hidden marker: {error}"))?;
-        Ok(())
+        clear_hidden_session_marker_with_conn(conn, branch)
     })
 }
 
 pub fn append_runtime_log(repo: &Repository, message: &str) -> Result<(), String> {
     crate::observability::append_runtime_message(repo, message)
-}
-
-pub fn remove_logs(repo: &Repository, branch: &str) -> Result<(), String> {
-    remove_if_exists(log_path(repo, branch), "agent log")
 }
 
 pub fn save_agent_state(repo: &Repository, branch: &str, state: AgentState) -> Result<(), String> {
@@ -239,6 +260,15 @@ pub fn save_agent_state(repo: &Repository, branch: &str, state: AgentState) -> R
         .map_err(|error| format!("write process state: {error}"))?;
         Ok(())
     })
+}
+
+pub(crate) fn remove_agent_state_with_conn(
+    conn: &rusqlite::Connection,
+    branch: &str,
+) -> Result<(), String> {
+    conn.execute("delete from agent_state where branch = ?1", params![branch])
+        .map_err(|error| format!("remove process state: {error}"))?;
+    Ok(())
 }
 
 fn load_agent_state(repo: &Repository, branch: &str) -> Option<AgentState> {
@@ -282,19 +312,6 @@ fn read_prompt_summary(path: &Path) -> Option<String> {
         }
     }
     None
-}
-
-fn log_path(repo: &Repository, branch: &str) -> PathBuf {
-    repo.prism_dir()
-        .join("logs")
-        .join(format!("{}.log", safe_branch_filename(branch)))
-}
-
-fn remove_if_exists(path: PathBuf, label: &str) -> Result<(), String> {
-    if path.exists() {
-        fs::remove_file(path).map_err(|error| format!("remove {label}: {error}"))?;
-    }
-    Ok(())
 }
 
 fn unix_seconds() -> i64 {

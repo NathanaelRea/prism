@@ -77,7 +77,7 @@ impl AgentState {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "idle" => Some(Self::Idle),
-            "running" => Some(Self::NeedsRestart),
+            "running" => Some(Self::Running),
             "done" => Some(Self::ExitedOk),
             "failed" => Some(Self::ExitedError),
             "needs restart" | "needs-restart" => Some(Self::NeedsRestart),
@@ -94,5 +94,19 @@ mod tests {
     #[test]
     fn opencode_uses_argument_prompt_for_json_run_mode() {
         assert_eq!(builtin_prompt_mode("opencode"), PromptMode::Argument);
+    }
+
+    #[test]
+    fn agent_state_labels_parse_back_to_same_state() {
+        for state in [
+            AgentState::Idle,
+            AgentState::Running,
+            AgentState::ExitedOk,
+            AgentState::ExitedError,
+            AgentState::NeedsRestart,
+            AgentState::NeedsInput,
+        ] {
+            assert_eq!(AgentState::parse(state.label()), Some(state));
+        }
     }
 }

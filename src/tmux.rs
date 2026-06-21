@@ -17,6 +17,31 @@ const CREATED_SESSION_READY_WAIT: Duration = Duration::from_millis(1_200);
 const SESSION_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const AGENT_INPUT_READY_WAIT: Duration = Duration::from_secs(5);
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TmuxAgentSession {
+    name: String,
+}
+
+impl TmuxAgentSession {
+    pub fn for_worktree_session(repo: &Repository, branch: &str, generation: u64) -> Self {
+        Self {
+            name: format!("{}{}", agent_session_prefix(repo, branch), generation),
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn target(&self, window: TmuxWindow) -> String {
+        window_target(&self.name, window)
+    }
+
+    fn prompt_buffer_name(&self) -> String {
+        format!("{}-prompt", self.name)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TmuxWindow {
     Agent,
@@ -48,11 +73,11 @@ pub fn attach_or_create_agent(
     session: &Session,
     generation: u64,
 ) -> Result<(), String> {
-    let name = agent_session_name(repo, &session.branch, generation);
-    ensure_agent_session(repo, config, session, generation)?;
-    match attach_session(config, &name) {
+    let runtime = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
+    ensure_tmux_agent_session(repo, config, session, &runtime)?;
+    match attach_session(config, runtime.name()) {
         Ok(()) => Ok(()),
-        Err(_) if matches!(session_exists(config, &name), Ok(false)) => Ok(()),
+        Err(_) if matches!(session_exists(config, runtime.name()), Ok(false)) => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -64,24 +89,28 @@ pub fn attach_or_create_window(
     generation: u64,
     window: TmuxWindow,
 ) -> Result<(), String> {
-    let name = agent_session_name(repo, &session.branch, generation);
-    ensure_agent_session(repo, config, session, generation)?;
-    match attach(config, &name, window) {
+    let runtime = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
+    ensure_tmux_agent_session(repo, config, session, &runtime)?;
+    match attach(config, &runtime, window) {
         Ok(()) => Ok(()),
-        Err(_) if matches!(session_exists(config, &name), Ok(false)) => Ok(()),
+        Err(_) if matches!(session_exists(config, runtime.name()), Ok(false)) => Ok(()),
         Err(error) => Err(error),
     }
 }
 
-pub fn attach_or_create_plan_mode(config: &Config, cwd: &Path) -> Result<(), String> {
-    let name = plan_mode_session_name(cwd);
-    if !session_exists(config, &name)? {
-        create_detached_plan_mode_session(config, cwd, &name)?;
-        configure_detach_on_destroy(config, &name)?;
+pub fn attach_or_create_plan_mode(
+    config: &Config,
+    name: &str,
+    cwd: &Path,
+    command: &str,
+) -> Result<(), String> {
+    if !session_exists(config, name)? {
+        create_detached_plan_mode_session(config, name, cwd, command)?;
+        configure_detach_on_destroy(config, name)?;
     }
-    match attach_session(config, &name) {
+    match attach_session(config, name) {
         Ok(()) => Ok(()),
-        Err(_) if matches!(session_exists(config, &name), Ok(false)) => Ok(()),
+        Err(_) if matches!(session_exists(config, name), Ok(false)) => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -92,41 +121,46 @@ pub fn ensure_agent_session(
     session: &Session,
     generation: u64,
 ) -> Result<bool, String> {
-    let name = agent_session_name(repo, &session.branch, generation);
+    let runtime = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
+    ensure_tmux_agent_session(repo, config, session, &runtime)
+}
+
+fn ensure_tmux_agent_session(
+    repo: &Repository,
+    config: &Config,
+    session: &Session,
+    runtime_session: &TmuxAgentSession,
+) -> Result<bool, String> {
     let runtime = opencode_runtime_for_session(repo, config, session)?;
-    if session_exists(config, &name)? {
-        if !configure_agent_session(config, &name)? {
-            create_detached_agent_session(repo, config, session, &name, runtime.as_ref())?;
-            configure_agent_session(config, &name)?;
-            ensure_companion_windows(config, session, &name)?;
-            return Ok(wait_for_agent_session_running(
+    if session_exists(config, runtime_session.name())? {
+        if !configure_agent_session(config, runtime_session.name())? {
+            create_detached_agent_session(
                 repo,
                 config,
                 session,
-                generation,
+                runtime_session,
+                runtime.as_ref(),
+            )?;
+            configure_agent_session(config, runtime_session.name())?;
+            ensure_companion_windows(config, session, runtime_session)?;
+            return Ok(wait_for_agent_session_running(
+                config,
+                runtime_session,
                 CREATED_SESSION_READY_WAIT,
             ));
         }
-        if wait_for_agent_session_running(
-            repo,
-            config,
-            session,
-            generation,
-            EXISTING_SESSION_READY_WAIT,
-        ) {
-            ensure_companion_windows(config, session, &name)?;
+        if wait_for_agent_session_running(config, runtime_session, EXISTING_SESSION_READY_WAIT) {
+            ensure_companion_windows(config, session, runtime_session)?;
             return Ok(true);
         }
-        kill_session(config, &name)?;
+        kill_session(config, runtime_session.name())?;
     }
-    create_detached_agent_session(repo, config, session, &name, runtime.as_ref())?;
-    configure_agent_session(config, &name)?;
-    ensure_companion_windows(config, session, &name)?;
+    create_detached_agent_session(repo, config, session, runtime_session, runtime.as_ref())?;
+    configure_agent_session(config, runtime_session.name())?;
+    ensure_companion_windows(config, session, runtime_session)?;
     Ok(wait_for_agent_session_running(
-        repo,
         config,
-        session,
-        generation,
+        runtime_session,
         CREATED_SESSION_READY_WAIT,
     ))
 }
@@ -138,7 +172,7 @@ pub fn paste_agent_prompt(
     generation: u64,
     prompt: &str,
 ) -> Result<(), String> {
-    let name = agent_session_name(repo, &session.branch, generation);
+    let runtime_session = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
     if config.default_agent == "opencode" && !config.is_default_branch(&session.branch) {
         let runtime = ensure_opencode_session(repo, config, &session.branch, &session.path)
             .map_err(|error| format!("prepare opencode runtime for prompt: {error}"))?;
@@ -154,7 +188,7 @@ pub fn paste_agent_prompt(
                         "submit opencode prompt through API failed: {api_error}; agent session did not become ready for paste fallback"
                     ));
                 }
-                paste_prompt_into_tmux(config, &name, prompt).map_err(|paste_error| {
+                paste_prompt_into_tmux(config, &runtime_session, prompt).map_err(|paste_error| {
                     format!(
                         "submit opencode prompt through API failed: {api_error}; paste fallback failed: {paste_error}"
                     )
@@ -166,14 +200,18 @@ pub fn paste_agent_prompt(
     if !ensure_agent_session(repo, config, session, generation)? {
         return Err("agent session did not become ready".to_string());
     }
-    paste_prompt_into_tmux(config, &name, prompt)
+    paste_prompt_into_tmux(config, &runtime_session, prompt)
 }
 
-fn paste_prompt_into_tmux(config: &Config, name: &str, prompt: &str) -> Result<(), String> {
-    if !wait_for_agent_input_ready(config, name, AGENT_INPUT_READY_WAIT) {
+fn paste_prompt_into_tmux(
+    config: &Config,
+    runtime_session: &TmuxAgentSession,
+    prompt: &str,
+) -> Result<(), String> {
+    if !wait_for_agent_input_ready(config, runtime_session.name(), AGENT_INPUT_READY_WAIT) {
         return Err("agent prompt did not become ready".to_string());
     }
-    let buffer_name = format!("{name}-prompt");
+    let buffer_name = runtime_session.prompt_buffer_name();
     run_tmux_status_with_stdin(
         Command::new(config.tool("tmux")).env_remove("TMUX").args([
             "load-buffer",
@@ -189,7 +227,7 @@ fn paste_prompt_into_tmux(config: &Config, name: &str, prompt: &str) -> Result<(
         "-b",
         &buffer_name,
         "-t",
-        &window_target(name, TmuxWindow::Agent),
+        &runtime_session.target(TmuxWindow::Agent),
     ]))
 }
 
@@ -199,11 +237,15 @@ pub fn agent_session_running(
     session: &Session,
     generation: u64,
 ) -> bool {
-    let name = agent_session_name(repo, &session.branch, generation);
-    if !matches!(session_exists(config, &name), Ok(true)) {
+    let runtime = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
+    tmux_agent_session_running(config, &runtime)
+}
+
+fn tmux_agent_session_running(config: &Config, runtime: &TmuxAgentSession) -> bool {
+    if !matches!(session_exists(config, runtime.name()), Ok(true)) {
         return false;
     }
-    pane_current_command(config, &window_target(&name, TmuxWindow::Agent))
+    pane_current_command(config, &runtime.target(TmuxWindow::Agent))
         .map(|command| pane_command_matches_agent(config, &command))
         .unwrap_or(false)
 }
@@ -214,12 +256,8 @@ pub fn kill_agent_session(
     branch: &str,
     generation: u64,
 ) -> Result<(), String> {
-    let name = agent_session_name(repo, branch, generation);
-    kill_session(config, &name)
-}
-
-pub fn agent_session_name(repo: &Repository, branch: &str, generation: u64) -> String {
-    format!("{}{}", agent_session_prefix(repo, branch), generation)
+    let runtime = TmuxAgentSession::for_worktree_session(repo, branch, generation);
+    kill_session(config, runtime.name())
 }
 
 pub fn latest_agent_session_generation(
@@ -246,11 +284,11 @@ fn agent_session_prefix(repo: &Repository, branch: &str) -> String {
     format!("prism-{hash:016x}-{branch}-")
 }
 
-fn attach(config: &Config, name: &str, window: TmuxWindow) -> Result<(), String> {
+fn attach(config: &Config, runtime: &TmuxAgentSession, window: TmuxWindow) -> Result<(), String> {
     run_status_inherited(Command::new(config.tool("tmux")).env_remove("TMUX").args([
         "attach-session",
         "-t",
-        &window_target(name, window),
+        &runtime.target(window),
     ]))
 }
 
@@ -266,7 +304,7 @@ fn create_detached_agent_session(
     repo: &Repository,
     config: &Config,
     session: &Session,
-    name: &str,
+    runtime_session: &TmuxAgentSession,
     runtime: Option<&OpencodeRuntime>,
 ) -> Result<(), String> {
     let command = agent_shell_command(repo, config, session, runtime)?;
@@ -274,7 +312,7 @@ fn create_detached_agent_session(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
             .args(["new-session", "-d", "-s"])
-            .arg(name)
+            .arg(runtime_session.name())
             .args(["-n", &TmuxWindow::Agent.name(config)])
             .arg("-c")
             .arg(&session.path)
@@ -302,10 +340,10 @@ fn configure_detach_on_destroy(config: &Config, name: &str) -> Result<(), String
 
 fn create_detached_plan_mode_session(
     config: &Config,
-    cwd: &Path,
     name: &str,
+    cwd: &Path,
+    command: &str,
 ) -> Result<(), String> {
-    let command = plan_mode_shell_command(cwd)?;
     run_tmux_status(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
@@ -318,31 +356,16 @@ fn create_detached_plan_mode_session(
     )
 }
 
-fn plan_mode_shell_command(cwd: &Path) -> Result<String, String> {
-    let exe =
-        std::env::current_exe().map_err(|error| format!("resolve prism executable: {error}"))?;
-    let command = [
-        shell_quote(&exe.to_string_lossy()),
-        "--repo".to_string(),
-        shell_quote(&cwd.to_string_lossy()),
-        "plan".to_string(),
-    ]
-    .join(" ");
-    Ok(format!(
-        "{command}; status=$?; printf '\\n[prism plan mode exited with status %s]\\nPress Enter to close this tmux session. ' \"$status\"; read _; exit \"$status\""
-    ))
-}
-
-fn plan_mode_session_name(cwd: &Path) -> String {
-    format!("prism-plan-{:016x}", stable_hash(cwd))
-}
-
-fn ensure_companion_windows(config: &Config, session: &Session, name: &str) -> Result<(), String> {
-    configure_window_indexing(config, name)?;
-    move_initial_window_to_one(config, name)?;
-    rename_window(config, name, TmuxWindow::Agent)?;
-    ensure_window(config, session, name, TmuxWindow::LazyGit)?;
-    ensure_window(config, session, name, TmuxWindow::Terminal)?;
+fn ensure_companion_windows(
+    config: &Config,
+    session: &Session,
+    runtime: &TmuxAgentSession,
+) -> Result<(), String> {
+    configure_window_indexing(config, runtime.name())?;
+    move_initial_window_to_one(config, runtime)?;
+    rename_window(config, runtime, TmuxWindow::Agent)?;
+    ensure_window(config, session, runtime, TmuxWindow::LazyGit)?;
+    ensure_window(config, session, runtime, TmuxWindow::Terminal)?;
     Ok(())
 }
 
@@ -363,13 +386,13 @@ fn configure_window_indexing(config: &Config, name: &str) -> Result<(), String> 
     ]))
 }
 
-fn move_initial_window_to_one(config: &Config, name: &str) -> Result<(), String> {
+fn move_initial_window_to_one(config: &Config, runtime: &TmuxAgentSession) -> Result<(), String> {
     match run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
         "move-window",
         "-s",
-        &format!("{name}:0"),
+        &format!("{}:0", runtime.name()),
         "-t",
-        &window_target(name, TmuxWindow::Agent),
+        &runtime.target(TmuxWindow::Agent),
     ])) {
         Ok(()) => Ok(()),
         Err(error) if tmux_missing_session_error(&error) || error.contains("same index") => Ok(()),
@@ -377,11 +400,15 @@ fn move_initial_window_to_one(config: &Config, name: &str) -> Result<(), String>
     }
 }
 
-fn rename_window(config: &Config, name: &str, window: TmuxWindow) -> Result<(), String> {
+fn rename_window(
+    config: &Config,
+    runtime: &TmuxAgentSession,
+    window: TmuxWindow,
+) -> Result<(), String> {
     match run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
         "rename-window",
         "-t",
-        &window_target(name, window),
+        &runtime.target(window),
         &window.name(config),
     ])) {
         Ok(()) => Ok(()),
@@ -393,11 +420,11 @@ fn rename_window(config: &Config, name: &str, window: TmuxWindow) -> Result<(), 
 fn ensure_window(
     config: &Config,
     session: &Session,
-    name: &str,
+    runtime: &TmuxAgentSession,
     window: TmuxWindow,
 ) -> Result<(), String> {
-    if window_exists(config, name, window)? {
-        rename_window(config, name, window)?;
+    if window_exists(config, runtime.name(), window)? {
+        rename_window(config, runtime, window)?;
         return Ok(());
     }
     let command = match window {
@@ -408,7 +435,7 @@ fn ensure_window(
     run_tmux_status(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
-            .args(["new-window", "-d", "-t", &window_target(name, window)])
+            .args(["new-window", "-d", "-t", &runtime.target(window)])
             .args(["-n", &window.name(config)])
             .arg("-c")
             .arg(&session.path)
@@ -459,15 +486,13 @@ fn session_exists(config: &Config, name: &str) -> Result<bool, String> {
 }
 
 fn wait_for_agent_session_running(
-    repo: &Repository,
     config: &Config,
-    session: &Session,
-    generation: u64,
+    runtime: &TmuxAgentSession,
     timeout: Duration,
 ) -> bool {
     let started = Instant::now();
     loop {
-        if agent_session_running(repo, config, session, generation) {
+        if tmux_agent_session_running(config, runtime) {
             return true;
         }
         if started.elapsed() >= timeout {
@@ -673,6 +698,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::{BufRead, BufReader, Read, Write};
+    use std::io::{Error, ErrorKind};
     use std::net::{TcpListener, TcpStream};
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
@@ -687,7 +713,7 @@ mod tests {
     use crate::session::Session;
 
     use super::{
-        TmuxWindow, agent_session_name, attach_or_create_agent, attach_or_create_plan_mode,
+        TmuxAgentSession, TmuxWindow, attach_or_create_agent, attach_or_create_plan_mode,
         attach_or_create_window, ensure_agent_session, latest_agent_session_generation,
         pane_command_matches_agent, paste_agent_prompt, shell_quote,
     };
@@ -698,12 +724,43 @@ mod tests {
             root: PathBuf::from("/repo/my project"),
         };
 
-        let name = agent_session_name(&repo, "feature/foo:bar", 3);
+        let runtime = TmuxAgentSession::for_worktree_session(&repo, "feature/foo:bar", 3);
+        let name = runtime.name();
 
         assert!(name.starts_with("prism-"));
         assert!(name.ends_with("-feature_foo_bar-3"));
         assert!(!name.contains('/'));
         assert!(!name.contains(':'));
+    }
+
+    #[test]
+    fn tmux_agent_session_exposes_runtime_targets() {
+        let repo = Repository {
+            root: PathBuf::from("/repo/my project"),
+        };
+
+        let runtime = TmuxAgentSession::for_worktree_session(&repo, "feature/foo:bar", 3);
+
+        assert_eq!(
+            runtime.name(),
+            TmuxAgentSession::for_worktree_session(&repo, "feature/foo:bar", 3).name()
+        );
+        assert_eq!(
+            runtime.target(TmuxWindow::Agent),
+            format!("{}:1", runtime.name())
+        );
+        assert_eq!(
+            runtime.target(TmuxWindow::LazyGit),
+            format!("{}:2", runtime.name())
+        );
+        assert_eq!(
+            runtime.target(TmuxWindow::Terminal),
+            format!("{}:3", runtime.name())
+        );
+        assert_eq!(
+            runtime.prompt_buffer_name(),
+            format!("{}-prompt", runtime.name())
+        );
     }
 
     #[test]
@@ -749,16 +806,21 @@ exit 1
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
 
-        attach_or_create_plan_mode(&config, &temp).unwrap();
+        attach_or_create_plan_mode(
+            &config,
+            "prism-plan-test",
+            &temp,
+            "prism --repo /repo plan; status=$?",
+        )
+        .unwrap();
 
         let commands = fs::read_to_string(&log).unwrap_or_default();
-        assert!(commands.contains("new-session -d -s prism-plan-"));
+        assert!(commands.contains("new-session -d -s prism-plan-test"));
         assert!(commands.contains("-n plan"));
-        assert!(commands.contains("--repo"));
-        assert!(commands.contains(" plan; status=$?;"));
-        assert!(commands.contains("set-option -t prism-plan-"));
+        assert!(commands.contains("prism --repo /repo plan; status=$?"));
+        assert!(commands.contains("set-option -t prism-plan-test"));
         assert!(commands.contains("detach-on-destroy on"));
-        assert!(commands.contains("attach-session -t prism-plan-"));
+        assert!(commands.contains("attach-session -t prism-plan-test"));
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -912,7 +974,11 @@ exit 0
             .insert("opencode".to_string(), "/usr/bin/opencode".to_string());
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
-        let port = start_fake_opencode_server(session.path.clone(), 200, None, 4);
+        let port = match start_fake_opencode_server(session.path.clone(), 200, None, 4) {
+            Ok(port) => port,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("start fake OpenCode server: {error}"),
+        };
         save_runtime(
             &repo,
             &OpencodeRuntime {
@@ -1291,7 +1357,12 @@ exit 1
             .insert("opencode".to_string(), "opencode".to_string());
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
-        let port = start_fake_opencode_server(session.path.clone(), 200, Some(api_log.clone()), 4);
+        let port =
+            match start_fake_opencode_server(session.path.clone(), 200, Some(api_log.clone()), 4) {
+                Ok(port) => port,
+                Err(error) if error.kind() == ErrorKind::PermissionDenied => return,
+                Err(error) => panic!("start fake OpenCode server: {error}"),
+            };
         save_runtime(
             &repo,
             &OpencodeRuntime {
@@ -1682,9 +1753,9 @@ exit 0
         append_status: u16,
         request_log: Option<PathBuf>,
         request_limit: usize,
-    ) -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
+    ) -> Result<u16, Error> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let port = listener.local_addr()?.port();
         thread::spawn(move || {
             for stream in listener.incoming().take(request_limit).flatten() {
                 handle_fake_opencode_request(
@@ -1695,7 +1766,7 @@ exit 0
                 );
             }
         });
-        port
+        Ok(port)
     }
 
     fn handle_fake_opencode_request(

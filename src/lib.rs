@@ -1,5 +1,6 @@
 mod actions;
 mod agent;
+mod agent_session;
 mod args;
 pub mod cli;
 mod config;
