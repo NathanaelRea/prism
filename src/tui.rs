@@ -26,6 +26,7 @@ pub struct Tui {
     pub(crate) selected: usize,
     pub(crate) selected_repo_root: Option<PathBuf>,
     pub(crate) focused_panel: PanelFocus,
+    pub(crate) repo_main_view: view::RepoMainView,
     pub(crate) selected_worktree_by_repo: BTreeMap<PathBuf, PathBuf>,
     pub(crate) pr_poll_tx: Sender<PrPollResult>,
     pub(crate) pr_poll_rx: Receiver<PrPollResult>,
@@ -232,6 +233,7 @@ impl Tui {
             selected: 0,
             selected_repo_root: None,
             focused_panel: PanelFocus::Repos,
+            repo_main_view: view::RepoMainView::Github,
             selected_worktree_by_repo: BTreeMap::new(),
             pr_poll_tx,
             pr_poll_rx,
@@ -688,7 +690,8 @@ impl Tui {
     fn show_keybindings_dialog(&self) -> Result<(), String> {
         let items = [
             "1 / 2 / 3    focus status / repos / worktrees",
-            "h/l, Tab     move focus between panels",
+            "Tab          move focus between panels",
+            "h/l, left/right arrows  switch horizontal view in repos",
             "Space Space  status: focus repos; repos: focus worktrees; worktrees: open agent if valid",
             "Enter        status: focus repos; repos: focus worktrees; worktrees: open agent if valid",
             "Space Enter  open tmux window 3: terminal",
@@ -709,7 +712,7 @@ impl Tui {
             "/            search/filter focused panel",
             "?            show keybindings; / filters this dialog",
             "D            delete non-default worktree/session",
-            "j/k, arrows  move selection",
+            "j/k, up/down move selection",
             "g g / G      top / bottom",
             "r            refresh",
             "q, Ctrl-C    quit",
@@ -1127,22 +1130,14 @@ impl Tui {
     }
 
     fn move_left(&mut self) {
-        self.focused_panel = match self.focused_panel {
-            PanelFocus::Status => PanelFocus::Status,
-            PanelFocus::Repos => PanelFocus::Status,
-            PanelFocus::Worktrees => PanelFocus::Repos,
-        };
+        if self.focused_panel == PanelFocus::Repos {
+            self.repo_main_view = view::RepoMainView::Github;
+        }
     }
 
     fn move_right(&mut self) {
-        self.focused_panel = match self.focused_panel {
-            PanelFocus::Status => PanelFocus::Repos,
-            PanelFocus::Repos => PanelFocus::Worktrees,
-            PanelFocus::Worktrees => PanelFocus::Worktrees,
-        };
-        if self.focused_panel == PanelFocus::Worktrees && self.visible_session_indices().is_empty()
-        {
-            let _ = self.show_message("selected repository has no visible worktrees");
+        if self.focused_panel == PanelFocus::Repos {
+            self.repo_main_view = view::RepoMainView::Kanban;
         }
     }
 
@@ -1494,6 +1489,7 @@ impl Tui {
             selected_repo_root,
             selected_session: self.selected_worktree_index(),
             focus: self.focused_panel,
+            repo_main_view: self.repo_main_view,
             mode_label: "normal",
             status_message: self.status_message.as_deref(),
             repo_filter: &self.repo_filter,
@@ -1739,6 +1735,7 @@ mod tests {
     use crate::github::PrCache;
     use crate::repo::Repository;
     use crate::session::Session;
+    use crate::view::RepoMainView;
 
     use super::{ManagedRepo, PanelFocus, Tui, truncate_ansi_dialog_line};
 
@@ -1787,6 +1784,28 @@ mod tests {
         tui.restore_selected_worktree_for_repo();
 
         assert_eq!(tui.selected_worktree_index(), Some(1));
+    }
+
+    #[test]
+    fn horizontal_keys_switch_repo_view_without_changing_focus() {
+        let mut tui = test_tui();
+        tui.focused_panel = PanelFocus::Repos;
+
+        tui.move_right();
+
+        assert_eq!(tui.focused_panel, PanelFocus::Repos);
+        assert_eq!(tui.repo_main_view, RepoMainView::Kanban);
+
+        tui.move_left();
+
+        assert_eq!(tui.focused_panel, PanelFocus::Repos);
+        assert_eq!(tui.repo_main_view, RepoMainView::Github);
+
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.move_left();
+
+        assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
+        assert_eq!(tui.repo_main_view, RepoMainView::Github);
     }
 
     #[test]

@@ -57,7 +57,8 @@ Common keys:
 - `Space Space` focuses repos from the status panel, focuses worktrees from the repos panel, or opens the selected agent from the worktrees panel when valid.
 - `Enter` focuses repos from the status panel, focuses worktrees from the repos panel, or opens the selected agent from the worktrees panel when valid.
 - `1`, `2`, and `3` focus the status, repos, and worktrees panels.
-- `h` / `l` or `Tab` moves focus between panels.
+- `Tab` cycles focus between panels.
+- `h` / `l` or left/right switches horizontal views in the repos panel.
 - `Space Enter` or `Ctrl-/` opens tmux window 3: terminal.
 - `Space g g` opens tmux window 2: lazygit.
 - `Space g o` opens the selected pull request in a browser.
@@ -75,7 +76,7 @@ Common keys:
 - `/` filters the focused panel.
 - `D` confirms and deletes the selected non-default worktree/session.
 - `r` refreshes the board.
-- `j` / `k` or arrow keys move selection.
+- `j` / `k` or up/down moves selection.
 - `q` or `Ctrl-C` quits.
 
 ## Configuration
