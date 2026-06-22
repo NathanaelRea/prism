@@ -444,7 +444,7 @@ fn format_status_dashboard_lines(model: &FrameModel<'_>, width: usize) -> Vec<St
         String::new(),
         color("Navigation", "1;37"),
         "1 status  2 repos  3 worktrees".to_string(),
-        "Tab cycles focus; h/l switches repo views".to_string(),
+        "Tab cycles focus; repos h/l switches views".to_string(),
         String::new(),
         color("Documentation", "1;37"),
         dashboard_link("GitHub repository", "https://github.com/NathanaelRea/prism"),
@@ -1377,26 +1377,7 @@ fn comment_count_label_for_row(config: &Config, row: &WorktreeRow) -> String {
         return String::new();
     }
 
-    if let Some(details) = &row.pr.details {
-        let open = details.comments.len()
-            + details
-                .review_comments
-                .iter()
-                .filter(|comment| !comment.resolved)
-                .count();
-        let resolved = details
-            .review_comments
-            .iter()
-            .filter(|comment| comment.resolved)
-            .count();
-        return format!("#{open}✓{resolved}");
-    }
-
-    row.pr
-        .summary
-        .as_ref()
-        .map(|summary| format!("#{}", summary.comment_count))
-        .unwrap_or_else(|| "#?".to_string())
+    pr_comment_count_label(&row.pr)
 }
 
 fn comment_count_color_for_row(row: &WorktreeRow) -> &'static str {

@@ -691,7 +691,7 @@ impl Tui {
         let items = [
             "1 / 2 / 3    focus status / repos / worktrees",
             "Tab          move focus between panels",
-            "h/l, arrows  switch horizontal view in repos",
+            "h/l, left/right arrows  switch horizontal view in repos",
             "Space Space  status: focus repos; repos: focus worktrees; worktrees: open agent if valid",
             "Enter        status: focus repos; repos: focus worktrees; worktrees: open agent if valid",
             "Space Enter  open tmux window 3: terminal",
