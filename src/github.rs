@@ -415,6 +415,18 @@ pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
     }
 }
 
+pub(crate) fn load_pr_cache_for_branch(
+    repo: &Repository,
+    config: &Config,
+    branch: &str,
+) -> PrCache {
+    if pr_cache_excluded_branch(config, branch) {
+        let _ = remove_pr_cache(repo, branch);
+        return PrCache::default();
+    }
+    load_pr_cache(repo, branch)
+}
+
 pub fn refresh_pr_cache(
     repo: &Repository,
     branch: &str,
@@ -591,8 +603,52 @@ pub fn pr_details_due(cache: &PrCache) -> bool {
         .unwrap_or(true)
 }
 
-fn pr_cache_excluded_branch(config: &Config, branch: &str) -> bool {
+pub(crate) fn pr_cache_excluded_branch(config: &Config, branch: &str) -> bool {
     branch == "(detached)" || config.is_default_branch(branch)
+}
+
+pub(crate) fn pr_cache_pollable(config: &Config, branch: &str, cache: &PrCache) -> bool {
+    !pr_cache_excluded_branch(config, branch)
+        && !cache.summary.as_ref().is_some_and(|summary| summary.merged)
+}
+
+pub(crate) fn pr_details_pollable(config: &Config, branch: &str, cache: &PrCache) -> bool {
+    pr_cache_pollable(config, branch, cache) && pr_details_due(cache)
+}
+
+pub(crate) fn pr_summary_or_error(cache: &PrCache) -> Result<Option<PrSummary>, String> {
+    if let Some(summary) = &cache.summary {
+        Ok(Some(summary.clone()))
+    } else if let Some(error) = &cache.error {
+        Err(error.clone())
+    } else {
+        Ok(None)
+    }
+}
+
+pub(crate) fn pr_cache_render_signature(cache: &PrCache) -> String {
+    format!(
+        "{:?}|{:?}|{:?}|{:?}",
+        cache.summary, cache.details, cache.last_refreshed, cache.error
+    )
+}
+
+pub(crate) fn pr_cache_comment_count(cache: &PrCache) -> usize {
+    cache
+        .details
+        .as_ref()
+        .map(|details| details.comments.len() + details.review_comments.len())
+        .or_else(|| {
+            cache
+                .summary
+                .as_ref()
+                .map(|summary| summary.comment_count as usize)
+        })
+        .unwrap_or(0)
+}
+
+pub(crate) fn pr_cache_has_comments(cache: &PrCache) -> bool {
+    pr_cache_comment_count(cache) > 0
 }
 
 fn apply_pr_summary_refresh(
@@ -1717,6 +1773,65 @@ mod tests {
         assert!(cache.signature.is_none());
         assert!(cache.error.is_none());
         assert_eq!(cache.last_refreshed.as_deref(), Some("now"));
+    }
+
+    #[test]
+    fn pr_cache_pollability_excludes_default_detached_and_merged_branches() {
+        let mut config = test_config();
+        config.default_base = Some("main".to_string());
+        let merged_summary = PrSummary {
+            merged: true,
+            ..test_summary("feature", "abc123", 0)
+        };
+        let merged_cache = PrCache {
+            summary: Some(merged_summary),
+            ..PrCache::default()
+        };
+
+        assert!(!pr_cache_pollable(&config, "main", &PrCache::default()));
+        assert!(!pr_cache_pollable(
+            &config,
+            "(detached)",
+            &PrCache::default()
+        ));
+        assert!(!pr_cache_pollable(&config, "feature", &merged_cache));
+        assert!(pr_cache_pollable(&config, "feature", &PrCache::default()));
+    }
+
+    #[test]
+    fn pr_cache_comment_count_prefers_loaded_details_over_summary() {
+        let cache = PrCache {
+            summary: Some(test_summary("feature", "abc123", 12)),
+            details: Some(PrDetails {
+                comments: vec![PrComment {
+                    author: "reviewer".to_string(),
+                    body: "top-level".to_string(),
+                }],
+                review_comments: vec![
+                    PrReviewComment {
+                        author: "reviewer".to_string(),
+                        path: "src/main.rs".to_string(),
+                        line: "10".to_string(),
+                        body: "inline".to_string(),
+                        created_at: "2026-01-01T00:00:00Z".to_string(),
+                        resolved: false,
+                    },
+                    PrReviewComment {
+                        author: "reviewer".to_string(),
+                        path: "src/lib.rs".to_string(),
+                        line: "20".to_string(),
+                        body: "resolved".to_string(),
+                        created_at: "2026-01-02T00:00:00Z".to_string(),
+                        resolved: true,
+                    },
+                ],
+                ..PrDetails::default()
+            }),
+            ..PrCache::default()
+        };
+
+        assert_eq!(pr_cache_comment_count(&cache), 3);
+        assert!(pr_cache_has_comments(&cache));
     }
 
     #[test]

@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::agent::AgentState;
 use crate::config::Config;
-use crate::github::PrCache;
+use crate::github::{PrCache, pr_cache_has_comments};
 use crate::opencode::OpencodeStatus;
 use crate::session::Session;
 use crate::terminal::{terminal_size, write_stdout};
@@ -542,7 +542,7 @@ fn repo_github_summary(
         let Some(session) = sessions.get(*index) else {
             continue;
         };
-        if config.is_default_branch(&session.branch) {
+        if session.is_default_branch(config) {
             continue;
         }
         match &session.pr.summary {
@@ -921,7 +921,7 @@ fn format_repo_work_item_line(
 }
 
 fn repo_work_kind_label(config: &Config, session: &Session) -> String {
-    if config.is_default_branch(&session.branch) {
+    if session.is_default_branch(config) {
         "default".to_string()
     } else if let Some(summary) = &session.pr.summary {
         format!("#{}", summary.number)
@@ -932,7 +932,7 @@ fn repo_work_kind_label(config: &Config, session: &Session) -> String {
 
 fn repo_work_detail_label(config: &Config, session: &Session) -> String {
     let mut parts = Vec::new();
-    if config.is_default_branch(&session.branch) {
+    if session.is_default_branch(config) {
         parts.push("tracking off".to_string());
     } else if let Some(summary) = &session.pr.summary {
         parts.push(pr_state_label(summary).to_string());
@@ -978,7 +978,7 @@ fn format_repo_preview_lines(
         ];
     };
     let mut lines = vec![color("Preview", "1;36")];
-    if config.is_default_branch(&session.branch) {
+    if session.is_default_branch(config) {
         lines.push(color("Default branch", "1;37"));
         lines.push(format!("branch {}", truncate_line(&session.branch, width)));
         lines.push(format!(
@@ -1223,7 +1223,7 @@ fn format_kanban_panel_lines(
 }
 
 fn kanban_lane(config: &Config, session: &Session) -> Option<KanbanLane> {
-    if config.is_default_branch(&session.branch) {
+    if session.is_default_branch(config) {
         return None;
     }
 
@@ -1351,7 +1351,7 @@ fn strip_ascii_control_chars(text: &str) -> String {
 }
 
 fn worktree_status_icons(config: &Config, row: &WorktreeRow) -> String {
-    if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
+    if row.kind != WorktreeKind::FeatureWorktree || config.is_default_branch(&row.branch) {
         return String::new();
     }
 
@@ -1374,7 +1374,7 @@ fn worktree_status_icons(config: &Config, row: &WorktreeRow) -> String {
 }
 
 fn comment_count_label_for_row(config: &Config, row: &WorktreeRow) -> String {
-    if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
+    if row.kind != WorktreeKind::FeatureWorktree || config.is_default_branch(&row.branch) {
         return String::new();
     }
 
@@ -1382,23 +1382,15 @@ fn comment_count_label_for_row(config: &Config, row: &WorktreeRow) -> String {
 }
 
 fn comment_count_color_for_row(row: &WorktreeRow) -> &'static str {
-    let has_comments = row
-        .pr
-        .details
-        .as_ref()
-        .map(|details| !details.comments.is_empty() || !details.review_comments.is_empty())
-        .or_else(|| {
-            row.pr
-                .summary
-                .as_ref()
-                .map(|summary| summary.comment_count > 0)
-        })
-        .unwrap_or(false);
-    if has_comments { "36" } else { "90" }
+    if pr_cache_has_comments(&row.pr) {
+        "36"
+    } else {
+        "90"
+    }
 }
 
 fn ci_icon(config: &Config, session: &Session) -> &'static str {
-    if config.is_default_branch(&session.branch) {
+    if session.is_default_branch(config) {
         return "";
     }
     match session
@@ -1417,7 +1409,7 @@ fn ci_icon(config: &Config, session: &Session) -> &'static str {
 }
 
 fn ci_icon_for_row(config: &Config, row: &WorktreeRow) -> &'static str {
-    if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
+    if row.kind != WorktreeKind::FeatureWorktree || config.is_default_branch(&row.branch) {
         return "";
     }
     match row
@@ -1475,7 +1467,7 @@ fn agent_state_color(state: AgentState) -> &'static str {
 }
 
 fn ci_color(config: &Config, session: &Session) -> &'static str {
-    if config.is_default_branch(&session.branch) {
+    if session.is_default_branch(config) {
         return "90";
     }
     match session
@@ -1494,7 +1486,7 @@ fn ci_color(config: &Config, session: &Session) -> &'static str {
 }
 
 fn ci_color_for_row(config: &Config, row: &WorktreeRow) -> &'static str {
-    if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
+    if row.kind != WorktreeKind::FeatureWorktree || config.is_default_branch(&row.branch) {
         return "90";
     }
     match row
@@ -1516,7 +1508,7 @@ fn format_pr_panel_lines(config: &Config, session: Option<&Session>) -> Vec<Stri
     let Some(session) = session else {
         return vec![color("No selected worktree", "90")];
     };
-    if config.is_default_branch(&session.branch) {
+    if session.is_default_branch(config) {
         return vec![
             color("Default branch", "1;36"),
             format!("branch {}", truncate_line(&session.branch, 80)),
@@ -2012,6 +2004,17 @@ mod tests {
     }
 
     #[test]
+    fn detached_worktree_status_icons_hide_stale_pr_state() {
+        let config = test_config(Some("main"));
+        let session = test_session("(detached)", "clean", AgentState::Idle, test_pr(12, false));
+        let row = test_worktree_row(&config, &session, 0, true);
+
+        let icons = worktree_status_icons(&config, &row);
+
+        assert!(icons.is_empty());
+    }
+
+    #[test]
     fn repo_overview_lists_pr_work_and_preview_comments() {
         let config = test_config(Some("main"));
         let mut reviewed_pr = test_pr(12, false);
@@ -2396,7 +2399,7 @@ mod tests {
             repo_root: "/repo".to_string(),
             worktree_path: session.path_display.clone(),
             branch: session.branch.clone(),
-            kind: if config.is_default_branch(&session.branch) {
+            kind: if session.is_default_branch(config) {
                 WorktreeKind::DefaultBranch
             } else if session.branch == "(detached)" {
                 WorktreeKind::Detached
