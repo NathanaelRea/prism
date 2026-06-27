@@ -39,6 +39,11 @@ Prism may attach metadata to a session, including prompt summary, agent state,
 logs, hidden markers, and pull request cache data. That metadata is keyed by
 repository and branch.
 
+The Worktree Session module owns session identity, default-branch
+classification, branch metadata facts, background-safe snapshots, and deletion
+warnings. It may carry Agent Session and PR Cache facts for callers, but it
+should not own tmux lifecycle behavior or GitHub refresh semantics.
+
 ### Agent Session
 
 An agent session is a persistent tmux session for a worktree session. The agent
@@ -48,6 +53,11 @@ provide lazygit and a shell in the same worktree.
 Agent session names are derived from a stable repository hash, a safe branch
 name, and a generation number. Prism can reattach to an existing agent session,
 create one when needed, or replace one that is not running the expected agent.
+
+The Agent Session module owns lifecycle decisions around generation freshness,
+warmup jobs, observed running state, attach outcomes, delayed rewarm, and prompt
+submission results. The tmux adapter remains the only interactive runtime and
+owns tmux command construction, target names, and terminal attach details.
 
 ### Default Branch
 
@@ -69,6 +79,11 @@ error.
 The cache exists to keep the board responsive and to avoid polling GitHub on
 every render. Refresh logic should preserve that separation: UI renders cached
 state, while lifecycle or GitHub code refreshes it.
+
+The PR Cache module owns branch eligibility, refresh pollability, summary/detail
+preservation rules, comment-count facts, render-change signatures, and refresh
+errors. Callers should consume those facts instead of rebuilding timestamp,
+signature, default-branch, or optional-detail rules.
 
 ### Plan Mode
 
