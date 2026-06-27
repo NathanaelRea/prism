@@ -300,7 +300,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -441,7 +441,14 @@ exit 0
         super::merge_pull_request(&config, &worktree, 42).unwrap();
 
         let commands = fs::read_to_string(&log).unwrap();
-        assert!(commands.contains(&format!("pwd={}", worktree.display())));
+        let actual_pwd = commands
+            .lines()
+            .find_map(|line| line.strip_prefix("pwd="))
+            .expect("gh shim should record its working directory");
+        assert_eq!(
+            Path::new(actual_pwd).canonicalize().unwrap(),
+            worktree.canonicalize().unwrap()
+        );
         assert!(commands.contains("args=pr merge 42 --squash"));
         assert!(!commands.contains("--delete-branch"));
 
