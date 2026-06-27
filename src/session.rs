@@ -9,13 +9,13 @@ use rusqlite::params;
 use crate::agent::AgentState;
 use crate::config::Config;
 use crate::git::git_status_label;
-use crate::github::{PrCache, load_pr_cache};
+use crate::github::{PrCache, load_pr_cache_for_branch};
 use crate::json::json_string_field;
 use crate::observability::{self, LogLevel};
 use crate::opencode::OpencodeStatus;
 use crate::process::run_capture;
 use crate::repo::Repository;
-use crate::util::{safe_branch_filename, truncate};
+use crate::util::{safe_branch_filename, status_count, truncate};
 
 #[derive(Debug)]
 pub struct Session {
@@ -37,6 +37,53 @@ pub struct Session {
 }
 
 impl Session {
+    pub(crate) fn is_default_branch(&self, config: &Config) -> bool {
+        config.is_default_branch(&self.branch)
+    }
+
+    pub(crate) fn is_detached(&self) -> bool {
+        self.branch == "(detached)"
+    }
+
+    pub(crate) fn is_task_branch(&self, config: &Config) -> bool {
+        !self.is_default_branch(config) && !self.is_detached()
+    }
+
+    pub(crate) fn identity_key(&self) -> WorktreeSessionKey {
+        WorktreeSessionKey {
+            repo_index: self.repo_index,
+            path: self.path.clone(),
+        }
+    }
+
+    pub(crate) fn matches_branch(&self, repo_index: usize, branch: &str) -> bool {
+        self.repo_index == repo_index && self.branch == branch
+    }
+
+    pub(crate) fn apply_repo_identity(
+        &mut self,
+        repo_index: usize,
+        repo_label: String,
+        repo_key: Option<char>,
+    ) {
+        self.repo_index = repo_index;
+        self.repo_label = repo_label;
+        self.repo_key = repo_key;
+    }
+
+    pub(crate) fn preserve_refresh_state_from(&mut self, previous: Session) {
+        self.agent_state = previous.agent_state;
+        self.opencode_status = previous.opencode_status;
+        self.pr = previous.pr;
+        self.wt_columns = previous.wt_columns;
+        self.unseen_comments = previous.unseen_comments;
+    }
+
+    pub(crate) fn mark_adopted_with_prompt(&mut self, initial_prompt: &str) {
+        self.adopted = true;
+        self.prompt_summary = prompt_summary_from_text(initial_prompt);
+    }
+
     pub(crate) fn background_job_snapshot(&self) -> Self {
         Self {
             repo_index: self.repo_index,
@@ -56,6 +103,40 @@ impl Session {
             unseen_comments: self.unseen_comments,
         }
     }
+
+    pub(crate) fn deletion_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if status_count(&self.status_label, "dirty").is_some() {
+            warnings.push("dirty worktree: uncommitted changes will be deleted".to_string());
+        }
+        if status_count(&self.status_label, "ahead").is_some() {
+            warnings.push("branch is ahead of upstream: unpushed commits may be lost".to_string());
+        }
+        if status_count(&self.status_label, "behind").is_some() {
+            warnings.push("branch is behind upstream".to_string());
+        }
+        if !self.adopted {
+            warnings.push("session was not created by Prism".to_string());
+        }
+        if self.is_detached() {
+            warnings.push("detached worktree: no local branch will be deleted".to_string());
+        }
+        if self.agent_state == AgentState::Running {
+            warnings.push("agent is still running".to_string());
+        }
+        if let Some(summary) = &self.pr.summary
+            && !summary.merged
+        {
+            warnings.push(format!("open PR #{} still exists", summary.number));
+        }
+        warnings
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct WorktreeSessionKey {
+    pub repo_index: usize,
+    pub path: PathBuf,
 }
 
 pub fn discover_sessions(repo: &Repository, config: &Config) -> Result<Vec<Session>, String> {
@@ -107,15 +188,19 @@ pub fn discover_sessions(repo: &Repository, config: &Config) -> Result<Vec<Sessi
         }
     }
 
-    sessions.sort_by(|a, b| {
-        let a_default = config.is_default_branch(&a.branch);
-        let b_default = config.is_default_branch(&b.branch);
-        b_default
-            .cmp(&a_default)
-            .then_with(|| a.branch.cmp(&b.branch))
-            .then_with(|| a.path.cmp(&b.path))
-    });
+    sessions.sort_by(|a, b| session_discovery_order(config, a, b));
     Ok(sessions)
+}
+
+pub(crate) fn session_discovery_order(
+    config: &Config,
+    a: &Session,
+    b: &Session,
+) -> std::cmp::Ordering {
+    b.is_default_branch(config)
+        .cmp(&a.is_default_branch(config))
+        .then_with(|| a.branch.cmp(&b.branch))
+        .then_with(|| a.path.cmp(&b.path))
 }
 
 fn build_session(repo: &Repository, path: PathBuf, branch: String, config: &Config) -> Session {
@@ -132,12 +217,7 @@ fn build_session(repo: &Repository, path: PathBuf, branch: String, config: &Conf
     let status_label = git_status_label(&path, config);
     let path_display = path.display().to_string();
     let agent_state = load_agent_state(repo, &branch).unwrap_or(AgentState::Idle);
-    let pr = if config.is_default_branch(&branch) {
-        let _ = crate::github::remove_pr_cache(repo, &branch);
-        PrCache::default()
-    } else {
-        load_pr_cache(repo, &branch)
-    };
+    let pr = load_pr_cache_for_branch(repo, config, &branch);
     Session {
         repo_index: 0,
         repo_label: String::new(),
@@ -162,7 +242,7 @@ pub fn write_task_metadata(
     session: &Session,
     initial_prompt: &str,
 ) -> Result<(), String> {
-    let summary = truncate(&initial_prompt.replace('\n', " "), 50);
+    let summary = prompt_summary_from_text(initial_prompt);
     observability::with_writable_db(repo, |conn| {
         conn.execute(
             "insert into task_metadata (
@@ -314,6 +394,10 @@ fn read_prompt_summary(path: &Path) -> Option<String> {
     None
 }
 
+fn prompt_summary_from_text(text: &str) -> String {
+    truncate(&text.replace('\n', " "), 50)
+}
+
 fn unix_seconds() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -387,6 +471,103 @@ exit 0
         assert_eq!(sessions[0].branch, "main");
 
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn worktree_session_default_branch_sorts_first() {
+        let mut config = test_config();
+        config.default_base = Some("main".to_string());
+        let main = test_session("main", "/repo/main");
+        let feature = test_session("feature", "/repo/feature");
+
+        assert_eq!(
+            session_discovery_order(&config, &main, &feature),
+            std::cmp::Ordering::Less
+        );
+        assert!(main.is_default_branch(&config));
+        assert!(feature.is_task_branch(&config));
+    }
+
+    #[test]
+    fn refresh_state_preserves_runtime_pr_columns_and_unseen_comments() {
+        let mut fresh = test_session("feature", "/repo/feature");
+        let mut previous = test_session("feature", "/repo/feature");
+        previous.agent_state = AgentState::Running;
+        previous
+            .wt_columns
+            .insert("ci".to_string(), "passed".to_string());
+        previous.unseen_comments = true;
+
+        fresh.preserve_refresh_state_from(previous);
+
+        assert_eq!(fresh.agent_state, AgentState::Running);
+        assert_eq!(
+            fresh.wt_columns.get("ci").map(String::as_str),
+            Some("passed")
+        );
+        assert!(fresh.unseen_comments);
+    }
+
+    #[test]
+    fn mark_adopted_with_prompt_updates_local_metadata_facts() {
+        let mut session = test_session("feature", "/repo/feature");
+
+        session.mark_adopted_with_prompt("first line\nsecond line with extra text");
+
+        assert!(session.adopted);
+        assert_eq!(
+            session.prompt_summary,
+            "first line second line with extra text"
+        );
+    }
+
+    #[test]
+    fn deletion_warnings_describe_worktree_session_local_risks() {
+        let mut session = test_session("(detached)", "/repo/detached");
+        session.status_label = "dirty 1 ahead 2 behind 3".to_string();
+        session.adopted = false;
+        session.agent_state = AgentState::Running;
+
+        let warnings = session.deletion_warnings();
+
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("dirty worktree"))
+        );
+        assert!(warnings.iter().any(|warning| warning.contains("unpushed")));
+        assert!(warnings.iter().any(|warning| warning.contains("behind")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("not created"))
+        );
+        assert!(warnings.iter().any(|warning| warning.contains("detached")));
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("agent is still running"))
+        );
+    }
+
+    fn test_session(branch: &str, path: &str) -> Session {
+        Session {
+            repo_index: 0,
+            repo_label: "repo".to_string(),
+            repo_key: None,
+            path: PathBuf::from(path),
+            path_display: path.to_string(),
+            branch: branch.to_string(),
+            prompt_summary: String::new(),
+            adopted: true,
+            hidden: false,
+            status_label: "clean".to_string(),
+            agent_state: AgentState::Idle,
+            opencode_status: None,
+            pr: PrCache::default(),
+            wt_columns: BTreeMap::new(),
+            unseen_comments: false,
+        }
     }
 
     fn test_config() -> Config {
