@@ -1,5 +1,5 @@
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,8 @@ use crate::util::timestamp_label;
 
 pub const PR_SUMMARY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 pub const PR_DETAIL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const PR_MERGE_VERIFY_ATTEMPTS: usize = 6;
+const PR_MERGE_VERIFY_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, Default)]
 pub struct PrCache {
@@ -444,6 +446,54 @@ pub fn refresh_pr_cache(
             cache.error = Some(error);
         }
     }
+}
+
+pub fn wait_for_pr_merged(
+    path: &std::path::Path,
+    pr_number: u64,
+    config: &Config,
+) -> Result<bool, String> {
+    let mut last_error = None;
+    for attempt in 0..PR_MERGE_VERIFY_ATTEMPTS {
+        match fetch_pr_merged_status(path, pr_number, config) {
+            Ok(true) => return Ok(true),
+            Ok(false) => last_error = None,
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < PR_MERGE_VERIFY_ATTEMPTS {
+            std::thread::sleep(PR_MERGE_VERIFY_INTERVAL);
+        }
+    }
+    match last_error {
+        Some(error) => Err(error),
+        None => Ok(false),
+    }
+}
+
+fn fetch_pr_merged_status(
+    path: &std::path::Path,
+    pr_number: u64,
+    config: &Config,
+) -> Result<bool, String> {
+    let output = run_output_allow_failure(
+        Command::new(config.tool("gh"))
+            .arg("pr")
+            .arg("view")
+            .arg(pr_number.to_string())
+            .arg("--json")
+            .arg("state,mergedAt")
+            .current_dir(path),
+    )?;
+    if !output.status.success() {
+        let stderr = output.stderr.trim().to_string();
+        let message = if stderr.is_empty() {
+            format!("exited with {}", output.status)
+        } else {
+            stderr
+        };
+        return Err(format!("gh pr view: {message}"));
+    }
+    Ok(parse_merged_status(&output.stdout))
 }
 
 pub fn refresh_pr_details_cache(
@@ -1096,7 +1146,6 @@ fn collect_failing_checks(rollup: &GithubStatusCheckRollup) -> Vec<String> {
         .collect()
 }
 
-#[cfg(test)]
 fn parse_merged_status(raw: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return false;

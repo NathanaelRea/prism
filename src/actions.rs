@@ -10,7 +10,7 @@ use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, sel
 use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCache, PrCacheRepository, apply_pr_details_poll_result,
     fetch_pr_summary_index, pr_details_due, refresh_pr_cache, refresh_pr_details_cache,
-    refresh_pr_summary_index_for_sessions,
+    refresh_pr_summary_index_for_sessions, wait_for_pr_merged,
 };
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::lifecycle::{
@@ -1462,15 +1462,44 @@ impl Tui {
             "Merge Pull Request",
             &format!("Merging PR #{}", summary.number),
         )?;
-        merge_pull_request(
-            &context.repo,
-            &context.config,
-            &path,
-            &branch,
-            summary.number,
+        merge_pull_request(&context.config, &path, summary.number)?;
+        self.show_loading_dialog(
+            "Merge Pull Request",
+            &format!("Verifying PR #{} is merged", summary.number),
         )?;
-        self.refresh_sessions()?;
-        self.show_message("merge complete")?;
+        let merged = match wait_for_pr_merged(&path, summary.number, &context.config) {
+            Ok(merged) => merged,
+            Err(error) => {
+                self.refresh_sessions()?;
+                self.show_message(&format!(
+                    "merge complete; could not verify PR merged: {error}"
+                ))?;
+                return Ok(());
+            }
+        };
+        if !merged {
+            self.refresh_sessions()?;
+            self.show_message("merge complete; GitHub has not marked the PR merged yet")?;
+            return Ok(());
+        }
+
+        if let Some(summary) = self.sessions[selected].pr.summary.as_mut() {
+            summary.merged = true;
+            summary.state = "MERGED".to_string();
+        }
+        let path_display = self.sessions[selected].path_display.clone();
+        let warnings = delete_warnings(&self.sessions[selected]);
+        if self.confirm_delete_dialog(&branch, &path_display, &warnings)? {
+            delete_worktree_session(&context.repo, &context.config, &path, &branch)?;
+            if self.selected_worktree_by_repo.get(&context.repo.root) == Some(&path) {
+                self.selected_worktree_by_repo.remove(&context.repo.root);
+            }
+            self.refresh_sessions()?;
+            self.show_message("merge complete; deleted local session data, worktree, and branch")?;
+        } else {
+            self.refresh_sessions()?;
+            self.show_message("merge complete")?;
+        }
         Ok(())
     }
 
