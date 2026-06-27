@@ -1,13 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
 use std::time::Duration;
 
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::ci::build_ci_failure_prompt;
+use crate::config::Config;
 use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
 use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCacheRepository, apply_pr_details_poll_result,
@@ -21,8 +23,16 @@ use crate::lifecycle::{
     push_branch, refresh_branch_pr_cache, run_pre_pr_checks, run_pre_push_checks,
 };
 use crate::opencode::{self, OpencodeStatus, load_runtime};
-use crate::plan::open_plan_mode;
+use crate::plan::{PlanExecution, open_plan_mode};
+use crate::plan_run::{
+    DEFAULT_OUTPUT_LINES_PER_STEP, PlanExecutorConfig, PlanRunMode, PlanRunStatus, PlanStepStatus,
+    abort_plan_run, abort_plan_step, archive_plan_run, execute_plan_parallel,
+    execute_plan_sequential, load_plan_run, load_resumable_plan_run, prepare_plan_plugin_config,
+    prepare_plan_run_for_resume, request_plan_run_pause, resume_paused_plan_run,
+    retry_failed_steps, retry_from_step, save_plan_run, skip_plan_step,
+};
 use crate::process::{command_exists, run_capture};
+use crate::repo::Repository;
 use crate::review::build_review_fix_prompt;
 use crate::session::{
     append_runtime_log, discover_sessions, save_agent_state, write_task_metadata,
@@ -30,7 +40,7 @@ use crate::session::{
 use crate::tmux::TmuxWindow;
 use crate::tui::{
     DefaultBranchPollResult, ManagedRepo, OpencodeEventResult, OpencodePollKey, OpencodePollResult,
-    PrPollKey, PrPollResult, Tui, WtPollResult,
+    PanelFocus, PlanRunResult, PrPollKey, PrPollResult, Tui, WtPollResult,
 };
 use crate::util::{status_count, yes};
 
@@ -987,6 +997,7 @@ impl Tui {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn open_selected_repo_plan_mode(
         &mut self,
         raw: &mut crate::terminal::RawTerminal,
@@ -1008,6 +1019,7 @@ impl Tui {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub(crate) fn open_selected_worktree_plan_mode(
         &mut self,
         raw: &mut crate::terminal::RawTerminal,
@@ -1027,6 +1039,328 @@ impl Tui {
         result?;
         self.show_message("returned from plan mode")?;
         Ok(())
+    }
+
+    pub(crate) fn start_selected_repo_plan_run(
+        &mut self,
+        raw: &mut crate::terminal::RawTerminal,
+    ) -> Result<(), String> {
+        let context = self
+            .selected_repo_context()
+            .ok_or_else(|| "no selected repository".to_string())?;
+        self.start_plan_run_for_scope(
+            raw,
+            context.repo.clone(),
+            context.config.clone(),
+            context.repo.root,
+        )
+    }
+
+    pub(crate) fn start_selected_worktree_plan_run(
+        &mut self,
+        raw: &mut crate::terminal::RawTerminal,
+    ) -> Result<(), String> {
+        let Some(context) = self.selected_worktree_context() else {
+            return Ok(());
+        };
+        let path = self.sessions[context.session_index].path.clone();
+        self.start_plan_run_for_scope(raw, context.repo, context.config, path)
+    }
+
+    fn start_plan_run_for_scope(
+        &mut self,
+        raw: &mut crate::terminal::RawTerminal,
+        repo: crate::repo::Repository,
+        config: crate::config::Config,
+        scope_path: PathBuf,
+    ) -> Result<(), String> {
+        raw.suspend()?;
+        let execution = PlanExecution::prepare(&scope_path, &config, None);
+        let resume_result = raw.resume();
+        resume_result?;
+        let execution = execution?;
+        let mode = self.prompt_line_dialog("Plan Run", "Run phases in parallel? [y/N] ", "")?;
+        let mode = if mode.as_deref().map(yes).unwrap_or(false) {
+            PlanRunMode::Parallel
+        } else {
+            PlanRunMode::Sequential
+        };
+        let launch = execution.launch(&repo.root, mode)?;
+        let mut should_execute = true;
+        let persisted = crate::observability::with_writable_db(&repo, |conn| {
+            if let Some(mut persisted) = load_resumable_plan_run(conn, &launch)? {
+                should_execute = prepare_plan_run_for_resume(
+                    conn,
+                    &mut persisted,
+                    DEFAULT_OUTPUT_LINES_PER_STEP,
+                )?;
+                Ok(persisted)
+            } else {
+                let persisted = launch.create_run();
+                save_plan_run(conn, &persisted)?;
+                Ok(persisted)
+            }
+        })?;
+        let run_id = persisted.run.id.clone();
+        let scope_path = execution.cwd().to_path_buf();
+        self.plan_runs.insert(run_id.clone(), persisted.clone());
+        self.active_plan_runs
+            .insert(scope_path.clone(), run_id.clone());
+        self.selected_plan_step_by_run
+            .insert(run_id.clone(), persisted.run.selected_step);
+
+        if should_execute {
+            self.spawn_plan_run_executor(repo, config, persisted);
+        }
+        self.focus_status();
+        if should_execute {
+            self.show_message("started plan run")?;
+        } else {
+            self.show_message("plan run is already running")?;
+        }
+        Ok(())
+    }
+
+    fn spawn_plan_run_executor(
+        &self,
+        repo: crate::repo::Repository,
+        config: crate::config::Config,
+        mut persisted: crate::plan_run::PersistedPlanRun,
+    ) {
+        let tx = self.plan_run_tx.clone();
+        thread::spawn(move || {
+            let run_id = persisted.run.id.clone();
+            let mode = persisted.run.mode;
+            let scope_path = persisted.run.scope_path.clone();
+            let title_prefix = persisted.run.plan_display.clone();
+            let server_url =
+                crate::opencode::ensure_opencode_server(&repo, &config, "plan", &scope_path)
+                    .ok()
+                    .map(|runtime| runtime.server_url);
+            let mut executor = PlanExecutorConfig::new(
+                config.tool("opencode"),
+                server_url,
+                scope_path.clone(),
+                title_prefix,
+            );
+            if config.opencode_plan_plugin
+                && let Ok(plugin) = prepare_plan_plugin_config(&repo.prism_dir())
+            {
+                executor = executor.with_plugin_config(plugin);
+            }
+            let result = crate::observability::with_writable_db(&repo, |conn| match mode {
+                PlanRunMode::Sequential => {
+                    execute_plan_sequential(conn, &mut persisted, &executor, &mut io::sink())
+                }
+                PlanRunMode::Parallel => {
+                    execute_plan_parallel(conn, &mut persisted, &executor, &mut io::sink())
+                }
+            });
+            let _ = tx.send(PlanRunResult {
+                repo_root: repo.root,
+                scope_path,
+                run_id,
+                result,
+            });
+        });
+    }
+
+    pub(crate) fn abort_selected_plan_run_or_step(&mut self) -> Result<bool, String> {
+        let Some(dashboard) = self.current_plan_dashboard() else {
+            return Ok(false);
+        };
+        if self.focused_panel != PanelFocus::Status {
+            return Ok(false);
+        }
+        let repo = Repository {
+            root: PathBuf::from(&dashboard.run.run.repo_root),
+        };
+        let run_id = dashboard.run.run.id.clone();
+        let selected_step = dashboard.run.run.selected_step;
+        let answer = self.prompt_line_dialog(
+            "Abort Plan",
+            "Abort selected phase? Use 'all' for every running phase. [y/N/all] ",
+            "",
+        )?;
+        let Some(answer) = answer else {
+            return Ok(true);
+        };
+        if answer.trim().eq_ignore_ascii_case("all") {
+            crate::observability::with_writable_db(&repo, |conn| {
+                let mut run = load_plan_run(conn, &run_id)?
+                    .ok_or_else(|| format!("plan run not found: {run_id}"))?;
+                abort_plan_run(conn, &mut run)
+            })?;
+            self.load_plan_run_snapshot(&repo.root, &run_id);
+            self.show_message("abort requested for plan run")?;
+            return Ok(true);
+        }
+        if !yes(&answer) {
+            return Ok(true);
+        }
+        crate::observability::with_writable_db(&repo, |conn| {
+            let mut run = load_plan_run(conn, &run_id)?
+                .ok_or_else(|| format!("plan run not found: {run_id}"))?;
+            let step = run
+                .steps
+                .iter_mut()
+                .find(|step| step.step == selected_step)
+                .ok_or_else(|| format!("plan phase not found: {selected_step}"))?;
+            if !matches!(
+                step.status,
+                PlanStepStatus::Starting | PlanStepStatus::Running
+            ) {
+                return Err(format!("plan phase {selected_step} is not running"));
+            }
+            abort_plan_step(conn, step)?;
+            run.run.status = run.aggregate_status();
+            save_plan_run(conn, &run)
+        })?;
+        self.load_plan_run_snapshot(&repo.root, &run_id);
+        self.show_message("abort requested for selected plan phase")?;
+        Ok(true)
+    }
+
+    pub(crate) fn retry_failed_plan_steps(&mut self) -> Result<bool, String> {
+        let Some(dashboard) = self.current_plan_dashboard() else {
+            return Ok(false);
+        };
+        if self.focused_panel != PanelFocus::Status {
+            return Ok(false);
+        }
+        let repo = Repository {
+            root: PathBuf::from(&dashboard.run.run.repo_root),
+        };
+        let config = Config::load(&repo);
+        let run_id = dashboard.run.run.id.clone();
+        let persisted = crate::observability::with_writable_db(&repo, |conn| {
+            let mut run = load_plan_run(conn, &run_id)?
+                .ok_or_else(|| format!("plan run not found: {run_id}"))?;
+            retry_failed_steps(conn, &mut run)?;
+            Ok(run)
+        })?;
+        self.remember_plan_run(persisted.clone());
+        self.spawn_plan_run_executor(repo, config, persisted);
+        self.show_message("retrying failed plan phases")?;
+        Ok(true)
+    }
+
+    pub(crate) fn retry_plan_from_selected_step(&mut self) -> Result<bool, String> {
+        let Some(dashboard) = self.current_plan_dashboard() else {
+            return Ok(false);
+        };
+        if self.focused_panel != PanelFocus::Status {
+            return Ok(false);
+        }
+        let selected_step = dashboard.run.run.selected_step;
+        let answer = self.prompt_line_dialog(
+            "Retry Plan",
+            &format!("Retry from phase {selected_step}? [y/N] "),
+            "",
+        )?;
+        if !answer.as_deref().map(yes).unwrap_or(false) {
+            return Ok(true);
+        }
+        let repo = Repository {
+            root: PathBuf::from(&dashboard.run.run.repo_root),
+        };
+        let config = Config::load(&repo);
+        let run_id = dashboard.run.run.id.clone();
+        let persisted = crate::observability::with_writable_db(&repo, |conn| {
+            let mut run = load_plan_run(conn, &run_id)?
+                .ok_or_else(|| format!("plan run not found: {run_id}"))?;
+            retry_from_step(conn, &mut run, selected_step)?;
+            Ok(run)
+        })?;
+        self.remember_plan_run(persisted.clone());
+        self.spawn_plan_run_executor(repo, config, persisted);
+        self.show_message("retrying plan from selected phase")?;
+        Ok(true)
+    }
+
+    pub(crate) fn skip_selected_plan_step(&mut self) -> Result<bool, String> {
+        let Some(dashboard) = self.current_plan_dashboard() else {
+            return Ok(false);
+        };
+        if self.focused_panel != PanelFocus::Status {
+            return Ok(false);
+        }
+        let repo = Repository {
+            root: PathBuf::from(&dashboard.run.run.repo_root),
+        };
+        let run_id = dashboard.run.run.id.clone();
+        let selected_step = dashboard.run.run.selected_step;
+        crate::observability::with_writable_db(&repo, |conn| {
+            let mut run = load_plan_run(conn, &run_id)?
+                .ok_or_else(|| format!("plan run not found: {run_id}"))?;
+            skip_plan_step(conn, &mut run, selected_step)
+        })?;
+        self.load_plan_run_snapshot(&repo.root, &run_id);
+        self.show_message("skipped selected plan phase")?;
+        Ok(true)
+    }
+
+    pub(crate) fn toggle_selected_plan_pause(&mut self) -> Result<bool, String> {
+        let Some(dashboard) = self.current_plan_dashboard() else {
+            return Ok(false);
+        };
+        if self.focused_panel != PanelFocus::Status {
+            return Ok(false);
+        }
+        let repo = Repository {
+            root: PathBuf::from(&dashboard.run.run.repo_root),
+        };
+        let config = Config::load(&repo);
+        let run_id = dashboard.run.run.id.clone();
+        let mut should_execute = false;
+        let persisted = crate::observability::with_writable_db(&repo, |conn| {
+            let mut run = load_plan_run(conn, &run_id)?
+                .ok_or_else(|| format!("plan run not found: {run_id}"))?;
+            if run.run.pause_requested || run.run.status == PlanRunStatus::Paused {
+                resume_paused_plan_run(conn, &mut run)?;
+                should_execute =
+                    prepare_plan_run_for_resume(conn, &mut run, DEFAULT_OUTPUT_LINES_PER_STEP)?;
+            } else {
+                request_plan_run_pause(conn, &mut run)?;
+            }
+            Ok(run)
+        })?;
+        self.remember_plan_run(persisted.clone());
+        if persisted.run.pause_requested || persisted.run.status == PlanRunStatus::Paused {
+            self.show_message("plan run will pause before the next phase")?;
+            return Ok(true);
+        }
+        if should_execute {
+            self.spawn_plan_run_executor(repo, config, persisted);
+            self.show_message("resumed plan run")?;
+        } else {
+            self.show_message("plan run is already running")?;
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn dismiss_selected_plan_run(&mut self) -> Result<bool, String> {
+        let Some(dashboard) = self.current_plan_dashboard() else {
+            return Ok(false);
+        };
+        if self.focused_panel != PanelFocus::Status {
+            return Ok(false);
+        }
+        let repo = Repository {
+            root: PathBuf::from(&dashboard.run.run.repo_root),
+        };
+        let run_id = dashboard.run.run.id.clone();
+        crate::observability::with_writable_db(&repo, |conn| {
+            let mut run = load_plan_run(conn, &run_id)?
+                .ok_or_else(|| format!("plan run not found: {run_id}"))?;
+            archive_plan_run(conn, &mut run)
+        })?;
+        self.plan_runs.remove(&run_id);
+        self.active_plan_runs.retain(|_, active| active != &run_id);
+        self.selected_plan_step_by_run.remove(&run_id);
+        self.plan_output_state_by_run.remove(&run_id);
+        self.show_message("dismissed plan run")?;
+        Ok(true)
     }
 
     pub(crate) fn start_tmux_agent_warmup(&mut self) {
@@ -2248,6 +2582,7 @@ exit 0
             opencode_port_base: 41_000,
             opencode_port_span: 1_000,
             opencode_shutdown_owned_servers: false,
+            opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             checks: Checks::default(),
