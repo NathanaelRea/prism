@@ -87,6 +87,7 @@ pub struct Config {
     pub opencode_port_base: u16,
     pub opencode_port_span: u16,
     pub opencode_shutdown_owned_servers: bool,
+    pub opencode_plan_plugin: bool,
     pub escape_key: EscapeKey,
     pub merge_method: MergeMethod,
     pub checks: Checks,
@@ -109,6 +110,7 @@ struct RawConfig {
     opencode_port_base: Option<u16>,
     opencode_port_span: Option<u16>,
     opencode_shutdown_owned_servers: Option<bool>,
+    opencode_plan_plugin: Option<bool>,
     escape_key: Option<String>,
     merge_method: Option<String>,
     checks: Option<RawChecks>,
@@ -172,6 +174,7 @@ impl Config {
             opencode_port_base: 41_000,
             opencode_port_span: 1_000,
             opencode_shutdown_owned_servers: false,
+            opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             checks: Checks::default(),
@@ -219,6 +222,9 @@ impl Config {
         }
         if let Some(shutdown) = raw.opencode_shutdown_owned_servers {
             self.opencode_shutdown_owned_servers = shutdown;
+        }
+        if let Some(enabled) = raw.opencode_plan_plugin {
+            self.opencode_plan_plugin = enabled;
         }
         if let Some(value) = raw
             .merge_method
@@ -320,6 +326,7 @@ pub fn print_config(repo: &Repository, config: &Config) {
         "opencode_shutdown_owned_servers = {}",
         config.opencode_shutdown_owned_servers
     );
+    println!("opencode_plan_plugin = {}", config.opencode_plan_plugin);
     println!("escape_key = {}", config.escape_key.label());
     println!("merge_method = {}", config.merge_method.label());
     println!("worktree_columns = {:?}", config.worktree_columns);
@@ -608,6 +615,7 @@ mod tests {
         assert_eq!(config.opencode_port_base, 41_000);
         assert_eq!(config.opencode_port_span, 1_000);
         assert!(!config.opencode_shutdown_owned_servers);
+        assert!(!config.opencode_plan_plugin);
         assert!(config.is_default_branch("main"));
         assert_eq!(
             config.agent_command("opencode"),
@@ -650,7 +658,7 @@ mod tests {
         ));
         fs::write(
             &path,
-            "opencode_port_base = 42000\nopencode_port_span = 50\nopencode_shutdown_owned_servers = true\n",
+            "opencode_port_base = 42000\nopencode_port_span = 50\nopencode_shutdown_owned_servers = true\nopencode_plan_plugin = true\n",
         )
         .unwrap();
         let mut config = Config::defaults(PathBuf::from("/tmp/user.toml"), path.clone());
@@ -660,6 +668,7 @@ mod tests {
         assert_eq!(config.opencode_port_base, 42_000);
         assert_eq!(config.opencode_port_span, 50);
         assert!(config.opencode_shutdown_owned_servers);
+        assert!(config.opencode_plan_plugin);
 
         let _ = fs::remove_file(path);
     }

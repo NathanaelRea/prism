@@ -1,12 +1,19 @@
 use std::fs;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use crate::config::Config;
+#[cfg(test)]
 use crate::json::json_string_field;
+use crate::observability;
+use crate::plan_run::{
+    PlanExecutorConfig, PlanLaunch, PlanRunMode, execute_plan_sequential,
+    prepare_plan_plugin_config, save_plan_run,
+};
 use crate::process::command_exists;
+use crate::repo::Repository;
 use crate::util::stable_hash;
 
 const DEFAULT_STEP_NAME: &str = "phase";
@@ -24,7 +31,7 @@ struct SelectedPlanFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PlanExecution {
+pub(crate) struct PlanExecution {
     cwd: PathBuf,
     plan_path: PathBuf,
     plan_file: String,
@@ -34,12 +41,14 @@ struct PlanExecution {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 struct PlanModeLaunch {
     cwd: PathBuf,
     tmux_session_name: String,
     shell_command: String,
 }
 
+#[allow(dead_code)]
 impl PlanModeLaunch {
     fn prepare(cwd: &Path) -> Result<Self, String> {
         let exe = std::env::current_exe()
@@ -62,7 +71,11 @@ impl PlanModeLaunch {
 }
 
 impl PlanExecution {
-    fn prepare(cwd: &Path, config: &Config, path: Option<&Path>) -> Result<Self, String> {
+    pub(crate) fn prepare(
+        cwd: &Path,
+        config: &Config,
+        path: Option<&Path>,
+    ) -> Result<Self, String> {
         let selected = select_plan_file(cwd, config, path)?;
         let inferred_total = infer_total_phases(&selected.path)?;
         let plan_file = display_plan_path(cwd, &selected.path);
@@ -82,6 +95,23 @@ impl PlanExecution {
         })
     }
 
+    pub(crate) fn launch(&self, repo_root: &Path, mode: PlanRunMode) -> Result<PlanLaunch, String> {
+        PlanLaunch::new(
+            repo_root,
+            &self.cwd,
+            &self.plan_path,
+            &self.step_name,
+            self.start,
+            self.total,
+            mode,
+        )
+    }
+
+    pub(crate) fn cwd(&self) -> &Path {
+        &self.cwd
+    }
+
+    #[cfg(test)]
     fn tasks(&self) -> Vec<String> {
         (self.start..=self.total)
             .map(|step| build_task(&self.plan_file, &self.step_name, step))
@@ -122,12 +152,14 @@ impl StepRange {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OpencodeRunCommand {
     program: String,
     args: Vec<String>,
 }
 
+#[cfg(test)]
 impl OpencodeRunCommand {
     fn new(config: &Config, task: &str) -> Self {
         Self {
@@ -143,12 +175,6 @@ impl OpencodeRunCommand {
 
     fn display(&self) -> String {
         format!("$ {} {}", self.program, self.args.join(" "))
-    }
-
-    fn command(&self) -> Command {
-        let mut command = Command::new(&self.program);
-        command.args(&self.args);
-        command
     }
 }
 
@@ -173,13 +199,53 @@ pub fn infer_total_phases(path: &Path) -> Result<usize, String> {
 
 pub fn run_plan_mode(cwd: &Path, config: &Config, path: Option<&Path>) -> Result<(), String> {
     let execution = PlanExecution::prepare(cwd, config, path)?;
-    for task in execution.tasks() {
-        println!("\n==> {task}\n");
-        run_opencode_step(config, &execution.cwd, &task)?;
+    let repo = Repository {
+        root: execution.cwd.clone(),
+    };
+    let launch = PlanLaunch::new(
+        &repo.root,
+        &execution.cwd,
+        &execution.plan_path,
+        &execution.step_name,
+        execution.start,
+        execution.total,
+        PlanRunMode::Sequential,
+    )?;
+    let mut persisted = launch.create_run();
+
+    let server_url = match crate::opencode::ensure_opencode_server(
+        &repo,
+        config,
+        "plan",
+        &execution.cwd,
+    ) {
+        Ok(runtime) => Some(runtime.server_url),
+        Err(error) => {
+            eprintln!(
+                "warning: could not start OpenCode server for attach; falling back to direct opencode run: {error}"
+            );
+            None
+        }
+    };
+
+    let mut executor = PlanExecutorConfig::new(
+        config.tool("opencode"),
+        server_url,
+        execution.cwd.clone(),
+        execution.plan_file.clone(),
+    );
+    if config.opencode_plan_plugin
+        && let Ok(plugin) = prepare_plan_plugin_config(&repo.prism_dir())
+    {
+        executor = executor.with_plugin_config(plugin);
     }
-    Ok(())
+    observability::with_writable_db(&repo, |conn| {
+        save_plan_run(conn, &persisted)?;
+        execute_plan_sequential(conn, &mut persisted, &executor, &mut io::stdout())
+    })
 }
 
+#[allow(dead_code)]
 pub fn open_plan_mode(config: &Config, cwd: &Path) -> Result<(), String> {
     let launch = PlanModeLaunch::prepare(cwd)?;
     crate::tmux::attach_or_create_plan_mode(
@@ -190,37 +256,7 @@ pub fn open_plan_mode(config: &Config, cwd: &Path) -> Result<(), String> {
     )
 }
 
-fn run_opencode_step(config: &Config, cwd: &Path, task: &str) -> Result<(), String> {
-    let invocation = OpencodeRunCommand::new(config, task);
-    println!("{}", invocation.display());
-    let mut child = invocation
-        .command()
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|error| format!("opencode: {error}"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "open opencode stdout".to_string())?;
-    let reader = BufReader::new(stdout);
-    for line in reader.lines() {
-        let line = line.map_err(|error| format!("read opencode output: {error}"))?;
-        for rendered in render_opencode_event(&line) {
-            println!("{rendered}");
-        }
-    }
-    let status = child
-        .wait()
-        .map_err(|error| format!("wait for opencode: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("opencode run exited with {status}"))
-    }
-}
-
+#[cfg(test)]
 fn render_opencode_event(raw: &str) -> Vec<String> {
     let raw = raw.trim();
     if raw.is_empty() {
@@ -257,6 +293,7 @@ fn render_opencode_event(raw: &str) -> Vec<String> {
     lines
 }
 
+#[cfg(test)]
 fn event_should_include_raw(raw: &str, event_type: &str) -> bool {
     let event_type = event_type.to_ascii_lowercase();
     event_type.contains("tool")
@@ -375,21 +412,23 @@ fn choose_with_fzf(config: &Config, files: &[PathBuf]) -> Result<PathBuf, String
     Ok(PathBuf::from(selected))
 }
 
-fn display_plan_path(cwd: &Path, path: &Path) -> String {
+pub(crate) fn display_plan_path(cwd: &Path, path: &Path) -> String {
     path.strip_prefix(cwd)
         .unwrap_or(path)
         .to_string_lossy()
         .to_string()
 }
 
-fn build_task(plan_file: &str, step_name: &str, step: usize) -> String {
+pub(crate) fn build_task(plan_file: &str, step_name: &str, step: usize) -> String {
     format!("Implement {plan_file} {step_name} {step}")
 }
 
+#[allow(dead_code)]
 fn plan_mode_session_name(cwd: &Path) -> String {
     format!("prism-plan-{:016x}", stable_hash(cwd))
 }
 
+#[allow(dead_code)]
 fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -620,6 +659,7 @@ mod tests {
             opencode_port_base: 41_000,
             opencode_port_span: 1_000,
             opencode_shutdown_owned_servers: false,
+            opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             checks: Checks::default(),

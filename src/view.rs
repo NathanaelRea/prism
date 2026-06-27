@@ -1,9 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::agent::AgentState;
 use crate::config::Config;
 use crate::github::PrCache;
 use crate::opencode::OpencodeStatus;
+use crate::plan_run::{
+    PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRunMode, PlanRunStatus, PlanStepRun,
+    PlanStepStatus,
+};
 use crate::session::Session;
 use crate::terminal::{terminal_size, write_stdout};
 use crate::tui::PanelFocus;
@@ -26,6 +30,7 @@ pub(crate) struct FrameModel<'a> {
     pub repo_filter: &'a str,
     pub worktree_filter: &'a str,
     pub leader_hint: Option<&'a str>,
+    pub plan_dashboard: Option<PlanDashboard>,
 }
 
 pub(crate) struct StatusRow {
@@ -54,6 +59,19 @@ pub(crate) struct WorktreeRow {
     pub unseen_comments: bool,
     pub prompt_summary: String,
     pub selected: bool,
+}
+
+pub(crate) struct PlanDashboard {
+    pub run: PersistedPlanRun,
+    pub output_lines: Vec<PlanOutputLine>,
+    pub output_state: PlanOutputViewerState,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PlanOutputViewerState {
+    pub cursor: usize,
+    pub follow: bool,
+    pub expanded_blocks: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,10 +131,14 @@ pub(crate) fn render_model_frame(model: &FrameModel<'_>, cols: u16, rows: u16) -
         .position(|row| row.selected)
         .unwrap_or(0);
     let worktree_start = scroll_start(worktree_selected, worktree_rows);
-    let main_lines = match model.focus {
-        PanelFocus::Status => format_status_dashboard_lines(model, main_width as usize),
-        PanelFocus::Repos => format_repo_overview_lines(model, main_width as usize, main_rows),
-        PanelFocus::Worktrees => format_worktree_detail_lines(model, main_width as usize),
+    let main_lines = if let Some(dashboard) = &model.plan_dashboard {
+        format_plan_dashboard_lines(dashboard, main_width as usize, main_rows)
+    } else {
+        match model.focus {
+            PanelFocus::Status => format_status_dashboard_lines(model, main_width as usize),
+            PanelFocus::Repos => format_repo_overview_lines(model, main_width as usize, main_rows),
+            PanelFocus::Worktrees => format_worktree_detail_lines(model, main_width as usize),
+        }
     };
     let sidebar_lines = format_sidebar_lines(
         model,
@@ -297,7 +319,8 @@ fn scoped_mode_label(model: &FrameModel<'_>) -> String {
 fn footer_actions(model: &FrameModel<'_>) -> String {
     match model.focus {
         PanelFocus::Status => {
-            "c create  Enter focus repos  ? help  Tab next  2 repos  3 worktrees".to_string()
+            "j/k output  h/l phase  f retry  B retry from  s skip  D dismiss  x abort  ? help"
+                .to_string()
         }
         PanelFocus::Repos => {
             let mut actions = Vec::new();
@@ -307,6 +330,7 @@ fn footer_actions(model: &FrameModel<'_>) -> String {
             actions.extend([
                 "c create",
                 "p pull",
+                "P plan",
                 "h/l view",
                 "<Space> for more options",
                 "A add",
@@ -327,6 +351,7 @@ fn footer_actions(model: &FrameModel<'_>) -> String {
                 actions.push("D delete");
             }
             actions.push("p pull");
+            actions.push("P plan");
             actions.push("c create");
             actions.push("/ search");
             actions.join("  ")
@@ -619,6 +644,409 @@ fn format_opencode_status_lines(status: &OpencodeStatus, width: usize) -> Vec<St
         lines.push(format!("todos {todo}"));
     }
     lines
+}
+
+fn format_plan_dashboard_lines(
+    dashboard: &PlanDashboard,
+    width: usize,
+    visible_rows: usize,
+) -> Vec<String> {
+    let run = &dashboard.run.run;
+    let selected_step = dashboard
+        .run
+        .steps
+        .iter()
+        .find(|step| step.step == run.selected_step)
+        .or_else(|| dashboard.run.steps.first());
+    let counts = dashboard.run.status_counts();
+    let mut lines = vec![
+        color("Plan Run", "1;36"),
+        format!("plan   {}", truncate_line(&run.plan_display, width)),
+        format!(
+            "scope  {}",
+            truncate_line(&run.scope_path.display().to_string(), width)
+        ),
+        format!(
+            "mode   {}  status {}  elapsed {}",
+            plan_mode_label(run.mode),
+            plan_run_status_label(run.status),
+            elapsed_label(run.created_unix_ms, run.updated_unix_ms)
+        ),
+    ];
+    if let Some(step) = selected_step {
+        lines.push(format!(
+            "phase  {}/{} {}",
+            step.step,
+            run.total_steps,
+            plan_step_status_label(step.status)
+        ));
+        if let Some(session_id) = step.opencode_session_id.as_deref() {
+            lines.push(format!("opencode session {}", short_id(session_id)));
+        }
+        if let Some(tool) = step.active_tool.as_deref() {
+            lines.push(format!("tool   {}", truncate_line(tool, width)));
+        }
+        if let Some(message) = step.latest_message.as_deref() {
+            lines.push(format!("latest {}", truncate_line(message, width)));
+        }
+        let todos = plan_todo_summary(step);
+        if !todos.is_empty() {
+            lines.push(format!("todos  {todos}"));
+        }
+        if let Some(error) = step.error.as_deref() {
+            lines.push(color(
+                &format!("error  {}", truncate_line(error, width)),
+                "1;31",
+            ));
+        }
+    }
+    lines.push(format!(
+        "counts queued {}  running {}  done {}  failed {}",
+        counts.queued + counts.starting,
+        counts.running,
+        counts.done,
+        counts.failed
+    ));
+    lines.push(String::new());
+    lines.push(color("Phases", "1;37"));
+    let rendered_output = render_plan_output_rows(dashboard, width);
+    let output_rows_reserved = rendered_output.len().min(8) + 2;
+    let phase_rows_available = visible_rows
+        .saturating_sub(lines.len())
+        .saturating_sub(output_rows_reserved)
+        .max(3);
+    let selected_index = dashboard
+        .run
+        .steps
+        .iter()
+        .position(|step| step.step == run.selected_step)
+        .unwrap_or(0);
+    let start = scroll_start(selected_index, phase_rows_available);
+    for step in dashboard
+        .run
+        .steps
+        .iter()
+        .skip(start)
+        .take(phase_rows_available)
+    {
+        lines.push(format_plan_step_row(
+            step,
+            run.selected_step,
+            run.total_steps,
+            width,
+        ));
+    }
+    lines.push(String::new());
+    lines.push(color("Output", "1;37"));
+    if rendered_output.is_empty() {
+        lines.push(color("No output yet", "90"));
+    } else {
+        let output_rows_available = visible_rows.saturating_sub(lines.len()).max(1);
+        let cursor = dashboard
+            .output_state
+            .cursor
+            .min(rendered_output.len().saturating_sub(1));
+        let start = if dashboard.output_state.follow {
+            rendered_output.len().saturating_sub(output_rows_available)
+        } else {
+            scroll_start(cursor, output_rows_available)
+        };
+        for (index, row) in rendered_output
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(output_rows_available)
+        {
+            lines.push(format_plan_rendered_output_row(row, index == cursor, width));
+        }
+    }
+    lines.truncate(visible_rows);
+    lines
+}
+
+fn format_plan_step_row(
+    step: &PlanStepRun,
+    selected_step: usize,
+    total_steps: usize,
+    width: usize,
+) -> String {
+    let marker = if step.step == selected_step {
+        color("▶", "1;36")
+    } else {
+        " ".to_string()
+    };
+    let label = format!(
+        "{} {}/{} {}",
+        marker,
+        step.step,
+        total_steps,
+        plan_step_status_label(step.status)
+    );
+    let detail = step
+        .active_tool
+        .as_deref()
+        .or(step.latest_message.as_deref())
+        .or(step.error.as_deref())
+        .unwrap_or("");
+    let text = format!(
+        "{} {} {}",
+        styled_cell(&label, 24, plan_step_status_color(step.status)),
+        styled_cell(&elapsed_step_label(step), 8, "90"),
+        truncate_line(detail, width.saturating_sub(34))
+    );
+    ansi_cell(&text, width)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RenderedPlanOutputRow {
+    line_number: u64,
+    kind: PlanOutputKind,
+    text: String,
+    collapsed: bool,
+    block_key: Option<String>,
+}
+
+fn render_plan_output_rows(dashboard: &PlanDashboard, width: usize) -> Vec<RenderedPlanOutputRow> {
+    let mut rows = Vec::new();
+    let mut index = 0;
+    while index < dashboard.output_lines.len() {
+        let line = &dashboard.output_lines[index];
+        if let Some(block_key) = collapsible_block_key(line) {
+            let block_len = block_len_at(&dashboard.output_lines, index, &block_key);
+            let collapsed = !dashboard.output_state.expanded_blocks.contains(&block_key);
+            if collapsed {
+                rows.push(RenderedPlanOutputRow {
+                    line_number: line.line_number,
+                    kind: line.kind,
+                    text: collapsed_block_summary(
+                        &dashboard.output_lines[index..index + block_len],
+                        width,
+                    ),
+                    collapsed: true,
+                    block_key: Some(block_key),
+                });
+                index += block_len;
+                continue;
+            }
+        }
+
+        for text in output_display_lines(line, width) {
+            rows.push(RenderedPlanOutputRow {
+                line_number: line.line_number,
+                kind: line.kind,
+                text,
+                collapsed: false,
+                block_key: collapsible_block_key(line),
+            });
+        }
+        index += 1;
+    }
+    rows
+}
+
+fn block_len_at(lines: &[PlanOutputLine], index: usize, block_key: &str) -> usize {
+    let mut len = 0;
+    for line in &lines[index..] {
+        if collapsible_block_key(line).as_deref() != Some(block_key) {
+            break;
+        }
+        len += 1;
+    }
+    len.max(1)
+}
+
+fn collapsible_block_key(line: &PlanOutputLine) -> Option<String> {
+    match line.kind {
+        PlanOutputKind::Tool | PlanOutputKind::ToolOutput => line
+            .block_id
+            .as_ref()
+            .map(|block_id| format!("tool:{block_id}"))
+            .or_else(|| Some(format!("tool-line:{}", line.line_number))),
+        PlanOutputKind::Diff => line
+            .block_id
+            .as_ref()
+            .map(|block_id| format!("diff:{block_id}"))
+            .or_else(|| Some(format!("diff-line:{}", line.line_number))),
+        PlanOutputKind::RawJson => Some(format!("raw:{}", line.line_number)),
+        _ => None,
+    }
+}
+
+fn collapsed_block_summary(lines: &[PlanOutputLine], width: usize) -> String {
+    let Some(first) = lines.first() else {
+        return String::new();
+    };
+    let line_count = lines
+        .iter()
+        .map(|line| line.text.lines().count().max(1))
+        .sum::<usize>();
+    let text = first.text.lines().next().unwrap_or("").replace('\n', " ");
+    truncate_line(
+        &format!("[+] L{} {} lines  {}", first.line_number, line_count, text),
+        width,
+    )
+}
+
+fn output_display_lines(line: &PlanOutputLine, width: usize) -> Vec<String> {
+    let rows = line.text.lines().collect::<Vec<_>>();
+    if rows.is_empty() {
+        return vec![String::new()];
+    }
+    rows.into_iter()
+        .map(|text| truncate_line(text, width))
+        .collect()
+}
+
+fn format_plan_rendered_output_row(
+    row: &RenderedPlanOutputRow,
+    selected: bool,
+    width: usize,
+) -> String {
+    let marker = if selected { ">" } else { " " };
+    let fold = if row.block_key.is_some() {
+        if row.collapsed { "[+]" } else { "[-]" }
+    } else {
+        "   "
+    };
+    let kind = plan_output_kind_label(row.kind);
+    let text = truncate_line(&row.text, width.saturating_sub(22));
+    let text = color_diff_output(row.kind, &text);
+    ansi_cell(
+        &format!(
+            "{} {} L{:<4} {} {}",
+            color(marker, if selected { "1;36" } else { "90" }),
+            fold,
+            row.line_number,
+            styled_cell(kind, 10, plan_output_kind_color(row.kind)),
+            text
+        ),
+        width,
+    )
+}
+
+fn color_diff_output(kind: PlanOutputKind, text: &str) -> String {
+    if kind != PlanOutputKind::Diff {
+        return text.to_string();
+    }
+    if text.starts_with("+++") || text.starts_with("---") || text.starts_with("@@") {
+        color(text, "1;36")
+    } else if text.starts_with('+') {
+        color(text, "32")
+    } else if text.starts_with('-') {
+        color(text, "31")
+    } else {
+        text.to_string()
+    }
+}
+
+fn plan_mode_label(mode: PlanRunMode) -> &'static str {
+    match mode {
+        PlanRunMode::Sequential => "sequential",
+        PlanRunMode::Parallel => "parallel",
+    }
+}
+
+fn plan_run_status_label(status: PlanRunStatus) -> &'static str {
+    match status {
+        PlanRunStatus::Draft => "draft",
+        PlanRunStatus::Queued => "queued",
+        PlanRunStatus::Running => "running",
+        PlanRunStatus::Done => "done",
+        PlanRunStatus::Failed => "failed",
+        PlanRunStatus::Aborted => "aborted",
+    }
+}
+
+fn plan_step_status_label(status: PlanStepStatus) -> &'static str {
+    match status {
+        PlanStepStatus::Queued => "queued",
+        PlanStepStatus::Starting => "starting",
+        PlanStepStatus::Running => "running",
+        PlanStepStatus::Done => "done",
+        PlanStepStatus::Failed => "failed",
+        PlanStepStatus::Aborted => "aborted",
+        PlanStepStatus::Skipped => "skipped",
+    }
+}
+
+fn plan_step_status_color(status: PlanStepStatus) -> &'static str {
+    match status {
+        PlanStepStatus::Done => "32",
+        PlanStepStatus::Failed | PlanStepStatus::Aborted => "1;31",
+        PlanStepStatus::Running | PlanStepStatus::Starting => "1;33",
+        PlanStepStatus::Queued | PlanStepStatus::Skipped => "37",
+    }
+}
+
+fn plan_output_kind_label(kind: PlanOutputKind) -> &'static str {
+    match kind {
+        PlanOutputKind::Assistant => "assistant",
+        PlanOutputKind::Tool => "tool",
+        PlanOutputKind::ToolOutput => "tool out",
+        PlanOutputKind::Diff => "diff",
+        PlanOutputKind::Todo => "todo",
+        PlanOutputKind::Status => "status",
+        PlanOutputKind::RawJson => "json",
+        PlanOutputKind::System => "system",
+        PlanOutputKind::Error => "error",
+    }
+}
+
+fn plan_output_kind_color(kind: PlanOutputKind) -> &'static str {
+    match kind {
+        PlanOutputKind::Assistant => "37",
+        PlanOutputKind::Tool | PlanOutputKind::ToolOutput => "33",
+        PlanOutputKind::Diff => "36",
+        PlanOutputKind::Todo => "35",
+        PlanOutputKind::Error => "1;31",
+        PlanOutputKind::Status | PlanOutputKind::RawJson | PlanOutputKind::System => "90",
+    }
+}
+
+fn plan_todo_summary(step: &PlanStepRun) -> String {
+    let mut pending = 0;
+    let mut active = 0;
+    let mut done = 0;
+    for todo in &step.todos {
+        match todo.status.as_str() {
+            "completed" | "complete" | "done" => done += 1,
+            "in_progress" | "in-progress" | "active" | "running" => active += 1,
+            _ => pending += 1,
+        }
+    }
+    let mut parts = Vec::new();
+    if pending > 0 {
+        parts.push(format!("pending {pending}"));
+    }
+    if active > 0 {
+        parts.push(format!("active {active}"));
+    }
+    if done > 0 {
+        parts.push(format!("done {done}"));
+    }
+    parts.join("  ")
+}
+
+fn elapsed_step_label(step: &PlanStepRun) -> String {
+    match (step.started_unix_ms, step.finished_unix_ms) {
+        (Some(start), Some(end)) => elapsed_label(start, end),
+        (Some(start), None) => elapsed_label(start, now_unix_ms()),
+        _ => String::new(),
+    }
+}
+
+fn elapsed_label(start_unix_ms: u64, end_unix_ms: u64) -> String {
+    let total_seconds = end_unix_ms.saturating_sub(start_unix_ms) / 1000;
+    let minutes = total_seconds / 60;
+    let seconds = total_seconds % 60;
+    format!("{minutes:02}:{seconds:02}")
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn short_id(id: &str) -> &str {
@@ -1804,20 +2232,25 @@ fn review_decision_for_display(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
     use crate::agent::AgentState;
     use crate::config::{Checks, Config, EscapeKey, MergeMethod};
     use crate::github::{PrCache, PrComment, PrDetails, PrReviewComment, PrSummary};
     use crate::opencode::{OpencodeState, OpencodeStatus, OpencodeTodo};
+    use crate::plan_run::{
+        PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRun, PlanRunMode, PlanRunStatus,
+        PlanStepRun, PlanStepStatus, PlanTodo,
+    };
     use crate::session::Session;
     use crate::tui::PanelFocus;
 
     use super::{
-        FrameModel, RepoMainView, RepoRow, StatusRow, WorktreeKind, WorktreeRow,
-        configured_column_label, format_column_value, format_repo_row, git_status_indicator,
-        render_model_frame, visible_len, worktree_status_icons,
+        FrameModel, PlanDashboard, RepoMainView, RepoRow, StatusRow, WorktreeKind, WorktreeRow,
+        configured_column_label, format_column_value, format_plan_rendered_output_row,
+        format_repo_row, git_status_indicator, render_model_frame, render_plan_output_rows,
+        visible_len, worktree_status_icons,
     };
 
     #[test]
@@ -1923,6 +2356,7 @@ mod tests {
             opencode_port_base: 41_000,
             opencode_port_span: 1_000,
             opencode_shutdown_owned_servers: false,
+            opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             checks: Checks::default(),
@@ -2093,6 +2527,235 @@ mod tests {
     }
 
     #[test]
+    fn render_model_frame_shows_plan_dashboard() {
+        let config = test_config(Some("main"));
+        let sessions = vec![test_session(
+            "feature",
+            "clean",
+            AgentState::Idle,
+            PrCache::default(),
+        )];
+        let mut model = test_model(&config, &sessions, Some(0), PanelFocus::Status, None);
+        let run = PlanRun {
+            id: "plan-test".to_string(),
+            repo_root: "/repo".to_string(),
+            scope_path: PathBuf::from("/repo"),
+            plan_path: PathBuf::from("/repo/plan.md"),
+            plan_display: "plan.md".to_string(),
+            step_name: "phase".to_string(),
+            start_step: 1,
+            total_steps: 3,
+            mode: PlanRunMode::Sequential,
+            status: PlanRunStatus::Running,
+            selected_step: 2,
+            created_unix_ms: 1_000,
+            updated_unix_ms: 61_000,
+            archived_unix_ms: None,
+        };
+        let mut step = PlanStepRun::queued("plan-test", 2, "Implement plan.md phase 2".to_string());
+        step.status = PlanStepStatus::Running;
+        step.latest_message = Some("adding dashboard rows".to_string());
+        step.active_tool = Some("tool bash running: cargo test".to_string());
+        step.todos = vec![PlanTodo::new("render status", "in_progress")];
+        model.plan_dashboard = Some(PlanDashboard {
+            run: PersistedPlanRun {
+                run,
+                steps: vec![
+                    PlanStepRun::queued("plan-test", 1, "Implement plan.md phase 1".to_string()),
+                    step,
+                    PlanStepRun::queued("plan-test", 3, "Implement plan.md phase 3".to_string()),
+                ],
+            },
+            output_lines: vec![PlanOutputLine {
+                run_id: "plan-test".to_string(),
+                step: 2,
+                line_number: 1,
+                time_unix_ms: 2_000,
+                kind: PlanOutputKind::Assistant,
+                text: "dashboard output preview".to_string(),
+                block_id: None,
+            }],
+            output_state: super::PlanOutputViewerState {
+                cursor: 0,
+                follow: true,
+                expanded_blocks: BTreeSet::new(),
+            },
+        });
+
+        let frame = crate::util::strip_ansi(&render_model_frame(&model, 120, 28));
+
+        assert!(frame.contains("Plan Run"));
+        assert!(frame.contains("plan.md"));
+        assert!(frame.contains("phase  2/3 running"));
+        assert!(frame.contains("tool bash running: cargo test"));
+        assert!(frame.contains("adding dashboard rows"));
+        assert!(frame.contains("todos  active 1"));
+        assert!(frame.contains("dashboard output preview"));
+    }
+
+    #[test]
+    fn plan_output_viewer_collapses_tool_blocks_by_default() {
+        let dashboard = test_plan_dashboard_with_output(
+            vec![
+                PlanOutputLine {
+                    run_id: "plan-test".to_string(),
+                    step: 1,
+                    line_number: 1,
+                    time_unix_ms: 1_000,
+                    kind: PlanOutputKind::Tool,
+                    text: "tool bash running: cargo test".to_string(),
+                    block_id: Some("call-1".to_string()),
+                },
+                PlanOutputLine {
+                    run_id: "plan-test".to_string(),
+                    step: 1,
+                    line_number: 2,
+                    time_unix_ms: 1_001,
+                    kind: PlanOutputKind::ToolOutput,
+                    text: "stdout line that should be hidden while collapsed".to_string(),
+                    block_id: Some("call-1".to_string()),
+                },
+            ],
+            super::PlanOutputViewerState {
+                cursor: 0,
+                follow: false,
+                expanded_blocks: BTreeSet::new(),
+            },
+        );
+
+        let lines = render_plan_output_rows(&dashboard, 120);
+
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].collapsed);
+        assert!(lines[0].text.contains("[+] L1 2 lines"));
+        assert!(!lines[0].text.contains("stdout line"));
+    }
+
+    #[test]
+    fn plan_output_viewer_expands_and_highlights_diff_lines() {
+        let mut expanded_blocks = BTreeSet::new();
+        expanded_blocks.insert("diff-line:3".to_string());
+        let dashboard = test_plan_dashboard_with_output(
+            vec![PlanOutputLine {
+                run_id: "plan-test".to_string(),
+                step: 1,
+                line_number: 3,
+                time_unix_ms: 1_000,
+                kind: PlanOutputKind::Diff,
+                text: "@@ -1 +1 @@\n- old\n+ new".to_string(),
+                block_id: None,
+            }],
+            super::PlanOutputViewerState {
+                cursor: 0,
+                follow: false,
+                expanded_blocks,
+            },
+        );
+
+        let rows = render_plan_output_rows(&dashboard, 120);
+        let rendered = rows
+            .iter()
+            .map(|row| format_plan_rendered_output_row(row, false, 120))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let plain = crate::util::strip_ansi(&rendered);
+
+        assert_eq!(rows.len(), 3);
+        assert!(plain.contains("@@ -1 +1 @@"));
+        assert!(plain.contains("- old"));
+        assert!(plain.contains("+ new"));
+        assert!(rendered.contains("\x1b[32m+ new\x1b[0m"));
+        assert!(rendered.contains("\x1b[31m- old\x1b[0m"));
+    }
+
+    #[test]
+    fn plan_output_viewer_cursor_and_follow_select_latest_row() {
+        let dashboard = test_plan_dashboard_with_output(
+            vec![
+                PlanOutputLine {
+                    run_id: "plan-test".to_string(),
+                    step: 1,
+                    line_number: 1,
+                    time_unix_ms: 1_000,
+                    kind: PlanOutputKind::Assistant,
+                    text: "first".to_string(),
+                    block_id: None,
+                },
+                PlanOutputLine {
+                    run_id: "plan-test".to_string(),
+                    step: 1,
+                    line_number: 2,
+                    time_unix_ms: 1_001,
+                    kind: PlanOutputKind::Assistant,
+                    text: "latest".to_string(),
+                    block_id: None,
+                },
+            ],
+            super::PlanOutputViewerState {
+                cursor: 1,
+                follow: true,
+                expanded_blocks: BTreeSet::new(),
+            },
+        );
+
+        let frame = crate::util::strip_ansi(&render_model_frame(
+            &test_model_with_plan_dashboard(dashboard),
+            120,
+            24,
+        ));
+
+        assert!(frame.contains(">     L2"));
+        assert!(frame.contains("latest"));
+    }
+
+    fn test_model_with_plan_dashboard(dashboard: PlanDashboard) -> FrameModel<'static> {
+        let config = Box::leak(Box::new(test_config(Some("main"))));
+        let sessions = Box::leak(Box::new(vec![test_session(
+            "feature",
+            "clean",
+            AgentState::Idle,
+            PrCache::default(),
+        )]));
+        let mut model = test_model(config, sessions, Some(0), PanelFocus::Status, None);
+        model.plan_dashboard = Some(dashboard);
+        model
+    }
+
+    fn test_plan_dashboard_with_output(
+        output_lines: Vec<PlanOutputLine>,
+        output_state: super::PlanOutputViewerState,
+    ) -> PlanDashboard {
+        let run = PlanRun {
+            id: "plan-test".to_string(),
+            repo_root: "/repo".to_string(),
+            scope_path: PathBuf::from("/repo"),
+            plan_path: PathBuf::from("/repo/plan.md"),
+            plan_display: "plan.md".to_string(),
+            step_name: "phase".to_string(),
+            start_step: 1,
+            total_steps: 1,
+            mode: PlanRunMode::Sequential,
+            status: PlanRunStatus::Running,
+            selected_step: 1,
+            created_unix_ms: 1_000,
+            updated_unix_ms: 2_000,
+            archived_unix_ms: None,
+        };
+        PlanDashboard {
+            run: PersistedPlanRun {
+                run,
+                steps: vec![PlanStepRun::queued(
+                    "plan-test",
+                    1,
+                    "Implement plan.md phase 1".to_string(),
+                )],
+            },
+            output_lines,
+            output_state,
+        }
+    }
+
+    #[test]
     fn render_model_frame_fits_common_terminal_viewports() {
         let config = test_config(Some("main"));
         let sessions = vec![
@@ -2209,6 +2872,7 @@ mod tests {
             repo_filter: "",
             worktree_filter: "",
             leader_hint: None,
+            plan_dashboard: None,
         };
 
         let frame = render_model_frame(&model, 100, 24);
@@ -2304,6 +2968,7 @@ mod tests {
             opencode_port_base: 41_000,
             opencode_port_span: 1_000,
             opencode_shutdown_owned_servers: false,
+            opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             checks: Checks::default(),
@@ -2382,6 +3047,7 @@ mod tests {
             repo_filter: "",
             worktree_filter: "",
             leader_hint: None,
+            plan_dashboard: None,
         }
     }
 

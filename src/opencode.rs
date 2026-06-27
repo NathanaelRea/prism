@@ -408,9 +408,51 @@ pub fn poll_status(runtime: &OpencodeRuntime) -> Result<OpencodeStatus, String> 
     })
 }
 
+pub fn poll_session_status(server_url: &str, session_id: &str) -> Result<OpencodeStatus, String> {
+    if !check_health(server_url) {
+        return Ok(OpencodeStatus::offline(
+            Some(server_url.to_string()),
+            Some(session_id.to_string()),
+        ));
+    }
+
+    let session = get_session(server_url, session_id)?.unwrap_or(OpencodeSession {
+        id: session_id.to_string(),
+        directory: None,
+        title: None,
+        time_updated: None,
+    });
+    let state = fetch_session_state(server_url, session_id).unwrap_or(OpencodeState::Idle);
+    let messages = fetch_message_summary(server_url, session_id).unwrap_or_default();
+    let todos = fetch_todos(server_url, session_id).unwrap_or_default();
+
+    Ok(OpencodeStatus {
+        server_url: Some(server_url.to_string()),
+        session_id: Some(session_id.to_string()),
+        title: session.title,
+        state,
+        latest_message: messages.latest_message,
+        active_tool: messages.active_tool,
+        todos,
+        last_updated_unix_ms: Some(unix_ms()),
+    })
+}
+
 pub fn listen_events(
     server_url: &str,
     mut on_event: impl FnMut(OpencodeEvent) -> Result<(), String>,
+) -> Result<(), String> {
+    listen_event_payloads(server_url, |payload| {
+        if let Some(event) = parse_event_payload(&payload) {
+            on_event(event)?;
+        }
+        Ok(())
+    })
+}
+
+pub fn listen_event_payloads(
+    server_url: &str,
+    mut on_payload: impl FnMut(String) -> Result<(), String>,
 ) -> Result<(), String> {
     let (host, port) = parse_localhost_url(server_url)?;
     let mut stream = TcpStream::connect_timeout(
@@ -471,18 +513,18 @@ pub fn listen_events(
     }
 
     if chunked {
-        read_sse_events(
+        read_sse_payloads(
             BufReader::new(ChunkedBodyReader::new(reader)),
-            &mut on_event,
+            &mut on_payload,
         )
     } else {
-        read_sse_events(reader, &mut on_event)
+        read_sse_payloads(reader, &mut on_payload)
     }
 }
 
-fn read_sse_events(
+fn read_sse_payloads(
     mut reader: impl BufRead,
-    on_event: &mut impl FnMut(OpencodeEvent) -> Result<(), String>,
+    on_payload: &mut impl FnMut(String) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut line = String::new();
     let mut data = String::new();
@@ -497,9 +539,7 @@ fn read_sse_events(
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             if !data.trim().is_empty() {
-                if let Some(event) = parse_event_payload(data.trim()) {
-                    on_event(event)?;
-                }
+                on_payload(data.trim().to_string())?;
                 data.clear();
             }
             continue;
