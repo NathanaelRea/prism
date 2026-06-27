@@ -110,6 +110,7 @@ pub(crate) enum PrPollResult {
     Summary {
         repo_index: usize,
         summaries: Result<Vec<PrSummary>, String>,
+        poll_started_at: Instant,
     },
     Details {
         key: PrPollKey,
@@ -517,8 +518,10 @@ impl Tui {
                     Key::PullDefault => {
                         self.clear_leader_hint();
                         pending_g = false;
-                        if self.focused_panel != PanelFocus::Repos {
-                            self.show_message("focus repos to pull the default branch")?;
+                        if self.focused_panel == PanelFocus::Status {
+                            self.show_message(
+                                "focus repos or worktrees to pull the default branch",
+                            )?;
                         } else if let Err(error) = self.pull_default_branch() {
                             self.show_error("pull failed", &error)?;
                         }
@@ -701,8 +704,8 @@ impl Tui {
             "Space g P    push branch, create PR if needed",
             "Space g M    merge selected PR",
             "Space g f    stage review-fix prompt",
-            "Space g p    repos: pull default branch",
-            "p            repos: pull default branch",
+            "Space g p    repos/worktrees: pull default branch",
+            "p            repos/worktrees: pull default branch",
             "P            repos/worktrees: run plan mode",
             "A            add repository",
             "R            edit repositories/order/keys/remove",
@@ -1682,9 +1685,9 @@ impl Tui {
                 Some("g: lazygit after focusing repos/worktrees")
             }
             (Some(LeaderHint::Git), PanelFocus::Repos) => Some("p: pull default branch"),
-            (Some(LeaderHint::Git), PanelFocus::Worktrees) => {
-                Some("g: lazygit  o: open PR  P: push/create PR  M: merge  f: review fix")
-            }
+            (Some(LeaderHint::Git), PanelFocus::Worktrees) => Some(
+                "g: lazygit  p: pull default  o: open PR  P: push/create PR  M: merge  f: review fix",
+            ),
             (None, _) => None,
         }
     }

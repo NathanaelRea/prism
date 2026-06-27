@@ -1,5 +1,5 @@
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,8 @@ use crate::util::timestamp_label;
 
 pub const PR_SUMMARY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 pub const PR_DETAIL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const PR_MERGE_VERIFY_ATTEMPTS: usize = 6;
+const PR_MERGE_VERIFY_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Debug, Default)]
 pub struct PrCache {
@@ -140,7 +142,7 @@ struct GithubPullRequest {
     #[serde(default)]
     state: String,
     #[serde(default, rename = "reviewDecision")]
-    review_decision: String,
+    review_decision: Option<String>,
     #[serde(default, rename = "reviewRequests")]
     review_requests: GithubReviewRequests,
     #[serde(default, rename = "headRefName")]
@@ -446,6 +448,54 @@ pub fn refresh_pr_cache(
     }
 }
 
+pub fn wait_for_pr_merged(
+    path: &std::path::Path,
+    pr_number: u64,
+    config: &Config,
+) -> Result<bool, String> {
+    let mut last_error = None;
+    for attempt in 0..PR_MERGE_VERIFY_ATTEMPTS {
+        match fetch_pr_merged_status(path, pr_number, config) {
+            Ok(true) => return Ok(true),
+            Ok(false) => last_error = None,
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < PR_MERGE_VERIFY_ATTEMPTS {
+            std::thread::sleep(PR_MERGE_VERIFY_INTERVAL);
+        }
+    }
+    match last_error {
+        Some(error) => Err(error),
+        None => Ok(false),
+    }
+}
+
+fn fetch_pr_merged_status(
+    path: &std::path::Path,
+    pr_number: u64,
+    config: &Config,
+) -> Result<bool, String> {
+    let output = run_output_allow_failure(
+        Command::new(config.tool("gh"))
+            .arg("pr")
+            .arg("view")
+            .arg(pr_number.to_string())
+            .arg("--json")
+            .arg("state,mergedAt")
+            .current_dir(path),
+    )?;
+    if !output.status.success() {
+        let stderr = output.stderr.trim().to_string();
+        let message = if stderr.is_empty() {
+            format!("exited with {}", output.status)
+        } else {
+            stderr
+        };
+        return Err(format!("gh pr view: {message}"));
+    }
+    Ok(parse_merged_status(&output.stdout))
+}
+
 pub fn refresh_pr_details_cache(
     branch: &str,
     cache: &mut PrCache,
@@ -496,6 +546,7 @@ pub(crate) fn refresh_pr_summary_index_for_sessions(
     sessions: &mut [Session],
     repo_index: usize,
     summaries: Vec<PrSummary>,
+    poll_started_at: Instant,
 ) {
     let Some(managed) = repos.get(repo_index) else {
         return;
@@ -506,6 +557,13 @@ pub(crate) fn refresh_pr_summary_index_for_sessions(
         .iter_mut()
         .filter(|session| session.repo_index == repo_index)
     {
+        if session
+            .pr
+            .last_polled
+            .is_some_and(|last_polled| last_polled > poll_started_at)
+        {
+            continue;
+        }
         session.pr.last_polled = Some(now);
         let summary = if pr_cache_excluded_branch(managed.config, &session.branch) {
             None
@@ -726,11 +784,12 @@ fn pr_summary_from_node(node: &GithubPullRequest) -> Option<PrSummary> {
         body: node.body.clone(),
         url: node.url.clone(),
         state: node.state.clone(),
-        review_decision: if node.review_decision.trim().is_empty() {
-            "UNKNOWN".to_string()
-        } else {
-            node.review_decision.clone()
-        },
+        review_decision: node
+            .review_decision
+            .as_deref()
+            .filter(|decision| !decision.trim().is_empty())
+            .unwrap_or("UNKNOWN")
+            .to_string(),
         requested_reviewers: requested_reviewers_from_requests(&node.review_requests),
         head_ref: node.head_ref_name.clone(),
         base_ref: node.base_ref_name.clone(),
@@ -1087,7 +1146,6 @@ fn collect_failing_checks(rollup: &GithubStatusCheckRollup) -> Vec<String> {
         .collect()
 }
 
-#[cfg(test)]
 fn parse_merged_status(raw: &str) -> bool {
     let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
         return false;
@@ -1714,6 +1772,7 @@ mod tests {
             &mut sessions,
             0,
             vec![feature_summary.clone()],
+            Instant::now(),
         );
 
         assert!(sessions[0].pr.summary.is_none());
@@ -1734,6 +1793,46 @@ mod tests {
     }
 
     #[test]
+    fn stale_pr_summary_index_refresh_does_not_clear_newer_direct_refresh() {
+        let temp = unique_temp_dir("prism-stale-pr-summary-index-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut config = test_config();
+        config.default_base = Some("main".to_string());
+        let poll_started_at = Instant::now();
+        let summary = test_summary("feature", "abc123", 2);
+        let cache = PrCache {
+            summary: Some(summary.clone()),
+            last_polled: Some(poll_started_at + std::time::Duration::from_millis(1)),
+            last_refreshed: Some("created".to_string()),
+            signature: Some(summary.signature()),
+            ..PrCache::default()
+        };
+        save_pr_cache(&repo, "feature", &cache).unwrap();
+        let mut sessions = vec![test_session("feature", cache)];
+
+        refresh_pr_summary_index_for_sessions(
+            &[PrCacheRepository {
+                repo: &repo,
+                config: &config,
+            }],
+            &mut sessions,
+            0,
+            Vec::new(),
+            poll_started_at,
+        );
+
+        assert_eq!(sessions[0].pr.summary.as_ref(), Some(&summary));
+        assert_eq!(
+            load_pr_cache(&repo, "feature").summary.as_ref(),
+            Some(&summary)
+        );
+
+        let _ = fs::remove_dir_all(repo.prism_dir());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn parses_graphql_pr_summary_index() {
         let raw = r#"{
           "data": {
@@ -1746,7 +1845,7 @@ mod tests {
                     "body": "summary",
                     "url": "https://github.com/example/repo/pull/9",
                     "state": "OPEN",
-                    "reviewDecision": "REVIEW_REQUIRED",
+                    "reviewDecision": null,
                     "reviewRequests": {
                       "nodes": [
                         {"requestedReviewer": {"__typename": "User", "login": "alice"}},
@@ -1792,6 +1891,7 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].number, 9);
         assert_eq!(summaries[0].head_ref, "feature");
+        assert_eq!(summaries[0].review_decision, "UNKNOWN");
         assert_eq!(summaries[0].requested_reviewers, vec!["alice", "backend"]);
         assert_eq!(summaries[0].comment_count, 5);
         assert_eq!(summaries[0].check_status, "passed");
@@ -1923,7 +2023,7 @@ cat <<'JSON'
   "title": "Test PR",
   "url": "https://github.com/example/repo/pull/7",
   "state": "CLOSED",
-  "reviewDecision": "",
+  "reviewDecision": null,
   "headRefName": "feature",
   "baseRefName": "main",
   "headRefOid": "abc123",
@@ -1951,6 +2051,7 @@ JSON
             .0;
 
         assert_eq!(summary.number, 7);
+        assert_eq!(summary.review_decision, "UNKNOWN");
         assert!(summary.merged);
 
         let _ = fs::remove_dir_all(temp);

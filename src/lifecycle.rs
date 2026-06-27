@@ -108,10 +108,8 @@ pub(crate) fn create_pull_request(
 }
 
 pub(crate) fn merge_pull_request(
-    repo: &Repository,
     config: &Config,
     path: &Path,
-    branch: &str,
     pr_number: u64,
 ) -> Result<(), String> {
     run_status(
@@ -119,7 +117,6 @@ pub(crate) fn merge_pull_request(
             .args(merge_pr_args(&pr_number.to_string(), config.merge_method))
             .current_dir(path),
     )?;
-    delete_branch_if_attached(repo, config, branch)?;
     Ok(())
 }
 

@@ -326,6 +326,7 @@ fn footer_actions(model: &FrameModel<'_>) -> String {
             if row.kind != WorktreeKind::DefaultBranch {
                 actions.push("D delete");
             }
+            actions.push("p pull");
             actions.push("c create");
             actions.push("/ search");
             actions.join("  ")

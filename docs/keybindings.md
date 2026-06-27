@@ -16,7 +16,7 @@ Prism uses a lazygit-style panel model.
 - `Space g M` merges the selected pull request.
 - `Space g f` stages a review-fix prompt.
 - `P` opens plan mode in tmux from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through `opencode run`.
-- `p` or `Space g p` pulls the default branch from the Repos panel.
+- `p` or `Space g p` pulls the selected repository's default branch from the Repos or Worktrees panel.
 - `Space 1` through `Space 9` jump to configured repositories.
 - `A` adds a repository by path from the Repos panel.
 - `R` edits repository order, key bindings, and tracked repositories.
@@ -29,4 +29,4 @@ Prism uses a lazygit-style panel model.
 - `r` refreshes cached repository, worktree, PR, and agent state.
 - `q` or `Ctrl-C` quits.
 
-Repository actions are only active from the Repos panel. Worktree actions are only active from the Worktrees panel.
+Most repository actions are only active from the Repos panel. Pulling the default branch is active from the Repos and Worktrees panels. Worktree actions are only active from the Worktrees panel.

@@ -10,7 +10,7 @@ use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, sel
 use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCache, PrCacheRepository, apply_pr_details_poll_result,
     fetch_pr_summary_index, pr_details_due, refresh_pr_cache, refresh_pr_details_cache,
-    refresh_pr_summary_index_for_sessions,
+    refresh_pr_summary_index_for_sessions, wait_for_pr_merged,
 };
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::lifecycle::{
@@ -612,8 +612,9 @@ impl Tui {
                 let path = managed.repo.root.clone();
                 let config = managed.config.clone();
                 let tx = self.pr_poll_tx.clone();
+                let poll_started_at = std::time::Instant::now();
                 if let Some(managed) = self.repos.get_mut(repo_index) {
-                    managed.pr_summary_last_polled = Some(std::time::Instant::now());
+                    managed.pr_summary_last_polled = Some(poll_started_at);
                     managed.pr_summary_poll_in_flight = true;
                 }
                 std::thread::spawn(move || {
@@ -621,6 +622,7 @@ impl Tui {
                     let _ = tx.send(PrPollResult::Summary {
                         repo_index,
                         summaries,
+                        poll_started_at,
                     });
                 });
             }
@@ -669,6 +671,7 @@ impl Tui {
                 PrPollResult::Summary {
                     repo_index,
                     summaries,
+                    poll_started_at,
                 } => {
                     if let Some(repo) = self.repos.get_mut(repo_index) {
                         repo.pr_summary_poll_in_flight = false;
@@ -698,6 +701,7 @@ impl Tui {
                                 &mut self.sessions,
                                 repo_index,
                                 summaries,
+                                poll_started_at,
                             );
                         }
                         Err(error) => {
@@ -1458,15 +1462,44 @@ impl Tui {
             "Merge Pull Request",
             &format!("Merging PR #{}", summary.number),
         )?;
-        merge_pull_request(
-            &context.repo,
-            &context.config,
-            &path,
-            &branch,
-            summary.number,
+        merge_pull_request(&context.config, &path, summary.number)?;
+        self.show_loading_dialog(
+            "Merge Pull Request",
+            &format!("Verifying PR #{} is merged", summary.number),
         )?;
-        self.refresh_sessions()?;
-        self.show_message("merge complete")?;
+        let merged = match wait_for_pr_merged(&path, summary.number, &context.config) {
+            Ok(merged) => merged,
+            Err(error) => {
+                self.refresh_sessions()?;
+                self.show_message(&format!(
+                    "merge complete; could not verify PR merged: {error}"
+                ))?;
+                return Ok(());
+            }
+        };
+        if !merged {
+            self.refresh_sessions()?;
+            self.show_message("merge complete; GitHub has not marked the PR merged yet")?;
+            return Ok(());
+        }
+
+        if let Some(summary) = self.sessions[selected].pr.summary.as_mut() {
+            summary.merged = true;
+            summary.state = "MERGED".to_string();
+        }
+        let path_display = self.sessions[selected].path_display.clone();
+        let warnings = delete_warnings(&self.sessions[selected]);
+        if self.confirm_delete_dialog(&branch, &path_display, &warnings)? {
+            delete_worktree_session(&context.repo, &context.config, &path, &branch)?;
+            if self.selected_worktree_by_repo.get(&context.repo.root) == Some(&path) {
+                self.selected_worktree_by_repo.remove(&context.repo.root);
+            }
+            self.refresh_sessions()?;
+            self.show_message("merge complete; deleted local session data, worktree, and branch")?;
+        } else {
+            self.refresh_sessions()?;
+            self.show_message("merge complete")?;
+        }
         Ok(())
     }
 

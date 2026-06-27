@@ -66,7 +66,7 @@ Common keys:
 - `Space g M` merges the selected pull request.
 - `Space g f` copies a review-fix prompt.
 - `P` opens plan mode in tmux from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through `opencode run`.
-- `p` or `Space g p` pulls the default branch from the repos panel.
+- `p` or `Space g p` pulls the selected repository's default branch from the repos or worktrees panel.
 - `Space 1`-`Space 9` switches repositories using configured repo keys.
 - `A` adds a repository by path from the repos panel.
 - `R` edits repository order, key bindings, and tracked repositories.
