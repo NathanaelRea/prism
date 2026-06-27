@@ -9,8 +9,9 @@ use crate::config::Config;
 use crate::json::json_string_field;
 use crate::observability;
 use crate::plan_run::{
-    PlanExecutorConfig, PlanLaunch, PlanRunMode, execute_plan_sequential,
-    prepare_plan_plugin_config, save_plan_run,
+    DEFAULT_OUTPUT_LINES_PER_STEP, PlanExecutorConfig, PlanLaunch, PlanRunMode,
+    execute_plan_sequential, load_resumable_plan_run, prepare_plan_plugin_config,
+    prepare_plan_run_for_resume, save_plan_run,
 };
 use crate::process::command_exists;
 use crate::repo::Repository;
@@ -211,8 +212,6 @@ pub fn run_plan_mode(cwd: &Path, config: &Config, path: Option<&Path>) -> Result
         execution.total,
         PlanRunMode::Sequential,
     )?;
-    let mut persisted = launch.create_run();
-
     let server_url = match crate::opencode::ensure_opencode_server(
         &repo,
         config,
@@ -240,7 +239,16 @@ pub fn run_plan_mode(cwd: &Path, config: &Config, path: Option<&Path>) -> Result
         executor = executor.with_plugin_config(plugin);
     }
     observability::with_writable_db(&repo, |conn| {
-        save_plan_run(conn, &persisted)?;
+        let mut persisted = if let Some(mut persisted) = load_resumable_plan_run(conn, &launch)? {
+            if !prepare_plan_run_for_resume(conn, &mut persisted, DEFAULT_OUTPUT_LINES_PER_STEP)? {
+                return Err("matching plan run is already running".to_string());
+            }
+            persisted
+        } else {
+            let persisted = launch.create_run();
+            save_plan_run(conn, &persisted)?;
+            persisted
+        };
         execute_plan_sequential(conn, &mut persisted, &executor, &mut io::stdout())
     })
 }

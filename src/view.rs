@@ -319,7 +319,7 @@ fn scoped_mode_label(model: &FrameModel<'_>) -> String {
 fn footer_actions(model: &FrameModel<'_>) -> String {
     match model.focus {
         PanelFocus::Status => {
-            "j/k output  h/l phase  f retry  B retry from  s skip  D dismiss  x abort  ? help"
+            "j/k output  h/l phase  u pause/resume  f retry  B retry from  s skip  D dismiss  x abort  ? help"
                 .to_string()
         }
         PanelFocus::Repos => {
@@ -951,6 +951,7 @@ fn plan_run_status_label(status: PlanRunStatus) -> &'static str {
         PlanRunStatus::Draft => "draft",
         PlanRunStatus::Queued => "queued",
         PlanRunStatus::Running => "running",
+        PlanRunStatus::Paused => "paused",
         PlanRunStatus::Done => "done",
         PlanRunStatus::Failed => "failed",
         PlanRunStatus::Aborted => "aborted",
@@ -2547,6 +2548,7 @@ mod tests {
             total_steps: 3,
             mode: PlanRunMode::Sequential,
             status: PlanRunStatus::Running,
+            pause_requested: false,
             selected_step: 2,
             created_unix_ms: 1_000,
             updated_unix_ms: 61_000,
@@ -2736,6 +2738,7 @@ mod tests {
             total_steps: 1,
             mode: PlanRunMode::Sequential,
             status: PlanRunStatus::Running,
+            pause_requested: false,
             selected_step: 1,
             created_unix_ms: 1_000,
             updated_unix_ms: 2_000,

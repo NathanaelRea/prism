@@ -606,6 +606,13 @@ impl Tui {
                             self.show_error("plan mode failed", &error)?;
                         }
                     }
+                    Key::PausePlan => {
+                        self.clear_leader_hint();
+                        pending_g = false;
+                        if !self.toggle_selected_plan_pause()? {
+                            self.show_message("focus a plan run to pause or resume it")?;
+                        }
+                    }
                     Key::RetryFailedPlanSteps => {
                         self.clear_leader_hint();
                         pending_g = false;
@@ -798,6 +805,7 @@ impl Tui {
             "Space g p    repos/worktrees: pull default branch",
             "p            repos/worktrees: pull default branch",
             "P            repos/worktrees: start or focus a plan run dashboard",
+            "u            status plan: pause before next phase, or resume paused plan",
             "j/k          status dashboard: move plan output or phase selection",
             "x            status plan: abort selected phase, or type all for all running phases",
             "A            add repository",
@@ -1986,7 +1994,9 @@ impl Tui {
         let mut failed_plans = 0;
         for run in self.plan_runs.values() {
             match run.run.status {
-                PlanRunStatus::Queued | PlanRunStatus::Running => active_plans += 1,
+                PlanRunStatus::Queued | PlanRunStatus::Running | PlanRunStatus::Paused => {
+                    active_plans += 1
+                }
                 PlanRunStatus::Failed | PlanRunStatus::Aborted => failed_plans += 1,
                 PlanRunStatus::Draft | PlanRunStatus::Done => {}
             }

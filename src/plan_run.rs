@@ -28,6 +28,7 @@ pub struct PlanRun {
     pub total_steps: usize,
     pub mode: PlanRunMode,
     pub status: PlanRunStatus,
+    pub pause_requested: bool,
     pub selected_step: usize,
     pub created_unix_ms: u64,
     pub updated_unix_ms: u64,
@@ -81,6 +82,7 @@ pub enum PlanRunStatus {
     Draft,
     Queued,
     Running,
+    Paused,
     Done,
     Failed,
     Aborted,
@@ -221,6 +223,7 @@ impl PlanRunStatus {
             Self::Draft => "draft",
             Self::Queued => "queued",
             Self::Running => "running",
+            Self::Paused => "paused",
             Self::Done => "done",
             Self::Failed => "failed",
             Self::Aborted => "aborted",
@@ -232,6 +235,7 @@ impl PlanRunStatus {
             "draft" => Ok(Self::Draft),
             "queued" => Ok(Self::Queued),
             "running" => Ok(Self::Running),
+            "paused" => Ok(Self::Paused),
             "done" => Ok(Self::Done),
             "failed" => Ok(Self::Failed),
             "aborted" => Ok(Self::Aborted),
@@ -352,6 +356,7 @@ impl PlanLaunch {
             total_steps: self.total_steps,
             mode: self.mode,
             status: PlanRunStatus::Queued,
+            pause_requested: false,
             selected_step: self.start_step,
             created_unix_ms: now,
             updated_unix_ms: now,
@@ -518,6 +523,7 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
           total_steps integer not null,
           mode text not null,
           status text not null,
+          pause_requested integer not null default 0,
           selected_step integer not null,
           created_unix_ms integer not null,
           updated_unix_ms integer not null,
@@ -572,6 +578,12 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
         "archived_unix_ms",
         "alter table plan_run add column archived_unix_ms integer",
     )?;
+    add_column_if_missing(
+        conn,
+        "plan_run",
+        "pause_requested",
+        "alter table plan_run add column pause_requested integer not null default 0",
+    )?;
     Ok(())
 }
 
@@ -616,11 +628,12 @@ pub fn load_recent_plan_runs_for_repo(
                and archived_unix_ms is null
              order by
                case status
-                 when 'running' then 0
-                 when 'queued' then 1
-                 when 'failed' then 2
-                 else 3
-               end,
+                  when 'running' then 0
+                  when 'queued' then 1
+                  when 'paused' then 2
+                  when 'failed' then 3
+                  else 4
+                end,
                updated_unix_ms desc
              limit ?2",
         )
@@ -636,6 +649,91 @@ pub fn load_recent_plan_runs_for_repo(
     ids.into_iter()
         .filter_map(|id| load_plan_run(conn, &id).transpose())
         .collect()
+}
+
+pub fn load_resumable_plan_run(
+    conn: &rusqlite::Connection,
+    launch: &PlanLaunch,
+) -> Result<Option<PersistedPlanRun>, String> {
+    let run_id = conn
+        .query_row(
+            "select id
+             from plan_run
+             where repo_root = ?1
+               and scope_path = ?2
+               and plan_path = ?3
+               and step_name = ?4
+               and start_step = ?5
+               and total_steps = ?6
+               and mode = ?7
+               and archived_unix_ms is null
+               and status in ('queued', 'running', 'paused')
+             order by updated_unix_ms desc
+             limit 1",
+            params![
+                launch.repo_root.as_str(),
+                launch.scope_path.display().to_string(),
+                launch.plan_path.display().to_string(),
+                launch.step_name.as_str(),
+                usize_to_i64(launch.start_step),
+                usize_to_i64(launch.total_steps),
+                launch.mode.as_str(),
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("load resumable plan run id: {error}"))?;
+    run_id
+        .map(|run_id| load_plan_run(conn, &run_id))
+        .transpose()
+        .map(Option::flatten)
+}
+
+pub fn prepare_plan_run_for_resume(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedPlanRun,
+    max_output_lines_per_step: usize,
+) -> Result<bool, String> {
+    let mut changed = false;
+    let mut has_live_child = false;
+    for step in &mut persisted.steps {
+        if !matches!(
+            step.status,
+            PlanStepStatus::Starting | PlanStepStatus::Running
+        ) {
+            continue;
+        }
+        if let Some(process_id) = step.process_id
+            && process_is_running(process_id)
+        {
+            has_live_child = true;
+            continue;
+        }
+        let message = format!(
+            "phase {} was interrupted before completion and was queued for resume",
+            step.step
+        );
+        reset_step_for_retry(step);
+        append_system_output(
+            conn,
+            step,
+            PlanOutputKind::System,
+            &message,
+            max_output_lines_per_step,
+        )?;
+        save_step_with_conn(conn, step)?;
+        changed = true;
+    }
+    if has_live_child {
+        return Ok(false);
+    }
+    if persisted.run.pause_requested || persisted.run.status == PlanRunStatus::Paused || changed {
+        persisted.run.pause_requested = false;
+        persisted.run.status = persisted.aggregate_status();
+        persisted.run.updated_unix_ms = unix_ms();
+        save_run_with_conn(conn, &persisted.run)?;
+    }
+    Ok(true)
 }
 
 pub fn append_output_line(
@@ -676,6 +774,7 @@ pub fn execute_plan_sequential(
     save_run_with_conn(conn, &persisted.run)?;
 
     let mut failure: Option<String> = None;
+    let mut paused = false;
     for index in 0..persisted.steps.len() {
         if failure.is_some() {
             break;
@@ -683,13 +782,21 @@ pub fn execute_plan_sequential(
         if persisted.steps[index].status != PlanStepStatus::Queued {
             continue;
         }
+        if reload_pause_request(conn, persisted)? {
+            paused = true;
+            break;
+        }
         let result = execute_one_step(conn, persisted, index, executor, output);
         if let Err(error) = result {
             failure = Some(error);
         }
     }
 
-    persisted.run.status = persisted.aggregate_status();
+    if paused {
+        persisted.run.status = PlanRunStatus::Paused;
+    } else {
+        persisted.run.status = persisted.aggregate_status();
+    }
     persisted.run.updated_unix_ms = unix_ms();
     save_run_with_conn(conn, &persisted.run)?;
 
@@ -946,7 +1053,7 @@ pub fn reconcile_stale_plan_run(
     }
     if matches!(
         persisted.run.status,
-        PlanRunStatus::Queued | PlanRunStatus::Running
+        PlanRunStatus::Queued | PlanRunStatus::Running | PlanRunStatus::Paused
     ) {
         persisted.run.status = persisted.aggregate_status();
         persisted.run.updated_unix_ms = unix_ms();
@@ -1037,13 +1144,49 @@ pub fn skip_plan_step(
     save_run_with_conn(conn, &persisted.run)
 }
 
+pub fn request_plan_run_pause(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedPlanRun,
+) -> Result<(), String> {
+    if matches!(
+        persisted.run.status,
+        PlanRunStatus::Done | PlanRunStatus::Failed | PlanRunStatus::Aborted
+    ) {
+        return Err("cannot pause a completed plan run".to_string());
+    }
+    persisted.run.pause_requested = true;
+    if !persisted.steps.iter().any(|step| {
+        matches!(
+            step.status,
+            PlanStepStatus::Starting | PlanStepStatus::Running
+        )
+    }) {
+        persisted.run.status = PlanRunStatus::Paused;
+    }
+    persisted.run.updated_unix_ms = unix_ms();
+    save_run_with_conn(conn, &persisted.run)
+}
+
+pub fn resume_paused_plan_run(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedPlanRun,
+) -> Result<(), String> {
+    if !persisted.run.pause_requested && persisted.run.status != PlanRunStatus::Paused {
+        return Err("plan run is not paused".to_string());
+    }
+    persisted.run.pause_requested = false;
+    persisted.run.status = persisted.aggregate_status();
+    persisted.run.updated_unix_ms = unix_ms();
+    save_run_with_conn(conn, &persisted.run)
+}
+
 pub fn archive_plan_run(
     conn: &rusqlite::Connection,
     persisted: &mut PersistedPlanRun,
 ) -> Result<(), String> {
     if matches!(
         persisted.run.status,
-        PlanRunStatus::Queued | PlanRunStatus::Running
+        PlanRunStatus::Queued | PlanRunStatus::Running | PlanRunStatus::Paused
     ) {
         return Err("cannot dismiss a queued or running plan run".to_string());
     }
@@ -1360,6 +1503,23 @@ fn execute_one_step(
             step.error.as_deref().unwrap_or("opencode run failed")
         ))
     }
+}
+
+fn reload_pause_request(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedPlanRun,
+) -> Result<bool, String> {
+    let Some(run) = load_run_with_conn(conn, &persisted.run.id)? else {
+        return Ok(false);
+    };
+    persisted.run.pause_requested = run.pause_requested;
+    if run.pause_requested || run.status == PlanRunStatus::Paused {
+        persisted.run.status = PlanRunStatus::Paused;
+        persisted.run.updated_unix_ms = unix_ms();
+        save_run_with_conn(conn, &persisted.run)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn finish_step_after_exit(
@@ -1991,9 +2151,9 @@ fn save_run_with_conn(conn: &rusqlite::Connection, run: &PlanRun) -> Result<(), 
     conn.execute(
         "insert into plan_run (
            id, repo_root, scope_path, plan_path, plan_display, step_name, start_step,
-           total_steps, mode, status, selected_step, created_unix_ms, updated_unix_ms,
-           archived_unix_ms
-         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+           total_steps, mode, status, pause_requested, selected_step, created_unix_ms,
+           updated_unix_ms, archived_unix_ms
+         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          on conflict(id) do update set
            repo_root = excluded.repo_root,
            scope_path = excluded.scope_path,
@@ -2004,6 +2164,7 @@ fn save_run_with_conn(conn: &rusqlite::Connection, run: &PlanRun) -> Result<(), 
            total_steps = excluded.total_steps,
            mode = excluded.mode,
            status = excluded.status,
+           pause_requested = excluded.pause_requested,
            selected_step = excluded.selected_step,
            updated_unix_ms = excluded.updated_unix_ms,
            archived_unix_ms = excluded.archived_unix_ms",
@@ -2018,6 +2179,7 @@ fn save_run_with_conn(conn: &rusqlite::Connection, run: &PlanRun) -> Result<(), 
             usize_to_i64(run.total_steps),
             run.mode.as_str(),
             run.status.as_str(),
+            bool_to_i64(run.pause_requested),
             usize_to_i64(run.selected_step),
             u64_to_i64(run.created_unix_ms),
             u64_to_i64(run.updated_unix_ms),
@@ -2090,8 +2252,8 @@ fn load_run_with_conn(
 ) -> Result<Option<PlanRun>, String> {
     conn.query_row(
         "select id, repo_root, scope_path, plan_path, plan_display, step_name,
-                start_step, total_steps, mode, status, selected_step, created_unix_ms,
-                updated_unix_ms, archived_unix_ms
+                start_step, total_steps, mode, status, pause_requested, selected_step,
+                created_unix_ms, updated_unix_ms, archived_unix_ms
          from plan_run
          where id = ?1",
         params![run_id],
@@ -2109,11 +2271,12 @@ fn load_run_with_conn(
                 total_steps: i64_to_usize(row.get(7)?, 7),
                 mode: PlanRunMode::parse(&mode).map_err(from_string_error)?,
                 status: PlanRunStatus::parse(&status).map_err(from_string_error)?,
-                selected_step: i64_to_usize(row.get(10)?, 10),
-                created_unix_ms: i64_to_u64(row.get(11)?, 11),
-                updated_unix_ms: i64_to_u64(row.get(12)?, 12),
+                pause_requested: row.get::<_, i64>(10)? != 0,
+                selected_step: i64_to_usize(row.get(11)?, 11),
+                created_unix_ms: i64_to_u64(row.get(12)?, 12),
+                updated_unix_ms: i64_to_u64(row.get(13)?, 13),
                 archived_unix_ms: row
-                    .get::<_, Option<i64>>(13)?
+                    .get::<_, Option<i64>>(14)?
                     .map(|value| value.max(0) as u64),
             })
         },
@@ -2294,6 +2457,10 @@ fn usize_to_i64(value: usize) -> i64 {
 
 fn u64_to_i64(value: u64) -> i64 {
     i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn bool_to_i64(value: bool) -> i64 {
+    if value { 1 } else { 0 }
 }
 
 fn unix_ms() -> u64 {
@@ -3035,6 +3202,95 @@ fi
         assert_eq!(loaded.steps[2].status, PlanStepStatus::Queued);
         assert_eq!(loaded.run.selected_step, 2);
         assert_eq!(loaded.run.status, PlanRunStatus::Queued);
+    }
+
+    #[test]
+    fn pause_request_stops_sequential_executor_before_next_queued_step() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&conn).unwrap();
+        let temp = unique_temp_dir("prism-plan-pause-before-next");
+        let marker = temp.join("should-not-run");
+        let opencode = fake_opencode(
+            &temp,
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+touch should-not-run
+"#,
+        );
+        let mut persisted = PlanLaunch::new(
+            &temp,
+            &temp,
+            &temp.join("plan.md"),
+            "phase",
+            1,
+            2,
+            PlanRunMode::Sequential,
+        )
+        .unwrap()
+        .create_run();
+        persisted.steps[0].status = PlanStepStatus::Done;
+        save_plan_run(&conn, &persisted).unwrap();
+        request_plan_run_pause(&conn, &mut persisted).unwrap();
+        let executor = PlanExecutorConfig::new(
+            opencode.display().to_string(),
+            None,
+            temp.clone(),
+            "plan.md",
+        );
+        let mut output = Vec::new();
+
+        execute_plan_sequential(&conn, &mut persisted, &executor, &mut output).unwrap();
+
+        let loaded = load_plan_run(&conn, &persisted.run.id)
+            .unwrap()
+            .expect("persisted run");
+        assert_eq!(loaded.run.status, PlanRunStatus::Paused);
+        assert!(loaded.run.pause_requested);
+        assert_eq!(loaded.steps[0].status, PlanStepStatus::Done);
+        assert_eq!(loaded.steps[1].status, PlanStepStatus::Queued);
+        assert!(!marker.exists());
+
+        let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn resumable_run_requeues_interrupted_steps_and_preserves_done_steps() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&conn).unwrap();
+        let repo = PathBuf::from("/repo/prism");
+        let launch = PlanLaunch::new(
+            &repo,
+            &repo,
+            &repo.join("plan.md"),
+            "phase",
+            1,
+            3,
+            PlanRunMode::Sequential,
+        )
+        .unwrap();
+        let mut persisted = launch.create_run();
+        persisted.run.status = PlanRunStatus::Running;
+        persisted.steps[0].status = PlanStepStatus::Done;
+        persisted.steps[1].status = PlanStepStatus::Running;
+        persisted.steps[1].process_id = None;
+        save_plan_run(&conn, &persisted).unwrap();
+
+        let mut resumed = load_resumable_plan_run(&conn, &launch)
+            .unwrap()
+            .expect("resumable run");
+        let can_execute =
+            prepare_plan_run_for_resume(&conn, &mut resumed, DEFAULT_OUTPUT_LINES_PER_STEP)
+                .unwrap();
+
+        assert!(can_execute);
+        let loaded = load_plan_run(&conn, &persisted.run.id)
+            .unwrap()
+            .expect("persisted run");
+        assert!(!loaded.run.pause_requested);
+        assert_eq!(loaded.run.status, PlanRunStatus::Queued);
+        assert_eq!(loaded.steps[0].status, PlanStepStatus::Done);
+        assert_eq!(loaded.steps[1].status, PlanStepStatus::Queued);
+        assert_eq!(loaded.steps[2].status, PlanStepStatus::Queued);
     }
 
     #[test]

@@ -23,9 +23,11 @@ use crate::lifecycle::{
 use crate::opencode::{self, OpencodeStatus, load_runtime};
 use crate::plan::{PlanExecution, open_plan_mode};
 use crate::plan_run::{
-    PlanExecutorConfig, PlanRunMode, PlanStepStatus, abort_plan_run, abort_plan_step,
-    archive_plan_run, execute_plan_parallel, execute_plan_sequential, load_plan_run,
-    prepare_plan_plugin_config, retry_failed_steps, retry_from_step, save_plan_run, skip_plan_step,
+    DEFAULT_OUTPUT_LINES_PER_STEP, PlanExecutorConfig, PlanRunMode, PlanRunStatus, PlanStepStatus,
+    abort_plan_run, abort_plan_step, archive_plan_run, execute_plan_parallel,
+    execute_plan_sequential, load_plan_run, load_resumable_plan_run, prepare_plan_plugin_config,
+    prepare_plan_run_for_resume, request_plan_run_pause, resume_paused_plan_run,
+    retry_failed_steps, retry_from_step, save_plan_run, skip_plan_step,
 };
 use crate::process::{command_exists, run_capture, run_status_with_stdin};
 use crate::repo::Repository;
@@ -1096,19 +1098,38 @@ impl Tui {
             PlanRunMode::Sequential
         };
         let launch = execution.launch(&repo.root, mode)?;
-        let persisted = launch.create_run();
+        let mut should_execute = true;
+        let persisted = crate::observability::with_writable_db(&repo, |conn| {
+            if let Some(mut persisted) = load_resumable_plan_run(conn, &launch)? {
+                should_execute = prepare_plan_run_for_resume(
+                    conn,
+                    &mut persisted,
+                    DEFAULT_OUTPUT_LINES_PER_STEP,
+                )?;
+                Ok(persisted)
+            } else {
+                let persisted = launch.create_run();
+                save_plan_run(conn, &persisted)?;
+                Ok(persisted)
+            }
+        })?;
         let run_id = persisted.run.id.clone();
         let scope_path = execution.cwd().to_path_buf();
-        crate::observability::with_writable_db(&repo, |conn| save_plan_run(conn, &persisted))?;
         self.plan_runs.insert(run_id.clone(), persisted.clone());
         self.active_plan_runs
             .insert(scope_path.clone(), run_id.clone());
         self.selected_plan_step_by_run
             .insert(run_id.clone(), persisted.run.selected_step);
 
-        self.spawn_plan_run_executor(repo, config, persisted);
+        if should_execute {
+            self.spawn_plan_run_executor(repo, config, persisted);
+        }
         self.focus_status();
-        self.show_message("started plan run")?;
+        if should_execute {
+            self.show_message("started plan run")?;
+        } else {
+            self.show_message("plan run is already running")?;
+        }
         Ok(())
     }
 
@@ -1288,6 +1309,45 @@ impl Tui {
         })?;
         self.load_plan_run_snapshot(&repo.root, &run_id);
         self.show_message("skipped selected plan phase")?;
+        Ok(true)
+    }
+
+    pub(crate) fn toggle_selected_plan_pause(&mut self) -> Result<bool, String> {
+        let Some(dashboard) = self.current_plan_dashboard() else {
+            return Ok(false);
+        };
+        if self.focused_panel != PanelFocus::Status {
+            return Ok(false);
+        }
+        let repo = Repository {
+            root: PathBuf::from(&dashboard.run.run.repo_root),
+        };
+        let config = Config::load(&repo);
+        let run_id = dashboard.run.run.id.clone();
+        let mut should_execute = false;
+        let persisted = crate::observability::with_writable_db(&repo, |conn| {
+            let mut run = load_plan_run(conn, &run_id)?
+                .ok_or_else(|| format!("plan run not found: {run_id}"))?;
+            if run.run.pause_requested || run.run.status == PlanRunStatus::Paused {
+                resume_paused_plan_run(conn, &mut run)?;
+                should_execute =
+                    prepare_plan_run_for_resume(conn, &mut run, DEFAULT_OUTPUT_LINES_PER_STEP)?;
+            } else {
+                request_plan_run_pause(conn, &mut run)?;
+            }
+            Ok(run)
+        })?;
+        self.remember_plan_run(persisted.clone());
+        if persisted.run.pause_requested || persisted.run.status == PlanRunStatus::Paused {
+            self.show_message("plan run will pause before the next phase")?;
+            return Ok(true);
+        }
+        if should_execute {
+            self.spawn_plan_run_executor(repo, config, persisted);
+            self.show_message("resumed plan run")?;
+        } else {
+            self.show_message("plan run is already running")?;
+        }
         Ok(true)
     }
 

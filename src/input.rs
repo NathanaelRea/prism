@@ -44,6 +44,7 @@ impl KeyInput {
                     b'4'..=b'9' => keys.push(Key::Other),
                     b'p' => keys.push(Key::PullDefault),
                     b'P' => keys.push(Key::PlanMode),
+                    b'u' => keys.push(Key::PausePlan),
                     b'f' => keys.push(Key::RetryFailedPlanSteps),
                     b'B' => keys.push(Key::RetryPlanFromSelected),
                     b's' => keys.push(Key::SkipPlanStep),
@@ -144,6 +145,7 @@ pub enum Key {
     Merge,
     PullDefault,
     PlanMode,
+    PausePlan,
     RetryFailedPlanSteps,
     RetryPlanFromSelected,
     SkipPlanStep,
@@ -288,7 +290,7 @@ mod tests {
                 Key::ManageRepos,
                 Key::AbortOpencode,
                 Key::Other,
-                Key::Other,
+                Key::PausePlan,
                 Key::Other,
             ]
         ));
