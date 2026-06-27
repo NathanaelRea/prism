@@ -612,8 +612,9 @@ impl Tui {
                 let path = managed.repo.root.clone();
                 let config = managed.config.clone();
                 let tx = self.pr_poll_tx.clone();
+                let poll_started_at = std::time::Instant::now();
                 if let Some(managed) = self.repos.get_mut(repo_index) {
-                    managed.pr_summary_last_polled = Some(std::time::Instant::now());
+                    managed.pr_summary_last_polled = Some(poll_started_at);
                     managed.pr_summary_poll_in_flight = true;
                 }
                 std::thread::spawn(move || {
@@ -621,6 +622,7 @@ impl Tui {
                     let _ = tx.send(PrPollResult::Summary {
                         repo_index,
                         summaries,
+                        poll_started_at,
                     });
                 });
             }
@@ -669,6 +671,7 @@ impl Tui {
                 PrPollResult::Summary {
                     repo_index,
                     summaries,
+                    poll_started_at,
                 } => {
                     if let Some(repo) = self.repos.get_mut(repo_index) {
                         repo.pr_summary_poll_in_flight = false;
@@ -698,6 +701,7 @@ impl Tui {
                                 &mut self.sessions,
                                 repo_index,
                                 summaries,
+                                poll_started_at,
                             );
                         }
                         Err(error) => {

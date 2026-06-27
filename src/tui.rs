@@ -110,6 +110,7 @@ pub(crate) enum PrPollResult {
     Summary {
         repo_index: usize,
         summaries: Result<Vec<PrSummary>, String>,
+        poll_started_at: Instant,
     },
     Details {
         key: PrPollKey,
