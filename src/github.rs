@@ -968,7 +968,9 @@ fn fetch_pr_details(
     let mut details = parse_pr_details(&raw);
     details.review_comments =
         fetch_inline_review_comments(path, pr_number, config).unwrap_or_else(|_| Vec::new());
-    details.ci_failures = fetch_ci_failures(path, branch, head_sha, config).unwrap_or_default();
+    if !details.failing_checks.is_empty() {
+        details.ci_failures = fetch_ci_failures(path, branch, head_sha, config).unwrap_or_default();
+    }
     Ok(details)
 }
 
@@ -1697,7 +1699,15 @@ fn decode_pr_review_comments(raw: &str) -> Vec<PrReviewComment> {
 }
 
 fn encode_ci_failures(failures: &[CiFailure]) -> String {
-    serde_json::to_string(failures).unwrap_or_else(|_| "[]".to_string())
+    let failures_without_logs: Vec<CiFailure> = failures
+        .iter()
+        .cloned()
+        .map(|mut failure| {
+            failure.log_tail.clear();
+            failure
+        })
+        .collect();
+    serde_json::to_string(&failures_without_logs).unwrap_or_else(|_| "[]".to_string())
 }
 
 fn decode_ci_failures(raw: &str) -> Vec<CiFailure> {
@@ -1835,7 +1845,7 @@ mod tests {
         assert!(loaded_details.review_comments[0].resolved);
         assert_eq!(loaded_details.files, vec!["src/main.rs"]);
         assert_eq!(loaded_details.failing_checks, vec!["test"]);
-        assert_eq!(loaded_details.ci_failures[0].log_tail, "failed log");
+        assert_eq!(loaded_details.ci_failures[0].log_tail, "");
 
         let _ = fs::remove_dir_all(prism_dir);
         let _ = fs::remove_dir_all(temp);

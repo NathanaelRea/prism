@@ -1696,7 +1696,7 @@ impl Tui {
             }
             (Some(LeaderHint::Git), PanelFocus::Repos) => Some("p: pull default branch"),
             (Some(LeaderHint::Git), PanelFocus::Worktrees) => Some(
-                "g: lazygit  p: pull default  o: open PR  P: push/create PR  M: merge  c: CI fix  f: review fix",
+                "g: lazygit  p: pull default  o: open PR  P: push/create PR  M: merge  c: copy CI prompt  f: review fix",
             ),
             (None, _) => None,
         }
