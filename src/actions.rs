@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -21,7 +22,7 @@ use crate::lifecycle::{
 };
 use crate::opencode::{self, OpencodeStatus, load_runtime};
 use crate::plan::open_plan_mode;
-use crate::process::{command_exists, run_capture, run_status_with_stdin};
+use crate::process::{command_exists, run_capture};
 use crate::review::build_review_fix_prompt;
 use crate::session::{
     append_runtime_log, discover_sessions, save_agent_state, write_task_metadata,
@@ -1571,7 +1572,29 @@ fn clipboard_command_exists(program: &str) -> bool {
 }
 
 fn write_clipboard_command(program: &str, args: &[&str], text: &str) -> Result<(), String> {
-    run_status_with_stdin(Command::new(program).args(args), text)
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("{program}: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("{program}: stdin unavailable"))?;
+    stdin
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("{program}: {error}"))?;
+    drop(stdin);
+    let status = child
+        .wait()
+        .map_err(|error| format!("{program}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{program}: exited with {status}"))
+    }
 }
 
 fn pr_poll_key(session: &crate::session::Session) -> PrPollKey {
@@ -1710,7 +1733,7 @@ mod tests {
     use crate::session::Session;
     use crate::tui::Tui;
 
-    use super::{run_browser_opener, status_label_with_behind};
+    use super::{copy_to_clipboard, run_browser_opener, status_label_with_behind};
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -1753,6 +1776,45 @@ exit 0
             fs::read_to_string(&log).unwrap(),
             "--flag\nhttps://example.test/pr/42\n"
         );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn clipboard_copy_does_not_wait_for_daemonized_stdio() {
+        let temp = unique_temp_dir("prism-clipboard-copy-test");
+        fs::create_dir_all(&temp).unwrap();
+        let copied = temp.join("copied.txt");
+        let clipboard = temp.join("wl-copy");
+        fs::write(
+            &clipboard,
+            format!(
+                r#"#!/bin/sh
+cat > '{}'
+(sleep 1) &
+exit 0
+"#,
+                copied.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&clipboard).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&clipboard, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("wl-copy".to_string(), clipboard.display().to_string());
+
+        let started = Instant::now();
+        copy_to_clipboard(&config, "review prompt").unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "clipboard copy waited for daemonized stdio for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(fs::read_to_string(&copied).unwrap(), "review prompt");
         let _ = fs::remove_dir_all(temp);
     }
 
