@@ -12,6 +12,7 @@ mod lifecycle;
 mod observability;
 mod opencode;
 mod plan;
+pub mod plan_run;
 mod process;
 mod repo;
 mod review;
