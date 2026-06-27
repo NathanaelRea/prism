@@ -71,12 +71,17 @@ impl Session {
         self.repo_key = repo_key;
     }
 
-    pub(crate) fn preserve_refresh_state_from(&mut self, previous: Session) {
+    pub(crate) fn preserve_refresh_state_from(&mut self, previous: Session, config: &Config) {
         self.agent_state = previous.agent_state;
         self.opencode_status = previous.opencode_status;
-        self.pr = previous.pr;
         self.wt_columns = previous.wt_columns;
-        self.unseen_comments = previous.unseen_comments;
+        if self.is_task_branch(config) {
+            self.pr = previous.pr;
+            self.unseen_comments = previous.unseen_comments;
+        } else {
+            self.pr = PrCache::default();
+            self.unseen_comments = false;
+        }
     }
 
     pub(crate) fn mark_adopted_with_prompt(&mut self, initial_prompt: &str) {
@@ -490,6 +495,7 @@ exit 0
 
     #[test]
     fn refresh_state_preserves_runtime_pr_columns_and_unseen_comments() {
+        let config = test_config();
         let mut fresh = test_session("feature", "/repo/feature");
         let mut previous = test_session("feature", "/repo/feature");
         previous.agent_state = AgentState::Running;
@@ -498,7 +504,7 @@ exit 0
             .insert("ci".to_string(), "passed".to_string());
         previous.unseen_comments = true;
 
-        fresh.preserve_refresh_state_from(previous);
+        fresh.preserve_refresh_state_from(previous, &config);
 
         assert_eq!(fresh.agent_state, AgentState::Running);
         assert_eq!(
@@ -506,6 +512,21 @@ exit 0
             Some("passed")
         );
         assert!(fresh.unseen_comments);
+    }
+
+    #[test]
+    fn refresh_state_clears_pr_state_for_non_task_branches() {
+        let mut config = test_config();
+        config.default_base = Some("main".to_string());
+        let mut fresh = test_session("main", "/repo/main");
+        let mut previous = test_session("main", "/repo/main");
+        previous.pr.error = Some("stale".to_string());
+        previous.unseen_comments = true;
+
+        fresh.preserve_refresh_state_from(previous, &config);
+
+        assert!(fresh.pr.error.is_none());
+        assert!(!fresh.unseen_comments);
     }
 
     #[test]

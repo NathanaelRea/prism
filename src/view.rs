@@ -1351,7 +1351,7 @@ fn strip_ascii_control_chars(text: &str) -> String {
 }
 
 fn worktree_status_icons(config: &Config, row: &WorktreeRow) -> String {
-    if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
+    if row.kind != WorktreeKind::FeatureWorktree || config.is_default_branch(&row.branch) {
         return String::new();
     }
 
@@ -1374,7 +1374,7 @@ fn worktree_status_icons(config: &Config, row: &WorktreeRow) -> String {
 }
 
 fn comment_count_label_for_row(config: &Config, row: &WorktreeRow) -> String {
-    if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
+    if row.kind != WorktreeKind::FeatureWorktree || config.is_default_branch(&row.branch) {
         return String::new();
     }
 
@@ -1409,7 +1409,7 @@ fn ci_icon(config: &Config, session: &Session) -> &'static str {
 }
 
 fn ci_icon_for_row(config: &Config, row: &WorktreeRow) -> &'static str {
-    if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
+    if row.kind != WorktreeKind::FeatureWorktree || config.is_default_branch(&row.branch) {
         return "";
     }
     match row
@@ -1486,7 +1486,7 @@ fn ci_color(config: &Config, session: &Session) -> &'static str {
 }
 
 fn ci_color_for_row(config: &Config, row: &WorktreeRow) -> &'static str {
-    if row.kind == WorktreeKind::DefaultBranch || config.is_default_branch(&row.branch) {
+    if row.kind != WorktreeKind::FeatureWorktree || config.is_default_branch(&row.branch) {
         return "90";
     }
     match row
@@ -2001,6 +2001,17 @@ mod tests {
         let icons = crate::util::strip_ansi(&worktree_status_icons(&config, &row));
 
         assert_eq!(icons, "⇄✓#2✓1");
+    }
+
+    #[test]
+    fn detached_worktree_status_icons_hide_stale_pr_state() {
+        let config = test_config(Some("main"));
+        let session = test_session("(detached)", "clean", AgentState::Idle, test_pr(12, false));
+        let row = test_worktree_row(&config, &session, 0, true);
+
+        let icons = worktree_status_icons(&config, &row);
+
+        assert!(icons.is_empty());
     }
 
     #[test]

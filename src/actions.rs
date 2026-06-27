@@ -55,7 +55,7 @@ impl Tui {
             for session in &mut repo_sessions {
                 session.apply_repo_identity(repo_index, managed.label.clone(), managed.key);
                 if let Some(previous) = by_path.remove(&session.identity_key()) {
-                    session.preserve_refresh_state_from(previous);
+                    session.preserve_refresh_state_from(previous, &managed.config);
                 }
             }
             fresh.extend(repo_sessions);
