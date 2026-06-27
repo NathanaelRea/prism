@@ -2,6 +2,7 @@ mod actions;
 mod agent;
 mod agent_session;
 mod args;
+mod ci;
 pub mod cli;
 mod config;
 mod git;

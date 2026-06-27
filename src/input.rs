@@ -99,6 +99,7 @@ impl KeyInput {
                         b'o' => keys.push(Key::OpenPr),
                         b'P' => keys.push(Key::Push),
                         b'M' => keys.push(Key::Merge),
+                        b'c' => keys.push(Key::CiFix),
                         b'f' => keys.push(Key::ReviewFix),
                         b'p' => keys.push(Key::PullDefault),
                         _ => keys.push(Key::Other),
@@ -132,6 +133,7 @@ pub enum Key {
     RepoShortcut(char),
     AddRepo,
     ManageRepos,
+    CiFix,
     ReviewFix,
     Push,
     Merge,
@@ -229,6 +231,16 @@ mod tests {
         assert!(matches!(
             keys.as_slice(),
             [Key::Leader, Key::LeaderGit, Key::OpenPr]
+        ));
+    }
+
+    #[test]
+    fn key_input_handles_leader_ci_fix() {
+        let mut input = KeyInput::default();
+        let keys = input.feed(b" gc");
+        assert!(matches!(
+            keys.as_slice(),
+            [Key::Leader, Key::LeaderGit, Key::CiFix]
         ));
     }
 

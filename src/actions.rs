@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionWarmupKey, AgentSessionWarmupResult};
+use crate::ci::build_ci_failure_prompt;
 use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
 use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCacheRepository, apply_pr_details_poll_result,
@@ -202,7 +203,7 @@ impl Tui {
         if !context.config.repo_config_path.exists() {
             fs::write(
                 &context.config.repo_config_path,
-                "# Prism repository config\n# Example:\n# [worktrees]\n# columns = [\"url\", \"vars.localdev\"]\n#\n# [prompt_templates]\n# review_fix = \"Here are review comments on PR {pr_number}.\\n\\nIf they are applicable, fix them. Otherwise, say why not.\\n\\n---\\n\\n{comments}\"\n",
+                "# Prism repository config\n# Example:\n# [worktrees]\n# columns = [\"url\", \"vars.localdev\"]\n#\n# [prompt_templates]\n# review_fix = \"Here are review comments on PR {pr_number}.\\n\\nIf they are applicable, fix them. Otherwise, say why not.\\n\\n---\\n\\n{comments}\"\n# ci_failure = \"Here are CI failures on PR {pr_number}.\\n\\nFix the failing checks. Use the log tails below as the primary clues.\\n\\nPR: {url}\\nBranch: {branch}\\nHead SHA: {head_sha}\\n\\n---\\n\\n{failures}\"\n",
             )
             .map_err(|error| format!("create config file: {error}"))?;
         }
@@ -1122,6 +1123,33 @@ impl Tui {
             build_review_fix_prompt(&self.sessions[context.session_index], &context.config)?;
         copy_to_clipboard(&context.config, &prompt)?;
         self.show_message("review-fix prompt copied to clipboard")?;
+        Ok(())
+    }
+
+    pub(crate) fn start_ci_fix(&mut self) -> Result<(), String> {
+        let Some(context) = self.selected_worktree_context() else {
+            return Ok(());
+        };
+        let selected = context.session_index;
+        if self.sessions[selected].is_default_branch(&context.config) {
+            self.show_message("default branch has no PR CI failures")?;
+            return Ok(());
+        }
+        self.show_loading_dialog("CI Failure Prompt", "Refreshing pull request CI details")?;
+        {
+            let session = &mut self.sessions[selected];
+            refresh_branch_pr_cache(
+                &context.repo,
+                &context.config,
+                &session.branch,
+                &session.path,
+                &mut session.pr,
+                true,
+            );
+        }
+        let prompt = build_ci_failure_prompt(&self.sessions[selected], &context.config)?;
+        copy_to_clipboard(&context.config, &prompt)?;
+        self.show_message("CI-failure prompt copied to clipboard")?;
         Ok(())
     }
 

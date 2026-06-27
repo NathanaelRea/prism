@@ -497,6 +497,15 @@ impl Tui {
                             self.show_error("review fix failed", &error)?;
                         }
                     }
+                    Key::CiFix => {
+                        self.clear_leader_hint();
+                        pending_g = false;
+                        if self.focused_panel != PanelFocus::Worktrees {
+                            self.show_message("focus worktrees to copy a CI-failure prompt")?;
+                        } else if let Err(error) = self.start_ci_fix() {
+                            self.show_error("CI failure prompt failed", &error)?;
+                        }
+                    }
                     Key::Push => {
                         self.clear_leader_hint();
                         pending_g = false;
@@ -703,6 +712,7 @@ impl Tui {
             "Space g o    open selected PR in browser",
             "Space g P    push branch, create PR if needed",
             "Space g M    merge selected PR",
+            "Space g c    copy CI-failure prompt",
             "Space g f    stage review-fix prompt",
             "Space g p    repos/worktrees: pull default branch",
             "p            repos/worktrees: pull default branch",
@@ -1686,7 +1696,7 @@ impl Tui {
             }
             (Some(LeaderHint::Git), PanelFocus::Repos) => Some("p: pull default branch"),
             (Some(LeaderHint::Git), PanelFocus::Worktrees) => Some(
-                "g: lazygit  p: pull default  o: open PR  P: push/create PR  M: merge  f: review fix",
+                "g: lazygit  p: pull default  o: open PR  P: push/create PR  M: merge  c: CI fix  f: review fix",
             ),
             (None, _) => None,
         }
