@@ -201,7 +201,6 @@ fn merge_pr_args(pr_number: &str, method: MergeMethod) -> Vec<String> {
         "merge".to_string(),
         pr_number.to_string(),
         method.gh_flag().to_string(),
-        "--delete-branch".to_string(),
     ]
 }
 
@@ -400,16 +399,53 @@ mod tests {
     fn merge_pr_args_use_configured_method() {
         assert_eq!(
             merge_pr_args("42", MergeMethod::Squash),
-            vec!["pr", "merge", "42", "--squash", "--delete-branch"]
+            vec!["pr", "merge", "42", "--squash"]
         );
         assert_eq!(
             merge_pr_args("42", MergeMethod::Merge),
-            vec!["pr", "merge", "42", "--merge", "--delete-branch"]
+            vec!["pr", "merge", "42", "--merge"]
         );
         assert_eq!(
             merge_pr_args("42", MergeMethod::Rebase),
-            vec!["pr", "merge", "42", "--rebase", "--delete-branch"]
+            vec!["pr", "merge", "42", "--rebase"]
         );
+    }
+
+    #[test]
+    fn merge_pull_request_does_not_delegate_branch_deletion_to_gh() {
+        let temp = unique_temp_dir("prism-merge-no-delete-branch-test");
+        let worktree = temp.join("worktree");
+        fs::create_dir_all(&worktree).unwrap();
+        let log = temp.join("gh.log");
+        let gh = temp.join("gh");
+        fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+printf 'pwd=%s\nargs=%s\n' "$PWD" "$*" > '{}'
+exit 0
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&gh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&gh, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+
+        super::merge_pull_request(&config, &worktree, 42).unwrap();
+
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(commands.contains(&format!("pwd={}", worktree.display())));
+        assert!(commands.contains("args=pr merge 42 --squash"));
+        assert!(!commands.contains("--delete-branch"));
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
