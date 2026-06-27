@@ -11,9 +11,9 @@ use crate::github::{PrCache, PrSummary};
 use crate::input::{Key, KeyInput};
 use crate::opencode::{OpencodeEvent, OpencodeStatus};
 use crate::plan_run::{
-    DEFAULT_OUTPUT_LINES_PER_STEP, PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRunStatus,
+    DEFAULT_OUTPUT_LINES_PER_STEP, PersistedPlanRun, PlanRunStatus,
     cleanup_stale_archived_plan_runs, load_output_lines, load_plan_run,
-    load_recent_plan_runs_for_repo, reconcile_stale_plan_run,
+    load_recent_plan_runs_for_repo, plan_output_block_key, reconcile_stale_plan_run,
 };
 use crate::repo::Repository;
 use crate::session::{Session, append_runtime_log};
@@ -197,23 +197,6 @@ impl OpencodePollKey {
             branch: session.branch.clone(),
             path: session.path.clone(),
         }
-    }
-}
-
-fn plan_output_block_key(line: &PlanOutputLine) -> Option<String> {
-    match line.kind {
-        PlanOutputKind::Tool | PlanOutputKind::ToolOutput => line
-            .block_id
-            .as_ref()
-            .map(|block_id| format!("tool:{block_id}"))
-            .or_else(|| Some(format!("tool-line:{}", line.line_number))),
-        PlanOutputKind::Diff => line
-            .block_id
-            .as_ref()
-            .map(|block_id| format!("diff:{block_id}"))
-            .or_else(|| Some(format!("diff-line:{}", line.line_number))),
-        PlanOutputKind::RawJson => Some(format!("raw:{}", line.line_number)),
-        _ => None,
     }
 }
 
@@ -1683,7 +1666,7 @@ impl Tui {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return false;
         };
-        let run_id = dashboard.run.run.id;
+        let run_id = dashboard.run.run.id.clone();
         let steps = dashboard
             .run
             .steps
@@ -1718,7 +1701,10 @@ impl Tui {
         }
         let run_id = dashboard.run.run.id;
         let max = dashboard.output_lines.len().saturating_sub(1);
-        let state = self.plan_output_state_by_run.entry(run_id).or_default();
+        let state = self
+            .plan_output_state_by_run
+            .entry(run_id)
+            .or_insert_with(|| dashboard.output_state.clone());
         let current = state.cursor.min(max);
         let next = if direction < 0 {
             current.saturating_sub(direction.unsigned_abs())
@@ -1739,8 +1725,8 @@ impl Tui {
         }
         let state = self
             .plan_output_state_by_run
-            .entry(dashboard.run.run.id)
-            .or_default();
+            .entry(dashboard.run.run.id.clone())
+            .or_insert_with(|| dashboard.output_state.clone());
         state.cursor = 0;
         state.follow = false;
         true
@@ -1755,8 +1741,8 @@ impl Tui {
         }
         let state = self
             .plan_output_state_by_run
-            .entry(dashboard.run.run.id)
-            .or_default();
+            .entry(dashboard.run.run.id.clone())
+            .or_insert_with(|| dashboard.output_state.clone());
         state.cursor = dashboard.output_lines.len().saturating_sub(1);
         state.follow = true;
         true
@@ -1769,7 +1755,7 @@ impl Tui {
         if self.focused_panel != PanelFocus::Status || dashboard.output_lines.is_empty() {
             return false;
         }
-        let run_id = dashboard.run.run.id;
+        let run_id = dashboard.run.run.id.clone();
         let current = self
             .plan_output_state_by_run
             .get(&run_id)
@@ -1793,7 +1779,10 @@ impl Tui {
             }
         }
         if let Some(target) = target {
-            let state = self.plan_output_state_by_run.entry(run_id).or_default();
+            let state = self
+                .plan_output_state_by_run
+                .entry(run_id)
+                .or_insert_with(|| dashboard.output_state.clone());
             state.cursor = target;
             state.follow = target == dashboard.output_lines.len().saturating_sub(1);
         }
@@ -1807,7 +1796,7 @@ impl Tui {
         if self.focused_panel != PanelFocus::Status || dashboard.output_lines.is_empty() {
             return false;
         }
-        let run_id = dashboard.run.run.id;
+        let run_id = dashboard.run.run.id.clone();
         let cursor = self
             .plan_output_state_by_run
             .get(&run_id)
@@ -1817,7 +1806,10 @@ impl Tui {
         let Some(block_key) = plan_output_block_key(&dashboard.output_lines[cursor]) else {
             return false;
         };
-        let state = self.plan_output_state_by_run.entry(run_id).or_default();
+        let state = self
+            .plan_output_state_by_run
+            .entry(run_id)
+            .or_insert_with(|| dashboard.output_state.clone());
         if !state.expanded_blocks.remove(&block_key) {
             state.expanded_blocks.insert(block_key);
         }

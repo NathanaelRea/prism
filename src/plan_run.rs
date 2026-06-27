@@ -112,6 +112,23 @@ pub enum PlanOutputKind {
     Error,
 }
 
+pub fn plan_output_block_key(line: &PlanOutputLine) -> Option<String> {
+    match line.kind {
+        PlanOutputKind::Tool | PlanOutputKind::ToolOutput => line
+            .block_id
+            .as_ref()
+            .map(|block_id| format!("tool:{block_id}"))
+            .or_else(|| Some(format!("tool-line:{}", line.line_number))),
+        PlanOutputKind::Diff => line
+            .block_id
+            .as_ref()
+            .map(|block_id| format!("diff:{block_id}"))
+            .or_else(|| Some(format!("diff-line:{}", line.line_number))),
+        PlanOutputKind::RawJson => Some(format!("raw:{}", line.line_number)),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanLaunch {
     pub repo_root: String,

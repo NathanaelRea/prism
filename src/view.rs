@@ -6,7 +6,7 @@ use crate::github::{PrCache, pr_cache_has_comments};
 use crate::opencode::OpencodeStatus;
 use crate::plan_run::{
     PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRunMode, PlanRunStatus, PlanStepRun,
-    PlanStepStatus,
+    PlanStepStatus, plan_output_block_key,
 };
 use crate::session::Session;
 use crate::terminal::{terminal_size, write_stdout};
@@ -742,10 +742,7 @@ fn format_plan_dashboard_lines(
         lines.push(color("No output yet", "90"));
     } else {
         let output_rows_available = visible_rows.saturating_sub(lines.len()).max(1);
-        let cursor = dashboard
-            .output_state
-            .cursor
-            .min(rendered_output.len().saturating_sub(1));
+        let cursor = selected_rendered_output_index(dashboard, &rendered_output);
         let start = if dashboard.output_state.follow {
             rendered_output.len().saturating_sub(output_rows_available)
         } else {
@@ -811,7 +808,7 @@ fn render_plan_output_rows(dashboard: &PlanDashboard, width: usize) -> Vec<Rende
     let mut index = 0;
     while index < dashboard.output_lines.len() {
         let line = &dashboard.output_lines[index];
-        if let Some(block_key) = collapsible_block_key(line) {
+        if let Some(block_key) = plan_output_block_key(line) {
             let block_len = block_len_at(&dashboard.output_lines, index, &block_key);
             let collapsed = !dashboard.output_state.expanded_blocks.contains(&block_key);
             if collapsed {
@@ -836,7 +833,7 @@ fn render_plan_output_rows(dashboard: &PlanDashboard, width: usize) -> Vec<Rende
                 kind: line.kind,
                 text,
                 collapsed: false,
-                block_key: collapsible_block_key(line),
+                block_key: plan_output_block_key(line),
             });
         }
         index += 1;
@@ -847,7 +844,7 @@ fn render_plan_output_rows(dashboard: &PlanDashboard, width: usize) -> Vec<Rende
 fn block_len_at(lines: &[PlanOutputLine], index: usize, block_key: &str) -> usize {
     let mut len = 0;
     for line in &lines[index..] {
-        if collapsible_block_key(line).as_deref() != Some(block_key) {
+        if plan_output_block_key(line).as_deref() != Some(block_key) {
             break;
         }
         len += 1;
@@ -855,21 +852,37 @@ fn block_len_at(lines: &[PlanOutputLine], index: usize, block_key: &str) -> usiz
     len.max(1)
 }
 
-fn collapsible_block_key(line: &PlanOutputLine) -> Option<String> {
-    match line.kind {
-        PlanOutputKind::Tool | PlanOutputKind::ToolOutput => line
-            .block_id
-            .as_ref()
-            .map(|block_id| format!("tool:{block_id}"))
-            .or_else(|| Some(format!("tool-line:{}", line.line_number))),
-        PlanOutputKind::Diff => line
-            .block_id
-            .as_ref()
-            .map(|block_id| format!("diff:{block_id}"))
-            .or_else(|| Some(format!("diff-line:{}", line.line_number))),
-        PlanOutputKind::RawJson => Some(format!("raw:{}", line.line_number)),
-        _ => None,
+fn selected_rendered_output_index(
+    dashboard: &PlanDashboard,
+    rendered_output: &[RenderedPlanOutputRow],
+) -> usize {
+    let Some(selected_line) = dashboard.output_lines.get(
+        dashboard
+            .output_state
+            .cursor
+            .min(dashboard.output_lines.len().saturating_sub(1)),
+    ) else {
+        return 0;
+    };
+    let selected_block_key = plan_output_block_key(selected_line);
+    if let Some(block_key) = selected_block_key.as_deref()
+        && let Some(index) = rendered_output
+            .iter()
+            .position(|row| row.collapsed && row.block_key.as_deref() == Some(block_key))
+    {
+        return index;
     }
+    rendered_output
+        .iter()
+        .position(|row| row.line_number == selected_line.line_number)
+        .or_else(|| {
+            selected_block_key.as_deref().and_then(|block_key| {
+                rendered_output
+                    .iter()
+                    .position(|row| row.block_key.as_deref() == Some(block_key))
+            })
+        })
+        .unwrap_or_else(|| rendered_output.len().saturating_sub(1))
 }
 
 fn collapsed_block_summary(lines: &[PlanOutputLine], width: usize) -> String {
@@ -2243,7 +2256,7 @@ mod tests {
         FrameModel, PlanDashboard, RepoMainView, RepoRow, StatusRow, WorktreeKind, WorktreeRow,
         configured_column_label, format_column_value, format_plan_rendered_output_row,
         format_repo_row, git_status_indicator, render_model_frame, render_plan_output_rows,
-        visible_len, worktree_status_icons,
+        selected_rendered_output_index, visible_len, worktree_status_icons,
     };
 
     #[test]
@@ -2671,6 +2684,68 @@ mod tests {
         assert!(plain.contains("+ new"));
         assert!(rendered.contains("\x1b[32m+ new\x1b[0m"));
         assert!(rendered.contains("\x1b[31m- old\x1b[0m"));
+    }
+
+    #[test]
+    fn plan_output_viewer_maps_output_cursor_to_rendered_rows() {
+        let collapsed_dashboard = test_plan_dashboard_with_output(
+            vec![
+                PlanOutputLine {
+                    run_id: "plan-test".to_string(),
+                    step: 1,
+                    line_number: 1,
+                    time_unix_ms: 1_000,
+                    kind: PlanOutputKind::Tool,
+                    text: "tool bash running: cargo test".to_string(),
+                    block_id: Some("call-1".to_string()),
+                },
+                PlanOutputLine {
+                    run_id: "plan-test".to_string(),
+                    step: 1,
+                    line_number: 2,
+                    time_unix_ms: 1_001,
+                    kind: PlanOutputKind::ToolOutput,
+                    text: "hidden output line".to_string(),
+                    block_id: Some("call-1".to_string()),
+                },
+            ],
+            super::PlanOutputViewerState {
+                cursor: 1,
+                follow: false,
+                expanded_blocks: BTreeSet::new(),
+            },
+        );
+        let collapsed_rows = render_plan_output_rows(&collapsed_dashboard, 120);
+
+        assert_eq!(
+            selected_rendered_output_index(&collapsed_dashboard, &collapsed_rows),
+            0
+        );
+
+        let mut expanded_blocks = BTreeSet::new();
+        expanded_blocks.insert("diff-line:3".to_string());
+        let expanded_dashboard = test_plan_dashboard_with_output(
+            vec![PlanOutputLine {
+                run_id: "plan-test".to_string(),
+                step: 1,
+                line_number: 3,
+                time_unix_ms: 1_000,
+                kind: PlanOutputKind::Diff,
+                text: "@@ -1 +1 @@\n- old\n+ new".to_string(),
+                block_id: None,
+            }],
+            super::PlanOutputViewerState {
+                cursor: 0,
+                follow: false,
+                expanded_blocks,
+            },
+        );
+        let expanded_rows = render_plan_output_rows(&expanded_dashboard, 120);
+
+        assert_eq!(
+            selected_rendered_output_index(&expanded_dashboard, &expanded_rows),
+            0
+        );
     }
 
     #[test]
