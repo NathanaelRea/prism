@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionWarmupKey, AgentSessionWarmupResult};
+use crate::ci::build_ci_failure_prompt;
 use crate::config::Config;
 use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
 use crate::github::{
@@ -30,7 +31,7 @@ use crate::plan_run::{
     prepare_plan_run_for_resume, request_plan_run_pause, resume_paused_plan_run,
     retry_failed_steps, retry_from_step, save_plan_run, skip_plan_step,
 };
-use crate::process::{command_exists, run_capture, run_status_with_stdin};
+use crate::process::{command_exists, run_capture};
 use crate::repo::Repository;
 use crate::review::build_review_fix_prompt;
 use crate::session::{
@@ -213,7 +214,7 @@ impl Tui {
         if !context.config.repo_config_path.exists() {
             fs::write(
                 &context.config.repo_config_path,
-                "# Prism repository config\n# Example:\n# [worktrees]\n# columns = [\"url\", \"vars.localdev\"]\n#\n# [prompt_templates]\n# review_fix = \"Here are review comments on PR {pr_number}.\\n\\nIf they are applicable, fix them. Otherwise, say why not.\\n\\n---\\n\\n{comments}\"\n",
+                "# Prism repository config\n# Example:\n# [worktrees]\n# columns = [\"url\", \"vars.localdev\"]\n#\n# [prompt_templates]\n# review_fix = \"Here are review comments on PR {pr_number}.\\n\\nIf they are applicable, fix them. Otherwise, say why not.\\n\\n---\\n\\n{comments}\"\n# ci_failure = \"Here are CI failures on PR {pr_number}.\\n\\nFix the failing checks. Use the log tails below as the primary clues.\\n\\nPR: {url}\\nBranch: {branch}\\nHead SHA: {head_sha}\\n\\n---\\n\\n{failures}\"\n",
             )
             .map_err(|error| format!("create config file: {error}"))?;
         }
@@ -1460,6 +1461,33 @@ impl Tui {
         Ok(())
     }
 
+    pub(crate) fn start_ci_fix(&mut self) -> Result<(), String> {
+        let Some(context) = self.selected_worktree_context() else {
+            return Ok(());
+        };
+        let selected = context.session_index;
+        if self.sessions[selected].is_default_branch(&context.config) {
+            self.show_message("default branch has no PR CI failures")?;
+            return Ok(());
+        }
+        self.show_loading_dialog("CI Failure Prompt", "Refreshing pull request CI details")?;
+        {
+            let session = &mut self.sessions[selected];
+            refresh_branch_pr_cache(
+                &context.repo,
+                &context.config,
+                &session.branch,
+                &session.path,
+                &mut session.pr,
+                true,
+            );
+        }
+        let prompt = build_ci_failure_prompt(&self.sessions[selected], &context.config)?;
+        copy_to_clipboard(&context.config, &prompt)?;
+        self.show_message("CI-failure prompt copied to clipboard")?;
+        Ok(())
+    }
+
     pub(crate) fn open_selected_pr(&mut self) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
@@ -1878,7 +1906,29 @@ fn clipboard_command_exists(program: &str) -> bool {
 }
 
 fn write_clipboard_command(program: &str, args: &[&str], text: &str) -> Result<(), String> {
-    run_status_with_stdin(Command::new(program).args(args), text)
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| format!("{program}: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| format!("{program}: stdin unavailable"))?;
+    stdin
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("{program}: {error}"))?;
+    drop(stdin);
+    let status = child
+        .wait()
+        .map_err(|error| format!("{program}: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("{program}: exited with {status}"))
+    }
 }
 
 fn pr_poll_key(session: &crate::session::Session) -> PrPollKey {
@@ -2017,7 +2067,7 @@ mod tests {
     use crate::session::Session;
     use crate::tui::Tui;
 
-    use super::{run_browser_opener, status_label_with_behind};
+    use super::{copy_to_clipboard, run_browser_opener, status_label_with_behind};
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -2060,6 +2110,45 @@ exit 0
             fs::read_to_string(&log).unwrap(),
             "--flag\nhttps://example.test/pr/42\n"
         );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn clipboard_copy_does_not_wait_for_daemonized_stdio() {
+        let temp = unique_temp_dir("prism-clipboard-copy-test");
+        fs::create_dir_all(&temp).unwrap();
+        let copied = temp.join("copied.txt");
+        let clipboard = temp.join("wl-copy");
+        fs::write(
+            &clipboard,
+            format!(
+                r#"#!/bin/sh
+cat > '{}'
+(sleep 1) &
+exit 0
+"#,
+                copied.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&clipboard).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&clipboard, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("wl-copy".to_string(), clipboard.display().to_string());
+
+        let started = Instant::now();
+        copy_to_clipboard(&config, "review prompt").unwrap();
+
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "clipboard copy waited for daemonized stdio for {:?}",
+            started.elapsed()
+        );
+        assert_eq!(fs::read_to_string(&copied).unwrap(), "review prompt");
         let _ = fs::remove_dir_all(temp);
     }
 

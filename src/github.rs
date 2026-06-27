@@ -9,7 +9,7 @@ use crate::observability;
 use crate::process::{run_capture, run_output_allow_failure};
 use crate::repo::Repository;
 use crate::session::Session;
-use crate::util::timestamp_label;
+use crate::util::{strip_ansi, timestamp_label};
 
 pub const PR_SUMMARY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 pub const PR_DETAIL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -81,6 +81,17 @@ pub struct PrDetails {
     pub review_comments: Vec<PrReviewComment>,
     pub files: Vec<String>,
     pub failing_checks: Vec<String>,
+    pub ci_failures: Vec<CiFailure>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct CiFailure {
+    pub workflow: String,
+    pub name: String,
+    pub conclusion: String,
+    pub url: String,
+    pub run_id: String,
+    pub log_tail: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -306,6 +317,26 @@ struct GhPrFile {
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct GhRunListItem {
+    #[serde(default, rename = "databaseId")]
+    database_id: u64,
+    #[serde(default, rename = "workflowName")]
+    workflow_name: String,
+    #[serde(default, rename = "displayTitle")]
+    display_title: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    conclusion: String,
+    #[serde(default)]
+    status: String,
+    #[serde(default, rename = "headSha")]
+    head_sha: String,
+    #[serde(default)]
+    url: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct GithubCommitConnection {
     #[serde(default)]
     nodes: Vec<GithubCommitNode>,
@@ -445,7 +476,7 @@ pub fn refresh_pr_cache(
     match result {
         Ok(Some((summary, _raw))) => {
             apply_pr_summary_refresh(cache, Some(summary), timestamp_label());
-            if force_details && pr_details_due(cache) {
+            if force_details || pr_details_due(cache) {
                 refresh_pr_details_cache(branch, cache, path, config);
             }
             persist_pr_summary_mutation(repo, branch, cache, PrCacheSummaryMutation::SaveSummary);
@@ -524,7 +555,7 @@ pub fn refresh_pr_details_cache(
         cache.details = None;
         return;
     };
-    match fetch_pr_details(path, branch, summary.number, config) {
+    match fetch_pr_details(path, branch, summary.number, &summary.head_sha, config) {
         Ok(details) => {
             cache.details = Some(details);
             cache.error = None;
@@ -921,6 +952,7 @@ fn fetch_pr_details(
     path: &std::path::Path,
     branch: &str,
     pr_number: u64,
+    head_sha: &str,
     config: &Config,
 ) -> Result<PrDetails, String> {
     let fields = ["comments", "reviews", "files", "statusCheckRollup"].join(",");
@@ -936,6 +968,9 @@ fn fetch_pr_details(
     let mut details = parse_pr_details(&raw);
     details.review_comments =
         fetch_inline_review_comments(path, pr_number, config).unwrap_or_else(|_| Vec::new());
+    if !details.failing_checks.is_empty() {
+        details.ci_failures = fetch_ci_failures(path, branch, head_sha, config).unwrap_or_default();
+    }
     Ok(details)
 }
 
@@ -958,7 +993,92 @@ pub fn parse_pr_details(raw: &str) -> PrDetails {
             .take(8)
             .collect(),
         failing_checks,
+        ci_failures: Vec::new(),
     }
+}
+
+fn fetch_ci_failures(
+    path: &std::path::Path,
+    branch: &str,
+    head_sha: &str,
+    config: &Config,
+) -> Result<Vec<CiFailure>, String> {
+    let output = run_output_allow_failure(
+        Command::new(config.tool("gh"))
+            .arg("run")
+            .arg("list")
+            .arg("--branch")
+            .arg(branch)
+            .arg("--commit")
+            .arg(head_sha)
+            .arg("--limit")
+            .arg("20")
+            .arg("--json")
+            .arg("databaseId,workflowName,displayTitle,name,conclusion,status,headSha,url")
+            .current_dir(path),
+    )?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let runs = serde_json::from_str::<Vec<GhRunListItem>>(&output.stdout).unwrap_or_default();
+    let mut failures = Vec::new();
+    for run in runs {
+        if failures.len() >= 4 {
+            break;
+        }
+        if !run.head_sha.trim().is_empty() && run.head_sha != head_sha {
+            continue;
+        }
+        if !is_failure_conclusion(&run.conclusion) {
+            continue;
+        }
+        let run_id = run.database_id.to_string();
+        let log_tail = fetch_failed_run_log_tail(path, &run_id, config).unwrap_or_default();
+        failures.push(CiFailure {
+            workflow: first_non_empty([run.workflow_name.as_str(), run.name.as_str()]),
+            name: first_non_empty([run.display_title.as_str(), run.name.as_str()]),
+            conclusion: first_non_empty([run.conclusion.as_str(), run.status.as_str()]),
+            url: run.url,
+            run_id,
+            log_tail,
+        });
+    }
+    Ok(failures)
+}
+
+fn fetch_failed_run_log_tail(
+    path: &std::path::Path,
+    run_id: &str,
+    config: &Config,
+) -> Result<String, String> {
+    if run_id == "0" {
+        return Ok(String::new());
+    }
+    let output = run_output_allow_failure(
+        Command::new(config.tool("gh"))
+            .arg("run")
+            .arg("view")
+            .arg(run_id)
+            .arg("--log-failed")
+            .current_dir(path),
+    )?;
+    if !output.status.success() {
+        return Ok(String::new());
+    }
+    Ok(tail_lines(&strip_ansi(&output.stdout), 80))
+}
+
+fn is_failure_conclusion(value: &str) -> bool {
+    matches!(
+        value.to_ascii_uppercase().as_str(),
+        "FAILURE" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED"
+    )
+}
+
+fn tail_lines(text: &str, max_lines: usize) -> String {
+    let lines = text.lines().collect::<Vec<_>>();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
 }
 
 fn fetch_inline_review_comments(
@@ -1333,6 +1453,7 @@ pub(crate) fn migrate_pr_cache_schema(conn: &rusqlite::Connection) -> Result<(),
           review_comments text not null,
           files text not null,
           failing_checks text not null,
+          ci_failures text not null default '[]',
           refreshed_unix_ms integer not null
         );
         ",
@@ -1358,6 +1479,13 @@ pub(crate) fn migrate_pr_cache_schema(conn: &rusqlite::Connection) -> Result<(),
             [],
         )
         .map_err(|error| format!("migrate pr_cache requested_reviewers column: {error}"))?;
+    }
+    if !table_has_column(conn, "pr_details_cache", "ci_failures")? {
+        conn.execute(
+            "alter table pr_details_cache add column ci_failures text not null default '[]'",
+            [],
+        )
+        .map_err(|error| format!("migrate pr_details_cache ci_failures column: {error}"))?;
     }
     Ok(())
 }
@@ -1420,7 +1548,7 @@ fn remove_pr_details_cache_with_conn(
 fn load_pr_details_cache(repo: &Repository, branch: &str) -> Option<PrDetails> {
     observability::with_writable_db(repo, |conn| {
         conn.query_row(
-            "select comments, reviews, review_comments, files, failing_checks
+            "select comments, reviews, review_comments, files, failing_checks, ci_failures
                from pr_details_cache
               where branch = ?1",
             params![branch],
@@ -1431,6 +1559,7 @@ fn load_pr_details_cache(repo: &Repository, branch: &str) -> Option<PrDetails> {
                     review_comments: decode_pr_review_comments(&row.get::<_, String>(2)?),
                     files: decode_string_values(&row.get::<_, String>(3)?),
                     failing_checks: decode_string_values(&row.get::<_, String>(4)?),
+                    ci_failures: decode_ci_failures(&row.get::<_, String>(5)?),
                 })
             },
         )
@@ -1449,14 +1578,15 @@ pub fn save_pr_details_cache(
     observability::with_writable_db(repo, |conn| {
         conn.execute(
             "insert into pr_details_cache (
-                branch, comments, reviews, review_comments, files, failing_checks, refreshed_unix_ms
-             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                branch, comments, reviews, review_comments, files, failing_checks, ci_failures, refreshed_unix_ms
+             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
               on conflict(branch) do update set
                 comments = excluded.comments,
                 reviews = excluded.reviews,
                 review_comments = excluded.review_comments,
                 files = excluded.files,
                 failing_checks = excluded.failing_checks,
+                ci_failures = excluded.ci_failures,
                 refreshed_unix_ms = excluded.refreshed_unix_ms",
             params![
                 branch,
@@ -1465,6 +1595,7 @@ pub fn save_pr_details_cache(
                 encode_pr_review_comments(&details.review_comments),
                 encode_string_values(&details.files),
                 encode_string_values(&details.failing_checks),
+                encode_ci_failures(&details.ci_failures),
                 unix_seconds(),
             ],
         )
@@ -1564,6 +1695,22 @@ fn encode_pr_review_comments(comments: &[PrReviewComment]) -> String {
 }
 
 fn decode_pr_review_comments(raw: &str) -> Vec<PrReviewComment> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+fn encode_ci_failures(failures: &[CiFailure]) -> String {
+    let failures_without_logs: Vec<CiFailure> = failures
+        .iter()
+        .cloned()
+        .map(|mut failure| {
+            failure.log_tail.clear();
+            failure
+        })
+        .collect();
+    serde_json::to_string(&failures_without_logs).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn decode_ci_failures(raw: &str) -> Vec<CiFailure> {
     serde_json::from_str(raw).unwrap_or_default()
 }
 
@@ -1668,6 +1815,14 @@ mod tests {
             }],
             files: vec!["src/main.rs".to_string()],
             failing_checks: vec!["test".to_string()],
+            ci_failures: vec![CiFailure {
+                workflow: "CI".to_string(),
+                name: "test".to_string(),
+                conclusion: "failure".to_string(),
+                url: "https://github.com/example/repo/actions/runs/99".to_string(),
+                run_id: "99".to_string(),
+                log_tail: "failed log".to_string(),
+            }],
         };
         let cache = PrCache {
             summary: Some(summary),
@@ -1690,6 +1845,7 @@ mod tests {
         assert!(loaded_details.review_comments[0].resolved);
         assert_eq!(loaded_details.files, vec!["src/main.rs"]);
         assert_eq!(loaded_details.failing_checks, vec!["test"]);
+        assert_eq!(loaded_details.ci_failures[0].log_tail, "");
 
         let _ = fs::remove_dir_all(prism_dir);
         let _ = fs::remove_dir_all(temp);

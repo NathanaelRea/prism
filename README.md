@@ -64,6 +64,7 @@ Common keys:
 - `Space g o` opens the selected pull request in a browser.
 - `Space g P` pushes the selected branch and creates a pull request if needed.
 - `Space g M` merges the selected pull request.
+- `Space g c` copies a CI-failure prompt with failed run metadata and log tails.
 - `Space g f` copies a review-fix prompt.
 - `P` opens plan mode in tmux from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through `opencode run`.
 - `p` or `Space g p` pulls the selected repository's default branch from the repos or worktrees panel.
@@ -117,6 +118,7 @@ columns = ["url", "vars.localdev", "ci"]
 
 [prompt_templates]
 review_fix = "Here are review comments on PR {pr_number}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n{comments}"
+ci_failure = "Here are CI failures on PR {pr_number}.\n\nFix the failing checks. Use the log tails below as the primary clues.\n\nPR: {url}\nBranch: {branch}\nHead SHA: {head_sha}\n\n---\n\n{failures}"
 ```
 
 Prism manages one local OpenCode server per worktree session. `opencode_port_base`

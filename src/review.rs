@@ -154,6 +154,7 @@ mod tests {
             ],
             files: vec!["src/lib.rs".to_string()],
             failing_checks: vec!["cargo test".to_string()],
+            ci_failures: Vec::new(),
         });
 
         let prompt = build_review_fix_prompt(&session, &test_config()).unwrap();

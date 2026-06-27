@@ -1499,6 +1499,13 @@ fn format_repo_preview_lines(
                 ));
             }
         }
+        if !details.ci_failures.is_empty() {
+            lines.push(format!(
+                "{} {}",
+                color("CI failures cached", "90"),
+                details.ci_failures.len()
+            ));
+        }
     } else {
         lines.push(color("Activity pending", "90"));
     }
@@ -2040,6 +2047,13 @@ fn format_pr_panel_lines(config: &Config, session: Option<&Session>) -> Vec<Stri
             for check in details.failing_checks.iter().take(3) {
                 lines.push(format!("{} {}", color("✕", "31"), truncate_line(check, 80)));
             }
+        }
+        if !details.ci_failures.is_empty() {
+            lines.push(format!(
+                "{} {}",
+                color("CI failures cached", "90"),
+                details.ci_failures.len()
+            ));
         }
     } else {
         lines.push(String::new());
