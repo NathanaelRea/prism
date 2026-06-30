@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::agent::AgentState;
 use crate::auto_flow::{
-    AutoOutputKind, AutoOutputLine, AutoRunMode, AutoRunStatus, AutoStepRun, AutoStepStatus,
-    PersistedAutoRun,
+    AutoImplementationSource, AutoOutputKind, AutoOutputLine, AutoRunMode, AutoRunStatus,
+    AutoStepKey, AutoStepRun, AutoStepStatus, PersistedAutoRun,
 };
 use crate::config::Config;
 use crate::github::{PrCache, pr_cache_has_comments};
@@ -29,6 +29,7 @@ pub(crate) struct FrameModel<'a> {
     pub selected_session: Option<usize>,
     pub focus: PanelFocus,
     pub repo_main_view: RepoMainView,
+    pub worktree_main_view: WorktreeMainView,
     pub mode_label: &'a str,
     pub status_message: Option<&'a str>,
     pub repo_filter: &'a str,
@@ -61,6 +62,7 @@ pub(crate) struct WorktreeRow {
     pub agent_state: AgentState,
     pub pr: PrCache,
     pub wt_columns: BTreeMap<String, String>,
+    pub auto_status: Option<AutoRunStatus>,
     pub unseen_comments: bool,
     pub prompt_summary: String,
     pub selected: bool,
@@ -74,6 +76,7 @@ pub(crate) struct PlanDashboard {
 
 pub(crate) struct AutoDashboard {
     pub run: PersistedAutoRun,
+    pub linked_plan_dashboard: Option<PlanDashboard>,
     pub output_lines: Vec<AutoOutputLine>,
     pub output_state: AutoOutputViewerState,
 }
@@ -95,6 +98,12 @@ pub(crate) struct PlanOutputViewerState {
 pub(crate) enum RepoMainView {
     Github,
     Kanban,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorktreeMainView {
+    Details,
+    Plan,
 }
 
 impl RepoMainView {
@@ -352,7 +361,6 @@ fn footer_actions(model: &FrameModel<'_>) -> String {
                 "P plan",
                 "h/l view",
                 "<Space> for more options",
-                "A add",
                 "R repos",
                 "/ search",
             ]);
@@ -363,6 +371,10 @@ fn footer_actions(model: &FrameModel<'_>) -> String {
                 return "c create  / search".to_string();
             };
             let mut actions = vec!["<Space> for more options"];
+            if model.plan_dashboard.is_some() || model.worktree_main_view == WorktreeMainView::Plan
+            {
+                actions.push("h/l view");
+            }
             if row.kind != WorktreeKind::DefaultBranch {
                 actions.insert(0, "Enter open");
             }
@@ -371,6 +383,7 @@ fn footer_actions(model: &FrameModel<'_>) -> String {
             }
             actions.push("p pull");
             actions.push("P plan");
+            actions.push("A Auto Flow");
             actions.push("c create");
             actions.push("/ search");
             actions.join("  ")
@@ -436,14 +449,23 @@ fn format_worktree_row(config: &Config, row: &WorktreeRow, width: usize) -> Stri
         "-"
     };
     let row_number = row.session_index.saturating_add(1).to_string();
+    let auto_code = row.auto_status.map(auto_run_status_color);
     let marker = if row.selected {
         color("▶", "1;36")
+    } else if let Some(status) = row.auto_status {
+        color("◆", auto_run_status_color(status))
     } else if row.unseen_comments {
         color("!", "1;36")
     } else {
         " ".to_string()
     };
-    let branch_code = if row.selected { "1;37" } else { "37" };
+    let branch_code = if let Some(code) = auto_code {
+        code
+    } else if row.selected {
+        "1;37"
+    } else {
+        "37"
+    };
     let status_icons = worktree_status_icons(config, row);
     let name = if status_icons.is_empty() {
         styled_cell(&row.branch, 22, branch_code)
@@ -689,6 +711,17 @@ fn format_auto_dashboard_lines(
             auto_run_status_label(run.status),
             elapsed_label(run.created_unix_ms, run.updated_unix_ms)
         ),
+        format!(
+            "source {}{}",
+            auto_source_label(run.implementation_source),
+            run.plan_path
+                .as_ref()
+                .map(|path| format!(
+                    "  plan {}",
+                    truncate_line(&path.display().to_string(), width)
+                ))
+                .unwrap_or_default()
+        ),
         format!("branch {}", truncate_line(&run.branch, width)),
     ];
     if let Some(pr_number) = run.pr_number {
@@ -725,7 +758,8 @@ fn format_auto_dashboard_lines(
     ));
     lines.push(String::new());
     lines.push(color("Steps", "1;37"));
-    let output_rows_reserved = dashboard.output_lines.len().min(8) + 2;
+    let linked_plan_rows_reserved = linked_plan_summary_lines(dashboard, width).len();
+    let output_rows_reserved = dashboard.output_lines.len().min(8) + linked_plan_rows_reserved + 2;
     let step_rows_available = visible_rows
         .saturating_sub(lines.len())
         .saturating_sub(output_rows_reserved)
@@ -751,6 +785,7 @@ fn format_auto_dashboard_lines(
     }
     lines.push(String::new());
     lines.push(color("Output", "1;37"));
+    lines.extend(linked_plan_summary_lines(dashboard, width));
     if dashboard.output_lines.is_empty() {
         lines.push(color("No output yet", "90"));
     } else {
@@ -778,6 +813,70 @@ fn format_auto_dashboard_lines(
         }
     }
     lines.truncate(visible_rows);
+    lines
+}
+
+fn linked_plan_summary_lines(dashboard: &AutoDashboard, width: usize) -> Vec<String> {
+    let selected_step = dashboard
+        .run
+        .run
+        .selected_step_run_id
+        .and_then(|id| dashboard.run.steps.iter().find(|step| step.id == Some(id)))
+        .or_else(|| dashboard.run.steps.first());
+    if !matches!(
+        selected_step.map(|step| &step.step_key),
+        Some(AutoStepKey::RunPlan)
+    ) {
+        return Vec::new();
+    }
+    let Some(plan_dashboard) = dashboard.linked_plan_dashboard.as_ref() else {
+        if selected_step
+            .and_then(|step| step.plan_run_id.as_ref())
+            .is_some()
+        {
+            return vec![color("linked plan unavailable", "90")];
+        }
+        return Vec::new();
+    };
+    let plan_run = &plan_dashboard.run.run;
+    let selected_phase = plan_dashboard
+        .run
+        .steps
+        .iter()
+        .find(|step| step.step == plan_run.selected_step)
+        .or_else(|| plan_dashboard.run.steps.first());
+    let mut lines = vec![format!(
+        "linked plan {}  status {}  mode {}",
+        truncate_line(&plan_run.plan_display, width),
+        plan_run_status_label(plan_run.status),
+        plan_mode_label(plan_run.mode)
+    )];
+    if let Some(phase) = selected_phase {
+        lines.push(format!(
+            "phase {}/{} {}{}",
+            phase.step,
+            plan_run.total_steps,
+            plan_step_status_label(phase.status),
+            phase
+                .latest_message
+                .as_ref()
+                .map(|message| format!("  {}", truncate_line(message, width)))
+                .unwrap_or_default()
+        ));
+        if let Some(error) = phase.error.as_deref() {
+            lines.push(color(
+                &format!("plan error {}", truncate_line(error, width)),
+                "1;31",
+            ));
+        }
+    }
+    if let Some(line) = plan_dashboard.output_lines.last() {
+        lines.push(format!(
+            "plan output {}",
+            truncate_line(&line.text, width.saturating_sub(12))
+        ));
+    }
+    lines.push(String::new());
     lines
 }
 
@@ -1153,6 +1252,14 @@ fn auto_mode_label(mode: AutoRunMode) -> &'static str {
     }
 }
 
+fn auto_source_label(source: AutoImplementationSource) -> &'static str {
+    match source {
+        AutoImplementationSource::Prompt => "prompt",
+        AutoImplementationSource::ExistingPlan => "plan file",
+        AutoImplementationSource::DraftPlan => "draft plan",
+    }
+}
+
 fn auto_run_status_label(status: AutoRunStatus) -> &'static str {
     match status {
         AutoRunStatus::Queued => "queued",
@@ -1183,6 +1290,15 @@ fn auto_step_status_color(status: AutoStepStatus) -> &'static str {
         AutoStepStatus::Failed | AutoStepStatus::Aborted => "1;31",
         AutoStepStatus::Running | AutoStepStatus::Starting | AutoStepStatus::Waiting => "1;33",
         AutoStepStatus::Queued | AutoStepStatus::Skipped => "37",
+    }
+}
+
+fn auto_run_status_color(status: AutoRunStatus) -> &'static str {
+    match status {
+        AutoRunStatus::Paused => "1;35",
+        AutoRunStatus::Queued | AutoRunStatus::Running => "1;33",
+        AutoRunStatus::Failed | AutoRunStatus::Aborted => "1;31",
+        AutoRunStatus::Done => "32",
     }
 }
 
@@ -2507,8 +2623,8 @@ mod tests {
 
     use crate::agent::AgentState;
     use crate::auto_flow::{
-        AutoOutputKind, AutoOutputLine, AutoRun, AutoRunMode, AutoRunStatus, AutoStepKey,
-        AutoStepRun, AutoStepStatus, PersistedAutoRun,
+        AutoImplementationSource, AutoOutputKind, AutoOutputLine, AutoRun, AutoRunMode,
+        AutoRunStatus, AutoStepKey, AutoStepRun, AutoStepStatus, PersistedAutoRun,
     };
     use crate::config::{Checks, Config, EscapeKey, MergeMethod};
     use crate::github::{PrCache, PrComment, PrDetails, PrReviewComment, PrSummary};
@@ -2522,10 +2638,10 @@ mod tests {
 
     use super::{
         AutoDashboard, AutoOutputViewerState, FrameModel, PlanDashboard, RepoMainView, RepoRow,
-        StatusRow, WorktreeKind, WorktreeRow, configured_column_label, format_column_value,
-        format_plan_rendered_output_row, format_repo_row, git_status_indicator, render_model_frame,
-        render_plan_output_rows, selected_rendered_output_index, visible_len,
-        worktree_status_icons,
+        StatusRow, WorktreeKind, WorktreeMainView, WorktreeRow, configured_column_label,
+        format_column_value, format_plan_rendered_output_row, format_repo_row, format_worktree_row,
+        git_status_indicator, render_model_frame, render_plan_output_rows,
+        selected_rendered_output_index, visible_len, worktree_status_icons,
     };
 
     #[test]
@@ -2581,6 +2697,23 @@ mod tests {
 
         assert!(row.contains("Space 1"));
         assert!(!row.contains("s1"));
+    }
+
+    #[test]
+    fn worktree_row_highlights_paused_auto_flow() {
+        let config = test_config(Some("main"));
+        let mut row = test_worktree_row(
+            &config,
+            &test_session("feature", "clean", AgentState::Idle, PrCache::default()),
+            0,
+            false,
+        );
+        row.auto_status = Some(AutoRunStatus::Paused);
+
+        let rendered = format_worktree_row(&config, &row, 100);
+
+        assert!(rendered.contains("\x1b[1;35m◆\x1b[0m"));
+        assert!(rendered.contains("\x1b[1;35mfeature"));
     }
 
     #[test]
@@ -2902,6 +3035,9 @@ mod tests {
             worktree_path: PathBuf::from("/repo/feature"),
             branch: "feature".to_string(),
             mode: AutoRunMode::Standard,
+            implementation_source: AutoImplementationSource::Prompt,
+            plan_path: None,
+            plan_run_mode: PlanRunMode::Sequential,
             variant: "default".to_string(),
             agent_profile: None,
             prompt_summary: "Implement the thing".to_string(),
@@ -2932,6 +3068,7 @@ mod tests {
                 run,
                 steps: vec![step],
             },
+            linked_plan_dashboard: None,
             output_lines: vec![AutoOutputLine {
                 step_run_id: 7,
                 line_number: 1,
@@ -2950,9 +3087,131 @@ mod tests {
 
         assert!(frame.contains("Auto Flow"));
         assert!(frame.contains("Implement the thing"));
+        assert!(frame.contains("source prompt"));
         assert!(frame.contains("step   #1 prepare attempt 1 waiting"));
         assert!(frame.contains("waiting for safe boundary"));
         assert!(frame.contains("created no-op auto run"));
+    }
+
+    #[test]
+    fn render_auto_dashboard_shows_linked_plan_run() {
+        let config = test_config(Some("main"));
+        let sessions = vec![test_session(
+            "feature",
+            "clean",
+            AgentState::Idle,
+            PrCache::default(),
+        )];
+        let mut model = test_model(&config, &sessions, Some(0), PanelFocus::Status, None);
+        let run = AutoRun {
+            id: "auto-test".to_string(),
+            repo_root: "/repo".to_string(),
+            worktree_path: PathBuf::from("/repo/feature"),
+            branch: "feature".to_string(),
+            mode: AutoRunMode::Standard,
+            implementation_source: AutoImplementationSource::ExistingPlan,
+            plan_path: Some(PathBuf::from("plan.md")),
+            plan_run_mode: PlanRunMode::Sequential,
+            variant: "default".to_string(),
+            agent_profile: None,
+            prompt_summary: "Run the plan".to_string(),
+            initial_prompt: "Run the plan".to_string(),
+            status: AutoRunStatus::Running,
+            pause_requested: false,
+            selected_step_run_id: Some(9),
+            pr_number: None,
+            pr_url: None,
+            current_head_sha: None,
+            review_baseline_json: None,
+            created_unix_ms: 1_000,
+            updated_unix_ms: 61_000,
+            archived_unix_ms: None,
+        };
+        let mut auto_step = AutoStepRun::queued(
+            "auto-test",
+            1,
+            AutoStepKey::RunPlan,
+            1,
+            Some("run plan phases".to_string()),
+        );
+        auto_step.id = Some(9);
+        auto_step.status = AutoStepStatus::Running;
+        auto_step.plan_run_id = Some("plan-test".to_string());
+        let plan_run = PlanRun {
+            id: "plan-test".to_string(),
+            repo_root: "/repo".to_string(),
+            scope_path: PathBuf::from("/repo/feature"),
+            plan_path: PathBuf::from("/repo/feature/plan.md"),
+            plan_display: "plan.md".to_string(),
+            step_name: "phase".to_string(),
+            start_step: 1,
+            total_steps: 2,
+            mode: PlanRunMode::Sequential,
+            status: PlanRunStatus::Running,
+            pause_requested: false,
+            selected_step: 2,
+            created_unix_ms: 1_000,
+            updated_unix_ms: 61_000,
+            archived_unix_ms: None,
+        };
+        let mut phase =
+            PlanStepRun::queued("plan-test", 2, "Implement plan.md phase 2".to_string());
+        phase.status = PlanStepStatus::Running;
+        phase.latest_message = Some("building phase detail".to_string());
+        model.auto_dashboard = Some(AutoDashboard {
+            run: PersistedAutoRun {
+                run,
+                steps: vec![auto_step],
+            },
+            linked_plan_dashboard: Some(PlanDashboard {
+                run: PersistedPlanRun {
+                    run: plan_run,
+                    steps: vec![
+                        PlanStepRun::queued(
+                            "plan-test",
+                            1,
+                            "Implement plan.md phase 1".to_string(),
+                        ),
+                        phase,
+                    ],
+                },
+                output_lines: vec![PlanOutputLine {
+                    run_id: "plan-test".to_string(),
+                    step: 2,
+                    line_number: 1,
+                    time_unix_ms: 2_000,
+                    kind: PlanOutputKind::Assistant,
+                    text: "linked plan output preview".to_string(),
+                    block_id: None,
+                }],
+                output_state: super::PlanOutputViewerState {
+                    cursor: 0,
+                    follow: true,
+                    expanded_blocks: BTreeSet::new(),
+                },
+            }),
+            output_lines: vec![AutoOutputLine {
+                step_run_id: 9,
+                line_number: 1,
+                time_unix_ms: 2_000,
+                kind: AutoOutputKind::Status,
+                text: "running plan phases from plan.md".to_string(),
+                block_id: None,
+            }],
+            output_state: AutoOutputViewerState {
+                cursor: 0,
+                follow: true,
+            },
+        });
+
+        let frame = crate::util::strip_ansi(&render_model_frame(&model, 140, 32));
+
+        assert!(frame.contains("source plan file  plan plan.md"));
+        assert!(frame.contains("step   #1 run_plan attempt 1 running"));
+        assert!(frame.contains("linked plan plan.md  status running  mode sequential"));
+        assert!(frame.contains("phase 2/2 running  building phase detail"));
+        assert!(frame.contains("plan output linked plan output preview"));
+        assert!(frame.contains("running plan phases from plan.md"));
     }
 
     #[test]
@@ -3292,6 +3551,7 @@ mod tests {
             selected_session: Some(1),
             focus: PanelFocus::Worktrees,
             repo_main_view: RepoMainView::Github,
+            worktree_main_view: WorktreeMainView::Details,
             mode_label: "normal",
             status_message: None,
             repo_filter: "",
@@ -3469,6 +3729,7 @@ mod tests {
             selected_session,
             focus,
             repo_main_view: RepoMainView::Github,
+            worktree_main_view: WorktreeMainView::Details,
             mode_label: "normal",
             status_message,
             repo_filter: "",
@@ -3500,6 +3761,7 @@ mod tests {
             agent_state: session.agent_state,
             pr: session.pr.clone(),
             wt_columns: session.wt_columns.clone(),
+            auto_status: None,
             unseen_comments: session.unseen_comments,
             prompt_summary: session.prompt_summary.clone(),
             selected,

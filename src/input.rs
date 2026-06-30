@@ -50,7 +50,7 @@ impl KeyInput {
                     b's' => keys.push(Key::SkipPlanStep),
                     b'c' => keys.push(Key::Create),
                     b'x' => keys.push(Key::AbortOpencode),
-                    b'A' => keys.push(Key::AddRepo),
+                    b'A' => keys.push(Key::AutoFlow),
                     b'R' => keys.push(Key::ManageRepos),
                     b'e' => keys.push(Key::EditConfig),
                     b'D' => keys.push(Key::Delete),
@@ -102,7 +102,7 @@ impl KeyInput {
                     self.state = KeyInputState::Normal;
                     match byte {
                         b'g' => keys.push(Key::LazyGit),
-                        b'a' => keys.push(Key::AutoFlow),
+                        b'a' => keys.push(Key::Other),
                         b'o' => keys.push(Key::OpenPr),
                         b'P' => keys.push(Key::Push),
                         b'M' => keys.push(Key::Merge),
@@ -141,7 +141,6 @@ pub enum Key {
     Help,
     Refresh,
     RepoShortcut(char),
-    AddRepo,
     ManageRepos,
     CiFix,
     ReviewFix,
@@ -239,12 +238,19 @@ mod tests {
     }
 
     #[test]
-    fn key_input_handles_leader_auto_flow() {
+    fn key_input_handles_auto_flow() {
+        let mut input = KeyInput::default();
+        let keys = input.feed(b"A");
+        assert!(matches!(keys.as_slice(), [Key::AutoFlow]));
+    }
+
+    #[test]
+    fn key_input_does_not_keep_leader_auto_flow_alias() {
         let mut input = KeyInput::default();
         let keys = input.feed(b" ga");
         assert!(matches!(
             keys.as_slice(),
-            [Key::Leader, Key::LeaderGit, Key::AutoFlow]
+            [Key::Leader, Key::LeaderGit, Key::Other]
         ));
     }
 

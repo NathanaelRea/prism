@@ -36,6 +36,7 @@ pub struct Tui {
     pub(crate) selected_repo_root: Option<PathBuf>,
     pub(crate) focused_panel: PanelFocus,
     pub(crate) repo_main_view: view::RepoMainView,
+    pub(crate) worktree_main_view: view::WorktreeMainView,
     pub(crate) selected_worktree_by_repo: BTreeMap<PathBuf, PathBuf>,
     pub(crate) pr_poll_tx: Sender<PrPollResult>,
     pub(crate) pr_poll_rx: Receiver<PrPollResult>,
@@ -269,6 +270,7 @@ impl Tui {
             selected_repo_root: None,
             focused_panel: PanelFocus::Repos,
             repo_main_view: view::RepoMainView::Github,
+            worktree_main_view: view::WorktreeMainView::Plan,
             selected_worktree_by_repo: BTreeMap::new(),
             pr_poll_tx,
             pr_poll_rx,
@@ -476,7 +478,8 @@ impl Tui {
                         pending_g = false;
                         match self.focused_panel {
                             PanelFocus::Status => {
-                                if !self.toggle_plan_output_block() {
+                                if self.open_current_plan_tmux_session(&mut raw)? {
+                                } else if !self.toggle_plan_output_block() {
                                     self.focus_repos();
                                 }
                             }
@@ -512,7 +515,7 @@ impl Tui {
                         pending_g = false;
                         if self.focused_panel != PanelFocus::Worktrees {
                             self.show_message("focus worktrees to start or focus Auto Flow")?;
-                        } else if let Err(error) = self.start_or_focus_selected_auto_run() {
+                        } else if let Err(error) = self.start_or_focus_selected_auto_run(&mut raw) {
                             self.show_error("auto flow failed", &error)?;
                         }
                     }
@@ -677,15 +680,6 @@ impl Tui {
                             self.show_error("abort failed", &error)?;
                         }
                     }
-                    Key::AddRepo => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if self.focused_panel != PanelFocus::Repos {
-                            self.show_message("focus repos to add a repository")?;
-                        } else if let Err(error) = self.add_repository() {
-                            self.show_error("add repository failed", &error)?;
-                        }
-                    }
                     Key::ManageRepos => {
                         self.clear_leader_hint();
                         pending_g = false;
@@ -819,8 +813,8 @@ impl Tui {
         let items = [
             "1 / 2 / 3    focus status / repos / worktrees",
             "Tab          move focus between panels",
-            "h/l, left/right arrows  repos: switch view; status plan: switch phase",
-            "Space Space  status: focus repos; repos: focus worktrees; worktrees: open agent if valid",
+            "h/l, left/right arrows  repos/worktrees: switch view; status plan: switch phase",
+            "Space Space  status: open current plan phase tmux window 1 if available; repos: focus worktrees; worktrees: open agent if valid",
             "Enter        status: focus repos; repos: focus worktrees; worktrees: open agent if valid",
             "Space Enter  open tmux window 3: terminal",
             "Space g g    open tmux window 2: lazygit",
@@ -833,10 +827,10 @@ impl Tui {
             "Space g p    repos/worktrees: pull default branch",
             "p            repos/worktrees: pull default branch",
             "P            repos/worktrees: start or focus a plan run dashboard",
-            "u            status plan: pause before next phase, or resume paused plan",
+            "u            status: pause/resume auto or plan; paused Auto Flow prompts before the next step",
             "j/k          status dashboard: move plan output or phase selection",
             "x            status plan: abort selected phase, or type all for all running phases",
-            "A            add repository",
+            "A            worktrees: start/focus Auto Flow; choose prompt, plan file, or draft plan",
             "R            edit repositories/order/keys/remove",
             "c            create worktree session in selected repo",
             "x            worktrees: abort selected OpenCode session",
@@ -1277,7 +1271,9 @@ impl Tui {
             PanelFocus::Repos => {
                 self.repo_main_view = view::RepoMainView::Github;
             }
-            PanelFocus::Worktrees => {}
+            PanelFocus::Worktrees => {
+                self.worktree_main_view = view::WorktreeMainView::Details;
+            }
         }
     }
 
@@ -1289,7 +1285,11 @@ impl Tui {
             PanelFocus::Repos => {
                 self.repo_main_view = view::RepoMainView::Kanban;
             }
-            PanelFocus::Worktrees => {}
+            PanelFocus::Worktrees => {
+                if self.selected_plan_run_id().is_some() {
+                    self.worktree_main_view = view::WorktreeMainView::Plan;
+                }
+            }
         }
     }
 
@@ -1659,11 +1659,12 @@ impl Tui {
         {
             return None;
         }
-        let (repo, scope_path) = self.selected_plan_scope()?;
-        let run_id = self
-            .active_plan_runs
-            .get(&scope_path)
-            .or_else(|| self.active_plan_runs.get(&repo.root))?;
+        if self.focused_panel == PanelFocus::Worktrees
+            && self.worktree_main_view == view::WorktreeMainView::Details
+        {
+            return None;
+        }
+        let (repo, run_id) = self.selected_plan_run_id()?;
         let mut run = self.plan_runs.get(run_id)?.clone();
         if let Some(selected_step) = self.selected_plan_step_by_run.get(run_id).copied() {
             run.run.selected_step = selected_step;
@@ -1693,6 +1694,15 @@ impl Tui {
             output_lines,
             output_state,
         })
+    }
+
+    fn selected_plan_run_id(&self) -> Option<(Repository, &String)> {
+        let (repo, scope_path) = self.selected_plan_scope()?;
+        let run_id = self
+            .active_plan_runs
+            .get(&scope_path)
+            .or_else(|| self.active_plan_runs.get(&repo.root))?;
+        Some((repo, run_id))
     }
 
     fn poll_auto_runs(&mut self) -> bool {
@@ -1791,7 +1801,54 @@ impl Tui {
                 .cursor
                 .min(output_lines.len().saturating_sub(1));
         }
+        let linked_plan_dashboard = run
+            .steps
+            .iter()
+            .find(|step| step.id == selected_step_run_id)
+            .and_then(|step| step.plan_run_id.as_deref())
+            .and_then(|plan_run_id| self.linked_plan_dashboard(&repo, plan_run_id));
         Some(view::AutoDashboard {
+            run,
+            linked_plan_dashboard,
+            output_lines,
+            output_state,
+        })
+    }
+
+    fn linked_plan_dashboard(
+        &self,
+        repo: &Repository,
+        plan_run_id: &str,
+    ) -> Option<view::PlanDashboard> {
+        let mut run = self.plan_runs.get(plan_run_id).cloned().or_else(|| {
+            crate::observability::with_writable_db(repo, |conn| load_plan_run(conn, plan_run_id))
+                .ok()
+                .flatten()
+        })?;
+        if let Some(selected_step) = self.selected_plan_step_by_run.get(plan_run_id).copied() {
+            run.run.selected_step = selected_step;
+        }
+        let output_lines = crate::observability::with_writable_db(repo, |conn| {
+            load_output_lines(conn, &run.run.id, run.run.selected_step)
+        })
+        .unwrap_or_default();
+        let mut output_state = self
+            .plan_output_state_by_run
+            .get(&run.run.id)
+            .cloned()
+            .unwrap_or_else(|| view::PlanOutputViewerState {
+                cursor: output_lines.len().saturating_sub(1),
+                follow: true,
+                expanded_blocks: BTreeSet::new(),
+            });
+        if output_state.follow {
+            output_state.cursor = output_lines.len().saturating_sub(1);
+        } else if !output_lines.is_empty() {
+            output_state.cursor = output_state
+                .cursor
+                .min(output_lines.len().saturating_sub(1));
+        }
+        Some(view::PlanDashboard {
             run,
             output_lines,
             output_state,
@@ -2039,6 +2096,11 @@ impl Tui {
                     .get(session.repo_index)
                     .map(|repo| repo.repo.root.display().to_string())
                     .unwrap_or_default();
+                let auto_status = self
+                    .active_auto_runs
+                    .get(&session.path)
+                    .and_then(|run_id| self.auto_runs.get(run_id))
+                    .map(|run| run.run.status);
                 Some(view::WorktreeRow {
                     session_index: index,
                     repo_root,
@@ -2058,6 +2120,7 @@ impl Tui {
                     agent_state: session.agent_state,
                     pr: session.pr.clone(),
                     wt_columns: session.wt_columns.clone(),
+                    auto_status,
                     unseen_comments: session.unseen_comments,
                     prompt_summary: session.prompt_summary.clone(),
                     selected: Some(index) == self.selected_worktree_index(),
@@ -2086,6 +2149,7 @@ impl Tui {
             selected_session: self.selected_worktree_index(),
             focus: self.focused_panel,
             repo_main_view: self.repo_main_view,
+            worktree_main_view: self.worktree_main_view,
             mode_label: "normal",
             status_message: self.status_message.as_deref(),
             repo_filter: &self.repo_filter,
@@ -2371,13 +2435,15 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::agent::AgentState;
-    use crate::auto_flow::{AutoRun, AutoRunMode, AutoRunStatus, PersistedAutoRun};
+    use crate::auto_flow::{
+        AutoImplementationSource, AutoRun, AutoRunMode, AutoRunStatus, PersistedAutoRun,
+    };
     use crate::config::{Checks, Config, EscapeKey, MergeMethod};
     use crate::github::PrCache;
     use crate::plan_run::{PersistedPlanRun, PlanRun, PlanRunMode, PlanRunStatus};
     use crate::repo::Repository;
     use crate::session::Session;
-    use crate::view::RepoMainView;
+    use crate::view::{RepoMainView, WorktreeMainView};
 
     use super::{ManagedRepo, PanelFocus, Tui, truncate_ansi_dialog_line};
 
@@ -2448,6 +2514,29 @@ mod tests {
 
         assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
         assert_eq!(tui.repo_main_view, RepoMainView::Github);
+    }
+
+    #[test]
+    fn horizontal_keys_switch_worktree_plan_dashboard_view() {
+        let mut tui = test_tui();
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.select_worktree(1);
+        tui.remember_plan_run(test_plan_run("plan", "/repo-one/feature-one"));
+
+        assert_eq!(tui.worktree_main_view, WorktreeMainView::Plan);
+        assert!(tui.current_plan_dashboard().is_some());
+
+        tui.move_left();
+
+        assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
+        assert_eq!(tui.worktree_main_view, WorktreeMainView::Details);
+        assert!(tui.current_plan_dashboard().is_none());
+
+        tui.move_right();
+
+        assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
+        assert_eq!(tui.worktree_main_view, WorktreeMainView::Plan);
+        assert!(tui.current_plan_dashboard().is_some());
     }
 
     #[test]
@@ -2530,6 +2619,9 @@ mod tests {
                 worktree_path: PathBuf::from(worktree_path),
                 branch: "feature".to_string(),
                 mode: AutoRunMode::Standard,
+                implementation_source: AutoImplementationSource::Prompt,
+                plan_path: None,
+                plan_run_mode: PlanRunMode::Sequential,
                 variant: "default".to_string(),
                 agent_profile: None,
                 prompt_summary: id.to_string(),

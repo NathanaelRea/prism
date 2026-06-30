@@ -343,6 +343,10 @@ fn select_plan_file(
     })
 }
 
+pub(crate) fn select_plan_path(cwd: &Path, config: &Config) -> Result<PathBuf, String> {
+    select_plan_file(cwd, config, None).map(|selected| selected.path)
+}
+
 fn resolve_path(cwd: &Path, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
