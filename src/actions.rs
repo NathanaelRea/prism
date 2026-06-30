@@ -1178,6 +1178,7 @@ impl Tui {
         let session_branch = self.sessions[context.session_index].branch.clone();
         if let Some(run_id) = self.active_auto_runs.get(&session_path).cloned() {
             self.load_auto_run_snapshot(&context.repo.root, &run_id);
+            self.selected_auto_run = Some(run_id);
             self.focus_status();
             self.show_message("focused Auto Flow run")?;
             return Ok(());
@@ -1222,7 +1223,9 @@ impl Tui {
         crate::observability::with_writable_db(&context.repo, |conn| {
             save_auto_run(conn, &mut persisted)
         })?;
+        let run_id = persisted.run.id.clone();
         self.remember_auto_run(persisted.clone());
+        self.selected_auto_run = Some(run_id);
         self.spawn_auto_run_executor(context.repo, context.config, persisted);
         self.focus_status();
         self.show_message("started Auto Flow run")?;
@@ -1481,6 +1484,9 @@ impl Tui {
         })?;
         self.auto_runs.remove(&run_id);
         self.active_auto_runs.retain(|_, active| active != &run_id);
+        if self.selected_auto_run.as_deref() == Some(run_id.as_str()) {
+            self.selected_auto_run = None;
+        }
         self.selected_auto_step_by_run.remove(&run_id);
         self.auto_output_state_by_run.remove(&run_id);
         self.show_message("dismissed Auto Flow run")?;

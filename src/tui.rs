@@ -63,6 +63,7 @@ pub struct Tui {
     pub(crate) plan_output_state_by_run: BTreeMap<String, view::PlanOutputViewerState>,
     pub(crate) auto_runs: BTreeMap<String, PersistedAutoRun>,
     pub(crate) active_auto_runs: BTreeMap<PathBuf, String>,
+    pub(crate) selected_auto_run: Option<String>,
     pub(crate) selected_auto_step_by_run: BTreeMap<String, i64>,
     pub(crate) auto_output_state_by_run: BTreeMap<String, view::AutoOutputViewerState>,
     pub(crate) last_plan_poll: Option<Instant>,
@@ -295,6 +296,7 @@ impl Tui {
             plan_output_state_by_run: BTreeMap::new(),
             auto_runs: BTreeMap::new(),
             active_auto_runs: BTreeMap::new(),
+            selected_auto_run: None,
             selected_auto_step_by_run: BTreeMap::new(),
             auto_output_state_by_run: BTreeMap::new(),
             last_plan_poll: None,
@@ -1653,12 +1655,11 @@ impl Tui {
     }
 
     pub(crate) fn current_plan_dashboard(&self) -> Option<view::PlanDashboard> {
-        let (repo, scope_path) = self.selected_plan_scope()?;
-        if self.active_auto_runs.contains_key(&scope_path)
-            && self.focused_panel == PanelFocus::Status
+        if self.focused_panel == PanelFocus::Status && self.selected_status_auto_run_id().is_some()
         {
             return None;
         }
+        let (repo, scope_path) = self.selected_plan_scope()?;
         let run_id = self
             .active_plan_runs
             .get(&scope_path)
@@ -1748,6 +1749,9 @@ impl Tui {
         }
         self.active_auto_runs
             .insert(run.run.worktree_path.clone(), run_id.clone());
+        if self.selected_auto_run.is_none() {
+            self.selected_auto_run = Some(run_id.clone());
+        }
         let changed = self.auto_runs.get(&run_id) != Some(&run);
         self.auto_runs.insert(run_id, run);
         changed
@@ -1804,19 +1808,39 @@ impl Tui {
                 ))
             }
             PanelFocus::Status => {
-                if let Some((path, run_id)) = self.active_auto_runs.iter().next() {
-                    let run = self.auto_runs.get(run_id)?;
-                    return Some((
-                        Repository {
-                            root: PathBuf::from(&run.run.repo_root),
-                        },
-                        path.clone(),
-                    ));
-                }
-                None
+                let run_id = self.selected_status_auto_run_id()?;
+                let run = self.auto_runs.get(run_id)?;
+                Some((
+                    Repository {
+                        root: PathBuf::from(&run.run.repo_root),
+                    },
+                    run.run.worktree_path.clone(),
+                ))
             }
             PanelFocus::Repos => None,
         }
+    }
+
+    fn selected_status_auto_run_id(&self) -> Option<&str> {
+        if let Some(run_id) = self.selected_auto_run.as_deref()
+            && self.auto_runs.contains_key(run_id)
+            && self
+                .active_auto_runs
+                .values()
+                .any(|active| active == run_id)
+        {
+            return Some(run_id);
+        }
+
+        self.active_auto_runs
+            .values()
+            .filter_map(|run_id| {
+                self.auto_runs
+                    .get(run_id)
+                    .map(|run| (run_id.as_str(), run.run.updated_unix_ms))
+            })
+            .max_by_key(|(_, updated_unix_ms)| *updated_unix_ms)
+            .map(|(run_id, _)| run_id)
     }
 
     fn selected_plan_scope(&self) -> Option<(Repository, PathBuf)> {
@@ -2347,8 +2371,10 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::agent::AgentState;
+    use crate::auto_flow::{AutoRun, AutoRunMode, AutoRunStatus, PersistedAutoRun};
     use crate::config::{Checks, Config, EscapeKey, MergeMethod};
     use crate::github::PrCache;
+    use crate::plan_run::{PersistedPlanRun, PlanRun, PlanRunMode, PlanRunStatus};
     use crate::repo::Repository;
     use crate::session::Session;
     use crate::view::RepoMainView;
@@ -2442,6 +2468,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn status_auto_dashboard_uses_selected_run() {
+        let mut tui = test_tui();
+        tui.focused_panel = PanelFocus::Status;
+        tui.remember_auto_run(test_auto_run("run-a", "/repo-one/a-worktree", 10));
+        tui.remember_auto_run(test_auto_run("run-b", "/repo-one/z-worktree", 20));
+        tui.selected_auto_run = Some("run-b".to_string());
+
+        let dashboard = tui.current_auto_dashboard().unwrap();
+
+        assert_eq!(dashboard.run.run.id, "run-b");
+        assert_eq!(
+            dashboard.run.run.worktree_path,
+            PathBuf::from("/repo-one/z-worktree")
+        );
+    }
+
+    #[test]
+    fn status_plan_dashboard_is_hidden_when_auto_run_is_selected() {
+        let mut tui = test_tui();
+        tui.focused_panel = PanelFocus::Status;
+        tui.remember_plan_run(test_plan_run("plan", "/repo-one"));
+        tui.remember_auto_run(test_auto_run("auto", "/repo-one/feature-one", 20));
+        tui.selected_auto_run = Some("auto".to_string());
+
+        assert!(tui.current_plan_dashboard().is_none());
+    }
+
     fn test_tui() -> Tui {
         let repos = vec![
             ManagedRepo::new(
@@ -2466,6 +2520,56 @@ mod tests {
             test_session(1, "/repo-two", "feature-two"),
         ];
         Tui::new(repos, 0, sessions)
+    }
+
+    fn test_auto_run(id: &str, worktree_path: &str, updated_unix_ms: u64) -> PersistedAutoRun {
+        PersistedAutoRun {
+            run: AutoRun {
+                id: id.to_string(),
+                repo_root: "/repo-one".to_string(),
+                worktree_path: PathBuf::from(worktree_path),
+                branch: "feature".to_string(),
+                mode: AutoRunMode::Standard,
+                variant: "default".to_string(),
+                agent_profile: None,
+                prompt_summary: id.to_string(),
+                initial_prompt: String::new(),
+                status: AutoRunStatus::Running,
+                pause_requested: false,
+                selected_step_run_id: None,
+                pr_number: None,
+                pr_url: None,
+                current_head_sha: None,
+                review_baseline_json: None,
+                created_unix_ms: 1,
+                updated_unix_ms,
+                archived_unix_ms: None,
+            },
+            steps: Vec::new(),
+        }
+    }
+
+    fn test_plan_run(id: &str, scope_path: &str) -> PersistedPlanRun {
+        PersistedPlanRun {
+            run: PlanRun {
+                id: id.to_string(),
+                repo_root: "/repo-one".to_string(),
+                scope_path: PathBuf::from(scope_path),
+                plan_path: PathBuf::from("plan.md"),
+                plan_display: "plan.md".to_string(),
+                step_name: "phase".to_string(),
+                start_step: 1,
+                total_steps: 1,
+                mode: PlanRunMode::Sequential,
+                status: PlanRunStatus::Running,
+                pause_requested: false,
+                selected_step: 1,
+                created_unix_ms: 1,
+                updated_unix_ms: 1,
+                archived_unix_ms: None,
+            },
+            steps: Vec::new(),
+        }
     }
 
     fn test_session(repo_index: usize, root: &str, branch: &str) -> Session {

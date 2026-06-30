@@ -258,7 +258,7 @@ fn passes_time_filter(value: &str, after: Option<&str>) -> bool {
     let Some(after) = after else {
         return true;
     };
-    value.is_empty() || value > after
+    value > after
 }
 
 fn render_template(template: &str, values: &[(&str, String)]) -> String {
@@ -407,6 +407,11 @@ mod tests {
                     created_at: "2026-06-14T12:11:00Z".to_string(),
                     ..PrComment::default()
                 },
+                PrComment {
+                    author: "bot".to_string(),
+                    body: "missing timestamp".to_string(),
+                    ..PrComment::default()
+                },
             ],
             reviews: vec![PrReview {
                 author: "bot".to_string(),
@@ -450,7 +455,7 @@ mod tests {
         assert_eq!(feedback.pr_comments[0].body, "new top-level");
         assert!(feedback.review_bodies.is_empty());
         assert_eq!(feedback.skipped_resolved_inline, 1);
-        assert_eq!(feedback.skipped_old, 1);
+        assert_eq!(feedback.skipped_old, 2);
         assert_eq!(feedback.skipped_author, 1);
     }
 
