@@ -105,6 +105,19 @@ run in the main panel from SQLite snapshots. The tmux-backed plan workflow
 remains a compatibility path for CLI/debug use while dashboard parity continues
 to improve.
 
+### Auto Flow
+
+Auto Flow is Prism's persisted workflow for taking one clean, non-default
+Worktree Session from an initial prompt through implementation, local
+verification, PR creation, review repair, CI repair, and eventual merge or
+cleanup.
+
+An Auto Flow run is stored in Prism's per-repository SQLite database as an
+`AutoRun` plus ordered `AutoStepRun` attempts. The `step_key` identifies the
+conceptual boundary, while each attempt gets its own monotonic sequence and
+output rows so repeated verification, review, and CI repairs remain auditable
+after restart.
+
 ### Startup Setup
 
 Startup setup is Prism's first-run or misaligned-checkout prompt for a tracked

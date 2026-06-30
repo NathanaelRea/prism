@@ -20,6 +20,37 @@ pub struct Checks {
     pub review_fix: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoConfig {
+    pub merge: bool,
+    pub cleanup_after_merge: bool,
+    pub review_wait_enabled: bool,
+    pub review_reviewer_identities: Vec<String>,
+    pub review_max_wait_seconds: u64,
+    pub review_poll_interval_seconds: u64,
+    pub review_continue_on_timeout: bool,
+    pub ci_wait_enabled: bool,
+    pub ci_max_wait_seconds: u64,
+    pub ci_poll_interval_seconds: u64,
+}
+
+impl Default for AutoConfig {
+    fn default() -> Self {
+        Self {
+            merge: false,
+            cleanup_after_merge: false,
+            review_wait_enabled: true,
+            review_reviewer_identities: vec!["Copilot".to_string(), "github-copilot".to_string()],
+            review_max_wait_seconds: 300,
+            review_poll_interval_seconds: 30,
+            review_continue_on_timeout: true,
+            ci_wait_enabled: true,
+            ci_max_wait_seconds: 1800,
+            ci_poll_interval_seconds: 30,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EscapeKey {
     EscEsc,
@@ -90,6 +121,7 @@ pub struct Config {
     pub opencode_plan_plugin: bool,
     pub escape_key: EscapeKey,
     pub merge_method: MergeMethod,
+    pub auto: AutoConfig,
     pub checks: Checks,
     pub worktree_columns: Vec<String>,
     pub tools: BTreeMap<String, String>,
@@ -114,6 +146,7 @@ struct RawConfig {
     escape_key: Option<String>,
     merge_method: Option<String>,
     checks: Option<RawChecks>,
+    auto: Option<RawAutoConfig>,
     worktrees: Option<RawWorktrees>,
     tools: Option<BTreeMap<String, String>>,
     agents: Option<BTreeMap<String, RawAgentConfig>>,
@@ -125,6 +158,20 @@ struct RawChecks {
     pre_pr: Option<Vec<String>>,
     pre_push: Option<Vec<String>>,
     review_fix: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawAutoConfig {
+    merge: Option<bool>,
+    cleanup_after_merge: Option<bool>,
+    review_wait_enabled: Option<bool>,
+    review_reviewer_identities: Option<Vec<String>>,
+    review_max_wait_seconds: Option<u64>,
+    review_poll_interval_seconds: Option<u64>,
+    review_continue_on_timeout: Option<bool>,
+    ci_wait_enabled: Option<bool>,
+    ci_max_wait_seconds: Option<u64>,
+    ci_poll_interval_seconds: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -177,6 +224,7 @@ impl Config {
             opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
+            auto: AutoConfig::default(),
             checks: Checks::default(),
             worktree_columns: vec!["url".to_string()],
             tools,
@@ -244,6 +292,38 @@ impl Config {
             }
             if let Some(values) = checks.review_fix {
                 self.checks.review_fix = values;
+            }
+        }
+        if let Some(auto) = raw.auto {
+            if let Some(enabled) = auto.merge {
+                self.auto.merge = enabled;
+            }
+            if let Some(enabled) = auto.cleanup_after_merge {
+                self.auto.cleanup_after_merge = enabled;
+            }
+            if let Some(enabled) = auto.review_wait_enabled {
+                self.auto.review_wait_enabled = enabled;
+            }
+            if let Some(values) = auto.review_reviewer_identities {
+                self.auto.review_reviewer_identities = values;
+            }
+            if let Some(seconds) = auto.review_max_wait_seconds {
+                self.auto.review_max_wait_seconds = seconds;
+            }
+            if let Some(seconds) = auto.review_poll_interval_seconds {
+                self.auto.review_poll_interval_seconds = seconds.max(1);
+            }
+            if let Some(value) = auto.review_continue_on_timeout {
+                self.auto.review_continue_on_timeout = value;
+            }
+            if let Some(enabled) = auto.ci_wait_enabled {
+                self.auto.ci_wait_enabled = enabled;
+            }
+            if let Some(seconds) = auto.ci_max_wait_seconds {
+                self.auto.ci_max_wait_seconds = seconds;
+            }
+            if let Some(seconds) = auto.ci_poll_interval_seconds {
+                self.auto.ci_poll_interval_seconds = seconds.max(1);
             }
         }
         if let Some(worktrees) = raw.worktrees
@@ -329,6 +409,40 @@ pub fn print_config(repo: &Repository, config: &Config) {
     println!("opencode_plan_plugin = {}", config.opencode_plan_plugin);
     println!("escape_key = {}", config.escape_key.label());
     println!("merge_method = {}", config.merge_method.label());
+    println!("auto.merge = {}", config.auto.merge);
+    println!(
+        "auto.cleanup_after_merge = {}",
+        config.auto.cleanup_after_merge
+    );
+    println!(
+        "auto.review_wait_enabled = {}",
+        config.auto.review_wait_enabled
+    );
+    println!(
+        "auto.review_reviewer_identities = {:?}",
+        config.auto.review_reviewer_identities
+    );
+    println!(
+        "auto.review_max_wait_seconds = {}",
+        config.auto.review_max_wait_seconds
+    );
+    println!(
+        "auto.review_poll_interval_seconds = {}",
+        config.auto.review_poll_interval_seconds
+    );
+    println!(
+        "auto.review_continue_on_timeout = {}",
+        config.auto.review_continue_on_timeout
+    );
+    println!("auto.ci_wait_enabled = {}", config.auto.ci_wait_enabled);
+    println!(
+        "auto.ci_max_wait_seconds = {}",
+        config.auto.ci_max_wait_seconds
+    );
+    println!(
+        "auto.ci_poll_interval_seconds = {}",
+        config.auto.ci_poll_interval_seconds
+    );
     println!("worktree_columns = {:?}", config.worktree_columns);
     println!(
         "prompt_templates = {:?}",

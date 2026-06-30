@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use crate::config::Config;
-use crate::process::{run_capture, run_output_allow_failure};
+use crate::process::{run_capture, run_output_allow_failure, run_status};
 use crate::repo::Repository;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -181,13 +181,7 @@ fn fetch_origin(path: &std::path::Path, config: &Config) -> Result<(), String> {
 }
 
 pub fn selected_dirty(path: &std::path::Path, config: &Config) -> Result<bool, String> {
-    let status = run_capture(
-        Command::new(config.tool("git"))
-            .arg("-C")
-            .arg(path)
-            .args(["status", "--short"]),
-    )?;
-    Ok(!status.trim().is_empty())
+    Ok(inspect_dirty(path, config)?.dirty)
 }
 
 pub fn has_upstream(path: &std::path::Path, config: &Config) -> Result<bool, String> {
@@ -199,6 +193,139 @@ pub fn has_upstream(path: &std::path::Path, config: &Config) -> Result<bool, Str
             "@{u}",
         ]))?;
     Ok(upstream.status.success())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DirtyState {
+    pub dirty: bool,
+    pub entries: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct GitCommitResult {
+    pub committed: bool,
+    pub commit_sha: Option<String>,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct GitPushResult {
+    pub branch: String,
+    pub set_upstream: bool,
+}
+
+pub(crate) fn inspect_dirty(path: &std::path::Path, config: &Config) -> Result<DirtyState, String> {
+    let status = run_capture(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["status", "--short"]),
+    )?;
+    let entries = status
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    Ok(DirtyState {
+        dirty: !entries.is_empty(),
+        entries,
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn stage_all(path: &std::path::Path, config: &Config) -> Result<(), String> {
+    run_status(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["add", "-A"]),
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn commit_if_dirty(
+    path: &std::path::Path,
+    config: &Config,
+    message: &str,
+) -> Result<GitCommitResult, String> {
+    if !inspect_dirty(path, config)?.dirty {
+        return Ok(GitCommitResult {
+            committed: false,
+            commit_sha: None,
+            message: "no changes to commit".to_string(),
+        });
+    }
+
+    stage_all(path, config)?;
+    run_status(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["commit", "-m", message]),
+    )?;
+    let commit_sha = current_head_sha(path, config)?;
+    Ok(GitCommitResult {
+        committed: true,
+        commit_sha: Some(commit_sha),
+        message: "committed changes".to_string(),
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn current_head_sha(path: &std::path::Path, config: &Config) -> Result<String, String> {
+    let sha = run_capture(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "HEAD"]),
+    )?;
+    Ok(sha.trim().to_string())
+}
+
+#[allow(dead_code)]
+pub(crate) fn push_current_branch(
+    path: &std::path::Path,
+    config: &Config,
+) -> Result<GitPushResult, String> {
+    let branch = current_branch_name(path, config)?
+        .ok_or_else(|| "cannot push detached HEAD".to_string())?;
+    let set_upstream = !has_upstream(path, config)?;
+    let mut args = vec!["push".to_string()];
+    if set_upstream {
+        args.extend(["-u".to_string(), "origin".to_string(), branch.clone()]);
+    }
+    run_status(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(args),
+    )?;
+    Ok(GitPushResult {
+        branch,
+        set_upstream,
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn current_branch_name(
+    path: &std::path::Path,
+    config: &Config,
+) -> Result<Option<String>, String> {
+    let output = run_capture(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["branch", "--show-current"]),
+    )?;
+    let branch = output.trim();
+    if branch.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(branch.to_string()))
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +431,115 @@ mod tests {
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[test]
+    fn inspect_dirty_reports_untracked_and_modified_entries() {
+        let temp = unique_temp_dir("prism-dirty-state-test");
+        let work = temp.join("work");
+        fs::create_dir_all(&work).unwrap();
+        run_git(&work, &["init"]);
+        configure_user(&work);
+        fs::write(work.join("tracked.txt"), "base\n").unwrap();
+        run_git(&work, &["add", "tracked.txt"]);
+        run_git(&work, &["commit", "-m", "initial"]);
+
+        fs::write(work.join("tracked.txt"), "changed\n").unwrap();
+        fs::write(work.join("untracked.txt"), "new\n").unwrap();
+
+        let state = inspect_dirty(&work, &test_config()).unwrap();
+        assert!(state.dirty);
+        assert!(
+            state
+                .entries
+                .iter()
+                .any(|entry| entry.contains("tracked.txt"))
+        );
+        assert!(
+            state
+                .entries
+                .iter()
+                .any(|entry| entry.contains("untracked.txt"))
+        );
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn commit_if_dirty_skips_clean_worktree() {
+        let temp = unique_temp_dir("prism-empty-commit-test");
+        let work = temp.join("work");
+        fs::create_dir_all(&work).unwrap();
+        run_git(&work, &["init"]);
+        configure_user(&work);
+        fs::write(work.join("tracked.txt"), "base\n").unwrap();
+        run_git(&work, &["add", "tracked.txt"]);
+        run_git(&work, &["commit", "-m", "initial"]);
+
+        let result = commit_if_dirty(&work, &test_config(), "test commit").unwrap();
+        assert!(!result.committed);
+        assert_eq!(result.commit_sha, None);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn commit_if_dirty_stages_and_commits_changes() {
+        let temp = unique_temp_dir("prism-normal-commit-test");
+        let work = temp.join("work");
+        fs::create_dir_all(&work).unwrap();
+        run_git(&work, &["init"]);
+        configure_user(&work);
+        fs::write(work.join("tracked.txt"), "base\n").unwrap();
+        run_git(&work, &["add", "tracked.txt"]);
+        run_git(&work, &["commit", "-m", "initial"]);
+        let before = current_head_sha(&work, &test_config()).unwrap();
+
+        fs::write(work.join("tracked.txt"), "changed\n").unwrap();
+        fs::write(work.join("new.txt"), "new\n").unwrap();
+        let result = commit_if_dirty(&work, &test_config(), "test commit").unwrap();
+
+        assert!(result.committed);
+        let after = result.commit_sha.unwrap();
+        assert_ne!(after, before);
+        assert_eq!(after, current_head_sha(&work, &test_config()).unwrap());
+        assert!(!inspect_dirty(&work, &test_config()).unwrap().dirty);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn push_current_branch_sets_upstream_when_missing() {
+        let temp = unique_temp_dir("prism-push-upstream-test");
+        let origin = temp.join("origin.git");
+        let seed = temp.join("seed");
+        let work = temp.join("work");
+        fs::create_dir_all(&temp).unwrap();
+        run(Command::new("git").args(["init", "--bare"]).arg(&origin));
+        run(Command::new("git").arg("--git-dir").arg(&origin).args([
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ]));
+        run(Command::new("git").arg("clone").arg(&origin).arg(&seed));
+        configure_user(&seed);
+        fs::write(seed.join("tracked.txt"), "base\n").unwrap();
+        run_git(&seed, &["add", "tracked.txt"]);
+        run_git(&seed, &["commit", "-m", "initial"]);
+        run_git(&seed, &["push", "-u", "origin", "main"]);
+        run(Command::new("git").arg("clone").arg(&origin).arg(&work));
+        configure_user(&work);
+        run_git(&work, &["switch", "-c", "feature"]);
+        fs::write(work.join("feature.txt"), "feature\n").unwrap();
+        run_git(&work, &["add", "feature.txt"]);
+        run_git(&work, &["commit", "-m", "feature"]);
+
+        let result = push_current_branch(&work, &test_config()).unwrap();
+        assert_eq!(result.branch, "feature");
+        assert!(result.set_upstream);
+        assert!(has_upstream(&work, &test_config()).unwrap());
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
     fn configure_user(path: &Path) {
         run_git(path, &["config", "user.email", "test@example.com"]);
         run_git(path, &["config", "user.name", "Test User"]);
@@ -341,6 +577,7 @@ mod tests {
             opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
+            auto: crate::config::AutoConfig::default(),
             checks: Checks::default(),
             worktree_columns: vec!["url".to_string()],
             tools,

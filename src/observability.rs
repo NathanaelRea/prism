@@ -891,6 +891,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     crate::session::migrate_worktree_session_schema(conn)?;
     crate::opencode::migrate_runtime_schema(conn)?;
     crate::plan_run::migrate_schema(conn)?;
+    crate::auto_flow::migrate_schema(conn)?;
     crate::github::migrate_pr_cache_schema(conn)?;
     conn.pragma_update(None, "foreign_keys", true)
         .map_err(|error| format!("enable foreign keys: {error}"))?;

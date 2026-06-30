@@ -8,6 +8,11 @@ use std::time::Duration;
 
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionWarmupKey, AgentSessionWarmupResult};
+use crate::auto_flow::{
+    AutoExecutorConfig, AutoLaunch, AutoRunMode, AutoRunStatus, AutoStepStatus, abort_auto_step,
+    append_step_run, archive_auto_run, execute_auto_initial_step, load_auto_run,
+    prepare_auto_run_for_resume, request_auto_run_pause, resume_paused_auto_run, save_auto_run,
+};
 use crate::ci::build_ci_failure_prompt;
 use crate::config::Config;
 use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
@@ -1165,6 +1170,329 @@ impl Tui {
         });
     }
 
+    pub(crate) fn start_or_focus_selected_auto_run(&mut self) -> Result<(), String> {
+        let Some(context) = self.selected_worktree_context() else {
+            return Ok(());
+        };
+        let session_path = self.sessions[context.session_index].path.clone();
+        let session_branch = self.sessions[context.session_index].branch.clone();
+        if let Some(run_id) = self.active_auto_runs.get(&session_path).cloned() {
+            self.load_auto_run_snapshot(&context.repo.root, &run_id);
+            self.selected_auto_run = Some(run_id);
+            self.focus_status();
+            self.show_message("focused Auto Flow run")?;
+            return Ok(());
+        }
+        let is_detached = session_branch == "(detached)";
+        if context.config.is_default_branch(&session_branch) || is_detached {
+            return if is_detached {
+                Err("Auto Flow cannot start on a detached worktree".to_string())
+            } else {
+                Err("Auto Flow cannot start on the default branch".to_string())
+            };
+        }
+        if selected_dirty(&session_path, &context.config)? {
+            return Err("Auto Flow requires a clean worktree at launch".to_string());
+        }
+        let Some(mode_answer) =
+            self.prompt_line_dialog("Auto Flow", "Intensive plan-first mode? [y/N] ", "")?
+        else {
+            return Ok(());
+        };
+        let plan_first = yes(&mode_answer);
+        let Some(prompt) = self.prompt_line_dialog("Auto Flow", "Initial prompt: ", "")? else {
+            return Ok(());
+        };
+        if prompt.trim().is_empty() {
+            return Ok(());
+        }
+        let launch = AutoLaunch::with_options(
+            &context.repo.root,
+            &session_path,
+            session_branch,
+            if plan_first {
+                AutoRunMode::PlanFirst
+            } else {
+                AutoRunMode::Standard
+            },
+            if plan_first { "intensive" } else { "default" },
+            None,
+            prompt.trim().to_string(),
+        )?;
+        let mut persisted = launch.create_run();
+        crate::observability::with_writable_db(&context.repo, |conn| {
+            save_auto_run(conn, &mut persisted)
+        })?;
+        let run_id = persisted.run.id.clone();
+        self.remember_auto_run(persisted.clone());
+        self.selected_auto_run = Some(run_id);
+        self.spawn_auto_run_executor(context.repo, context.config, persisted);
+        self.focus_status();
+        self.show_message("started Auto Flow run")?;
+        Ok(())
+    }
+
+    fn spawn_auto_run_executor(
+        &self,
+        repo: crate::repo::Repository,
+        config: crate::config::Config,
+        mut persisted: crate::auto_flow::PersistedAutoRun,
+    ) {
+        thread::spawn(move || {
+            let worktree_path = persisted.run.worktree_path.clone();
+            let server_url = crate::opencode::ensure_opencode_server(
+                &repo,
+                &config,
+                &persisted.run.branch,
+                &worktree_path,
+            )
+            .ok()
+            .map(|runtime| runtime.server_url);
+            let executor = AutoExecutorConfig::new(
+                config.tool("opencode"),
+                server_url,
+                worktree_path,
+                format!("Auto Flow {}", persisted.run.prompt_summary),
+            );
+            let _ = crate::observability::with_writable_db(&repo, |conn| {
+                execute_auto_initial_step(
+                    conn,
+                    &repo,
+                    &config,
+                    &mut persisted,
+                    &executor,
+                    &mut io::sink(),
+                )
+            });
+        });
+    }
+
+    pub(crate) fn abort_selected_auto_run_or_step(&mut self) -> Result<bool, String> {
+        let Some(dashboard) = self.current_auto_dashboard() else {
+            return Ok(false);
+        };
+        if self.focused_panel != PanelFocus::Status {
+            return Ok(false);
+        }
+        let answer = self.prompt_line_dialog(
+            "Abort Auto Flow",
+            "Abort selected step? Use 'all' for the whole run. [y/N/all] ",
+            "",
+        )?;
+        let Some(answer) = answer else {
+            return Ok(true);
+        };
+        if !answer.trim().eq_ignore_ascii_case("all") && !yes(&answer) {
+            return Ok(true);
+        }
+        let repo = Repository {
+            root: PathBuf::from(&dashboard.run.run.repo_root),
+        };
+        let run_id = dashboard.run.run.id.clone();
+        crate::observability::with_writable_db(&repo, |conn| {
+            let mut run = load_auto_run(conn, &run_id)?
+                .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
+            if answer.trim().eq_ignore_ascii_case("all") {
+                for step in &mut run.steps {
+                    if matches!(
+                        step.status,
+                        AutoStepStatus::Queued
+                            | AutoStepStatus::Starting
+                            | AutoStepStatus::Running
+                            | AutoStepStatus::Waiting
+                    ) {
+                        if matches!(
+                            step.status,
+                            AutoStepStatus::Starting | AutoStepStatus::Running
+                        ) {
+                            let _ = abort_auto_step(conn, step);
+                        } else {
+                            step.status = AutoStepStatus::Aborted;
+                            step.finished_unix_ms = Some(crate::auto_flow::unix_ms());
+                        }
+                    }
+                }
+                run.run.status = AutoRunStatus::Aborted;
+                run.run.pause_requested = false;
+            } else {
+                let selected = run
+                    .run
+                    .selected_step_run_id
+                    .or_else(|| run.steps.first().and_then(|step| step.id))
+                    .ok_or_else(|| "auto flow run has no selected step".to_string())?;
+                let step = run
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.id == Some(selected))
+                    .ok_or_else(|| format!("auto flow step not found: {selected}"))?;
+                if matches!(
+                    step.status,
+                    AutoStepStatus::Starting | AutoStepStatus::Running
+                ) {
+                    abort_auto_step(conn, step)?;
+                } else {
+                    step.status = AutoStepStatus::Aborted;
+                    step.finished_unix_ms = Some(crate::auto_flow::unix_ms());
+                }
+                run.run.status = run.aggregate_status();
+            }
+            save_auto_run(conn, &mut run)
+        })?;
+        self.load_auto_run_snapshot(&repo.root, &run_id);
+        self.show_message("abort recorded for Auto Flow")?;
+        Ok(true)
+    }
+
+    pub(crate) fn retry_failed_auto_step(&mut self) -> Result<bool, String> {
+        let Some(dashboard) = self.current_auto_dashboard() else {
+            return Ok(false);
+        };
+        if self.focused_panel != PanelFocus::Status {
+            return Ok(false);
+        }
+        let repo = Repository {
+            root: PathBuf::from(&dashboard.run.run.repo_root),
+        };
+        let config = Config::load(&repo);
+        let run_id = dashboard.run.run.id.clone();
+        let persisted = crate::observability::with_writable_db(&repo, |conn| {
+            let mut run = load_auto_run(conn, &run_id)?
+                .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
+            let step_key = run
+                .steps
+                .iter()
+                .rev()
+                .find(|step| {
+                    matches!(
+                        step.status,
+                        AutoStepStatus::Failed | AutoStepStatus::Aborted
+                    )
+                })
+                .map(|step| step.step_key.clone())
+                .ok_or_else(|| "auto flow run has no failed step to retry".to_string())?;
+            append_step_run(conn, &mut run, step_key, Some("manual retry".to_string()))?;
+            Ok(run)
+        })?;
+        self.remember_auto_run(persisted.clone());
+        self.spawn_auto_run_executor(repo, config, persisted);
+        self.show_message("retrying Auto Flow step")?;
+        Ok(true)
+    }
+
+    pub(crate) fn retry_auto_from_selected_step(&mut self) -> Result<bool, String> {
+        let Some(dashboard) = self.current_auto_dashboard() else {
+            return Ok(false);
+        };
+        if self.focused_panel != PanelFocus::Status {
+            return Ok(false);
+        }
+        let selected = dashboard
+            .run
+            .run
+            .selected_step_run_id
+            .or_else(|| dashboard.run.steps.first().and_then(|step| step.id));
+        let Some(selected) = selected else {
+            return Ok(true);
+        };
+        let answer =
+            self.prompt_line_dialog("Retry Auto Flow", "Retry from selected step? [y/N] ", "")?;
+        if !answer.as_deref().map(yes).unwrap_or(false) {
+            return Ok(true);
+        }
+        let repo = Repository {
+            root: PathBuf::from(&dashboard.run.run.repo_root),
+        };
+        let config = Config::load(&repo);
+        let run_id = dashboard.run.run.id.clone();
+        let persisted = crate::observability::with_writable_db(&repo, |conn| {
+            let mut run = load_auto_run(conn, &run_id)?
+                .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
+            let step_key = run
+                .steps
+                .iter()
+                .find(|step| step.id == Some(selected))
+                .map(|step| step.step_key.clone())
+                .ok_or_else(|| format!("auto flow step not found: {selected}"))?;
+            append_step_run(
+                conn,
+                &mut run,
+                step_key,
+                Some("manual retry from selected step".to_string()),
+            )?;
+            Ok(run)
+        })?;
+        self.remember_auto_run(persisted.clone());
+        self.spawn_auto_run_executor(repo, config, persisted);
+        self.show_message("retrying Auto Flow from selected step")?;
+        Ok(true)
+    }
+
+    pub(crate) fn toggle_selected_auto_pause(&mut self) -> Result<bool, String> {
+        let Some(dashboard) = self.current_auto_dashboard() else {
+            return Ok(false);
+        };
+        if self.focused_panel != PanelFocus::Status {
+            return Ok(false);
+        }
+        let repo = Repository {
+            root: PathBuf::from(&dashboard.run.run.repo_root),
+        };
+        let config = Config::load(&repo);
+        let run_id = dashboard.run.run.id.clone();
+        let mut should_execute = false;
+        let persisted = crate::observability::with_writable_db(&repo, |conn| {
+            let mut run = load_auto_run(conn, &run_id)?
+                .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
+            if run.run.pause_requested || run.run.status == AutoRunStatus::Paused {
+                resume_paused_auto_run(conn, &mut run)?;
+                should_execute =
+                    prepare_auto_run_for_resume(conn, &mut run, DEFAULT_OUTPUT_LINES_PER_STEP)?;
+            } else {
+                request_auto_run_pause(conn, &mut run)?;
+            }
+            Ok(run)
+        })?;
+        self.remember_auto_run(persisted.clone());
+        if persisted.run.pause_requested || persisted.run.status == AutoRunStatus::Paused {
+            self.show_message("Auto Flow will pause before the next step")?;
+        } else {
+            if should_execute {
+                self.spawn_auto_run_executor(repo, config, persisted);
+                self.show_message("resumed Auto Flow run")?;
+            } else {
+                self.show_message("Auto Flow has no queued agent step")?;
+            }
+        }
+        Ok(true)
+    }
+
+    pub(crate) fn dismiss_selected_auto_run(&mut self) -> Result<bool, String> {
+        let Some(dashboard) = self.current_auto_dashboard() else {
+            return Ok(false);
+        };
+        if self.focused_panel != PanelFocus::Status {
+            return Ok(false);
+        }
+        let repo = Repository {
+            root: PathBuf::from(&dashboard.run.run.repo_root),
+        };
+        let run_id = dashboard.run.run.id.clone();
+        crate::observability::with_writable_db(&repo, |conn| {
+            let mut run = load_auto_run(conn, &run_id)?
+                .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
+            archive_auto_run(conn, &mut run)
+        })?;
+        self.auto_runs.remove(&run_id);
+        self.active_auto_runs.retain(|_, active| active != &run_id);
+        if self.selected_auto_run.as_deref() == Some(run_id.as_str()) {
+            self.selected_auto_run = None;
+        }
+        self.selected_auto_step_by_run.remove(&run_id);
+        self.auto_output_state_by_run.remove(&run_id);
+        self.show_message("dismissed Auto Flow run")?;
+        Ok(true)
+    }
+
     pub(crate) fn abort_selected_plan_run_or_step(&mut self) -> Result<bool, String> {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return Ok(false);
@@ -1450,12 +1778,27 @@ impl Tui {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
-        if self.sessions[context.session_index].is_default_branch(&context.config) {
+        let selected = context.session_index;
+        if self.sessions[selected].is_default_branch(&context.config) {
             self.show_message("default branch has no PR review comments")?;
             return Ok(());
         }
-        let prompt =
-            build_review_fix_prompt(&self.sessions[context.session_index], &context.config)?;
+        self.show_loading_dialog(
+            "Review Fix Prompt",
+            "Refreshing pull request review details",
+        )?;
+        {
+            let session = &mut self.sessions[selected];
+            refresh_branch_pr_cache(
+                &context.repo,
+                &context.config,
+                &session.branch,
+                &session.path,
+                &mut session.pr,
+                true,
+            );
+        }
+        let prompt = build_review_fix_prompt(&self.sessions[selected], &context.config)?;
         copy_to_clipboard(&context.config, &prompt)?;
         self.show_message("review-fix prompt copied to clipboard")?;
         Ok(())
@@ -2062,7 +2405,7 @@ mod tests {
     use crate::agent::AgentState;
     use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
     use crate::config::{Checks, Config, EscapeKey, MergeMethod};
-    use crate::github::{PrCache, pr_summary_or_error};
+    use crate::github::{PrCache, PrComment, PrDetails, PrSummary, pr_summary_or_error};
     use crate::repo::Repository;
     use crate::session::Session;
     use crate::tui::Tui;
@@ -2149,6 +2492,120 @@ exit 0
             started.elapsed()
         );
         assert_eq!(fs::read_to_string(&copied).unwrap(), "review prompt");
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn review_fix_refreshes_pr_details_before_copying_prompt() {
+        let temp = unique_temp_dir("prism-review-fix-refresh-test");
+        let repo_root = temp.join("repo");
+        let worktree = repo_root.join("feature");
+        fs::create_dir_all(&worktree).unwrap();
+        let copied = temp.join("copied.txt");
+        let gh = temp.join("gh");
+        let git = temp.join("git");
+        let clipboard = temp.join("wl-copy");
+
+        fs::write(
+            &gh,
+            r#"#!/bin/sh
+case "$*" in
+  "pr view feature --json comments,reviews,files,statusCheckRollup")
+    cat <<'JSON'
+{"comments":[{"id":"PRC_fresh","author":{"login":"reviewer"},"body":"fresh top-level comment","createdAt":"2026-06-14T12:00:00Z"}],"reviews":[{"id":"PRR_fresh","author":{"login":"bot"},"state":"CHANGES_REQUESTED","body":"fresh review body","submittedAt":"2026-06-14T12:01:00Z"}],"files":[],"statusCheckRollup":{"contexts":{"nodes":[]}}}
+JSON
+    ;;
+  api\ graphql*)
+    cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}
+JSON
+    ;;
+  *)
+    cat <<'JSON'
+{"number":42,"title":"Review refresh","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"CHANGES_REQUESTED","reviewRequests":{"nodes":[]},"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","updatedAt":"2026-06-14T12:02:00Z","comments":{"totalCount":2},"statusCheckRollup":{"contexts":{"nodes":[]}},"isDraft":false}
+JSON
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &git,
+            r#"#!/bin/sh
+case "$*" in
+  *"remote get-url origin"*)
+    echo "https://github.com/example/repo.git"
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &clipboard,
+            format!(
+                r#"#!/bin/sh
+cat > '{}'
+"#,
+                copied.display()
+            ),
+        )
+        .unwrap();
+        for executable in [&gh, &git, &clipboard] {
+            let mut permissions = fs::metadata(executable).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(executable, permissions).unwrap();
+        }
+
+        let mut config = test_config();
+        config.default_base = Some("main".to_string());
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        config
+            .tools
+            .insert("wl-copy".to_string(), clipboard.display().to_string());
+        let repo = Repository::with_config_dir_for_test(repo_root.clone(), temp.join("config"));
+        let mut session = test_session(worktree, "feature");
+        session.pr = PrCache {
+            summary: Some(PrSummary {
+                number: 42,
+                title: "Stale review".to_string(),
+                body: String::new(),
+                url: "https://github.com/example/repo/pull/42".to_string(),
+                state: "OPEN".to_string(),
+                review_decision: "CHANGES_REQUESTED".to_string(),
+                requested_reviewers: Vec::new(),
+                head_ref: "feature".to_string(),
+                base_ref: "main".to_string(),
+                head_sha: "oldsha".to_string(),
+                updated_at: "2026-06-14T11:00:00Z".to_string(),
+                check_status: "unknown".to_string(),
+                comment_count: 1,
+                merged: false,
+                draft: false,
+            }),
+            details: Some(PrDetails {
+                comments: vec![PrComment {
+                    author: "reviewer".to_string(),
+                    body: "stale cached comment".to_string(),
+                    ..PrComment::default()
+                }],
+                ..PrDetails::default()
+            }),
+            ..PrCache::default()
+        };
+        let mut tui = Tui::new_single(repo, config, vec![session]);
+
+        tui.start_review_fix().unwrap();
+
+        let prompt = fs::read_to_string(&copied).unwrap();
+        assert!(prompt.contains("fresh top-level comment"));
+        assert!(prompt.contains("fresh review body"));
+        assert!(!prompt.contains("stale cached comment"));
+
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -2585,6 +3042,7 @@ exit 0
             opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
+            auto: crate::config::AutoConfig::default(),
             checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools: BTreeMap::new(),

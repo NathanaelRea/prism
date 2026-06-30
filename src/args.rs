@@ -19,9 +19,16 @@ pub enum CommandKind {
     Version,
     Doctor,
     Config,
+    Auto(AutoCommand),
     RunPlan(Option<PathBuf>),
     Debug(DebugCommand),
     Db(DbCommand),
+}
+
+#[derive(Debug)]
+pub struct AutoCommand {
+    pub plan_first: bool,
+    pub prompt: Option<String>,
 }
 
 #[derive(Debug)]
@@ -74,6 +81,17 @@ impl Args {
                 }
                 "doctor" => command = CommandKind::Doctor,
                 "config" => command = CommandKind::Config,
+                "auto" => {
+                    let first = iter.next().map(|arg| arg.to_string_lossy().to_string());
+                    let (plan_first, prompt) = match first.as_deref() {
+                        Some("plan") | Some("plan-first") | Some("intensive") => (
+                            true,
+                            iter.next().map(|arg| arg.to_string_lossy().to_string()),
+                        ),
+                        _ => (false, first),
+                    };
+                    command = CommandKind::Auto(AutoCommand { plan_first, prompt });
+                }
                 "run-plan" | "plan" => {
                     command = CommandKind::RunPlan(iter.next().map(PathBuf::from));
                 }
@@ -120,5 +138,5 @@ impl Args {
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>"
+    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config\n  prism [--repo <path>] auto [prompt]\n  prism [--repo <path>] auto plan [prompt]\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>"
 }
