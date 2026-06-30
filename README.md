@@ -10,7 +10,7 @@
 
 Prism is a terminal board for running agent-backed coding sessions across Git worktrees.
 
-It gives you one place to mange local worktrees in different stages of progress, watch GH PR comments and CI status. It uses tmux as the backbone for persistent OpenCode runs in the background, and enables you to quickly switch between sessions.
+It gives you one place to manage local worktrees in different stages of progress, watch GH PR comments and CI status. It uses tmux as the backbone for persistent OpenCode runs in the background, and enables you to quickly switch between sessions.
 
 ## Demo
 
@@ -18,13 +18,13 @@ It gives you one place to mange local worktrees in different stages of progress,
 
 ## What it enables
 
-It's basically a local dashboard to manage agent implementation. From planning, implementaiton, PR, CI checks, CR comments and fixes. All this for different things in different stages or progress.
+It's basically a local dashboard to manage agent implementation. From planning, impl, PR, CI checks, CR comments and fixes. All this for different things in different stages or progress.
 
 - Work on multiple worktrees at once without juggling terminal tabs.
 - Keep each task in its own Git worktree and tmux-backed agent session.
 - See repository, worktree, pull request, CI, and agent state in one TUI.
 - Kick off repeatable agent flows for implementation, review repair, CI repair, and merge readiness.
-- Kick off automatic flows from prompt or plan to reviewed and CI validated pre-merge
+- Kick off automatic flows from prompt or plan through reviewed and CI-validated ready to merge PR
 
 ## Prerequisites
 
