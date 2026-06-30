@@ -30,4 +30,14 @@ columns = ["url", "ci"]
 
 [tools]
 opencode = "opencode"
+
+[prompt_templates]
+review_fix = "Here are review comments on PR {pr_number}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n{comments}"
+ci_failure = "Here are CI failures on PR {pr_number}.\n\nFix the failing checks. Use the log tails below as the primary clues.\n\nPR: {url}\nBranch: {branch}\nHead SHA: {head_sha}\n\n---\n\n{failures}"
 ```
+
+Prism treats `main` as the default branch by default. The default branch is not polled or shown as a pull request branch.
+
+Prism uses squash merges for pull requests by default. Set `merge_method` to `merge` or `rebase` if a repository requires a different GitHub merge method.
+
+Prism manages one local OpenCode server per worktree session. `opencode_port_base` and `opencode_port_span` define the deterministic local port range used for those servers. By default Prism keeps servers warm after the TUI exits; set `opencode_shutdown_owned_servers = true` to send SIGTERM to OpenCode servers that Prism spawned during the session.
