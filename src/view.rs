@@ -29,6 +29,7 @@ pub(crate) struct FrameModel<'a> {
     pub selected_session: Option<usize>,
     pub focus: PanelFocus,
     pub repo_main_view: RepoMainView,
+    pub worktree_main_view: WorktreeMainView,
     pub mode_label: &'a str,
     pub status_message: Option<&'a str>,
     pub repo_filter: &'a str,
@@ -97,6 +98,12 @@ pub(crate) struct PlanOutputViewerState {
 pub(crate) enum RepoMainView {
     Github,
     Kanban,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorktreeMainView {
+    Details,
+    Plan,
 }
 
 impl RepoMainView {
@@ -364,6 +371,10 @@ fn footer_actions(model: &FrameModel<'_>) -> String {
                 return "c create  / search".to_string();
             };
             let mut actions = vec!["<Space> for more options"];
+            if model.plan_dashboard.is_some() || model.worktree_main_view == WorktreeMainView::Plan
+            {
+                actions.push("h/l view");
+            }
             if row.kind != WorktreeKind::DefaultBranch {
                 actions.insert(0, "Enter open");
             }
@@ -2627,8 +2638,8 @@ mod tests {
 
     use super::{
         AutoDashboard, AutoOutputViewerState, FrameModel, PlanDashboard, RepoMainView, RepoRow,
-        StatusRow, WorktreeKind, WorktreeRow, configured_column_label, format_column_value,
-        format_plan_rendered_output_row, format_repo_row, format_worktree_row,
+        StatusRow, WorktreeKind, WorktreeMainView, WorktreeRow, configured_column_label,
+        format_column_value, format_plan_rendered_output_row, format_repo_row, format_worktree_row,
         git_status_indicator, render_model_frame, render_plan_output_rows,
         selected_rendered_output_index, visible_len, worktree_status_icons,
     };
@@ -3540,6 +3551,7 @@ mod tests {
             selected_session: Some(1),
             focus: PanelFocus::Worktrees,
             repo_main_view: RepoMainView::Github,
+            worktree_main_view: WorktreeMainView::Details,
             mode_label: "normal",
             status_message: None,
             repo_filter: "",
@@ -3717,6 +3729,7 @@ mod tests {
             selected_session,
             focus,
             repo_main_view: RepoMainView::Github,
+            worktree_main_view: WorktreeMainView::Details,
             mode_label: "normal",
             status_message,
             repo_filter: "",

@@ -36,6 +36,7 @@ pub struct Tui {
     pub(crate) selected_repo_root: Option<PathBuf>,
     pub(crate) focused_panel: PanelFocus,
     pub(crate) repo_main_view: view::RepoMainView,
+    pub(crate) worktree_main_view: view::WorktreeMainView,
     pub(crate) selected_worktree_by_repo: BTreeMap<PathBuf, PathBuf>,
     pub(crate) pr_poll_tx: Sender<PrPollResult>,
     pub(crate) pr_poll_rx: Receiver<PrPollResult>,
@@ -269,6 +270,7 @@ impl Tui {
             selected_repo_root: None,
             focused_panel: PanelFocus::Repos,
             repo_main_view: view::RepoMainView::Github,
+            worktree_main_view: view::WorktreeMainView::Plan,
             selected_worktree_by_repo: BTreeMap::new(),
             pr_poll_tx,
             pr_poll_rx,
@@ -811,7 +813,7 @@ impl Tui {
         let items = [
             "1 / 2 / 3    focus status / repos / worktrees",
             "Tab          move focus between panels",
-            "h/l, left/right arrows  repos: switch view; status plan: switch phase",
+            "h/l, left/right arrows  repos/worktrees: switch view; status plan: switch phase",
             "Space Space  status: open current plan phase tmux window 1 if available; repos: focus worktrees; worktrees: open agent if valid",
             "Enter        status: focus repos; repos: focus worktrees; worktrees: open agent if valid",
             "Space Enter  open tmux window 3: terminal",
@@ -1269,7 +1271,9 @@ impl Tui {
             PanelFocus::Repos => {
                 self.repo_main_view = view::RepoMainView::Github;
             }
-            PanelFocus::Worktrees => {}
+            PanelFocus::Worktrees => {
+                self.worktree_main_view = view::WorktreeMainView::Details;
+            }
         }
     }
 
@@ -1281,7 +1285,11 @@ impl Tui {
             PanelFocus::Repos => {
                 self.repo_main_view = view::RepoMainView::Kanban;
             }
-            PanelFocus::Worktrees => {}
+            PanelFocus::Worktrees => {
+                if self.selected_plan_run_id().is_some() {
+                    self.worktree_main_view = view::WorktreeMainView::Plan;
+                }
+            }
         }
     }
 
@@ -1651,11 +1659,12 @@ impl Tui {
         {
             return None;
         }
-        let (repo, scope_path) = self.selected_plan_scope()?;
-        let run_id = self
-            .active_plan_runs
-            .get(&scope_path)
-            .or_else(|| self.active_plan_runs.get(&repo.root))?;
+        if self.focused_panel == PanelFocus::Worktrees
+            && self.worktree_main_view == view::WorktreeMainView::Details
+        {
+            return None;
+        }
+        let (repo, run_id) = self.selected_plan_run_id()?;
         let mut run = self.plan_runs.get(run_id)?.clone();
         if let Some(selected_step) = self.selected_plan_step_by_run.get(run_id).copied() {
             run.run.selected_step = selected_step;
@@ -1685,6 +1694,15 @@ impl Tui {
             output_lines,
             output_state,
         })
+    }
+
+    fn selected_plan_run_id(&self) -> Option<(Repository, &String)> {
+        let (repo, scope_path) = self.selected_plan_scope()?;
+        let run_id = self
+            .active_plan_runs
+            .get(&scope_path)
+            .or_else(|| self.active_plan_runs.get(&repo.root))?;
+        Some((repo, run_id))
     }
 
     fn poll_auto_runs(&mut self) -> bool {
@@ -2131,6 +2149,7 @@ impl Tui {
             selected_session: self.selected_worktree_index(),
             focus: self.focused_panel,
             repo_main_view: self.repo_main_view,
+            worktree_main_view: self.worktree_main_view,
             mode_label: "normal",
             status_message: self.status_message.as_deref(),
             repo_filter: &self.repo_filter,
@@ -2424,7 +2443,7 @@ mod tests {
     use crate::plan_run::{PersistedPlanRun, PlanRun, PlanRunMode, PlanRunStatus};
     use crate::repo::Repository;
     use crate::session::Session;
-    use crate::view::RepoMainView;
+    use crate::view::{RepoMainView, WorktreeMainView};
 
     use super::{ManagedRepo, PanelFocus, Tui, truncate_ansi_dialog_line};
 
@@ -2495,6 +2514,29 @@ mod tests {
 
         assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
         assert_eq!(tui.repo_main_view, RepoMainView::Github);
+    }
+
+    #[test]
+    fn horizontal_keys_switch_worktree_plan_dashboard_view() {
+        let mut tui = test_tui();
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.select_worktree(1);
+        tui.remember_plan_run(test_plan_run("plan", "/repo-one/feature-one"));
+
+        assert_eq!(tui.worktree_main_view, WorktreeMainView::Plan);
+        assert!(tui.current_plan_dashboard().is_some());
+
+        tui.move_left();
+
+        assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
+        assert_eq!(tui.worktree_main_view, WorktreeMainView::Details);
+        assert!(tui.current_plan_dashboard().is_none());
+
+        tui.move_right();
+
+        assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
+        assert_eq!(tui.worktree_main_view, WorktreeMainView::Plan);
+        assert!(tui.current_plan_dashboard().is_some());
     }
 
     #[test]

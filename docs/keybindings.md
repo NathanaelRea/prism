@@ -6,7 +6,7 @@ Prism uses a lazygit-style panel model.
 - `2` focuses Repos.
 - `3` focuses Worktrees / Sessions.
 - `Tab` cycles focus between panels.
-- `h` / `l` or left/right switches horizontal views in the Repos panel.
+- `h` / `l` or left/right switches horizontal views in the Repos panel, and switches the Worktrees main panel between details and the active plan dashboard when a plan run exists.
 - `j` / `k` or up/down moves within the focused row panel.
 - `Space Space` opens tmux window 1 for the current plan phase from Status when available; otherwise it focuses the next useful panel or opens the selected agent from Worktrees when valid.
 - `Space Enter` or `Ctrl-/` opens tmux window 3: terminal.
