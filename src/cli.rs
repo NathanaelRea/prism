@@ -1,11 +1,15 @@
-use crate::args::{self, Args, CommandKind, DbCommand, DebugCommand};
+use crate::args::{
+    self, Args, AutoCommand, AutoCommandSource, CommandKind, DbCommand, DebugCommand,
+};
 use crate::auto_flow::{
-    AutoExecutorConfig, AutoLaunch, AutoRunMode, execute_auto_initial_step,
-    load_recent_active_runs_for_repo, prepare_auto_run_for_resume, save_auto_run,
+    AutoExecutorConfig, AutoImplementationSource, AutoLaunch, AutoLaunchOptions, AutoRunMode,
+    execute_auto_initial_step, load_recent_active_runs_for_repo, prepare_auto_run_for_resume,
+    save_auto_run,
 };
 use crate::config::Config;
 use crate::git::{current_branch_name, selected_dirty};
 use crate::observability::{self, LogLevel, ObserverOptions};
+use crate::plan_run::PlanRunMode;
 use crate::repo::Repository;
 use crate::tui::ManagedRepo;
 use crate::{config, plan, session, setup, tui, workspace};
@@ -47,7 +51,7 @@ pub fn run() -> Result<(), String> {
         }
         CommandKind::Auto(command) => {
             let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
-            run_auto_command(&repo, &config, command.plan_first, command.prompt)
+            run_auto_command(&repo, &config, command)
         }
         CommandKind::Debug(command) => {
             let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;
@@ -158,8 +162,7 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
 fn run_auto_command(
     repo: &Repository,
     config: &Config,
-    plan_first: bool,
-    prompt: Option<String>,
+    mut command: AutoCommand,
 ) -> Result<(), String> {
     let existing = observability::with_writable_db(repo, |conn| {
         load_recent_active_runs_for_repo(conn, &repo.root, 1)
@@ -183,6 +186,7 @@ fn run_auto_command(
         );
         return Ok(());
     }
+    validate_auto_command_before_launch(repo, &mut command)?;
     let branch = current_branch_name(&repo.root, config)?
         .ok_or_else(|| "Auto Flow cannot start on detached HEAD".to_string())?;
     if config.is_default_branch(&branch) {
@@ -191,25 +195,8 @@ fn run_auto_command(
     if selected_dirty(&repo.root, config)? {
         return Err("Auto Flow requires a clean worktree at launch".to_string());
     }
-    let initial_prompt = prompt
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "prism auto requires an initial prompt for a new run".to_string())?;
-    let mode = if plan_first {
-        AutoRunMode::PlanFirst
-    } else {
-        AutoRunMode::Standard
-    };
-    let launch = AutoLaunch::with_options(
-        &repo.root,
-        &repo.root,
-        branch,
-        mode,
-        if plan_first { "intensive" } else { "default" },
-        None,
-        initial_prompt.to_string(),
-    )?;
+    let launch_options = auto_launch_options_for_command(repo, branch, command)?;
+    let launch = AutoLaunch::with_options(&repo.root, &repo.root, launch_options)?;
     let mut persisted = launch.create_run();
     observability::with_writable_db(repo, |conn| save_auto_run(conn, &mut persisted))?;
     run_auto_executor(repo, config, &mut persisted)?;
@@ -220,6 +207,101 @@ fn run_auto_command(
         persisted.run.worktree_path.display()
     );
     Ok(())
+}
+
+fn validate_auto_command_before_launch(
+    repo: &Repository,
+    command: &mut AutoCommand,
+) -> Result<(), String> {
+    if command.source != AutoCommandSource::ExistingPlan {
+        return Ok(());
+    }
+    let plan_path = command
+        .plan_path
+        .as_deref()
+        .ok_or_else(|| "auto run-plan requires a plan path".to_string())?;
+    let plan_path = resolve_cli_plan_path(&repo.root, plan_path);
+    let total = plan::infer_total_phases(&plan_path)?;
+    if total == 0 {
+        return Err("could not infer phases; add headings like 'Phase 1'".to_string());
+    }
+    command.plan_path = Some(plan_path);
+    Ok(())
+}
+
+fn auto_launch_options_for_command(
+    repo: &Repository,
+    branch: String,
+    command: AutoCommand,
+) -> Result<AutoLaunchOptions, String> {
+    match command.source {
+        AutoCommandSource::Prompt => {
+            let initial_prompt = command
+                .prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| "prism auto requires an initial prompt for a new run".to_string())?;
+            Ok(AutoLaunchOptions {
+                branch,
+                mode: AutoRunMode::Standard,
+                implementation_source: AutoImplementationSource::Prompt,
+                plan_path: None,
+                plan_run_mode: PlanRunMode::Sequential,
+                variant: "default".to_string(),
+                agent_profile: None,
+                initial_prompt: initial_prompt.to_string(),
+            })
+        }
+        AutoCommandSource::ExistingPlan => {
+            let plan_path = command
+                .plan_path
+                .ok_or_else(|| "auto run-plan requires a plan path".to_string())?;
+            let plan_path = resolve_cli_plan_path(&repo.root, &plan_path);
+            let total = plan::infer_total_phases(&plan_path)?;
+            if total == 0 {
+                return Err("could not infer phases; add headings like 'Phase 1'".to_string());
+            }
+            Ok(AutoLaunchOptions {
+                branch,
+                mode: AutoRunMode::Standard,
+                implementation_source: AutoImplementationSource::ExistingPlan,
+                plan_path: Some(plan_path.clone()),
+                plan_run_mode: PlanRunMode::Sequential,
+                variant: "plan".to_string(),
+                agent_profile: None,
+                initial_prompt: format!("Run plan phases from {}", plan_path.display()),
+            })
+        }
+        AutoCommandSource::DraftPlan => {
+            let initial_prompt = command
+                .prompt
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    "prism auto plan requires a task prompt for a new run".to_string()
+                })?;
+            Ok(AutoLaunchOptions {
+                branch,
+                mode: AutoRunMode::PlanFirst,
+                implementation_source: AutoImplementationSource::DraftPlan,
+                plan_path: Some(repo.root.join("plan.md")),
+                plan_run_mode: PlanRunMode::Sequential,
+                variant: "draft-plan".to_string(),
+                agent_profile: None,
+                initial_prompt: initial_prompt.to_string(),
+            })
+        }
+    }
+}
+
+fn resolve_cli_plan_path(cwd: &std::path::Path, path: &std::path::Path) -> std::path::PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
 }
 
 fn run_auto_executor(

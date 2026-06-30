@@ -12,7 +12,7 @@ pub struct Args {
     pub command: CommandKind,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum CommandKind {
     Tui,
     Help,
@@ -25,13 +25,21 @@ pub enum CommandKind {
     Db(DbCommand),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct AutoCommand {
-    pub plan_first: bool,
+    pub source: AutoCommandSource,
     pub prompt: Option<String>,
+    pub plan_path: Option<PathBuf>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoCommandSource {
+    Prompt,
+    ExistingPlan,
+    DraftPlan,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub enum DebugCommand {
     Paths,
     Info,
@@ -39,7 +47,7 @@ pub enum DebugCommand {
     Startup,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum DbCommand {
     Path,
     Query(String),
@@ -83,14 +91,29 @@ impl Args {
                 "config" => command = CommandKind::Config,
                 "auto" => {
                     let first = iter.next().map(|arg| arg.to_string_lossy().to_string());
-                    let (plan_first, prompt) = match first.as_deref() {
+                    let (source, prompt, plan_path) = match first.as_deref() {
+                        Some("run-plan") => {
+                            let path = iter
+                                .next()
+                                .ok_or_else(|| "auto run-plan requires a plan path".to_string())?;
+                            (
+                                AutoCommandSource::ExistingPlan,
+                                None,
+                                Some(PathBuf::from(path)),
+                            )
+                        }
                         Some("plan") | Some("plan-first") | Some("intensive") => (
-                            true,
+                            AutoCommandSource::DraftPlan,
                             iter.next().map(|arg| arg.to_string_lossy().to_string()),
+                            None,
                         ),
-                        _ => (false, first),
+                        _ => (AutoCommandSource::Prompt, first, None),
                     };
-                    command = CommandKind::Auto(AutoCommand { plan_first, prompt });
+                    command = CommandKind::Auto(AutoCommand {
+                        source,
+                        prompt,
+                        plan_path,
+                    });
                 }
                 "run-plan" | "plan" => {
                     command = CommandKind::RunPlan(iter.next().map(PathBuf::from));
@@ -138,5 +161,66 @@ impl Args {
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config\n  prism [--repo <path>] auto [prompt]\n  prism [--repo <path>] auto plan [prompt]\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>"
+    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config\n  prism [--repo <path>] auto [prompt]\n  prism [--repo <path>] auto run-plan <plan.md>\n  prism [--repo <path>] auto plan [prompt]\n  prism [--repo <path>] auto plan-first [prompt]\n  prism [--repo <path>] auto intensive [prompt]\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n\nAliases:\n  auto plan-first and auto intensive are aliases for auto plan."
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> CommandKind {
+        Args::parse(args.iter().map(OsString::from))
+            .unwrap()
+            .command
+    }
+
+    #[test]
+    fn auto_prompt_parses_existing_prompt_first_form() {
+        assert_eq!(
+            parse(&["auto", "implement the task"]),
+            CommandKind::Auto(AutoCommand {
+                source: AutoCommandSource::Prompt,
+                prompt: Some("implement the task".to_string()),
+                plan_path: None,
+            })
+        );
+    }
+
+    #[test]
+    fn auto_run_plan_requires_and_parses_plan_path() {
+        assert_eq!(
+            parse(&["auto", "run-plan", "plan.md"]),
+            CommandKind::Auto(AutoCommand {
+                source: AutoCommandSource::ExistingPlan,
+                prompt: None,
+                plan_path: Some(PathBuf::from("plan.md")),
+            })
+        );
+        assert_eq!(
+            Args::parse([OsString::from("auto"), OsString::from("run-plan")]).unwrap_err(),
+            "auto run-plan requires a plan path"
+        );
+    }
+
+    #[test]
+    fn auto_plan_aliases_parse_as_draft_plan() {
+        for alias in ["plan", "plan-first", "intensive"] {
+            assert_eq!(
+                parse(&["auto", alias, "draft before coding"]),
+                CommandKind::Auto(AutoCommand {
+                    source: AutoCommandSource::DraftPlan,
+                    prompt: Some("draft before coding".to_string()),
+                    plan_path: None,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn help_documents_auto_plan_forms() {
+        let help = help_text();
+        assert!(help.contains("auto run-plan <plan.md>"));
+        assert!(help.contains("auto plan-first [prompt]"));
+        assert!(help.contains("auto intensive [prompt]"));
+    }
 }

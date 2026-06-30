@@ -13,7 +13,14 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::github::{PrCheckState, PrDetails, PrSummary};
 use crate::observability::{self, LogLevel};
-use crate::plan_run::{DEFAULT_OUTPUT_LINES_PER_STEP, PlanAgentEvent};
+use crate::plan::PlanExecution;
+use crate::plan_run::{
+    DEFAULT_OUTPUT_LINES_PER_STEP, PlanAgentEvent, PlanExecutorConfig, PlanRunMode, PlanRunStatus,
+    execute_plan_parallel, execute_plan_sequential, load_plan_run, prepare_plan_plugin_config,
+    prepare_plan_run_for_resume, request_plan_run_pause,
+    retry_failed_steps as retry_plan_failed_steps, retry_from_step as retry_plan_from_step,
+    save_plan_run,
+};
 use crate::repo::Repository;
 use crate::review::{ReviewFeedback, ReviewFeedbackFilter, actionable_review_feedback};
 use crate::verify::{VerifyMode, VerifyResult};
@@ -29,6 +36,9 @@ pub struct AutoRun {
     pub worktree_path: PathBuf,
     pub branch: String,
     pub mode: AutoRunMode,
+    pub implementation_source: AutoImplementationSource,
+    pub plan_path: Option<PathBuf>,
+    pub plan_run_mode: PlanRunMode,
     pub variant: String,
     pub agent_profile: Option<String>,
     pub prompt_summary: String,
@@ -59,6 +69,7 @@ pub struct AutoStepRun {
     pub opencode_server_url: Option<String>,
     pub opencode_session_id: Option<String>,
     pub process_id: Option<u32>,
+    pub plan_run_id: Option<String>,
     pub commit_sha: Option<String>,
     pub head_sha: Option<String>,
     pub summary: Option<String>,
@@ -91,9 +102,24 @@ pub struct AutoLaunch {
     pub worktree_path: PathBuf,
     pub branch: String,
     pub mode: AutoRunMode,
+    pub implementation_source: AutoImplementationSource,
+    pub plan_path: Option<PathBuf>,
+    pub plan_run_mode: PlanRunMode,
     pub variant: String,
     pub agent_profile: Option<String>,
     pub prompt_summary: String,
+    pub initial_prompt: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoLaunchOptions {
+    pub branch: String,
+    pub mode: AutoRunMode,
+    pub implementation_source: AutoImplementationSource,
+    pub plan_path: Option<PathBuf>,
+    pub plan_run_mode: PlanRunMode,
+    pub variant: String,
+    pub agent_profile: Option<String>,
     pub initial_prompt: String,
 }
 
@@ -119,6 +145,13 @@ pub enum AutoRunMode {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoImplementationSource {
+    Prompt,
+    ExistingPlan,
+    DraftPlan,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AutoRunStatus {
     Queued,
     Running,
@@ -134,6 +167,7 @@ pub enum AutoStepKey {
     CreatePlan,
     ReviewPlan,
     ApprovePlan,
+    RunPlan,
     Implement,
     LocalVerify,
     FixLocalVerify,
@@ -205,6 +239,25 @@ impl AutoRunMode {
     }
 }
 
+impl AutoImplementationSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Prompt => "prompt",
+            Self::ExistingPlan => "existing_plan",
+            Self::DraftPlan => "draft_plan",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "prompt" => Ok(Self::Prompt),
+            "existing_plan" => Ok(Self::ExistingPlan),
+            "draft_plan" => Ok(Self::DraftPlan),
+            _ => Err(format!("unknown auto implementation source: {value}")),
+        }
+    }
+}
+
 impl AutoRunStatus {
     fn as_str(self) -> &'static str {
         match self {
@@ -237,6 +290,7 @@ impl AutoStepKey {
             Self::CreatePlan => "create_plan",
             Self::ReviewPlan => "review_plan",
             Self::ApprovePlan => "approve_plan",
+            Self::RunPlan => "run_plan",
             Self::Implement => "implement",
             Self::LocalVerify => "local_verify",
             Self::FixLocalVerify => "fix_local_verify",
@@ -262,6 +316,7 @@ impl AutoStepKey {
             "create_plan" => Self::CreatePlan,
             "review_plan" => Self::ReviewPlan,
             "approve_plan" => Self::ApprovePlan,
+            "run_plan" => Self::RunPlan,
             "implement" => Self::Implement,
             "local_verify" => Self::LocalVerify,
             "fix_local_verify" => Self::FixLocalVerify,
@@ -350,32 +405,46 @@ impl AutoLaunch {
         Self::with_options(
             repo_root,
             worktree_path,
-            branch,
-            AutoRunMode::Standard,
-            "default",
-            None,
-            initial_prompt,
+            AutoLaunchOptions {
+                branch: branch.into(),
+                mode: AutoRunMode::Standard,
+                implementation_source: AutoImplementationSource::Prompt,
+                plan_path: None,
+                plan_run_mode: PlanRunMode::Sequential,
+                variant: "default".to_string(),
+                agent_profile: None,
+                initial_prompt: initial_prompt.into(),
+            },
         )
     }
 
     pub fn with_options(
         repo_root: &Path,
         worktree_path: &Path,
-        branch: impl Into<String>,
-        mode: AutoRunMode,
-        variant: impl Into<String>,
-        agent_profile: Option<String>,
-        initial_prompt: impl Into<String>,
+        options: AutoLaunchOptions,
     ) -> Result<Self, String> {
-        let branch = branch.into();
+        let AutoLaunchOptions {
+            branch,
+            mode,
+            implementation_source,
+            plan_path,
+            plan_run_mode,
+            variant,
+            agent_profile,
+            initial_prompt,
+        } = options;
         if branch.trim().is_empty() {
             return Err("auto flow branch cannot be empty".to_string());
         }
-        let initial_prompt = initial_prompt.into();
         if initial_prompt.trim().is_empty() {
             return Err("auto flow prompt cannot be empty".to_string());
         }
-        let variant = variant.into();
+        if implementation_source == AutoImplementationSource::ExistingPlan && plan_path.is_none() {
+            return Err("existing-plan auto flow requires a plan path".to_string());
+        }
+        if implementation_source == AutoImplementationSource::Prompt && plan_path.is_some() {
+            return Err("prompt auto flow cannot have a plan path".to_string());
+        }
         if variant.trim().is_empty() {
             return Err("auto flow variant cannot be empty".to_string());
         }
@@ -384,6 +453,9 @@ impl AutoLaunch {
             worktree_path: worktree_path.to_path_buf(),
             branch,
             mode,
+            implementation_source,
+            plan_path,
+            plan_run_mode,
             variant,
             agent_profile,
             prompt_summary: summarize_prompt(&initial_prompt),
@@ -400,6 +472,9 @@ impl AutoLaunch {
             worktree_path: self.worktree_path.clone(),
             branch: self.branch.clone(),
             mode: self.mode,
+            implementation_source: self.implementation_source,
+            plan_path: self.plan_path.clone(),
+            plan_run_mode: self.plan_run_mode,
             variant: self.variant.clone(),
             agent_profile: self.agent_profile.clone(),
             prompt_summary: self.prompt_summary.clone(),
@@ -456,6 +531,7 @@ impl AutoStepRun {
             opencode_server_url: None,
             opencode_session_id: None,
             process_id: None,
+            plan_run_id: None,
             commit_sha: None,
             head_sha: None,
             summary: None,
@@ -576,6 +652,9 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
           worktree_path text not null,
           branch text not null,
           mode text not null,
+          implementation_source text not null default 'prompt',
+          plan_path text,
+          plan_run_mode text not null default 'sequential',
           variant text not null,
           agent_profile text,
           prompt_summary text not null,
@@ -606,6 +685,7 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
           opencode_server_url text,
           opencode_session_id text,
           process_id integer,
+          plan_run_id text,
           commit_sha text,
           head_sha text,
           summary text,
@@ -652,6 +732,37 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
     if !table_has_column(conn, "auto_run", "pr_url")? {
         conn.execute("alter table auto_run add column pr_url text", [])
             .map_err(|error| format!("migrate auto_run pr_url column: {error}"))?;
+    }
+    if !table_has_column(conn, "auto_run", "implementation_source")? {
+        conn.execute(
+            "alter table auto_run add column implementation_source text not null default 'prompt'",
+            [],
+        )
+        .map_err(|error| format!("migrate auto_run implementation_source column: {error}"))?;
+        conn.execute(
+            "update auto_run
+             set implementation_source = case mode
+               when 'plan_first' then 'draft_plan'
+               else 'prompt'
+             end",
+            [],
+        )
+        .map_err(|error| format!("backfill auto_run implementation_source: {error}"))?;
+    }
+    if !table_has_column(conn, "auto_run", "plan_path")? {
+        conn.execute("alter table auto_run add column plan_path text", [])
+            .map_err(|error| format!("migrate auto_run plan_path column: {error}"))?;
+    }
+    if !table_has_column(conn, "auto_run", "plan_run_mode")? {
+        conn.execute(
+            "alter table auto_run add column plan_run_mode text not null default 'sequential'",
+            [],
+        )
+        .map_err(|error| format!("migrate auto_run plan_run_mode column: {error}"))?;
+    }
+    if !table_has_column(conn, "auto_step_run", "plan_run_id")? {
+        conn.execute("alter table auto_step_run add column plan_run_id text", [])
+            .map_err(|error| format!("migrate auto_step_run plan_run_id column: {error}"))?;
     }
     Ok(())
 }
@@ -765,6 +876,7 @@ pub fn request_auto_run_pause(
     }) {
         persisted.run.status = AutoRunStatus::Paused;
     }
+    request_active_linked_plan_pause(conn, persisted)?;
     persisted.run.updated_unix_ms = unix_ms();
     save_run_with_conn(conn, &persisted.run)
 }
@@ -805,6 +917,78 @@ pub fn fail_auto_run(
     save_run_with_conn(conn, &persisted.run)
 }
 
+pub fn retry_failed_auto_step(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+) -> Result<(), String> {
+    let failed_index = persisted
+        .steps
+        .iter()
+        .rposition(|step| {
+            matches!(
+                step.status,
+                AutoStepStatus::Failed | AutoStepStatus::Aborted
+            )
+        })
+        .ok_or_else(|| "auto flow run has no failed step to retry".to_string())?;
+    if persisted.steps[failed_index].step_key == AutoStepKey::RunPlan
+        && let Some(plan_run_id) = persisted.steps[failed_index].plan_run_id.clone()
+        && let Some(mut plan_run) = load_plan_run(conn, &plan_run_id)?
+    {
+        retry_plan_failed_steps(conn, &mut plan_run)?;
+        reset_auto_step_for_retry(&mut persisted.steps[failed_index]);
+        append_step_status_output(
+            conn,
+            &persisted.steps[failed_index],
+            "retrying linked plan run failed phases",
+            DEFAULT_OUTPUT_LINES_PER_STEP,
+        )?;
+        save_step_with_conn(conn, &mut persisted.steps[failed_index])?;
+        persisted.run.pause_requested = false;
+        persisted.run.status = persisted.aggregate_status();
+        persisted.run.updated_unix_ms = unix_ms();
+        save_run_with_conn(conn, &persisted.run)?;
+        return Ok(());
+    }
+
+    let step_key = persisted.steps[failed_index].step_key.clone();
+    append_step_run(conn, persisted, step_key, Some("manual retry".to_string()))?;
+    Ok(())
+}
+
+pub fn retry_auto_from_step(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+    selected_step_run_id: i64,
+) -> Result<(), String> {
+    let selected_index = persisted
+        .steps
+        .iter()
+        .position(|step| step.id == Some(selected_step_run_id))
+        .ok_or_else(|| format!("auto flow step not found: {selected_step_run_id}"))?;
+    let selected_sequence = persisted.steps[selected_index].sequence;
+    if persisted.steps[selected_index].step_key == AutoStepKey::RunPlan
+        && let Some(plan_run_id) = persisted.steps[selected_index].plan_run_id.clone()
+        && let Some(mut plan_run) = load_plan_run(conn, &plan_run_id)?
+    {
+        let start_step = plan_run.run.start_step;
+        retry_plan_from_step(conn, &mut plan_run, start_step)?;
+    }
+    for step in persisted
+        .steps
+        .iter_mut()
+        .filter(|step| step.sequence >= selected_sequence)
+    {
+        reset_auto_step_for_retry(step);
+        save_step_with_conn(conn, step)?;
+    }
+    persisted.run.selected_step_run_id = persisted.steps[selected_index].id;
+    persisted.run.pause_requested = false;
+    persisted.run.status = persisted.aggregate_status();
+    persisted.run.updated_unix_ms = unix_ms();
+    save_run_with_conn(conn, &persisted.run)
+}
+
 pub fn archive_auto_run(
     conn: &rusqlite::Connection,
     persisted: &mut PersistedAutoRun,
@@ -840,6 +1024,7 @@ pub fn execute_auto_initial_step(
             step.step_key,
             AutoStepKey::CreatePlan
                 | AutoStepKey::ReviewPlan
+                | AutoStepKey::RunPlan
                 | AutoStepKey::Implement
                 | AutoStepKey::FixLocalVerify
                 | AutoStepKey::FixReview
@@ -947,6 +1132,9 @@ pub fn reconcile_stale_auto_run(
         ) {
             continue;
         }
+        if step.step_key == AutoStepKey::RunPlan && step.plan_run_id.is_some() {
+            continue;
+        }
         let message = match step.process_id {
             Some(process_id) => format!(
                 "Prism restarted while auto flow step {} attempt {} was active in process {process_id}; the attempt was marked failed for retry.",
@@ -992,12 +1180,113 @@ pub fn reconcile_stale_auto_run(
     Ok(changed)
 }
 
+fn reconcile_linked_plan_runs(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+    max_output_lines_per_step: usize,
+) -> Result<bool, String> {
+    crate::plan_run::migrate_schema(conn)?;
+    let mut changed = false;
+    for index in 0..persisted.steps.len() {
+        if persisted.steps[index].step_key != AutoStepKey::RunPlan {
+            continue;
+        }
+        let Some(plan_run_id) = persisted.steps[index].plan_run_id.clone() else {
+            continue;
+        };
+        let Some(mut plan_run) = load_plan_run(conn, &plan_run_id)? else {
+            if matches!(
+                persisted.steps[index].status,
+                AutoStepStatus::Starting | AutoStepStatus::Running | AutoStepStatus::Waiting
+            ) {
+                let error = format!("linked plan run {plan_run_id} was not found");
+                fail_step(
+                    conn,
+                    &mut persisted.steps[index],
+                    &error,
+                    max_output_lines_per_step,
+                )?;
+                changed = true;
+            }
+            continue;
+        };
+        let can_resume =
+            prepare_plan_run_for_resume(conn, &mut plan_run, max_output_lines_per_step)?;
+        let before = persisted.steps[index].status;
+        match plan_run.run.status {
+            PlanRunStatus::Done => {
+                if persisted.steps[index].status != AutoStepStatus::Done {
+                    let summary = format!("plan run {} completed", plan_run.run.id);
+                    finish_non_agent_step(
+                        conn,
+                        &mut persisted.steps[index],
+                        AutoStepStatus::Done,
+                        Some(summary),
+                        None,
+                    )?;
+                }
+            }
+            PlanRunStatus::Failed | PlanRunStatus::Aborted => {
+                if persisted.steps[index].status != AutoStepStatus::Failed {
+                    let error = format!(
+                        "plan run {} ended with status {}; inspect linked plan dashboard",
+                        plan_run.run.id,
+                        plan_run_status_label(plan_run.run.status)
+                    );
+                    finish_non_agent_step(
+                        conn,
+                        &mut persisted.steps[index],
+                        AutoStepStatus::Failed,
+                        Some("plan run failed".to_string()),
+                        Some(error),
+                    )?;
+                }
+            }
+            PlanRunStatus::Paused => {
+                if persisted.steps[index].status != AutoStepStatus::Waiting {
+                    let summary = format!(
+                        "plan run {} paused; resume linked plan run",
+                        plan_run.run.id
+                    );
+                    set_auto_step_waiting(conn, &mut persisted.steps[index], summary)?;
+                }
+            }
+            PlanRunStatus::Draft | PlanRunStatus::Queued => {
+                if can_resume && persisted.steps[index].status != AutoStepStatus::Queued {
+                    reset_auto_step_for_retry(&mut persisted.steps[index]);
+                    save_step_with_conn(conn, &mut persisted.steps[index])?;
+                }
+            }
+            PlanRunStatus::Running => {
+                if can_resume {
+                    reset_auto_step_for_retry(&mut persisted.steps[index]);
+                    save_step_with_conn(conn, &mut persisted.steps[index])?;
+                } else if persisted.steps[index].status != AutoStepStatus::Waiting {
+                    let summary = format!(
+                        "plan run {} is running; Auto Flow is waiting",
+                        plan_run.run.id
+                    );
+                    set_auto_step_waiting(conn, &mut persisted.steps[index], summary)?;
+                }
+            }
+        }
+        changed |= persisted.steps[index].status != before;
+    }
+    if changed {
+        persisted.run.status = persisted.aggregate_status();
+        persisted.run.updated_unix_ms = unix_ms();
+        save_run_with_conn(conn, &persisted.run)?;
+    }
+    Ok(changed)
+}
+
 pub fn prepare_auto_run_for_resume(
     conn: &rusqlite::Connection,
     persisted: &mut PersistedAutoRun,
     max_output_lines_per_step: usize,
 ) -> Result<bool, String> {
-    let changed = reconcile_stale_auto_run(conn, persisted)?;
+    let linked_changed = reconcile_linked_plan_runs(conn, persisted, max_output_lines_per_step)?;
+    let changed = reconcile_stale_auto_run(conn, persisted)? || linked_changed;
     if matches!(persisted.run.status, AutoRunStatus::Paused) {
         persisted.run.pause_requested = false;
         persisted.run.status = persisted.aggregate_status();
@@ -1026,6 +1315,7 @@ pub fn prepare_auto_run_for_resume(
                 step.step_key,
                 AutoStepKey::CreatePlan
                     | AutoStepKey::ReviewPlan
+                    | AutoStepKey::RunPlan
                     | AutoStepKey::Implement
                     | AutoStepKey::FixLocalVerify
                     | AutoStepKey::FixReview
@@ -1037,6 +1327,7 @@ pub fn prepare_auto_run_for_resume(
         || has_queued_non_agent_step(persisted)
         || queued_prepare_needs_initial_agent_step(persisted)
         || next_state_machine_step_needed(persisted)
+        || implementation_follow_up_step_needed(persisted)
     {
         Ok(true)
     } else {
@@ -1124,16 +1415,19 @@ pub fn append_auto_event(conn: &rusqlite::Connection, event: &AutoEvent) -> Resu
 fn save_run_with_conn(conn: &rusqlite::Connection, run: &AutoRun) -> Result<(), String> {
     conn.execute(
         "insert into auto_run (
-           id, repo_root, worktree_path, branch, mode, variant, agent_profile, prompt_summary,
-           initial_prompt, status, pause_requested, selected_step_run_id, pr_number,
-           pr_url, current_head_sha, review_baseline_json, created_unix_ms, updated_unix_ms,
-           archived_unix_ms
-         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
+           id, repo_root, worktree_path, branch, mode, implementation_source, plan_path,
+           plan_run_mode, variant, agent_profile, prompt_summary, initial_prompt, status, pause_requested,
+           selected_step_run_id, pr_number, pr_url, current_head_sha, review_baseline_json,
+           created_unix_ms, updated_unix_ms, archived_unix_ms
+         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
          on conflict(id) do update set
            repo_root = excluded.repo_root,
            worktree_path = excluded.worktree_path,
            branch = excluded.branch,
            mode = excluded.mode,
+           implementation_source = excluded.implementation_source,
+           plan_path = excluded.plan_path,
+           plan_run_mode = excluded.plan_run_mode,
            variant = excluded.variant,
            agent_profile = excluded.agent_profile,
            prompt_summary = excluded.prompt_summary,
@@ -1153,6 +1447,9 @@ fn save_run_with_conn(conn: &rusqlite::Connection, run: &AutoRun) -> Result<(), 
             run.worktree_path.display().to_string(),
             run.branch.as_str(),
             run.mode.as_str(),
+            run.implementation_source.as_str(),
+            run.plan_path.as_ref().map(|path| path.display().to_string()),
+            plan_run_mode_label(run.plan_run_mode),
             run.variant.as_str(),
             run.agent_profile.as_deref(),
             run.prompt_summary.as_str(),
@@ -1186,14 +1483,15 @@ fn save_step_with_conn(conn: &rusqlite::Connection, step: &mut AutoStepRun) -> R
                  attempt = ?6,
                  started_unix_ms = ?7,
                  finished_unix_ms = ?8,
-                 opencode_server_url = ?9,
-                 opencode_session_id = ?10,
-                 process_id = ?11,
-                 commit_sha = ?12,
-                 head_sha = ?13,
-                 summary = ?14,
-                 error = ?15
-             where id = ?16",
+                  opencode_server_url = ?9,
+                  opencode_session_id = ?10,
+                  process_id = ?11,
+                  plan_run_id = ?12,
+                  commit_sha = ?13,
+                  head_sha = ?14,
+                  summary = ?15,
+                  error = ?16
+             where id = ?17",
             params![
                 step.run_id.as_str(),
                 usize_to_i64(step.sequence),
@@ -1206,6 +1504,7 @@ fn save_step_with_conn(conn: &rusqlite::Connection, step: &mut AutoStepRun) -> R
                 step.opencode_server_url.as_deref(),
                 step.opencode_session_id.as_deref(),
                 step.process_id.map(i64::from),
+                step.plan_run_id.as_deref(),
                 step.commit_sha.as_deref(),
                 step.head_sha.as_deref(),
                 step.summary.as_deref(),
@@ -1221,8 +1520,8 @@ fn save_step_with_conn(conn: &rusqlite::Connection, step: &mut AutoStepRun) -> R
             "insert into auto_step_run (
                run_id, sequence, step_key, reason, status, attempt, started_unix_ms,
                finished_unix_ms, opencode_server_url, opencode_session_id, process_id,
-               commit_sha, head_sha, summary, error
-             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+               plan_run_id, commit_sha, head_sha, summary, error
+             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 step.run_id.as_str(),
                 usize_to_i64(step.sequence),
@@ -1235,6 +1534,7 @@ fn save_step_with_conn(conn: &rusqlite::Connection, step: &mut AutoStepRun) -> R
                 step.opencode_server_url.as_deref(),
                 step.opencode_session_id.as_deref(),
                 step.process_id.map(i64::from),
+                step.plan_run_id.as_deref(),
                 step.commit_sha.as_deref(),
                 step.head_sha.as_deref(),
                 step.summary.as_deref(),
@@ -1254,39 +1554,45 @@ fn load_run_with_conn(
     run_id: &str,
 ) -> Result<Option<AutoRun>, String> {
     conn.query_row(
-        "select id, repo_root, worktree_path, branch, mode, variant, agent_profile,
-                prompt_summary, initial_prompt, status, pause_requested, selected_step_run_id,
-                pr_number, pr_url, current_head_sha, review_baseline_json, created_unix_ms,
-                updated_unix_ms, archived_unix_ms
+        "select id, repo_root, worktree_path, branch, mode, implementation_source, plan_path,
+                plan_run_mode, variant, agent_profile, prompt_summary, initial_prompt, status, pause_requested,
+                selected_step_run_id, pr_number, pr_url, current_head_sha, review_baseline_json,
+                created_unix_ms, updated_unix_ms, archived_unix_ms
          from auto_run
          where id = ?1",
         params![run_id],
         |row| {
             let mode: String = row.get(4)?;
-            let status: String = row.get(9)?;
+            let implementation_source: String = row.get(5)?;
+            let plan_run_mode: String = row.get(7)?;
+            let status: String = row.get(12)?;
             Ok(AutoRun {
                 id: row.get(0)?,
                 repo_root: row.get(1)?,
                 worktree_path: PathBuf::from(row.get::<_, String>(2)?),
                 branch: row.get(3)?,
                 mode: AutoRunMode::parse(&mode).map_err(from_string_error)?,
-                variant: row.get(5)?,
-                agent_profile: row.get(6)?,
-                prompt_summary: row.get(7)?,
-                initial_prompt: row.get(8)?,
+                implementation_source: AutoImplementationSource::parse(&implementation_source)
+                    .map_err(from_string_error)?,
+                plan_path: row.get::<_, Option<String>>(6)?.map(PathBuf::from),
+                plan_run_mode: parse_plan_run_mode(&plan_run_mode).map_err(from_string_error)?,
+                variant: row.get(8)?,
+                agent_profile: row.get(9)?,
+                prompt_summary: row.get(10)?,
+                initial_prompt: row.get(11)?,
                 status: AutoRunStatus::parse(&status).map_err(from_string_error)?,
-                pause_requested: row.get::<_, i64>(10)? != 0,
-                selected_step_run_id: row.get(11)?,
+                pause_requested: row.get::<_, i64>(13)? != 0,
+                selected_step_run_id: row.get(14)?,
                 pr_number: row
-                    .get::<_, Option<i64>>(12)?
+                    .get::<_, Option<i64>>(15)?
                     .map(|value| value.max(0) as u64),
-                pr_url: row.get(13)?,
-                current_head_sha: row.get(14)?,
-                review_baseline_json: row.get(15)?,
-                created_unix_ms: i64_to_u64(row.get(16)?, 16),
-                updated_unix_ms: i64_to_u64(row.get(17)?, 17),
+                pr_url: row.get(16)?,
+                current_head_sha: row.get(17)?,
+                review_baseline_json: row.get(18)?,
+                created_unix_ms: i64_to_u64(row.get(19)?, 19),
+                updated_unix_ms: i64_to_u64(row.get(20)?, 20),
                 archived_unix_ms: row
-                    .get::<_, Option<i64>>(18)?
+                    .get::<_, Option<i64>>(21)?
                     .map(|value| value.max(0) as u64),
             })
         },
@@ -1303,7 +1609,7 @@ fn load_steps_with_conn(
         .prepare(
             "select id, run_id, sequence, step_key, reason, status, attempt, started_unix_ms,
                     finished_unix_ms, opencode_server_url, opencode_session_id, process_id,
-                    commit_sha, head_sha, summary, error
+                    plan_run_id, commit_sha, head_sha, summary, error
              from auto_step_run
              where run_id = ?1
              order by sequence",
@@ -1332,10 +1638,11 @@ fn load_steps_with_conn(
                 process_id: row
                     .get::<_, Option<i64>>(11)?
                     .map(|value| value.max(0) as u32),
-                commit_sha: row.get(12)?,
-                head_sha: row.get(13)?,
-                summary: row.get(14)?,
-                error: row.get(15)?,
+                plan_run_id: row.get(12)?,
+                commit_sha: row.get(13)?,
+                head_sha: row.get(14)?,
+                summary: row.get(15)?,
+                error: row.get(16)?,
             })
         })
         .map_err(|error| format!("load auto steps: {error}"))?;
@@ -1380,7 +1687,7 @@ fn queued_prepare_needs_initial_agent_step(persisted: &PersistedAutoRun) -> bool
         && !persisted.steps.iter().any(|step| {
             matches!(
                 step.step_key,
-                AutoStepKey::CreatePlan | AutoStepKey::Implement
+                AutoStepKey::CreatePlan | AutoStepKey::RunPlan | AutoStepKey::Implement
             )
         })
 }
@@ -1513,6 +1820,7 @@ fn next_queued_non_agent_step(persisted: &PersistedAutoRun) -> Option<usize> {
             && matches!(
                 step.step_key,
                 AutoStepKey::ApprovePlan
+                    | AutoStepKey::RunPlan
                     | AutoStepKey::LocalVerify
                     | AutoStepKey::CommitImpl
                     | AutoStepKey::PushPr
@@ -1533,7 +1841,7 @@ fn has_queued_non_agent_step(persisted: &PersistedAutoRun) -> bool {
 }
 
 fn next_state_machine_step_needed(persisted: &PersistedAutoRun) -> bool {
-    if persisted.run.mode == AutoRunMode::PlanFirst {
+    if persisted.run.implementation_source == AutoImplementationSource::DraftPlan {
         if !has_step_key(persisted, &AutoStepKey::CreatePlan) {
             return true;
         }
@@ -1551,7 +1859,12 @@ fn next_state_machine_step_needed(persisted: &PersistedAutoRun) -> bool {
             return false;
         }
     }
-    !has_step_key(persisted, &AutoStepKey::Implement)
+    !has_step_key(persisted, &implementation_step_key(persisted))
+}
+
+fn implementation_follow_up_step_needed(persisted: &PersistedAutoRun) -> bool {
+    latest_step_status(persisted, &implementation_step_key(persisted)) == Some(AutoStepStatus::Done)
+        && !has_step_key(persisted, &AutoStepKey::LocalVerify)
 }
 
 fn ensure_next_auto_step(
@@ -1584,7 +1897,7 @@ fn ensure_next_auto_step(
         )?;
         return Ok(true);
     }
-    if persisted.run.mode == AutoRunMode::PlanFirst
+    if persisted.run.implementation_source == AutoImplementationSource::DraftPlan
         && !has_step_key(persisted, &AutoStepKey::CreatePlan)
     {
         append_step_run(
@@ -1595,7 +1908,7 @@ fn ensure_next_auto_step(
         )?;
         return Ok(true);
     }
-    if persisted.run.mode == AutoRunMode::PlanFirst
+    if persisted.run.implementation_source == AutoImplementationSource::DraftPlan
         && latest_step_status(persisted, &AutoStepKey::CreatePlan) == Some(AutoStepStatus::Done)
         && !has_step_key(persisted, &AutoStepKey::ReviewPlan)
     {
@@ -1607,7 +1920,7 @@ fn ensure_next_auto_step(
         )?;
         return Ok(true);
     }
-    if persisted.run.mode == AutoRunMode::PlanFirst
+    if persisted.run.implementation_source == AutoImplementationSource::DraftPlan
         && latest_step_status(persisted, &AutoStepKey::ReviewPlan) == Some(AutoStepStatus::Done)
         && !has_step_key(persisted, &AutoStepKey::ApprovePlan)
     {
@@ -1619,21 +1932,22 @@ fn ensure_next_auto_step(
         )?;
         return Ok(true);
     }
-    if persisted.run.mode == AutoRunMode::PlanFirst
+    if persisted.run.implementation_source == AutoImplementationSource::DraftPlan
         && latest_step_status(persisted, &AutoStepKey::ApprovePlan) != Some(AutoStepStatus::Done)
     {
         return Ok(false);
     }
-    if !has_step_key(persisted, &AutoStepKey::Implement) {
+    let implementation_step_key = implementation_step_key(persisted);
+    if !has_step_key(persisted, &implementation_step_key) {
         append_step_run(
             conn,
             persisted,
-            AutoStepKey::Implement,
+            implementation_step_key,
             Some(implementation_step_reason(persisted).to_string()),
         )?;
         return Ok(true);
     }
-    if latest_step_status(persisted, &AutoStepKey::Implement) == Some(AutoStepStatus::Done)
+    if latest_step_status(persisted, &implementation_step_key) == Some(AutoStepStatus::Done)
         && !has_step_key(persisted, &AutoStepKey::LocalVerify)
     {
         append_step_run(
@@ -1804,16 +2118,31 @@ fn ensure_next_auto_step(
 }
 
 fn initial_agent_step(persisted: &PersistedAutoRun) -> (AutoStepKey, &'static str) {
-    match persisted.run.mode {
-        AutoRunMode::Standard => (AutoStepKey::Implement, "run initial implementation prompt"),
-        AutoRunMode::PlanFirst => (AutoStepKey::CreatePlan, "create implementation plan.md"),
+    match persisted.run.implementation_source {
+        AutoImplementationSource::Prompt => {
+            (AutoStepKey::Implement, "run initial implementation prompt")
+        }
+        AutoImplementationSource::ExistingPlan => (AutoStepKey::RunPlan, "run plan phases"),
+        AutoImplementationSource::DraftPlan => {
+            (AutoStepKey::CreatePlan, "create implementation plan.md")
+        }
+    }
+}
+
+fn implementation_step_key(persisted: &PersistedAutoRun) -> AutoStepKey {
+    match persisted.run.implementation_source {
+        AutoImplementationSource::Prompt => AutoStepKey::Implement,
+        AutoImplementationSource::ExistingPlan | AutoImplementationSource::DraftPlan => {
+            AutoStepKey::RunPlan
+        }
     }
 }
 
 fn implementation_step_reason(persisted: &PersistedAutoRun) -> &'static str {
-    match persisted.run.mode {
-        AutoRunMode::Standard => "run initial implementation prompt",
-        AutoRunMode::PlanFirst => "run implementation from approved plan.md",
+    match persisted.run.implementation_source {
+        AutoImplementationSource::Prompt => "run initial implementation prompt",
+        AutoImplementationSource::ExistingPlan => "run plan phases from selected plan",
+        AutoImplementationSource::DraftPlan => "run plan phases from approved plan.md",
     }
 }
 
@@ -1830,6 +2159,14 @@ fn execute_one_non_agent_step(
         AutoStepKey::ApprovePlan => {
             execute_approve_plan_step(conn, persisted, step_index, max_output_lines_per_step)
         }
+        AutoStepKey::RunPlan => execute_run_plan_step(
+            conn,
+            repo,
+            config,
+            persisted,
+            step_index,
+            max_output_lines_per_step,
+        ),
         AutoStepKey::LocalVerify => execute_local_verify_step(
             conn,
             config,
@@ -1961,6 +2298,152 @@ fn execute_approve_plan_step(
     persisted.run.status = AutoRunStatus::Paused;
     persisted.run.updated_unix_ms = unix_ms();
     save_run_with_conn(conn, &persisted.run)
+}
+
+fn execute_run_plan_step(
+    conn: &rusqlite::Connection,
+    repo: &Repository,
+    config: &Config,
+    persisted: &mut PersistedAutoRun,
+    step_index: usize,
+    max_output_lines_per_step: usize,
+) -> Result<(), String> {
+    crate::plan_run::migrate_schema(conn)?;
+    let step_id = persisted.steps[step_index]
+        .id
+        .ok_or_else(|| "auto run-plan step must be saved before output".to_string())?;
+    let plan_path = auto_plan_path(&persisted.run)?;
+    let execution = PlanExecution::prepare(
+        &persisted.run.worktree_path,
+        config,
+        Some(plan_path.as_path()),
+    )?;
+    let mode = persisted.run.plan_run_mode;
+    let launch = execution.launch(Path::new(&persisted.run.repo_root), mode)?;
+    let mut plan_run = if let Some(plan_run_id) = persisted.steps[step_index].plan_run_id.as_deref()
+    {
+        load_plan_run(conn, plan_run_id)?.ok_or_else(|| {
+            format!("linked plan run {plan_run_id} was not found for auto run-plan step")
+        })?
+    } else {
+        let plan_run = launch.create_run();
+        save_plan_run(conn, &plan_run)?;
+        persisted.steps[step_index].plan_run_id = Some(plan_run.run.id.clone());
+        save_step_with_conn(conn, &mut persisted.steps[step_index])?;
+        plan_run
+    };
+
+    let summary = format!("running plan phases from {}", plan_run.run.plan_display);
+    append_system_output(
+        conn,
+        step_id,
+        AutoOutputKind::Status,
+        &summary,
+        None,
+        max_output_lines_per_step,
+    )?;
+
+    let mut plan_executor = PlanExecutorConfig::new(
+        config.tool("opencode"),
+        None,
+        persisted.run.worktree_path.clone(),
+        plan_run.run.plan_display.clone(),
+    );
+    plan_executor.max_output_lines_per_step = max_output_lines_per_step;
+    if config.opencode_plan_plugin
+        && let Ok(plugin) = prepare_plan_plugin_config(&repo.prism_dir())
+    {
+        plan_executor = plan_executor.with_plugin_config(plugin);
+    }
+
+    let mut output = Vec::new();
+    let result = match mode {
+        PlanRunMode::Sequential => {
+            execute_plan_sequential(conn, &mut plan_run, &plan_executor, &mut output)
+        }
+        PlanRunMode::Parallel => {
+            execute_plan_parallel(conn, &mut plan_run, &plan_executor, &mut output)
+        }
+    };
+    if let Err(error) = result
+        && !matches!(
+            plan_run.run.status,
+            PlanRunStatus::Failed | PlanRunStatus::Aborted
+        )
+    {
+        return Err(error);
+    }
+
+    match plan_run.run.status {
+        PlanRunStatus::Done => {
+            let summary = format!("plan run {} completed", plan_run.run.id);
+            append_system_output(
+                conn,
+                step_id,
+                AutoOutputKind::Status,
+                &summary,
+                None,
+                max_output_lines_per_step,
+            )?;
+            finish_non_agent_step(
+                conn,
+                &mut persisted.steps[step_index],
+                AutoStepStatus::Done,
+                Some(summary),
+                None,
+            )
+        }
+        PlanRunStatus::Paused => {
+            let summary = format!(
+                "plan run {} paused; resume linked plan run",
+                plan_run.run.id
+            );
+            append_system_output(
+                conn,
+                step_id,
+                AutoOutputKind::Status,
+                &summary,
+                None,
+                max_output_lines_per_step,
+            )?;
+            finish_non_agent_step(
+                conn,
+                &mut persisted.steps[step_index],
+                AutoStepStatus::Waiting,
+                Some(summary),
+                None,
+            )
+        }
+        PlanRunStatus::Failed | PlanRunStatus::Aborted => {
+            let error = format!(
+                "plan run {} ended with status {}; inspect linked plan dashboard",
+                plan_run.run.id,
+                plan_run_status_label(plan_run.run.status)
+            );
+            finish_non_agent_step(
+                conn,
+                &mut persisted.steps[step_index],
+                AutoStepStatus::Failed,
+                Some("plan run failed".to_string()),
+                Some(error.clone()),
+            )?;
+            Err(error)
+        }
+        PlanRunStatus::Draft | PlanRunStatus::Queued | PlanRunStatus::Running => {
+            let summary = format!(
+                "plan run {} is {}; Auto Flow is waiting",
+                plan_run.run.id,
+                plan_run_status_label(plan_run.run.status)
+            );
+            finish_non_agent_step(
+                conn,
+                &mut persisted.steps[step_index],
+                AutoStepStatus::Waiting,
+                Some(summary),
+                None,
+            )
+        }
+    }
 }
 
 fn start_non_agent_step(
@@ -2831,6 +3314,82 @@ fn finish_non_agent_step(
     Ok(())
 }
 
+fn set_auto_step_waiting(
+    conn: &rusqlite::Connection,
+    step: &mut AutoStepRun,
+    summary: String,
+) -> Result<(), String> {
+    step.status = AutoStepStatus::Waiting;
+    step.finished_unix_ms = None;
+    step.process_id = None;
+    step.summary = Some(summary);
+    step.error = None;
+    save_step_with_conn(conn, step).map(|_| ())
+}
+
+fn reset_auto_step_for_retry(step: &mut AutoStepRun) {
+    step.status = AutoStepStatus::Queued;
+    step.started_unix_ms = None;
+    step.finished_unix_ms = None;
+    step.opencode_session_id = None;
+    step.process_id = None;
+    step.commit_sha = None;
+    step.head_sha = None;
+    step.summary = None;
+    step.error = None;
+}
+
+fn append_step_status_output(
+    conn: &rusqlite::Connection,
+    step: &AutoStepRun,
+    text: &str,
+    max_output_lines_per_step: usize,
+) -> Result<(), String> {
+    let Some(step_id) = step.id else {
+        return Ok(());
+    };
+    append_system_output(
+        conn,
+        step_id,
+        AutoOutputKind::Status,
+        text,
+        None,
+        max_output_lines_per_step,
+    )
+}
+
+fn request_active_linked_plan_pause(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+) -> Result<(), String> {
+    for step in &persisted.steps {
+        if step.step_key != AutoStepKey::RunPlan
+            || !matches!(
+                step.status,
+                AutoStepStatus::Queued
+                    | AutoStepStatus::Starting
+                    | AutoStepStatus::Running
+                    | AutoStepStatus::Waiting
+            )
+        {
+            continue;
+        }
+        let Some(plan_run_id) = step.plan_run_id.as_deref() else {
+            continue;
+        };
+        let Some(mut plan_run) = load_plan_run(conn, plan_run_id)? else {
+            continue;
+        };
+        if !matches!(
+            plan_run.run.status,
+            PlanRunStatus::Done | PlanRunStatus::Failed | PlanRunStatus::Aborted
+        ) {
+            request_plan_run_pause(conn, &mut plan_run)?;
+        }
+    }
+    Ok(())
+}
+
 fn fail_step(
     conn: &rusqlite::Connection,
     step: &mut AutoStepRun,
@@ -3514,7 +4073,49 @@ fn auto_ci_fix_prompt(run: &AutoRun, step: &AutoStepRun) -> String {
 }
 
 fn plan_first_plan_path(run: &AutoRun) -> PathBuf {
-    run.worktree_path.join("plan.md")
+    run.plan_path
+        .clone()
+        .unwrap_or_else(|| run.worktree_path.join("plan.md"))
+}
+
+fn auto_plan_path(run: &AutoRun) -> Result<PathBuf, String> {
+    match run.implementation_source {
+        AutoImplementationSource::Prompt => {
+            Err("prompt auto flow does not have a plan path".to_string())
+        }
+        AutoImplementationSource::ExistingPlan => run
+            .plan_path
+            .clone()
+            .ok_or_else(|| "existing-plan auto flow requires a plan path".to_string()),
+        AutoImplementationSource::DraftPlan => Ok(plan_first_plan_path(run)),
+    }
+}
+
+fn plan_run_status_label(status: PlanRunStatus) -> &'static str {
+    match status {
+        PlanRunStatus::Draft => "draft",
+        PlanRunStatus::Queued => "queued",
+        PlanRunStatus::Running => "running",
+        PlanRunStatus::Paused => "paused",
+        PlanRunStatus::Done => "done",
+        PlanRunStatus::Failed => "failed",
+        PlanRunStatus::Aborted => "aborted",
+    }
+}
+
+fn plan_run_mode_label(mode: PlanRunMode) -> &'static str {
+    match mode {
+        PlanRunMode::Sequential => "sequential",
+        PlanRunMode::Parallel => "parallel",
+    }
+}
+
+fn parse_plan_run_mode(value: &str) -> Result<PlanRunMode, String> {
+    match value {
+        "sequential" => Ok(PlanRunMode::Sequential),
+        "parallel" => Ok(PlanRunMode::Parallel),
+        _ => Err(format!("unknown plan run mode: {value}")),
+    }
 }
 
 fn opencode_run_command(
@@ -4192,16 +4793,21 @@ mod tests {
     }
 
     #[test]
-    fn plan_first_prompts_create_review_and_implement_plan_file() {
+    fn plan_first_prompts_create_and_review_plan_file() {
         let repo = PathBuf::from("/repo/prism");
         let persisted = AutoLaunch::with_options(
             &repo,
             &repo.join("feature"),
-            "feat/auto",
-            AutoRunMode::PlanFirst,
-            "intensive",
-            Some("planner".to_string()),
-            "Implement auto",
+            AutoLaunchOptions {
+                branch: "feat/auto".to_string(),
+                mode: AutoRunMode::PlanFirst,
+                implementation_source: AutoImplementationSource::DraftPlan,
+                plan_path: Some(repo.join("feature/plan.md")),
+                plan_run_mode: PlanRunMode::Sequential,
+                variant: "intensive".to_string(),
+                agent_profile: Some("planner".to_string()),
+                initial_prompt: "Implement auto".to_string(),
+            },
         )
         .unwrap()
         .create_run();
@@ -4214,34 +4820,32 @@ mod tests {
             &persisted.run,
             &AutoStepRun::queued(&persisted.run.id, 3, AutoStepKey::ReviewPlan, 1, None),
         );
-        let implement_prompt = prompt_for_step(
-            &persisted.run,
-            &AutoStepRun::queued(&persisted.run.id, 4, AutoStepKey::Implement, 1, None),
-        );
-
         assert!(create_prompt.contains("/repo/prism/feature/plan.md"));
         assert!(create_prompt.contains("Do not implement"));
         assert!(create_prompt.contains("Variant: intensive"));
         assert!(create_prompt.contains("Agent profile: planner"));
         assert!(review_prompt.contains("missing phases"));
         assert!(review_prompt.contains("Edit the plan in place"));
-        assert!(implement_prompt.contains("approved plan"));
-        assert!(implement_prompt.contains("plan.md"));
     }
 
     #[test]
-    fn plan_first_queues_prelude_before_implementation() {
+    fn plan_first_queues_prelude_before_run_plan() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         migrate_schema(&conn).unwrap();
         let repo = PathBuf::from("/repo/prism");
         let mut persisted = AutoLaunch::with_options(
             &repo,
             &repo.join("feature"),
-            "feat/auto",
-            AutoRunMode::PlanFirst,
-            "intensive",
-            None,
-            "Implement auto",
+            AutoLaunchOptions {
+                branch: "feat/auto".to_string(),
+                mode: AutoRunMode::PlanFirst,
+                implementation_source: AutoImplementationSource::DraftPlan,
+                plan_path: Some(repo.join("feature/plan.md")),
+                plan_run_mode: PlanRunMode::Sequential,
+                variant: "intensive".to_string(),
+                agent_profile: None,
+                initial_prompt: "Implement auto".to_string(),
+            },
         )
         .unwrap()
         .create_run();
@@ -4266,21 +4870,31 @@ mod tests {
                 .iter()
                 .any(|step| step.step_key == AutoStepKey::Implement)
         );
+        persisted.steps[3].status = AutoStepStatus::Done;
+        save_auto_run(&conn, &mut persisted).unwrap();
+
+        assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
+        assert_eq!(persisted.steps[4].step_key, AutoStepKey::RunPlan);
     }
 
     #[test]
-    fn plan_approval_pauses_and_resume_queues_implementation() {
+    fn plan_approval_pauses_and_resume_queues_run_plan() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         migrate_schema(&conn).unwrap();
         let repo = PathBuf::from("/repo/prism");
         let mut persisted = AutoLaunch::with_options(
             &repo,
             &repo.join("feature"),
-            "feat/auto",
-            AutoRunMode::PlanFirst,
-            "intensive",
-            None,
-            "Implement auto",
+            AutoLaunchOptions {
+                branch: "feat/auto".to_string(),
+                mode: AutoRunMode::PlanFirst,
+                implementation_source: AutoImplementationSource::DraftPlan,
+                plan_path: Some(repo.join("feature/plan.md")),
+                plan_run_mode: PlanRunMode::Sequential,
+                variant: "intensive".to_string(),
+                agent_profile: None,
+                initial_prompt: "Implement auto".to_string(),
+            },
         )
         .unwrap()
         .create_run();
@@ -4320,8 +4934,282 @@ mod tests {
             persisted
                 .steps
                 .iter()
-                .any(|step| step.step_key == AutoStepKey::Implement)
+                .any(|step| step.step_key == AutoStepKey::RunPlan)
         );
+    }
+
+    #[test]
+    fn existing_plan_queues_run_plan() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&conn).unwrap();
+        let repo = PathBuf::from("/repo/prism");
+        let mut persisted = AutoLaunch::with_options(
+            &repo,
+            &repo.join("feature"),
+            AutoLaunchOptions {
+                branch: "feat/auto".to_string(),
+                mode: AutoRunMode::Standard,
+                implementation_source: AutoImplementationSource::ExistingPlan,
+                plan_path: Some(repo.join("feature/plan.md")),
+                plan_run_mode: PlanRunMode::Sequential,
+                variant: "default".to_string(),
+                agent_profile: None,
+                initial_prompt: "Implement existing plan".to_string(),
+            },
+        )
+        .unwrap()
+        .create_run();
+        persisted.steps[0].status = AutoStepStatus::Done;
+        save_auto_run(&conn, &mut persisted).unwrap();
+
+        assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
+
+        assert_eq!(persisted.steps[1].step_key, AutoStepKey::RunPlan);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_plan_success_queues_local_verify() {
+        let temp = TempDir::new("run-plan-success");
+        let work = temp.path().join("work");
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("plan.md"), "# Phase 1\n\nImplement it.\n").unwrap();
+        let repo =
+            Repository::with_config_dir_for_test(work.clone(), temp.path().join("prism-config"));
+        let mut config = Config::load(&repo);
+        let opencode = temp.path().join("opencode");
+        write_executable(
+            &opencode,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"message","text":"phase done"}'
+"#,
+        );
+        config
+            .tools
+            .insert("opencode".to_string(), opencode.display().to_string());
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&conn).unwrap();
+        crate::plan_run::migrate_schema(&conn).unwrap();
+        let mut persisted = AutoLaunch::with_options(
+            &work,
+            &work,
+            AutoLaunchOptions {
+                branch: "feat/auto".to_string(),
+                mode: AutoRunMode::Standard,
+                implementation_source: AutoImplementationSource::ExistingPlan,
+                plan_path: Some(work.join("plan.md")),
+                plan_run_mode: PlanRunMode::Sequential,
+                variant: "default".to_string(),
+                agent_profile: None,
+                initial_prompt: "Implement existing plan".to_string(),
+            },
+        )
+        .unwrap()
+        .create_run();
+        persisted.steps.clear();
+        persisted.steps.push(AutoStepRun::queued(
+            &persisted.run.id,
+            1,
+            AutoStepKey::RunPlan,
+            1,
+            Some("run plan".to_string()),
+        ));
+        save_auto_run(&conn, &mut persisted).unwrap();
+        start_non_agent_step(&conn, &mut persisted, 0).unwrap();
+
+        execute_run_plan_step(&conn, &repo, &config, &mut persisted, 0, 100).unwrap();
+        assert_eq!(persisted.steps[0].status, AutoStepStatus::Done);
+        assert!(persisted.steps[0].plan_run_id.is_some());
+
+        assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
+        assert!(
+            persisted
+                .steps
+                .iter()
+                .any(|step| step.step_key == AutoStepKey::LocalVerify)
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_plan_failure_marks_auto_step_failed() {
+        let temp = TempDir::new("run-plan-failure");
+        let work = temp.path().join("work");
+        fs::create_dir_all(&work).unwrap();
+        fs::write(work.join("plan.md"), "# Phase 1\n\nImplement it.\n").unwrap();
+        let repo =
+            Repository::with_config_dir_for_test(work.clone(), temp.path().join("prism-config"));
+        let mut config = Config::load(&repo);
+        let opencode = temp.path().join("opencode");
+        write_executable(
+            &opencode,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"message","text":"phase failed"}'
+exit 7
+"#,
+        );
+        config
+            .tools
+            .insert("opencode".to_string(), opencode.display().to_string());
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&conn).unwrap();
+        crate::plan_run::migrate_schema(&conn).unwrap();
+        let mut persisted = AutoLaunch::with_options(
+            &work,
+            &work,
+            AutoLaunchOptions {
+                branch: "feat/auto".to_string(),
+                mode: AutoRunMode::Standard,
+                implementation_source: AutoImplementationSource::ExistingPlan,
+                plan_path: Some(work.join("plan.md")),
+                plan_run_mode: PlanRunMode::Sequential,
+                variant: "default".to_string(),
+                agent_profile: None,
+                initial_prompt: "Implement existing plan".to_string(),
+            },
+        )
+        .unwrap()
+        .create_run();
+        persisted.steps.clear();
+        persisted.steps.push(AutoStepRun::queued(
+            &persisted.run.id,
+            1,
+            AutoStepKey::RunPlan,
+            1,
+            Some("run plan".to_string()),
+        ));
+        save_auto_run(&conn, &mut persisted).unwrap();
+        start_non_agent_step(&conn, &mut persisted, 0).unwrap();
+
+        let error = execute_run_plan_step(&conn, &repo, &config, &mut persisted, 0, 100)
+            .expect_err("run-plan should fail when linked phase fails");
+
+        assert!(error.contains("inspect linked plan dashboard"));
+        assert_eq!(persisted.steps[0].status, AutoStepStatus::Failed);
+        assert_eq!(
+            persisted.steps[0].summary.as_deref(),
+            Some("plan run failed")
+        );
+        assert!(
+            persisted.steps[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("ended with status failed"))
+        );
+        let plan_run_id = persisted.steps[0].plan_run_id.as_deref().unwrap();
+        let linked_plan = load_plan_run(&conn, plan_run_id).unwrap().unwrap();
+        assert_eq!(linked_plan.run.status, PlanRunStatus::Failed);
+    }
+
+    #[test]
+    fn resume_reconciles_interrupted_linked_plan_before_auto_stale_failure() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&conn).unwrap();
+        crate::plan_run::migrate_schema(&conn).unwrap();
+        let repo = PathBuf::from("/repo/prism");
+        let mut persisted = linked_run_plan_auto_run(&conn, &repo);
+        let plan_run_id = persisted.steps[0].plan_run_id.clone().unwrap();
+        let mut plan_run = load_plan_run(&conn, &plan_run_id).unwrap().unwrap();
+        plan_run.run.status = PlanRunStatus::Running;
+        plan_run.steps[0].status = crate::plan_run::PlanStepStatus::Running;
+        crate::plan_run::save_plan_run(&conn, &plan_run).unwrap();
+
+        assert!(prepare_auto_run_for_resume(&conn, &mut persisted, 100).unwrap());
+
+        assert_eq!(persisted.steps[0].status, AutoStepStatus::Queued);
+        assert_eq!(persisted.run.status, AutoRunStatus::Queued);
+        let loaded_plan = load_plan_run(&conn, &plan_run_id).unwrap().unwrap();
+        assert_eq!(
+            loaded_plan.steps[0].status,
+            crate::plan_run::PlanStepStatus::Queued
+        );
+    }
+
+    #[test]
+    fn resume_marks_run_plan_done_when_linked_plan_finished() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&conn).unwrap();
+        crate::plan_run::migrate_schema(&conn).unwrap();
+        let repo = PathBuf::from("/repo/prism");
+        let mut persisted = linked_run_plan_auto_run(&conn, &repo);
+        let plan_run_id = persisted.steps[0].plan_run_id.clone().unwrap();
+        let mut plan_run = load_plan_run(&conn, &plan_run_id).unwrap().unwrap();
+        plan_run.run.status = PlanRunStatus::Done;
+        plan_run.steps[0].status = crate::plan_run::PlanStepStatus::Done;
+        crate::plan_run::save_plan_run(&conn, &plan_run).unwrap();
+
+        assert!(prepare_auto_run_for_resume(&conn, &mut persisted, 100).unwrap());
+
+        assert_eq!(persisted.steps[0].status, AutoStepStatus::Done);
+        assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
+        assert_eq!(persisted.steps[1].step_key, AutoStepKey::LocalVerify);
+    }
+
+    #[test]
+    fn retry_failed_run_plan_requeues_linked_failed_phase() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&conn).unwrap();
+        crate::plan_run::migrate_schema(&conn).unwrap();
+        let repo = PathBuf::from("/repo/prism");
+        let mut persisted = linked_run_plan_auto_run(&conn, &repo);
+        let plan_run_id = persisted.steps[0].plan_run_id.clone().unwrap();
+        persisted.steps[0].status = AutoStepStatus::Failed;
+        save_auto_run(&conn, &mut persisted).unwrap();
+        let mut plan_run = load_plan_run(&conn, &plan_run_id).unwrap().unwrap();
+        plan_run.run.status = PlanRunStatus::Failed;
+        plan_run.steps[0].status = crate::plan_run::PlanStepStatus::Failed;
+        crate::plan_run::save_plan_run(&conn, &plan_run).unwrap();
+
+        retry_failed_auto_step(&conn, &mut persisted).unwrap();
+
+        assert_eq!(persisted.steps.len(), 1);
+        assert_eq!(persisted.steps[0].status, AutoStepStatus::Queued);
+        let loaded_plan = load_plan_run(&conn, &plan_run_id).unwrap().unwrap();
+        assert_eq!(
+            loaded_plan.steps[0].status,
+            crate::plan_run::PlanStepStatus::Queued
+        );
+    }
+
+    #[test]
+    fn retry_from_run_plan_resets_later_auto_steps() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&conn).unwrap();
+        crate::plan_run::migrate_schema(&conn).unwrap();
+        let repo = PathBuf::from("/repo/prism");
+        let mut persisted = linked_run_plan_auto_run(&conn, &repo);
+        persisted.steps[0].status = AutoStepStatus::Done;
+        save_auto_run(&conn, &mut persisted).unwrap();
+        append_step_run(
+            &conn,
+            &mut persisted,
+            AutoStepKey::LocalVerify,
+            Some("verify".to_string()),
+        )
+        .unwrap();
+        persisted.steps[1].status = AutoStepStatus::Done;
+        save_auto_run(&conn, &mut persisted).unwrap();
+        let selected = persisted.steps[0].id.unwrap();
+
+        retry_auto_from_step(&conn, &mut persisted, selected).unwrap();
+
+        assert_eq!(persisted.steps[0].status, AutoStepStatus::Queued);
+        assert_eq!(persisted.steps[1].status, AutoStepStatus::Queued);
+    }
+
+    #[test]
+    fn pause_auto_run_requests_linked_plan_pause() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&conn).unwrap();
+        crate::plan_run::migrate_schema(&conn).unwrap();
+        let repo = PathBuf::from("/repo/prism");
+        let mut persisted = linked_run_plan_auto_run(&conn, &repo);
+        let plan_run_id = persisted.steps[0].plan_run_id.clone().unwrap();
+
+        request_auto_run_pause(&conn, &mut persisted).unwrap();
+
+        let loaded_plan = load_plan_run(&conn, &plan_run_id).unwrap().unwrap();
+        assert!(loaded_plan.run.pause_requested);
     }
 
     #[test]
@@ -4363,6 +5251,7 @@ mod tests {
             AutoStepKey::Implement,
             1,
         ));
+        persisted.steps[1].plan_run_id = Some("plan-linked".to_string());
         persisted.run.selected_step_run_id = Some(2);
 
         save_auto_run(&conn, &mut persisted).unwrap();
@@ -4392,6 +5281,92 @@ mod tests {
             load_output_lines(&conn, implement_id).unwrap()[0].text,
             "working"
         );
+    }
+
+    #[test]
+    fn schema_round_trips_prompt_existing_plan_and_draft_plan_sources() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&conn).unwrap();
+        let repo = PathBuf::from("/repo/prism");
+
+        let mut prompt = AutoLaunch::with_options(
+            &repo,
+            &repo.join("prompt"),
+            AutoLaunchOptions {
+                branch: "feat/prompt".to_string(),
+                mode: AutoRunMode::Standard,
+                implementation_source: AutoImplementationSource::Prompt,
+                plan_path: None,
+                plan_run_mode: PlanRunMode::Sequential,
+                variant: "default".to_string(),
+                agent_profile: None,
+                initial_prompt: "Implement prompt task".to_string(),
+            },
+        )
+        .unwrap()
+        .create_run();
+        let mut existing_plan = AutoLaunch::with_options(
+            &repo,
+            &repo.join("existing"),
+            AutoLaunchOptions {
+                branch: "feat/existing".to_string(),
+                mode: AutoRunMode::Standard,
+                implementation_source: AutoImplementationSource::ExistingPlan,
+                plan_path: Some(repo.join("existing/plan.md")),
+                plan_run_mode: PlanRunMode::Parallel,
+                variant: "default".to_string(),
+                agent_profile: None,
+                initial_prompt: "Implement existing plan".to_string(),
+            },
+        )
+        .unwrap()
+        .create_run();
+        let mut draft_plan = AutoLaunch::with_options(
+            &repo,
+            &repo.join("draft"),
+            AutoLaunchOptions {
+                branch: "feat/draft".to_string(),
+                mode: AutoRunMode::PlanFirst,
+                implementation_source: AutoImplementationSource::DraftPlan,
+                plan_path: Some(repo.join("draft/plan.md")),
+                plan_run_mode: PlanRunMode::Sequential,
+                variant: "intensive".to_string(),
+                agent_profile: None,
+                initial_prompt: "Draft then implement plan".to_string(),
+            },
+        )
+        .unwrap()
+        .create_run();
+
+        save_auto_run(&conn, &mut prompt).unwrap();
+        save_auto_run(&conn, &mut existing_plan).unwrap();
+        save_auto_run(&conn, &mut draft_plan).unwrap();
+
+        let prompt = load_auto_run(&conn, &prompt.run.id).unwrap().unwrap();
+        let existing_plan = load_auto_run(&conn, &existing_plan.run.id)
+            .unwrap()
+            .unwrap();
+        let draft_plan = load_auto_run(&conn, &draft_plan.run.id).unwrap().unwrap();
+
+        assert_eq!(
+            prompt.run.implementation_source,
+            AutoImplementationSource::Prompt
+        );
+        assert_eq!(prompt.run.plan_path, None);
+        assert_eq!(
+            existing_plan.run.implementation_source,
+            AutoImplementationSource::ExistingPlan
+        );
+        assert_eq!(
+            existing_plan.run.plan_path,
+            Some(repo.join("existing/plan.md"))
+        );
+        assert_eq!(existing_plan.run.plan_run_mode, PlanRunMode::Parallel);
+        assert_eq!(
+            draft_plan.run.implementation_source,
+            AutoImplementationSource::DraftPlan
+        );
+        assert_eq!(draft_plan.run.plan_path, Some(repo.join("draft/plan.md")));
     }
 
     #[test]
@@ -4873,6 +5848,7 @@ exit 7
                 opencode_server_url: None,
                 opencode_session_id: None,
                 process_id: None,
+                plan_run_id: None,
                 commit_sha: None,
                 head_sha: None,
                 summary: Some("done".to_string()),
@@ -5112,11 +6088,54 @@ exit 1
             opencode_server_url: None,
             opencode_session_id: None,
             process_id: None,
+            plan_run_id: None,
             commit_sha: None,
             head_sha: None,
             summary: Some("done".to_string()),
             error: None,
         });
+    }
+
+    fn linked_run_plan_auto_run(conn: &rusqlite::Connection, repo: &Path) -> PersistedAutoRun {
+        let mut persisted = AutoLaunch::with_options(
+            repo,
+            repo,
+            AutoLaunchOptions {
+                branch: "feat/auto".to_string(),
+                mode: AutoRunMode::Standard,
+                implementation_source: AutoImplementationSource::ExistingPlan,
+                plan_path: Some(repo.join("plan.md")),
+                plan_run_mode: PlanRunMode::Sequential,
+                variant: "default".to_string(),
+                agent_profile: None,
+                initial_prompt: "Implement existing plan".to_string(),
+            },
+        )
+        .unwrap()
+        .create_run();
+        let plan_launch = crate::plan_run::PlanLaunch::new(
+            repo,
+            repo,
+            &repo.join("plan.md"),
+            "phase",
+            1,
+            1,
+            PlanRunMode::Sequential,
+        )
+        .unwrap();
+        let plan_run = plan_launch.create_run();
+        crate::plan_run::save_plan_run(conn, &plan_run).unwrap();
+        persisted.steps.clear();
+        persisted.steps.push(AutoStepRun::running(
+            &persisted.run.id,
+            1,
+            AutoStepKey::RunPlan,
+            1,
+        ));
+        persisted.steps[0].plan_run_id = Some(plan_run.run.id);
+        persisted.run.status = AutoRunStatus::Running;
+        save_auto_run(conn, &mut persisted).unwrap();
+        persisted
     }
 
     fn verify_result(passed: bool) -> VerifyResult {

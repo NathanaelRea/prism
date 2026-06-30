@@ -17,9 +17,9 @@ Prism uses a lazygit-style panel model.
 - `Space g c` copies a CI-failure prompt.
 - `Space g f` stages a review-fix prompt.
 - `P` opens plan mode in tmux from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through `opencode run`.
+- `A` starts or focuses Auto Flow for the selected non-default worktree.
 - `p` or `Space g p` pulls the selected repository's default branch from the Repos or Worktrees panel.
 - `Space 1` through `Space 9` jump to configured repositories.
-- `A` adds a repository by path from the Repos panel.
 - `R` edits repository order, key bindings, and tracked repositories.
 - `c` creates a worktree session from the Repos panel.
 - `x` aborts the selected OpenCode session from the Worktrees panel.

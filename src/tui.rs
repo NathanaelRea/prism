@@ -512,7 +512,7 @@ impl Tui {
                         pending_g = false;
                         if self.focused_panel != PanelFocus::Worktrees {
                             self.show_message("focus worktrees to start or focus Auto Flow")?;
-                        } else if let Err(error) = self.start_or_focus_selected_auto_run() {
+                        } else if let Err(error) = self.start_or_focus_selected_auto_run(&mut raw) {
                             self.show_error("auto flow failed", &error)?;
                         }
                     }
@@ -677,15 +677,6 @@ impl Tui {
                             self.show_error("abort failed", &error)?;
                         }
                     }
-                    Key::AddRepo => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if self.focused_panel != PanelFocus::Repos {
-                            self.show_message("focus repos to add a repository")?;
-                        } else if let Err(error) = self.add_repository() {
-                            self.show_error("add repository failed", &error)?;
-                        }
-                    }
                     Key::ManageRepos => {
                         self.clear_leader_hint();
                         pending_g = false;
@@ -836,7 +827,7 @@ impl Tui {
             "u            status plan: pause before next phase, or resume paused plan",
             "j/k          status dashboard: move plan output or phase selection",
             "x            status plan: abort selected phase, or type all for all running phases",
-            "A            add repository",
+            "A            worktrees: start/focus Auto Flow; choose prompt, plan file, or draft plan",
             "R            edit repositories/order/keys/remove",
             "c            create worktree session in selected repo",
             "x            worktrees: abort selected OpenCode session",
@@ -1791,7 +1782,54 @@ impl Tui {
                 .cursor
                 .min(output_lines.len().saturating_sub(1));
         }
+        let linked_plan_dashboard = run
+            .steps
+            .iter()
+            .find(|step| step.id == selected_step_run_id)
+            .and_then(|step| step.plan_run_id.as_deref())
+            .and_then(|plan_run_id| self.linked_plan_dashboard(&repo, plan_run_id));
         Some(view::AutoDashboard {
+            run,
+            linked_plan_dashboard,
+            output_lines,
+            output_state,
+        })
+    }
+
+    fn linked_plan_dashboard(
+        &self,
+        repo: &Repository,
+        plan_run_id: &str,
+    ) -> Option<view::PlanDashboard> {
+        let mut run = self.plan_runs.get(plan_run_id).cloned().or_else(|| {
+            crate::observability::with_writable_db(repo, |conn| load_plan_run(conn, plan_run_id))
+                .ok()
+                .flatten()
+        })?;
+        if let Some(selected_step) = self.selected_plan_step_by_run.get(plan_run_id).copied() {
+            run.run.selected_step = selected_step;
+        }
+        let output_lines = crate::observability::with_writable_db(repo, |conn| {
+            load_output_lines(conn, &run.run.id, run.run.selected_step)
+        })
+        .unwrap_or_default();
+        let mut output_state = self
+            .plan_output_state_by_run
+            .get(&run.run.id)
+            .cloned()
+            .unwrap_or_else(|| view::PlanOutputViewerState {
+                cursor: output_lines.len().saturating_sub(1),
+                follow: true,
+                expanded_blocks: BTreeSet::new(),
+            });
+        if output_state.follow {
+            output_state.cursor = output_lines.len().saturating_sub(1);
+        } else if !output_lines.is_empty() {
+            output_state.cursor = output_state
+                .cursor
+                .min(output_lines.len().saturating_sub(1));
+        }
+        Some(view::PlanDashboard {
             run,
             output_lines,
             output_state,
@@ -2371,7 +2409,9 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::agent::AgentState;
-    use crate::auto_flow::{AutoRun, AutoRunMode, AutoRunStatus, PersistedAutoRun};
+    use crate::auto_flow::{
+        AutoImplementationSource, AutoRun, AutoRunMode, AutoRunStatus, PersistedAutoRun,
+    };
     use crate::config::{Checks, Config, EscapeKey, MergeMethod};
     use crate::github::PrCache;
     use crate::plan_run::{PersistedPlanRun, PlanRun, PlanRunMode, PlanRunStatus};
@@ -2530,6 +2570,9 @@ mod tests {
                 worktree_path: PathBuf::from(worktree_path),
                 branch: "feature".to_string(),
                 mode: AutoRunMode::Standard,
+                implementation_source: AutoImplementationSource::Prompt,
+                plan_path: None,
+                plan_run_mode: PlanRunMode::Sequential,
                 variant: "default".to_string(),
                 agent_profile: None,
                 prompt_summary: id.to_string(),

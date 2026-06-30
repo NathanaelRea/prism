@@ -87,6 +87,7 @@ fn help_prints_usage_without_repo() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).contains("Usage:\n  prism"));
+    assert!(stdout(&output).contains("auto run-plan <plan.md>"));
     assert!(stderr(&output).is_empty());
 }
 
@@ -181,6 +182,31 @@ fn unknown_argument_fails_with_stderr() {
     assert!(!output.status.success());
     assert!(stdout(&output).is_empty());
     assert!(stderr(&output).contains("prism: unknown argument: --definitely-not-real"));
+}
+
+#[test]
+fn auto_run_plan_without_path_fails_before_repo_discovery() {
+    let temp = TempDir::new("auto-run-plan-missing-path");
+    let output = run(["auto", "run-plan"], temp.path(), temp.path());
+
+    assert!(!output.status.success());
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).contains("prism: auto run-plan requires a plan path"));
+}
+
+#[test]
+fn auto_run_plan_without_phase_headings_fails_before_launch_gates() {
+    let temp = TempDir::new("auto-run-plan-no-phases");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+    fs::write(repo.join("plan.md"), "# Notes\n\nNo phases yet.\n").expect("write plan");
+
+    let output = run(["auto", "run-plan", "plan.md"], &repo, &config_home);
+
+    assert!(!output.status.success());
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).contains("could not infer phases"));
 }
 
 #[test]

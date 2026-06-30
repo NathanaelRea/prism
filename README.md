@@ -64,13 +64,12 @@ Common keys:
 - `Space g o` opens the selected pull request in a browser.
 - `Space g P` pushes the selected branch and creates a pull request if needed.
 - `Space g M` merges the selected pull request.
-- `Space g a` starts or focuses Auto Flow for the selected non-default worktree.
+- `A` starts or focuses Auto Flow for the selected non-default worktree.
 - `Space g c` copies a CI-failure prompt with failed run metadata and log tails.
 - `Space g f` copies a review-fix prompt.
 - `P` opens plan mode in tmux from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through `opencode run`.
 - `p` or `Space g p` pulls the selected repository's default branch from the repos or worktrees panel.
 - `Space 1`-`Space 9` switches repositories using configured repo keys.
-- `A` adds a repository by path from the repos panel.
 - `R` edits repository order, key bindings, and tracked repositories.
 - `c` creates a worktree session from the repos panel.
 - `x` aborts the selected OpenCode session from the worktrees panel.
@@ -130,15 +129,34 @@ that Prism spawned during the session.
 
 ### Auto Flow
 
-Auto Flow automates one clean, non-default worktree from an initial prompt through
-implementation, local verification, PR creation, automated review repair, CI
-repair, and a final merge gate. Start it from the TUI with `Space g a`, or from
-the CLI:
+Auto Flow automates one clean, non-default worktree through implementation,
+local verification, PR creation, automated review repair, CI repair, and a final
+merge gate. Start or focus it from the TUI with `A` on a selected non-default
+worktree. New runs ask how to source implementation work:
+
+- prompt: enter an initial prompt and run the current one-shot implementation
+  step
+- plan file: select an existing Markdown plan and run its phases before local
+  verification
+- draft plan: enter a task prompt, draft `plan.md`, pause for review/approval,
+  then run the approved plan phases
+
+Start or resume Auto Flow from the CLI with:
 
 ```sh
 prism --repo /work/project auto "implement the task"
+prism --repo /work/project auto run-plan plan.md
 prism --repo /work/project auto plan "draft and review a plan before coding"
 ```
+
+Compatibility notes:
+
+- `P` remains standalone Plan Mode for running plan phases without the Auto Flow
+  PR pipeline
+- `A` is the TUI Auto Flow shortcut; the former leader-based Auto Flow shortcut
+  has been removed
+- `auto plan` drafts, reviews, and waits for approval, then executes the approved
+  `plan.md` by phase; `auto plan-first` and `auto intensive` are aliases
 
 The CLI resumes the most recent active Auto Flow run for that repository before
 starting a new one. Auto Flow state is stored in Prism's per-repository SQLite
@@ -181,5 +199,5 @@ Troubleshooting:
   runtime events
 - use the dashboard controls to pause/resume, retry a failed step, retry from a
   selected step, abort, or dismiss a completed run
-- when automation pauses after plan review, inspect `plan.md` in the worktree
-  and resume the run when the plan is acceptable
+- when draft-plan automation pauses after plan review, inspect `plan.md` in the
+  worktree and resume the run when the plan is acceptable

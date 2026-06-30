@@ -108,15 +108,21 @@ to improve.
 ### Auto Flow
 
 Auto Flow is Prism's persisted workflow for taking one clean, non-default
-Worktree Session from an initial prompt through implementation, local
-verification, PR creation, review repair, CI repair, and eventual merge or
-cleanup.
+Worktree Session through implementation, local verification, PR creation, review
+repair, CI repair, and eventual merge or cleanup. Implementation can come from a
+prompt, an existing Markdown plan, or a drafted `plan.md` that pauses for user
+approval before execution.
 
 An Auto Flow run is stored in Prism's per-repository SQLite database as an
 `AutoRun` plus ordered `AutoStepRun` attempts. The `step_key` identifies the
 conceptual boundary, while each attempt gets its own monotonic sequence and
 output rows so repeated verification, review, and CI repairs remain auditable
 after restart.
+
+Plan-backed Auto Flow delegates implementation to a linked Plan Mode run instead
+of duplicating each phase as an Auto Flow step. The Auto pipeline records one
+`RunPlan` step with a linked `PlanRun`, waits for that plan run to finish, and
+then continues with local verification and the rest of the PR pipeline.
 
 ### Startup Setup
 
