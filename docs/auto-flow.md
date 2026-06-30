@@ -28,6 +28,8 @@ Safety defaults:
 
 - launch is refused on the default branch, detached HEAD, or a dirty worktree
 - every step attempt is persisted before the next external side effect
+- the TUI pauses Auto Flow between steps; resume from Status with `u` after reviewing the dialog that describes the next step
+- worktrees with active Auto Flow runs are highlighted in the worktree list so paused/running/failed runs are visible from the sidebar
 - local verification runs `checks.pre_push`, `checks.pre_pr`, and a non-mutating merge-conflict check
 - review repair uses `checks.review_fix` before the normal verification gate
 - `auto.merge = false` and `auto.cleanup_after_merge = false` by default

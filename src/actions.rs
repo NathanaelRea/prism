@@ -10,9 +10,10 @@ use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{
     AutoExecutorConfig, AutoImplementationSource, AutoLaunch, AutoLaunchOptions, AutoRunMode,
-    AutoRunStatus, AutoStepStatus, abort_auto_step, archive_auto_run, execute_auto_initial_step,
-    load_auto_run, prepare_auto_run_for_resume, request_auto_run_pause, resume_paused_auto_run,
-    retry_auto_from_step, retry_failed_auto_step as retry_auto_failed_step, save_auto_run,
+    AutoRunStatus, AutoStepKey, AutoStepStatus, PersistedAutoRun, abort_auto_step,
+    archive_auto_run, execute_auto_initial_step, load_auto_run, prepare_auto_run_for_resume,
+    request_auto_run_pause, resume_paused_auto_run, retry_auto_from_step,
+    retry_failed_auto_step as retry_auto_failed_step, save_auto_run,
 };
 use crate::ci::build_ci_failure_prompt;
 use crate::config::Config;
@@ -63,6 +64,21 @@ fn validate_existing_auto_plan(plan_path: &Path) -> Result<(), String> {
         return Err("could not infer phases; add headings like 'Phase 1'".to_string());
     }
     Ok(())
+}
+
+fn next_auto_step_description(run: &PersistedAutoRun) -> Option<String> {
+    let step = run.steps.iter().find(|step| {
+        step.status == AutoStepStatus::Queued
+            || matches!(step.status, AutoStepStatus::Waiting)
+                && matches!(step.step_key, AutoStepKey::RunPlan)
+    })?;
+    let detail = step.summary.as_deref().or(step.reason.as_deref());
+    Some(match detail {
+        Some(detail) if !detail.trim().is_empty() => {
+            format!("#{} {} ({})", step.sequence, step.step_key.as_str(), detail)
+        }
+        _ => format!("#{} {}", step.sequence, step.step_key.as_str()),
+    })
 }
 use crate::util::{status_count, yes};
 
@@ -953,17 +969,40 @@ impl Tui {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
-        let session = self.sessions[context.session_index].background_job_snapshot();
-        let use_ =
+        self.attach_tmux_window_for_session_index(context.session_index, window, false)
+    }
+
+    fn attach_tmux_window_for_session_index(
+        &mut self,
+        session_index: usize,
+        window: TmuxWindow,
+        force_new_generation: bool,
+    ) -> Result<(), String> {
+        let Some(session) = self.sessions.get(session_index) else {
+            return Ok(());
+        };
+        let Some(managed) = self.repos.get(session.repo_index) else {
+            return Ok(());
+        };
+        let repo = managed.repo.clone();
+        let config = managed.config.clone();
+        let session = self.sessions[session_index].background_job_snapshot();
+        let mut use_ =
             crate::agent_session::session_use(&self.repos, &mut self.tmux_generations, &session);
+        if force_new_generation {
+            use_.generation = crate::agent_session::rotate_generation(
+                &self.repos,
+                &mut self.tmux_generations,
+                use_.slot.clone(),
+            );
+            use_.warmup_key = crate::agent_session::AgentSessionWarmupKey::new(
+                use_.slot.clone(),
+                use_.generation,
+            );
+        }
         self.finish_tmux_warmup_for_key(&use_.warmup_key);
-        let running = crate::agent_session::attach_window(
-            &context.repo,
-            &context.config,
-            &session,
-            use_.generation,
-            window,
-        )?;
+        let running =
+            crate::agent_session::attach_window(&repo, &config, &session, use_.generation, window)?;
         crate::agent_session::apply_running_result(
             &self.repos,
             &mut self.sessions,
@@ -1384,6 +1423,101 @@ impl Tui {
         });
     }
 
+    pub(crate) fn open_current_plan_tmux_session(
+        &mut self,
+        raw: &mut crate::terminal::RawTerminal,
+    ) -> Result<bool, String> {
+        let Some((repo, plan_run)) = self.current_tmux_plan_run() else {
+            return Ok(false);
+        };
+        let Some(plan_step) = plan_run
+            .steps
+            .iter()
+            .find(|step| {
+                matches!(
+                    step.status,
+                    PlanStepStatus::Starting | PlanStepStatus::Running
+                ) && step.opencode_session_id.is_some()
+            })
+            .or_else(|| {
+                plan_run
+                    .steps
+                    .iter()
+                    .find(|step| step.step == plan_run.run.selected_step)
+            })
+        else {
+            self.show_message("selected plan run has no phase session yet")?;
+            return Ok(false);
+        };
+        let Some(session_id) = plan_step.opencode_session_id.as_deref() else {
+            self.show_message("selected plan phase has no OpenCode session yet")?;
+            return Ok(false);
+        };
+        let Some(session_index) = self.sessions.iter().position(|session| {
+            session.path == plan_run.run.scope_path
+                && self
+                    .repos
+                    .get(session.repo_index)
+                    .is_some_and(|managed| managed.repo.root == repo.root)
+        }) else {
+            self.show_message("plan run worktree is not visible")?;
+            return Ok(false);
+        };
+        let Some(managed) = self.repos.get(self.sessions[session_index].repo_index) else {
+            return Ok(true);
+        };
+        let config = managed.config.clone();
+        let session = self.sessions[session_index].background_job_snapshot();
+        let mut runtime = crate::opencode::ensure_opencode_server(
+            &repo,
+            &config,
+            &session.branch,
+            &session.path,
+        )?;
+        let changed_session = runtime.opencode_session_id.as_deref() != Some(session_id);
+        if changed_session {
+            runtime.opencode_session_id = Some(session_id.to_string());
+            runtime.generation = runtime.generation.saturating_add(1);
+            runtime.updated_unix_ms = crate::auto_flow::unix_ms();
+            crate::opencode::save_runtime(&repo, &runtime)?;
+        }
+        raw.suspend()?;
+        let result = self.attach_tmux_window_for_session_index(
+            session_index,
+            TmuxWindow::Agent,
+            changed_session,
+        );
+        let resume_result = raw.resume();
+        self.refresh_sessions()?;
+        self.start_tmux_agent_warmup();
+        resume_result?;
+        result?;
+        Ok(true)
+    }
+
+    fn current_tmux_plan_run(
+        &self,
+    ) -> Option<(crate::repo::Repository, crate::plan_run::PersistedPlanRun)> {
+        if let Some(dashboard) = self
+            .current_auto_dashboard()
+            .and_then(|dashboard| dashboard.linked_plan_dashboard)
+        {
+            return Some((
+                Repository {
+                    root: PathBuf::from(&dashboard.run.run.repo_root),
+                },
+                dashboard.run,
+            ));
+        }
+        let dashboard = self.current_plan_dashboard()?;
+        Some((
+            Repository {
+                root: PathBuf::from(&dashboard.run.run.repo_root),
+            },
+            dashboard.run,
+        ))
+    }
+
     pub(crate) fn abort_selected_auto_run_or_step(&mut self) -> Result<bool, String> {
         let Some(dashboard) = self.current_auto_dashboard() else {
             return Ok(false);
@@ -1534,6 +1668,12 @@ impl Tui {
         let config = Config::load(&repo);
         let run_id = dashboard.run.run.id.clone();
         let mut should_execute = false;
+        let resuming =
+            dashboard.run.run.pause_requested || dashboard.run.run.status == AutoRunStatus::Paused;
+        if resuming && !self.confirm_resume_auto_step(&dashboard.run)? {
+            self.show_message("Auto Flow resume cancelled")?;
+            return Ok(true);
+        }
         let persisted = crate::observability::with_writable_db(&repo, |conn| {
             let mut run = load_auto_run(conn, &run_id)?
                 .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
@@ -1558,6 +1698,17 @@ impl Tui {
             }
         }
         Ok(true)
+    }
+
+    fn confirm_resume_auto_step(&self, run: &PersistedAutoRun) -> Result<bool, String> {
+        let description = next_auto_step_description(run)
+            .unwrap_or_else(|| "determine the next Auto Flow step".to_string());
+        let answer = self.prompt_line_dialog(
+            "Resume Auto Flow",
+            &format!("Next: {description}. Continue? [y/N] "),
+            "",
+        )?;
+        Ok(answer.as_deref().map(yes).unwrap_or(false))
     }
 
     pub(crate) fn dismiss_selected_auto_run(&mut self) -> Result<bool, String> {

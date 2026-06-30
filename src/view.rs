@@ -61,6 +61,7 @@ pub(crate) struct WorktreeRow {
     pub agent_state: AgentState,
     pub pr: PrCache,
     pub wt_columns: BTreeMap<String, String>,
+    pub auto_status: Option<AutoRunStatus>,
     pub unseen_comments: bool,
     pub prompt_summary: String,
     pub selected: bool,
@@ -437,14 +438,23 @@ fn format_worktree_row(config: &Config, row: &WorktreeRow, width: usize) -> Stri
         "-"
     };
     let row_number = row.session_index.saturating_add(1).to_string();
+    let auto_code = row.auto_status.map(auto_run_status_color);
     let marker = if row.selected {
         color("▶", "1;36")
+    } else if let Some(status) = row.auto_status {
+        color("◆", auto_run_status_color(status))
     } else if row.unseen_comments {
         color("!", "1;36")
     } else {
         " ".to_string()
     };
-    let branch_code = if row.selected { "1;37" } else { "37" };
+    let branch_code = if let Some(code) = auto_code {
+        code
+    } else if row.selected {
+        "1;37"
+    } else {
+        "37"
+    };
     let status_icons = worktree_status_icons(config, row);
     let name = if status_icons.is_empty() {
         styled_cell(&row.branch, 22, branch_code)
@@ -1269,6 +1279,15 @@ fn auto_step_status_color(status: AutoStepStatus) -> &'static str {
         AutoStepStatus::Failed | AutoStepStatus::Aborted => "1;31",
         AutoStepStatus::Running | AutoStepStatus::Starting | AutoStepStatus::Waiting => "1;33",
         AutoStepStatus::Queued | AutoStepStatus::Skipped => "37",
+    }
+}
+
+fn auto_run_status_color(status: AutoRunStatus) -> &'static str {
+    match status {
+        AutoRunStatus::Paused => "1;35",
+        AutoRunStatus::Queued | AutoRunStatus::Running => "1;33",
+        AutoRunStatus::Failed | AutoRunStatus::Aborted => "1;31",
+        AutoRunStatus::Done => "32",
     }
 }
 
@@ -2609,9 +2628,9 @@ mod tests {
     use super::{
         AutoDashboard, AutoOutputViewerState, FrameModel, PlanDashboard, RepoMainView, RepoRow,
         StatusRow, WorktreeKind, WorktreeRow, configured_column_label, format_column_value,
-        format_plan_rendered_output_row, format_repo_row, git_status_indicator, render_model_frame,
-        render_plan_output_rows, selected_rendered_output_index, visible_len,
-        worktree_status_icons,
+        format_plan_rendered_output_row, format_repo_row, format_worktree_row,
+        git_status_indicator, render_model_frame, render_plan_output_rows,
+        selected_rendered_output_index, visible_len, worktree_status_icons,
     };
 
     #[test]
@@ -2667,6 +2686,23 @@ mod tests {
 
         assert!(row.contains("Space 1"));
         assert!(!row.contains("s1"));
+    }
+
+    #[test]
+    fn worktree_row_highlights_paused_auto_flow() {
+        let config = test_config(Some("main"));
+        let mut row = test_worktree_row(
+            &config,
+            &test_session("feature", "clean", AgentState::Idle, PrCache::default()),
+            0,
+            false,
+        );
+        row.auto_status = Some(AutoRunStatus::Paused);
+
+        let rendered = format_worktree_row(&config, &row, 100);
+
+        assert!(rendered.contains("\x1b[1;35m◆\x1b[0m"));
+        assert!(rendered.contains("\x1b[1;35mfeature"));
     }
 
     #[test]
@@ -3712,6 +3748,7 @@ mod tests {
             agent_state: session.agent_state,
             pr: session.pr.clone(),
             wt_columns: session.wt_columns.clone(),
+            auto_status: None,
             unseen_comments: session.unseen_comments,
             prompt_summary: session.prompt_summary.clone(),
             selected,

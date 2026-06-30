@@ -1054,24 +1054,21 @@ pub fn execute_auto_initial_step(
                 save_run_with_conn(conn, &persisted.run)?;
                 return Err(error);
             }
+            pause_before_next_auto_step(conn, persisted)?;
             continue;
         }
 
         if let Some(step_index) = next_queued_non_agent_step(persisted) {
-            if let Err(error) = execute_one_non_agent_step(
-                conn,
-                repo,
-                config,
-                persisted,
-                step_index,
-                executor.max_output_lines_per_step,
-            ) {
+            if let Err(error) =
+                execute_one_non_agent_step(conn, repo, config, persisted, step_index, executor)
+            {
                 persisted.run.status = AutoRunStatus::Failed;
                 persisted.run.pause_requested = false;
                 persisted.run.updated_unix_ms = unix_ms();
                 save_run_with_conn(conn, &persisted.run)?;
                 return Err(error);
             }
+            pause_before_next_auto_step(conn, persisted)?;
             continue;
         }
 
@@ -1840,6 +1837,50 @@ fn has_queued_non_agent_step(persisted: &PersistedAutoRun) -> bool {
     next_queued_non_agent_step(persisted).is_some()
 }
 
+fn has_queued_auto_step(persisted: &PersistedAutoRun) -> bool {
+    next_queued_agent_step(persisted).is_some() || next_queued_non_agent_step(persisted).is_some()
+}
+
+fn has_pending_auto_work(persisted: &PersistedAutoRun) -> bool {
+    has_queued_auto_step(persisted)
+        || queued_prepare_needs_initial_agent_step(persisted)
+        || next_state_machine_step_needed(persisted)
+        || implementation_follow_up_step_needed(persisted)
+}
+
+fn pause_before_next_auto_step(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+) -> Result<(), String> {
+    if matches!(
+        persisted.run.status,
+        AutoRunStatus::Failed | AutoRunStatus::Aborted | AutoRunStatus::Done
+    ) {
+        return Ok(());
+    }
+    if !has_queued_auto_step(persisted) {
+        ensure_next_auto_step(conn, persisted)?;
+    }
+    if !has_pending_auto_work(persisted) {
+        return Ok(());
+    }
+    persisted.run.pause_requested = true;
+    persisted.run.status = AutoRunStatus::Paused;
+    persisted.run.updated_unix_ms = unix_ms();
+    append_auto_event(
+        conn,
+        &AutoEvent {
+            id: None,
+            run_id: persisted.run.id.clone(),
+            step_run_id: persisted.run.selected_step_run_id,
+            time_unix_ms: persisted.run.updated_unix_ms,
+            kind: "step_gate".to_string(),
+            data_json: "{}".to_string(),
+        },
+    )?;
+    save_run_with_conn(conn, &persisted.run)
+}
+
 fn next_state_machine_step_needed(persisted: &PersistedAutoRun) -> bool {
     if persisted.run.implementation_source == AutoImplementationSource::DraftPlan {
         if !has_step_key(persisted, &AutoStepKey::CreatePlan) {
@@ -2152,9 +2193,10 @@ fn execute_one_non_agent_step(
     config: &Config,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
-    max_output_lines_per_step: usize,
+    executor: &AutoExecutorConfig,
 ) -> Result<(), String> {
     start_non_agent_step(conn, persisted, step_index)?;
+    let max_output_lines_per_step = executor.max_output_lines_per_step;
     let result = match persisted.steps[step_index].step_key {
         AutoStepKey::ApprovePlan => {
             execute_approve_plan_step(conn, persisted, step_index, max_output_lines_per_step)
@@ -2165,6 +2207,7 @@ fn execute_one_non_agent_step(
             config,
             persisted,
             step_index,
+            executor.server_url.clone(),
             max_output_lines_per_step,
         ),
         AutoStepKey::LocalVerify => execute_local_verify_step(
@@ -2306,6 +2349,7 @@ fn execute_run_plan_step(
     config: &Config,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
+    server_url: Option<String>,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
     crate::plan_run::migrate_schema(conn)?;
@@ -2345,7 +2389,7 @@ fn execute_run_plan_step(
 
     let mut plan_executor = PlanExecutorConfig::new(
         config.tool("opencode"),
-        None,
+        server_url,
         persisted.run.worktree_path.clone(),
         plan_run.run.plan_display.clone(),
     );
@@ -4978,11 +5022,16 @@ mod tests {
             Repository::with_config_dir_for_test(work.clone(), temp.path().join("prism-config"));
         let mut config = Config::load(&repo);
         let opencode = temp.path().join("opencode");
+        let opencode_log = temp.path().join("opencode.log");
         write_executable(
             &opencode,
-            r#"#!/bin/sh
-printf '%s\n' '{"type":"message","text":"phase done"}'
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+printf '%s\n' '{{"type":"message","text":"phase done"}}'
 "#,
+                opencode_log.display()
+            ),
         );
         config
             .tools
@@ -5017,9 +5066,20 @@ printf '%s\n' '{"type":"message","text":"phase done"}'
         save_auto_run(&conn, &mut persisted).unwrap();
         start_non_agent_step(&conn, &mut persisted, 0).unwrap();
 
-        execute_run_plan_step(&conn, &repo, &config, &mut persisted, 0, 100).unwrap();
+        execute_run_plan_step(
+            &conn,
+            &repo,
+            &config,
+            &mut persisted,
+            0,
+            Some("http://127.0.0.1:41234".to_string()),
+            100,
+        )
+        .unwrap();
         assert_eq!(persisted.steps[0].status, AutoStepStatus::Done);
         assert!(persisted.steps[0].plan_run_id.is_some());
+        let command = fs::read_to_string(opencode_log).unwrap();
+        assert!(command.contains("--attach http://127.0.0.1:41234"));
 
         assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
         assert!(
@@ -5081,7 +5141,7 @@ exit 7
         save_auto_run(&conn, &mut persisted).unwrap();
         start_non_agent_step(&conn, &mut persisted, 0).unwrap();
 
-        let error = execute_run_plan_step(&conn, &repo, &config, &mut persisted, 0, 100)
+        let error = execute_run_plan_step(&conn, &repo, &config, &mut persisted, 0, None, 100)
             .expect_err("run-plan should fail when linked phase fails");
 
         assert!(error.contains("inspect linked plan dashboard"));
@@ -5536,7 +5596,7 @@ exit 7
 
     #[test]
     #[cfg(unix)]
-    fn executor_runs_fake_opencode_and_persists_events() {
+    fn executor_runs_fake_opencode_pauses_before_next_step_and_persists_events() {
         let temp = TempDir::new("executor-success");
         let origin = temp.path().join("origin.git");
         let work = temp.path().join("work");
@@ -5576,12 +5636,8 @@ printf '%s\n' '{"type":"tool.execute.after","id":"tool_1","status":"success","ou
         .unwrap();
 
         let loaded = load_auto_run(&conn, &persisted.run.id).unwrap().unwrap();
-        assert_eq!(loaded.run.status, AutoRunStatus::Done);
-        assert_eq!(loaded.run.pr_number, Some(42));
-        assert_eq!(
-            loaded.run.pr_url.as_deref(),
-            Some("https://example.com/pr/42")
-        );
+        assert_eq!(loaded.run.status, AutoRunStatus::Paused);
+        assert!(loaded.run.pause_requested);
         assert_eq!(loaded.steps[0].status, AutoStepStatus::Done);
         let implement = loaded
             .steps
@@ -5591,6 +5647,12 @@ printf '%s\n' '{"type":"tool.execute.after","id":"tool_1","status":"success","ou
         assert_eq!(implement.status, AutoStepStatus::Done);
         assert_eq!(implement.opencode_session_id.as_deref(), Some("ses_auto"));
         assert_eq!(implement.summary.as_deref(), Some("working on it"));
+        let verify = loaded
+            .steps
+            .iter()
+            .find(|step| step.step_key == AutoStepKey::LocalVerify)
+            .unwrap();
+        assert_eq!(verify.status, AutoStepStatus::Queued);
         let lines = load_output_lines(&conn, implement.id.unwrap()).unwrap();
         assert!(
             lines.iter().any(|line| {

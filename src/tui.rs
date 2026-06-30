@@ -476,7 +476,8 @@ impl Tui {
                         pending_g = false;
                         match self.focused_panel {
                             PanelFocus::Status => {
-                                if !self.toggle_plan_output_block() {
+                                if self.open_current_plan_tmux_session(&mut raw)? {
+                                } else if !self.toggle_plan_output_block() {
                                     self.focus_repos();
                                 }
                             }
@@ -811,7 +812,7 @@ impl Tui {
             "1 / 2 / 3    focus status / repos / worktrees",
             "Tab          move focus between panels",
             "h/l, left/right arrows  repos: switch view; status plan: switch phase",
-            "Space Space  status: focus repos; repos: focus worktrees; worktrees: open agent if valid",
+            "Space Space  status: open current plan phase tmux window 1 if available; repos: focus worktrees; worktrees: open agent if valid",
             "Enter        status: focus repos; repos: focus worktrees; worktrees: open agent if valid",
             "Space Enter  open tmux window 3: terminal",
             "Space g g    open tmux window 2: lazygit",
@@ -824,7 +825,7 @@ impl Tui {
             "Space g p    repos/worktrees: pull default branch",
             "p            repos/worktrees: pull default branch",
             "P            repos/worktrees: start or focus a plan run dashboard",
-            "u            status plan: pause before next phase, or resume paused plan",
+            "u            status: pause/resume auto or plan; paused Auto Flow prompts before the next step",
             "j/k          status dashboard: move plan output or phase selection",
             "x            status plan: abort selected phase, or type all for all running phases",
             "A            worktrees: start/focus Auto Flow; choose prompt, plan file, or draft plan",
@@ -2077,6 +2078,11 @@ impl Tui {
                     .get(session.repo_index)
                     .map(|repo| repo.repo.root.display().to_string())
                     .unwrap_or_default();
+                let auto_status = self
+                    .active_auto_runs
+                    .get(&session.path)
+                    .and_then(|run_id| self.auto_runs.get(run_id))
+                    .map(|run| run.run.status);
                 Some(view::WorktreeRow {
                     session_index: index,
                     repo_root,
@@ -2096,6 +2102,7 @@ impl Tui {
                     agent_state: session.agent_state,
                     pr: session.pr.clone(),
                     wt_columns: session.wt_columns.clone(),
+                    auto_status,
                     unseen_comments: session.unseen_comments,
                     prompt_summary: session.prompt_summary.clone(),
                     selected: Some(index) == self.selected_worktree_index(),
