@@ -72,6 +72,41 @@ impl PrSummary {
             self.comment_count
         )
     }
+
+    pub fn check_state(&self) -> PrCheckState {
+        PrCheckState::from_label(&self.check_status)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrCheckState {
+    Pending,
+    Success,
+    Failed,
+    Mixed,
+    Unknown,
+}
+
+impl PrCheckState {
+    pub fn from_label(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "running" | "pending" => Self::Pending,
+            "passed" | "success" => Self::Success,
+            "failed" | "failure" => Self::Failed,
+            "mixed" => Self::Mixed,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "running",
+            Self::Success => "passed",
+            Self::Failed => "failed",
+            Self::Mixed => "mixed",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -96,19 +131,29 @@ pub struct CiFailure {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PrComment {
+    #[serde(default)]
+    pub id: String,
     pub author: String,
     pub body: String,
+    #[serde(default)]
+    pub created_at: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PrReview {
+    #[serde(default)]
+    pub id: String,
     pub author: String,
     pub state: String,
     pub body: String,
+    #[serde(default)]
+    pub submitted_at: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PrReviewComment {
+    #[serde(default)]
+    pub id: String,
     pub author: String,
     pub path: String,
     pub line: String,
@@ -248,6 +293,8 @@ struct GithubReviewThreadCommentConnection {
 #[derive(Debug, Default, Deserialize)]
 struct GithubReviewThreadComment {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
     author: GithubLogin,
     #[serde(default)]
     path: String,
@@ -285,15 +332,21 @@ struct GhPrViewDetails {
 #[derive(Debug, Default, Deserialize)]
 struct GhPrComment {
     #[serde(default)]
+    id: String,
+    #[serde(default)]
     author: GhActor,
     #[serde(default)]
     user: GhActor,
     #[serde(default)]
     body: String,
+    #[serde(default, rename = "createdAt")]
+    created_at: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct GhPrReview {
+    #[serde(default)]
+    id: String,
     #[serde(default)]
     author: GhActor,
     #[serde(default)]
@@ -302,6 +355,8 @@ struct GhPrReview {
     state: String,
     #[serde(default)]
     body: String,
+    #[serde(default, rename = "submittedAt")]
+    submitted_at: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1116,6 +1171,7 @@ query($owner: String!, $name: String!, $number: Int!) {
               author {
                 login
               }
+              id
               path
               line
               originalLine
@@ -1135,8 +1191,10 @@ fn parse_pr_comments(details: &GhPrViewDetails) -> Vec<PrComment> {
         .comments
         .iter()
         .map(|object| PrComment {
+            id: object.id.clone(),
             author: first_non_empty([object.author.login.as_str(), object.user.login.as_str()]),
             body: object.body.clone(),
+            created_at: object.created_at.clone(),
         })
         .filter(|comment| !comment.body.trim().is_empty())
         .take(20)
@@ -1148,9 +1206,11 @@ fn parse_pr_reviews(details: &GhPrViewDetails) -> Vec<PrReview> {
         .reviews
         .iter()
         .map(|object| PrReview {
+            id: object.id.clone(),
             author: first_non_empty([object.author.login.as_str(), object.user.login.as_str()]),
             state: object.state.clone(),
             body: object.body.clone(),
+            submitted_at: object.submitted_at.clone(),
         })
         .filter(|review| !review.state.trim().is_empty() || !review.body.trim().is_empty())
         .take(20)
@@ -1188,6 +1248,8 @@ fn parse_inline_review_comments(raw: &str) -> Vec<PrReviewComment> {
     #[derive(Default, Deserialize)]
     struct InlineComment {
         #[serde(default)]
+        id: String,
+        #[serde(default)]
         user: GhActor,
         #[serde(default)]
         path: String,
@@ -1205,6 +1267,7 @@ fn parse_inline_review_comments(raw: &str) -> Vec<PrReviewComment> {
     comments
         .into_iter()
         .map(|object| PrReviewComment {
+            id: object.id,
             author: object.user.login,
             path: object.path,
             line: object
@@ -1232,6 +1295,7 @@ pub fn parse_review_thread_comments(raw: &str) -> Vec<PrReviewComment> {
                 return comments;
             }
             let comment = PrReviewComment {
+                id: object.id,
                 author: object.author.login,
                 path: object.path,
                 line: object
@@ -1755,8 +1819,19 @@ mod tests {
             "title": "Fix review",
             "mergedAt": "2026-01-01T00:00:00Z",
             "isDraft": true,
-            "comments": [{"author": {"login": "reviewer"}, "body": "hello"}],
-            "reviews": [{"author": {"login": "maintainer"}, "state": "CHANGES_REQUESTED"}],
+            "comments": [{
+                "id": "PRC_kw123",
+                "author": {"login": "reviewer"},
+                "body": "hello",
+                "createdAt": "2026-01-01T00:00:00Z"
+            }],
+            "reviews": [{
+                "id": "PRR_kw123",
+                "author": {"login": "maintainer"},
+                "state": "CHANGES_REQUESTED",
+                "body": "review body",
+                "submittedAt": "2026-01-01T00:01:00Z"
+            }],
             "files": [{"path": "src/main.rs"}],
             "statusCheckRollup": {
                 "contexts": {
@@ -1769,8 +1844,24 @@ mod tests {
         let details = parse_pr_details(raw);
         assert_eq!(details.files, vec!["src/main.rs"]);
         assert_eq!(details.failing_checks, vec!["test"]);
+        assert_eq!(details.comments[0].id, "PRC_kw123");
         assert_eq!(details.comments[0].body, "hello");
+        assert_eq!(details.comments[0].created_at, "2026-01-01T00:00:00Z");
+        assert_eq!(details.reviews[0].id, "PRR_kw123");
         assert_eq!(details.reviews[0].state, "CHANGES_REQUESTED");
+        assert_eq!(details.reviews[0].body, "review body");
+        assert_eq!(details.reviews[0].submitted_at, "2026-01-01T00:01:00Z");
+    }
+
+    #[test]
+    fn check_state_normalizes_display_labels_for_workflow_decisions() {
+        assert_eq!(PrCheckState::from_label("running"), PrCheckState::Pending);
+        assert_eq!(PrCheckState::from_label("pending"), PrCheckState::Pending);
+        assert_eq!(PrCheckState::from_label("passed"), PrCheckState::Success);
+        assert_eq!(PrCheckState::from_label("success"), PrCheckState::Success);
+        assert_eq!(PrCheckState::from_label("failed"), PrCheckState::Failed);
+        assert_eq!(PrCheckState::from_label("mixed"), PrCheckState::Mixed);
+        assert_eq!(PrCheckState::from_label(""), PrCheckState::Unknown);
     }
 
     #[test]
@@ -1799,11 +1890,15 @@ mod tests {
             comments: vec![PrComment {
                 author: "reviewer".to_string(),
                 body: "please fix\nthis".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                ..PrComment::default()
             }],
             reviews: vec![PrReview {
                 author: "maintainer".to_string(),
                 state: "CHANGES_REQUESTED".to_string(),
                 body: "needs work".to_string(),
+                submitted_at: "2026-01-01T00:01:00Z".to_string(),
+                ..PrReview::default()
             }],
             review_comments: vec![PrReviewComment {
                 author: "reviewer".to_string(),
@@ -1812,6 +1907,7 @@ mod tests {
                 body: "inline note".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 resolved: true,
+                ..PrReviewComment::default()
             }],
             files: vec!["src/main.rs".to_string()],
             failing_checks: vec!["test".to_string()],
@@ -1840,7 +1936,15 @@ mod tests {
         let loaded_details = loaded.details.as_ref().unwrap();
         assert_eq!(loaded_details.comments[0].author, "reviewer");
         assert_eq!(loaded_details.comments[0].body, "please fix\nthis");
+        assert_eq!(
+            loaded_details.comments[0].created_at,
+            "2026-01-01T00:00:00Z"
+        );
         assert_eq!(loaded_details.reviews[0].state, "CHANGES_REQUESTED");
+        assert_eq!(
+            loaded_details.reviews[0].submitted_at,
+            "2026-01-01T00:01:00Z"
+        );
         assert_eq!(loaded_details.review_comments[0].path, "src/main.rs");
         assert!(loaded_details.review_comments[0].resolved);
         assert_eq!(loaded_details.files, vec!["src/main.rs"]);
@@ -1862,6 +1966,7 @@ mod tests {
                 body: "inline note".to_string(),
                 created_at: "2026-01-01T00:00:00Z".to_string(),
                 resolved: false,
+                ..PrReviewComment::default()
             }],
             ..PrDetails::default()
         };
@@ -1962,6 +2067,7 @@ mod tests {
                 comments: vec![PrComment {
                     author: "reviewer".to_string(),
                     body: "top-level".to_string(),
+                    ..PrComment::default()
                 }],
                 review_comments: vec![
                     PrReviewComment {
@@ -1971,6 +2077,7 @@ mod tests {
                         body: "inline".to_string(),
                         created_at: "2026-01-01T00:00:00Z".to_string(),
                         resolved: false,
+                        ..PrReviewComment::default()
                     },
                     PrReviewComment {
                         author: "reviewer".to_string(),
@@ -1979,6 +2086,7 @@ mod tests {
                         body: "resolved".to_string(),
                         created_at: "2026-01-02T00:00:00Z".to_string(),
                         resolved: true,
+                        ..PrReviewComment::default()
                     },
                 ],
                 ..PrDetails::default()
@@ -2003,6 +2111,7 @@ mod tests {
             comments: vec![PrComment {
                 author: "reviewer".to_string(),
                 body: "new comment".to_string(),
+                ..PrComment::default()
             }],
             ..PrDetails::default()
         };
@@ -2200,6 +2309,7 @@ mod tests {
             {
                 "path": "src/main.rs",
                 "line": 12,
+                "id": "PRRC_kw123",
                 "body": "please simplify",
                 "created_at": "2026-01-01T00:00:00Z",
                 "user": {"login": "reviewer"}
@@ -2208,8 +2318,10 @@ mod tests {
         let comments = parse_inline_review_comments(raw);
         assert_eq!(comments.len(), 1);
         assert_eq!(comments[0].path, "src/main.rs");
+        assert_eq!(comments[0].id, "PRRC_kw123");
         assert_eq!(comments[0].line, "12");
         assert_eq!(comments[0].author, "reviewer");
+        assert_eq!(comments[0].created_at, "2026-01-01T00:00:00Z");
         assert!(!comments[0].resolved);
     }
 
@@ -2226,6 +2338,7 @@ mod tests {
                       "comments": {
                         "nodes": [
                           {
+                            "id": "PRRC_kw123",
                             "path": "src/main.rs",
                             "line": 12,
                             "body": "please simplify",
@@ -2240,6 +2353,7 @@ mod tests {
                       "comments": {
                         "nodes": [
                           {
+                            "id": "PRRC_kw456",
                             "path": "src/lib.rs",
                             "originalLine": 20,
                             "body": "still needs work",
@@ -2260,10 +2374,12 @@ mod tests {
 
         assert_eq!(comments.len(), 2);
         assert_eq!(comments[0].author, "reviewer");
+        assert_eq!(comments[0].id, "PRRC_kw123");
         assert_eq!(comments[0].path, "src/main.rs");
         assert_eq!(comments[0].line, "12");
         assert!(comments[0].resolved);
         assert_eq!(comments[1].author, "maintainer");
+        assert_eq!(comments[1].id, "PRRC_kw456");
         assert_eq!(comments[1].path, "src/lib.rs");
         assert_eq!(comments[1].line, "20");
         assert!(!comments[1].resolved);
@@ -2341,6 +2457,7 @@ JSON
             opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: crate::config::MergeMethod::Squash,
+            auto: crate::config::AutoConfig::default(),
             checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools: BTreeMap::new(),

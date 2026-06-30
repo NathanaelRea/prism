@@ -221,6 +221,7 @@ mod tests {
             agent_commands: BTreeMap::new(),
             checks: Checks::default(),
             merge_method: crate::config::MergeMethod::Squash,
+            auto: crate::config::AutoConfig::default(),
             worktree_columns: Vec::new(),
             user_path: PathBuf::from("/repo/.config/prism/config.toml"),
             repo_config_path: PathBuf::from("/repo/.prism/config.toml"),

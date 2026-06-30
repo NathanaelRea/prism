@@ -64,6 +64,7 @@ Common keys:
 - `Space g o` opens the selected pull request in a browser.
 - `Space g P` pushes the selected branch and creates a pull request if needed.
 - `Space g M` merges the selected pull request.
+- `Space g a` starts or focuses Auto Flow for the selected non-default worktree.
 - `Space g c` copies a CI-failure prompt with failed run metadata and log tails.
 - `Space g f` copies a review-fix prompt.
 - `P` opens plan mode in tmux from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through `opencode run`.
@@ -126,3 +127,59 @@ and `opencode_port_span` define the deterministic local port range used for
 those servers. By default Prism keeps servers warm after the TUI exits; set
 `opencode_shutdown_owned_servers = true` to send SIGTERM to OpenCode servers
 that Prism spawned during the session.
+
+### Auto Flow
+
+Auto Flow automates one clean, non-default worktree from an initial prompt through
+implementation, local verification, PR creation, automated review repair, CI
+repair, and a final merge gate. Start it from the TUI with `Space g a`, or from
+the CLI:
+
+```sh
+prism --repo /work/project auto "implement the task"
+prism --repo /work/project auto plan "draft and review a plan before coding"
+```
+
+The CLI resumes the most recent active Auto Flow run for that repository before
+starting a new one. Auto Flow state is stored in Prism's per-repository SQLite
+database under `~/.config/prism/repos/...`, not in the project checkout.
+
+Safety defaults:
+
+- launch is refused on the default branch, detached HEAD, or a dirty worktree
+- every step attempt is persisted before the next external side effect
+- local verification runs `checks.pre_push`, `checks.pre_pr`, and a
+  non-mutating merge-conflict check
+- review repair uses `checks.review_fix` before the normal verification gate
+- `auto.merge = false` and `auto.cleanup_after_merge = false` by default
+
+Useful per-repository options:
+
+```toml
+[auto]
+merge = false
+cleanup_after_merge = false
+review_wait_enabled = true
+review_reviewer_identities = ["Copilot", "github-copilot"]
+review_max_wait_seconds = 300
+review_poll_interval_seconds = 30
+review_continue_on_timeout = true
+ci_wait_enabled = true
+ci_max_wait_seconds = 1800
+ci_poll_interval_seconds = 30
+```
+
+If Prism exits or the machine restarts, rerun `prism` or `prism auto` for the
+repository. Active Auto Flow steps are reconciled from the persisted run; stale
+running attempts are marked failed so they can be retried instead of being
+silently forgotten.
+
+Troubleshooting:
+
+- run `prism config` to inspect effective Auto Flow and check settings
+- run `prism debug logs` or start with `--print-logs --log-level debug` for
+  runtime events
+- use the dashboard controls to pause/resume, retry a failed step, retry from a
+  selected step, abort, or dismiss a completed run
+- when automation pauses after plan review, inspect `plan.md` in the worktree
+  and resume the run when the plan is acceptable

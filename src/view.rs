@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::agent::AgentState;
+use crate::auto_flow::{
+    AutoOutputKind, AutoOutputLine, AutoRunMode, AutoRunStatus, AutoStepRun, AutoStepStatus,
+    PersistedAutoRun,
+};
 use crate::config::Config;
 use crate::github::{PrCache, pr_cache_has_comments};
 use crate::opencode::OpencodeStatus;
@@ -30,6 +34,7 @@ pub(crate) struct FrameModel<'a> {
     pub repo_filter: &'a str,
     pub worktree_filter: &'a str,
     pub leader_hint: Option<&'a str>,
+    pub auto_dashboard: Option<AutoDashboard>,
     pub plan_dashboard: Option<PlanDashboard>,
 }
 
@@ -65,6 +70,18 @@ pub(crate) struct PlanDashboard {
     pub run: PersistedPlanRun,
     pub output_lines: Vec<PlanOutputLine>,
     pub output_state: PlanOutputViewerState,
+}
+
+pub(crate) struct AutoDashboard {
+    pub run: PersistedAutoRun,
+    pub output_lines: Vec<AutoOutputLine>,
+    pub output_state: AutoOutputViewerState,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AutoOutputViewerState {
+    pub cursor: usize,
+    pub follow: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -131,7 +148,9 @@ pub(crate) fn render_model_frame(model: &FrameModel<'_>, cols: u16, rows: u16) -
         .position(|row| row.selected)
         .unwrap_or(0);
     let worktree_start = scroll_start(worktree_selected, worktree_rows);
-    let main_lines = if let Some(dashboard) = &model.plan_dashboard {
+    let main_lines = if let Some(dashboard) = &model.auto_dashboard {
+        format_auto_dashboard_lines(dashboard, main_width as usize, main_rows)
+    } else if let Some(dashboard) = &model.plan_dashboard {
         format_plan_dashboard_lines(dashboard, main_width as usize, main_rows)
     } else {
         match model.focus {
@@ -646,6 +665,174 @@ fn format_opencode_status_lines(status: &OpencodeStatus, width: usize) -> Vec<St
     lines
 }
 
+fn format_auto_dashboard_lines(
+    dashboard: &AutoDashboard,
+    width: usize,
+    visible_rows: usize,
+) -> Vec<String> {
+    let run = &dashboard.run.run;
+    let selected_step = run
+        .selected_step_run_id
+        .and_then(|id| dashboard.run.steps.iter().find(|step| step.id == Some(id)))
+        .or_else(|| dashboard.run.steps.first());
+    let counts = dashboard.run.status_counts();
+    let mut lines = vec![
+        color("Auto Flow", "1;36"),
+        format!("task   {}", truncate_line(&run.prompt_summary, width)),
+        format!(
+            "work   {}",
+            truncate_line(&run.worktree_path.display().to_string(), width)
+        ),
+        format!(
+            "mode   {}  status {}  elapsed {}",
+            auto_mode_label(run.mode),
+            auto_run_status_label(run.status),
+            elapsed_label(run.created_unix_ms, run.updated_unix_ms)
+        ),
+        format!("branch {}", truncate_line(&run.branch, width)),
+    ];
+    if let Some(pr_number) = run.pr_number {
+        lines.push(format!("pr     #{pr_number}"));
+    }
+    if let Some(step) = selected_step {
+        lines.push(format!(
+            "step   #{} {} attempt {} {}",
+            step.sequence,
+            step.step_key.as_str(),
+            step.attempt,
+            auto_step_status_label(step.status)
+        ));
+        if let Some(session_id) = step.opencode_session_id.as_deref() {
+            lines.push(format!("opencode session {}", short_id(session_id)));
+        }
+        if let Some(summary) = step.summary.as_deref().or(step.reason.as_deref()) {
+            lines.push(format!("latest {}", truncate_line(summary, width)));
+        }
+        if let Some(error) = step.error.as_deref() {
+            lines.push(color(
+                &format!("error  {}", truncate_line(error, width)),
+                "1;31",
+            ));
+        }
+    }
+    lines.push(format!(
+        "counts queued {}  running {}  waiting {}  done {}  failed {}",
+        counts.queued + counts.starting,
+        counts.running,
+        counts.waiting,
+        counts.done,
+        counts.failed
+    ));
+    lines.push(String::new());
+    lines.push(color("Steps", "1;37"));
+    let output_rows_reserved = dashboard.output_lines.len().min(8) + 2;
+    let step_rows_available = visible_rows
+        .saturating_sub(lines.len())
+        .saturating_sub(output_rows_reserved)
+        .max(3);
+    let selected_index = selected_step
+        .and_then(|selected| {
+            dashboard
+                .run
+                .steps
+                .iter()
+                .position(|step| step.id == selected.id)
+        })
+        .unwrap_or(0);
+    let start = scroll_start(selected_index, step_rows_available);
+    for step in dashboard
+        .run
+        .steps
+        .iter()
+        .skip(start)
+        .take(step_rows_available)
+    {
+        lines.push(format_auto_step_row(step, run.selected_step_run_id, width));
+    }
+    lines.push(String::new());
+    lines.push(color("Output", "1;37"));
+    if dashboard.output_lines.is_empty() {
+        lines.push(color("No output yet", "90"));
+    } else {
+        let output_rows_available = visible_rows.saturating_sub(lines.len()).max(1);
+        let cursor = dashboard
+            .output_state
+            .cursor
+            .min(dashboard.output_lines.len().saturating_sub(1));
+        let start = if dashboard.output_state.follow {
+            dashboard
+                .output_lines
+                .len()
+                .saturating_sub(output_rows_available)
+        } else {
+            scroll_start(cursor, output_rows_available)
+        };
+        for (index, line) in dashboard
+            .output_lines
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(output_rows_available)
+        {
+            lines.push(format_auto_output_row(line, index == cursor, width));
+        }
+    }
+    lines.truncate(visible_rows);
+    lines
+}
+
+fn format_auto_step_row(
+    step: &AutoStepRun,
+    selected_step_run_id: Option<i64>,
+    width: usize,
+) -> String {
+    let marker = if step.id == selected_step_run_id {
+        color("▶", "1;36")
+    } else {
+        " ".to_string()
+    };
+    let label = format!(
+        "{} #{} {}",
+        marker,
+        step.sequence,
+        auto_step_status_label(step.status)
+    );
+    let detail = step
+        .summary
+        .as_deref()
+        .or(step.reason.as_deref())
+        .or(step.error.as_deref())
+        .unwrap_or("");
+    let text = format!(
+        "{} {} {}",
+        styled_cell(&label, 24, auto_step_status_color(step.status)),
+        styled_cell(step.step_key.as_str(), 20, "37"),
+        truncate_line(detail, width.saturating_sub(46))
+    );
+    ansi_cell(&text, width)
+}
+
+fn format_auto_output_row(line: &AutoOutputLine, selected: bool, width: usize) -> String {
+    let marker = if selected {
+        color("▶", "1;36")
+    } else {
+        " ".to_string()
+    };
+    let kind = auto_output_kind_label(line.kind);
+    let prefix = format!(
+        "{} {}",
+        marker,
+        styled_cell(kind, 10, auto_output_kind_color(line.kind))
+    );
+    ansi_cell(
+        &format!(
+            "{prefix} {}",
+            truncate_line(&line.text, width.saturating_sub(14))
+        ),
+        width,
+    )
+}
+
 fn format_plan_dashboard_lines(
     dashboard: &PlanDashboard,
     width: usize,
@@ -956,6 +1143,69 @@ fn plan_mode_label(mode: PlanRunMode) -> &'static str {
     match mode {
         PlanRunMode::Sequential => "sequential",
         PlanRunMode::Parallel => "parallel",
+    }
+}
+
+fn auto_mode_label(mode: AutoRunMode) -> &'static str {
+    match mode {
+        AutoRunMode::Standard => "standard",
+        AutoRunMode::PlanFirst => "plan_first",
+    }
+}
+
+fn auto_run_status_label(status: AutoRunStatus) -> &'static str {
+    match status {
+        AutoRunStatus::Queued => "queued",
+        AutoRunStatus::Running => "running",
+        AutoRunStatus::Paused => "paused",
+        AutoRunStatus::Done => "done",
+        AutoRunStatus::Failed => "failed",
+        AutoRunStatus::Aborted => "aborted",
+    }
+}
+
+fn auto_step_status_label(status: AutoStepStatus) -> &'static str {
+    match status {
+        AutoStepStatus::Queued => "queued",
+        AutoStepStatus::Starting => "starting",
+        AutoStepStatus::Running => "running",
+        AutoStepStatus::Waiting => "waiting",
+        AutoStepStatus::Done => "done",
+        AutoStepStatus::Failed => "failed",
+        AutoStepStatus::Aborted => "aborted",
+        AutoStepStatus::Skipped => "skipped",
+    }
+}
+
+fn auto_step_status_color(status: AutoStepStatus) -> &'static str {
+    match status {
+        AutoStepStatus::Done => "32",
+        AutoStepStatus::Failed | AutoStepStatus::Aborted => "1;31",
+        AutoStepStatus::Running | AutoStepStatus::Starting | AutoStepStatus::Waiting => "1;33",
+        AutoStepStatus::Queued | AutoStepStatus::Skipped => "37",
+    }
+}
+
+fn auto_output_kind_label(kind: AutoOutputKind) -> &'static str {
+    match kind {
+        AutoOutputKind::Assistant => "assistant",
+        AutoOutputKind::Tool => "tool",
+        AutoOutputKind::ToolOutput => "tool out",
+        AutoOutputKind::Diff => "diff",
+        AutoOutputKind::Status => "status",
+        AutoOutputKind::System => "system",
+        AutoOutputKind::Error => "error",
+        AutoOutputKind::RawJson => "json",
+    }
+}
+
+fn auto_output_kind_color(kind: AutoOutputKind) -> &'static str {
+    match kind {
+        AutoOutputKind::Assistant => "37",
+        AutoOutputKind::Tool | AutoOutputKind::ToolOutput => "33",
+        AutoOutputKind::Diff => "36",
+        AutoOutputKind::Error => "1;31",
+        AutoOutputKind::Status | AutoOutputKind::System | AutoOutputKind::RawJson => "90",
     }
 }
 
@@ -2256,6 +2506,10 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::agent::AgentState;
+    use crate::auto_flow::{
+        AutoOutputKind, AutoOutputLine, AutoRun, AutoRunMode, AutoRunStatus, AutoStepKey,
+        AutoStepRun, AutoStepStatus, PersistedAutoRun,
+    };
     use crate::config::{Checks, Config, EscapeKey, MergeMethod};
     use crate::github::{PrCache, PrComment, PrDetails, PrReviewComment, PrSummary};
     use crate::opencode::{OpencodeState, OpencodeStatus, OpencodeTodo};
@@ -2267,10 +2521,11 @@ mod tests {
     use crate::tui::PanelFocus;
 
     use super::{
-        FrameModel, PlanDashboard, RepoMainView, RepoRow, StatusRow, WorktreeKind, WorktreeRow,
-        configured_column_label, format_column_value, format_plan_rendered_output_row,
-        format_repo_row, git_status_indicator, render_model_frame, render_plan_output_rows,
-        selected_rendered_output_index, visible_len, worktree_status_icons,
+        AutoDashboard, AutoOutputViewerState, FrameModel, PlanDashboard, RepoMainView, RepoRow,
+        StatusRow, WorktreeKind, WorktreeRow, configured_column_label, format_column_value,
+        format_plan_rendered_output_row, format_repo_row, git_status_indicator, render_model_frame,
+        render_plan_output_rows, selected_rendered_output_index, visible_len,
+        worktree_status_icons,
     };
 
     #[test]
@@ -2379,6 +2634,7 @@ mod tests {
             opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
+            auto: crate::config::AutoConfig::default(),
             checks: Checks::default(),
             worktree_columns: vec!["url".to_string()],
             tools: BTreeMap::new(),
@@ -2436,6 +2692,7 @@ mod tests {
             comments: vec![PrComment {
                 author: "a".to_string(),
                 body: "top-level".to_string(),
+                ..PrComment::default()
             }],
             review_comments: vec![
                 PrReviewComment {
@@ -2445,6 +2702,7 @@ mod tests {
                     body: "open".to_string(),
                     created_at: "now".to_string(),
                     resolved: false,
+                    ..PrReviewComment::default()
                 },
                 PrReviewComment {
                     author: "c".to_string(),
@@ -2453,6 +2711,7 @@ mod tests {
                     body: "resolved".to_string(),
                     created_at: "now".to_string(),
                     resolved: true,
+                    ..PrReviewComment::default()
                 },
             ],
             ..PrDetails::default()
@@ -2484,6 +2743,7 @@ mod tests {
             comments: vec![PrComment {
                 author: "reviewer".to_string(),
                 body: "please tighten this panel".to_string(),
+                ..PrComment::default()
             }],
             review_comments: vec![PrReviewComment {
                 author: "reviewer".to_string(),
@@ -2492,6 +2752,7 @@ mod tests {
                 body: "this should stay readable".to_string(),
                 created_at: "now".to_string(),
                 resolved: false,
+                ..PrReviewComment::default()
             }],
             files: vec!["src/view.rs".to_string()],
             ..PrDetails::default()
@@ -2623,6 +2884,75 @@ mod tests {
         assert!(frame.contains("adding dashboard rows"));
         assert!(frame.contains("todos  active 1"));
         assert!(frame.contains("dashboard output preview"));
+    }
+
+    #[test]
+    fn render_model_frame_shows_auto_dashboard() {
+        let config = test_config(Some("main"));
+        let sessions = vec![test_session(
+            "feature",
+            "clean",
+            AgentState::Idle,
+            PrCache::default(),
+        )];
+        let mut model = test_model(&config, &sessions, Some(0), PanelFocus::Status, None);
+        let run = AutoRun {
+            id: "auto-test".to_string(),
+            repo_root: "/repo".to_string(),
+            worktree_path: PathBuf::from("/repo/feature"),
+            branch: "feature".to_string(),
+            mode: AutoRunMode::Standard,
+            variant: "default".to_string(),
+            agent_profile: None,
+            prompt_summary: "Implement the thing".to_string(),
+            initial_prompt: "Implement the thing".to_string(),
+            status: AutoRunStatus::Running,
+            pause_requested: false,
+            selected_step_run_id: Some(7),
+            pr_number: Some(42),
+            pr_url: Some("https://example.com/pr/42".to_string()),
+            current_head_sha: None,
+            review_baseline_json: None,
+            created_unix_ms: 1_000,
+            updated_unix_ms: 61_000,
+            archived_unix_ms: None,
+        };
+        let mut step = AutoStepRun::queued(
+            "auto-test",
+            1,
+            AutoStepKey::Prepare,
+            1,
+            Some("validate worktree".to_string()),
+        );
+        step.id = Some(7);
+        step.status = AutoStepStatus::Waiting;
+        step.summary = Some("waiting for safe boundary".to_string());
+        model.auto_dashboard = Some(AutoDashboard {
+            run: PersistedAutoRun {
+                run,
+                steps: vec![step],
+            },
+            output_lines: vec![AutoOutputLine {
+                step_run_id: 7,
+                line_number: 1,
+                time_unix_ms: 2_000,
+                kind: AutoOutputKind::System,
+                text: "created no-op auto run".to_string(),
+                block_id: None,
+            }],
+            output_state: AutoOutputViewerState {
+                cursor: 0,
+                follow: true,
+            },
+        });
+
+        let frame = crate::util::strip_ansi(&render_model_frame(&model, 120, 28));
+
+        assert!(frame.contains("Auto Flow"));
+        assert!(frame.contains("Implement the thing"));
+        assert!(frame.contains("step   #1 prepare attempt 1 waiting"));
+        assert!(frame.contains("waiting for safe boundary"));
+        assert!(frame.contains("created no-op auto run"));
     }
 
     #[test]
@@ -2967,6 +3297,7 @@ mod tests {
             repo_filter: "",
             worktree_filter: "",
             leader_hint: None,
+            auto_dashboard: None,
             plan_dashboard: None,
         };
 
@@ -3066,6 +3397,7 @@ mod tests {
             opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
+            auto: crate::config::AutoConfig::default(),
             checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
@@ -3142,6 +3474,7 @@ mod tests {
             repo_filter: "",
             worktree_filter: "",
             leader_hint: None,
+            auto_dashboard: None,
             plan_dashboard: None,
         }
     }

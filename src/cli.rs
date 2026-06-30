@@ -1,5 +1,10 @@
 use crate::args::{self, Args, CommandKind, DbCommand, DebugCommand};
+use crate::auto_flow::{
+    AutoExecutorConfig, AutoLaunch, AutoRunMode, execute_auto_initial_step,
+    load_recent_active_runs_for_repo, prepare_auto_run_for_resume, save_auto_run,
+};
 use crate::config::Config;
+use crate::git::{current_branch_name, selected_dirty};
 use crate::observability::{self, LogLevel, ObserverOptions};
 use crate::repo::Repository;
 use crate::tui::ManagedRepo;
@@ -39,6 +44,10 @@ pub fn run() -> Result<(), String> {
         CommandKind::RunPlan(path) => {
             let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
             plan::run_plan_mode(&repo.root, &config, path.as_deref())
+        }
+        CommandKind::Auto(command) => {
+            let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
+            run_auto_command(&repo, &config, command.plan_first, command.prompt)
         }
         CommandKind::Debug(command) => {
             let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;
@@ -144,6 +153,103 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
         Err(error) => observability::finish_startup_run("error", Some(error.as_str())),
     }
     result
+}
+
+fn run_auto_command(
+    repo: &Repository,
+    config: &Config,
+    plan_first: bool,
+    prompt: Option<String>,
+) -> Result<(), String> {
+    let existing = observability::with_writable_db(repo, |conn| {
+        load_recent_active_runs_for_repo(conn, &repo.root, 1)
+    })?;
+    if let Some(mut run) = existing.into_iter().next() {
+        let should_execute = observability::with_writable_db(repo, |conn| {
+            prepare_auto_run_for_resume(
+                conn,
+                &mut run,
+                crate::plan_run::DEFAULT_OUTPUT_LINES_PER_STEP,
+            )
+        })?;
+        if should_execute {
+            run_auto_executor(repo, config, &mut run)?;
+        }
+        println!(
+            "auto_run_id = {}\nstatus = {:?}\nworktree = {}",
+            run.run.id,
+            run.run.status,
+            run.run.worktree_path.display()
+        );
+        return Ok(());
+    }
+    let branch = current_branch_name(&repo.root, config)?
+        .ok_or_else(|| "Auto Flow cannot start on detached HEAD".to_string())?;
+    if config.is_default_branch(&branch) {
+        return Err("Auto Flow cannot start on the default branch".to_string());
+    }
+    if selected_dirty(&repo.root, config)? {
+        return Err("Auto Flow requires a clean worktree at launch".to_string());
+    }
+    let initial_prompt = prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "prism auto requires an initial prompt for a new run".to_string())?;
+    let mode = if plan_first {
+        AutoRunMode::PlanFirst
+    } else {
+        AutoRunMode::Standard
+    };
+    let launch = AutoLaunch::with_options(
+        &repo.root,
+        &repo.root,
+        branch,
+        mode,
+        if plan_first { "intensive" } else { "default" },
+        None,
+        initial_prompt.to_string(),
+    )?;
+    let mut persisted = launch.create_run();
+    observability::with_writable_db(repo, |conn| save_auto_run(conn, &mut persisted))?;
+    run_auto_executor(repo, config, &mut persisted)?;
+    println!(
+        "auto_run_id = {}\nstatus = {:?}\nworktree = {}",
+        persisted.run.id,
+        persisted.run.status,
+        persisted.run.worktree_path.display()
+    );
+    Ok(())
+}
+
+fn run_auto_executor(
+    repo: &Repository,
+    config: &Config,
+    persisted: &mut crate::auto_flow::PersistedAutoRun,
+) -> Result<(), String> {
+    let runtime = crate::opencode::ensure_opencode_server(
+        repo,
+        config,
+        &persisted.run.branch,
+        &persisted.run.worktree_path,
+    )
+    .ok();
+    let executor = AutoExecutorConfig::new(
+        config.tool("opencode"),
+        runtime.map(|runtime| runtime.server_url),
+        persisted.run.worktree_path.clone(),
+        format!("Auto Flow {}", persisted.run.prompt_summary),
+    );
+    observability::with_writable_db(repo, |conn| {
+        execute_auto_initial_step(
+            conn,
+            repo,
+            config,
+            persisted,
+            &executor,
+            &mut std::io::sink(),
+        )
+    })
 }
 
 fn discover_workspace_sessions(repos: &[ManagedRepo]) -> Result<Vec<session::Session>, String> {
