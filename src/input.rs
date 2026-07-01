@@ -55,6 +55,7 @@ impl KeyInput {
             KeyCode::Char('{') if plain_char(event) => Key::PreviousBlock,
             KeyCode::Char('}') if plain_char(event) => Key::NextBlock,
             KeyCode::Char('r') if plain_char(event) => Key::Refresh,
+            KeyCode::Char('0') if plain_char(event) => Key::FocusMain,
             KeyCode::Char('1') if plain_char(event) => Key::FocusStatus,
             KeyCode::Char('2') if plain_char(event) => Key::FocusRepos,
             KeyCode::Char('3') if plain_char(event) => Key::FocusWorktrees,
@@ -142,6 +143,7 @@ pub enum Key {
     Left,
     Right,
     FocusNext,
+    FocusMain,
     FocusStatus,
     FocusRepos,
     FocusWorktrees,
@@ -216,6 +218,7 @@ mod tests {
     fn key_input_uses_top_digits_for_panel_focus() {
         let mut input = KeyInput::default();
         assert_eq!(map(&mut input, key(KeyCode::Char('1'))), Key::FocusStatus);
+        assert_eq!(map(&mut input, key(KeyCode::Char('0'))), Key::FocusMain);
         assert_eq!(map(&mut input, key(KeyCode::Char('2'))), Key::FocusRepos);
         assert_eq!(
             map(&mut input, key(KeyCode::Char('3'))),

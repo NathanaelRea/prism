@@ -37,6 +37,7 @@ pub struct Tui {
     pub(crate) selected: usize,
     pub(crate) selected_repo_root: Option<PathBuf>,
     pub(crate) focused_panel: PanelFocus,
+    pub(crate) main_focused: bool,
     pub(crate) repo_main_view: view::RepoMainView,
     pub(crate) worktree_main_view: view::WorktreeMainView,
     pub(crate) selected_worktree_by_repo: BTreeMap<PathBuf, PathBuf>,
@@ -281,6 +282,7 @@ impl Tui {
             selected: 0,
             selected_repo_root: None,
             focused_panel: PanelFocus::Repos,
+            main_focused: false,
             repo_main_view: view::RepoMainView::Github,
             worktree_main_view: view::WorktreeMainView::Plan,
             selected_worktree_by_repo: BTreeMap::new(),
@@ -428,6 +430,11 @@ impl Tui {
                 Key::FocusNext => {
                     self.clear_leader_hint();
                     self.focus_next_panel();
+                    pending_g = false;
+                }
+                Key::FocusMain => {
+                    self.clear_leader_hint();
+                    self.focus_main();
                     pending_g = false;
                 }
                 Key::FocusStatus => {
@@ -781,7 +788,8 @@ impl Tui {
 
     fn show_keybindings_dialog(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
         let items = [
-            "1 / 2 / 3    focus status / repos / worktrees",
+            "1 / 2 / 3    focus status / repos / worktrees sidebars",
+            "0            focus main panel for the selected sidebar",
             "Tab          move focus between panels",
             "h/l, left/right arrows  repos/worktrees: switch view; status plan: switch phase",
             "Space Space  status: open current plan phase tmux window 1 if available; repos: focus worktrees; worktrees: open agent if valid",
@@ -1107,30 +1115,37 @@ impl Tui {
     }
 
     fn move_down(&mut self) {
-        match self.focused_panel {
-            PanelFocus::Status => {
-                if !self.move_plan_output_cursor(1) {
-                    self.move_plan_step_selection(1);
-                }
+        if self.main_focused {
+            if !self.move_plan_output_cursor(1) {
+                self.move_plan_step_selection(1);
             }
+            return;
+        }
+        match self.focused_panel {
+            PanelFocus::Status => {}
             PanelFocus::Repos => self.move_repo_selection(1),
             PanelFocus::Worktrees => self.move_worktree_selection(1),
         }
     }
 
     fn move_up(&mut self) {
-        match self.focused_panel {
-            PanelFocus::Status => {
-                if !self.move_plan_output_cursor(-1) {
-                    self.move_plan_step_selection(-1);
-                }
+        if self.main_focused {
+            if !self.move_plan_output_cursor(-1) {
+                self.move_plan_step_selection(-1);
             }
+            return;
+        }
+        match self.focused_panel {
+            PanelFocus::Status => {}
             PanelFocus::Repos => self.move_repo_selection(-1),
             PanelFocus::Worktrees => self.move_worktree_selection(-1),
         }
     }
 
     fn move_left(&mut self) {
+        if !self.main_focused {
+            return;
+        }
         match self.focused_panel {
             PanelFocus::Status => {
                 self.move_plan_step_selection(-1);
@@ -1145,6 +1160,9 @@ impl Tui {
     }
 
     fn move_right(&mut self) {
+        if !self.main_focused {
+            return;
+        }
         match self.focused_panel {
             PanelFocus::Status => {
                 self.move_plan_step_selection(1);
@@ -1166,18 +1184,26 @@ impl Tui {
             PanelFocus::Repos => PanelFocus::Worktrees,
             PanelFocus::Worktrees => PanelFocus::Status,
         };
+        self.main_focused = false;
     }
 
     pub(crate) fn focus_status(&mut self) {
         self.focused_panel = PanelFocus::Status;
+        self.main_focused = false;
     }
 
     fn focus_repos(&mut self) {
         self.focused_panel = PanelFocus::Repos;
+        self.main_focused = false;
     }
 
     fn focus_worktrees(&mut self) {
         self.focused_panel = PanelFocus::Worktrees;
+        self.main_focused = false;
+    }
+
+    fn focus_main(&mut self) {
+        self.main_focused = true;
     }
 
     fn move_repo_selection(&mut self, direction: isize) {
@@ -1211,6 +1237,10 @@ impl Tui {
     }
 
     pub(crate) fn select_top_visible(&mut self) {
+        if self.main_focused {
+            let _ = self.move_plan_output_top();
+            return;
+        }
         match self.focused_panel {
             PanelFocus::Status => {}
             PanelFocus::Repos => {
@@ -1227,6 +1257,10 @@ impl Tui {
     }
 
     fn select_bottom_visible(&mut self) {
+        if self.main_focused {
+            let _ = self.move_plan_output_bottom();
+            return;
+        }
         match self.focused_panel {
             PanelFocus::Status => {}
             PanelFocus::Repos => {
@@ -1821,7 +1855,7 @@ impl Tui {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return false;
         };
-        if self.focused_panel != PanelFocus::Status || dashboard.output_lines.is_empty() {
+        if !self.main_focused || dashboard.output_lines.is_empty() {
             return false;
         }
         let run_id = dashboard.run.run.id;
@@ -1845,7 +1879,7 @@ impl Tui {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return false;
         };
-        if self.focused_panel != PanelFocus::Status || dashboard.output_lines.is_empty() {
+        if !self.main_focused || dashboard.output_lines.is_empty() {
             return false;
         }
         let state = self
@@ -1861,7 +1895,7 @@ impl Tui {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return false;
         };
-        if self.focused_panel != PanelFocus::Status || dashboard.output_lines.is_empty() {
+        if !self.main_focused || dashboard.output_lines.is_empty() {
             return false;
         }
         let state = self
@@ -1877,7 +1911,7 @@ impl Tui {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return false;
         };
-        if self.focused_panel != PanelFocus::Status || dashboard.output_lines.is_empty() {
+        if !self.main_focused || dashboard.output_lines.is_empty() {
             return false;
         }
         let run_id = dashboard.run.run.id.clone();
@@ -1918,7 +1952,7 @@ impl Tui {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return false;
         };
-        if self.focused_panel != PanelFocus::Status || dashboard.output_lines.is_empty() {
+        if !self.main_focused || dashboard.output_lines.is_empty() {
             return false;
         }
         let run_id = dashboard.run.run.id.clone();
@@ -2020,6 +2054,7 @@ impl Tui {
             selected_repo_root,
             selected_session: self.selected_worktree_index(),
             focus: self.focused_panel,
+            main_focused: self.main_focused,
             repo_main_view: self.repo_main_view,
             worktree_main_view: self.worktree_main_view,
             mode_label: "normal",
@@ -2251,18 +2286,24 @@ impl Tui {
                 &[
                     ("g", "git actions"),
                     ("p", "plan actions"),
+                    ("0", "focus main"),
                     ("space/enter", "focus repos"),
                 ],
             )),
             (Some(LeaderHint::Root), PanelFocus::Repos) => Some(choice_list(
                 "Shortcuts",
-                &[("g", "git actions"), ("space/enter", "focus worktrees")],
+                &[
+                    ("g", "git actions"),
+                    ("0", "focus main"),
+                    ("space/enter", "focus worktrees"),
+                ],
             )),
             (Some(LeaderHint::Root), PanelFocus::Worktrees) => Some(choice_list(
                 "Shortcuts",
                 &[
                     ("g", "git actions"),
                     ("p", "plan actions"),
+                    ("0", "focus main"),
                     ("enter", "terminal"),
                     ("space", "agent if valid"),
                 ],
@@ -2370,6 +2411,12 @@ mod tests {
         tui.move_right();
 
         assert_eq!(tui.focused_panel, PanelFocus::Repos);
+        assert_eq!(tui.repo_main_view, RepoMainView::Github);
+
+        tui.focus_main();
+        tui.move_right();
+
+        assert_eq!(tui.focused_panel, PanelFocus::Repos);
         assert_eq!(tui.repo_main_view, RepoMainView::Kanban);
 
         tui.move_left();
@@ -2378,6 +2425,7 @@ mod tests {
         assert_eq!(tui.repo_main_view, RepoMainView::Github);
 
         tui.focused_panel = PanelFocus::Worktrees;
+        tui.main_focused = false;
         tui.move_left();
 
         assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
@@ -2394,6 +2442,13 @@ mod tests {
         assert_eq!(tui.worktree_main_view, WorktreeMainView::Plan);
         assert!(tui.current_plan_dashboard().is_some());
 
+        tui.move_left();
+
+        assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
+        assert_eq!(tui.worktree_main_view, WorktreeMainView::Plan);
+        assert!(tui.current_plan_dashboard().is_some());
+
+        tui.focus_main();
         tui.move_left();
 
         assert_eq!(tui.focused_panel, PanelFocus::Worktrees);

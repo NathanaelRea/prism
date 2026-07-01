@@ -21,6 +21,7 @@ pub(crate) struct FrameModel<'a> {
     pub selected_repo_root: String,
     pub selected_session: Option<usize>,
     pub focus: PanelFocus,
+    pub main_focused: bool,
     pub repo_main_view: RepoMainView,
     pub worktree_main_view: WorktreeMainView,
     pub mode_label: &'a str,

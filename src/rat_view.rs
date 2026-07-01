@@ -87,7 +87,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>
             })
             .collect()
     };
-    let focused = model.focus == PanelFocus::Status;
+    let focused = model.focus == PanelFocus::Status && !model.main_focused;
     let title = panel_title("1", "Status", focused);
     frame.render_widget(List::new(rows).block(panel_block(title, focused)), area);
 }
@@ -114,14 +114,14 @@ fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>)
                     Span::styled(format!("  {}", repo.health), health_style(&repo.health)),
                 ]);
                 ListItem::new(line).style(if repo.selected {
-                    selected_style(model.focus == PanelFocus::Repos)
+                    selected_style(model.focus == PanelFocus::Repos && !model.main_focused)
                 } else {
                     Style::default()
                 })
             })
             .collect()
     };
-    let focused = model.focus == PanelFocus::Repos;
+    let focused = model.focus == PanelFocus::Repos && !model.main_focused;
     let mut title = panel_title("2", "Repos", focused);
     if !model.repo_filter.is_empty() {
         title.push_span(Span::styled(
@@ -188,14 +188,14 @@ fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<
                 }
             }
             ListItem::new(Line::from(spans)).style(if worktree.selected {
-                selected_style(model.focus == PanelFocus::Worktrees)
+                selected_style(model.focus == PanelFocus::Worktrees && !model.main_focused)
             } else {
                 Style::default()
             })
         }));
         rows
     };
-    let focused = model.focus == PanelFocus::Worktrees;
+    let focused = model.focus == PanelFocus::Worktrees && !model.main_focused;
     let mut title = panel_title("3", "Worktrees", focused);
     if !model.worktree_filter.is_empty() {
         title.push_span(Span::styled(
@@ -207,10 +207,13 @@ fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<
 }
 
 fn render_main(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>) {
-    let content_area = panel_block(Line::from(Span::styled("Main", title_style(true))), false)
-        .inner(area)
-        .height
-        .saturating_sub(0) as usize;
+    let content_area = panel_block(
+        Line::from(Span::styled("0 Main", title_style(model.main_focused))),
+        model.main_focused,
+    )
+    .inner(area)
+    .height
+    .saturating_sub(0) as usize;
     let width = area.width.saturating_sub(2) as usize;
     let lines = if let Some(dashboard) = &model.auto_dashboard {
         auto_dashboard_lines(dashboard, width, content_area)
@@ -226,8 +229,8 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>) 
     frame.render_widget(
         Paragraph::new(lines)
             .block(panel_block(
-                Line::from(Span::styled("Main", title_style(true))),
-                false,
+                Line::from(Span::styled("0 Main", title_style(model.main_focused))),
+                model.main_focused,
             ))
             .wrap(Wrap { trim: false }),
         area,
@@ -638,9 +641,13 @@ fn auto_dashboard_lines(
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>) {
     let actions = match model.focus {
-        PanelFocus::Status => "1/2/3 focus  Tab next  P plan  A auto  ? help  q quit",
-        PanelFocus::Repos => "j/k select  Enter open  r refresh  R manage  / search  q quit",
-        PanelFocus::Worktrees => "j/k select  Enter tmux  Space g git  c create  D delete  q quit",
+        PanelFocus::Status => "1/2/3 sidebars  0 main  Tab next  P plan  A auto  ? help  q quit",
+        PanelFocus::Repos => {
+            "j/k select  0 main  Enter open  r refresh  R manage  / search  q quit"
+        }
+        PanelFocus::Worktrees => {
+            "j/k select  0 main  Enter tmux  Space g git  c create  D delete  q quit"
+        }
     };
     let mut spans = vec![
         Span::styled(
@@ -3368,6 +3375,7 @@ mod tests {
             selected_repo_root: "/repo".to_string(),
             selected_session: Some(0),
             focus,
+            main_focused: false,
             repo_main_view: RepoMainView::Github,
             worktree_main_view: WorktreeMainView::Details,
             mode_label: "normal",
