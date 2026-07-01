@@ -115,29 +115,34 @@ impl Tui {
         Ok(())
     }
 
-    pub(crate) fn create_session(&mut self) -> Result<bool, String> {
+    pub(crate) fn create_session(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<bool, String> {
         let context = self
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
-        self.ensure_default_branch_ready_for_create()?;
+        self.ensure_default_branch_ready_for_create(raw)?;
         let repo_label = self
             .repos
             .get(context.repo_index)
             .map(|repo| repo.label.clone())
             .unwrap_or_else(|| context.repo.root.display().to_string());
         let branch_prompt = format!("Branch name for {repo_label}: ");
-        let Some(branch) = self.prompt_line_dialog("Create Session", &branch_prompt, "")? else {
+        let Some(branch) = self.prompt_line_dialog(raw, "Create Session", &branch_prompt, "")?
+        else {
             return Ok(false);
         };
         if branch.trim().is_empty() {
             return Ok(false);
         }
         let Some(initial_prompt) =
-            self.prompt_line_dialog("Create Session", "Initial prompt (optional): ", "")?
+            self.prompt_line_dialog(raw, "Create Session", "Initial prompt (optional): ", "")?
         else {
             return Ok(false);
         };
         self.show_loading_dialog(
+            raw,
             "Create Session",
             &format!("Creating worktree for {}", branch.trim()),
         )?;
@@ -163,14 +168,17 @@ impl Tui {
         write_task_metadata(&context.repo, &self.sessions[index], initial_prompt)?;
         self.sessions[index].mark_adopted_with_prompt(initial_prompt);
         if !initial_prompt.is_empty() {
-            self.show_loading_dialog("Create Session", "Starting agent session")?;
+            self.show_loading_dialog(raw, "Create Session", "Starting agent session")?;
             self.paste_prompt_into_tmux_agent(index, initial_prompt)?;
             self.show_message("pasted initial prompt into agent session")?;
         }
         Ok(true)
     }
 
-    fn ensure_default_branch_ready_for_create(&mut self) -> Result<(), String> {
+    fn ensure_default_branch_ready_for_create(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
@@ -190,19 +198,23 @@ impl Tui {
             return Ok(());
         }
         let answer = self.prompt_line_dialog(
+            raw,
             "Default Branch Behind",
             &format!("{base} is behind origin/{base} by {behind}. Pull first? [Y/n] "),
             "",
         )?;
         if answer.as_deref().map(yes_default).unwrap_or(false) {
-            self.show_loading_dialog("Pull Default Branch", &format!("Pulling {base}"))?;
+            self.show_loading_dialog(raw, "Pull Default Branch", &format!("Pulling {base}"))?;
             pull_branch(&base_path, &base, &context.config)?;
             self.refresh_sessions()?;
         }
         Ok(())
     }
 
-    pub(crate) fn pull_default_branch(&mut self) -> Result<(), String> {
+    pub(crate) fn pull_default_branch(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
@@ -218,7 +230,7 @@ impl Tui {
             return Ok(());
         };
         let base_path = self.default_branch_path_for_repo(context.repo_index, &base);
-        self.show_loading_dialog("Pull Default Branch", &format!("Pulling {base}"))?;
+        self.show_loading_dialog(raw, "Pull Default Branch", &format!("Pulling {base}"))?;
         pull_branch(&base_path, &base, &context.config)?;
         self.refresh_sessions()?;
         self.start_wt_column_poll();
@@ -241,7 +253,7 @@ impl Tui {
 
     pub(crate) fn edit_config(
         &mut self,
-        raw: &mut crate::terminal::RawTerminal,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -280,8 +292,12 @@ impl Tui {
         Ok(())
     }
 
-    pub(crate) fn add_repository(&mut self) -> Result<(), String> {
-        let Some(path) = self.prompt_line_dialog("Add Repository", "Base/main path: ", "")? else {
+    pub(crate) fn add_repository(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let Some(path) = self.prompt_line_dialog(raw, "Add Repository", "Base/main path: ", "")?
+        else {
             return Ok(());
         };
         let path = path.trim();
@@ -300,7 +316,7 @@ impl Tui {
 
     pub(crate) fn edit_repositories(
         &mut self,
-        raw: &mut crate::terminal::RawTerminal,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
         let path = crate::workspace::repos_path();
         if !path.exists() {
@@ -1014,7 +1030,7 @@ impl Tui {
 
     pub(crate) fn open_selected_repo_lazygit(
         &mut self,
-        raw: &mut crate::terminal::RawTerminal,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -1035,7 +1051,7 @@ impl Tui {
 
     pub(crate) fn open_selected_repo_terminal(
         &mut self,
-        raw: &mut crate::terminal::RawTerminal,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -1061,7 +1077,7 @@ impl Tui {
     #[allow(dead_code)]
     pub(crate) fn open_selected_repo_plan_mode(
         &mut self,
-        raw: &mut crate::terminal::RawTerminal,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -1083,7 +1099,7 @@ impl Tui {
     #[allow(dead_code)]
     pub(crate) fn open_selected_worktree_plan_mode(
         &mut self,
-        raw: &mut crate::terminal::RawTerminal,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
@@ -1104,7 +1120,7 @@ impl Tui {
 
     pub(crate) fn start_selected_repo_plan_run(
         &mut self,
-        raw: &mut crate::terminal::RawTerminal,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
         let context = self
             .selected_repo_context()
@@ -1119,7 +1135,7 @@ impl Tui {
 
     pub(crate) fn start_selected_worktree_plan_run(
         &mut self,
-        raw: &mut crate::terminal::RawTerminal,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
@@ -1130,7 +1146,7 @@ impl Tui {
 
     fn start_plan_run_for_scope(
         &mut self,
-        raw: &mut crate::terminal::RawTerminal,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
         repo: crate::repo::Repository,
         config: crate::config::Config,
         scope_path: PathBuf,
@@ -1140,7 +1156,8 @@ impl Tui {
         let resume_result = raw.resume();
         resume_result?;
         let execution = execution?;
-        let mode = self.prompt_line_dialog("Plan Run", "Run phases in parallel? [y/N] ", "")?;
+        let mode =
+            self.prompt_line_dialog(raw, "Plan Run", "Run phases in parallel? [y/N] ", "")?;
         let mode = if mode.as_deref().map(yes).unwrap_or(false) {
             PlanRunMode::Parallel
         } else {
@@ -1228,7 +1245,7 @@ impl Tui {
 
     pub(crate) fn start_or_focus_selected_auto_run(
         &mut self,
-        raw: &mut crate::terminal::RawTerminal,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
@@ -1253,13 +1270,14 @@ impl Tui {
         if selected_dirty(&session_path, &context.config)? {
             return Err("Auto Flow requires a clean worktree at launch".to_string());
         }
-        let Some(source) = self.prompt_auto_implementation_source()? else {
+        let Some(source) = self.prompt_auto_implementation_source(raw)? else {
             return Ok(());
         };
         let (mode, implementation_source, plan_path, plan_run_mode, variant, prompt) = match source
         {
             AutoStartupSource::Prompt => {
-                let Some(prompt) = self.prompt_line_dialog("Auto Flow", "Initial prompt: ", "")?
+                let Some(prompt) =
+                    self.prompt_line_dialog(raw, "Auto Flow", "Initial prompt: ", "")?
                 else {
                     return Ok(());
                 };
@@ -1282,7 +1300,7 @@ impl Tui {
                 resume_result?;
                 let plan_path = selected?;
                 validate_existing_auto_plan(&plan_path)?;
-                let Some(plan_run_mode) = self.prompt_auto_plan_run_mode()? else {
+                let Some(plan_run_mode) = self.prompt_auto_plan_run_mode(raw)? else {
                     return Ok(());
                 };
                 (
@@ -1302,14 +1320,15 @@ impl Tui {
                                 .to_string(),
                         );
                 }
-                let Some(prompt) = self.prompt_line_dialog("Auto Flow", "Task prompt: ", "")?
+                let Some(prompt) =
+                    self.prompt_line_dialog(raw, "Auto Flow", "Task prompt: ", "")?
                 else {
                     return Ok(());
                 };
                 if prompt.trim().is_empty() {
                     return Ok(());
                 }
-                let Some(plan_run_mode) = self.prompt_auto_plan_run_mode()? else {
+                let Some(plan_run_mode) = self.prompt_auto_plan_run_mode(raw)? else {
                     return Ok(());
                 };
                 (
@@ -1349,9 +1368,13 @@ impl Tui {
         Ok(())
     }
 
-    fn prompt_auto_implementation_source(&mut self) -> Result<Option<AutoStartupSource>, String> {
+    fn prompt_auto_implementation_source(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<Option<AutoStartupSource>, String> {
         loop {
             let Some(answer) = self.prompt_line_dialog(
+                raw,
                 "Auto Flow",
                 "Implementation source [p]rompt/[e]xisting plan/[d]raft plan: ",
                 "p",
@@ -1370,9 +1393,13 @@ impl Tui {
         }
     }
 
-    fn prompt_auto_plan_run_mode(&mut self) -> Result<Option<PlanRunMode>, String> {
+    fn prompt_auto_plan_run_mode(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<Option<PlanRunMode>, String> {
         loop {
             let Some(answer) = self.prompt_line_dialog(
+                raw,
                 "Auto Flow",
                 "Plan execution [s]equential/[p]arallel: ",
                 "s",
@@ -1425,7 +1452,7 @@ impl Tui {
 
     pub(crate) fn open_current_plan_tmux_session(
         &mut self,
-        raw: &mut crate::terminal::RawTerminal,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<bool, String> {
         let Some((repo, plan_run)) = self.current_tmux_plan_run() else {
             return Ok(false);
@@ -1518,7 +1545,10 @@ impl Tui {
         ))
     }
 
-    pub(crate) fn abort_selected_auto_run_or_step(&mut self) -> Result<bool, String> {
+    pub(crate) fn abort_selected_auto_run_or_step(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<bool, String> {
         let Some(dashboard) = self.current_auto_dashboard() else {
             return Ok(false);
         };
@@ -1526,6 +1556,7 @@ impl Tui {
             return Ok(false);
         }
         let answer = self.prompt_line_dialog(
+            raw,
             "Abort Auto Flow",
             "Abort selected step? Use 'all' for the whole run. [y/N/all] ",
             "",
@@ -1618,7 +1649,10 @@ impl Tui {
         Ok(true)
     }
 
-    pub(crate) fn retry_auto_from_selected_step(&mut self) -> Result<bool, String> {
+    pub(crate) fn retry_auto_from_selected_step(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<bool, String> {
         let Some(dashboard) = self.current_auto_dashboard() else {
             return Ok(false);
         };
@@ -1633,8 +1667,12 @@ impl Tui {
         let Some(selected) = selected else {
             return Ok(true);
         };
-        let answer =
-            self.prompt_line_dialog("Retry Auto Flow", "Retry from selected step? [y/N] ", "")?;
+        let answer = self.prompt_line_dialog(
+            raw,
+            "Retry Auto Flow",
+            "Retry from selected step? [y/N] ",
+            "",
+        )?;
         if !answer.as_deref().map(yes).unwrap_or(false) {
             return Ok(true);
         }
@@ -1655,7 +1693,10 @@ impl Tui {
         Ok(true)
     }
 
-    pub(crate) fn toggle_selected_auto_pause(&mut self) -> Result<bool, String> {
+    pub(crate) fn toggle_selected_auto_pause(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<bool, String> {
         let Some(dashboard) = self.current_auto_dashboard() else {
             return Ok(false);
         };
@@ -1670,7 +1711,7 @@ impl Tui {
         let mut should_execute = false;
         let resuming =
             dashboard.run.run.pause_requested || dashboard.run.run.status == AutoRunStatus::Paused;
-        if resuming && !self.confirm_resume_auto_step(&dashboard.run)? {
+        if resuming && !self.confirm_resume_auto_step(raw, &dashboard.run)? {
             self.show_message("Auto Flow resume cancelled")?;
             return Ok(true);
         }
@@ -1700,10 +1741,15 @@ impl Tui {
         Ok(true)
     }
 
-    fn confirm_resume_auto_step(&self, run: &PersistedAutoRun) -> Result<bool, String> {
+    fn confirm_resume_auto_step(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+        run: &PersistedAutoRun,
+    ) -> Result<bool, String> {
         let description = next_auto_step_description(run)
             .unwrap_or_else(|| "determine the next Auto Flow step".to_string());
         let answer = self.prompt_line_dialog(
+            raw,
             "Resume Auto Flow",
             &format!("Next: {description}. Continue? [y/N] "),
             "",
@@ -1738,7 +1784,10 @@ impl Tui {
         Ok(true)
     }
 
-    pub(crate) fn abort_selected_plan_run_or_step(&mut self) -> Result<bool, String> {
+    pub(crate) fn abort_selected_plan_run_or_step(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<bool, String> {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return Ok(false);
         };
@@ -1751,6 +1800,7 @@ impl Tui {
         let run_id = dashboard.run.run.id.clone();
         let selected_step = dashboard.run.run.selected_step;
         let answer = self.prompt_line_dialog(
+            raw,
             "Abort Plan",
             "Abort selected phase? Use 'all' for every running phase. [y/N/all] ",
             "",
@@ -1818,7 +1868,10 @@ impl Tui {
         Ok(true)
     }
 
-    pub(crate) fn retry_plan_from_selected_step(&mut self) -> Result<bool, String> {
+    pub(crate) fn retry_plan_from_selected_step(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<bool, String> {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return Ok(false);
         };
@@ -1827,6 +1880,7 @@ impl Tui {
         }
         let selected_step = dashboard.run.run.selected_step;
         let answer = self.prompt_line_dialog(
+            raw,
             "Retry Plan",
             &format!("Retry from phase {selected_step}? [y/N] "),
             "",
@@ -2019,7 +2073,19 @@ impl Tui {
         )
     }
 
-    pub(crate) fn start_review_fix(&mut self) -> Result<(), String> {
+    pub(crate) fn start_review_fix(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        self.show_loading_dialog(
+            raw,
+            "Review Fix Prompt",
+            "Refreshing pull request review details",
+        )?;
+        self.copy_review_fix_prompt()
+    }
+
+    fn copy_review_fix_prompt(&mut self) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
@@ -2028,10 +2094,6 @@ impl Tui {
             self.show_message("default branch has no PR review comments")?;
             return Ok(());
         }
-        self.show_loading_dialog(
-            "Review Fix Prompt",
-            "Refreshing pull request review details",
-        )?;
         {
             let session = &mut self.sessions[selected];
             refresh_branch_pr_cache(
@@ -2049,7 +2111,15 @@ impl Tui {
         Ok(())
     }
 
-    pub(crate) fn start_ci_fix(&mut self) -> Result<(), String> {
+    #[cfg(test)]
+    pub(crate) fn start_review_fix_for_test(&mut self) -> Result<(), String> {
+        self.copy_review_fix_prompt()
+    }
+
+    pub(crate) fn start_ci_fix(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
@@ -2058,7 +2128,11 @@ impl Tui {
             self.show_message("default branch has no PR CI failures")?;
             return Ok(());
         }
-        self.show_loading_dialog("CI Failure Prompt", "Refreshing pull request CI details")?;
+        self.show_loading_dialog(
+            raw,
+            "CI Failure Prompt",
+            "Refreshing pull request CI details",
+        )?;
         {
             let session = &mut self.sessions[selected];
             refresh_branch_pr_cache(
@@ -2076,7 +2150,10 @@ impl Tui {
         Ok(())
     }
 
-    pub(crate) fn open_selected_pr(&mut self) -> Result<(), String> {
+    pub(crate) fn open_selected_pr(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
@@ -2090,7 +2167,7 @@ impl Tui {
             return Ok(());
         }
         if self.sessions[selected].pr.summary.is_none() {
-            self.show_loading_dialog("Open Pull Request", "Refreshing pull request")?;
+            self.show_loading_dialog(raw, "Open Pull Request", "Refreshing pull request")?;
             let session = &mut self.sessions[selected];
             refresh_pr_cache(
                 &context.repo,
@@ -2114,7 +2191,10 @@ impl Tui {
         Ok(())
     }
 
-    pub(crate) fn abort_selected_opencode_session(&mut self) -> Result<(), String> {
+    pub(crate) fn abort_selected_opencode_session(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
@@ -2128,6 +2208,7 @@ impl Tui {
             return Ok(());
         }
         let answer = self.prompt_line_dialog(
+            raw,
             "Abort OpenCode",
             &format!("Abort {}? [y/N] ", self.sessions[selected].branch),
             "",
@@ -2232,7 +2313,10 @@ impl Tui {
         Ok(())
     }
 
-    pub(crate) fn push_selected_branch(&mut self) -> Result<(), String> {
+    pub(crate) fn push_selected_branch(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
@@ -2252,6 +2336,7 @@ impl Tui {
             false
         } else {
             let Some(answer) = self.prompt_line_dialog(
+                raw,
                 "Push Branch",
                 &format!("No upstream. Push -u origin {branch}? [y/N] "),
                 "",
@@ -2264,7 +2349,7 @@ impl Tui {
             }
             true
         };
-        self.show_loading_dialog("Push Branch", "Pushing selected branch")?;
+        self.show_loading_dialog(raw, "Push Branch", "Pushing selected branch")?;
         push_branch(&context.config, &path, &branch, set_upstream)?;
         {
             let session = &mut self.sessions[selected];
@@ -2281,10 +2366,10 @@ impl Tui {
             && !self.sessions[selected].is_default_branch(&context.config)
         {
             run_pre_pr_checks(&context.config, &path)?;
-            let Some(pr_body) = self.prompt_pr_description()? else {
+            let Some(pr_body) = self.prompt_pr_description(raw)? else {
                 return Ok(());
             };
-            self.show_loading_dialog("Create Pull Request", "Creating pull request")?;
+            self.show_loading_dialog(raw, "Create Pull Request", "Creating pull request")?;
             let session = &mut self.sessions[selected];
             create_pull_request(
                 &context.repo,
@@ -2301,11 +2386,17 @@ impl Tui {
         Ok(())
     }
 
-    fn prompt_pr_description(&self) -> Result<Option<String>, String> {
-        self.prompt_line_dialog("Create Pull Request", "Description: ", "")
+    fn prompt_pr_description(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<Option<String>, String> {
+        self.prompt_line_dialog(raw, "Create Pull Request", "Description: ", "")
     }
 
-    pub(crate) fn merge_selected_pr(&mut self) -> Result<(), String> {
+    pub(crate) fn merge_selected_pr(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
@@ -2341,11 +2432,13 @@ impl Tui {
         }
         run_pre_push_checks(&context.config, &path)?;
         self.show_loading_dialog(
+            raw,
             "Merge Pull Request",
             &format!("Merging PR #{}", summary.number),
         )?;
         merge_pull_request(&context.config, &path, summary.number)?;
         self.show_loading_dialog(
+            raw,
             "Merge Pull Request",
             &format!("Verifying PR #{} is merged", summary.number),
         )?;
@@ -2371,7 +2464,7 @@ impl Tui {
         }
         let path_display = self.sessions[selected].path_display.clone();
         let warnings = self.sessions[selected].deletion_warnings();
-        if self.confirm_delete_dialog(&branch, &path_display, &warnings)? {
+        if self.confirm_delete_dialog(raw, &branch, &path_display, &warnings)? {
             delete_worktree_session(&context.repo, &context.config, &path, &branch)?;
             if self.selected_worktree_by_repo.get(&context.repo.root) == Some(&path) {
                 self.selected_worktree_by_repo.remove(&context.repo.root);
@@ -2385,7 +2478,10 @@ impl Tui {
         Ok(())
     }
 
-    pub(crate) fn delete_session(&mut self) -> Result<(), String> {
+    pub(crate) fn delete_session(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
@@ -2398,7 +2494,7 @@ impl Tui {
         let path = self.sessions[selected].path.clone();
         let path_display = self.sessions[selected].path_display.clone();
         let warnings = self.sessions[selected].deletion_warnings();
-        if !self.confirm_delete_dialog(&branch, &path_display, &warnings)? {
+        if !self.confirm_delete_dialog(raw, &branch, &path_display, &warnings)? {
             return Ok(());
         }
         delete_worktree_session(&context.repo, &context.config, &path, &branch)?;
@@ -2844,7 +2940,7 @@ cat > '{}'
         };
         let mut tui = Tui::new_single(repo, config, vec![session]);
 
-        tui.start_review_fix().unwrap();
+        tui.start_review_fix_for_test().unwrap();
 
         let prompt = fs::read_to_string(&copied).unwrap();
         assert!(prompt.contains("fresh top-level comment"));
