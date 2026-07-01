@@ -24,11 +24,7 @@ Sleep 250ms
 Type "g"
 Sleep 250ms
 Type "g"
-Sleep 2s
-Type "j"
-Sleep 600ms
-Type "k"
-Sleep 800ms
+Sleep 4s
 Ctrl+B
 Sleep 250ms
 Type "1"

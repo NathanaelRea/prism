@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
+
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
@@ -21,9 +22,10 @@ use crate::plan_run::{
 };
 use crate::repo::Repository;
 use crate::session::{Session, append_runtime_log};
-use crate::terminal::{RawTerminal, stdin_is_tty, terminal_size, write_stdout};
+use crate::terminal::stdin_is_tty;
 use crate::tmux::TmuxWindow;
-use crate::util::{status_count, strip_ansi, truncate_line, yes};
+use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
+use crate::util::{status_count, yes};
 use crate::view;
 
 pub struct Tui {
@@ -71,6 +73,7 @@ pub struct Tui {
     pub(crate) repo_filter: String,
     pub(crate) worktree_filter: String,
     pub(crate) leader_hint: Option<LeaderHint>,
+    pub(crate) dialog: Option<view::DialogModel>,
     status_message: Option<String>,
     status_message_until: Option<Instant>,
 }
@@ -221,7 +224,6 @@ struct TuiBackgroundChanges {
     auto_runs: bool,
     pull_requests: bool,
     status_message: bool,
-    resized: bool,
 }
 
 impl TuiBackgroundChanges {
@@ -235,8 +237,18 @@ impl TuiBackgroundChanges {
             || self.auto_runs
             || self.pull_requests
             || self.status_message
-            || self.resized
     }
+}
+
+fn plain_key(event: KeyEvent) -> bool {
+    event
+        .modifiers
+        .intersection(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        .is_empty()
+}
+
+fn ctrl_key(event: KeyEvent) -> bool {
+    event.modifiers.contains(KeyModifiers::CONTROL)
 }
 
 impl Tui {
@@ -305,6 +317,7 @@ impl Tui {
             repo_filter: String::new(),
             worktree_filter: String::new(),
             leader_hint: None,
+            dialog: None,
             status_message: None,
             status_message_until: None,
         };
@@ -354,7 +367,7 @@ impl Tui {
             return Err("TUI requires an interactive terminal".to_string());
         }
 
-        let mut raw = RawTerminal::enter()?;
+        let mut runtime = TerminalRuntime::enter()?;
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
         self.start_default_branch_status_poll(true);
@@ -362,379 +375,369 @@ impl Tui {
         self.start_opencode_event_listeners();
         self.refresh_plan_runs();
         self.refresh_auto_runs();
-        self.draw()?;
+        self.draw(&mut runtime)?;
         if self.repos.is_empty() {
-            match self.add_repository() {
+            match self.add_repository(&mut runtime) {
                 Ok(()) => {}
                 Err(error) => self.show_error("add repository failed", &error)?,
             }
         }
-        let mut stdin = io::stdin();
-        let mut buffer = [0_u8; 64];
         let mut key_input = KeyInput::default();
         let mut pending_g = false;
-        let mut last_size = terminal_size();
-
         loop {
-            if self.tick_tui_action_jobs(&mut last_size).any() {
-                self.draw()?;
+            if self.tick_tui_action_jobs().any() {
+                self.draw(&mut runtime)?;
             }
-            let count = match stdin.read(&mut buffer) {
-                Ok(count) => count,
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+            let event = runtime.poll_event(Duration::from_millis(100))?;
+            let Some(event) = event else {
+                continue;
+            };
+            let key = match event {
+                RuntimeEvent::Key(event) => key_input.map_event(event),
+                RuntimeEvent::Resize => {
+                    self.draw(&mut runtime)?;
                     continue;
                 }
-                Err(error) => return Err(error.to_string()),
             };
-            if count == 0 {
+            let Some(key) = key else {
                 continue;
-            }
+            };
 
             let mut should_quit = false;
-            for key in key_input.feed(&buffer[..count]) {
-                match key {
-                    Key::Quit => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        should_quit = self.confirm_quit()?;
-                    }
-                    Key::Down => {
-                        self.clear_leader_hint();
-                        self.move_down();
-                        pending_g = false;
-                    }
-                    Key::Left => {
-                        self.clear_leader_hint();
-                        self.move_left();
-                        pending_g = false;
-                    }
-                    Key::Right => {
-                        self.clear_leader_hint();
-                        self.move_right();
-                        pending_g = false;
-                    }
-                    Key::FocusNext => {
-                        self.clear_leader_hint();
-                        self.focus_next_panel();
-                        pending_g = false;
-                    }
-                    Key::FocusStatus => {
-                        self.clear_leader_hint();
-                        self.focus_status();
-                        pending_g = false;
-                    }
-                    Key::FocusRepos => {
-                        self.clear_leader_hint();
-                        self.focus_repos();
-                        pending_g = false;
-                    }
-                    Key::FocusWorktrees => {
-                        self.clear_leader_hint();
-                        self.focus_worktrees();
-                        pending_g = false;
-                    }
-                    Key::Up => {
-                        self.clear_leader_hint();
-                        self.move_up();
-                        pending_g = false;
-                    }
-                    Key::Bottom => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if !self.move_plan_output_bottom() {
-                            self.select_bottom_visible();
-                        }
-                    }
-                    Key::G => {
-                        self.clear_leader_hint();
-                        if pending_g {
-                            if !self.move_plan_output_top() {
-                                self.select_top_visible();
-                            }
-                            pending_g = false;
-                        } else {
-                            pending_g = true;
-                        }
-                    }
-                    Key::PreviousBlock => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        self.move_plan_output_block(-1);
-                    }
-                    Key::NextBlock => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        self.move_plan_output_block(1);
-                    }
-                    Key::Leader => {
-                        self.leader_hint = Some(LeaderHint::Root);
-                    }
-                    Key::LeaderGit => {
-                        self.leader_hint = Some(LeaderHint::Git);
-                    }
-                    Key::OpenTmuxSession => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        match self.focused_panel {
-                            PanelFocus::Status => {
-                                if self.open_current_plan_tmux_session(&mut raw)? {
-                                } else if !self.toggle_plan_output_block() {
-                                    self.focus_repos();
-                                }
-                            }
-                            PanelFocus::Repos => {
-                                if self.visible_session_indices().is_empty() {
-                                    self.show_message(
-                                        "selected repository has no visible worktrees",
-                                    )?;
-                                } else {
-                                    self.focus_worktrees();
-                                }
-                            }
-                            PanelFocus::Worktrees => self.enter_agent_mode(&mut raw)?,
-                        }
-                    }
-                    Key::LazyGit => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if self.focused_panel == PanelFocus::Status {
-                            self.show_message("focus repos or worktrees to open lazygit")?;
-                        } else if self.focused_panel == PanelFocus::Repos {
-                            if let Err(error) = self.open_selected_repo_lazygit(&mut raw) {
-                                self.show_error("repository lazygit failed", &error)?;
-                            }
-                        } else if let Err(error) =
-                            self.open_tmux_window(&mut raw, TmuxWindow::LazyGit)
-                        {
-                            self.show_error("lazygit failed", &error)?;
-                        }
-                    }
-                    Key::AutoFlow => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if self.focused_panel != PanelFocus::Worktrees {
-                            self.show_message("focus worktrees to start or focus Auto Flow")?;
-                        } else if let Err(error) = self.start_or_focus_selected_auto_run(&mut raw) {
-                            self.show_error("auto flow failed", &error)?;
-                        }
-                    }
-                    Key::OpenPr => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if self.focused_panel != PanelFocus::Worktrees {
-                            self.show_message("focus worktrees to open a PR")?;
-                        } else if let Err(error) = self.open_selected_pr() {
-                            self.show_error("open PR failed", &error)?;
-                        }
-                    }
-                    Key::Terminal => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if self.focused_panel == PanelFocus::Status {
-                            self.show_message("focus repos or worktrees to open a terminal")?;
-                        } else if self.focused_panel == PanelFocus::Repos {
-                            if let Err(error) = self.open_selected_repo_terminal(&mut raw) {
-                                self.show_error("repository terminal failed", &error)?;
-                            }
-                        } else if let Err(error) =
-                            self.open_tmux_window(&mut raw, TmuxWindow::Terminal)
-                        {
-                            self.show_error("terminal failed", &error)?;
-                        }
-                    }
-                    Key::Help => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        self.show_keybindings_dialog()?;
-                    }
-                    Key::Refresh => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        self.refresh_sessions()?;
-                        self.start_tmux_agent_warmup();
-                        self.start_wt_column_poll();
-                        self.start_default_branch_status_poll(true);
-                        self.start_opencode_status_poll(true);
-                        self.start_opencode_event_listeners();
-                        self.refresh_plan_runs();
-                        self.refresh_auto_runs();
-                        self.poll_pull_requests(true);
-                    }
-                    Key::RepoShortcut(key) => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if let Err(error) = self.select_repo_by_key(key) {
-                            self.show_error("select repository failed", &error)?;
-                        }
-                    }
-                    Key::ReviewFix => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if self.focused_panel != PanelFocus::Worktrees {
-                            self.show_message("focus worktrees to stage a review-fix prompt")?;
-                        } else if let Err(error) = self.start_review_fix() {
-                            self.show_error("review fix failed", &error)?;
-                        }
-                    }
-                    Key::CiFix => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if self.focused_panel != PanelFocus::Worktrees {
-                            self.show_message("focus worktrees to copy a CI-failure prompt")?;
-                        } else if let Err(error) = self.start_ci_fix() {
-                            self.show_error("CI failure prompt failed", &error)?;
-                        }
-                    }
-                    Key::Push => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if self.focused_panel != PanelFocus::Worktrees {
-                            self.show_message("focus worktrees to push a branch")?;
-                        } else if let Err(error) = self.push_selected_branch() {
-                            self.show_error("push failed", &error)?;
-                        }
-                    }
-                    Key::Merge => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if self.focused_panel != PanelFocus::Worktrees {
-                            self.show_message("focus worktrees to merge a PR")?;
-                        } else if let Err(error) = self.merge_selected_pr() {
-                            self.show_error("merge failed", &error)?;
-                        }
-                    }
-                    Key::PullDefault => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if self.focused_panel == PanelFocus::Status {
-                            self.show_message(
-                                "focus repos or worktrees to pull the default branch",
-                            )?;
-                        } else if let Err(error) = self.pull_default_branch() {
-                            self.show_error("pull failed", &error)?;
-                        }
-                    }
-                    Key::PlanMode => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if self.focused_panel == PanelFocus::Status {
-                            self.show_message("focus repos or worktrees to run plan mode")?;
-                        } else if self.focused_panel == PanelFocus::Repos {
-                            if let Err(error) = self.start_selected_repo_plan_run(&mut raw) {
-                                self.show_error("plan mode failed", &error)?;
-                            }
-                        } else if let Err(error) = self.start_selected_worktree_plan_run(&mut raw) {
-                            self.show_error("plan mode failed", &error)?;
-                        }
-                    }
-                    Key::PausePlan => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if self.toggle_selected_auto_pause()? {
-                        } else if !self.toggle_selected_plan_pause()? {
-                            self.show_message("focus an auto or plan run to pause or resume it")?;
-                        }
-                    }
-                    Key::RetryFailedPlanSteps => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if self.retry_failed_auto_step()? {
-                        } else if !self.retry_failed_plan_steps()? {
-                            self.show_message("focus a failed auto or plan run to retry")?;
-                        }
-                    }
-                    Key::RetryPlanFromSelected => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if self.retry_auto_from_selected_step()? {
-                        } else if !self.retry_plan_from_selected_step()? {
-                            self.show_message("focus an auto or plan run to retry from selection")?;
-                        }
-                    }
-                    Key::SkipPlanStep => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if !self.skip_selected_plan_step()? {
-                            self.show_message("focus a plan run to skip selected phase")?;
-                        }
-                    }
-                    Key::Create => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        match self.create_session() {
-                            Ok(true) => self.focus_worktrees(),
-                            Ok(false) => {}
-                            Err(error) => self.show_error("create session failed", &error)?,
-                        }
-                    }
-                    Key::AbortOpencode => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        let handled = self.abort_selected_auto_run_or_step()?
-                            || self.abort_selected_plan_run_or_step()?;
-                        if handled {
-                        } else if self.focused_panel != PanelFocus::Worktrees {
-                            self.show_message("focus worktrees to abort an OpenCode session")?;
-                        } else if let Err(error) = self.abort_selected_opencode_session() {
-                            self.show_error("abort failed", &error)?;
-                        }
-                    }
-                    Key::ManageRepos => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if let Err(error) = self.edit_repositories(&mut raw) {
-                            self.show_error("edit repositories failed", &error)?;
-                        }
-                    }
-                    Key::Delete => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        let handled = self.dismiss_selected_auto_run()?
-                            || self.dismiss_selected_plan_run()?;
-                        if handled {
-                        } else if self.focused_panel == PanelFocus::Status {
-                            self.show_message("focus worktrees to delete a worktree/session")?;
-                        } else if self.focused_panel == PanelFocus::Repos {
-                            self.show_message("repository removal is available from R")?;
-                        } else if let Err(error) = self.delete_session() {
-                            self.show_error("delete failed", &error)?;
-                        }
-                    }
-                    Key::EditConfig => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        if self.focused_panel != PanelFocus::Repos {
-                            self.show_message("focus repos to edit repository config")?;
-                        } else if let Err(error) = self.edit_config(&mut raw) {
-                            self.show_error("edit config failed", &error)?;
-                        }
-                    }
-                    Key::Search => {
-                        self.clear_leader_hint();
-                        pending_g = false;
-                        self.search_sessions()?;
-                    }
-                    Key::Other => {
-                        self.clear_leader_hint();
-                        pending_g = false;
+            match key {
+                Key::Quit => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    should_quit = self.confirm_quit(&mut runtime)?;
+                }
+                Key::Down => {
+                    self.clear_leader_hint();
+                    self.move_down();
+                    pending_g = false;
+                }
+                Key::Left => {
+                    self.clear_leader_hint();
+                    self.move_left();
+                    pending_g = false;
+                }
+                Key::Right => {
+                    self.clear_leader_hint();
+                    self.move_right();
+                    pending_g = false;
+                }
+                Key::FocusNext => {
+                    self.clear_leader_hint();
+                    self.focus_next_panel();
+                    pending_g = false;
+                }
+                Key::FocusStatus => {
+                    self.clear_leader_hint();
+                    self.focus_status();
+                    pending_g = false;
+                }
+                Key::FocusRepos => {
+                    self.clear_leader_hint();
+                    self.focus_repos();
+                    pending_g = false;
+                }
+                Key::FocusWorktrees => {
+                    self.clear_leader_hint();
+                    self.focus_worktrees();
+                    pending_g = false;
+                }
+                Key::Up => {
+                    self.clear_leader_hint();
+                    self.move_up();
+                    pending_g = false;
+                }
+                Key::Bottom => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if !self.move_plan_output_bottom() {
+                        self.select_bottom_visible();
                     }
                 }
-                if should_quit {
-                    break;
+                Key::G => {
+                    self.clear_leader_hint();
+                    if pending_g {
+                        if !self.move_plan_output_top() {
+                            self.select_top_visible();
+                        }
+                        pending_g = false;
+                    } else {
+                        pending_g = true;
+                    }
+                }
+                Key::PreviousBlock => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    self.move_plan_output_block(-1);
+                }
+                Key::NextBlock => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    self.move_plan_output_block(1);
+                }
+                Key::Leader => {
+                    self.leader_hint = Some(LeaderHint::Root);
+                }
+                Key::LeaderGit => {
+                    self.leader_hint = Some(LeaderHint::Git);
+                }
+                Key::OpenTmuxSession => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    match self.focused_panel {
+                        PanelFocus::Status => {
+                            if self.open_current_plan_tmux_session(&mut runtime)? {
+                            } else if !self.toggle_plan_output_block() {
+                                self.focus_repos();
+                            }
+                        }
+                        PanelFocus::Repos => {
+                            if self.visible_session_indices().is_empty() {
+                                self.show_message("selected repository has no visible worktrees")?;
+                            } else {
+                                self.focus_worktrees();
+                            }
+                        }
+                        PanelFocus::Worktrees => self.enter_agent_mode(&mut runtime)?,
+                    }
+                }
+                Key::LazyGit => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.focused_panel == PanelFocus::Status {
+                        self.show_message("focus repos or worktrees to open lazygit")?;
+                    } else if self.focused_panel == PanelFocus::Repos {
+                        if let Err(error) = self.open_selected_repo_lazygit(&mut runtime) {
+                            self.show_error("repository lazygit failed", &error)?;
+                        }
+                    } else if let Err(error) =
+                        self.open_tmux_window(&mut runtime, TmuxWindow::LazyGit)
+                    {
+                        self.show_error("lazygit failed", &error)?;
+                    }
+                }
+                Key::AutoFlow => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.focused_panel != PanelFocus::Worktrees {
+                        self.show_message("focus worktrees to start or focus Auto Flow")?;
+                    } else if let Err(error) = self.start_or_focus_selected_auto_run(&mut runtime) {
+                        self.show_error("auto flow failed", &error)?;
+                    }
+                }
+                Key::OpenPr => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.focused_panel != PanelFocus::Worktrees {
+                        self.show_message("focus worktrees to open a PR")?;
+                    } else if let Err(error) = self.open_selected_pr(&mut runtime) {
+                        self.show_error("open PR failed", &error)?;
+                    }
+                }
+                Key::Terminal => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.focused_panel == PanelFocus::Status {
+                        self.show_message("focus repos or worktrees to open a terminal")?;
+                    } else if self.focused_panel == PanelFocus::Repos {
+                        if let Err(error) = self.open_selected_repo_terminal(&mut runtime) {
+                            self.show_error("repository terminal failed", &error)?;
+                        }
+                    } else if let Err(error) =
+                        self.open_tmux_window(&mut runtime, TmuxWindow::Terminal)
+                    {
+                        self.show_error("terminal failed", &error)?;
+                    }
+                }
+                Key::Help => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    self.show_keybindings_dialog(&mut runtime)?;
+                }
+                Key::Refresh => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    self.refresh_sessions()?;
+                    self.start_tmux_agent_warmup();
+                    self.start_wt_column_poll();
+                    self.start_default_branch_status_poll(true);
+                    self.start_opencode_status_poll(true);
+                    self.start_opencode_event_listeners();
+                    self.refresh_plan_runs();
+                    self.refresh_auto_runs();
+                    self.poll_pull_requests(true);
+                }
+                Key::RepoShortcut(key) => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if let Err(error) = self.select_repo_by_key(key) {
+                        self.show_error("select repository failed", &error)?;
+                    }
+                }
+                Key::ReviewFix => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.focused_panel != PanelFocus::Worktrees {
+                        self.show_message("focus worktrees to stage a review-fix prompt")?;
+                    } else if let Err(error) = self.start_review_fix(&mut runtime) {
+                        self.show_error("review fix failed", &error)?;
+                    }
+                }
+                Key::CiFix => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.focused_panel != PanelFocus::Worktrees {
+                        self.show_message("focus worktrees to copy a CI-failure prompt")?;
+                    } else if let Err(error) = self.start_ci_fix(&mut runtime) {
+                        self.show_error("CI failure prompt failed", &error)?;
+                    }
+                }
+                Key::Push => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.focused_panel != PanelFocus::Worktrees {
+                        self.show_message("focus worktrees to push a branch")?;
+                    } else if let Err(error) = self.push_selected_branch(&mut runtime) {
+                        self.show_error("push failed", &error)?;
+                    }
+                }
+                Key::Merge => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.focused_panel != PanelFocus::Worktrees {
+                        self.show_message("focus worktrees to merge a PR")?;
+                    } else if let Err(error) = self.merge_selected_pr(&mut runtime) {
+                        self.show_error("merge failed", &error)?;
+                    }
+                }
+                Key::PullDefault => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.focused_panel == PanelFocus::Status {
+                        self.show_message("focus repos or worktrees to pull the default branch")?;
+                    } else if let Err(error) = self.pull_default_branch(&mut runtime) {
+                        self.show_error("pull failed", &error)?;
+                    }
+                }
+                Key::PlanMode => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.focused_panel == PanelFocus::Status {
+                        self.show_message("focus repos or worktrees to run plan mode")?;
+                    } else if self.focused_panel == PanelFocus::Repos {
+                        if let Err(error) = self.start_selected_repo_plan_run(&mut runtime) {
+                            self.show_error("plan mode failed", &error)?;
+                        }
+                    } else if let Err(error) = self.start_selected_worktree_plan_run(&mut runtime) {
+                        self.show_error("plan mode failed", &error)?;
+                    }
+                }
+                Key::PausePlan => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.toggle_selected_auto_pause(&mut runtime)? {
+                    } else if !self.toggle_selected_plan_pause()? {
+                        self.show_message("focus an auto or plan run to pause or resume it")?;
+                    }
+                }
+                Key::RetryFailedPlanSteps => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.retry_failed_auto_step()? {
+                    } else if !self.retry_failed_plan_steps()? {
+                        self.show_message("focus a failed auto or plan run to retry")?;
+                    }
+                }
+                Key::RetryPlanFromSelected => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.retry_auto_from_selected_step(&mut runtime)? {
+                    } else if !self.retry_plan_from_selected_step(&mut runtime)? {
+                        self.show_message("focus an auto or plan run to retry from selection")?;
+                    }
+                }
+                Key::SkipPlanStep => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if !self.skip_selected_plan_step()? {
+                        self.show_message("focus a plan run to skip selected phase")?;
+                    }
+                }
+                Key::Create => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    match self.create_session(&mut runtime) {
+                        Ok(true) => self.focus_worktrees(),
+                        Ok(false) => {}
+                        Err(error) => self.show_error("create session failed", &error)?,
+                    }
+                }
+                Key::AbortOpencode => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    let handled = self.abort_selected_auto_run_or_step(&mut runtime)?
+                        || self.abort_selected_plan_run_or_step(&mut runtime)?;
+                    if handled {
+                    } else if self.focused_panel != PanelFocus::Worktrees {
+                        self.show_message("focus worktrees to abort an OpenCode session")?;
+                    } else if let Err(error) = self.abort_selected_opencode_session(&mut runtime) {
+                        self.show_error("abort failed", &error)?;
+                    }
+                }
+                Key::ManageRepos => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if let Err(error) = self.edit_repositories(&mut runtime) {
+                        self.show_error("edit repositories failed", &error)?;
+                    }
+                }
+                Key::Delete => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    let handled =
+                        self.dismiss_selected_auto_run()? || self.dismiss_selected_plan_run()?;
+                    if handled {
+                    } else if self.focused_panel == PanelFocus::Status {
+                        self.show_message("focus worktrees to delete a worktree/session")?;
+                    } else if self.focused_panel == PanelFocus::Repos {
+                        self.show_message("repository removal is available from R")?;
+                    } else if let Err(error) = self.delete_session(&mut runtime) {
+                        self.show_error("delete failed", &error)?;
+                    }
+                }
+                Key::EditConfig => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.focused_panel != PanelFocus::Repos {
+                        self.show_message("focus repos to edit repository config")?;
+                    } else if let Err(error) = self.edit_config(&mut runtime) {
+                        self.show_error("edit config failed", &error)?;
+                    }
+                }
+                Key::Search => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    self.search_sessions(&mut runtime)?;
+                }
+                Key::Other => {
+                    self.clear_leader_hint();
+                    pending_g = false;
                 }
             }
             if should_quit {
                 break;
             }
-            self.draw()?;
+            self.draw(&mut runtime)?;
         }
         self.shutdown_owned_opencode_servers();
         Ok(())
     }
 
-    fn tick_tui_action_jobs(&mut self, last_size: &mut (u16, u16)) -> TuiBackgroundChanges {
-        let mut changes = TuiBackgroundChanges {
+    fn tick_tui_action_jobs(&mut self) -> TuiBackgroundChanges {
+        let changes = TuiBackgroundChanges {
             tmux: self.poll_tmux_agent_warmup(),
             worktree_columns: self.poll_wt_columns(),
             default_branch: self.poll_default_branch_status(),
@@ -744,20 +747,14 @@ impl Tui {
             auto_runs: self.poll_auto_runs(),
             pull_requests: self.poll_pull_requests(false),
             status_message: self.expire_status_message(),
-            ..TuiBackgroundChanges::default()
         };
         self.start_default_branch_status_poll(false);
         self.start_opencode_status_poll(false);
         self.start_opencode_event_listeners();
-        let current_size = terminal_size();
-        changes.resized = current_size != *last_size;
-        if changes.resized {
-            *last_size = current_size;
-        }
         changes
     }
 
-    fn confirm_quit(&self) -> Result<bool, String> {
+    fn confirm_quit(&mut self, runtime: &mut TerminalRuntime) -> Result<bool, String> {
         if !self
             .sessions
             .iter()
@@ -765,11 +762,11 @@ impl Tui {
         {
             return Ok(true);
         }
-        let answer = self.prompt_line("Agents are running. Quit Prism? [y/N] ")?;
+        let answer = self.prompt_line(runtime, "Agents are running. Quit Prism? [y/N] ")?;
         Ok(yes(&answer))
     }
 
-    fn enter_agent_mode(&mut self, raw: &mut RawTerminal) -> Result<(), String> {
+    fn enter_agent_mode(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
@@ -780,9 +777,9 @@ impl Tui {
             self.show_message("default branch does not have an agent session")?;
             return Ok(());
         }
-        raw.suspend()?;
+        runtime.suspend()?;
         let result = self.attach_selected_tmux_session();
-        let resume_result = raw.resume();
+        let resume_result = runtime.resume();
         self.refresh_sessions()?;
         self.start_tmux_agent_warmup();
         resume_result?;
@@ -794,22 +791,22 @@ impl Tui {
 
     fn open_tmux_window(
         &mut self,
-        raw: &mut RawTerminal,
+        runtime: &mut TerminalRuntime,
         window: TmuxWindow,
     ) -> Result<(), String> {
         if self.selected >= self.sessions.len() {
             return Ok(());
         }
-        raw.suspend()?;
+        runtime.suspend()?;
         let result = self.attach_selected_tmux_window(window);
-        let resume_result = raw.resume();
+        let resume_result = runtime.resume();
         self.refresh_sessions()?;
         self.start_tmux_agent_warmup();
         resume_result?;
         result
     }
 
-    fn show_keybindings_dialog(&self) -> Result<(), String> {
+    fn show_keybindings_dialog(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
         let items = [
             "1 / 2 / 3    focus status / repos / worktrees",
             "Tab          move focus between panels",
@@ -843,384 +840,230 @@ impl Tui {
             "r            refresh",
             "q, Ctrl-C    quit",
         ];
+        let items = items
+            .iter()
+            .map(|item| (*item).to_string())
+            .collect::<Vec<_>>();
         let mut filter = String::new();
         let mut editing_filter = false;
-        self.draw_keybindings_dialog(&items, &filter)?;
-
-        let mut stdin = io::stdin();
-        let mut byte = [0_u8; 1];
+        self.dialog = Some(view::DialogModel::Help {
+            filter: filter.clone(),
+            editing_filter,
+            items: items.clone(),
+        });
+        self.draw(runtime)?;
         loop {
-            match stdin.read(&mut byte) {
-                Ok(1) => {}
-                Ok(_) => {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                    continue;
-                }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                    continue;
-                }
-                Err(error) => return Err(error.to_string()),
+            if self.tick_tui_action_jobs().any() {
+                self.draw(runtime)?;
             }
-            match byte[0] {
-                b'/' if !editing_filter => {
+            let Some(event) = runtime.poll_event(Duration::from_millis(100))? else {
+                continue;
+            };
+            let RuntimeEvent::Key(event) = event else {
+                self.draw(runtime)?;
+                continue;
+            };
+            if event.kind != KeyEventKind::Press {
+                continue;
+            }
+            let mut close = false;
+            match event.code {
+                KeyCode::Char('/') if plain_key(event) && !editing_filter => {
                     editing_filter = true;
                     filter.clear();
-                    self.draw_keybindings_dialog(&items, &filter)?;
                 }
-                b'\r' | b'\n' if editing_filter => editing_filter = false,
-                8 | 127 if editing_filter => {
+                KeyCode::Enter if editing_filter => editing_filter = false,
+                KeyCode::Backspace if editing_filter => {
                     filter.pop();
-                    self.draw_keybindings_dialog(&items, &filter)?;
                 }
-                3 | 27 | b'q' => return Ok(()),
-                byte if editing_filter && !byte.is_ascii_control() => {
-                    filter.push(byte as char);
-                    self.draw_keybindings_dialog(&items, &filter)?;
+                KeyCode::Esc => close = true,
+                KeyCode::Char('c') if ctrl_key(event) => close = true,
+                KeyCode::Char('q') if plain_key(event) => close = true,
+                KeyCode::Char(ch) if editing_filter && plain_key(event) && !ch.is_control() => {
+                    filter.push(ch);
                 }
-                _ if !editing_filter => return Ok(()),
+                _ if !editing_filter => close = true,
                 _ => {}
             }
+            if close {
+                self.dialog = None;
+                self.draw(runtime)?;
+                return Ok(());
+            }
+            self.dialog = Some(view::DialogModel::Help {
+                filter: filter.clone(),
+                editing_filter,
+                items: items.clone(),
+            });
+            self.draw(runtime)?;
         }
-    }
-
-    fn draw_keybindings_dialog(&self, items: &[&str], filter: &str) -> Result<(), String> {
-        let query = filter.trim().to_ascii_lowercase();
-        let mut lines = vec!["Keybindings".to_string()];
-        lines.push(if filter.is_empty() {
-            "Filter: /".to_string()
-        } else {
-            format!("Filter: /{filter}")
-        });
-        lines.push(String::new());
-        lines.extend(
-            items
-                .iter()
-                .filter(|line| query.is_empty() || line.to_ascii_lowercase().contains(&query))
-                .map(|line| (*line).to_string()),
-        );
-        if lines.len() == 3 {
-            lines.push("No matching keybindings".to_string());
-        }
-        lines.extend([String::new(), "Esc/q closes. / searches.".to_string()]);
-        let (cols, rows) = terminal_size();
-        let available_width = (cols as usize).saturating_sub(2).max(4);
-        let width = lines
-            .iter()
-            .map(|line| line.chars().count())
-            .max()
-            .unwrap_or(0)
-            .saturating_add(4)
-            .max(24)
-            .min(available_width);
-        let height = lines.len() + 2;
-        let left = ((cols as usize).saturating_sub(width) / 2).saturating_add(1);
-        let top = ((rows as usize).saturating_sub(height) / 2).saturating_add(1);
-
-        let mut frame = format!(
-            "\x1b[?25l\x1b[{top};{left}H+{}+",
-            "-".repeat(width.saturating_sub(2))
-        );
-        for (index, line) in lines.iter().enumerate() {
-            let y = top + index + 1;
-            let text_width = width.saturating_sub(4);
-            let text = truncate_line(line, text_width);
-            frame.push_str(&format!(
-                "\x1b[{y};{left}H| {:<text_width$} |",
-                text,
-                text_width = text_width
-            ));
-        }
-        frame.push_str(&format!(
-            "\x1b[{};{}H+{}+",
-            top + height - 1,
-            left,
-            "-".repeat(width.saturating_sub(2))
-        ));
-        write_stdout(&frame)
     }
 
     pub(crate) fn confirm_delete_dialog(
-        &self,
+        &mut self,
+        runtime: &mut TerminalRuntime,
         branch: &str,
         path: &str,
         warnings: &[String],
     ) -> Result<bool, String> {
         let mut lines = vec![
-            "Delete Session".to_string(),
-            String::new(),
-            format!("branch: {branch}"),
-            format!("path: {path}"),
-            String::new(),
+            view::DialogLine {
+                text: format!("branch: {branch}"),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!("path: {path}"),
+                attention: false,
+            },
         ];
         if warnings.is_empty() {
-            lines.push("No warnings detected.".to_string());
+            lines.push(view::DialogLine {
+                text: "No warnings detected.".to_string(),
+                attention: false,
+            });
         } else {
-            lines.push("Warnings".to_string());
             for warning in warnings {
-                lines.push(format!("\x1b[31m•\x1b[0m {warning}"));
+                lines.push(view::DialogLine {
+                    text: warning.clone(),
+                    attention: true,
+                });
             }
         }
-        lines.extend([
-            String::new(),
-            "Enter confirms delete. Esc/q cancels.".to_string(),
-        ]);
-
-        let (cols, rows) = terminal_size();
-        let available_width = (cols as usize).saturating_sub(2).max(4);
-        let width = lines
-            .iter()
-            .map(|line| strip_ansi(line).chars().count())
-            .max()
-            .unwrap_or(0)
-            .saturating_add(4)
-            .max(42)
-            .min(available_width);
-        let height = lines.len() + 2;
-        let left = ((cols as usize).saturating_sub(width) / 2).saturating_add(1);
-        let top = ((rows as usize).saturating_sub(height) / 2).saturating_add(1);
-
-        print!("\x1b[?25l");
-        print!(
-            "\x1b[{top};{left}H+{}+",
-            "-".repeat(width.saturating_sub(2))
-        );
-        for (index, line) in lines.iter().enumerate() {
-            let y = top + index + 1;
-            let text_width = width.saturating_sub(4);
-            let text = truncate_line(&strip_ansi(line), text_width);
-            let text = if line.contains("\x1b[") {
-                truncate_ansi_dialog_line(line, text_width)
-            } else {
-                text
-            };
-            print!(
-                "\x1b[{y};{left}H| {}{} |",
-                text,
-                " ".repeat(text_width.saturating_sub(strip_ansi(&text).chars().count()))
-            );
-        }
-        print!(
-            "\x1b[{};{}H+{}+",
-            top + height - 1,
-            left,
-            "-".repeat(width.saturating_sub(2))
-        );
-        io::stdout().flush().map_err(|error| error.to_string())?;
-
-        let mut stdin = io::stdin();
-        let mut byte = [0_u8; 1];
-        loop {
-            match stdin.read(&mut byte) {
-                Ok(1) => match byte[0] {
-                    b'\r' | b'\n' => return Ok(true),
-                    3 | 27 | b'q' => return Ok(false),
-                    _ => {}
-                },
-                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                }
-                Err(error) => return Err(error.to_string()),
-            }
-        }
+        self.confirm_dialog(runtime, "Delete Session", lines, "Delete", "Cancel")
     }
 
-    pub(crate) fn prompt_line(&self, prompt: &str) -> Result<String, String> {
-        self.prompt_line_with_initial(prompt, "")
+    pub(crate) fn prompt_line(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        prompt: &str,
+    ) -> Result<String, String> {
+        Ok(self
+            .prompt_line_dialog(runtime, "Prism", prompt, "")?
+            .unwrap_or_default())
     }
 
     pub(crate) fn prompt_line_dialog(
-        &self,
+        &mut self,
+        runtime: &mut TerminalRuntime,
         title: &str,
         prompt: &str,
         initial: &str,
     ) -> Result<Option<String>, String> {
         let mut input = initial.to_string();
-        self.draw()?;
-        self.draw_prompt_dialog(title, prompt, &input)?;
-        let mut stdin = io::stdin();
-        let mut byte = [0_u8; 1];
+        self.dialog = Some(view::DialogModel::Prompt {
+            title: title.to_string(),
+            prompt: prompt.to_string(),
+            input: input.clone(),
+        });
+        self.draw(runtime)?;
         loop {
-            match stdin.read(&mut byte) {
-                Ok(1) => {}
-                Ok(_) => {
-                    std::thread::sleep(Duration::from_millis(25));
-                    continue;
-                }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(25));
-                    continue;
-                }
-                Err(error) => return Err(error.to_string()),
+            if self.tick_tui_action_jobs().any() {
+                self.draw(runtime)?;
             }
-            match byte[0] {
-                b'\r' | b'\n' => {
-                    write_stdout("\x1b[?25l")?;
+            let Some(event) = runtime.poll_event(Duration::from_millis(100))? else {
+                continue;
+            };
+            let RuntimeEvent::Key(event) = event else {
+                self.draw(runtime)?;
+                continue;
+            };
+            if event.kind != KeyEventKind::Press {
+                continue;
+            }
+            match event.code {
+                KeyCode::Enter => {
+                    self.dialog = None;
+                    self.draw(runtime)?;
                     return Ok(Some(input));
                 }
-                3 | 27 => {
-                    write_stdout("\x1b[?25l")?;
+                KeyCode::Esc | KeyCode::Char('c')
+                    if event.code == KeyCode::Esc || ctrl_key(event) =>
+                {
+                    self.dialog = None;
+                    self.draw(runtime)?;
                     return Ok(None);
                 }
-                8 | 127 => {
+                KeyCode::Backspace => {
                     input.pop();
-                    self.draw_prompt_dialog(title, prompt, &input)?;
                 }
-                byte if !byte.is_ascii_control() => {
-                    input.push(byte as char);
-                    self.draw_prompt_dialog(title, prompt, &input)?;
+                KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => {
+                    input.push(ch);
                 }
                 _ => {}
             }
+            self.dialog = Some(view::DialogModel::Prompt {
+                title: title.to_string(),
+                prompt: prompt.to_string(),
+                input: input.clone(),
+            });
+            self.draw(runtime)?;
         }
     }
 
-    pub(crate) fn show_loading_dialog(&self, title: &str, message: &str) -> Result<(), String> {
-        self.draw()?;
-        self.draw_static_dialog(title, &["[*] Please wait", message])
-    }
-
-    fn draw_prompt_dialog(&self, title: &str, prompt: &str, input: &str) -> Result<(), String> {
-        let (cols, rows) = terminal_size();
-        let prompt_len = prompt.chars().count();
-        let requested_width = title
-            .chars()
-            .count()
-            .max(prompt_len.saturating_add(input.chars().count()))
-            .saturating_add(4)
-            .max(44);
-        let width = requested_width.min((cols as usize).saturating_sub(2).max(12));
-        let text_width = width.saturating_sub(4);
-        let max_input_width = text_width.saturating_sub(prompt_len);
-        let input_display = tail_chars(input, max_input_width);
-        let input_line = format!("{prompt}{input_display}");
-        let cursor_col = prompt_len
-            .saturating_add(input_display.chars().count())
-            .min(text_width);
-        self.draw_dialog_frame(
-            title,
-            &[
-                String::new(),
-                input_line,
-                "Enter to continue, Esc to cancel".to_string(),
-            ],
-            Some((1, cursor_col)),
-            width,
-            rows,
-            cols,
-        )
-    }
-
-    fn draw_static_dialog(&self, title: &str, lines: &[&str]) -> Result<(), String> {
-        let (cols, rows) = terminal_size();
-        let requested_width = lines
-            .iter()
-            .map(|line| line.chars().count())
-            .chain(std::iter::once(title.chars().count()))
-            .max()
-            .unwrap_or(0)
-            .saturating_add(4)
-            .max(44);
-        let width = requested_width.min((cols as usize).saturating_sub(2).max(12));
-        let owned_lines = lines
-            .iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
-        self.draw_dialog_frame(title, &owned_lines, None, width, rows, cols)
-    }
-
-    fn draw_dialog_frame(
-        &self,
+    pub(crate) fn show_loading_dialog(
+        &mut self,
+        runtime: &mut TerminalRuntime,
         title: &str,
-        lines: &[String],
-        cursor: Option<(usize, usize)>,
-        width: usize,
-        rows: u16,
-        cols: u16,
+        message: &str,
     ) -> Result<(), String> {
-        let height = lines.len() + 3;
-        let left = ((cols as usize).saturating_sub(width) / 2).saturating_add(1);
-        let top = ((rows as usize).saturating_sub(height) / 3).saturating_add(1);
-        let text_width = width.saturating_sub(4);
-        let mut frame = format!(
-            "\x1b[?25l\x1b[{top};{left}H+{}+",
-            "-".repeat(width.saturating_sub(2))
-        );
-        let title_line = truncate_line(title, text_width);
-        frame.push_str(&format!(
-            "\x1b[{};{}H| {:<text_width$} |",
-            top + 1,
-            left,
-            title_line,
-            text_width = text_width
-        ));
-        for (index, line) in lines.iter().enumerate() {
-            let y = top + index + 2;
-            let text = truncate_line(line, text_width);
-            frame.push_str(&format!(
-                "\x1b[{y};{left}H| {:<text_width$} |",
-                text,
-                text_width = text_width
-            ));
-        }
-        frame.push_str(&format!(
-            "\x1b[{};{}H+{}+",
-            top + height - 1,
-            left,
-            "-".repeat(width.saturating_sub(2))
-        ));
-        if let Some((line_index, cursor_col)) = cursor {
-            frame.push_str(&format!(
-                "\x1b[{};{}H\x1b[?25h",
-                top + line_index + 2,
-                left + 2 + cursor_col
-            ));
-        }
-        write_stdout(&frame)
+        self.dialog = Some(view::DialogModel::Progress {
+            title: title.to_string(),
+            message: message.to_string(),
+        });
+        self.draw(runtime)?;
+        self.dialog = None;
+        Ok(())
     }
 
-    fn prompt_line_with_initial(&self, prompt: &str, initial: &str) -> Result<String, String> {
-        let mut input = initial.to_string();
-        write_stdout(&format!(
-            "\x1b[{};1H\x1b[2K\x1b[?25h{}{}",
-            terminal_size().1,
-            prompt,
-            input
-        ))?;
-        let mut stdin = io::stdin();
-        let mut byte = [0_u8; 1];
+    fn confirm_dialog(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        title: &str,
+        lines: Vec<view::DialogLine>,
+        confirm_label: &str,
+        cancel_label: &str,
+    ) -> Result<bool, String> {
+        self.dialog = Some(view::DialogModel::Confirm {
+            title: title.to_string(),
+            lines: lines.clone(),
+            confirm_label: confirm_label.to_string(),
+            cancel_label: cancel_label.to_string(),
+        });
+        self.draw(runtime)?;
         loop {
-            match stdin.read(&mut byte) {
-                Ok(1) => {}
-                Ok(_) => {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                    continue;
-                }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(std::time::Duration::from_millis(25));
-                    continue;
-                }
-                Err(error) => return Err(error.to_string()),
+            if self.tick_tui_action_jobs().any() {
+                self.draw(runtime)?;
             }
-            match byte[0] {
-                b'\r' | b'\n' => {
-                    write_stdout("\r\n\x1b[?25l")?;
-                    return Ok(input);
+            let Some(event) = runtime.poll_event(Duration::from_millis(100))? else {
+                continue;
+            };
+            let RuntimeEvent::Key(event) = event else {
+                self.draw(runtime)?;
+                continue;
+            };
+            if event.kind != KeyEventKind::Press {
+                continue;
+            }
+            match event.code {
+                KeyCode::Enter => {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Ok(true);
                 }
-                3 | 27 => {
-                    write_stdout("\r\n\x1b[?25l")?;
-                    return Ok(String::new());
+                KeyCode::Esc => {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Ok(false);
                 }
-                8 | 127 => {
-                    if input.pop().is_some() {
-                        write_stdout("\x08 \x08")?;
-                    }
+                KeyCode::Char('q') if plain_key(event) => {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Ok(false);
                 }
-                byte if !byte.is_ascii_control() => {
-                    let ch = byte as char;
-                    input.push(ch);
-                    write_stdout(&ch.to_string())?;
+                KeyCode::Char('c') if ctrl_key(event) => {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Ok(false);
                 }
                 _ => {}
             }
@@ -1231,7 +1074,7 @@ impl Tui {
         self.status_message = Some(message.to_string());
         self.status_message_until = Some(Instant::now() + STATUS_MESSAGE_DURATION);
         let _ = append_runtime_log(&self.repo, message);
-        self.draw()
+        Ok(())
     }
 
     fn show_error(&mut self, context: &str, error: &str) -> Result<(), String> {
@@ -1520,16 +1363,18 @@ impl Tui {
         self.leader_hint = None;
     }
 
-    fn search_sessions(&mut self) -> Result<(), String> {
+    fn search_sessions(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
         match self.focused_panel {
             PanelFocus::Status => {
                 self.show_message("status panel has no filter")?;
             }
             PanelFocus::Repos => {
+                let initial = self.repo_filter.clone();
                 let Some(input) = self.prompt_line_dialog(
+                    runtime,
                     "Search Repositories",
                     "Filter (empty clears): ",
-                    &self.repo_filter,
+                    &initial,
                 )?
                 else {
                     return Ok(());
@@ -1538,10 +1383,12 @@ impl Tui {
                 self.ensure_navigation_valid();
             }
             PanelFocus::Worktrees => {
+                let initial = self.worktree_filter.clone();
                 let Some(input) = self.prompt_line_dialog(
+                    runtime,
                     "Search Worktrees",
                     "Filter (empty clears): ",
-                    &self.worktree_filter,
+                    &initial,
                 )?
                 else {
                     return Ok(());
@@ -1565,9 +1412,9 @@ impl Tui {
         false
     }
 
-    fn draw(&self) -> Result<(), String> {
+    fn draw(&self, runtime: &mut TerminalRuntime) -> Result<(), String> {
         let model = self.frame_model();
-        view::draw_model(&model)
+        runtime.draw(&model)
     }
 
     fn poll_plan_runs(&mut self) -> bool {
@@ -2118,6 +1965,7 @@ impl Tui {
                         view::WorktreeKind::FeatureWorktree
                     },
                     agent_state: session.agent_state,
+                    status_label: session.status_label.clone(),
                     pr: session.pr.clone(),
                     wt_columns: session.wt_columns.clone(),
                     auto_status,
@@ -2157,6 +2005,7 @@ impl Tui {
             leader_hint: self.leader_hint_label(),
             auto_dashboard: self.current_auto_dashboard(),
             plan_dashboard: self.current_plan_dashboard(),
+            dialog: self.dialog.clone(),
         }
     }
 
@@ -2394,41 +2243,6 @@ impl Tui {
     }
 }
 
-fn truncate_ansi_dialog_line(text: &str, max_chars: usize) -> String {
-    let stripped = strip_ansi(text);
-    if stripped.chars().count() <= max_chars {
-        return text.to_string();
-    }
-    let warning_prefix = "\x1b[31m•\x1b[0m ";
-    if let Some(rest) = text.strip_prefix(warning_prefix) {
-        let visible_prefix = "• ";
-        let prefix_width = visible_prefix.chars().count();
-        if max_chars > prefix_width {
-            return format!(
-                "{warning_prefix}{}",
-                truncate_line(rest, max_chars - prefix_width)
-            );
-        }
-    }
-    truncate_line(&stripped, max_chars)
-}
-
-fn tail_chars(text: &str, max_chars: usize) -> String {
-    let count = text.chars().count();
-    if count <= max_chars {
-        return text.to_string();
-    }
-    if max_chars == 0 {
-        return String::new();
-    }
-    if max_chars == 1 {
-        return "~".to_string();
-    }
-    let mut out = String::from("~");
-    out.extend(text.chars().skip(count - max_chars + 1));
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -2445,15 +2259,7 @@ mod tests {
     use crate::session::Session;
     use crate::view::{RepoMainView, WorktreeMainView};
 
-    use super::{ManagedRepo, PanelFocus, Tui, truncate_ansi_dialog_line};
-
-    #[test]
-    fn truncated_warning_line_keeps_colored_bullet_prefix() {
-        assert_eq!(
-            truncate_ansi_dialog_line("\x1b[31m•\x1b[0m dirty worktree", 8),
-            "\x1b[31m•\x1b[0m dirty~"
-        );
-    }
+    use super::{ManagedRepo, PanelFocus, Tui};
 
     #[test]
     fn tui_defaults_to_repos_panel_focus() {

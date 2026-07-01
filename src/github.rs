@@ -733,6 +733,7 @@ pub(crate) fn pr_cache_comment_count(cache: &PrCache) -> usize {
         .unwrap_or(0)
 }
 
+#[cfg(test)]
 pub(crate) fn pr_cache_has_comments(cache: &PrCache) -> bool {
     pr_cache_comment_count(cache) > 0
 }
