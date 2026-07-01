@@ -19,7 +19,7 @@ use crate::{
     },
     session::Session,
     tui::PanelFocus,
-    util::status_count,
+    util::{status_count, truncate},
     view,
 };
 
@@ -591,32 +591,14 @@ fn auto_dashboard_lines(
         Span::raw(counts.failed.to_string()),
     ]));
     lines.push(Line::from(""));
-    lines.push(heading_line("Steps"));
+    lines.push(heading_line("Checklist"));
     let linked_plan_rows_reserved = linked_plan_summary_lines(dashboard).len();
     let output_rows_reserved = dashboard.output_lines.len().min(8) + linked_plan_rows_reserved + 2;
     let step_rows_available = visible_rows
         .saturating_sub(lines.len())
         .saturating_sub(output_rows_reserved)
         .max(3);
-    let selected_index = selected_step
-        .and_then(|selected| {
-            dashboard
-                .run
-                .steps
-                .iter()
-                .position(|step| step.id == selected.id)
-        })
-        .unwrap_or(0);
-    let start = scroll_start(selected_index, step_rows_available);
-    for step in dashboard
-        .run
-        .steps
-        .iter()
-        .skip(start)
-        .take(step_rows_available)
-    {
-        lines.push(auto_step_row(step, run.selected_step_run_id));
-    }
+    lines.extend(auto_checklist_lines(dashboard, step_rows_available));
     lines.push(Line::from(""));
     lines.push(heading_line(if dashboard.output_state.follow {
         "Output (follow)"
@@ -1598,24 +1580,230 @@ fn linked_plan_summary_lines(dashboard: &view::AutoDashboard) -> Vec<Line<'stati
     lines
 }
 
-fn auto_step_row(step: &AutoStepRun, selected_step_run_id: Option<i64>) -> Line<'static> {
-    let selected = step.id == selected_step_run_id;
-    let detail = step
-        .summary
-        .as_deref()
-        .or(step.reason.as_deref())
-        .or(step.error.as_deref())
-        .unwrap_or("");
+fn auto_checklist_lines(dashboard: &view::AutoDashboard, max_rows: usize) -> Vec<Line<'static>> {
+    let run = &dashboard.run.run;
+    let steps = &dashboard.run.steps;
+    let mut lines = Vec::new();
+    lines.push(checklist_line(
+        0,
+        auto_status_for_key(steps, AutoStepKey::Prepare),
+        "Prepare worktree".to_string(),
+    ));
+
+    if run.implementation_source == AutoImplementationSource::DraftPlan {
+        lines.push(checklist_line(
+            0,
+            auto_status_for_key(steps, AutoStepKey::CreatePlan),
+            "Create implementation plan".to_string(),
+        ));
+        lines.push(checklist_line(
+            0,
+            auto_status_for_key(steps, AutoStepKey::ReviewPlan),
+            "Review implementation plan".to_string(),
+        ));
+        lines.push(checklist_line(
+            0,
+            auto_status_for_key(steps, AutoStepKey::ApprovePlan),
+            "Approve implementation plan".to_string(),
+        ));
+    }
+
+    if run.implementation_source == AutoImplementationSource::Prompt {
+        let label = format!("Implement \"{}\"", truncate(&run.prompt_summary, 50));
+        lines.push(checklist_line(
+            0,
+            auto_status_for_key(steps, AutoStepKey::Implement),
+            label,
+        ));
+    } else {
+        let plan_name = dashboard
+            .linked_plan_dashboard
+            .as_ref()
+            .map(|plan| plan.run.run.plan_display.clone())
+            .or_else(|| {
+                run.plan_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+            })
+            .unwrap_or_else(|| run.prompt_summary.clone());
+        lines.push(checklist_line(
+            0,
+            plan_implementation_status(dashboard),
+            format!("Run plan {plan_name}"),
+        ));
+        if let Some(plan) = dashboard.linked_plan_dashboard.as_ref() {
+            for phase in &plan.run.steps {
+                lines.push(checklist_line(
+                    1,
+                    plan_step_as_auto_status(phase.status),
+                    format!("Run Phase {}", phase.step),
+                ));
+            }
+        }
+    }
+
+    lines.push(checklist_line(
+        0,
+        auto_status_for_key(steps, AutoStepKey::LocalVerify),
+        "Run local verification".to_string(),
+    ));
+    push_if_step_seen(
+        &mut lines,
+        steps,
+        AutoStepKey::FixLocalVerify,
+        "Fix local verification failure",
+    );
+    lines.push(checklist_line(
+        0,
+        auto_status_for_key(steps, AutoStepKey::CommitImpl),
+        "Commit implementation".to_string(),
+    ));
+    lines.push(checklist_line(
+        0,
+        auto_status_for_key(steps, AutoStepKey::PushPr),
+        "Create or update PR".to_string(),
+    ));
+    lines.push(checklist_line(
+        0,
+        auto_status_for_key(steps, AutoStepKey::WaitReview),
+        "Wait for automated review".to_string(),
+    ));
+    push_if_step_seen(
+        &mut lines,
+        steps,
+        AutoStepKey::FixReview,
+        "Fix review feedback",
+    );
+    push_if_step_seen(
+        &mut lines,
+        steps,
+        AutoStepKey::VerifyReviewFix,
+        "Verify review fixes",
+    );
+    push_if_step_seen(
+        &mut lines,
+        steps,
+        AutoStepKey::CommitReviewFix,
+        "Commit and push review fixes",
+    );
+    lines.push(checklist_line(
+        0,
+        auto_status_for_key(steps, AutoStepKey::WaitCi),
+        "Wait for PR checks".to_string(),
+    ));
+    push_if_step_seen(&mut lines, steps, AutoStepKey::FixCi, "Fix CI failure");
+    push_if_step_seen(
+        &mut lines,
+        steps,
+        AutoStepKey::VerifyCiFix,
+        "Verify CI fixes",
+    );
+    push_if_step_seen(
+        &mut lines,
+        steps,
+        AutoStepKey::CommitCiFix,
+        "Commit and push CI fixes",
+    );
+    lines.push(checklist_line(
+        0,
+        auto_status_for_key(steps, AutoStepKey::Merge),
+        "Run final merge safety gate".to_string(),
+    ));
+    lines.push(checklist_line(
+        0,
+        auto_status_for_key(steps, AutoStepKey::Cleanup),
+        "Clean up merged worktree/session".to_string(),
+    ));
+
+    if lines.len() > max_rows {
+        lines.truncate(max_rows.saturating_sub(1));
+        lines.push(Line::from(Span::styled("  ...", muted_style())));
+    }
+    lines
+}
+
+fn push_if_step_seen(
+    lines: &mut Vec<Line<'static>>,
+    steps: &[AutoStepRun],
+    key: AutoStepKey,
+    label: &str,
+) {
+    if steps.iter().any(|step| step.step_key == key) {
+        lines.push(checklist_line(
+            0,
+            auto_status_for_key(steps, key),
+            label.to_string(),
+        ));
+    }
+}
+
+fn checklist_line(indent: usize, status: AutoStepStatus, label: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled(if selected { "▶ " } else { "  " }, title_style(selected)),
-        Span::styled(format!("#{} ", step.sequence), muted_style()),
-        Span::styled(
-            format!("{:<10}", auto_step_status_label(step.status)),
-            auto_step_status_style(step.status),
-        ),
-        Span::styled(format!(" {:<20}", step.step_key.as_str()), Style::default()),
-        Span::raw(detail.to_string()),
+        Span::raw("  ".repeat(indent)),
+        Span::styled(checklist_mark(status), auto_step_status_style(status)),
+        Span::raw(" "),
+        Span::styled(label, auto_step_status_style(status)),
     ])
+}
+
+fn checklist_mark(status: AutoStepStatus) -> &'static str {
+    match status {
+        AutoStepStatus::Done | AutoStepStatus::Skipped => "[x]",
+        AutoStepStatus::Failed | AutoStepStatus::Aborted => "[!]",
+        AutoStepStatus::Starting | AutoStepStatus::Running | AutoStepStatus::Waiting => "[-]",
+        AutoStepStatus::Queued => "[ ]",
+    }
+}
+
+fn auto_status_for_key(steps: &[AutoStepRun], key: AutoStepKey) -> AutoStepStatus {
+    steps
+        .iter()
+        .rev()
+        .find(|step| step.step_key == key)
+        .map(|step| step.status)
+        .unwrap_or(AutoStepStatus::Queued)
+}
+
+fn plan_implementation_status(dashboard: &view::AutoDashboard) -> AutoStepStatus {
+    if let Some(plan) = dashboard.linked_plan_dashboard.as_ref() {
+        if plan
+            .run
+            .steps
+            .iter()
+            .all(|step| step.status == PlanStepStatus::Done)
+        {
+            return AutoStepStatus::Done;
+        }
+        if plan
+            .run
+            .steps
+            .iter()
+            .any(|step| step.status == PlanStepStatus::Failed)
+        {
+            return AutoStepStatus::Failed;
+        }
+        if plan.run.steps.iter().any(|step| {
+            matches!(
+                step.status,
+                PlanStepStatus::Starting | PlanStepStatus::Running
+            )
+        }) {
+            return AutoStepStatus::Running;
+        }
+    }
+    auto_status_for_key(&dashboard.run.steps, AutoStepKey::RunPlan)
+}
+
+fn plan_step_as_auto_status(status: PlanStepStatus) -> AutoStepStatus {
+    match status {
+        PlanStepStatus::Queued => AutoStepStatus::Queued,
+        PlanStepStatus::Starting => AutoStepStatus::Starting,
+        PlanStepStatus::Running => AutoStepStatus::Running,
+        PlanStepStatus::Done => AutoStepStatus::Done,
+        PlanStepStatus::Failed => AutoStepStatus::Failed,
+        PlanStepStatus::Aborted => AutoStepStatus::Aborted,
+        PlanStepStatus::Skipped => AutoStepStatus::Skipped,
+    }
 }
 
 fn auto_output_row(line: &crate::auto_flow::AutoOutputLine, selected: bool) -> Line<'static> {
@@ -2789,7 +2977,9 @@ mod tests {
 
         assert!(buffer.contains("Auto Flow"));
         assert!(buffer.contains("task"));
-        assert!(buffer.contains("implement"));
+        assert!(buffer.contains("Checklist"));
+        assert!(buffer.contains("Implement \"implement feature\""));
+        assert!(buffer.contains("Run local verification"));
         assert!(buffer.contains("Output (follow)"));
         assert!(buffer.contains("auto output"));
     }

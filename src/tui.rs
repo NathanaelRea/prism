@@ -552,6 +552,13 @@ impl Tui {
                         self.show_error("terminal failed", &error)?;
                     }
                 }
+                Key::PlanActions => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if let Err(error) = self.show_plan_actions_dialog(&mut runtime) {
+                        self.show_error("plan actions failed", &error)?;
+                    }
+                }
                 Key::Help => {
                     self.clear_leader_hint();
                     pending_g = false;
@@ -814,6 +821,7 @@ impl Tui {
             "Space Space  status: open current plan phase tmux window 1 if available; repos: focus worktrees; worktrees: open agent if valid",
             "Enter        status: focus repos; repos: focus worktrees; worktrees: open agent if valid",
             "Space Enter  open tmux window 3: terminal",
+            "Space P      status auto plan mode: show plan actions",
             "Space g g    open tmux window 2: lazygit",
             "Ctrl-/       open tmux window 3: terminal",
             "Space g o    open selected PR in browser",
@@ -2223,7 +2231,7 @@ impl Tui {
     fn leader_hint_label(&self) -> Option<&'static str> {
         match (self.leader_hint, self.focused_panel) {
             (Some(LeaderHint::Root), PanelFocus::Status) => {
-                Some("g: git  space/enter: focus repos")
+                Some("g: git  P: plan actions  space/enter: focus repos")
             }
             (Some(LeaderHint::Root), PanelFocus::Repos) => {
                 Some("g: git  space/enter: focus worktrees")

@@ -1625,6 +1625,57 @@ impl Tui {
         Ok(true)
     }
 
+    pub(crate) fn show_plan_actions_dialog(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let Some(dashboard) = self.current_auto_dashboard() else {
+            self.show_message("focus an Auto Flow run to show plan actions")?;
+            return Ok(());
+        };
+        if self.focused_panel != PanelFocus::Status {
+            self.show_message("focus an Auto Flow run to show plan actions")?;
+            return Ok(());
+        }
+        if dashboard.run.run.implementation_source == AutoImplementationSource::Prompt {
+            self.show_message("selected Auto Flow run is not using plan mode")?;
+            return Ok(());
+        }
+
+        let answer = self.prompt_line_dialog(
+            raw,
+            "Auto Plan Actions",
+            "[u] pause/resume, [f] retry failed, [b] retry from selected, [x] abort, Enter cancel: ",
+            "",
+        )?;
+        let Some(answer) = answer else {
+            return Ok(());
+        };
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(()),
+            "u" | "pause" | "resume" => {
+                let _ = self.toggle_selected_auto_pause(raw)?;
+                Ok(())
+            }
+            "f" | "retry" | "retry failed" => {
+                let _ = self.retry_failed_auto_step()?;
+                Ok(())
+            }
+            "b" | "from" | "retry from" => {
+                let _ = self.retry_auto_from_selected_step(raw)?;
+                Ok(())
+            }
+            "x" | "abort" => {
+                let _ = self.abort_selected_auto_run_or_step(raw)?;
+                Ok(())
+            }
+            _ => {
+                self.show_message("unknown Auto Plan action")?;
+                Ok(())
+            }
+        }
+    }
+
     pub(crate) fn retry_failed_auto_step(&mut self) -> Result<bool, String> {
         let Some(dashboard) = self.current_auto_dashboard() else {
             return Ok(false);

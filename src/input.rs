@@ -83,6 +83,10 @@ impl KeyInput {
                 self.state = KeyInputState::Normal;
                 Key::OpenTmuxSession
             }
+            KeyCode::Char('P') if plain_char(event) => {
+                self.state = KeyInputState::Normal;
+                Key::PlanActions
+            }
             KeyCode::Enter => {
                 self.state = KeyInputState::Normal;
                 Key::Terminal
@@ -152,6 +156,7 @@ pub enum Key {
     Leader,
     LeaderGit,
     OpenTmuxSession,
+    PlanActions,
     LazyGit,
     AutoFlow,
     OpenPr,
@@ -275,6 +280,16 @@ mod tests {
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('A'))),
             Key::AutoFlow
+        );
+    }
+
+    #[test]
+    fn key_input_handles_leader_plan_actions() {
+        let mut input = KeyInput::default();
+        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('P'))),
+            Key::PlanActions
         );
     }
 
