@@ -1552,9 +1552,6 @@ impl Tui {
         let Some(dashboard) = self.current_auto_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let answer = self.prompt_line_dialog(
             raw,
             "Abort Auto Flow",
@@ -1625,13 +1622,128 @@ impl Tui {
         Ok(true)
     }
 
+    pub(crate) fn show_plan_actions_dialog(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let Some(dashboard) = self.current_auto_dashboard() else {
+            return self.show_standalone_plan_actions_dialog(raw);
+        };
+        if dashboard.run.run.implementation_source == AutoImplementationSource::Prompt {
+            self.show_message("selected Auto Flow run is not using plan mode")?;
+            return Ok(());
+        }
+
+        self.show_auto_plan_actions_dialog(raw)
+    }
+
+    fn show_standalone_plan_actions_dialog(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        if self.current_plan_dashboard().is_none() {
+            self.show_message("focus an Auto Flow or plan run to show plan actions")?;
+            return Ok(());
+        }
+
+        let answer = self
+            .prompt_choice_dialog(raw, Self::plan_action_choices("Plan Actions", "skip phase"))?;
+        let Some(answer) = answer else {
+            return Ok(());
+        };
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(()),
+            "u" | "pause" | "resume" => {
+                let _ = self.toggle_selected_plan_pause()?;
+                Ok(())
+            }
+            "f" | "retry" | "retry failed" => {
+                let _ = self.retry_failed_plan_steps()?;
+                Ok(())
+            }
+            "b" | "from" | "retry from" => {
+                let _ = self.retry_plan_from_selected_step(raw)?;
+                Ok(())
+            }
+            "s" | "skip" => {
+                let _ = self.skip_selected_plan_step()?;
+                Ok(())
+            }
+            "x" | "abort" => {
+                let _ = self.abort_selected_plan_run_or_step(raw)?;
+                Ok(())
+            }
+            _ => {
+                self.show_message("unknown Plan action")?;
+                Ok(())
+            }
+        }
+    }
+
+    fn show_auto_plan_actions_dialog(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let answer = self.prompt_choice_dialog(
+            raw,
+            Self::plan_action_choices("Auto Plan Actions", "skip linked phase"),
+        )?;
+        let Some(answer) = answer else {
+            return Ok(());
+        };
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(()),
+            "u" | "pause" | "resume" => {
+                let _ = self.toggle_selected_auto_pause(raw)?;
+                Ok(())
+            }
+            "f" | "retry" | "retry failed" => {
+                let _ = self.retry_failed_auto_step()?;
+                Ok(())
+            }
+            "b" | "from" | "retry from" => {
+                let _ = self.retry_auto_from_selected_step(raw)?;
+                Ok(())
+            }
+            "s" | "skip" => {
+                let _ = self.skip_selected_auto_plan_step()?;
+                Ok(())
+            }
+            "x" | "abort" => {
+                let _ = self.abort_selected_auto_run_or_step(raw)?;
+                Ok(())
+            }
+            _ => {
+                self.show_message("unknown Auto Plan action")?;
+                Ok(())
+            }
+        }
+    }
+
+    fn plan_action_choices(title: &str, skip_label: &str) -> crate::view::ChoiceList {
+        let choices = [
+            ("u", "pause/resume"),
+            ("f", "retry failed"),
+            ("b", "retry from selected"),
+            ("s", skip_label),
+            ("x", "abort"),
+        ];
+        crate::view::ChoiceList {
+            title: title.to_string(),
+            choices: choices
+                .into_iter()
+                .map(|(key, label)| crate::view::KeyChoice {
+                    key: key.to_string(),
+                    label: label.to_string(),
+                })
+                .collect(),
+        }
+    }
+
     pub(crate) fn retry_failed_auto_step(&mut self) -> Result<bool, String> {
         let Some(dashboard) = self.current_auto_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
@@ -1656,9 +1768,6 @@ impl Tui {
         let Some(dashboard) = self.current_auto_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let selected = dashboard
             .run
             .run
@@ -1700,9 +1809,6 @@ impl Tui {
         let Some(dashboard) = self.current_auto_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
@@ -1791,9 +1897,6 @@ impl Tui {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
@@ -1848,9 +1951,6 @@ impl Tui {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
@@ -1875,9 +1975,6 @@ impl Tui {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let selected_step = dashboard.run.run.selected_step;
         let answer = self.prompt_line_dialog(
             raw,
@@ -1909,9 +2006,6 @@ impl Tui {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
@@ -1927,13 +2021,46 @@ impl Tui {
         Ok(true)
     }
 
+    pub(crate) fn skip_selected_auto_plan_step(&mut self) -> Result<bool, String> {
+        let Some(dashboard) = self.current_auto_dashboard() else {
+            return Ok(false);
+        };
+        let Some(plan_dashboard) = dashboard.linked_plan_dashboard else {
+            return Ok(false);
+        };
+        let repo = Repository {
+            root: PathBuf::from(&dashboard.run.run.repo_root),
+        };
+        let config = Config::load(&repo);
+        let auto_run_id = dashboard.run.run.id.clone();
+        let plan_run_id = plan_dashboard.run.run.id.clone();
+        let selected_step = plan_dashboard.run.run.selected_step;
+        let mut should_execute = false;
+        let (auto_run, plan_run) = crate::observability::with_writable_db(&repo, |conn| {
+            let mut plan_run = load_plan_run(conn, &plan_run_id)?
+                .ok_or_else(|| format!("plan run not found: {plan_run_id}"))?;
+            skip_plan_step(conn, &mut plan_run, selected_step)?;
+            let mut auto_run = load_auto_run(conn, &auto_run_id)?
+                .ok_or_else(|| format!("auto flow run not found: {auto_run_id}"))?;
+            should_execute =
+                prepare_auto_run_for_resume(conn, &mut auto_run, DEFAULT_OUTPUT_LINES_PER_STEP)?;
+            Ok((auto_run, plan_run))
+        })?;
+        self.remember_plan_run(plan_run);
+        self.remember_auto_run(auto_run.clone());
+        if should_execute {
+            self.spawn_auto_run_executor(repo, config, auto_run);
+            self.show_message("skipped linked plan phase; continuing Auto Flow")?;
+        } else {
+            self.show_message("skipped linked plan phase")?;
+        }
+        Ok(true)
+    }
+
     pub(crate) fn toggle_selected_plan_pause(&mut self) -> Result<bool, String> {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };

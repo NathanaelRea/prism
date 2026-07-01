@@ -935,15 +935,33 @@ pub fn retry_failed_auto_step(
         && let Some(plan_run_id) = persisted.steps[failed_index].plan_run_id.clone()
         && let Some(mut plan_run) = load_plan_run(conn, &plan_run_id)?
     {
-        retry_plan_failed_steps(conn, &mut plan_run)?;
-        reset_auto_step_for_retry(&mut persisted.steps[failed_index]);
-        append_step_status_output(
-            conn,
-            &persisted.steps[failed_index],
-            "retrying linked plan run failed phases",
-            DEFAULT_OUTPUT_LINES_PER_STEP,
-        )?;
-        save_step_with_conn(conn, &mut persisted.steps[failed_index])?;
+        let _ = prepare_plan_run_for_resume(conn, &mut plan_run, DEFAULT_OUTPUT_LINES_PER_STEP)?;
+        if plan_run.run.status == PlanRunStatus::Done {
+            let summary = format!("plan run {} completed", plan_run.run.id);
+            finish_non_agent_step(
+                conn,
+                &mut persisted.steps[failed_index],
+                AutoStepStatus::Done,
+                Some(summary.clone()),
+                None,
+            )?;
+            append_step_status_output(
+                conn,
+                &persisted.steps[failed_index],
+                &summary,
+                DEFAULT_OUTPUT_LINES_PER_STEP,
+            )?;
+        } else {
+            retry_plan_failed_steps(conn, &mut plan_run)?;
+            reset_auto_step_for_retry(&mut persisted.steps[failed_index]);
+            append_step_status_output(
+                conn,
+                &persisted.steps[failed_index],
+                "retrying linked plan run failed phases",
+                DEFAULT_OUTPUT_LINES_PER_STEP,
+            )?;
+            save_step_with_conn(conn, &mut persisted.steps[failed_index])?;
+        }
         persisted.run.pause_requested = false;
         persisted.run.status = persisted.aggregate_status();
         persisted.run.updated_unix_ms = unix_ms();
@@ -5229,6 +5247,29 @@ exit 7
             loaded_plan.steps[0].status,
             crate::plan_run::PlanStepStatus::Queued
         );
+    }
+
+    #[test]
+    fn retry_failed_run_plan_continues_when_linked_plan_finished() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&conn).unwrap();
+        crate::plan_run::migrate_schema(&conn).unwrap();
+        let repo = PathBuf::from("/repo/prism");
+        let mut persisted = linked_run_plan_auto_run(&conn, &repo);
+        let plan_run_id = persisted.steps[0].plan_run_id.clone().unwrap();
+        persisted.steps[0].status = AutoStepStatus::Failed;
+        save_auto_run(&conn, &mut persisted).unwrap();
+        let mut plan_run = load_plan_run(&conn, &plan_run_id).unwrap().unwrap();
+        plan_run.run.status = PlanRunStatus::Done;
+        plan_run.steps[0].status = crate::plan_run::PlanStepStatus::Done;
+        crate::plan_run::save_plan_run(&conn, &plan_run).unwrap();
+
+        retry_failed_auto_step(&conn, &mut persisted).unwrap();
+
+        assert_eq!(persisted.steps[0].status, AutoStepStatus::Done);
+        assert_eq!(persisted.run.status, AutoRunStatus::Done);
+        assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
+        assert_eq!(persisted.steps[1].step_key, AutoStepKey::LocalVerify);
     }
 
     #[test]

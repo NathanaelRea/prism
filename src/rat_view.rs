@@ -19,7 +19,7 @@ use crate::{
     },
     session::Session,
     tui::PanelFocus,
-    util::status_count,
+    util::{status_count, truncate},
     view,
 };
 
@@ -40,7 +40,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &view::FrameModel<'_>) {
     render_sidebar(frame, body[0], model);
     render_main(frame, body[1], model);
     render_footer(frame, vertical[1], model);
-    if let Some(hint) = model.leader_hint {
+    if let Some(hint) = &model.leader_hint {
         render_leader_hint(frame, area, hint);
     }
     if let Some(dialog) = &model.dialog {
@@ -87,7 +87,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>
             })
             .collect()
     };
-    let focused = model.focus == PanelFocus::Status;
+    let focused = model.focus == PanelFocus::Status && !model.main_focused;
     let title = panel_title("1", "Status", focused);
     frame.render_widget(List::new(rows).block(panel_block(title, focused)), area);
 }
@@ -114,14 +114,14 @@ fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>)
                     Span::styled(format!("  {}", repo.health), health_style(&repo.health)),
                 ]);
                 ListItem::new(line).style(if repo.selected {
-                    selected_style(model.focus == PanelFocus::Repos)
+                    selected_style(model.focus == PanelFocus::Repos && !model.main_focused)
                 } else {
                     Style::default()
                 })
             })
             .collect()
     };
-    let focused = model.focus == PanelFocus::Repos;
+    let focused = model.focus == PanelFocus::Repos && !model.main_focused;
     let mut title = panel_title("2", "Repos", focused);
     if !model.repo_filter.is_empty() {
         title.push_span(Span::styled(
@@ -188,14 +188,14 @@ fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<
                 }
             }
             ListItem::new(Line::from(spans)).style(if worktree.selected {
-                selected_style(model.focus == PanelFocus::Worktrees)
+                selected_style(model.focus == PanelFocus::Worktrees && !model.main_focused)
             } else {
                 Style::default()
             })
         }));
         rows
     };
-    let focused = model.focus == PanelFocus::Worktrees;
+    let focused = model.focus == PanelFocus::Worktrees && !model.main_focused;
     let mut title = panel_title("3", "Worktrees", focused);
     if !model.worktree_filter.is_empty() {
         title.push_span(Span::styled(
@@ -207,10 +207,13 @@ fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<
 }
 
 fn render_main(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>) {
-    let content_area = panel_block(Line::from(Span::styled("Main", title_style(true))), false)
-        .inner(area)
-        .height
-        .saturating_sub(0) as usize;
+    let content_area = panel_block(
+        Line::from(Span::styled("0 Main", title_style(model.main_focused))),
+        model.main_focused,
+    )
+    .inner(area)
+    .height
+    .saturating_sub(0) as usize;
     let width = area.width.saturating_sub(2) as usize;
     let lines = if let Some(dashboard) = &model.auto_dashboard {
         auto_dashboard_lines(dashboard, width, content_area)
@@ -226,8 +229,8 @@ fn render_main(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>) 
     frame.render_widget(
         Paragraph::new(lines)
             .block(panel_block(
-                Line::from(Span::styled("Main", title_style(true))),
-                false,
+                Line::from(Span::styled("0 Main", title_style(model.main_focused))),
+                model.main_focused,
             ))
             .wrap(Wrap { trim: false }),
         area,
@@ -591,32 +594,14 @@ fn auto_dashboard_lines(
         Span::raw(counts.failed.to_string()),
     ]));
     lines.push(Line::from(""));
-    lines.push(heading_line("Steps"));
+    lines.push(heading_line("Checklist"));
     let linked_plan_rows_reserved = linked_plan_summary_lines(dashboard).len();
     let output_rows_reserved = dashboard.output_lines.len().min(8) + linked_plan_rows_reserved + 2;
     let step_rows_available = visible_rows
         .saturating_sub(lines.len())
         .saturating_sub(output_rows_reserved)
         .max(3);
-    let selected_index = selected_step
-        .and_then(|selected| {
-            dashboard
-                .run
-                .steps
-                .iter()
-                .position(|step| step.id == selected.id)
-        })
-        .unwrap_or(0);
-    let start = scroll_start(selected_index, step_rows_available);
-    for step in dashboard
-        .run
-        .steps
-        .iter()
-        .skip(start)
-        .take(step_rows_available)
-    {
-        lines.push(auto_step_row(step, run.selected_step_run_id));
-    }
+    lines.extend(auto_checklist_lines(dashboard, step_rows_available));
     lines.push(Line::from(""));
     lines.push(heading_line(if dashboard.output_state.follow {
         "Output (follow)"
@@ -656,9 +641,13 @@ fn auto_dashboard_lines(
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>) {
     let actions = match model.focus {
-        PanelFocus::Status => "1/2/3 focus  Tab next  P plan  A auto  ? help  q quit",
-        PanelFocus::Repos => "j/k select  Enter open  r refresh  R manage  / search  q quit",
-        PanelFocus::Worktrees => "j/k select  Enter tmux  Space g git  c create  D delete  q quit",
+        PanelFocus::Status => "1/2/3 sidebars  0 main  Tab next  P plan  A auto  ? help  q quit",
+        PanelFocus::Repos => {
+            "j/k select  0 main  Enter open  r refresh  R manage  / search  q quit"
+        }
+        PanelFocus::Worktrees => {
+            "j/k select  0 main  Enter tmux  Space g git  c create  D delete  q quit"
+        }
     };
     let mut spans = vec![
         Span::styled(
@@ -673,10 +662,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_leader_hint(frame: &mut Frame<'_>, area: Rect, hint: &str) {
-    let lines = leader_hint_lines(hint);
+fn render_leader_hint(frame: &mut Frame<'_>, area: Rect, hint: &view::LeaderHintModel) {
+    let lines = choice_lines(hint);
     let content_width = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
-    let width = content_width.saturating_add(4).min(area.width.max(1));
+    let width = content_width
+        .max(hint.title.chars().count() as u16)
+        .saturating_add(4)
+        .min(area.width.max(1));
     let height = (lines.len() as u16)
         .saturating_add(2)
         .min(area.height.max(1));
@@ -687,28 +679,16 @@ fn render_leader_hint(frame: &mut Frame<'_>, area: Rect, hint: &str) {
         height,
     };
     frame.render_widget(Clear, popup);
+    let block = panel_block(
+        Line::from(Span::styled(hint.title.clone(), title_style(true))),
+        false,
+    );
     frame.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Left).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .style(Style::default().bg(Color::Black)),
-        ),
+        Paragraph::new(lines)
+            .alignment(Alignment::Left)
+            .block(block),
         popup,
     );
-}
-
-fn leader_hint_lines(hint: &str) -> Vec<Line<'static>> {
-    let parts = if hint.contains('\n') {
-        hint.lines().collect::<Vec<_>>()
-    } else {
-        hint.split("  ").collect::<Vec<_>>()
-    };
-    parts
-        .into_iter()
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(|part| Line::from(Span::styled(part.to_string(), title_style(true))))
-        .collect()
 }
 
 fn render_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &view::DialogModel) {
@@ -749,16 +729,22 @@ fn set_prompt_cursor(frame: &mut Frame<'_>, area: Rect, prompt: &str, input: &st
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let prompt_prefix_lines = prompt.split('\n').collect::<Vec<_>>();
+    let prompt_prefix = prompt_prefix_lines.last().copied().unwrap_or(prompt);
     let prompt_line = Line::from(vec![
-        Span::raw(prompt.to_string()),
+        Span::raw(prompt_prefix.to_string()),
         Span::raw(input.to_string()),
     ]);
     let width = prompt_line.width() as u16;
     let line_offset = width / area.width;
     let x_offset = width % area.width;
+    let prompt_y = prompt_prefix_lines.len().saturating_sub(1) as u16;
     frame.set_cursor_position((
         area.x + x_offset.min(area.width.saturating_sub(1)),
-        area.y + line_offset.min(area.height.saturating_sub(1)),
+        area.y
+            + prompt_y
+                .saturating_add(line_offset)
+                .min(area.height.saturating_sub(1)),
     ));
 }
 
@@ -767,6 +753,10 @@ fn dialog_title(dialog: &view::DialogModel) -> String {
         view::DialogModel::Help { .. } => "Keybindings".to_string(),
         view::DialogModel::Confirm { title, .. }
         | view::DialogModel::Prompt { title, .. }
+        | view::DialogModel::Choice {
+            choices: view::ChoiceList { title, .. },
+            ..
+        }
         | view::DialogModel::Progress { title, .. } => title.clone(),
     }
 }
@@ -838,17 +828,16 @@ fn dialog_lines(dialog: &view::DialogModel) -> Vec<Line<'static>> {
             ]));
             rendered
         }
-        view::DialogModel::Prompt { prompt, input, .. } => vec![
-            Line::from(vec![
-                Span::styled(prompt.clone(), muted_style()),
-                Span::raw(input.clone()),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
+        view::DialogModel::Prompt { prompt, input, .. } => {
+            let mut lines = prompt_dialog_lines(prompt, input);
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
                 "Enter to continue, Esc to cancel",
                 muted_style(),
-            )),
-        ],
+            )));
+            lines
+        }
+        view::DialogModel::Choice { choices, .. } => choice_lines(choices),
         view::DialogModel::Progress { message, .. } => {
             let mut lines = vec![Line::from(Span::styled(
                 "[*] Please wait",
@@ -858,6 +847,55 @@ fn dialog_lines(dialog: &view::DialogModel) -> Vec<Line<'static>> {
             lines
         }
     }
+}
+
+fn choice_lines(choices: &view::ChoiceList) -> Vec<Line<'static>> {
+    choices
+        .choices
+        .iter()
+        .map(|choice| {
+            Line::from(vec![
+                Span::styled(format!("[{}]", choice.key), selected_style(true)),
+                Span::styled(format!(" {}", choice.label), muted_style()),
+            ])
+        })
+        .collect::<Vec<_>>()
+}
+
+fn prompt_dialog_lines(prompt: &str, input: &str) -> Vec<Line<'static>> {
+    let prompt_lines = prompt.split('\n').collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    for (index, line) in prompt_lines.iter().enumerate() {
+        let mut spans = styled_prompt_spans(line);
+        if index + 1 == prompt_lines.len() {
+            spans.push(Span::raw(input.to_string()));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn styled_prompt_spans(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('[') {
+        let (before, after_start) = rest.split_at(start);
+        if !before.is_empty() {
+            spans.push(Span::styled(before.to_string(), muted_style()));
+        }
+        if let Some(end) = after_start.find(']') {
+            let (option, after_option) = after_start.split_at(end + 1);
+            spans.push(Span::styled(option.to_string(), selected_style(true)));
+            rest = after_option;
+        } else {
+            rest = after_start;
+            break;
+        }
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), muted_style()));
+    }
+    spans
 }
 
 fn styled_text_lines(text: &str, style: Style) -> Vec<Line<'static>> {
@@ -1598,24 +1636,337 @@ fn linked_plan_summary_lines(dashboard: &view::AutoDashboard) -> Vec<Line<'stati
     lines
 }
 
-fn auto_step_row(step: &AutoStepRun, selected_step_run_id: Option<i64>) -> Line<'static> {
-    let selected = step.id == selected_step_run_id;
-    let detail = step
-        .summary
-        .as_deref()
-        .or(step.reason.as_deref())
-        .or(step.error.as_deref())
-        .unwrap_or("");
+fn auto_checklist_lines(dashboard: &view::AutoDashboard, max_rows: usize) -> Vec<Line<'static>> {
+    let run = &dashboard.run.run;
+    let steps = &dashboard.run.steps;
+    let mut lines = Vec::new();
+    lines.push(checklist_line(
+        0,
+        auto_status_for_key(steps, AutoStepKey::Prepare),
+        "Prepare worktree".to_string(),
+    ));
+
+    if run.implementation_source == AutoImplementationSource::DraftPlan {
+        lines.push(checklist_line(
+            0,
+            auto_status_for_key(steps, AutoStepKey::CreatePlan),
+            "Create implementation plan".to_string(),
+        ));
+        lines.push(checklist_line(
+            0,
+            auto_status_for_key(steps, AutoStepKey::ReviewPlan),
+            "Review implementation plan".to_string(),
+        ));
+        lines.push(checklist_line(
+            0,
+            auto_status_for_key(steps, AutoStepKey::ApprovePlan),
+            "Approve implementation plan".to_string(),
+        ));
+    }
+
+    if run.implementation_source == AutoImplementationSource::Prompt {
+        let label = format!("Implement \"{}\"", truncate(&run.prompt_summary, 50));
+        lines.push(checklist_line(
+            0,
+            auto_status_for_key(steps, AutoStepKey::Implement),
+            label,
+        ));
+    } else {
+        let plan_name = dashboard
+            .linked_plan_dashboard
+            .as_ref()
+            .map(|plan| plan.run.run.plan_display.clone())
+            .or_else(|| {
+                run.plan_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+            })
+            .unwrap_or_else(|| run.prompt_summary.clone());
+        lines.push(checklist_line(
+            0,
+            plan_implementation_status(dashboard),
+            format!("Run plan {plan_name}"),
+        ));
+        if let Some(plan) = dashboard.linked_plan_dashboard.as_ref() {
+            for phase in &plan.run.steps {
+                lines.push(checklist_line(
+                    1,
+                    plan_step_as_auto_status(phase.status),
+                    format!("Run Phase {}", phase.step),
+                ));
+            }
+        }
+    }
+
+    push_local_validation_loop(&mut lines, steps);
+    lines.push(checklist_line(
+        0,
+        auto_status_for_key(steps, AutoStepKey::CommitImpl),
+        "Commit implementation".to_string(),
+    ));
+    lines.push(checklist_line(
+        0,
+        auto_status_for_key(steps, AutoStepKey::PushPr),
+        "Create or update PR".to_string(),
+    ));
+    push_review_loop(&mut lines, steps);
+    push_ci_loop(&mut lines, steps);
+    lines.push(checklist_line(
+        0,
+        auto_status_for_key(steps, AutoStepKey::Merge),
+        "Run final merge safety gate".to_string(),
+    ));
+    lines.push(checklist_line(
+        0,
+        auto_status_for_key(steps, AutoStepKey::Cleanup),
+        "Clean up merged worktree/session".to_string(),
+    ));
+
+    if lines.len() > max_rows {
+        lines.truncate(max_rows.saturating_sub(1));
+        lines.push(Line::from(Span::styled("  ...", muted_style())));
+    }
+    lines
+}
+
+fn push_local_validation_loop(lines: &mut Vec<Line<'static>>, steps: &[AutoStepRun]) {
+    let group_status = first_active_or_latest_status(
+        steps,
+        &[AutoStepKey::FixLocalVerify, AutoStepKey::LocalVerify],
+    );
+    lines.push(checklist_line(
+        0,
+        group_status,
+        "Local validation loop".to_string(),
+    ));
+    lines.push(checklist_line(
+        1,
+        auto_status_for_key(steps, AutoStepKey::LocalVerify),
+        "Run local validation".to_string(),
+    ));
+    if step_seen(steps, &AutoStepKey::FixLocalVerify) {
+        lines.push(checklist_line(
+            1,
+            auto_status_for_key(steps, AutoStepKey::FixLocalVerify),
+            format!(
+                "Fix local validation failure ({})",
+                attempt_label(steps, &AutoStepKey::FixLocalVerify, 3)
+            ),
+        ));
+        lines.push(checklist_line(
+            1,
+            auto_status_for_key(steps, AutoStepKey::LocalVerify),
+            "Re-run local validation".to_string(),
+        ));
+    }
+}
+
+fn push_review_loop(lines: &mut Vec<Line<'static>>, steps: &[AutoStepRun]) {
+    let group_status = if step_seen(steps, &AutoStepKey::WaitCi) {
+        AutoStepStatus::Done
+    } else {
+        first_active_or_latest_status(
+            steps,
+            &[
+                AutoStepKey::FixReview,
+                AutoStepKey::VerifyReviewFix,
+                AutoStepKey::CommitReviewFix,
+                AutoStepKey::WaitReview,
+            ],
+        )
+    };
+    lines.push(checklist_line(
+        0,
+        group_status,
+        "Review feedback loop".to_string(),
+    ));
+    lines.push(checklist_line(
+        1,
+        auto_status_for_key(steps, AutoStepKey::WaitReview),
+        "Wait for automated review".to_string(),
+    ));
+    if step_seen(steps, &AutoStepKey::FixReview) {
+        lines.push(checklist_line(
+            1,
+            auto_status_for_key(steps, AutoStepKey::FixReview),
+            format!(
+                "Fix review feedback ({})",
+                attempt_label(steps, &AutoStepKey::FixReview, 3)
+            ),
+        ));
+        lines.push(checklist_line(
+            1,
+            auto_status_for_key(steps, AutoStepKey::VerifyReviewFix),
+            "Verify review fixes".to_string(),
+        ));
+        lines.push(checklist_line(
+            1,
+            auto_status_for_key(steps, AutoStepKey::CommitReviewFix),
+            "Commit and push review fixes".to_string(),
+        ));
+        if step_count(steps, &AutoStepKey::WaitReview) > 1 {
+            lines.push(checklist_line(
+                1,
+                auto_status_for_key(steps, AutoStepKey::WaitReview),
+                "Wait for automated review again".to_string(),
+            ));
+        }
+    }
+}
+
+fn push_ci_loop(lines: &mut Vec<Line<'static>>, steps: &[AutoStepRun]) {
+    let group_status = if step_seen(steps, &AutoStepKey::Merge) {
+        AutoStepStatus::Done
+    } else {
+        first_active_or_latest_status(
+            steps,
+            &[
+                AutoStepKey::FixCi,
+                AutoStepKey::VerifyCiFix,
+                AutoStepKey::CommitCiFix,
+                AutoStepKey::WaitCi,
+            ],
+        )
+    };
+    lines.push(checklist_line(0, group_status, "CI loop".to_string()));
+    lines.push(checklist_line(
+        1,
+        auto_status_for_key(steps, AutoStepKey::WaitCi),
+        "Wait for PR checks".to_string(),
+    ));
+    if step_seen(steps, &AutoStepKey::FixCi) {
+        lines.push(checklist_line(
+            1,
+            auto_status_for_key(steps, AutoStepKey::FixCi),
+            format!(
+                "Fix CI failure ({})",
+                attempt_label(steps, &AutoStepKey::FixCi, 3)
+            ),
+        ));
+        lines.push(checklist_line(
+            1,
+            auto_status_for_key(steps, AutoStepKey::VerifyCiFix),
+            "Verify CI fixes".to_string(),
+        ));
+        lines.push(checklist_line(
+            1,
+            auto_status_for_key(steps, AutoStepKey::CommitCiFix),
+            "Commit and push CI fixes".to_string(),
+        ));
+        if step_count(steps, &AutoStepKey::WaitCi) > 1 {
+            lines.push(checklist_line(
+                1,
+                auto_status_for_key(steps, AutoStepKey::WaitCi),
+                "Wait for PR checks again".to_string(),
+            ));
+        }
+    }
+}
+
+fn checklist_line(indent: usize, status: AutoStepStatus, label: String) -> Line<'static> {
     Line::from(vec![
-        Span::styled(if selected { "▶ " } else { "  " }, title_style(selected)),
-        Span::styled(format!("#{} ", step.sequence), muted_style()),
-        Span::styled(
-            format!("{:<10}", auto_step_status_label(step.status)),
-            auto_step_status_style(step.status),
-        ),
-        Span::styled(format!(" {:<20}", step.step_key.as_str()), Style::default()),
-        Span::raw(detail.to_string()),
+        Span::raw("  ".repeat(indent)),
+        Span::styled(checklist_mark(status), auto_step_status_style(status)),
+        Span::raw(" "),
+        Span::styled(label, auto_step_status_style(status)),
     ])
+}
+
+fn checklist_mark(status: AutoStepStatus) -> &'static str {
+    match status {
+        AutoStepStatus::Done | AutoStepStatus::Skipped => "[x]",
+        AutoStepStatus::Failed | AutoStepStatus::Aborted => "[!]",
+        AutoStepStatus::Starting | AutoStepStatus::Running | AutoStepStatus::Waiting => "[-]",
+        AutoStepStatus::Queued => "[ ]",
+    }
+}
+
+fn auto_status_for_key(steps: &[AutoStepRun], key: AutoStepKey) -> AutoStepStatus {
+    latest_step_for_key(steps, &key)
+        .map(|step| step.status)
+        .unwrap_or(AutoStepStatus::Queued)
+}
+
+fn latest_step_for_key<'a>(steps: &'a [AutoStepRun], key: &AutoStepKey) -> Option<&'a AutoStepRun> {
+    steps.iter().rev().find(|step| &step.step_key == key)
+}
+
+fn step_seen(steps: &[AutoStepRun], key: &AutoStepKey) -> bool {
+    steps.iter().any(|step| &step.step_key == key)
+}
+
+fn step_count(steps: &[AutoStepRun], key: &AutoStepKey) -> usize {
+    steps.iter().filter(|step| &step.step_key == key).count()
+}
+
+fn attempt_label(steps: &[AutoStepRun], key: &AutoStepKey, max_attempts: usize) -> String {
+    let attempt = latest_step_for_key(steps, key)
+        .map(|step| step.attempt)
+        .unwrap_or(1);
+    format!("attempt {}/{max_attempts}", attempt.min(max_attempts))
+}
+
+fn first_active_or_latest_status(steps: &[AutoStepRun], keys: &[AutoStepKey]) -> AutoStepStatus {
+    for key in keys {
+        let status = auto_status_for_key(steps, key.clone());
+        if matches!(
+            status,
+            AutoStepStatus::Starting
+                | AutoStepStatus::Running
+                | AutoStepStatus::Waiting
+                | AutoStepStatus::Failed
+                | AutoStepStatus::Aborted
+        ) {
+            return status;
+        }
+    }
+    keys.iter()
+        .rev()
+        .map(|key| auto_status_for_key(steps, key.clone()))
+        .find(|status| *status != AutoStepStatus::Queued)
+        .unwrap_or(AutoStepStatus::Queued)
+}
+
+fn plan_implementation_status(dashboard: &view::AutoDashboard) -> AutoStepStatus {
+    if let Some(plan) = dashboard.linked_plan_dashboard.as_ref() {
+        if plan
+            .run
+            .steps
+            .iter()
+            .all(|step| step.status == PlanStepStatus::Done)
+        {
+            return AutoStepStatus::Done;
+        }
+        if plan
+            .run
+            .steps
+            .iter()
+            .any(|step| step.status == PlanStepStatus::Failed)
+        {
+            return AutoStepStatus::Failed;
+        }
+        if plan.run.steps.iter().any(|step| {
+            matches!(
+                step.status,
+                PlanStepStatus::Starting | PlanStepStatus::Running
+            )
+        }) {
+            return AutoStepStatus::Running;
+        }
+    }
+    auto_status_for_key(&dashboard.run.steps, AutoStepKey::RunPlan)
+}
+
+fn plan_step_as_auto_status(status: PlanStepStatus) -> AutoStepStatus {
+    match status {
+        PlanStepStatus::Queued => AutoStepStatus::Queued,
+        PlanStepStatus::Starting => AutoStepStatus::Starting,
+        PlanStepStatus::Running => AutoStepStatus::Running,
+        PlanStepStatus::Done => AutoStepStatus::Done,
+        PlanStepStatus::Failed => AutoStepStatus::Failed,
+        PlanStepStatus::Aborted => AutoStepStatus::Aborted,
+        PlanStepStatus::Skipped => AutoStepStatus::Skipped,
+    }
 }
 
 fn auto_output_row(line: &crate::auto_flow::AutoOutputLine, selected: bool) -> Line<'static> {
@@ -2549,9 +2900,9 @@ mod tests {
         },
         session::Session,
         view::{
-            AutoDashboard, AutoOutputViewerState, DialogLine, DialogModel, FrameModel,
-            PlanDashboard, PlanOutputViewerState, RepoMainView, RepoRow, StatusRow, WorktreeKind,
-            WorktreeMainView, WorktreeRow,
+            AutoDashboard, AutoOutputViewerState, ChoiceList, DialogLine, DialogModel, FrameModel,
+            KeyChoice, PlanDashboard, PlanOutputViewerState, RepoMainView, RepoRow, StatusRow,
+            WorktreeKind, WorktreeMainView, WorktreeRow,
         },
     };
 
@@ -2683,16 +3034,33 @@ mod tests {
             &sessions,
             PanelFocus::Status,
             Some("saved config"),
-            Some("a: one  b: two  c: three"),
+            Some(ChoiceList {
+                title: "Shortcuts".to_string(),
+                choices: vec![
+                    KeyChoice {
+                        key: "a".to_string(),
+                        label: "one".to_string(),
+                    },
+                    KeyChoice {
+                        key: "b".to_string(),
+                        label: "two".to_string(),
+                    },
+                    KeyChoice {
+                        key: "c".to_string(),
+                        label: "three".to_string(),
+                    },
+                ],
+            }),
         );
         let buffer = render_to_buffer(&model, 100, 20);
 
         assert_line_contains(&buffer, 19, "saved config");
-        assert_region_contains(&buffer, 0..100, 0..20, "a: one");
-        assert_region_contains(&buffer, 0..100, 0..20, "b: two");
-        assert_region_contains(&buffer, 0..100, 0..20, "c: three");
-        assert_ne!(find_line(&buffer, "a: one"), find_line(&buffer, "b: two"));
-        assert_ne!(find_line(&buffer, "b: two"), find_line(&buffer, "c: three"));
+        assert_region_contains(&buffer, 0..100, 0..20, "Shortcuts");
+        assert_region_contains(&buffer, 0..100, 0..20, "[a] one");
+        assert_region_contains(&buffer, 0..100, 0..20, "[b] two");
+        assert_region_contains(&buffer, 0..100, 0..20, "[c] three");
+        assert_ne!(find_line(&buffer, "[a]"), find_line(&buffer, "[b]"));
+        assert_ne!(find_line(&buffer, "[b]"), find_line(&buffer, "[c]"));
     }
 
     #[test]
@@ -2710,6 +3078,33 @@ mod tests {
         assert!(buffer.contains("Search Repositories"));
         assert!(buffer.contains("Filter: api"));
         assert!(buffer.contains("Enter to continue"));
+
+        model.dialog = Some(DialogModel::Choice {
+            choices: ChoiceList {
+                title: "Plan Actions".to_string(),
+                choices: vec![
+                    KeyChoice {
+                        key: "u".to_string(),
+                        label: "pause/resume".to_string(),
+                    },
+                    KeyChoice {
+                        key: "f".to_string(),
+                        label: "retry failed".to_string(),
+                    },
+                ],
+            },
+        });
+        let buffer = render_to_buffer(&model, 80, 20);
+        let buffer_text = buffer_to_string(&buffer);
+
+        assert!(buffer_text.contains("Plan Actions"));
+        assert!(buffer_text.contains("[u] pause/resume"));
+        assert!(buffer_text.contains("[f] retry failed"));
+        assert_ne!(find_line(&buffer, "[u]"), find_line(&buffer, "[f]"));
+
+        let lines = dialog_lines(model.dialog.as_ref().unwrap());
+        assert_eq!(lines[0].spans[0].content.as_ref(), "[u]");
+        assert_eq!(lines[0].spans[0].style, selected_style(true));
 
         model.dialog = Some(DialogModel::Confirm {
             title: "Delete Session".to_string(),
@@ -2789,7 +3184,10 @@ mod tests {
 
         assert!(buffer.contains("Auto Flow"));
         assert!(buffer.contains("task"));
-        assert!(buffer.contains("implement"));
+        assert!(buffer.contains("Checklist"));
+        assert!(buffer.contains("Implement \"implement feature\""));
+        assert!(buffer.contains("Local validation loop"));
+        assert!(buffer.contains("Run local validation"));
         assert!(buffer.contains("Output (follow)"));
         assert!(buffer.contains("auto output"));
     }
@@ -2936,7 +3334,7 @@ mod tests {
         sessions: &'a [Session],
         focus: PanelFocus,
         status_message: Option<&'a str>,
-        leader_hint: Option<&'a str>,
+        leader_hint: Option<crate::view::LeaderHintModel>,
     ) -> FrameModel<'a> {
         FrameModel {
             config,
@@ -2977,6 +3375,7 @@ mod tests {
             selected_repo_root: "/repo".to_string(),
             selected_session: Some(0),
             focus,
+            main_focused: false,
             repo_main_view: RepoMainView::Github,
             worktree_main_view: WorktreeMainView::Details,
             mode_label: "normal",
