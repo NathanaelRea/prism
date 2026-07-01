@@ -61,10 +61,6 @@ impl KeyInput {
             KeyCode::Char('4'..='9') if plain_char(event) => Key::Other,
             KeyCode::Char('p') if plain_char(event) => Key::PullDefault,
             KeyCode::Char('P') if plain_char(event) => Key::PlanMode,
-            KeyCode::Char('u') if plain_char(event) => Key::PausePlan,
-            KeyCode::Char('f') if plain_char(event) => Key::RetryFailedPlanSteps,
-            KeyCode::Char('B') if plain_char(event) => Key::RetryPlanFromSelected,
-            KeyCode::Char('s') if plain_char(event) => Key::SkipPlanStep,
             KeyCode::Char('c') if plain_char(event) => Key::Create,
             KeyCode::Char('x') if plain_char(event) => Key::AbortOpencode,
             KeyCode::Char('A') if plain_char(event) => Key::AutoFlow,
@@ -83,7 +79,7 @@ impl KeyInput {
                 self.state = KeyInputState::Normal;
                 Key::OpenTmuxSession
             }
-            KeyCode::Char('P') if plain_char(event) => {
+            KeyCode::Char('p') if plain_char(event) => {
                 self.state = KeyInputState::Normal;
                 Key::PlanActions
             }
@@ -171,10 +167,6 @@ pub enum Key {
     Merge,
     PullDefault,
     PlanMode,
-    PausePlan,
-    RetryFailedPlanSteps,
-    RetryPlanFromSelected,
-    SkipPlanStep,
     Create,
     AbortOpencode,
     Delete,
@@ -287,10 +279,11 @@ mod tests {
     fn key_input_handles_leader_plan_actions() {
         let mut input = KeyInput::default();
         assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
-        assert_eq!(
-            map(&mut input, shift_key(KeyCode::Char('P'))),
-            Key::PlanActions
-        );
+        assert_eq!(map(&mut input, key(KeyCode::Char('p'))), Key::PlanActions);
+
+        let mut input = KeyInput::default();
+        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
+        assert_eq!(map(&mut input, shift_key(KeyCode::Char('P'))), Key::Other);
     }
 
     #[test]
@@ -363,7 +356,7 @@ mod tests {
         );
         assert_eq!(map(&mut input, key(KeyCode::Char('x'))), Key::AbortOpencode);
         assert_eq!(map(&mut input, key(KeyCode::Char('m'))), Key::Other);
-        assert_eq!(map(&mut input, key(KeyCode::Char('u'))), Key::PausePlan);
+        assert_eq!(map(&mut input, key(KeyCode::Char('u'))), Key::Other);
         assert_eq!(map(&mut input, key(KeyCode::Char('a'))), Key::Other);
     }
 

@@ -642,37 +642,6 @@ impl Tui {
                         self.show_error("plan mode failed", &error)?;
                     }
                 }
-                Key::PausePlan => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.toggle_selected_auto_pause(&mut runtime)? {
-                    } else if !self.toggle_selected_plan_pause()? {
-                        self.show_message("focus an auto or plan run to pause or resume it")?;
-                    }
-                }
-                Key::RetryFailedPlanSteps => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.retry_failed_auto_step()? {
-                    } else if !self.retry_failed_plan_steps()? {
-                        self.show_message("focus a failed auto or plan run to retry")?;
-                    }
-                }
-                Key::RetryPlanFromSelected => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if self.retry_auto_from_selected_step(&mut runtime)? {
-                    } else if !self.retry_plan_from_selected_step(&mut runtime)? {
-                        self.show_message("focus an auto or plan run to retry from selection")?;
-                    }
-                }
-                Key::SkipPlanStep => {
-                    self.clear_leader_hint();
-                    pending_g = false;
-                    if !self.skip_selected_plan_step()? {
-                        self.show_message("focus a plan run to skip selected phase")?;
-                    }
-                }
                 Key::Create => {
                     self.clear_leader_hint();
                     pending_g = false;
@@ -685,10 +654,7 @@ impl Tui {
                 Key::AbortOpencode => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    let handled = self.abort_selected_auto_run_or_step(&mut runtime)?
-                        || self.abort_selected_plan_run_or_step(&mut runtime)?;
-                    if handled {
-                    } else if self.focused_panel != PanelFocus::Worktrees {
+                    if self.focused_panel != PanelFocus::Worktrees {
                         self.show_message("focus worktrees to abort an OpenCode session")?;
                     } else if let Err(error) = self.abort_selected_opencode_session(&mut runtime) {
                         self.show_error("abort failed", &error)?;
@@ -821,7 +787,7 @@ impl Tui {
             "Space Space  status: open current plan phase tmux window 1 if available; repos: focus worktrees; worktrees: open agent if valid",
             "Enter        status: focus repos; repos: focus worktrees; worktrees: open agent if valid",
             "Space Enter  open tmux window 3: terminal",
-            "Space P      status auto plan mode: show plan actions",
+            "Space p      status auto/plan: pause, retry, skip, or abort",
             "Space g g    open tmux window 2: lazygit",
             "Ctrl-/       open tmux window 3: terminal",
             "Space g o    open selected PR in browser",
@@ -832,9 +798,7 @@ impl Tui {
             "Space g p    repos/worktrees: pull default branch",
             "p            repos/worktrees: pull default branch",
             "P            repos/worktrees: start or focus a plan run dashboard",
-            "u            status: pause/resume auto or plan; paused Auto Flow prompts before the next step",
             "j/k          status dashboard: move plan output or phase selection",
-            "x            status plan: abort selected phase, or type all for all running phases",
             "A            worktrees: start/focus Auto Flow; choose prompt, plan file, or draft plan",
             "R            edit repositories/order/keys/remove",
             "c            create worktree session in selected repo",
@@ -2231,13 +2195,13 @@ impl Tui {
     fn leader_hint_label(&self) -> Option<&'static str> {
         match (self.leader_hint, self.focused_panel) {
             (Some(LeaderHint::Root), PanelFocus::Status) => {
-                Some("g: git  P: plan actions  space/enter: focus repos")
+                Some("g: git  p: plan actions  space/enter: focus repos")
             }
             (Some(LeaderHint::Root), PanelFocus::Repos) => {
                 Some("g: git  space/enter: focus worktrees")
             }
             (Some(LeaderHint::Root), PanelFocus::Worktrees) => {
-                Some("g: git  enter: terminal  space: agent if valid")
+                Some("g: git  p: plan actions  enter: terminal  space: agent if valid")
             }
             (Some(LeaderHint::Git), PanelFocus::Status) => {
                 Some("g: lazygit after focusing repos/worktrees")

@@ -731,16 +731,22 @@ fn set_prompt_cursor(frame: &mut Frame<'_>, area: Rect, prompt: &str, input: &st
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let prompt_prefix_lines = prompt.split('\n').collect::<Vec<_>>();
+    let prompt_prefix = prompt_prefix_lines.last().copied().unwrap_or(prompt);
     let prompt_line = Line::from(vec![
-        Span::raw(prompt.to_string()),
+        Span::raw(prompt_prefix.to_string()),
         Span::raw(input.to_string()),
     ]);
     let width = prompt_line.width() as u16;
     let line_offset = width / area.width;
     let x_offset = width % area.width;
+    let prompt_y = prompt_prefix_lines.len().saturating_sub(1) as u16;
     frame.set_cursor_position((
         area.x + x_offset.min(area.width.saturating_sub(1)),
-        area.y + line_offset.min(area.height.saturating_sub(1)),
+        area.y
+            + prompt_y
+                .saturating_add(line_offset)
+                .min(area.height.saturating_sub(1)),
     ));
 }
 
@@ -820,17 +826,15 @@ fn dialog_lines(dialog: &view::DialogModel) -> Vec<Line<'static>> {
             ]));
             rendered
         }
-        view::DialogModel::Prompt { prompt, input, .. } => vec![
-            Line::from(vec![
-                Span::styled(prompt.clone(), muted_style()),
-                Span::raw(input.clone()),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
+        view::DialogModel::Prompt { prompt, input, .. } => {
+            let mut lines = prompt_dialog_lines(prompt, input);
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
                 "Enter to continue, Esc to cancel",
                 muted_style(),
-            )),
-        ],
+            )));
+            lines
+        }
         view::DialogModel::Progress { message, .. } => {
             let mut lines = vec![Line::from(Span::styled(
                 "[*] Please wait",
@@ -840,6 +844,42 @@ fn dialog_lines(dialog: &view::DialogModel) -> Vec<Line<'static>> {
             lines
         }
     }
+}
+
+fn prompt_dialog_lines(prompt: &str, input: &str) -> Vec<Line<'static>> {
+    let prompt_lines = prompt.split('\n').collect::<Vec<_>>();
+    let mut lines = Vec::new();
+    for (index, line) in prompt_lines.iter().enumerate() {
+        let mut spans = styled_prompt_spans(line);
+        if index + 1 == prompt_lines.len() {
+            spans.push(Span::raw(input.to_string()));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn styled_prompt_spans(text: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find('[') {
+        let (before, after_start) = rest.split_at(start);
+        if !before.is_empty() {
+            spans.push(Span::styled(before.to_string(), muted_style()));
+        }
+        if let Some(end) = after_start.find(']') {
+            let (option, after_option) = after_start.split_at(end + 1);
+            spans.push(Span::styled(option.to_string(), selected_style(true)));
+            rest = after_option;
+        } else {
+            rest = after_start;
+            break;
+        }
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), muted_style()));
+    }
+    spans
 }
 
 fn styled_text_lines(text: &str, style: Style) -> Vec<Line<'static>> {
@@ -3006,6 +3046,26 @@ mod tests {
         assert!(buffer.contains("Filter: api"));
         assert!(buffer.contains("Enter to continue"));
 
+        model.dialog = Some(DialogModel::Prompt {
+            title: "Plan Actions".to_string(),
+            prompt: "[u] pause/resume\n[f] retry failed\nChoice: ".to_string(),
+            input: "".to_string(),
+        });
+        let buffer = render_to_buffer(&model, 80, 20);
+        let buffer_text = buffer_to_string(&buffer);
+
+        assert!(buffer_text.contains("Plan Actions"));
+        assert!(buffer_text.contains("[u] pause/resume"));
+        assert!(buffer_text.contains("[f] retry failed"));
+        assert_ne!(
+            find_line(&buffer, "[u]"),
+            find_line(&buffer, "[f]")
+        );
+
+        let lines = prompt_dialog_lines("[u] pause/resume\nChoice: ", "");
+        assert_eq!(lines[0].spans[0].content.as_ref(), "[u]");
+        assert_eq!(lines[0].spans[0].style, selected_style(true));
+
         model.dialog = Some(DialogModel::Confirm {
             title: "Delete Session".to_string(),
             lines: vec![DialogLine {
@@ -3038,6 +3098,16 @@ mod tests {
 
         assert!(backend.cursor_visible());
         assert_eq!(backend.cursor_position(), Position::new(34, 8));
+
+        model.dialog = Some(DialogModel::Prompt {
+            title: "Plan Actions".to_string(),
+            prompt: "[u] pause/resume\nChoice: ".to_string(),
+            input: "f".to_string(),
+        });
+        let backend = render_to_backend(&model, 80, 20);
+
+        assert!(backend.cursor_visible());
+        assert_eq!(backend.cursor_position(), Position::new(32, 9));
 
         model.dialog = None;
         let backend = render_to_backend(&model, 80, 20);
