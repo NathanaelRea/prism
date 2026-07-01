@@ -1642,17 +1642,7 @@ fn auto_checklist_lines(dashboard: &view::AutoDashboard, max_rows: usize) -> Vec
         }
     }
 
-    lines.push(checklist_line(
-        0,
-        auto_status_for_key(steps, AutoStepKey::LocalVerify),
-        "Run local verification".to_string(),
-    ));
-    push_if_step_seen(
-        &mut lines,
-        steps,
-        AutoStepKey::FixLocalVerify,
-        "Fix local verification failure",
-    );
+    push_local_validation_loop(&mut lines, steps);
     lines.push(checklist_line(
         0,
         auto_status_for_key(steps, AutoStepKey::CommitImpl),
@@ -1663,47 +1653,8 @@ fn auto_checklist_lines(dashboard: &view::AutoDashboard, max_rows: usize) -> Vec
         auto_status_for_key(steps, AutoStepKey::PushPr),
         "Create or update PR".to_string(),
     ));
-    lines.push(checklist_line(
-        0,
-        auto_status_for_key(steps, AutoStepKey::WaitReview),
-        "Wait for automated review".to_string(),
-    ));
-    push_if_step_seen(
-        &mut lines,
-        steps,
-        AutoStepKey::FixReview,
-        "Fix review feedback",
-    );
-    push_if_step_seen(
-        &mut lines,
-        steps,
-        AutoStepKey::VerifyReviewFix,
-        "Verify review fixes",
-    );
-    push_if_step_seen(
-        &mut lines,
-        steps,
-        AutoStepKey::CommitReviewFix,
-        "Commit and push review fixes",
-    );
-    lines.push(checklist_line(
-        0,
-        auto_status_for_key(steps, AutoStepKey::WaitCi),
-        "Wait for PR checks".to_string(),
-    ));
-    push_if_step_seen(&mut lines, steps, AutoStepKey::FixCi, "Fix CI failure");
-    push_if_step_seen(
-        &mut lines,
-        steps,
-        AutoStepKey::VerifyCiFix,
-        "Verify CI fixes",
-    );
-    push_if_step_seen(
-        &mut lines,
-        steps,
-        AutoStepKey::CommitCiFix,
-        "Commit and push CI fixes",
-    );
+    push_review_loop(&mut lines, steps);
+    push_ci_loop(&mut lines, steps);
     lines.push(checklist_line(
         0,
         auto_status_for_key(steps, AutoStepKey::Merge),
@@ -1722,18 +1673,137 @@ fn auto_checklist_lines(dashboard: &view::AutoDashboard, max_rows: usize) -> Vec
     lines
 }
 
-fn push_if_step_seen(
-    lines: &mut Vec<Line<'static>>,
-    steps: &[AutoStepRun],
-    key: AutoStepKey,
-    label: &str,
-) {
-    if steps.iter().any(|step| step.step_key == key) {
+fn push_local_validation_loop(lines: &mut Vec<Line<'static>>, steps: &[AutoStepRun]) {
+    let group_status = first_active_or_latest_status(
+        steps,
+        &[AutoStepKey::FixLocalVerify, AutoStepKey::LocalVerify],
+    );
+    lines.push(checklist_line(
+        0,
+        group_status,
+        "Local validation loop".to_string(),
+    ));
+    lines.push(checklist_line(
+        1,
+        auto_status_for_key(steps, AutoStepKey::LocalVerify),
+        "Run local validation".to_string(),
+    ));
+    if step_seen(steps, &AutoStepKey::FixLocalVerify) {
         lines.push(checklist_line(
-            0,
-            auto_status_for_key(steps, key),
-            label.to_string(),
+            1,
+            auto_status_for_key(steps, AutoStepKey::FixLocalVerify),
+            format!(
+                "Fix local validation failure ({})",
+                attempt_label(steps, &AutoStepKey::FixLocalVerify, 3)
+            ),
         ));
+        lines.push(checklist_line(
+            1,
+            auto_status_for_key(steps, AutoStepKey::LocalVerify),
+            "Re-run local validation".to_string(),
+        ));
+    }
+}
+
+fn push_review_loop(lines: &mut Vec<Line<'static>>, steps: &[AutoStepRun]) {
+    let group_status = if step_seen(steps, &AutoStepKey::WaitCi) {
+        AutoStepStatus::Done
+    } else {
+        first_active_or_latest_status(
+            steps,
+            &[
+                AutoStepKey::FixReview,
+                AutoStepKey::VerifyReviewFix,
+                AutoStepKey::CommitReviewFix,
+                AutoStepKey::WaitReview,
+            ],
+        )
+    };
+    lines.push(checklist_line(
+        0,
+        group_status,
+        "Review feedback loop".to_string(),
+    ));
+    lines.push(checklist_line(
+        1,
+        auto_status_for_key(steps, AutoStepKey::WaitReview),
+        "Wait for automated review".to_string(),
+    ));
+    if step_seen(steps, &AutoStepKey::FixReview) {
+        lines.push(checklist_line(
+            1,
+            auto_status_for_key(steps, AutoStepKey::FixReview),
+            format!(
+                "Fix review feedback ({})",
+                attempt_label(steps, &AutoStepKey::FixReview, 3)
+            ),
+        ));
+        lines.push(checklist_line(
+            1,
+            auto_status_for_key(steps, AutoStepKey::VerifyReviewFix),
+            "Verify review fixes".to_string(),
+        ));
+        lines.push(checklist_line(
+            1,
+            auto_status_for_key(steps, AutoStepKey::CommitReviewFix),
+            "Commit and push review fixes".to_string(),
+        ));
+        if step_count(steps, &AutoStepKey::WaitReview) > 1 {
+            lines.push(checklist_line(
+                1,
+                auto_status_for_key(steps, AutoStepKey::WaitReview),
+                "Wait for automated review again".to_string(),
+            ));
+        }
+    }
+}
+
+fn push_ci_loop(lines: &mut Vec<Line<'static>>, steps: &[AutoStepRun]) {
+    let group_status = if step_seen(steps, &AutoStepKey::Merge) {
+        AutoStepStatus::Done
+    } else {
+        first_active_or_latest_status(
+            steps,
+            &[
+                AutoStepKey::FixCi,
+                AutoStepKey::VerifyCiFix,
+                AutoStepKey::CommitCiFix,
+                AutoStepKey::WaitCi,
+            ],
+        )
+    };
+    lines.push(checklist_line(0, group_status, "CI loop".to_string()));
+    lines.push(checklist_line(
+        1,
+        auto_status_for_key(steps, AutoStepKey::WaitCi),
+        "Wait for PR checks".to_string(),
+    ));
+    if step_seen(steps, &AutoStepKey::FixCi) {
+        lines.push(checklist_line(
+            1,
+            auto_status_for_key(steps, AutoStepKey::FixCi),
+            format!(
+                "Fix CI failure ({})",
+                attempt_label(steps, &AutoStepKey::FixCi, 3)
+            ),
+        ));
+        lines.push(checklist_line(
+            1,
+            auto_status_for_key(steps, AutoStepKey::VerifyCiFix),
+            "Verify CI fixes".to_string(),
+        ));
+        lines.push(checklist_line(
+            1,
+            auto_status_for_key(steps, AutoStepKey::CommitCiFix),
+            "Commit and push CI fixes".to_string(),
+        ));
+        if step_count(steps, &AutoStepKey::WaitCi) > 1 {
+            lines.push(checklist_line(
+                1,
+                auto_status_for_key(steps, AutoStepKey::WaitCi),
+                "Wait for PR checks again".to_string(),
+            ));
+        }
     }
 }
 
@@ -1756,11 +1826,48 @@ fn checklist_mark(status: AutoStepStatus) -> &'static str {
 }
 
 fn auto_status_for_key(steps: &[AutoStepRun], key: AutoStepKey) -> AutoStepStatus {
-    steps
-        .iter()
-        .rev()
-        .find(|step| step.step_key == key)
+    latest_step_for_key(steps, &key)
         .map(|step| step.status)
+        .unwrap_or(AutoStepStatus::Queued)
+}
+
+fn latest_step_for_key<'a>(steps: &'a [AutoStepRun], key: &AutoStepKey) -> Option<&'a AutoStepRun> {
+    steps.iter().rev().find(|step| &step.step_key == key)
+}
+
+fn step_seen(steps: &[AutoStepRun], key: &AutoStepKey) -> bool {
+    steps.iter().any(|step| &step.step_key == key)
+}
+
+fn step_count(steps: &[AutoStepRun], key: &AutoStepKey) -> usize {
+    steps.iter().filter(|step| &step.step_key == key).count()
+}
+
+fn attempt_label(steps: &[AutoStepRun], key: &AutoStepKey, max_attempts: usize) -> String {
+    let attempt = latest_step_for_key(steps, key)
+        .map(|step| step.attempt)
+        .unwrap_or(1);
+    format!("attempt {}/{max_attempts}", attempt.min(max_attempts))
+}
+
+fn first_active_or_latest_status(steps: &[AutoStepRun], keys: &[AutoStepKey]) -> AutoStepStatus {
+    for key in keys {
+        let status = auto_status_for_key(steps, key.clone());
+        if matches!(
+            status,
+            AutoStepStatus::Starting
+                | AutoStepStatus::Running
+                | AutoStepStatus::Waiting
+                | AutoStepStatus::Failed
+                | AutoStepStatus::Aborted
+        ) {
+            return status;
+        }
+    }
+    keys.iter()
+        .rev()
+        .map(|key| auto_status_for_key(steps, key.clone()))
+        .find(|status| *status != AutoStepStatus::Queued)
         .unwrap_or(AutoStepStatus::Queued)
 }
 
@@ -2979,7 +3086,8 @@ mod tests {
         assert!(buffer.contains("task"));
         assert!(buffer.contains("Checklist"));
         assert!(buffer.contains("Implement \"implement feature\""));
-        assert!(buffer.contains("Run local verification"));
+        assert!(buffer.contains("Local validation loop"));
+        assert!(buffer.contains("Run local validation"));
         assert!(buffer.contains("Output (follow)"));
         assert!(buffer.contains("auto output"));
     }
