@@ -1646,12 +1646,8 @@ impl Tui {
             return Ok(());
         }
 
-        let answer = self.prompt_line_dialog(
-            raw,
-            "Plan Actions",
-            "[u] pause/resume\n[f] retry failed\n[b] retry from selected\n[s] skip phase\n[x] abort\nChoice: ",
-            "",
-        )?;
+        let answer = self
+            .prompt_choice_dialog(raw, Self::plan_action_choices("Plan Actions", "skip phase"))?;
         let Some(answer) = answer else {
             return Ok(());
         };
@@ -1688,11 +1684,9 @@ impl Tui {
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
-        let answer = self.prompt_line_dialog(
+        let answer = self.prompt_choice_dialog(
             raw,
-            "Auto Plan Actions",
-            "[u] pause/resume\n[f] retry failed\n[b] retry from selected\n[s] skip linked phase\n[x] abort\nChoice: ",
-            "",
+            Self::plan_action_choices("Auto Plan Actions", "skip linked phase"),
         )?;
         let Some(answer) = answer else {
             return Ok(());
@@ -1723,6 +1717,26 @@ impl Tui {
                 self.show_message("unknown Auto Plan action")?;
                 Ok(())
             }
+        }
+    }
+
+    fn plan_action_choices(title: &str, skip_label: &str) -> crate::view::ChoiceList {
+        let choices = [
+            ("u", "pause/resume"),
+            ("f", "retry failed"),
+            ("b", "retry from selected"),
+            ("s", skip_label),
+            ("x", "abort"),
+        ];
+        crate::view::ChoiceList {
+            title: title.to_string(),
+            choices: choices
+                .into_iter()
+                .map(|(key, label)| crate::view::KeyChoice {
+                    key: key.to_string(),
+                    label: label.to_string(),
+                })
+                .collect(),
         }
     }
 

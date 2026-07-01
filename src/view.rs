@@ -27,7 +27,7 @@ pub(crate) struct FrameModel<'a> {
     pub status_message: Option<&'a str>,
     pub repo_filter: &'a str,
     pub worktree_filter: &'a str,
-    pub leader_hint: Option<&'a str>,
+    pub leader_hint: Option<LeaderHintModel>,
     pub auto_dashboard: Option<AutoDashboard>,
     pub plan_dashboard: Option<PlanDashboard>,
     pub dialog: Option<DialogModel>,
@@ -51,6 +51,9 @@ pub(crate) enum DialogModel {
         prompt: String,
         input: String,
     },
+    Choice {
+        choices: ChoiceList,
+    },
     Progress {
         title: String,
         message: String,
@@ -62,6 +65,20 @@ pub(crate) struct DialogLine {
     pub text: String,
     pub attention: bool,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChoiceList {
+    pub title: String,
+    pub choices: Vec<KeyChoice>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeyChoice {
+    pub key: String,
+    pub label: String,
+}
+
+pub(crate) type LeaderHintModel = ChoiceList;
 
 pub(crate) struct StatusRow {
     pub label: String,

@@ -972,6 +972,58 @@ impl Tui {
         }
     }
 
+    pub(crate) fn prompt_choice_dialog(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        choices: view::ChoiceList,
+    ) -> Result<Option<String>, String> {
+        self.dialog = Some(view::DialogModel::Choice {
+            choices: choices.clone(),
+        });
+        self.draw(runtime)?;
+        loop {
+            if self.tick_tui_action_jobs().any() {
+                self.draw(runtime)?;
+            }
+            let Some(event) = runtime.poll_event(Duration::from_millis(100))? else {
+                continue;
+            };
+            let RuntimeEvent::Key(event) = event else {
+                self.draw(runtime)?;
+                continue;
+            };
+            if event.kind != KeyEventKind::Press {
+                continue;
+            }
+            match event.code {
+                KeyCode::Esc | KeyCode::Char('c')
+                    if event.code == KeyCode::Esc || ctrl_key(event) =>
+                {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Ok(None);
+                }
+                KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => {
+                    let normalized = ch.to_string().to_ascii_lowercase();
+                    if choices
+                        .choices
+                        .iter()
+                        .any(|option| option.key.eq_ignore_ascii_case(&normalized))
+                    {
+                        self.dialog = None;
+                        self.draw(runtime)?;
+                        return Ok(Some(normalized));
+                    }
+                }
+                _ => {}
+            }
+            self.dialog = Some(view::DialogModel::Choice {
+                choices: choices.clone(),
+            });
+            self.draw(runtime)?;
+        }
+    }
+
     pub(crate) fn show_loading_dialog(
         &mut self,
         runtime: &mut TerminalRuntime,
@@ -1974,7 +2026,7 @@ impl Tui {
             status_message: self.status_message.as_deref(),
             repo_filter: &self.repo_filter,
             worktree_filter: &self.worktree_filter,
-            leader_hint: self.leader_hint_label(),
+            leader_hint: self.leader_hint_model(),
             auto_dashboard: self.current_auto_dashboard(),
             plan_dashboard: self.current_plan_dashboard(),
             dialog: self.dialog.clone(),
@@ -2192,26 +2244,64 @@ impl Tui {
         ]
     }
 
-    fn leader_hint_label(&self) -> Option<&'static str> {
+    fn leader_hint_model(&self) -> Option<view::LeaderHintModel> {
         match (self.leader_hint, self.focused_panel) {
-            (Some(LeaderHint::Root), PanelFocus::Status) => {
-                Some("g: git  p: plan actions  space/enter: focus repos")
+            (Some(LeaderHint::Root), PanelFocus::Status) => Some(choice_list(
+                "Shortcuts",
+                &[
+                    ("g", "git actions"),
+                    ("p", "plan actions"),
+                    ("space/enter", "focus repos"),
+                ],
+            )),
+            (Some(LeaderHint::Root), PanelFocus::Repos) => Some(choice_list(
+                "Shortcuts",
+                &[("g", "git actions"), ("space/enter", "focus worktrees")],
+            )),
+            (Some(LeaderHint::Root), PanelFocus::Worktrees) => Some(choice_list(
+                "Shortcuts",
+                &[
+                    ("g", "git actions"),
+                    ("p", "plan actions"),
+                    ("enter", "terminal"),
+                    ("space", "agent if valid"),
+                ],
+            )),
+            (Some(LeaderHint::Git), PanelFocus::Status) => Some(choice_list(
+                "Git Actions",
+                &[("g", "lazygit after focusing repos/worktrees")],
+            )),
+            (Some(LeaderHint::Git), PanelFocus::Repos) => {
+                Some(choice_list("Git Actions", &[("p", "pull default branch")]))
             }
-            (Some(LeaderHint::Root), PanelFocus::Repos) => {
-                Some("g: git  space/enter: focus worktrees")
-            }
-            (Some(LeaderHint::Root), PanelFocus::Worktrees) => {
-                Some("g: git  p: plan actions  enter: terminal  space: agent if valid")
-            }
-            (Some(LeaderHint::Git), PanelFocus::Status) => {
-                Some("g: lazygit after focusing repos/worktrees")
-            }
-            (Some(LeaderHint::Git), PanelFocus::Repos) => Some("p: pull default branch"),
-            (Some(LeaderHint::Git), PanelFocus::Worktrees) => Some(
-                "a: auto flow  g: lazygit  p: pull default  o: open PR  P: push/create PR  M: merge  c: copy CI prompt  f: review fix",
-            ),
+            (Some(LeaderHint::Git), PanelFocus::Worktrees) => Some(choice_list(
+                "Git Actions",
+                &[
+                    ("a", "auto flow"),
+                    ("g", "lazygit"),
+                    ("p", "pull default"),
+                    ("o", "open PR"),
+                    ("P", "push/create PR"),
+                    ("M", "merge"),
+                    ("c", "copy CI prompt"),
+                    ("f", "review fix"),
+                ],
+            )),
             (None, _) => None,
         }
+    }
+}
+
+fn choice_list(title: &str, choices: &[(&str, &str)]) -> view::ChoiceList {
+    view::ChoiceList {
+        title: title.to_string(),
+        choices: choices
+            .iter()
+            .map(|(key, label)| view::KeyChoice {
+                key: (*key).to_string(),
+                label: (*label).to_string(),
+            })
+            .collect(),
     }
 }
 

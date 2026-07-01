@@ -40,7 +40,7 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &view::FrameModel<'_>) {
     render_sidebar(frame, body[0], model);
     render_main(frame, body[1], model);
     render_footer(frame, vertical[1], model);
-    if let Some(hint) = model.leader_hint {
+    if let Some(hint) = &model.leader_hint {
         render_leader_hint(frame, area, hint);
     }
     if let Some(dialog) = &model.dialog {
@@ -655,10 +655,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn render_leader_hint(frame: &mut Frame<'_>, area: Rect, hint: &str) {
-    let lines = leader_hint_lines(hint);
+fn render_leader_hint(frame: &mut Frame<'_>, area: Rect, hint: &view::LeaderHintModel) {
+    let lines = choice_lines(hint);
     let content_width = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
-    let width = content_width.saturating_add(4).min(area.width.max(1));
+    let width = content_width
+        .max(hint.title.chars().count() as u16)
+        .saturating_add(4)
+        .min(area.width.max(1));
     let height = (lines.len() as u16)
         .saturating_add(2)
         .min(area.height.max(1));
@@ -669,28 +672,16 @@ fn render_leader_hint(frame: &mut Frame<'_>, area: Rect, hint: &str) {
         height,
     };
     frame.render_widget(Clear, popup);
+    let block = panel_block(
+        Line::from(Span::styled(hint.title.clone(), title_style(true))),
+        false,
+    );
     frame.render_widget(
-        Paragraph::new(lines).alignment(Alignment::Left).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .style(Style::default().bg(Color::Black)),
-        ),
+        Paragraph::new(lines)
+            .alignment(Alignment::Left)
+            .block(block),
         popup,
     );
-}
-
-fn leader_hint_lines(hint: &str) -> Vec<Line<'static>> {
-    let parts = if hint.contains('\n') {
-        hint.lines().collect::<Vec<_>>()
-    } else {
-        hint.split("  ").collect::<Vec<_>>()
-    };
-    parts
-        .into_iter()
-        .map(str::trim)
-        .filter(|part| !part.is_empty())
-        .map(|part| Line::from(Span::styled(part.to_string(), title_style(true))))
-        .collect()
 }
 
 fn render_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &view::DialogModel) {
@@ -755,6 +746,10 @@ fn dialog_title(dialog: &view::DialogModel) -> String {
         view::DialogModel::Help { .. } => "Keybindings".to_string(),
         view::DialogModel::Confirm { title, .. }
         | view::DialogModel::Prompt { title, .. }
+        | view::DialogModel::Choice {
+            choices: view::ChoiceList { title, .. },
+            ..
+        }
         | view::DialogModel::Progress { title, .. } => title.clone(),
     }
 }
@@ -835,6 +830,7 @@ fn dialog_lines(dialog: &view::DialogModel) -> Vec<Line<'static>> {
             )));
             lines
         }
+        view::DialogModel::Choice { choices, .. } => choice_lines(choices),
         view::DialogModel::Progress { message, .. } => {
             let mut lines = vec![Line::from(Span::styled(
                 "[*] Please wait",
@@ -844,6 +840,19 @@ fn dialog_lines(dialog: &view::DialogModel) -> Vec<Line<'static>> {
             lines
         }
     }
+}
+
+fn choice_lines(choices: &view::ChoiceList) -> Vec<Line<'static>> {
+    choices
+        .choices
+        .iter()
+        .map(|choice| {
+            Line::from(vec![
+                Span::styled(format!("[{}]", choice.key), selected_style(true)),
+                Span::styled(format!(" {}", choice.label), muted_style()),
+            ])
+        })
+        .collect::<Vec<_>>()
 }
 
 fn prompt_dialog_lines(prompt: &str, input: &str) -> Vec<Line<'static>> {
@@ -2884,9 +2893,9 @@ mod tests {
         },
         session::Session,
         view::{
-            AutoDashboard, AutoOutputViewerState, DialogLine, DialogModel, FrameModel,
-            PlanDashboard, PlanOutputViewerState, RepoMainView, RepoRow, StatusRow, WorktreeKind,
-            WorktreeMainView, WorktreeRow,
+            AutoDashboard, AutoOutputViewerState, ChoiceList, DialogLine, DialogModel, FrameModel,
+            KeyChoice, PlanDashboard, PlanOutputViewerState, RepoMainView, RepoRow, StatusRow,
+            WorktreeKind, WorktreeMainView, WorktreeRow,
         },
     };
 
@@ -3018,16 +3027,33 @@ mod tests {
             &sessions,
             PanelFocus::Status,
             Some("saved config"),
-            Some("a: one  b: two  c: three"),
+            Some(ChoiceList {
+                title: "Shortcuts".to_string(),
+                choices: vec![
+                    KeyChoice {
+                        key: "a".to_string(),
+                        label: "one".to_string(),
+                    },
+                    KeyChoice {
+                        key: "b".to_string(),
+                        label: "two".to_string(),
+                    },
+                    KeyChoice {
+                        key: "c".to_string(),
+                        label: "three".to_string(),
+                    },
+                ],
+            }),
         );
         let buffer = render_to_buffer(&model, 100, 20);
 
         assert_line_contains(&buffer, 19, "saved config");
-        assert_region_contains(&buffer, 0..100, 0..20, "a: one");
-        assert_region_contains(&buffer, 0..100, 0..20, "b: two");
-        assert_region_contains(&buffer, 0..100, 0..20, "c: three");
-        assert_ne!(find_line(&buffer, "a: one"), find_line(&buffer, "b: two"));
-        assert_ne!(find_line(&buffer, "b: two"), find_line(&buffer, "c: three"));
+        assert_region_contains(&buffer, 0..100, 0..20, "Shortcuts");
+        assert_region_contains(&buffer, 0..100, 0..20, "[a] one");
+        assert_region_contains(&buffer, 0..100, 0..20, "[b] two");
+        assert_region_contains(&buffer, 0..100, 0..20, "[c] three");
+        assert_ne!(find_line(&buffer, "[a]"), find_line(&buffer, "[b]"));
+        assert_ne!(find_line(&buffer, "[b]"), find_line(&buffer, "[c]"));
     }
 
     #[test]
@@ -3046,10 +3072,20 @@ mod tests {
         assert!(buffer.contains("Filter: api"));
         assert!(buffer.contains("Enter to continue"));
 
-        model.dialog = Some(DialogModel::Prompt {
-            title: "Plan Actions".to_string(),
-            prompt: "[u] pause/resume\n[f] retry failed\nChoice: ".to_string(),
-            input: "".to_string(),
+        model.dialog = Some(DialogModel::Choice {
+            choices: ChoiceList {
+                title: "Plan Actions".to_string(),
+                choices: vec![
+                    KeyChoice {
+                        key: "u".to_string(),
+                        label: "pause/resume".to_string(),
+                    },
+                    KeyChoice {
+                        key: "f".to_string(),
+                        label: "retry failed".to_string(),
+                    },
+                ],
+            },
         });
         let buffer = render_to_buffer(&model, 80, 20);
         let buffer_text = buffer_to_string(&buffer);
@@ -3057,12 +3093,9 @@ mod tests {
         assert!(buffer_text.contains("Plan Actions"));
         assert!(buffer_text.contains("[u] pause/resume"));
         assert!(buffer_text.contains("[f] retry failed"));
-        assert_ne!(
-            find_line(&buffer, "[u]"),
-            find_line(&buffer, "[f]")
-        );
+        assert_ne!(find_line(&buffer, "[u]"), find_line(&buffer, "[f]"));
 
-        let lines = prompt_dialog_lines("[u] pause/resume\nChoice: ", "");
+        let lines = dialog_lines(model.dialog.as_ref().unwrap());
         assert_eq!(lines[0].spans[0].content.as_ref(), "[u]");
         assert_eq!(lines[0].spans[0].style, selected_style(true));
 
@@ -3098,16 +3131,6 @@ mod tests {
 
         assert!(backend.cursor_visible());
         assert_eq!(backend.cursor_position(), Position::new(34, 8));
-
-        model.dialog = Some(DialogModel::Prompt {
-            title: "Plan Actions".to_string(),
-            prompt: "[u] pause/resume\nChoice: ".to_string(),
-            input: "f".to_string(),
-        });
-        let backend = render_to_backend(&model, 80, 20);
-
-        assert!(backend.cursor_visible());
-        assert_eq!(backend.cursor_position(), Position::new(32, 9));
 
         model.dialog = None;
         let backend = render_to_backend(&model, 80, 20);
@@ -3304,7 +3327,7 @@ mod tests {
         sessions: &'a [Session],
         focus: PanelFocus,
         status_message: Option<&'a str>,
-        leader_hint: Option<&'a str>,
+        leader_hint: Option<crate::view::LeaderHintModel>,
     ) -> FrameModel<'a> {
         FrameModel {
             config,
