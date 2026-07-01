@@ -13,7 +13,7 @@ pub fn truncate(text: &str, max_chars: usize) -> String {
     out
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn truncate_line(text: &str, max_chars: usize) -> String {
     truncate(&single_line(text), max_chars)
 }

@@ -1050,7 +1050,12 @@ impl Tui {
                     self.draw(runtime)?;
                     return Ok(true);
                 }
-                KeyCode::Esc | KeyCode::Char('q') => {
+                KeyCode::Esc => {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Ok(false);
+                }
+                KeyCode::Char('q') if plain_key(event) => {
                     self.dialog = None;
                     self.draw(runtime)?;
                     return Ok(false);
