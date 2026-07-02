@@ -2832,7 +2832,7 @@ fn worktree_git_column(worktree: &view::WorktreeRow) -> (&'static str, Style) {
     } else if status_count(&worktree.status_label, "behind").is_some() {
         ("↓", attention_style())
     } else {
-        ("✓", muted_style())
+        ("✓", Style::default().fg(Color::Green))
     }
 }
 
@@ -3381,6 +3381,32 @@ mod tests {
 
         assert!(buffer.contains("12345678901234567~"));
         assert!(buffer.contains("·"));
+    }
+
+    #[test]
+    fn clean_worktree_git_check_is_green() {
+        let session = test_session("feature", AgentState::Running);
+        let worktree = WorktreeRow {
+            session_index: 0,
+            repo_root: "/repo".to_string(),
+            worktree_path: "/repo/feature".to_string(),
+            branch: session.branch.clone(),
+            kind: WorktreeKind::FeatureWorktree,
+            agent_state: session.agent_state,
+            status_label: session.status_label.clone(),
+            pr: session.pr.clone(),
+            wt_columns: session.wt_columns.clone(),
+            auto_status: None,
+            unseen_comments: session.unseen_comments,
+            prompt_summary: session.prompt_summary.clone(),
+            classification: session.classification,
+            selected: true,
+        };
+
+        let (label, style) = worktree_git_column(&worktree);
+
+        assert_eq!(label, "✓");
+        assert_eq!(style.fg, Some(Color::Green));
     }
 
     #[test]
