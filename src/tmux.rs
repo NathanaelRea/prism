@@ -181,14 +181,12 @@ pub fn paste_agent_prompt(
             .opencode_session_id
             .as_deref()
             .ok_or_else(|| "OpenCode session ID is not available".to_string())?;
+        if !ensure_agent_session(repo, config, session, generation)? {
+            return Err("agent session did not become ready".to_string());
+        }
         match submit_prompt(&runtime.server_url, session_id, prompt) {
             Ok(()) => return Ok(()),
             Err(api_error) => {
-                if !ensure_agent_session(repo, config, session, generation)? {
-                    return Err(format!(
-                        "submit opencode prompt through API failed: {api_error}; agent session did not become ready for paste fallback"
-                    ));
-                }
                 paste_prompt_into_tmux(config, &runtime_session, prompt).map_err(|paste_error| {
                     format!(
                         "submit opencode prompt through API failed: {api_error}; paste fallback failed: {paste_error}"
@@ -1311,12 +1309,13 @@ exit 1
     }
 
     #[test]
-    fn paste_agent_prompt_uses_opencode_api_when_runtime_exists() {
+    fn paste_agent_prompt_prepares_tmux_session_before_opencode_api() {
         let temp = unique_temp_dir("prism-tmux-api-paste-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
         let prompt_file = temp.join("prompt.txt");
         let api_log = temp.join("api.log");
+        let session_marker = temp.join("tmux-session");
         let tmux = temp.join("tmux");
         fs::write(
             &tmux,
@@ -1324,7 +1323,15 @@ exit 1
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> '{}'
 case "$1" in
-  has-session|set-option|move-window|rename-window|new-window)
+  has-session)
+    test -f '{}'
+    exit $?
+    ;;
+  new-session)
+    touch '{}'
+    exit 0
+    ;;
+  set-option|move-window|rename-window|new-window)
     exit 0
     ;;
   list-windows)
@@ -1349,6 +1356,8 @@ esac
 exit 1
 "#,
                 log.display(),
+                session_marker.display(),
+                session_marker.display(),
                 prompt_file.display()
             ),
         )
@@ -1369,7 +1378,7 @@ exit 1
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
         let port =
-            match start_fake_opencode_server(session.path.clone(), 200, Some(api_log.clone()), 4) {
+            match start_fake_opencode_server(session.path.clone(), 200, Some(api_log.clone()), 8) {
                 Ok(port) => port,
                 Err(error) if error.kind() == ErrorKind::PermissionDenied => return,
                 Err(error) => panic!("start fake OpenCode server: {error}"),
@@ -1403,7 +1412,8 @@ exit 1
             r#"{"sessionID":"ses_123","text":"  fix review comments\nquote: \"that's fine\"\n$PATH && rm -rf nope\n--leading-dash"}"#
         ));
         let commands = fs::read_to_string(&log).unwrap_or_default();
-        assert!(!commands.contains("capture-pane"));
+        assert!(commands.contains("new-session -d -s"));
+        assert!(commands.contains("opencode attach"));
         assert!(!commands.contains("load-buffer"));
         assert!(!commands.contains("paste-buffer"));
 
