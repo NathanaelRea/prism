@@ -4,6 +4,7 @@ use std::process::Command;
 use crate::config::{Config, MergeMethod};
 use crate::github::{PrCache, refresh_pr_cache};
 use crate::observability;
+use crate::opencode;
 use crate::process::{run_capture, run_configured_commands, run_status};
 use crate::repo::Repository;
 use crate::session::{
@@ -152,9 +153,22 @@ pub(crate) fn delete_worktree_session(
     path: &Path,
     branch: &str,
 ) -> Result<(), String> {
+    delete_worktree_session_processes(repo, config, branch)?;
     delete_worktree_session_local_data(repo, branch)?;
     remove_worktree(repo, config, path)?;
     delete_branch_if_attached(repo, config, branch)?;
+    Ok(())
+}
+
+fn delete_worktree_session_processes(
+    repo: &Repository,
+    config: &Config,
+    branch: &str,
+) -> Result<(), String> {
+    crate::tmux::kill_agent_sessions_for_branch(repo, config, branch)?;
+    for runtime in opencode::load_runtimes_for_branch(repo, branch)? {
+        opencode::shutdown_stored_server(&runtime)?;
+    }
     Ok(())
 }
 
@@ -608,6 +622,102 @@ exit 0
         let commands = fs::read_to_string(&log).unwrap();
         assert!(commands.contains("worktree remove --force"));
         assert!(!commands.contains("worktree prune"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn delete_worktree_session_kills_tmux_sessions_before_removing_state() {
+        let temp = unique_temp_dir("prism-delete-kills-tmux-test");
+        fs::create_dir_all(&temp).unwrap();
+        let tmux_log = temp.join("tmux.log");
+        let git_log = temp.join("git.log");
+        let tmux = temp.join("tmux");
+        let git = temp.join("git");
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        let branch = "feature/delete";
+        let runtime = crate::tmux::TmuxAgentSession::for_worktree_session(&repo, branch, 3);
+        let other_runtime =
+            crate::tmux::TmuxAgentSession::for_worktree_session(&repo, "feature/keep", 0);
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  list-sessions)
+    printf '%s\n' '{}' '{}'
+    exit 0
+    ;;
+  kill-session)
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+                tmux_log.display(),
+                runtime.name(),
+                other_runtime.name()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &git,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+exit 0
+"#,
+                git_log.display()
+            ),
+        )
+        .unwrap();
+        for shim in [&tmux, &git] {
+            let mut permissions = fs::metadata(shim).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(shim, permissions).unwrap();
+        }
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        let path = temp.join("worktree");
+        fs::create_dir_all(&path).unwrap();
+        observability::with_writable_db(&repo, |conn| {
+            conn.execute(
+                "insert into opencode_runtime (
+                    repo_root, branch, worktree_path, server_port, server_url,
+                    generation, updated_unix_ms
+                 ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    repo.root.display().to_string(),
+                    branch,
+                    path.display().to_string(),
+                    41000_i64,
+                    "http://127.0.0.1:41000",
+                    1_i64,
+                    123_i64,
+                ],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        super::delete_worktree_session(&repo, &config, &path, branch).unwrap();
+
+        let tmux_commands = fs::read_to_string(&tmux_log).unwrap();
+        assert!(tmux_commands.contains("list-sessions -F #{session_name}"));
+        assert!(tmux_commands.contains(&format!("kill-session -t {}", runtime.name())));
+        assert!(!tmux_commands.contains(&format!("kill-session -t {}", other_runtime.name())));
+        let git_commands = fs::read_to_string(&git_log).unwrap();
+        assert!(git_commands.contains("worktree remove --force"));
+        assert!(git_commands.contains("branch -D feature/delete"));
+        assert_eq!(count_rows(&repo, "opencode_runtime", branch), 0);
 
         let _ = fs::remove_dir_all(temp);
     }

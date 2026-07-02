@@ -332,6 +332,52 @@ pub fn shutdown_owned_server(runtime: &OpencodeRuntime) -> Result<(), String> {
     }
 }
 
+pub(crate) fn shutdown_stored_server(runtime: &OpencodeRuntime) -> Result<(), String> {
+    if runtime.server_pid.and_then(owned_server_process).is_some() {
+        return shutdown_owned_server(runtime);
+    }
+    let Some(pid) = runtime.server_pid else {
+        return Ok(());
+    };
+    if !stored_server_process_matches(pid) {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        if result == 0 {
+            Ok(())
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                Ok(())
+            } else {
+                Err(format!("stop opencode server {pid}: {error}"))
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        Ok(())
+    }
+}
+
+fn stored_server_process_matches(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let cmdline = fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+        let args: Vec<&str> = cmdline.split('\0').filter(|arg| !arg.is_empty()).collect();
+        args.windows(2)
+            .any(|window| window[0].ends_with("opencode") && window[1] == "serve")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 fn owned_server_processes() -> &'static Mutex<BTreeMap<u32, OwnedServerProcess>> {
     OWNED_SERVER_PROCESSES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
@@ -818,6 +864,55 @@ pub fn load_runtime(
         )
         .optional()
         .map_err(|error| format!("read opencode runtime: {error}"))
+    })
+}
+
+pub(crate) fn load_runtimes_for_branch(
+    repo: &Repository,
+    branch: &str,
+) -> Result<Vec<OpencodeRuntime>, String> {
+    let repo_root = repo.root.display().to_string();
+    observability::with_writable_db(repo, |conn| {
+        let mut statement = conn
+            .prepare(
+                "select repo_root, branch, worktree_path, server_port, server_url, server_pid,
+                        opencode_session_id, generation, updated_unix_ms
+                   from opencode_runtime
+                  where repo_root = ?1 and branch = ?2",
+            )
+            .map_err(|error| format!("prepare opencode runtime lookup: {error}"))?;
+        let rows = statement
+            .query_map(params![repo_root, branch], |row| {
+                let server_pid = row
+                    .get::<_, Option<i64>>(5)?
+                    .and_then(|pid| u32::try_from(pid).ok());
+                Ok(OpencodeRuntime {
+                    repo_root: row.get(0)?,
+                    branch: row.get(1)?,
+                    worktree_path: row.get(2)?,
+                    server_port: u16::try_from(row.get::<_, i64>(3)?).unwrap_or_default(),
+                    server_url: row.get(4)?,
+                    server_pid,
+                    opencode_session_id: row.get(6)?,
+                    generation: row
+                        .get::<_, i64>(7)
+                        .ok()
+                        .and_then(|value| u64::try_from(value).ok())
+                        .unwrap_or_default(),
+                    updated_unix_ms: row
+                        .get::<_, i64>(8)
+                        .ok()
+                        .and_then(|value| u64::try_from(value).ok())
+                        .unwrap_or_default(),
+                })
+            })
+            .map_err(|error| format!("read opencode runtime: {error}"))?;
+
+        let mut runtimes = Vec::new();
+        for row in rows {
+            runtimes.push(row.map_err(|error| format!("read opencode runtime: {error}"))?);
+        }
+        Ok(runtimes)
     })
 }
 
