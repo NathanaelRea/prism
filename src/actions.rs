@@ -2703,6 +2703,14 @@ impl Tui {
             self.show_message("default branch worktree cannot be archived from Prism")?;
             return Ok(());
         }
+        let archive_key_count = archive_choice_keys().len();
+        let archived_count = list_archived_worktrees(&context.repo)?.len();
+        if archived_count >= archive_key_count {
+            self.show_message(&format!(
+                "archived worktree limit {archive_key_count} reached; unarchive one before archiving another"
+            ))?;
+            return Ok(());
+        }
         let path = self.sessions[selected].path.clone();
         let path_display = self.sessions[selected].path_display.clone();
         let warnings = self.sessions[selected].archive_warnings();
@@ -2731,6 +2739,10 @@ impl Tui {
             return Ok(());
         }
         let keys = archive_choice_keys();
+        if let Some(message) = archived_picker_overflow_message(archived.len(), keys.len()) {
+            self.show_message(&message)?;
+            return Ok(());
+        }
         let choices = archived
             .iter()
             .zip(keys.iter())
@@ -2853,6 +2865,14 @@ fn archive_choice_keys() -> Vec<String> {
         .chain('a'..='z')
         .map(|key| key.to_string())
         .collect()
+}
+
+fn archived_picker_overflow_message(archived_count: usize, key_count: usize) -> Option<String> {
+    (archived_count > key_count).then(|| {
+        format!(
+            "{archived_count} archived worktrees exceeds picker limit {key_count}; create by branch name to restore"
+        )
+    })
 }
 
 fn open_url_in_browser(url: &str) -> Result<(), String> {
@@ -3083,7 +3103,10 @@ mod tests {
     use crate::session::Session;
     use crate::tui::Tui;
 
-    use super::{discover_wt_columns, run_browser_opener, status_label_with_behind};
+    use super::{
+        archived_picker_overflow_message, discover_wt_columns, run_browser_opener,
+        status_label_with_behind,
+    };
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -3355,6 +3378,16 @@ esac
             status_label_with_behind("dirty 1 ahead 3 behind 9", 2),
             "dirty 1 ahead 3 behind 2"
         );
+    }
+
+    #[test]
+    fn archived_picker_reports_overflow_instead_of_truncating() {
+        assert!(archived_picker_overflow_message(35, 35).is_none());
+
+        let message = archived_picker_overflow_message(36, 35).unwrap();
+
+        assert!(message.contains("36 archived worktrees"));
+        assert!(message.contains("picker limit 35"));
     }
 
     #[test]

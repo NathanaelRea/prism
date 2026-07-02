@@ -188,7 +188,7 @@ fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<
             let (error_label, error_style) = worktree_error_column(worktree);
             let (agent_label, agent_style) =
                 if matches!(worktree.kind, view::WorktreeKind::DefaultBranch) {
-                    ("", muted_style())
+                    (" ", muted_style())
                 } else {
                     (
                         agent_icon(worktree.agent_state),
@@ -2857,7 +2857,7 @@ fn worktree_pr_column(
     icon_style: IconStyle,
 ) -> (&'static str, Style) {
     if matches!(worktree.kind, view::WorktreeKind::DefaultBranch) {
-        return ("", muted_style());
+        return (" ", muted_style());
     }
     if worktree.pr.error.is_some() {
         return (icon(icon_style, "!", ""), error_style());
@@ -2873,7 +2873,7 @@ fn worktree_git_column(
     icon_style: IconStyle,
 ) -> (&'static str, Style) {
     if matches!(worktree.kind, view::WorktreeKind::DefaultBranch) {
-        return ("", muted_style());
+        return (" ", muted_style());
     }
     if status_count(&worktree.status_label, "dirty").is_some() {
         (
@@ -2901,7 +2901,7 @@ fn worktree_ci_column(
     icon_style: IconStyle,
 ) -> (&'static str, Style) {
     if matches!(worktree.kind, view::WorktreeKind::DefaultBranch) {
-        return ("", muted_style());
+        return (" ", muted_style());
     }
     let Some(summary) = &worktree.pr.summary else {
         return ("·", muted_style());
@@ -2914,7 +2914,7 @@ fn worktree_ci_column(
 
 fn worktree_comments_column(worktree: &view::WorktreeRow) -> (String, Style) {
     if matches!(worktree.kind, view::WorktreeKind::DefaultBranch) {
-        return (String::new(), muted_style());
+        return (" ".to_string(), muted_style());
     }
     let label = if let Some(details) = &worktree.pr.details {
         let unresolved = details.comments.len()
@@ -2959,7 +2959,7 @@ fn worktree_comments_column(worktree: &view::WorktreeRow) -> (String, Style) {
 
 fn worktree_error_column(worktree: &view::WorktreeRow) -> (&'static str, Style) {
     if matches!(worktree.kind, view::WorktreeKind::DefaultBranch) {
-        return ("", muted_style());
+        return (" ", muted_style());
     }
     if worktree.pr.error.is_some() || worktree.agent_state == AgentState::ExitedError {
         ("!", error_style())
@@ -3487,6 +3487,33 @@ mod tests {
     }
 
     #[test]
+    fn default_branch_row_preserves_column_alignment() {
+        let mut config = test_config();
+        config.worktree_columns = vec!["url".to_string()];
+        let mut main = test_session("main", AgentState::Idle);
+        main.wt_columns
+            .insert("url".to_string(), "main-url".to_string());
+        let mut feature = test_session("feature", AgentState::Running);
+        feature
+            .wt_columns
+            .insert("url".to_string(), "feature-url".to_string());
+        let sessions = vec![main, feature];
+        let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+        model.worktrees[0].kind = WorktreeKind::DefaultBranch;
+        let buffer = render_to_buffer(&model, 140, 30);
+        let (main_x, main_y) = sidebar_cell_containing(&buffer, "main-url");
+        let (feature_x, feature_y) = sidebar_cell_containing(&buffer, "feature-url");
+
+        assert_eq!(
+            main_x,
+            feature_x,
+            "default row should keep configured columns aligned\nmain: {main_row:?}\nfeature: {feature_row:?}",
+            main_row = line_text(&buffer, main_y),
+            feature_row = line_text(&buffer, feature_y),
+        );
+    }
+
+    #[test]
     fn renders_nerd_font_worktree_icons_when_configured() {
         let mut config = test_config();
         config.icon_style = IconStyle::NerdFont;
@@ -3873,6 +3900,22 @@ mod tests {
         (buffer.area.y..buffer.area.y + buffer.area.height)
             .find(|&y| line_text(buffer, y).contains(expected))
             .unwrap_or_else(|| panic!("expected buffer to contain line fragment {expected:?}"))
+    }
+
+    fn sidebar_cell_containing(buffer: &Buffer, expected: &str) -> (u16, u16) {
+        let expected = expected.chars().collect::<Vec<_>>();
+        for y in buffer.area.y..buffer.area.y + buffer.area.height {
+            for x in buffer.area.x..buffer.area.x + buffer.area.width.min(56) {
+                if expected.iter().enumerate().all(|(offset, expected)| {
+                    let x = x + offset as u16;
+                    x < buffer.area.x + buffer.area.width
+                        && buffer[(x, y)].symbol() == expected.to_string()
+                }) {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("expected sidebar to contain line fragment {expected:?}")
     }
 
     fn test_config() -> Config {
