@@ -18,6 +18,12 @@ Useful options:
 
 All temporary demo state is kept under `target/screenshots/` and can be deleted after debugging.
 
+Timeout controls:
+
+- `PRISM_DEMO_VHS_SMOKE_TIMEOUT` controls the small VHS recorder smoke check. Default: `30` seconds.
+- `PRISM_DEMO_VHS_TIMEOUT` controls the full VHS recording. Default: `300` seconds.
+- `PRISM_DEMO_CHROME_BINARY` points VHS at a specific Chrome/Chromium binary by placing a sandbox-local `chrome` wrapper first on `PATH`. If unset, the harness uses a cached go-rod managed Chromium from `~/.cache/rod/browser/` when one is available.
+
 ## Architecture
 
 `scripts/screenshot.sh` is the public entrypoint. It creates a timestamped sandbox under `target/screenshots/`, then delegates to `scripts/screenshots/run.sh`.
@@ -84,6 +90,14 @@ If a shim logs `UNSUPPORTED`, add the smallest deterministic behavior needed by 
 
 On failure, the script prints the sandbox path, shim log path, `run.env` path, and a rerun command using `--keep --skip-build`.
 
+## Known VHS Browser Workaround
+
+VHS uses go-rod to launch a Chrome-family browser and navigate to a local `ttyd` page. Some system Chromium builds can hang before the tape commands run. In that failure mode, the smoke tape prints `File: ...` and then times out without creating a GIF.
+
+The harness currently has a narrow workaround: if `PRISM_DEMO_CHROME_BINARY` is set, or if a cached go-rod managed Chromium exists under `~/.cache/rod/browser/`, it creates a sandbox-local `chrome` wrapper before running VHS. That keeps the workaround inside the screenshot sandbox and avoids changing the user's system browser.
+
+This is intentionally a compatibility hack, not the long-term dependency model. A better implementation should make the recorder browser an explicit, pinned screenshot dependency with a preflight that proves headless Chromium can load local HTTP before VHS runs. If provisioning a managed browser becomes necessary, it should be an explicit setup step with a documented version and checksum, not an implicit download hidden inside normal GIF generation.
+
 ## Refresh Checklist
 
 1. Run `./scripts/screenshot.sh --check` and fix missing local dependencies or unsupported shim calls.
@@ -91,3 +105,5 @@ On failure, the script prints the sandbox path, shim log path, `run.env` path, a
 3. Visually inspect `docs/prism-demo.gif` for the expected worktree navigation, active agent progress, OpenCode/tmux session, plan-mode moment, and PR/CI or review-fix action.
 4. If needed, inspect `target/screenshots/<run>/logs/` and rerun with `--frames` for frame-level debugging.
 5. Run `scripts/full-check.sh` before committing code or docs changes.
+
+If the VHS smoke check times out, the failure is before Prism starts. Check local VHS browser/ttyd startup first, then rerun with a larger `PRISM_DEMO_VHS_SMOKE_TIMEOUT` only if the recorder is known to be slow.
