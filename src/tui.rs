@@ -210,7 +210,6 @@ pub(crate) struct OpencodeEventResult {
 
 pub(crate) struct PlanRunResult {
     pub repo_root: PathBuf,
-    pub scope_path: PathBuf,
     pub run_id: String,
     pub result: Result<(), String>,
 }
@@ -271,6 +270,18 @@ fn preferred_plan_step(run: &PersistedPlanRun) -> usize {
         .or_else(|| run.steps.iter().max_by_key(|step| step.step))
         .map(|step| step.step)
         .unwrap_or(run.run.selected_step)
+}
+
+fn plan_run_status_sort_key(status: PlanRunStatus) -> u8 {
+    match status {
+        PlanRunStatus::Running => 0,
+        PlanRunStatus::Queued => 1,
+        PlanRunStatus::Paused => 2,
+        PlanRunStatus::Failed => 3,
+        PlanRunStatus::Aborted => 4,
+        PlanRunStatus::Draft => 5,
+        PlanRunStatus::Done => 6,
+    }
 }
 
 #[derive(Default)]
@@ -343,7 +354,7 @@ impl Tui {
             focused_panel: PanelFocus::Repos,
             main_focused: false,
             repo_main_view: view::RepoMainView::Github,
-            worktree_main_view: view::WorktreeMainView::Plan,
+            worktree_main_view: view::WorktreeMainView::Details,
             selected_worktree_by_repo: BTreeMap::new(),
             pr_poll_tx,
             pr_poll_rx,
@@ -701,7 +712,6 @@ impl Tui {
                     pending_g = false;
                     if self.focused_panel == PanelFocus::Status {
                         self.show_message("focus repos or worktrees to run plan mode")?;
-                    } else if self.focus_existing_plan_panel() {
                     } else if self.focused_panel == PanelFocus::Repos {
                         if let Err(error) = self.start_selected_repo_plan_run(&mut runtime) {
                             self.show_error("plan mode failed", &error)?;
@@ -1641,8 +1651,6 @@ impl Tui {
         while let Ok(result) = self.plan_run_rx.try_recv() {
             changed = true;
             self.load_plan_run_snapshot(&result.repo_root, &result.run_id);
-            self.active_plan_runs
-                .insert(result.scope_path.clone(), result.run_id.clone());
             match result.result {
                 Ok(()) => {
                     self.status_message = Some("plan run completed".to_string());
@@ -1706,11 +1714,17 @@ impl Tui {
 
     pub(crate) fn remember_plan_run(&mut self, run: PersistedPlanRun) -> bool {
         let run_id = run.run.id.clone();
+        let scope_path = run.run.scope_path.clone();
         let selected_step = self.resolved_plan_step_selection(&run);
         self.selected_plan_step_by_run
             .insert(run_id.clone(), selected_step);
-        self.active_plan_runs
-            .insert(run.run.scope_path.clone(), run_id.clone());
+        let selected_run_is_known = self
+            .active_plan_runs
+            .get(&scope_path)
+            .is_some_and(|selected| selected == &run_id || self.plan_runs.contains_key(selected));
+        if !selected_run_is_known {
+            self.active_plan_runs.insert(scope_path, run_id.clone());
+        }
         let changed = self.plan_runs.get(&run_id) != Some(&run);
         self.plan_runs.insert(run_id, run);
         changed
@@ -1727,7 +1741,8 @@ impl Tui {
             return None;
         }
         let (repo, run_id) = self.selected_plan_run_id()?;
-        let mut run = self.plan_runs.get(run_id)?.clone();
+        let mut run = self.plan_runs.get(&run_id)?.clone();
+        let run_scope_path = run.run.scope_path.clone();
         run.run.selected_step = self.resolved_plan_step_selection(&run);
         let output_lines = crate::observability::with_writable_db(&repo, |conn| {
             load_output_lines(conn, &run.run.id, run.run.selected_step)
@@ -1751,35 +1766,103 @@ impl Tui {
         }
         Some(view::PlanDashboard {
             run,
+            runs: self.plan_run_summaries_for_scope(&repo.root, &run_scope_path, Some(&run_id)),
             output_lines,
             output_state,
         })
     }
 
-    fn selected_plan_run_id(&self) -> Option<(Repository, &String)> {
+    fn selected_plan_run_id(&self) -> Option<(Repository, String)> {
         let (repo, scope_path) = self.selected_plan_scope()?;
-        let run_id = self
+        let exact_runs = self.plan_run_ids_for_scope(&repo.root, &scope_path);
+        let (scope_path, run_ids) = if exact_runs.is_empty() && scope_path != repo.root {
+            let repo_runs = self.plan_run_ids_for_scope(&repo.root, &repo.root);
+            (repo.root.clone(), repo_runs)
+        } else {
+            (scope_path, exact_runs)
+        };
+        let selected = self
             .active_plan_runs
             .get(&scope_path)
-            .or_else(|| self.active_plan_runs.get(&repo.root))?;
-        Some((repo, run_id))
+            .filter(|run_id| run_ids.iter().any(|candidate| candidate == *run_id))
+            .cloned()
+            .or_else(|| run_ids.first().cloned())?;
+        Some((repo, selected))
     }
 
-    fn focus_existing_plan_panel(&mut self) -> bool {
-        if self.selected_plan_run_id().is_none() {
+    fn plan_run_ids_for_scope(&self, repo_root: &Path, scope_path: &Path) -> Vec<String> {
+        let repo_root = repo_root.display().to_string();
+        let mut runs = self
+            .plan_runs
+            .values()
+            .filter(|run| {
+                run.run.repo_root == repo_root
+                    && run.run.scope_path == scope_path
+                    && run.run.archived_unix_ms.is_none()
+            })
+            .collect::<Vec<_>>();
+        runs.sort_by_key(|run| {
+            (
+                plan_run_status_sort_key(run.run.status),
+                std::cmp::Reverse(run.run.updated_unix_ms),
+            )
+        });
+        runs.into_iter().map(|run| run.run.id.clone()).collect()
+    }
+
+    fn plan_run_summaries_for_scope(
+        &self,
+        repo_root: &Path,
+        scope_path: &Path,
+        selected_run_id: Option<&str>,
+    ) -> Vec<view::PlanRunSummary> {
+        let selected = self.active_plan_runs.get(scope_path);
+        self.plan_run_ids_for_scope(repo_root, scope_path)
+            .into_iter()
+            .filter_map(|run_id| {
+                let run = self.plan_runs.get(&run_id)?;
+                Some(view::PlanRunSummary {
+                    id: run.run.id.clone(),
+                    plan_display: run.run.plan_display.clone(),
+                    scope_path: run.run.scope_path.display().to_string(),
+                    status: run.run.status,
+                    updated_unix_ms: run.run.updated_unix_ms,
+                    selected: selected_run_id
+                        .map(|selected| selected == run_id.as_str())
+                        .unwrap_or(selected == Some(&run_id)),
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn move_plan_run_selection(&mut self, direction: isize) -> bool {
+        let Some((repo, selected_run_id)) = self.selected_plan_run_id() else {
+            return false;
+        };
+        let Some(selected_run) = self.plan_runs.get(&selected_run_id) else {
+            return false;
+        };
+        let scope_path = selected_run.run.scope_path.clone();
+        let run_ids = self.plan_run_ids_for_scope(&repo.root, &scope_path);
+        if run_ids.len() < 2 {
             return false;
         }
-        match self.focused_panel {
-            PanelFocus::Worktrees => {
-                self.worktree_main_view = view::WorktreeMainView::Plan;
-                true
+        let current = run_ids
+            .iter()
+            .position(|run_id| run_id == &selected_run_id)
+            .unwrap_or(0);
+        let next = if direction < 0 {
+            if current == 0 {
+                run_ids.len() - 1
+            } else {
+                current.saturating_sub(direction.unsigned_abs())
             }
-            PanelFocus::Repos => {
-                self.focused_panel = PanelFocus::Status;
-                true
-            }
-            PanelFocus::Status => true,
-        }
+        } else {
+            (current + direction as usize) % run_ids.len()
+        };
+        self.active_plan_runs
+            .insert(scope_path, run_ids[next].clone());
+        true
     }
 
     fn poll_auto_runs(&mut self) -> bool {
@@ -1902,6 +1985,7 @@ impl Tui {
                 .ok()
                 .flatten()
         })?;
+        let run_scope_path = run.run.scope_path.clone();
         run.run.selected_step = self.resolved_plan_step_selection(&run);
         let output_lines = crate::observability::with_writable_db(repo, |conn| {
             load_output_lines(conn, &run.run.id, run.run.selected_step)
@@ -1925,6 +2009,7 @@ impl Tui {
         }
         Some(view::PlanDashboard {
             run,
+            runs: self.plan_run_summaries_for_scope(&repo.root, &run_scope_path, Some(plan_run_id)),
             output_lines,
             output_state,
         })
@@ -2637,27 +2722,52 @@ mod tests {
         tui.select_worktree(1);
         tui.remember_plan_run(test_plan_run("plan", "/repo-one/feature-one"));
 
-        assert_eq!(tui.worktree_main_view, WorktreeMainView::Plan);
-        assert!(tui.current_plan_dashboard().is_some());
+        assert_eq!(tui.worktree_main_view, WorktreeMainView::Details);
+        assert!(tui.current_plan_dashboard().is_none());
 
-        tui.move_left();
-
-        assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
-        assert_eq!(tui.worktree_main_view, WorktreeMainView::Plan);
-        assert!(tui.current_plan_dashboard().is_some());
-
-        tui.focus_main();
         tui.move_left();
 
         assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
         assert_eq!(tui.worktree_main_view, WorktreeMainView::Details);
         assert!(tui.current_plan_dashboard().is_none());
 
+        tui.focus_main();
         tui.move_right();
 
         assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
         assert_eq!(tui.worktree_main_view, WorktreeMainView::Plan);
         assert!(tui.current_plan_dashboard().is_some());
+
+        tui.move_left();
+
+        assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
+        assert_eq!(tui.worktree_main_view, WorktreeMainView::Details);
+        assert!(tui.current_plan_dashboard().is_none());
+    }
+
+    #[test]
+    fn plan_runs_for_same_worktree_keep_independent_selection_history() {
+        let mut tui = test_tui();
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.select_worktree(1);
+        tui.worktree_main_view = WorktreeMainView::Plan;
+        let mut first = test_plan_run("plan-a", "/repo-one/feature-one");
+        first.run.updated_unix_ms = 10;
+        let mut second = test_plan_run("plan-b", "/repo-one/feature-one");
+        second.run.updated_unix_ms = 20;
+
+        tui.remember_plan_run(first);
+        tui.remember_plan_run(second);
+
+        let dashboard = tui.current_plan_dashboard().unwrap();
+        assert_eq!(dashboard.run.run.id, "plan-a");
+        assert_eq!(dashboard.runs.len(), 2);
+
+        assert!(tui.move_plan_run_selection(1));
+
+        let dashboard = tui.current_plan_dashboard().unwrap();
+        assert_eq!(dashboard.run.run.id, "plan-b");
+        assert_eq!(dashboard.runs.iter().filter(|run| run.selected).count(), 1);
     }
 
     #[test]

@@ -554,6 +554,13 @@ fn plan_dashboard_lines(
             ]));
         }
     }
+    if dashboard.runs.len() > 1 {
+        lines.push(Line::from(""));
+        lines.push(heading_line("Runs"));
+        for run in dashboard.runs.iter().take(5) {
+            lines.push(plan_run_row(run));
+        }
+    }
     lines.push(Line::from(vec![
         Span::styled("counts queued ", muted_style()),
         Span::raw((counts.queued + counts.starting).to_string()),
@@ -615,6 +622,26 @@ fn plan_dashboard_lines(
     }
     lines.truncate(visible_rows);
     lines
+}
+
+fn plan_run_row(run: &view::PlanRunSummary) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            if run.selected { "▶ " } else { "  " },
+            title_style(run.selected),
+        ),
+        Span::styled(
+            format!("{:<8}", plan_run_status_label(run.status)),
+            plan_run_status_style(run.status),
+        ),
+        Span::styled(
+            format!(" {} ", age_label(run.updated_unix_ms)),
+            muted_style(),
+        ),
+        Span::raw(run.plan_display.clone()),
+        Span::styled(format!("  {}", short_id(&run.id)), muted_style()),
+        Span::styled(format!("  {}", run.scope_path), muted_style()),
+    ])
 }
 
 fn auto_dashboard_lines(
@@ -4114,6 +4141,14 @@ mod tests {
                     },
                 ],
             },
+            runs: vec![crate::view::PlanRunSummary {
+                id: "plan-run".to_string(),
+                plan_display: "plan.md".to_string(),
+                scope_path: "/repo".to_string(),
+                status: PlanRunStatus::Running,
+                updated_unix_ms: 4_000,
+                selected: true,
+            }],
             output_lines: vec![
                 PlanOutputLine {
                     run_id: "plan-run".to_string(),

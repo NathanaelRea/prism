@@ -1242,7 +1242,12 @@ impl Tui {
         if should_execute {
             self.spawn_plan_run_executor(repo, config, persisted);
         }
-        self.focus_status();
+        if self.focused_panel == crate::tui::PanelFocus::Worktrees {
+            self.worktree_main_view = crate::view::WorktreeMainView::Plan;
+            self.main_focused = false;
+        } else {
+            self.focus_status();
+        }
         if should_execute {
             self.show_message("started plan run")?;
         } else {
@@ -1288,7 +1293,6 @@ impl Tui {
             });
             let _ = tx.send(PlanRunResult {
                 repo_root: repo.root,
-                scope_path,
                 run_id,
                 result,
             });
@@ -1698,13 +1702,27 @@ impl Tui {
             return Ok(());
         }
 
-        let answer = self
-            .prompt_choice_dialog(raw, Self::plan_action_choices("Plan Actions", "skip phase"))?;
+        let answer = self.prompt_choice_dialog(
+            raw,
+            Self::plan_action_choices("Plan Actions", "skip phase", true),
+        )?;
         let Some(answer) = answer else {
             return Ok(());
         };
         match answer.trim().to_ascii_lowercase().as_str() {
             "" => Ok(()),
+            "n" | "next" | "next run" => {
+                if !self.move_plan_run_selection(1) {
+                    self.show_message("no later plan run")?;
+                }
+                Ok(())
+            }
+            "v" | "prev" | "previous" | "previous run" => {
+                if !self.move_plan_run_selection(-1) {
+                    self.show_message("no earlier plan run")?;
+                }
+                Ok(())
+            }
             "u" | "pause" | "resume" => {
                 let _ = self.toggle_selected_plan_pause()?;
                 Ok(())
@@ -1738,7 +1756,7 @@ impl Tui {
     ) -> Result<(), String> {
         let answer = self.prompt_choice_dialog(
             raw,
-            Self::plan_action_choices("Auto Plan Actions", "skip linked phase"),
+            Self::plan_action_choices("Auto Plan Actions", "skip linked phase", false),
         )?;
         let Some(answer) = answer else {
             return Ok(());
@@ -1772,14 +1790,22 @@ impl Tui {
         }
     }
 
-    fn plan_action_choices(title: &str, skip_label: &str) -> crate::view::ChoiceList {
-        let choices = [
+    fn plan_action_choices(
+        title: &str,
+        skip_label: &str,
+        include_run_navigation: bool,
+    ) -> crate::view::ChoiceList {
+        let mut choices = Vec::new();
+        if include_run_navigation {
+            choices.extend([("n", "next run"), ("v", "previous run")]);
+        }
+        choices.extend([
             ("u", "pause/resume"),
             ("f", "retry failed"),
             ("b", "retry from selected"),
             ("s", skip_label),
             ("x", "abort"),
-        ];
+        ]);
         crate::view::ChoiceList {
             title: title.to_string(),
             choices: choices
@@ -2160,6 +2186,11 @@ impl Tui {
         self.selected_plan_step_by_run.remove(&run_id);
         self.manual_plan_step_selection_by_run.remove(&run_id);
         self.plan_output_state_by_run.remove(&run_id);
+        if self.focused_panel == crate::tui::PanelFocus::Worktrees
+            && self.current_plan_dashboard().is_none()
+        {
+            self.worktree_main_view = crate::view::WorktreeMainView::Details;
+        }
         self.show_message("dismissed plan run")?;
         Ok(true)
     }
