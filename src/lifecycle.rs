@@ -627,7 +627,7 @@ exit 0
     }
 
     #[test]
-    fn delete_worktree_session_kills_tmux_sessions_before_removing_state() {
+    fn delete_worktree_session_kills_tmux_sessions_and_removes_state() {
         let temp = unique_temp_dir("prism-delete-kills-tmux-test");
         fs::create_dir_all(&temp).unwrap();
         let tmux_log = temp.join("tmux.log");

@@ -339,7 +339,7 @@ pub(crate) fn shutdown_stored_server(runtime: &OpencodeRuntime) -> Result<(), St
     let Some(pid) = runtime.server_pid else {
         return Ok(());
     };
-    if !stored_server_process_matches(pid) {
+    if !stored_server_process_matches(pid, runtime.server_port) {
         return Ok(());
     }
     #[cfg(unix)]
@@ -363,19 +363,30 @@ pub(crate) fn shutdown_stored_server(runtime: &OpencodeRuntime) -> Result<(), St
     }
 }
 
-fn stored_server_process_matches(pid: u32) -> bool {
+fn stored_server_process_matches(pid: u32, port: u16) -> bool {
     #[cfg(target_os = "linux")]
     {
         let cmdline = fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
         let args: Vec<&str> = cmdline.split('\0').filter(|arg| !arg.is_empty()).collect();
-        args.windows(2)
-            .any(|window| window[0].ends_with("opencode") && window[1] == "serve")
+        stored_server_args_match(&args, port)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = pid;
+        let _ = (pid, port);
         false
     }
+}
+
+fn stored_server_args_match(args: &[&str], port: u16) -> bool {
+    let port = port.to_string();
+    args.windows(2)
+        .any(|window| window[0].ends_with("opencode") && window[1] == "serve")
+        && args
+            .windows(2)
+            .any(|window| window[0] == "--hostname" && window[1] == "127.0.0.1")
+        && args
+            .windows(2)
+            .any(|window| window[0] == "--port" && window[1] == port)
 }
 
 fn owned_server_processes() -> &'static Mutex<BTreeMap<u32, OwnedServerProcess>> {
@@ -1410,6 +1421,30 @@ mod tests {
     #[test]
     fn server_url_maps_port_to_local_http_url() {
         assert_eq!(server_url(41_234), "http://127.0.0.1:41234");
+    }
+
+    #[test]
+    fn stored_server_args_match_requires_expected_host_and_port() {
+        let args = [
+            "/home/mockuser/.npm/bin/opencode",
+            "serve",
+            "--hostname",
+            "127.0.0.1",
+            "--port",
+            "41234",
+        ];
+
+        assert!(stored_server_args_match(&args, 41_234));
+        assert!(!stored_server_args_match(&args, 41_235));
+        assert!(!stored_server_args_match(
+            &[
+                "/home/mockuser/.npm/bin/opencode",
+                "serve",
+                "--port",
+                "41234"
+            ],
+            41_234,
+        ));
     }
 
     #[test]
