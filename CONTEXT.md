@@ -99,6 +99,10 @@ metadata, latest message/tool/todo state, and bounded output lines. Prism stores
 that state in its own SQLite database under the user's Prism config directory,
 not in the project repository.
 
+Plan phases use OpenCode's `medium` agent variant by default. The selected
+variant is persisted on each `PlanStepRun` and shown in the plan dashboard so
+historical phase output remains explainable.
+
 The TUI `P` launcher creates a persisted plan run for the selected repository or
 worktree, starts sequential execution in the background, and renders the active
 run in the main panel from SQLite snapshots. The tmux-backed plan workflow

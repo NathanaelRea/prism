@@ -124,6 +124,11 @@ impl Session {
         self.prompt_summary = prompt_summary_from_text(initial_prompt);
     }
 
+    pub(crate) fn mark_adopted_with_summary(&mut self, summary: &str) {
+        self.adopted = true;
+        self.prompt_summary = summary.to_string();
+    }
+
     pub(crate) fn background_job_snapshot(&self) -> Self {
         Self {
             repo_index: self.repo_index,
@@ -328,6 +333,32 @@ pub fn write_task_metadata(
             ],
         )
         .map_err(|error| format!("write task metadata: {error}"))?;
+        Ok(())
+    })
+}
+
+pub fn write_task_summary_metadata(
+    repo: &Repository,
+    session: &Session,
+    summary: &str,
+) -> Result<(), String> {
+    observability::with_writable_db(repo, |conn| {
+        conn.execute(
+            "insert into task_metadata (
+                branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
+             ) values (?1, ?2, '', ?3, ?4)
+             on conflict(branch) do update set
+                prompt_summary = excluded.prompt_summary,
+                worktree = excluded.worktree,
+                updated_unix_ms = excluded.updated_unix_ms",
+            params![
+                session.branch.as_str(),
+                summary,
+                session.path_display.as_str(),
+                unix_seconds(),
+            ],
+        )
+        .map_err(|error| format!("write task summary metadata: {error}"))?;
         Ok(())
     })
 }

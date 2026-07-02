@@ -20,11 +20,11 @@ Prism uses a lazygit-style panel model.
 - `Space g o` opens the selected pull request in a browser.
 - `Space g P` pushes the selected branch and creates a pull request if needed.
 - `Space g M` merges the selected pull request.
-- `Space g c` copies a CI-failure prompt.
-- `Space g f` stages a review-fix prompt.
-- `P` opens plan mode in tmux from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through `opencode run`.
+- `Space g c` sends a CI-failure prompt to the selected agent session.
+- `Space g f` sends a review-fix prompt to the selected agent session.
+- `P` focuses an existing selected plan dashboard when one is available; otherwise it opens plan mode from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through `opencode run`.
 - `A` starts or focuses Auto Flow for the selected non-default worktree.
-- `u` pauses/resumes the selected Auto Flow or plan run from Status; paused Auto Flow resumes only after a dialog describes the next step.
+- `u` pauses/resumes the selected Auto Flow or plan run from Status or the active Worktrees plan dashboard; paused Auto Flow resumes only after a dialog describes the next step.
 - `f` retries failed Auto Flow or Plan steps from the active dashboard.
 - `B` retries Auto Flow or Plan execution from the selected step.
 - `s` skips the selected Plan step from the active Plan dashboard.

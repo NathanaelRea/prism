@@ -12,7 +12,7 @@ use crate::{
         AutoImplementationSource, AutoOutputKind, AutoRunMode, AutoRunStatus, AutoStepKey,
         AutoStepRun, AutoStepStatus,
     },
-    opencode::OpencodeStatus,
+    opencode::{OpencodeState, OpencodeStatus},
     plan_run::{
         PlanOutputKind, PlanOutputLine, PlanRunMode, PlanRunStatus, PlanStepRun, PlanStepStatus,
         plan_output_block_key,
@@ -412,8 +412,11 @@ fn worktree_detail_lines(model: &view::FrameModel<'_>) -> Vec<Line<'static>> {
     if !session.prompt_summary.trim().is_empty() {
         lines.push(labelled_line("prompt", session.prompt_summary.clone()));
     }
-    if let Some(status) = &session.opencode_status {
-        lines.extend(opencode_status_lines(status));
+    if session.is_task_branch(model.config) && model.config.default_agent == "opencode" {
+        match &session.opencode_status {
+            Some(status) => lines.extend(opencode_status_lines(status)),
+            None => lines.extend(opencode_not_started_lines()),
+        }
     }
     lines.push(Line::from(""));
     lines.extend(wt_column_detail_lines(session));
@@ -490,23 +493,15 @@ fn plan_dashboard_lines(
                 plan_step_status_label(step.status),
                 plan_step_status_style(step.status),
             ),
+            Span::styled("  variant ", muted_style()),
+            Span::raw(
+                step.agent_variant
+                    .as_deref()
+                    .unwrap_or("default")
+                    .to_string(),
+            ),
         ]));
-        if let Some(session_id) = step.opencode_session_id.as_deref() {
-            lines.push(labelled_line(
-                "opencode session",
-                short_id(session_id).to_string(),
-            ));
-        }
-        if let Some(tool) = step.active_tool.as_deref() {
-            lines.push(labelled_line("tool", tool.to_string()));
-        }
-        if let Some(message) = step.latest_message.as_deref() {
-            lines.push(labelled_line("latest", message.to_string()));
-        }
-        let todos = plan_todo_summary(step);
-        if !todos.is_empty() {
-            lines.push(labelled_line("todos", todos));
-        }
+        lines.extend(plan_opencode_status_lines(step));
         if let Some(error) = step.error.as_deref() {
             lines.push(Line::from(vec![
                 Span::styled("error ", muted_style()),
@@ -1451,11 +1446,18 @@ fn kanban_lane(config: &crate::config::Config, session: &Session) -> Option<Kanb
 
 fn opencode_status_lines(status: &OpencodeStatus) -> Vec<Line<'static>> {
     let session = status.session_id.as_deref().map(short_id).unwrap_or("none");
+    let server = status
+        .server_url
+        .as_deref()
+        .map(short_server)
+        .unwrap_or("none");
     let title = status.title.as_deref().filter(|title| !title.is_empty());
     let mut lines = vec![match title {
         Some(title) => Line::from(vec![
             Span::styled("opencode ", muted_style()),
             Span::raw(status.state.label().to_string()),
+            Span::styled("  server ", muted_style()),
+            Span::raw(server.to_string()),
             Span::styled("  session ", muted_style()),
             Span::raw(session.to_string()),
             Span::raw(format!("  {title}")),
@@ -1463,6 +1465,8 @@ fn opencode_status_lines(status: &OpencodeStatus) -> Vec<Line<'static>> {
         None => Line::from(vec![
             Span::styled("opencode ", muted_style()),
             Span::raw(status.state.label().to_string()),
+            Span::styled("  server ", muted_style()),
+            Span::raw(server.to_string()),
             Span::styled("  session ", muted_style()),
             Span::raw(session.to_string()),
         ]),
@@ -1476,6 +1480,56 @@ fn opencode_status_lines(status: &OpencodeStatus) -> Vec<Line<'static>> {
     let todo = todo_summary(&status.todos);
     if !todo.is_empty() {
         lines.push(labelled_line("todos", todo));
+    }
+    if let Some(updated) = status.last_updated_unix_ms {
+        lines.push(labelled_line("updated", age_label(updated)));
+    }
+    lines
+}
+
+fn opencode_not_started_lines() -> Vec<Line<'static>> {
+    vec![Line::from(vec![
+        Span::styled("opencode ", muted_style()),
+        Span::raw("not started"),
+        Span::styled("  server ", muted_style()),
+        Span::raw("none"),
+        Span::styled("  session ", muted_style()),
+        Span::raw("none"),
+    ])]
+}
+
+fn plan_opencode_status_lines(step: &PlanStepRun) -> Vec<Line<'static>> {
+    let state = step
+        .opencode_state
+        .map(OpencodeState::label)
+        .unwrap_or_else(|| plan_step_status_label(step.status));
+    let server = step
+        .opencode_server_url
+        .as_deref()
+        .map(short_server)
+        .unwrap_or("none");
+    let session = step
+        .opencode_session_id
+        .as_deref()
+        .map(short_id)
+        .unwrap_or("none");
+    let mut lines = vec![Line::from(vec![
+        Span::styled("opencode ", muted_style()),
+        Span::raw(state.to_string()),
+        Span::styled("  server ", muted_style()),
+        Span::raw(server.to_string()),
+        Span::styled("  session ", muted_style()),
+        Span::raw(session.to_string()),
+    ])];
+    if let Some(tool) = step.active_tool.as_deref() {
+        lines.push(labelled_line("tool", tool.to_string()));
+    }
+    if let Some(message) = step.latest_message.as_deref() {
+        lines.push(labelled_line("latest", message.to_string()));
+    }
+    let todos = plan_todo_summary(step);
+    if !todos.is_empty() {
+        lines.push(labelled_line("todos", todos));
     }
     lines
 }
@@ -2601,6 +2655,24 @@ fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
+fn short_server(server_url: &str) -> &str {
+    server_url
+        .strip_prefix("http://")
+        .or_else(|| server_url.strip_prefix("https://"))
+        .unwrap_or(server_url)
+}
+
+fn age_label(updated_unix_ms: u64) -> String {
+    let seconds = now_unix_ms().saturating_sub(updated_unix_ms) / 1000;
+    if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if seconds < 60 * 60 {
+        format!("{}m ago", seconds / 60)
+    } else {
+        format!("{}h ago", seconds / 60 / 60)
+    }
+}
+
 fn todo_summary(todos: &[crate::opencode::OpencodeTodo]) -> String {
     let mut pending = 0;
     let mut active = 0;
@@ -3672,8 +3744,10 @@ mod tests {
                         step: 1,
                         prompt: "do phase one".to_string(),
                         status: PlanStepStatus::Running,
+                        opencode_state: Some(OpencodeState::Busy),
                         opencode_server_url: None,
                         opencode_session_id: Some("abcdefgh1234".to_string()),
+                        agent_variant: Some("medium".to_string()),
                         process_id: None,
                         started_unix_ms: Some(1_000),
                         finished_unix_ms: None,
@@ -3689,8 +3763,10 @@ mod tests {
                         step: 2,
                         prompt: "do phase two".to_string(),
                         status: PlanStepStatus::Queued,
+                        opencode_state: None,
                         opencode_server_url: None,
                         opencode_session_id: None,
+                        agent_variant: None,
                         process_id: None,
                         started_unix_ms: None,
                         finished_unix_ms: None,

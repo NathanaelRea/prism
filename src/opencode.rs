@@ -85,6 +85,19 @@ impl OpencodeState {
         }
     }
 
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "unknown" => Some(Self::Unknown),
+            "starting" | "loading" => Some(Self::Starting),
+            "idle" | "ready" => Some(Self::Idle),
+            "busy" | "running" | "working" => Some(Self::Busy),
+            "retry" | "retrying" => Some(Self::Retry),
+            "error" | "failed" => Some(Self::Error),
+            "offline" | "disconnected" => Some(Self::Offline),
+            _ => None,
+        }
+    }
+
     pub fn agent_state(self) -> AgentState {
         match self {
             Self::Unknown | Self::Starting => AgentState::NeedsRestart,
@@ -1122,15 +1135,7 @@ fn parse_session_state(body: &str, session_id: &str) -> Option<OpencodeState> {
 }
 
 fn parse_state_label(value: &str) -> Option<OpencodeState> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "starting" | "loading" => Some(OpencodeState::Starting),
-        "idle" | "ready" => Some(OpencodeState::Idle),
-        "busy" | "running" | "working" => Some(OpencodeState::Busy),
-        "retry" | "retrying" => Some(OpencodeState::Retry),
-        "error" | "failed" => Some(OpencodeState::Error),
-        "offline" | "disconnected" => Some(OpencodeState::Offline),
-        _ => None,
-    }
+    OpencodeState::parse(value)
 }
 
 fn event_type_state(event_type: &str) -> Option<OpencodeState> {
@@ -1465,8 +1470,11 @@ mod tests {
     #[test]
     fn prompt_submission_bodies_include_session_and_escape_text() {
         assert_eq!(
-            append_prompt_body("ses_123", "hello\n\"world\""),
-            r#"{"sessionID":"ses_123","text":"hello\n\"world\""}"#
+            append_prompt_body(
+                "ses_123",
+                "  hello world\n\"quotes\" and $PATH && true\n--leading-dash"
+            ),
+            r#"{"sessionID":"ses_123","text":"  hello world\n\"quotes\" and $PATH && true\n--leading-dash"}"#
         );
         assert_eq!(submit_prompt_body("ses_123"), r#"{"sessionID":"ses_123"}"#);
     }
