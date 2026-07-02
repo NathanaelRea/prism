@@ -3122,6 +3122,7 @@ esac
                 head_sha: "oldsha".to_string(),
                 updated_at: "2026-06-14T11:00:00Z".to_string(),
                 check_status: "unknown".to_string(),
+                merge_state_status: "CLEAN".to_string(),
                 comment_count: 1,
                 merged: false,
                 draft: false,

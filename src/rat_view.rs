@@ -2490,7 +2490,9 @@ fn review_decision_for_display(
 }
 
 fn pr_state_label(summary: &crate::github::PrSummary) -> &'static str {
-    if summary.merged {
+    if pr_has_merge_conflict(summary) {
+        "conflict"
+    } else if summary.merged {
         "merged"
     } else if summary.draft {
         "draft"
@@ -2513,6 +2515,9 @@ fn review_label(decision: &str) -> &str {
 }
 
 fn pr_state_icon(summary: &crate::github::PrSummary, icon_style: IconStyle) -> &'static str {
+    if pr_has_merge_conflict(summary) {
+        return icon(icon_style, "⚔", "");
+    }
     if icon_style == IconStyle::NerdFont {
         return if summary.merged {
             ""
@@ -2533,6 +2538,10 @@ fn pr_state_icon(summary: &crate::github::PrSummary, icon_style: IconStyle) -> &
     } else {
         "×"
     }
+}
+
+fn pr_has_merge_conflict(summary: &crate::github::PrSummary) -> bool {
+    summary.merge_state_status.eq_ignore_ascii_case("DIRTY")
 }
 
 fn ci_icon(
@@ -3158,7 +3167,9 @@ fn diff_text_style(kind: PlanOutputKind, text: &str) -> Style {
 }
 
 fn pr_state_style(summary: &crate::github::PrSummary) -> Style {
-    if summary.merged {
+    if pr_has_merge_conflict(summary) {
+        error_style()
+    } else if summary.merged {
         Style::default()
             .fg(Color::Magenta)
             .add_modifier(Modifier::BOLD)
@@ -3214,7 +3225,9 @@ fn pr_check_style(status: &str) -> Style {
 }
 
 fn pr_style(summary: &crate::github::PrSummary) -> Style {
-    if summary.merged {
+    if pr_has_merge_conflict(summary) {
+        Style::default().fg(Color::Red)
+    } else if summary.merged {
         Style::default().fg(Color::Magenta)
     } else if summary.draft {
         muted_style()
@@ -3477,6 +3490,16 @@ mod tests {
 
         assert_eq!(label, "✓");
         assert_eq!(style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn pr_merge_conflict_uses_conflict_icon() {
+        let mut summary = test_pr_summary();
+        summary.merge_state_status = "DIRTY".to_string();
+
+        assert_eq!(pr_state_label(&summary), "conflict");
+        assert_eq!(pr_state_icon(&summary, IconStyle::Unicode), "⚔");
+        assert_eq!(pr_state_style(&summary).fg, Some(Color::Red));
     }
 
     #[test]
@@ -3861,6 +3884,7 @@ mod tests {
             head_sha: "abc123".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             check_status: "failed".to_string(),
+            merge_state_status: "CLEAN".to_string(),
             comment_count: 5,
             merged: false,
             draft: false,

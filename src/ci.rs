@@ -193,6 +193,7 @@ mod tests {
                     head_sha: "abc123".to_string(),
                     updated_at: "2026-06-14T12:00:00Z".to_string(),
                     check_status: "failed".to_string(),
+                    merge_state_status: "CLEAN".to_string(),
                     comment_count: 0,
                     merged: false,
                     draft: false,

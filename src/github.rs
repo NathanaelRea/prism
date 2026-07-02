@@ -52,6 +52,7 @@ pub struct PrSummary {
     pub head_sha: String,
     pub updated_at: String,
     pub check_status: String,
+    pub merge_state_status: String,
     pub comment_count: u64,
     pub merged: bool,
     pub draft: bool,
@@ -60,7 +61,7 @@ pub struct PrSummary {
 impl PrSummary {
     pub fn signature(&self) -> String {
         format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.number,
             self.state,
             self.review_decision,
@@ -69,6 +70,7 @@ impl PrSummary {
             self.head_sha,
             self.updated_at,
             self.check_status,
+            self.merge_state_status,
             self.comment_count
         )
     }
@@ -221,6 +223,8 @@ struct GithubPullRequest {
         deserialize_with = "deserialize_status_rollup"
     )]
     status_check_rollup: GithubStatusCheckRollup,
+    #[serde(default, rename = "mergeStateStatus")]
+    merge_state_status: String,
     #[serde(default)]
     merged: Option<bool>,
     #[serde(default, rename = "mergedAt")]
@@ -458,8 +462,8 @@ pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
         conn.query_row(
             "select
                 number, title, body, url, state, review_decision, requested_reviewers,
-                head_ref, base_ref, head_sha, updated_at, check_status, comment_count, merged,
-                draft, last_refreshed
+                head_ref, base_ref, head_sha, updated_at, check_status, merge_state_status,
+                comment_count, merged, draft, last_refreshed
               from pr_cache
               where branch = ?1",
             params![branch],
@@ -478,11 +482,12 @@ pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
                         head_sha: row.get(9)?,
                         updated_at: row.get(10)?,
                         check_status: row.get(11)?,
-                        comment_count: row_u64(row, 12)?,
-                        merged: row.get(13)?,
-                        draft: row.get(14)?,
+                        merge_state_status: row.get(12)?,
+                        comment_count: row_u64(row, 13)?,
+                        merged: row.get(14)?,
+                        draft: row.get(15)?,
                     },
-                    row.get::<_, String>(15)?,
+                    row.get::<_, String>(16)?,
                 ))
             },
         )
@@ -837,6 +842,7 @@ query($owner: String!, $name: String!) {
         baseRefName
         headRefOid
         updatedAt
+        mergeStateStatus
         merged
         isDraft
         comments {
@@ -939,6 +945,7 @@ fn pr_summary_from_node(node: &GithubPullRequest) -> Option<PrSummary> {
         head_sha: node.head_ref_oid.clone(),
         updated_at: node.updated_at.clone(),
         check_status: check_status_from_contexts(&status_contexts_for_pr(node)),
+        merge_state_status: node.merge_state_status.clone(),
         comment_count: node.comments.total_count + node.review_threads.total_count,
         merged: merged_status_from_node(node),
         draft: node.is_draft,
@@ -966,6 +973,7 @@ fn fetch_pr_summary(
         "headRefOid",
         "updatedAt",
         "statusCheckRollup",
+        "mergeStateStatus",
         "mergedAt",
         "isDraft",
     ]
@@ -1504,6 +1512,7 @@ pub(crate) fn migrate_pr_cache_schema(conn: &rusqlite::Connection) -> Result<(),
           head_sha text not null,
           updated_at text not null,
           check_status text not null,
+          merge_state_status text not null default '',
           comment_count integer not null default 0,
           merged integer not null,
           draft integer not null,
@@ -1537,6 +1546,13 @@ pub(crate) fn migrate_pr_cache_schema(conn: &rusqlite::Connection) -> Result<(),
             [],
         )
         .map_err(|error| format!("migrate pr_cache comment_count column: {error}"))?;
+    }
+    if !table_has_column(conn, "pr_cache", "merge_state_status")? {
+        conn.execute(
+            "alter table pr_cache add column merge_state_status text not null default ''",
+            [],
+        )
+        .map_err(|error| format!("migrate pr_cache merge_state_status column: {error}"))?;
     }
     if !table_has_column(conn, "pr_cache", "requested_reviewers")? {
         conn.execute(
@@ -1679,9 +1695,9 @@ pub fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result
         conn.execute(
             "insert into pr_cache (
                 branch, number, title, body, url, state, review_decision, requested_reviewers,
-                head_ref, base_ref, head_sha, updated_at, check_status, comment_count, merged,
-                draft, last_refreshed, refreshed_unix_ms
-             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
+                head_ref, base_ref, head_sha, updated_at, check_status, merge_state_status,
+                comment_count, merged, draft, last_refreshed, refreshed_unix_ms
+             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
               on conflict(branch) do update set
                 number = excluded.number,
                 title = excluded.title,
@@ -1695,6 +1711,7 @@ pub fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result
                 head_sha = excluded.head_sha,
                 updated_at = excluded.updated_at,
                 check_status = excluded.check_status,
+                merge_state_status = excluded.merge_state_status,
                 comment_count = excluded.comment_count,
                 merged = excluded.merged,
                 draft = excluded.draft,
@@ -1714,6 +1731,7 @@ pub fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result
                 summary.head_sha.as_str(),
                 summary.updated_at.as_str(),
                 summary.check_status.as_str(),
+                summary.merge_state_status.as_str(),
                 comment_count,
                 summary.merged,
                 summary.draft,
@@ -1883,6 +1901,7 @@ mod tests {
             head_sha: "abc123".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             check_status: "failed".to_string(),
+            merge_state_status: "CLEAN".to_string(),
             comment_count: 2,
             merged: false,
             draft: false,
@@ -1934,6 +1953,7 @@ mod tests {
         let prism_dir = repo.prism_dir();
 
         assert_eq!(loaded.summary.as_ref().unwrap().number, 42);
+        assert_eq!(loaded.summary.as_ref().unwrap().merge_state_status, "CLEAN");
         let loaded_details = loaded.details.as_ref().unwrap();
         assert_eq!(loaded_details.comments[0].author, "reviewer");
         assert_eq!(loaded_details.comments[0].body, "please fix\nthis");
@@ -2237,6 +2257,7 @@ mod tests {
                     "baseRefName": "main",
                     "headRefOid": "abc123",
                     "updatedAt": "2026-01-01T00:00:00Z",
+                    "mergeStateStatus": "DIRTY",
                     "merged": false,
                     "isDraft": false,
                     "comments": {"totalCount": 2},
@@ -2276,6 +2297,7 @@ mod tests {
         assert_eq!(summaries[0].requested_reviewers, vec!["alice", "backend"]);
         assert_eq!(summaries[0].comment_count, 5);
         assert_eq!(summaries[0].check_status, "passed");
+        assert_eq!(summaries[0].merge_state_status, "DIRTY");
     }
 
     #[test]
@@ -2495,6 +2517,7 @@ JSON
             head_sha: head_sha.to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             check_status: "failed".to_string(),
+            merge_state_status: "CLEAN".to_string(),
             comment_count,
             merged: false,
             draft: false,
