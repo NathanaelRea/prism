@@ -116,8 +116,9 @@ fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>)
                     Span::raw(repo.label.clone()),
                     Span::styled(format!("  {}", repo.health), health_style(&repo.health)),
                 ]);
+                let focused = model.focus == PanelFocus::Repos && !model.main_focused;
                 ListItem::new(line).style(if repo.selected {
-                    selected_style(model.focus == PanelFocus::Repos && !model.main_focused)
+                    selected_sidebar_row_style(focused)
                 } else {
                     Style::default()
                 })
@@ -132,7 +133,15 @@ fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>)
             muted_style(),
         ));
     }
+    let selected_row = model
+        .repos
+        .iter()
+        .position(|repo| repo.selected)
+        .map(|row| row as u16);
     frame.render_widget(List::new(rows).block(panel_block(title, focused)), area);
+    if let Some(row) = selected_row {
+        render_selected_row_outline(frame, area, row, focused);
+    }
 }
 
 fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>) {
@@ -216,8 +225,9 @@ fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<
                     muted_style(),
                 )
             }));
+            let focused = model.focus == PanelFocus::Worktrees && !model.main_focused;
             ListItem::new(Line::from(spans)).style(if worktree.selected {
-                selected_style(model.focus == PanelFocus::Worktrees && !model.main_focused)
+                selected_sidebar_row_style(focused)
             } else {
                 Style::default()
             })
@@ -232,7 +242,31 @@ fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<
             muted_style(),
         ));
     }
+    let selected_row = model
+        .worktrees
+        .iter()
+        .position(|worktree| worktree.selected)
+        .map(|row| row as u16 + 1);
     frame.render_widget(List::new(rows).block(panel_block(title, focused)), area);
+    if let Some(row) = selected_row {
+        render_selected_row_outline(frame, area, row, focused);
+    }
+}
+
+fn render_selected_row_outline(frame: &mut Frame<'_>, area: Rect, row: u16, focused: bool) {
+    if area.width < 2 || area.height < 3 {
+        return;
+    }
+    let y = area.y.saturating_add(1).saturating_add(row);
+    if y >= area.y.saturating_add(area.height).saturating_sub(1) {
+        return;
+    }
+    let style = selected_sidebar_outline_style(focused);
+    frame.render_widget(Paragraph::new("█").style(style), Rect::new(area.x, y, 1, 1));
+    frame.render_widget(
+        Paragraph::new("█").style(style),
+        Rect::new(area.x + area.width - 1, y, 1, 1),
+    );
 }
 
 fn render_main(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>) {
@@ -2936,6 +2970,31 @@ fn selected_style(focused: bool) -> Style {
     }
 }
 
+fn selected_sidebar_row_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .underline_color(highlight_color())
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else {
+        Style::default()
+            .underline_color(Color::DarkGray)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+}
+
+fn selected_sidebar_outline_style(focused: bool) -> Style {
+    let style = if focused {
+        highlight_style()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    if focused {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
+}
+
 fn attention_style() -> Style {
     Style::default()
         .fg(Color::Yellow)
@@ -3155,7 +3214,15 @@ mod tests {
         assert_region_contains(&buffer, 0..56, 0..30, "[1] Status");
         assert_region_contains(&buffer, 0..56, 0..30, "[2] Repos");
         assert_region_contains(&buffer, 0..56, 0..30, "[3] Worktrees");
-        assert_cell_style(&buffer, 0, 20, highlight_style().bg(Color::Reset));
+        let row = find_line(&buffer, "●");
+        assert_cell_style(
+            &buffer,
+            0,
+            row,
+            highlight_style()
+                .bg(Color::Reset)
+                .add_modifier(Modifier::BOLD),
+        );
         assert_region_contains(&buffer, 56..120, 0..29, "Main");
         assert_region_contains(&buffer, 0..56, 0..30, "feature");
         assert!(!line_text(&buffer, 29).contains("normal"));
@@ -3169,7 +3236,15 @@ mod tests {
         let buffer = render_to_buffer(&model, 48, 12);
 
         assert_region_contains(&buffer, 0..48, 0..11, "[2] Repos");
-        assert_cell_style(&buffer, 0, 6, highlight_style().bg(Color::Reset));
+        let row = find_line(&buffer, "repo  ok");
+        assert_cell_style(
+            &buffer,
+            0,
+            row,
+            highlight_style()
+                .bg(Color::Reset)
+                .add_modifier(Modifier::BOLD),
+        );
         assert_region_contains(&buffer, 0..48, 0..11, "repo");
         assert!(!line_text(&buffer, 11).contains("normal"));
     }
@@ -3184,11 +3259,27 @@ mod tests {
 
         assert_cell_style(
             &buffer,
+            0,
+            row,
+            highlight_style()
+                .bg(Color::Reset)
+                .add_modifier(Modifier::BOLD),
+        );
+        assert_cell_style(
+            &buffer,
             4,
             row,
             Style::default()
-                .fg(Color::Black)
-                .bg(highlight_color())
+                .fg(Color::Reset)
+                .bg(Color::Reset)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        );
+        assert_cell_style(
+            &buffer,
+            55,
+            row,
+            highlight_style()
+                .bg(Color::Reset)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -3198,11 +3289,36 @@ mod tests {
 
         assert_cell_style(
             &buffer,
+            0,
+            row,
+            highlight_style()
+                .bg(Color::Reset)
+                .add_modifier(Modifier::BOLD),
+        );
+        assert_cell_style(
+            &buffer,
             5,
             row,
             Style::default()
-                .fg(Color::Black)
-                .bg(highlight_color())
+                .fg(Color::Reset)
+                .bg(Color::Reset)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        );
+        assert_cell_style(
+            &buffer,
+            16,
+            row,
+            Style::default()
+                .fg(Color::Green)
+                .bg(Color::Reset)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        );
+        assert_cell_style(
+            &buffer,
+            55,
+            row,
+            highlight_style()
+                .bg(Color::Reset)
                 .add_modifier(Modifier::BOLD),
         );
     }
