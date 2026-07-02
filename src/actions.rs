@@ -2621,7 +2621,7 @@ impl Tui {
         let selected = context.session_index;
         let branch = self.sessions[selected].branch.clone();
         if self.sessions[selected].is_default_branch(&context.config) {
-            self.show_message("default branch worktree cannot be deleted from Prism")?;
+            self.show_message("default branch worktree cannot be archived from Prism")?;
             return Ok(());
         }
         let path = self.sessions[selected].path.clone();
@@ -2674,7 +2674,8 @@ fn ensure_repo_config_file(path: &Path, include_worktree_columns: bool) -> Resul
     }
     if path.exists() {
         if include_worktree_columns {
-            let mut text = fs::read_to_string(path).unwrap_or_default();
+            let mut text =
+                fs::read_to_string(path).map_err(|error| format!("read config file: {error}"))?;
             if !text.contains("[worktrees]") {
                 if !text.ends_with('\n') && !text.is_empty() {
                     text.push('\n');
