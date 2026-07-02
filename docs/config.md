@@ -4,6 +4,8 @@ Tracked repositories live in `~/.config/prism/repos.toml`.
 
 Global Prism settings live in `~/.config/prism/config.toml`. Press `E` in the TUI to edit this file and reload configuration.
 
+Run `prism config example` to print a complete commented config template, `prism config schema` to print the JSON Schema used by TOML editor tooling, and `prism config paths` to inspect the active config paths and schema URL.
+
 Each repository entry has a path and may have a digit key. Digit keys are used as `Space <digit>` shortcuts in the TUI.
 
 ```toml
@@ -19,6 +21,8 @@ Per-repository Prism state also lives under that repository config directory, no
 Use `R` from Prism to edit repository order, keys, and tracked repositories.
 
 ```toml
+#:schema https://raw.githubusercontent.com/NathanaelRea/prism/main/schemas/config.schema.json
+
 default_base = "main"
 merge_method = "squash"
 
@@ -45,6 +49,8 @@ opencode = "opencode"
 review_fix = "Here are review comments on PR {pr_number}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n{comments}"
 ci_failure = "Here are CI failures on PR {pr_number}.\n\nFix the failing checks. Use the log tails below as the primary clues.\n\nPR: {url}\nBranch: {branch}\nHead SHA: {head_sha}\n\n---\n\n{failures}"
 ```
+
+The `#:schema` line is an optional TOML comment. Prism ignores it, while Taplo-compatible TOML language servers can use it for completions, descriptions, enum values, and type validation.
 
 Prism treats `main` as the default branch by default. The default branch is not polled or shown as a pull request branch.
 

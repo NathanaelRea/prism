@@ -122,6 +122,37 @@ fn config_prints_effective_repo_config() {
 }
 
 #[test]
+fn config_discovery_commands_print_templates_schema_and_paths() {
+    let temp = TempDir::new("config-discovery");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+
+    let example = run(["config", "example"], &repo, &config_home);
+    assert!(example.status.success(), "{}", stderr(&example));
+    let example_stdout = stdout(&example);
+    assert!(example_stdout.contains("#:schema https://raw.githubusercontent.com/"));
+    assert!(example_stdout.contains("[ui]"));
+    assert!(example_stdout.contains("# [worktrees]"));
+
+    let schema = run(["config", "schema"], &repo, &config_home);
+    assert!(schema.status.success(), "{}", stderr(&schema));
+    let schema_stdout = stdout(&schema);
+    assert!(schema_stdout.contains(r#""title": "Prism Config""#));
+    assert!(schema_stdout.contains(r#""merge_method""#));
+
+    let paths = run(["config", "paths"], &repo, &config_home);
+    assert!(paths.status.success(), "{}", stderr(&paths));
+    let paths_stdout = stdout(&paths);
+    assert!(paths_stdout.contains(&format!(
+        "user_config = {}",
+        config_home.join("prism/config.toml").display()
+    )));
+    assert!(paths_stdout.contains("repo_config = "));
+    assert!(paths_stdout.contains("schema_url = https://raw.githubusercontent.com/"));
+}
+
+#[test]
 #[cfg(unix)]
 fn doctor_reports_repository_and_tool_status() {
     let temp = TempDir::new("doctor");

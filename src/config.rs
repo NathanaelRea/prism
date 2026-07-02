@@ -12,6 +12,87 @@ use crate::session::discover_sessions;
 use crate::util::prism_config_dir;
 
 pub const AGENT_CANDIDATES: [&str; 1] = ["opencode"];
+pub const CONFIG_SCHEMA_URL: &str =
+    "https://raw.githubusercontent.com/NathanaelRea/prism/main/schemas/config.schema.json";
+pub const CONFIG_SCHEMA_JSON: &str = include_str!("../schemas/config.schema.json");
+
+pub fn config_example() -> String {
+    format!(
+        "#:schema {CONFIG_SCHEMA_URL}\n\
+\n\
+# Prism config. Values here may be used in the global user config or a repository config.\n\
+# Global path: ~/.config/prism/config.toml\n\
+# Repository configs override global config for one repository.\n\
+\n\
+# default_agent = \"opencode\"\n\
+# default_base = \"main\"\n\
+# merge_method = \"squash\" # squash, merge, or rebase\n\
+# escape_key = \"esc-esc\" # esc-esc or ctrl-space\n\
+\n\
+# plan_dir = \"plans\"\n\
+# review_packet_dir = \".agent/review\"\n\
+# worktree_command = \"wt\"\n\
+\n\
+# Prism starts local OpenCode servers on deterministic ports in this range.\n\
+# opencode_port_base = 41000\n\
+# opencode_port_span = 1000\n\
+# opencode_shutdown_owned_servers = false\n\
+# opencode_plan_plugin = false\n\
+\n\
+# [layout]\n\
+# sidebar_width = 56\n\
+\n\
+[ui]\n\
+icon_style = \"unicode\" # or \"nerd-font\"\n\
+\n\
+# [worktrees]\n\
+# columns = [\"url\", \"ci.status\", \"vars.localdev\"]\n\
+\n\
+# [tools]\n\
+# opencode = \"opencode\"\n\
+# gh = \"gh\"\n\
+# git = \"git\"\n\
+# tmux = \"tmux\"\n\
+# wt = \"wt\"\n\
+\n\
+# [checks]\n\
+# pre_pr = [\"scripts/full-check.sh\"]\n\
+# pre_push = [\"scripts/full-check.sh\"]\n\
+# review_fix = [\"scripts/full-check.sh\"]\n\
+\n\
+# [auto]\n\
+# merge = false\n\
+# cleanup_after_merge = false\n\
+# review_wait_enabled = true\n\
+# review_reviewer_identities = [\"Copilot\", \"github-copilot\"]\n\
+# review_max_wait_seconds = 300\n\
+# review_poll_interval_seconds = 30\n\
+# review_continue_on_timeout = true\n\
+# ci_wait_enabled = true\n\
+# ci_max_wait_seconds = 1800\n\
+# ci_poll_interval_seconds = 30\n\
+\n\
+# [agents.opencode]\n\
+# command = \"opencode run --format json\"\n\
+# prompt_mode = \"stdin\"\n\
+\n\
+# [prompt_templates]\n\
+# review_fix = \"Here are review comments on PR {{pr_number}}.\\n\\nIf they are applicable, fix them. Otherwise, say why not.\\n\\n---\\n\\n{{comments}}\"\n\
+# ci_failure = \"Here are CI failures on PR {{pr_number}}.\\n\\nFix the failing checks. Use the log tails below as the primary clues.\\n\\nPR: {{url}}\\nBranch: {{branch}}\\nHead SHA: {{head_sha}}\\n\\n---\\n\\n{{failures}}\"\n"
+    )
+}
+
+pub fn user_config_template() -> String {
+    config_example()
+}
+
+pub fn repo_config_template(include_worktree_columns: bool) -> String {
+    let mut text = config_example();
+    if include_worktree_columns {
+        text.push_str("\n[worktrees]\ncolumns = [\"url\", \"vars.localdev\"]\n");
+    }
+    text
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Checks {

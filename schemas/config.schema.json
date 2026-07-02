@@ -1,0 +1,218 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/NathanaelRea/prism/main/schemas/config.schema.json",
+  "title": "Prism Config",
+  "description": "Configuration for Prism user and repository config.toml files.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "default_agent": {
+      "type": "string",
+      "enum": ["opencode", "ask"],
+      "default": "opencode",
+      "description": "Default agent backend. Use ask to prompt for a detected backend on first interactive startup."
+    },
+    "default_base": {
+      "type": "string",
+      "default": "main",
+      "description": "Default branch for this repository. Prism does not treat this branch as a pull request branch."
+    },
+    "plan_dir": {
+      "type": "string",
+      "default": "plans",
+      "description": "Directory used for plan files."
+    },
+    "review_packet_dir": {
+      "type": "string",
+      "default": ".agent/review",
+      "description": "Directory used for review packet files."
+    },
+    "worktree_command": {
+      "type": "string",
+      "default": "wt",
+      "description": "Command used for worktree operations."
+    },
+    "opencode_port_base": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535,
+      "default": 41000,
+      "description": "Base port for Prism-managed OpenCode servers."
+    },
+    "opencode_port_span": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 65535,
+      "default": 1000,
+      "description": "Number of ports in the deterministic OpenCode server port range."
+    },
+    "opencode_shutdown_owned_servers": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether Prism should shut down OpenCode servers it started when Prism exits."
+    },
+    "opencode_plan_plugin": {
+      "type": "boolean",
+      "default": false,
+      "description": "Whether Prism should install and use the OpenCode plan plugin."
+    },
+    "escape_key": {
+      "type": "string",
+      "enum": ["esc-esc", "ctrl-space"],
+      "default": "esc-esc",
+      "description": "Key sequence used to leave embedded terminal sessions."
+    },
+    "merge_method": {
+      "type": "string",
+      "enum": ["squash", "merge", "rebase"],
+      "default": "squash",
+      "description": "GitHub merge method Prism uses for pull requests."
+    },
+    "ui": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "icon_style": {
+          "type": "string",
+          "enum": ["unicode", "nerd-font"],
+          "default": "unicode",
+          "description": "Status icon style. nerd-font requires a Nerd Font in the terminal."
+        }
+      }
+    },
+    "checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "pre_pr": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Commands to run before opening a pull request."
+        },
+        "pre_push": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Commands to run before pushing."
+        },
+        "review_fix": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Commands to run after applying review fixes."
+        }
+      }
+    },
+    "auto": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "merge": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether Auto Flow may merge pull requests."
+        },
+        "cleanup_after_merge": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether Auto Flow should clean up branches/worktrees after merging."
+        },
+        "review_wait_enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether Auto Flow waits for review results."
+        },
+        "review_reviewer_identities": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["Copilot", "github-copilot"],
+          "description": "Reviewer identities Auto Flow treats as automated review feedback."
+        },
+        "review_max_wait_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 300,
+          "description": "Maximum time to wait for review feedback."
+        },
+        "review_poll_interval_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30,
+          "description": "Polling interval while waiting for review feedback."
+        },
+        "review_continue_on_timeout": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether Auto Flow continues when review waiting times out."
+        },
+        "ci_wait_enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether Auto Flow waits for CI."
+        },
+        "ci_max_wait_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 1800,
+          "description": "Maximum time to wait for CI."
+        },
+        "ci_poll_interval_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30,
+          "description": "Polling interval while waiting for CI."
+        }
+      }
+    },
+    "layout": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "sidebar_width": {
+          "type": "integer",
+          "minimum": 20,
+          "maximum": 120,
+          "description": "Preferred sidebar width in terminal columns."
+        }
+      }
+    },
+    "worktrees": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "columns": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["url"],
+          "description": "Extra wt list JSON columns shown in the worktree list."
+        }
+      }
+    },
+    "tools": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Command overrides for external tools."
+    },
+    "agents": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "type": "string",
+            "description": "Command used to run this agent."
+          },
+          "prompt_mode": {
+            "type": "string",
+            "enum": ["interactive", "stdin", "argument", "temp-file"],
+            "description": "How Prism passes prompts to this agent command."
+          }
+        }
+      }
+    },
+    "prompt_templates": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Prompt templates keyed by template name."
+    }
+  }
+}

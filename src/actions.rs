@@ -2730,10 +2730,7 @@ fn ensure_repo_config_file(path: &Path, include_worktree_columns: bool) -> Resul
         }
         return Ok(());
     }
-    let mut text = "# Prism repository config\n# Example:\n# [worktrees]\n# columns = [\"url\", \"vars.localdev\"]\n#\n# [prompt_templates]\n# review_fix = \"Here are review comments on PR {pr_number}.\\n\\nIf they are applicable, fix them. Otherwise, say why not.\\n\\n---\\n\\n{comments}\"\n# ci_failure = \"Here are CI failures on PR {pr_number}.\\n\\nFix the failing checks. Use the log tails below as the primary clues.\\n\\nPR: {url}\\nBranch: {branch}\\nHead SHA: {head_sha}\\n\\n---\\n\\n{failures}\"\n".to_string();
-    if include_worktree_columns {
-        text.push_str("\n[worktrees]\ncolumns = [\"url\", \"vars.localdev\"]\n");
-    }
+    let text = crate::config::repo_config_template(include_worktree_columns);
     fs::write(path, text).map_err(|error| format!("create config file: {error}"))
 }
 
@@ -2744,7 +2741,7 @@ fn ensure_user_config_file(path: &Path) -> Result<(), String> {
     if path.exists() {
         return Ok(());
     }
-    let text = "# Prism user config\n# Applies to all repositories unless overridden by repository config.\n\n[ui]\nicon_style = \"unicode\" # or \"nerd-font\"\n";
+    let text = crate::config::user_config_template();
     fs::write(path, text).map_err(|error| format!("create user config file: {error}"))
 }
 
