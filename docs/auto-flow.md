@@ -57,4 +57,5 @@ Troubleshooting:
 - run `prism config` to inspect effective Auto Flow and check settings
 - run `prism debug logs` or start with `--print-logs --log-level debug` for runtime events
 - use the dashboard controls to pause/resume, retry a failed step, retry from a selected step, abort, or dismiss a completed run
+- if a linked plan phase completed in OpenCode but Prism missed the final signal, focus the Auto Flow status view, select the phase, press `Space p`, then choose `s` to skip/accept that linked phase without rerunning it
 - when draft-plan automation pauses after plan review, inspect `plan.md` in the worktree and resume the run when the plan is acceptable
