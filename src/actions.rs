@@ -1698,13 +1698,13 @@ impl Tui {
             "" => Ok(()),
             "n" | "next" | "next run" => {
                 if !self.move_plan_run_selection(1) {
-                    self.show_message("no later plan run")?;
+                    self.show_message("no other plan run")?;
                 }
                 Ok(())
             }
             "v" | "prev" | "previous" | "previous run" => {
                 if !self.move_plan_run_selection(-1) {
-                    self.show_message("no earlier plan run")?;
+                    self.show_message("no other plan run")?;
                 }
                 Ok(())
             }

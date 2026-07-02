@@ -557,7 +557,13 @@ fn plan_dashboard_lines(
     if dashboard.runs.len() > 1 {
         lines.push(Line::from(""));
         lines.push(heading_line("Runs"));
-        for run in dashboard.runs.iter().take(5) {
+        let selected_run = dashboard
+            .runs
+            .iter()
+            .position(|run| run.selected)
+            .unwrap_or(0);
+        let start = scroll_start(selected_run, 5);
+        for run in dashboard.runs.iter().skip(start).take(5) {
             lines.push(plan_run_row(run));
         }
     }
@@ -3837,6 +3843,31 @@ mod tests {
         assert!(buffer.contains("[-]"));
         assert!(buffer.contains("running command"));
         assert!(buffer.contains("command output"));
+    }
+
+    #[test]
+    fn renders_plan_run_window_around_selected_run() {
+        let config = test_config();
+        let sessions = vec![test_session("feature", AgentState::Running)];
+        let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+        let mut dashboard = test_plan_dashboard(false);
+        dashboard.runs = (1..=8)
+            .map(|index| crate::view::PlanRunSummary {
+                id: format!("plan-run-{index}"),
+                plan_display: format!("plan-{index}.md"),
+                scope_path: "/repo".to_string(),
+                status: PlanRunStatus::Done,
+                updated_unix_ms: 4_000 + index,
+                selected: index == 7,
+            })
+            .collect();
+        model.plan_dashboard = Some(dashboard);
+
+        let buffer = render_to_string(&model, 120, 40);
+
+        assert!(buffer.contains("plan-7.md"));
+        assert!(buffer.contains("▶ done"));
+        assert!(!buffer.contains("plan-1.md"));
     }
 
     #[test]
