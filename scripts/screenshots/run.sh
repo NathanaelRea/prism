@@ -74,6 +74,9 @@ logs_path="$sandbox_path/logs"
 setup_helper="$script_dir/setup-demo.sh"
 tape_template="$script_dir/tapes/prism-demo.tape"
 host_mise_config="${XDG_CONFIG_HOME:-$HOME/.config}/mise/config.toml"
+host_home="${HOME:-}"
+vhs_browser_binary=""
+vhs_browser_source=""
 
 cleanup() {
   local status=$?
@@ -126,6 +129,118 @@ optional_tool() {
   if ! command -v "$tool" >/dev/null 2>&1; then
     warn "optional tool '$tool' was not found; later GIF optimization steps will skip it"
   fi
+}
+
+run_with_timeout() {
+  local seconds="$1"
+  shift
+
+  python3 - "$seconds" "$@" <<'PY'
+import os
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+seconds = float(sys.argv[1])
+cmd = sys.argv[2:]
+
+try:
+    process = subprocess.Popen(cmd, start_new_session=True)
+except FileNotFoundError:
+    print(f"command not found: {cmd[0]}", file=sys.stderr)
+    sys.exit(127)
+
+try:
+    sys.exit(process.wait(timeout=seconds))
+except subprocess.TimeoutExpired:
+    print(f"command timed out after {seconds:g}s: {shlex.join(cmd)}", file=sys.stderr)
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            sys.exit(124)
+        time.sleep(0.1)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    sys.exit(124)
+PY
+}
+
+smoke_vhs_recorder() {
+  local timeout_seconds="${PRISM_DEMO_VHS_SMOKE_TIMEOUT:-30}"
+  local smoke_dir="$sandbox_path/vhs-smoke"
+  local smoke_tape="$smoke_dir/smoke.tape"
+  local smoke_gif="$smoke_dir/smoke.gif"
+  local status
+
+  mkdir -p "$smoke_dir"
+  cat >"$smoke_tape" <<EOF
+Output "$smoke_gif"
+Set Shell "bash"
+Type "printf vhs-smoke"
+Enter
+Sleep 1s
+EOF
+
+  printf 'Running VHS recorder smoke check (timeout: %ss)...\n' "$timeout_seconds"
+  set +e
+  run_with_timeout "$timeout_seconds" vhs "$smoke_tape"
+  status=$?
+  set -e
+
+  if [[ "$status" -eq 124 ]]; then
+    die "VHS recorder smoke check timed out after ${timeout_seconds}s. Check that VHS can launch its browser/ttyd recorder, or rerun with PRISM_DEMO_VHS_SMOKE_TIMEOUT=<seconds>."
+  elif [[ "$status" -ne 0 ]]; then
+    die "VHS recorder smoke check failed with exit code $status"
+  elif [[ ! -s "$smoke_gif" ]]; then
+    die "VHS recorder smoke check did not produce a non-empty GIF: $smoke_gif"
+  fi
+}
+
+find_cached_rod_chrome() {
+  local browser_dir="$host_home/.cache/rod/browser"
+  local candidate
+  local found=""
+
+  [[ -n "$host_home" && -d "$browser_dir" ]] || return 1
+
+  for candidate in "$browser_dir"/chromium-*/chrome; do
+    [[ -x "$candidate" ]] || continue
+    found="$candidate"
+  done
+
+  [[ -n "$found" ]] || return 1
+  printf '%s\n' "$found"
+}
+
+configure_vhs_browser() {
+  local browser="${PRISM_DEMO_CHROME_BINARY:-}"
+  local source="PRISM_DEMO_CHROME_BINARY"
+
+  if [[ -z "$browser" ]]; then
+    if ! browser="$(find_cached_rod_chrome)"; then
+      return 0
+    fi
+    source="cached go-rod Chromium"
+  fi
+
+  [[ -x "$browser" ]] || die "PRISM_DEMO_CHROME_BINARY is not executable: $browser"
+
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'exec %q "$@"\n' "$browser"
+  } >"$sandbox_path/bin/chrome"
+  chmod +x "$sandbox_path/bin/chrome"
+  vhs_browser_binary="$browser"
+  vhs_browser_source="$source"
+  printf 'Using VHS browser (%s): %s\n' "$source" "$browser"
 }
 
 file_size_bytes() {
@@ -306,6 +421,8 @@ printf 'Shim logs: %s\n' "$logs_path"
 printf 'Fake HOME: %s\n' "$HOME"
 printf 'Fake XDG_CONFIG_HOME: %s\n' "$XDG_CONFIG_HOME"
 
+configure_vhs_browser
+
 cat >"$sandbox_path/run.env" <<EOF
 PATH=$PATH
 HOME=$HOME
@@ -315,6 +432,9 @@ XDG_STATE_HOME=$XDG_STATE_HOME
 GIT_CONFIG_GLOBAL=$GIT_CONFIG_GLOBAL
 PRISM_BINARY=$prism_binary
 RECORDER=$(command -v vhs)
+PRISM_DEMO_CHROME_BINARY=${PRISM_DEMO_CHROME_BINARY:-}
+PRISM_DEMO_EFFECTIVE_CHROME_BINARY=$vhs_browser_binary
+PRISM_DEMO_EFFECTIVE_CHROME_SOURCE=$vhs_browser_source
 TERM=$TERM
 COLORTERM=$COLORTERM
 COLUMNS=$COLUMNS
@@ -344,6 +464,7 @@ smoke_opencode_server
 printf 'README.md\nplan-demo.md\n' | "$sandbox_path/bin/fzf" >/dev/null
 printf 'shim clipboard smoke\n' | "$sandbox_path/bin/wl-copy"
 "$sandbox_path/bin/date" +%H:%M:%S >/dev/null
+smoke_vhs_recorder
 
 assert_no_unsupported_shim_calls
 
@@ -379,14 +500,27 @@ sed \
   -e "s|__REPO__|$(escape_sed_replacement "$PRISM_DEMO_REPO")|g" \
   "$tape_template" >"$rendered_tape"
 
+vhs validate "$rendered_tape"
+
 if [[ "$frames" -eq 1 ]]; then
   printf 'Frame directory for this run: %s\n' "$sandbox_path/frames"
 fi
 
+vhs_timeout="${PRISM_DEMO_VHS_TIMEOUT:-300}"
+printf 'Running VHS recording (timeout: %ss)...\n' "$vhs_timeout"
+set +e
 (
   cd "$PRISM_DEMO_REPO"
-  vhs "$rendered_tape"
+  run_with_timeout "$vhs_timeout" vhs "$rendered_tape"
 )
+vhs_status=$?
+set -e
+
+if [[ "$vhs_status" -eq 124 ]]; then
+  die "VHS recording timed out after ${vhs_timeout}s. Inspect $rendered_tape and rerun with PRISM_DEMO_VHS_TIMEOUT=<seconds> if the recorder is just slow."
+elif [[ "$vhs_status" -ne 0 ]]; then
+  die "VHS recording failed with exit code $vhs_status"
+fi
 
 if [[ ! -s "$raw_gif" ]]; then
   die "recording did not produce a non-empty GIF: $raw_gif"

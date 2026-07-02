@@ -14,6 +14,11 @@ Type "./prism --repo ."
 Enter
 Sleep 2s
 
+Type "n"
+Sleep 300ms
+Enter
+Sleep 1s
+
 Type "2"
 Sleep 500ms
 Type "3"
