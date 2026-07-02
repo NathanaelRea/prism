@@ -6,6 +6,8 @@ use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
+use serde_json::Value;
+
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{
@@ -42,13 +44,13 @@ use crate::process::{command_exists, run_capture};
 use crate::repo::Repository;
 use crate::review::build_review_fix_prompt;
 use crate::session::{
-    append_runtime_log, discover_sessions, save_agent_state, write_task_metadata,
-    write_task_summary_metadata,
+    append_runtime_log, archive_worktree_session, discover_sessions, save_agent_state,
+    write_task_metadata, write_task_summary_metadata,
 };
 use crate::tmux::TmuxWindow;
 use crate::tui::{
-    DefaultBranchPollResult, ManagedRepo, OpencodeEventResult, OpencodePollKey, OpencodePollResult,
-    PlanRunResult, PrPollKey, PrPollResult, Tui, WtPollResult,
+    DEFAULT_BRANCH_AGENT_MESSAGE, DefaultBranchPollResult, ManagedRepo, OpencodeEventResult,
+    OpencodePollKey, OpencodePollResult, PlanRunResult, PrPollKey, PrPollResult, Tui, WtPollResult,
 };
 
 enum AutoStartupSource {
@@ -258,16 +260,7 @@ impl Tui {
         let context = self
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
-        if let Some(parent) = context.config.repo_config_path.parent() {
-            fs::create_dir_all(parent).map_err(|error| format!("create config dir: {error}"))?;
-        }
-        if !context.config.repo_config_path.exists() {
-            fs::write(
-                &context.config.repo_config_path,
-                "# Prism repository config\n# Example:\n# [worktrees]\n# columns = [\"url\", \"vars.localdev\"]\n#\n# [prompt_templates]\n# review_fix = \"Here are review comments on PR {pr_number}.\\n\\nIf they are applicable, fix them. Otherwise, say why not.\\n\\n---\\n\\n{comments}\"\n# ci_failure = \"Here are CI failures on PR {pr_number}.\\n\\nFix the failing checks. Use the log tails below as the primary clues.\\n\\nPR: {url}\\nBranch: {branch}\\nHead SHA: {head_sha}\\n\\n---\\n\\n{failures}\"\n",
-            )
-            .map_err(|error| format!("create config file: {error}"))?;
-        }
+        ensure_repo_config_file(&context.config.repo_config_path, false)?;
         let editor =
             editor_command().ok_or_else(|| "no editor found; set VISUAL or EDITOR".to_string())?;
         raw.suspend()?;
@@ -290,6 +283,17 @@ impl Tui {
         self.start_wt_column_poll();
         self.show_message("config reloaded")?;
         Ok(())
+    }
+
+    pub(crate) fn edit_worktree_columns(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let context = self
+            .selected_repo_context()
+            .ok_or_else(|| "no selected repository".to_string())?;
+        ensure_repo_config_file(&context.config.repo_config_path, true)?;
+        self.edit_config(raw)
     }
 
     pub(crate) fn add_repository(
@@ -946,7 +950,7 @@ impl Tui {
             return Ok(());
         };
         if self.sessions[context.session_index].is_default_branch(&context.config) {
-            self.show_message("default branch does not have an agent session")?;
+            self.show_message(DEFAULT_BRANCH_AGENT_MESSAGE)?;
             return Ok(());
         }
         let session = self.sessions[context.session_index].background_job_snapshot();
@@ -2636,6 +2640,34 @@ impl Tui {
         Ok(())
     }
 
+    pub(crate) fn archive_session(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let Some(context) = self.selected_worktree_context() else {
+            return Ok(());
+        };
+        let selected = context.session_index;
+        let branch = self.sessions[selected].branch.clone();
+        if self.sessions[selected].is_default_branch(&context.config) {
+            self.show_message("default branch worktree cannot be archived from Prism")?;
+            return Ok(());
+        }
+        let path = self.sessions[selected].path.clone();
+        let path_display = self.sessions[selected].path_display.clone();
+        let warnings = self.sessions[selected].deletion_warnings();
+        if !self.confirm_archive_dialog(raw, &branch, &path_display, &warnings)? {
+            return Ok(());
+        }
+        archive_worktree_session(&context.repo, &self.sessions[selected])?;
+        if self.selected_worktree_by_repo.get(&context.repo.root) == Some(&path) {
+            self.selected_worktree_by_repo.remove(&context.repo.root);
+        }
+        self.refresh_sessions()?;
+        self.show_message("archived worktree; files and branch were left intact")?;
+        Ok(())
+    }
+
     pub(crate) fn delete_session(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
@@ -2663,6 +2695,31 @@ impl Tui {
         self.show_message("deleted local session data, worktree, and branch")?;
         Ok(())
     }
+}
+
+fn ensure_repo_config_file(path: &Path, include_worktree_columns: bool) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("create config dir: {error}"))?;
+    }
+    if path.exists() {
+        if include_worktree_columns {
+            let mut text =
+                fs::read_to_string(path).map_err(|error| format!("read config file: {error}"))?;
+            if !text.contains("[worktrees]") {
+                if !text.ends_with('\n') && !text.is_empty() {
+                    text.push('\n');
+                }
+                text.push_str("\n[worktrees]\ncolumns = [\"url\", \"vars.localdev\"]\n");
+                fs::write(path, text).map_err(|error| format!("update config file: {error}"))?;
+            }
+        }
+        return Ok(());
+    }
+    let mut text = "# Prism repository config\n# Example:\n# [worktrees]\n# columns = [\"url\", \"vars.localdev\"]\n#\n# [prompt_templates]\n# review_fix = \"Here are review comments on PR {pr_number}.\\n\\nIf they are applicable, fix them. Otherwise, say why not.\\n\\n---\\n\\n{comments}\"\n# ci_failure = \"Here are CI failures on PR {pr_number}.\\n\\nFix the failing checks. Use the log tails below as the primary clues.\\n\\nPR: {url}\\nBranch: {branch}\\nHead SHA: {head_sha}\\n\\n---\\n\\n{failures}\"\n".to_string();
+    if include_worktree_columns {
+        text.push_str("\n[worktrees]\ncolumns = [\"url\", \"vars.localdev\"]\n");
+    }
+    fs::write(path, text).map_err(|error| format!("create config file: {error}"))
 }
 
 fn open_url_in_browser(url: &str) -> Result<(), String> {
@@ -2737,7 +2794,7 @@ fn fetch_wt_columns(
         let Some(path) = json_string_field(object, "path") else {
             continue;
         };
-        let mut columns = BTreeMap::new();
+        let mut columns = discover_wt_columns(object);
         for column in &config.worktree_columns {
             if let Some(value) = wt_column_value(object, column) {
                 columns.insert(column.clone(), value);
@@ -2746,6 +2803,45 @@ fn fetch_wt_columns(
         by_path.insert(PathBuf::from(path), columns);
     }
     Ok(by_path)
+}
+
+fn discover_wt_columns(object: &str) -> BTreeMap<String, String> {
+    let Ok(value) = serde_json::from_str::<Value>(object) else {
+        return BTreeMap::new();
+    };
+    let mut columns = BTreeMap::new();
+    let Some(fields) = value.as_object() else {
+        return columns;
+    };
+    for (key, value) in fields {
+        if key == "path" {
+            continue;
+        }
+        collect_wt_column(&mut columns, key, value);
+    }
+    columns
+}
+
+fn collect_wt_column(columns: &mut BTreeMap<String, String>, key: &str, value: &Value) {
+    match value {
+        Value::String(value) => {
+            if !value.is_empty() {
+                columns.insert(key.to_string(), value.clone());
+            }
+        }
+        Value::Bool(value) => {
+            columns.insert(key.to_string(), value.to_string());
+        }
+        Value::Number(value) => {
+            columns.insert(key.to_string(), value.to_string());
+        }
+        Value::Object(fields) => {
+            for (field, value) in fields {
+                collect_wt_column(columns, &format!("{key}.{field}"), value);
+            }
+        }
+        Value::Array(_) | Value::Null => {}
+    }
 }
 
 fn default_branch_status_label(
@@ -2854,7 +2950,7 @@ mod tests {
     use crate::session::Session;
     use crate::tui::Tui;
 
-    use super::{run_browser_opener, status_label_with_behind};
+    use super::{discover_wt_columns, run_browser_opener, status_label_with_behind};
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -2898,6 +2994,36 @@ exit 0
             "--flag\nhttps://example.test/pr/42\n"
         );
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn discover_wt_columns_flattens_available_primitive_values() {
+        let columns = discover_wt_columns(
+            r#"{
+                "path":"/repo/feature",
+                "url":"https://example.test/pr/42",
+                "url_active":true,
+                "ci":{"status":"success","number":42},
+                "vars":{"localdev":"on"},
+                "empty":"",
+                "labels":["bug"]
+            }"#,
+        );
+
+        assert_eq!(
+            columns.get("url").map(String::as_str),
+            Some("https://example.test/pr/42")
+        );
+        assert_eq!(columns.get("url_active").map(String::as_str), Some("true"));
+        assert_eq!(
+            columns.get("ci.status").map(String::as_str),
+            Some("success")
+        );
+        assert_eq!(columns.get("ci.number").map(String::as_str), Some("42"));
+        assert_eq!(columns.get("vars.localdev").map(String::as_str), Some("on"));
+        assert!(!columns.contains_key("path"));
+        assert!(!columns.contains_key("empty"));
+        assert!(!columns.contains_key("labels"));
     }
 
     #[test]
@@ -3482,6 +3608,7 @@ exit 0
             path_display: path.display().to_string(),
             branch: branch.to_string(),
             prompt_summary: String::new(),
+            classification: crate::session::SessionClassification::Work,
             adopted: false,
             hidden: false,
             status_label: "clean".to_string(),
@@ -3507,6 +3634,7 @@ exit 0
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             auto: crate::config::AutoConfig::default(),
+            layout: crate::config::LayoutConfig::default(),
             checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools: BTreeMap::new(),

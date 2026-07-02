@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::github::PrCache;
 use crate::plan_run::{PersistedPlanRun, PlanOutputLine};
 use crate::session::Session;
+use crate::session::SessionClassification;
 use crate::tui::PanelFocus;
 
 pub(crate) struct FrameModel<'a> {
@@ -108,6 +109,7 @@ pub(crate) struct WorktreeRow {
     pub auto_status: Option<AutoRunStatus>,
     pub unseen_comments: bool,
     pub prompt_summary: String,
+    pub classification: SessionClassification,
     pub selected: bool,
 }
 

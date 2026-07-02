@@ -64,7 +64,9 @@ impl KeyInput {
             KeyCode::Char('P') if plain_char(event) => Key::PlanMode,
             KeyCode::Char('c') if plain_char(event) => Key::Create,
             KeyCode::Char('x') if plain_char(event) => Key::AbortOpencode,
+            KeyCode::Char('X') if plain_char(event) => Key::DeletePermanent,
             KeyCode::Char('A') if plain_char(event) => Key::AutoFlow,
+            KeyCode::Char('C') if plain_char(event) => Key::EditWorktreeColumns,
             KeyCode::Char('R') if plain_char(event) => Key::ManageRepos,
             KeyCode::Char('e') if plain_char(event) => Key::EditConfig,
             KeyCode::Char('D') if plain_char(event) => Key::Delete,
@@ -163,6 +165,7 @@ pub enum Key {
     Refresh,
     RepoShortcut(char),
     ManageRepos,
+    EditWorktreeColumns,
     CiFix,
     ReviewFix,
     Push,
@@ -172,6 +175,7 @@ pub enum Key {
     Create,
     AbortOpencode,
     Delete,
+    DeletePermanent,
     EditConfig,
     Search,
     Quit,
@@ -339,6 +343,14 @@ mod tests {
     fn key_input_handles_cleanup_keys() {
         let mut input = KeyInput::default();
         assert_eq!(map(&mut input, shift_key(KeyCode::Char('D'))), Key::Delete);
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('X'))),
+            Key::DeletePermanent
+        );
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('C'))),
+            Key::EditWorktreeColumns
+        );
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('P'))),
             Key::PlanMode

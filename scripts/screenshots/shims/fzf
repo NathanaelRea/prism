@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+tool="$(basename "$0")"
+root="${PRISM_DEMO_ROOT:?PRISM_DEMO_ROOT is required}"
+log_dir="$root/logs"
+mkdir -p "$log_dir"
+{
+  printf 'tool=%s\n' "$tool"
+  printf 'cwd=%s\n' "$(pwd)"
+  printf 'argv='
+  printf '%q ' "$@"
+  printf '\nPRISM_DEMO_ROOT=%s\n\n' "$root"
+} >>"$log_dir/$tool.log"
+
+choice=""
+while IFS= read -r line; do
+  if [[ "$line" == "plan-demo.md" ]]; then
+    choice="$line"
+  elif [[ -z "$choice" && "$line" == *.md ]]; then
+    choice="$line"
+  fi
+done
+
+[[ -n "$choice" ]] || exit 1
+printf '%s\n' "$choice"
