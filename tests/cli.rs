@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -175,6 +176,154 @@ fn db_path_prints_repo_database_path() {
 }
 
 #[test]
+#[cfg(unix)]
+fn db_without_arguments_launches_sqlite3_with_initialized_database() {
+    let temp = TempDir::new("db-shell");
+    let repo = temp.path().join("repo with spaces");
+    let config_home = temp.path().join("xdg");
+    let bin = temp.path().join("bin");
+    let marker = temp.path().join("sqlite3-args");
+    init_repo(&repo);
+    install_sqlite3_db_asserting_shim(&bin, &marker);
+
+    let mut command = prism();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = command
+        .arg("db")
+        .current_dir(&repo)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("HOME", &config_home)
+        .env("PATH", path)
+        .output()
+        .expect("run prism db");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stderr(&output).is_empty());
+    let db_path = fs::read_to_string(marker).expect("read sqlite3 marker");
+    assert!(db_path.trim().ends_with("/prism.db"));
+    assert!(Path::new(db_path.trim()).exists());
+    assert_db_has_tables(
+        db_path.trim(),
+        [
+            "agent_state",
+            "auto_event",
+            "auto_output_line",
+            "auto_run",
+            "auto_step_run",
+            "event",
+            "hidden_session",
+            "metadata",
+            "opencode_runtime",
+            "plan_output_line",
+            "plan_run",
+            "plan_step_run",
+            "pr_cache",
+            "pr_details_cache",
+            "startup_phase",
+            "startup_run",
+            "task_metadata",
+        ],
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn db_without_arguments_reports_missing_sqlite3() {
+    let temp = TempDir::new("db-shell-missing-sqlite3");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    let bin = temp.path().join("bin");
+    init_repo(&repo);
+    install_git_proxy_shim(&bin);
+
+    let output = prism()
+        .arg("db")
+        .current_dir(&repo)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("HOME", &config_home)
+        .env("PATH", &bin)
+        .output()
+        .expect("run prism db");
+
+    assert!(!output.status.success());
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).contains("sqlite3 not found; install sqlite3"));
+}
+
+#[test]
+#[cfg(unix)]
+fn db_query_rejects_writes_after_shell_initializes_database() {
+    let temp = TempDir::new("db-query-readonly");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    let bin = temp.path().join("bin");
+    let marker = temp.path().join("sqlite3-args");
+    init_repo(&repo);
+    install_sqlite3_db_asserting_shim(&bin, &marker);
+
+    let mut init_command = prism();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let init_output = init_command
+        .arg("db")
+        .current_dir(&repo)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("HOME", &config_home)
+        .env("PATH", path)
+        .output()
+        .expect("initialize prism db");
+    assert!(init_output.status.success(), "{}", stderr(&init_output));
+
+    let output = run(
+        ["db", "insert into plan_run(id) values ('not-allowed')"],
+        &repo,
+        &config_home,
+    );
+
+    assert!(!output.status.success());
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).contains("readonly database"));
+}
+
+#[test]
+#[cfg(unix)]
+fn db_whitespace_query_stays_non_interactive() {
+    let temp = TempDir::new("db-query-whitespace");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    let bin = temp.path().join("bin");
+    let marker = temp.path().join("sqlite3-args");
+    init_repo(&repo);
+    install_sqlite3_db_asserting_shim(&bin, &marker);
+
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let output = prism()
+        .args(["db", "   "])
+        .current_dir(&repo)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("HOME", &config_home)
+        .env("PATH", path)
+        .output()
+        .expect("run whitespace db query");
+
+    assert!(!output.status.success());
+    assert!(stdout(&output).is_empty());
+    assert!(stderr(&output).contains("prism:"));
+    assert!(!marker.exists());
+}
+
+#[test]
 fn unknown_argument_fails_with_stderr() {
     let temp = TempDir::new("unknown-arg");
     let output = run(["--definitely-not-real"], temp.path(), temp.path());
@@ -230,6 +379,66 @@ fn install_shim(bin: &Path, name: &str) {
         format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"{name} test\"; fi\n"),
     )
     .expect("write shim");
+    let mut permissions = fs::metadata(&path).expect("shim metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod shim");
+}
+
+fn assert_db_has_tables<const N: usize>(db_path: &str, expected: [&str; N]) {
+    let conn = rusqlite::Connection::open(db_path).expect("open db");
+    let mut statement = conn
+        .prepare("select name from sqlite_master where type = 'table'")
+        .expect("prepare table list");
+    let actual = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query table list")
+        .collect::<Result<BTreeSet<_>, _>>()
+        .expect("read table list");
+
+    for table in expected {
+        assert!(
+            actual.contains(table),
+            "missing table {table}; found {actual:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn install_sqlite3_db_asserting_shim(bin: &Path, marker: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir_all(bin).expect("create shim bin");
+    let path = bin.join("sqlite3");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\n\
+             test \"$#\" -eq 1 || exit 11\n\
+             test -f \"$1\" || exit 12\n\
+             printf '%s\\n' \"$1\" > \"{}\"\n",
+            marker.display()
+        ),
+    )
+    .expect("write sqlite3 shim");
+    let mut permissions = fs::metadata(&path).expect("shim metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod shim");
+}
+
+#[cfg(unix)]
+fn install_git_proxy_shim(bin: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::create_dir_all(bin).expect("create shim bin");
+    let path = bin.join("git");
+    fs::write(
+        &path,
+        format!(
+            "#!/bin/sh\nPATH='{}' exec git \"$@\"\n",
+            std::env::var("PATH").unwrap_or_default()
+        ),
+    )
+    .expect("write git shim");
     let mut permissions = fs::metadata(&path).expect("shim metadata").permissions();
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions).expect("chmod shim");

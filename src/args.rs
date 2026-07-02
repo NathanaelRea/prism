@@ -49,6 +49,7 @@ pub enum DebugCommand {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum DbCommand {
+    Shell,
     Path,
     Query(String),
 }
@@ -132,9 +133,10 @@ impl Args {
                     });
                 }
                 "db" => {
-                    let value = iter
-                        .next()
-                        .ok_or_else(|| "db requires `path` or a read-only SQL query".to_string())?;
+                    let Some(value) = iter.next() else {
+                        command = CommandKind::Db(DbCommand::Shell);
+                        break;
+                    };
                     let mut parts = vec![value.to_string_lossy().to_string()];
                     parts.extend(iter.map(|arg| arg.to_string_lossy().to_string()));
                     if parts.len() == 1 && parts[0] == "path" {
@@ -161,7 +163,7 @@ impl Args {
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config\n  prism [--repo <path>] auto [prompt]\n  prism [--repo <path>] auto run-plan <plan.md>\n  prism [--repo <path>] auto plan [prompt]\n  prism [--repo <path>] auto plan-first [prompt]\n  prism [--repo <path>] auto intensive [prompt]\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n\nAliases:\n  auto plan-first and auto intensive are aliases for auto plan."
+    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config\n  prism [--repo <path>] auto [prompt]\n  prism [--repo <path>] auto run-plan <plan.md>\n  prism [--repo <path>] auto plan [prompt]\n  prism [--repo <path>] auto plan-first [prompt]\n  prism [--repo <path>] auto intensive [prompt]\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n\nAliases:\n  auto plan-first and auto intensive are aliases for auto plan."
 }
 
 #[cfg(test)]
@@ -222,5 +224,39 @@ mod tests {
         assert!(help.contains("auto run-plan <plan.md>"));
         assert!(help.contains("auto plan-first [prompt]"));
         assert!(help.contains("auto intensive [prompt]"));
+    }
+
+    #[test]
+    fn db_without_arguments_parses_as_shell() {
+        assert_eq!(parse(&["db"]), CommandKind::Db(DbCommand::Shell));
+    }
+
+    #[test]
+    fn db_path_parses_as_path_command() {
+        assert_eq!(parse(&["db", "path"]), CommandKind::Db(DbCommand::Path));
+    }
+
+    #[test]
+    fn db_query_joins_remaining_arguments() {
+        assert_eq!(
+            parse(&["db", "select", "*", "from", "plan_run"]),
+            CommandKind::Db(DbCommand::Query("select * from plan_run".to_string()))
+        );
+    }
+
+    #[test]
+    fn db_whitespace_query_parses_as_query() {
+        assert_eq!(
+            parse(&["db", "   "]),
+            CommandKind::Db(DbCommand::Query("   ".to_string()))
+        );
+    }
+
+    #[test]
+    fn help_documents_db_forms() {
+        let help = help_text();
+        assert!(help.contains("prism [--repo <path>] db\n"));
+        assert!(help.contains("prism [--repo <path>] db path"));
+        assert!(help.contains("prism [--repo <path>] db <read-only-sql>"));
     }
 }

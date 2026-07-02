@@ -12,6 +12,8 @@ key = "1"
 
 Repository-specific Prism config lives under the repository config path shown by `e` from the Repos panel. Common settings include `default_base`, layout width, worktree columns, merge method, OpenCode runtime settings, tools, and prompt templates.
 
+Per-repository Prism state also lives under that repository config directory, not inside the project repository. The state database is named `prism.db` and stores worktree session metadata, OpenCode runtime records, Plan Mode and Auto Flow runs, PR cache data, and observability records.
+
 Use `R` from Prism to edit repository order, keys, and tracked repositories.
 
 ```toml
@@ -57,3 +59,29 @@ columns = ["url", "url_active", "ci.status", "vars.localdev"]
 ```
 
 The selected worktree detail panel shows all currently loaded `wt` column keys and values, sorted by key, so you can discover names before adding them to config. Use `C` from the Repos panel to open the repository config at the worktree column section, then save and return to Prism to reload.
+
+## Database Access
+
+Use `prism db` commands to inspect a repository's local Prism state:
+
+```sh
+prism db
+prism db path
+prism db "select name from sqlite_schema where type = 'table' order by name"
+prism db 'select id, status from plan_run order by updated_unix_ms desc'
+```
+
+Bare `prism db` opens an interactive `sqlite3` shell for the selected repository database. Prism initializes and migrates the database before launching the shell. This is direct writable SQLite access; quit Prism first if you are doing manual repairs to avoid lock contention or conflicting writes.
+
+`prism db path` prints the selected repository database path and exits.
+
+`prism db <query>` runs a read-only query and prints tab-separated rows for scripts. Write statements are rejected in query mode. Query mode uses Prism's built-in SQLite support and does not require the external `sqlite3` command.
+
+When running outside the checkout you want to inspect, select the repository explicitly:
+
+```sh
+prism --repo /path/to/repo db
+prism --repo /path/to/repo db path
+```
+
+If bare `prism db` reports that `sqlite3` is missing, install the SQLite command-line shell and make sure `sqlite3` is on your `PATH`.

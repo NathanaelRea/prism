@@ -25,3 +25,14 @@ Prism's TUI is split between local application state and Ratatui/Crossterm termi
 Keep domain behavior out of renderer widgets. Rendering should consume view models, while state transitions and command decisions remain testable through `Tui` methods without a real terminal.
 
 Dialogs currently use typed nested loops in `src/tui.rs` instead of a single explicit `UiMode` state machine. This is an intentional Ratatui migration deviation: raw byte parsing is gone, dialog input uses Crossterm `KeyEvent`s, and those loops continue to tick background polling and redraw on resize. Consolidating help, prompt, confirm, and progress dialogs into a shared `UiMode` remains a future refactor if Prism adds richer modal editing or more dialog types.
+
+## Prism Database Tables
+
+Prism stores per-repository runtime state in `prism.db` under the user's Prism config directory. The most useful tables to inspect are:
+
+- `task_metadata`, `hidden_session`, `agent_state`: worktree session metadata and local session state.
+- `opencode_runtime`: OpenCode server/session records associated with worktrees.
+- `plan_run`, `plan_step_run`, `plan_output_line`: persisted Plan Mode runs, step state, and bounded step output.
+- `auto_run`, `auto_step_run`, `auto_output_line`, `auto_event`: persisted Auto Flow runs, attempts, output, and event history.
+- `pr_cache`, `pr_details_cache`: GitHub pull request summaries and detail payload caches.
+- `event`, `startup_run`, `startup_phase`: observability events and startup timing records.
