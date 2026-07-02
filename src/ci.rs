@@ -222,6 +222,8 @@ mod tests {
             agent_commands: BTreeMap::new(),
             checks: Checks::default(),
             merge_method: crate::config::MergeMethod::Squash,
+            icon_style: crate::config::IconStyle::Unicode,
+            icon_style_configured: false,
             auto: crate::config::AutoConfig::default(),
             layout: crate::config::LayoutConfig::default(),
             worktree_columns: Vec::new(),

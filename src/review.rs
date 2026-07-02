@@ -548,6 +548,8 @@ mod tests {
             opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: crate::config::MergeMethod::Squash,
+            icon_style: crate::config::IconStyle::Unicode,
+            icon_style_configured: false,
             auto: crate::config::AutoConfig::default(),
             layout: crate::config::LayoutConfig::default(),
             checks: Checks::default(),

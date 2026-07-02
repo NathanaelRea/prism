@@ -136,6 +136,13 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
             })?;
             repos.push(ManagedRepo::new(repo, config, entry.key));
         }
+        if let Some(repo) = repos.get(selected_repo)
+            && setup::maybe_prompt_icon_style(&repo.config)?.is_some()
+        {
+            for repo in &mut repos {
+                repo.config = Config::load(&repo.repo);
+            }
+        }
         let selected_repo = selected_repo.min(repos.len().saturating_sub(1));
         if let Some(repo) = repos.get(selected_repo) {
             observability::attach_repo(&repo.repo);

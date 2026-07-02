@@ -30,6 +30,9 @@ opencode_shutdown_owned_servers = false
 [layout]
 sidebar_width = 56
 
+[ui]
+icon_style = "unicode" # or "nerd-font"
+
 [worktrees]
 columns = ["url", "ci.status", "vars.localdev"]
 
@@ -48,6 +51,8 @@ Prism uses squash merges for pull requests by default. Set `merge_method` to `me
 Prism manages one local OpenCode server per worktree session. `opencode_port_base` and `opencode_port_span` define the deterministic local port range used for those servers. By default Prism keeps servers warm after the TUI exits; set `opencode_shutdown_owned_servers = true` to send SIGTERM to OpenCode servers that Prism spawned during the session.
 
 `[layout] sidebar_width` controls the Status/Repos/Worktrees sidebar width in terminal columns. Values are bounded to `20..=120`. When the terminal is too narrow, Prism reduces the configured width so the main panel keeps usable space; this preserves the board layout instead of strictly honoring a width that would hide the main panel.
+
+`[ui] icon_style` controls TUI status glyphs. `unicode` is the portable default. `nerd-font` uses richer Nerd Font glyphs for pull requests, merge state, Git status, and CI, and requires a Nerd Font configured in your terminal.
 
 `[worktrees] columns` controls the visible extra columns in the TUI worktree list. Columns are shown in the configured order after Prism's built-in worktree indicators. Missing values render as a compact placeholder so neighboring columns stay aligned.
 

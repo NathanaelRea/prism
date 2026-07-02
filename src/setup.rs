@@ -1,6 +1,6 @@
 use std::io::{self, Write};
 
-use crate::config::Config;
+use crate::config::{Config, IconStyle};
 use crate::git::{RepositoryCheckout, inspect_repository_checkout, worktree_dirty};
 use crate::lifecycle::move_current_branch_to_worktree;
 use crate::repo::Repository;
@@ -42,6 +42,33 @@ pub(crate) fn maybe_prompt_startup_setup(repo: &Repository, config: &Config) -> 
     }
 
     prompt_setup_loop(repo, config, setup)
+}
+
+pub(crate) fn maybe_prompt_icon_style(config: &Config) -> Result<Option<IconStyle>, String> {
+    if config.icon_style_configured || !stdin_is_tty() {
+        return Ok(None);
+    }
+
+    println!();
+    println!("Prism setup");
+    println!();
+    println!("Choose icon style:");
+    println!();
+    println!("  u  Unicode icons");
+    println!("     Works in most terminals.");
+    println!();
+    println!("  n  Nerd Font icons");
+    println!("     Looks better, but requires a Nerd Font in your terminal.");
+    println!();
+    print!("Choice [u]: ");
+    io::stdout().flush().map_err(|error| error.to_string())?;
+
+    let style = match read_line()?.trim().to_ascii_lowercase().as_str() {
+        "n" => IconStyle::NerdFont,
+        _ => IconStyle::Unicode,
+    };
+    config.save_user_icon_style(style)?;
+    Ok(Some(style))
 }
 
 pub(crate) fn inspect_startup_setup(

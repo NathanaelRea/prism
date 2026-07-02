@@ -12,6 +12,7 @@ use crate::{
         AutoImplementationSource, AutoOutputKind, AutoRunMode, AutoRunStatus, AutoStepKey,
         AutoStepRun, AutoStepStatus,
     },
+    config::IconStyle,
     opencode::{OpencodeState, OpencodeStatus},
     plan_run::{
         PlanOutputKind, PlanOutputLine, PlanRunMode, PlanRunStatus, PlanStepRun, PlanStepStatus,
@@ -180,9 +181,9 @@ fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<
             .collect::<Vec<_>>(),
         ))];
         rows.extend(model.worktrees.iter().map(|worktree| {
-            let (pr_label, pr_style) = worktree_pr_column(worktree);
-            let (git_label, git_style) = worktree_git_column(worktree);
-            let (ci_label, ci_style) = worktree_ci_column(worktree);
+            let (pr_label, pr_style) = worktree_pr_column(worktree, model.config.icon_style);
+            let (git_label, git_style) = worktree_git_column(worktree, model.config.icon_style);
+            let (ci_label, ci_style) = worktree_ci_column(worktree, model.config.icon_style);
             let (comments_label, comments_style) = worktree_comments_column(worktree);
             let (error_label, error_style) = worktree_error_column(worktree);
             let mut spans = vec![
@@ -318,6 +319,7 @@ fn status_dashboard_lines(model: &view::FrameModel<'_>) -> Vec<Line<'static>> {
         heading_line("Navigation"),
         Line::from("1 status  2 repos  3 worktrees"),
         Line::from("Tab cycles focus; repos h/l switches views"),
+        Line::from("e edits selected repository config"),
         Line::from(""),
         heading_line("Documentation"),
         Line::from("GitHub repository  https://github.com/NathanaelRea/prism"),
@@ -431,7 +433,10 @@ fn worktree_detail_lines(model: &view::FrameModel<'_>) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from(vec![
             Span::styled("status ", muted_style()),
-            Span::raw(git_status_indicator(&session.status_label)),
+            Span::raw(git_status_indicator(
+                &session.status_label,
+                model.config.icon_style,
+            )),
             Span::styled("  agent ", muted_style()),
             Span::styled(
                 agent_label(session.agent_state),
@@ -1255,7 +1260,10 @@ fn repo_preview_lines(
     };
     let review = review_decision_for_display(summary, session.pr.details.as_ref());
     lines.push(Line::from(vec![
-        Span::styled(pr_state_icon(summary), pr_state_style(summary)),
+        Span::styled(
+            pr_state_icon(summary, config.icon_style),
+            pr_state_style(summary),
+        ),
         Span::styled(
             format!(" PR #{} {}", summary.number, pr_state_label(summary)),
             pr_state_style(summary),
@@ -1427,12 +1435,16 @@ fn kanban_card_spans(
     session: &Session,
     selected: bool,
 ) -> Vec<Span<'static>> {
-    let mut suffix = git_status_indicator(&session.status_label);
+    let mut suffix = git_status_indicator(&session.status_label, config.icon_style);
     if let Some(summary) = &session.pr.summary {
         if !suffix.is_empty() {
             suffix.push(' ');
         }
-        suffix.push_str(&format!("#{} {}", summary.number, ci_icon(config, session)));
+        suffix.push_str(&format!(
+            "#{} {}",
+            summary.number,
+            ci_icon(config, session, config.icon_style)
+        ));
     }
     vec![
         Span::styled(if selected { "▶ " } else { "  " }, title_style(selected)),
@@ -1605,7 +1617,10 @@ fn pr_panel_lines(config: &crate::config::Config, session: Option<&Session>) -> 
     let review = review_decision_for_display(summary, session.pr.details.as_ref());
     let mut lines = vec![
         Line::from(vec![
-            Span::styled(pr_state_icon(summary), pr_state_style(summary)),
+            Span::styled(
+                pr_state_icon(summary, config.icon_style),
+                pr_state_style(summary),
+            ),
             Span::styled(
                 format!(" PR #{} {}", summary.number, pr_state_label(summary)),
                 pr_state_style(summary),
@@ -1622,7 +1637,10 @@ fn pr_panel_lines(config: &crate::config::Config, session: Option<&Session>) -> 
             Span::styled("review ", muted_style()),
             Span::styled(review_label(&review).to_string(), review_style(&review)),
             Span::styled("  ci ", muted_style()),
-            Span::styled(ci_icon(config, session), ci_style(config, session)),
+            Span::styled(
+                ci_icon(config, session, config.icon_style),
+                ci_style(config, session),
+            ),
             Span::raw(format!(" {}", summary.check_status)),
         ]),
     ];
@@ -2402,14 +2420,14 @@ fn repo_work_detail_label(config: &crate::config::Config, session: &Session) -> 
         );
         parts.push(format!(
             "ci {} {}",
-            ci_icon(config, session),
+            ci_icon(config, session, config.icon_style),
             summary.check_status
         ));
         parts.push(pr_comment_count_label(&session.pr));
     } else {
         parts.push("no PR".to_string());
     }
-    let git = git_status_indicator(&session.status_label);
+    let git = git_status_indicator(&session.status_label, config.icon_style);
     if !git.is_empty() {
         parts.push(git);
     }
@@ -2494,7 +2512,18 @@ fn review_label(decision: &str) -> &str {
     }
 }
 
-fn pr_state_icon(summary: &crate::github::PrSummary) -> &'static str {
+fn pr_state_icon(summary: &crate::github::PrSummary, icon_style: IconStyle) -> &'static str {
+    if icon_style == IconStyle::NerdFont {
+        return if summary.merged {
+            ""
+        } else if summary.draft {
+            ""
+        } else if summary.state == "OPEN" {
+            ""
+        } else {
+            ""
+        };
+    }
     if summary.merged {
         "⋈"
     } else if summary.draft {
@@ -2506,7 +2535,11 @@ fn pr_state_icon(summary: &crate::github::PrSummary) -> &'static str {
     }
 }
 
-fn ci_icon(config: &crate::config::Config, session: &Session) -> &'static str {
+fn ci_icon(
+    config: &crate::config::Config,
+    session: &Session,
+    icon_style: IconStyle,
+) -> &'static str {
     if session.is_default_branch(config) {
         return "";
     }
@@ -2516,10 +2549,10 @@ fn ci_icon(config: &crate::config::Config, session: &Session) -> &'static str {
         .as_ref()
         .map(|summary| summary.check_status.as_str())
     {
-        Some("passed") => "✓",
-        Some("failed") => "✕",
-        Some("running") => "•",
-        Some("mixed") => "±",
+        Some("passed") => icon(icon_style, "✓", ""),
+        Some("failed") => icon(icon_style, "✕", ""),
+        Some("running") => icon(icon_style, "•", ""),
+        Some("mixed") => icon(icon_style, "±", ""),
         Some("unknown") | None => "?",
         Some(_) => "!",
     }
@@ -2536,10 +2569,10 @@ fn agent_icon(state: AgentState) -> &'static str {
     }
 }
 
-fn git_status_indicator(status: &str) -> String {
+fn git_status_indicator(status: &str, icon_style: IconStyle) -> String {
     let mut out = String::new();
     if let Some(count) = status_count(status, "dirty") {
-        out.push('✗');
+        out.push_str(icon(icon_style, "✗", ""));
         out.push_str(&count.to_string());
     }
     if let Some(count) = status_count(status, "ahead") {
@@ -2804,39 +2837,51 @@ fn truncate_column(value: &str, width: usize) -> String {
     out
 }
 
-fn worktree_pr_column(worktree: &view::WorktreeRow) -> (&'static str, Style) {
+fn worktree_pr_column(
+    worktree: &view::WorktreeRow,
+    icon_style: IconStyle,
+) -> (&'static str, Style) {
     if matches!(worktree.kind, view::WorktreeKind::DefaultBranch) {
         return ("·", muted_style());
     }
     if worktree.pr.error.is_some() {
-        return ("!", error_style());
+        return (icon(icon_style, "!", ""), error_style());
     }
     let Some(summary) = &worktree.pr.summary else {
         return ("○", muted_style());
     };
-    (pr_state_icon(summary), pr_style(summary))
+    (pr_state_icon(summary, icon_style), pr_style(summary))
 }
 
-fn worktree_git_column(worktree: &view::WorktreeRow) -> (&'static str, Style) {
+fn worktree_git_column(
+    worktree: &view::WorktreeRow,
+    icon_style: IconStyle,
+) -> (&'static str, Style) {
     if status_count(&worktree.status_label, "dirty").is_some() {
         (
-            "✗",
+            icon(icon_style, "✗", ""),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )
     } else if status_count(&worktree.status_label, "ahead").is_some()
         && status_count(&worktree.status_label, "behind").is_some()
     {
-        ("↕", attention_style())
+        (icon(icon_style, "↕", ""), attention_style())
     } else if status_count(&worktree.status_label, "ahead").is_some() {
         ("↑", attention_style())
     } else if status_count(&worktree.status_label, "behind").is_some() {
         ("↓", attention_style())
     } else {
-        ("✓", Style::default().fg(Color::Green))
+        (
+            icon(icon_style, "✓", ""),
+            Style::default().fg(Color::Green),
+        )
     }
 }
 
-fn worktree_ci_column(worktree: &view::WorktreeRow) -> (&'static str, Style) {
+fn worktree_ci_column(
+    worktree: &view::WorktreeRow,
+    icon_style: IconStyle,
+) -> (&'static str, Style) {
     if matches!(worktree.kind, view::WorktreeKind::DefaultBranch) {
         return ("·", muted_style());
     }
@@ -2844,7 +2889,7 @@ fn worktree_ci_column(worktree: &view::WorktreeRow) -> (&'static str, Style) {
         return ("·", muted_style());
     };
     (
-        ci_icon_for_status(&summary.check_status),
+        ci_icon_for_status(&summary.check_status, icon_style),
         pr_check_style(&summary.check_status),
     )
 }
@@ -2904,14 +2949,21 @@ fn worktree_error_column(worktree: &view::WorktreeRow) -> (&'static str, Style) 
     }
 }
 
-fn ci_icon_for_status(status: &str) -> &'static str {
+fn ci_icon_for_status(status: &str, icon_style: IconStyle) -> &'static str {
     match status {
-        "passed" => "✓",
-        "failed" => "✕",
-        "running" => "•",
-        "mixed" => "±",
+        "passed" => icon(icon_style, "✓", ""),
+        "failed" => icon(icon_style, "✕", ""),
+        "running" => icon(icon_style, "•", ""),
+        "mixed" => icon(icon_style, "±", ""),
         "unknown" => "?",
         _ => "!",
+    }
+}
+
+fn icon(icon_style: IconStyle, unicode: &'static str, nerd_font: &'static str) -> &'static str {
+    match icon_style {
+        IconStyle::Unicode => unicode,
+        IconStyle::NerdFont => nerd_font,
     }
 }
 
@@ -3368,6 +3420,24 @@ mod tests {
     }
 
     #[test]
+    fn renders_nerd_font_worktree_icons_when_configured() {
+        let mut config = test_config();
+        config.icon_style = IconStyle::NerdFont;
+        let mut session = test_session("feature", AgentState::Running);
+        session.status_label = "dirty 2".to_string();
+        let mut summary = test_pr_summary();
+        summary.check_status = "passed".to_string();
+        session.pr.summary = Some(summary);
+        let sessions = vec![session];
+        let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+        let buffer = render_to_string(&model, 160, 30);
+
+        assert!(buffer.contains(""));
+        assert!(buffer.contains(""));
+        assert!(buffer.contains(""));
+    }
+
+    #[test]
     fn worktree_sidebar_renders_missing_configured_columns_as_placeholders() {
         let mut config = test_config();
         config.worktree_columns = vec!["todo".to_string(), "owner".to_string()];
@@ -3403,7 +3473,7 @@ mod tests {
             selected: true,
         };
 
-        let (label, style) = worktree_git_column(&worktree);
+        let (label, style) = worktree_git_column(&worktree, IconStyle::Unicode);
 
         assert_eq!(label, "✓");
         assert_eq!(style.fg, Some(Color::Green));
@@ -3741,6 +3811,8 @@ mod tests {
             opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
+            icon_style: IconStyle::Unicode,
+            icon_style_configured: false,
             auto: crate::config::AutoConfig::default(),
             layout: crate::config::LayoutConfig::default(),
             checks: Checks::default(),

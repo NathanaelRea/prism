@@ -39,6 +39,29 @@ pub struct LayoutConfig {
     pub sidebar_width: Option<u16>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IconStyle {
+    Unicode,
+    NerdFont,
+}
+
+impl IconStyle {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "unicode" => Some(Self::Unicode),
+            "nerd-font" | "nerdfont" | "nerd_font" => Some(Self::NerdFont),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unicode => "unicode",
+            Self::NerdFont => "nerd-font",
+        }
+    }
+}
+
 impl Default for AutoConfig {
     fn default() -> Self {
         Self {
@@ -126,6 +149,8 @@ pub struct Config {
     pub opencode_plan_plugin: bool,
     pub escape_key: EscapeKey,
     pub merge_method: MergeMethod,
+    pub icon_style: IconStyle,
+    pub icon_style_configured: bool,
     pub auto: AutoConfig,
     pub layout: LayoutConfig,
     pub checks: Checks,
@@ -151,6 +176,7 @@ struct RawConfig {
     opencode_plan_plugin: Option<bool>,
     escape_key: Option<String>,
     merge_method: Option<String>,
+    ui: Option<RawUiConfig>,
     checks: Option<RawChecks>,
     auto: Option<RawAutoConfig>,
     layout: Option<RawLayoutConfig>,
@@ -158,6 +184,11 @@ struct RawConfig {
     tools: Option<BTreeMap<String, String>>,
     agents: Option<BTreeMap<String, RawAgentConfig>>,
     prompt_templates: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawUiConfig {
+    icon_style: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -236,6 +267,8 @@ impl Config {
             opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
+            icon_style: IconStyle::Unicode,
+            icon_style_configured: false,
             auto: AutoConfig::default(),
             layout: LayoutConfig::default(),
             checks: Checks::default(),
@@ -295,6 +328,12 @@ impl Config {
         }
         if let Some(value) = raw.escape_key.and_then(|value| EscapeKey::parse(&value)) {
             self.escape_key = value;
+        }
+        if let Some(value) = raw.ui.and_then(|ui| ui.icon_style)
+            && let Some(style) = IconStyle::parse(&value)
+        {
+            self.icon_style = style;
+            self.icon_style_configured = true;
         }
         if let Some(checks) = raw.checks {
             if let Some(values) = checks.pre_pr {
@@ -404,6 +443,52 @@ impl Config {
             .map(|base| !base.trim().is_empty() && branch == base)
             .unwrap_or(false)
     }
+
+    pub fn save_user_icon_style(&self, style: IconStyle) -> Result<(), String> {
+        save_user_icon_style(&self.user_path, style)
+    }
+}
+
+fn save_user_icon_style(path: &Path, style: IconStyle) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("create config dir: {error}"))?;
+    }
+    let mut text = fs::read_to_string(path).unwrap_or_default();
+    if text.contains("icon_style") {
+        return Ok(());
+    }
+    let setting = format!("icon_style = \"{}\"\n", style.label());
+    if let Some(index) = ui_table_insert_index(&text) {
+        text.insert_str(index, &setting);
+    } else {
+        if !text.is_empty() && !text.ends_with('\n') {
+            text.push('\n');
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str("[ui]\n");
+        text.push_str(&setting);
+    }
+    fs::write(path, text).map_err(|error| format!("write user config: {error}"))
+}
+
+fn ui_table_insert_index(text: &str) -> Option<usize> {
+    let mut offset = 0;
+    let mut in_ui = false;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed == "[ui]" {
+            in_ui = true;
+            offset += line.len();
+            continue;
+        }
+        if in_ui && trimmed.starts_with('[') {
+            return Some(offset);
+        }
+        offset += line.len();
+    }
+    in_ui.then_some(offset)
 }
 
 pub fn print_config(repo: &Repository, config: &Config) {
@@ -427,6 +512,7 @@ pub fn print_config(repo: &Repository, config: &Config) {
     println!("opencode_plan_plugin = {}", config.opencode_plan_plugin);
     println!("escape_key = {}", config.escape_key.label());
     println!("merge_method = {}", config.merge_method.label());
+    println!("ui.icon_style = {}", config.icon_style.label());
     println!(
         "layout.sidebar_width = {}",
         config
@@ -752,6 +838,8 @@ mod tests {
         assert_eq!(config.default_agent, "opencode");
         assert_eq!(config.default_base.as_deref(), Some("main"));
         assert_eq!(config.merge_method, MergeMethod::Squash);
+        assert_eq!(config.icon_style, IconStyle::Unicode);
+        assert!(!config.icon_style_configured);
         assert_eq!(config.layout.sidebar_width, None);
         assert_eq!(config.opencode_port_base, 41_000);
         assert_eq!(config.opencode_port_span, 1_000);
@@ -856,6 +944,9 @@ escape_key = "ctrl-space"
 [layout]
 sidebar_width = 64
 
+[ui]
+icon_style = "nerd-font"
+
 [checks]
 pre_pr = ["cargo test", "printf \"done\""] # trailing comment
 
@@ -881,6 +972,8 @@ review = "fix\nreview"
         assert_eq!(config.default_base.as_deref(), Some("release/main"));
         assert_eq!(config.review_packet_dir, ".agent/review \"packets\"");
         assert_eq!(config.escape_key, EscapeKey::CtrlSpace);
+        assert_eq!(config.icon_style, IconStyle::NerdFont);
+        assert!(config.icon_style_configured);
         assert_eq!(config.layout.sidebar_width, Some(64));
         assert_eq!(config.checks.pre_pr, vec!["cargo test", "printf \"done\""]);
         assert_eq!(config.worktree_columns, vec!["url", "ci.status"]);
@@ -912,6 +1005,28 @@ review = "fix\nreview"
             ..RawConfig::default()
         });
         assert_eq!(config.layout.sidebar_width, Some(120));
+    }
+
+    #[test]
+    fn saves_icon_style_in_existing_ui_table() {
+        let path = std::env::temp_dir().join(format!(
+            "prism-config-icon-style-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, "[ui]\nother = true\n[tools]\ngh = \"gh\"\n").unwrap();
+
+        save_user_icon_style(&path, IconStyle::NerdFont).unwrap();
+
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[ui]"));
+        assert!(text.contains("icon_style = \"nerd-font\""));
+        assert!(text.contains("[tools]"));
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]
