@@ -79,7 +79,7 @@ pub struct Tui {
     status_message: Option<String>,
     status_message_until: Option<Instant>,
     #[cfg(test)]
-    pub(crate) prompt_submissions: Option<Vec<(usize, String)>>,
+    pub(crate) prompt_submissions: Option<Vec<(usize, String, u64)>>,
 }
 
 const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
@@ -892,8 +892,8 @@ impl Tui {
             "Space g o    open selected PR in browser",
             "Space g P    push branch, create PR if needed",
             "Space g M    merge selected PR",
-            "Space g c    send CI-failure prompt to agent session",
-            "Space g f    send review-fix prompt to agent session",
+            "Space g c    send CI-failure prompt to new agent session",
+            "Space g f    send review-fix prompt to new agent session",
             "Space g p    repos/worktrees: pull default branch",
             "p            repos/worktrees: pull default branch",
             "P            repos/worktrees: start or focus a plan run dashboard",

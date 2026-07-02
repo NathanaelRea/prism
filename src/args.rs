@@ -17,6 +17,8 @@ pub enum CommandKind {
     Tui,
     Help,
     Version,
+    DebugHelp,
+    DbHelp,
     Doctor,
     Config(ConfigCommand),
     Auto(AutoCommand),
@@ -146,6 +148,10 @@ impl Args {
                         .next()
                         .ok_or_else(|| "debug requires a subcommand".to_string())?;
                     let value = value.to_string_lossy();
+                    if value == "-h" || value == "--help" {
+                        command = CommandKind::DebugHelp;
+                        break;
+                    }
                     command = CommandKind::Debug(match value.as_ref() {
                         "paths" => DebugCommand::Paths,
                         "info" => DebugCommand::Info,
@@ -159,7 +165,12 @@ impl Args {
                         command = CommandKind::Db(DbCommand::Shell);
                         break;
                     };
-                    let mut parts = vec![value.to_string_lossy().to_string()];
+                    let value_text = value.to_string_lossy().to_string();
+                    if value_text == "-h" || value_text == "--help" {
+                        command = CommandKind::DbHelp;
+                        break;
+                    }
+                    let mut parts = vec![value_text];
                     parts.extend(iter.map(|arg| arg.to_string_lossy().to_string()));
                     if parts.len() == 1 && parts[0] == "path" {
                         command = CommandKind::Db(DbCommand::Path);
@@ -185,7 +196,15 @@ impl Args {
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config [show|example|schema|paths]\n  prism [--repo <path>] auto [prompt]\n  prism [--repo <path>] auto run-plan <plan.md>\n  prism [--repo <path>] auto plan [prompt]\n  prism [--repo <path>] auto plan-first [prompt]\n  prism [--repo <path>] auto intensive [prompt]\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n\nAliases:\n  auto plan-first and auto intensive are aliases for auto plan."
+    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config [show|example|schema|paths]\n  prism [--repo <path>] auto [prompt]\n  prism [--repo <path>] auto run-plan <plan.md>\n  prism [--repo <path>] auto plan [prompt]\n  prism [--repo <path>] auto plan-first [prompt]\n  prism [--repo <path>] auto intensive [prompt]\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] debug --help\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n  prism [--repo <path>] db --help\n\nDebugging:\n  Use `debug paths` to find Prism state, `debug logs` to tail the runtime log,\n  and `db path` or `db <read-only-sql>` to inspect persisted repo state.\n  Use `--print-logs --log-level trace` to print detailed subprocess logs.\n\nAliases:\n  auto plan-first and auto intensive are aliases for auto plan."
+}
+
+pub fn debug_help_text() -> &'static str {
+    "Usage:\n  prism [--repo <path>] debug paths\n  prism [--repo <path>] debug info\n  prism [--repo <path>] debug logs\n  prism [--repo <path>] debug startup\n\nDebug commands:\n  paths    print repo root, Prism state directory, database path, runtime log path, and config paths\n  info     print resolved runtime/config facts and startup setup facts\n  logs     tail the repo runtime log from Prism state\n  startup  run startup checks and print startup timing/debug output\n\nLogging flags:\n  --print-logs           print runtime logs to stderr while Prism runs\n  --log-level trace      include detailed subprocess argv/status logs"
+}
+
+pub fn db_help_text() -> &'static str {
+    "Usage:\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n\nDB commands:\n  db                  open sqlite3 on the repo Prism database\n  db path             print the repo Prism database path\n  db <read-only-sql>  run a read-only SQL query against persisted repo state"
 }
 
 #[cfg(test)]
@@ -301,5 +320,17 @@ mod tests {
         assert!(help.contains("prism [--repo <path>] db\n"));
         assert!(help.contains("prism [--repo <path>] db path"));
         assert!(help.contains("prism [--repo <path>] db <read-only-sql>"));
+    }
+
+    #[test]
+    fn debug_help_parses_as_static_command() {
+        assert_eq!(parse(&["debug", "--help"]), CommandKind::DebugHelp);
+        assert!(debug_help_text().contains("debug logs"));
+    }
+
+    #[test]
+    fn db_help_parses_as_static_command() {
+        assert_eq!(parse(&["db", "--help"]), CommandKind::DbHelp);
+        assert!(db_help_text().contains("db path"));
     }
 }

@@ -17,7 +17,10 @@ use std::process::{Command as ProcessCommand, Stdio};
 
 pub fn run() -> Result<(), String> {
     let args = Args::parse(std::env::args_os().skip(1))?;
-    if matches!(args.command, CommandKind::Help | CommandKind::Version) {
+    if matches!(
+        args.command,
+        CommandKind::Help | CommandKind::Version | CommandKind::DebugHelp | CommandKind::DbHelp
+    ) {
         return run_static_command(args.command);
     }
 
@@ -36,7 +39,9 @@ pub fn run() -> Result<(), String> {
     });
 
     match args.command {
-        CommandKind::Help | CommandKind::Version => run_static_command(args.command),
+        CommandKind::Help | CommandKind::Version | CommandKind::DebugHelp | CommandKind::DbHelp => {
+            run_static_command(args.command)
+        }
         CommandKind::Config(command) => {
             let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
             run_config_command(command, &repo, &config);
@@ -101,6 +106,14 @@ fn run_static_command(command: CommandKind) -> Result<(), String> {
         }
         CommandKind::Version => {
             println!("prism {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
+        CommandKind::DebugHelp => {
+            println!("{}", args::debug_help_text());
+            Ok(())
+        }
+        CommandKind::DbHelp => {
+            println!("{}", args::db_help_text());
             Ok(())
         }
         _ => unreachable!("static command runner received a stateful command"),
