@@ -69,6 +69,7 @@ impl KeyInput {
             KeyCode::Char('C') if plain_char(event) => Key::EditWorktreeColumns,
             KeyCode::Char('R') if plain_char(event) => Key::ManageRepos,
             KeyCode::Char('e') if plain_char(event) => Key::EditConfig,
+            KeyCode::Char('E') if plain_char(event) => Key::EditUserConfig,
             KeyCode::Char('D') if plain_char(event) => Key::Delete,
             KeyCode::Char('?') if plain_char(event) => Key::Help,
             KeyCode::Char('/') if plain_char(event) => Key::Search,
@@ -177,6 +178,7 @@ pub enum Key {
     Delete,
     DeletePermanent,
     EditConfig,
+    EditUserConfig,
     Search,
     Quit,
     Other,
@@ -350,6 +352,11 @@ mod tests {
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('C'))),
             Key::EditWorktreeColumns
+        );
+        assert_eq!(map(&mut input, key(KeyCode::Char('e'))), Key::EditConfig);
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('E'))),
+            Key::EditUserConfig
         );
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('P'))),

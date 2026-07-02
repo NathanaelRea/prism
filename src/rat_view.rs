@@ -12,6 +12,7 @@ use crate::{
         AutoImplementationSource, AutoOutputKind, AutoRunMode, AutoRunStatus, AutoStepKey,
         AutoStepRun, AutoStepStatus,
     },
+    config::IconStyle,
     opencode::{OpencodeState, OpencodeStatus},
     plan_run::{
         PlanOutputKind, PlanOutputLine, PlanRunMode, PlanRunStatus, PlanStepRun, PlanStepStatus,
@@ -116,8 +117,9 @@ fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>)
                     Span::raw(repo.label.clone()),
                     Span::styled(format!("  {}", repo.health), health_style(&repo.health)),
                 ]);
+                let focused = model.focus == PanelFocus::Repos && !model.main_focused;
                 ListItem::new(line).style(if repo.selected {
-                    selected_style(model.focus == PanelFocus::Repos && !model.main_focused)
+                    selected_sidebar_row_style(focused)
                 } else {
                     Style::default()
                 })
@@ -132,7 +134,15 @@ fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>)
             muted_style(),
         ));
     }
+    let selected_row = model
+        .repos
+        .iter()
+        .position(|repo| repo.selected)
+        .map(|row| row as u16);
     frame.render_widget(List::new(rows).block(panel_block(title, focused)), area);
+    if let Some(row) = selected_row {
+        render_selected_row_outline(frame, area, row, focused);
+    }
 }
 
 fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>) {
@@ -171,9 +181,9 @@ fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<
             .collect::<Vec<_>>(),
         ))];
         rows.extend(model.worktrees.iter().map(|worktree| {
-            let (pr_label, pr_style) = worktree_pr_column(worktree);
-            let (git_label, git_style) = worktree_git_column(worktree);
-            let (ci_label, ci_style) = worktree_ci_column(worktree);
+            let (pr_label, pr_style) = worktree_pr_column(worktree, model.config.icon_style);
+            let (git_label, git_style) = worktree_git_column(worktree, model.config.icon_style);
+            let (ci_label, ci_style) = worktree_ci_column(worktree, model.config.icon_style);
             let (comments_label, comments_style) = worktree_comments_column(worktree);
             let (error_label, error_style) = worktree_error_column(worktree);
             let mut spans = vec![
@@ -216,8 +226,9 @@ fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<
                     muted_style(),
                 )
             }));
+            let focused = model.focus == PanelFocus::Worktrees && !model.main_focused;
             ListItem::new(Line::from(spans)).style(if worktree.selected {
-                selected_style(model.focus == PanelFocus::Worktrees && !model.main_focused)
+                selected_sidebar_row_style(focused)
             } else {
                 Style::default()
             })
@@ -232,7 +243,31 @@ fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<
             muted_style(),
         ));
     }
+    let selected_row = model
+        .worktrees
+        .iter()
+        .position(|worktree| worktree.selected)
+        .map(|row| row as u16 + 1);
     frame.render_widget(List::new(rows).block(panel_block(title, focused)), area);
+    if let Some(row) = selected_row {
+        render_selected_row_outline(frame, area, row, focused);
+    }
+}
+
+fn render_selected_row_outline(frame: &mut Frame<'_>, area: Rect, row: u16, focused: bool) {
+    if area.width < 2 || area.height < 3 {
+        return;
+    }
+    let y = area.y.saturating_add(1).saturating_add(row);
+    if y >= area.y.saturating_add(area.height).saturating_sub(1) {
+        return;
+    }
+    let style = selected_sidebar_outline_style(focused);
+    frame.render_widget(Paragraph::new("█").style(style), Rect::new(area.x, y, 1, 1));
+    frame.render_widget(
+        Paragraph::new("█").style(style),
+        Rect::new(area.x + area.width - 1, y, 1, 1),
+    );
 }
 
 fn render_main(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>) {
@@ -284,6 +319,7 @@ fn status_dashboard_lines(model: &view::FrameModel<'_>) -> Vec<Line<'static>> {
         heading_line("Navigation"),
         Line::from("1 status  2 repos  3 worktrees"),
         Line::from("Tab cycles focus; repos h/l switches views"),
+        Line::from("e edits repo config; E edits user config"),
         Line::from(""),
         heading_line("Documentation"),
         Line::from("GitHub repository  https://github.com/NathanaelRea/prism"),
@@ -397,7 +433,10 @@ fn worktree_detail_lines(model: &view::FrameModel<'_>) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from(vec![
             Span::styled("status ", muted_style()),
-            Span::raw(git_status_indicator(&session.status_label)),
+            Span::raw(git_status_indicator(
+                &session.status_label,
+                model.config.icon_style,
+            )),
             Span::styled("  agent ", muted_style()),
             Span::styled(
                 agent_label(session.agent_state),
@@ -1221,7 +1260,10 @@ fn repo_preview_lines(
     };
     let review = review_decision_for_display(summary, session.pr.details.as_ref());
     lines.push(Line::from(vec![
-        Span::styled(pr_state_icon(summary), pr_state_style(summary)),
+        Span::styled(
+            pr_state_icon(summary, config.icon_style),
+            pr_state_style(summary),
+        ),
         Span::styled(
             format!(" PR #{} {}", summary.number, pr_state_label(summary)),
             pr_state_style(summary),
@@ -1393,12 +1435,16 @@ fn kanban_card_spans(
     session: &Session,
     selected: bool,
 ) -> Vec<Span<'static>> {
-    let mut suffix = git_status_indicator(&session.status_label);
+    let mut suffix = git_status_indicator(&session.status_label, config.icon_style);
     if let Some(summary) = &session.pr.summary {
         if !suffix.is_empty() {
             suffix.push(' ');
         }
-        suffix.push_str(&format!("#{} {}", summary.number, ci_icon(config, session)));
+        suffix.push_str(&format!(
+            "#{} {}",
+            summary.number,
+            ci_icon(config, session, config.icon_style)
+        ));
     }
     vec![
         Span::styled(if selected { "▶ " } else { "  " }, title_style(selected)),
@@ -1571,7 +1617,10 @@ fn pr_panel_lines(config: &crate::config::Config, session: Option<&Session>) -> 
     let review = review_decision_for_display(summary, session.pr.details.as_ref());
     let mut lines = vec![
         Line::from(vec![
-            Span::styled(pr_state_icon(summary), pr_state_style(summary)),
+            Span::styled(
+                pr_state_icon(summary, config.icon_style),
+                pr_state_style(summary),
+            ),
             Span::styled(
                 format!(" PR #{} {}", summary.number, pr_state_label(summary)),
                 pr_state_style(summary),
@@ -1588,7 +1637,10 @@ fn pr_panel_lines(config: &crate::config::Config, session: Option<&Session>) -> 
             Span::styled("review ", muted_style()),
             Span::styled(review_label(&review).to_string(), review_style(&review)),
             Span::styled("  ci ", muted_style()),
-            Span::styled(ci_icon(config, session), ci_style(config, session)),
+            Span::styled(
+                ci_icon(config, session, config.icon_style),
+                ci_style(config, session),
+            ),
             Span::raw(format!(" {}", summary.check_status)),
         ]),
     ];
@@ -2368,14 +2420,14 @@ fn repo_work_detail_label(config: &crate::config::Config, session: &Session) -> 
         );
         parts.push(format!(
             "ci {} {}",
-            ci_icon(config, session),
+            ci_icon(config, session, config.icon_style),
             summary.check_status
         ));
         parts.push(pr_comment_count_label(&session.pr));
     } else {
         parts.push("no PR".to_string());
     }
-    let git = git_status_indicator(&session.status_label);
+    let git = git_status_indicator(&session.status_label, config.icon_style);
     if !git.is_empty() {
         parts.push(git);
     }
@@ -2438,7 +2490,9 @@ fn review_decision_for_display(
 }
 
 fn pr_state_label(summary: &crate::github::PrSummary) -> &'static str {
-    if summary.merged {
+    if pr_has_merge_conflict(summary) {
+        "conflict"
+    } else if summary.merged {
         "merged"
     } else if summary.draft {
         "draft"
@@ -2460,7 +2514,21 @@ fn review_label(decision: &str) -> &str {
     }
 }
 
-fn pr_state_icon(summary: &crate::github::PrSummary) -> &'static str {
+fn pr_state_icon(summary: &crate::github::PrSummary, icon_style: IconStyle) -> &'static str {
+    if pr_has_merge_conflict(summary) {
+        return icon(icon_style, "⚔", "");
+    }
+    if icon_style == IconStyle::NerdFont {
+        return if summary.merged {
+            ""
+        } else if summary.draft {
+            ""
+        } else if summary.state == "OPEN" {
+            ""
+        } else {
+            ""
+        };
+    }
     if summary.merged {
         "⋈"
     } else if summary.draft {
@@ -2472,7 +2540,15 @@ fn pr_state_icon(summary: &crate::github::PrSummary) -> &'static str {
     }
 }
 
-fn ci_icon(config: &crate::config::Config, session: &Session) -> &'static str {
+fn pr_has_merge_conflict(summary: &crate::github::PrSummary) -> bool {
+    summary.merge_state_status.eq_ignore_ascii_case("DIRTY")
+}
+
+fn ci_icon(
+    config: &crate::config::Config,
+    session: &Session,
+    icon_style: IconStyle,
+) -> &'static str {
     if session.is_default_branch(config) {
         return "";
     }
@@ -2482,10 +2558,10 @@ fn ci_icon(config: &crate::config::Config, session: &Session) -> &'static str {
         .as_ref()
         .map(|summary| summary.check_status.as_str())
     {
-        Some("passed") => "✓",
-        Some("failed") => "✕",
-        Some("running") => "•",
-        Some("mixed") => "±",
+        Some("passed") => icon(icon_style, "✓", ""),
+        Some("failed") => icon(icon_style, "✕", ""),
+        Some("running") => icon(icon_style, "•", ""),
+        Some("mixed") => icon(icon_style, "±", ""),
         Some("unknown") | None => "?",
         Some(_) => "!",
     }
@@ -2502,10 +2578,10 @@ fn agent_icon(state: AgentState) -> &'static str {
     }
 }
 
-fn git_status_indicator(status: &str) -> String {
+fn git_status_indicator(status: &str, icon_style: IconStyle) -> String {
     let mut out = String::new();
     if let Some(count) = status_count(status, "dirty") {
-        out.push('✗');
+        out.push_str(icon(icon_style, "✗", ""));
         out.push_str(&count.to_string());
     }
     if let Some(count) = status_count(status, "ahead") {
@@ -2770,39 +2846,51 @@ fn truncate_column(value: &str, width: usize) -> String {
     out
 }
 
-fn worktree_pr_column(worktree: &view::WorktreeRow) -> (&'static str, Style) {
+fn worktree_pr_column(
+    worktree: &view::WorktreeRow,
+    icon_style: IconStyle,
+) -> (&'static str, Style) {
     if matches!(worktree.kind, view::WorktreeKind::DefaultBranch) {
         return ("·", muted_style());
     }
     if worktree.pr.error.is_some() {
-        return ("!", error_style());
+        return (icon(icon_style, "!", ""), error_style());
     }
     let Some(summary) = &worktree.pr.summary else {
         return ("○", muted_style());
     };
-    (pr_state_icon(summary), pr_style(summary))
+    (pr_state_icon(summary, icon_style), pr_style(summary))
 }
 
-fn worktree_git_column(worktree: &view::WorktreeRow) -> (&'static str, Style) {
+fn worktree_git_column(
+    worktree: &view::WorktreeRow,
+    icon_style: IconStyle,
+) -> (&'static str, Style) {
     if status_count(&worktree.status_label, "dirty").is_some() {
         (
-            "✗",
+            icon(icon_style, "✗", ""),
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )
     } else if status_count(&worktree.status_label, "ahead").is_some()
         && status_count(&worktree.status_label, "behind").is_some()
     {
-        ("↕", attention_style())
+        (icon(icon_style, "↕", ""), attention_style())
     } else if status_count(&worktree.status_label, "ahead").is_some() {
         ("↑", attention_style())
     } else if status_count(&worktree.status_label, "behind").is_some() {
         ("↓", attention_style())
     } else {
-        ("✓", muted_style())
+        (
+            icon(icon_style, "✓", ""),
+            Style::default().fg(Color::Green),
+        )
     }
 }
 
-fn worktree_ci_column(worktree: &view::WorktreeRow) -> (&'static str, Style) {
+fn worktree_ci_column(
+    worktree: &view::WorktreeRow,
+    icon_style: IconStyle,
+) -> (&'static str, Style) {
     if matches!(worktree.kind, view::WorktreeKind::DefaultBranch) {
         return ("·", muted_style());
     }
@@ -2810,7 +2898,7 @@ fn worktree_ci_column(worktree: &view::WorktreeRow) -> (&'static str, Style) {
         return ("·", muted_style());
     };
     (
-        ci_icon_for_status(&summary.check_status),
+        ci_icon_for_status(&summary.check_status, icon_style),
         pr_check_style(&summary.check_status),
     )
 }
@@ -2870,14 +2958,21 @@ fn worktree_error_column(worktree: &view::WorktreeRow) -> (&'static str, Style) 
     }
 }
 
-fn ci_icon_for_status(status: &str) -> &'static str {
+fn ci_icon_for_status(status: &str, icon_style: IconStyle) -> &'static str {
     match status {
-        "passed" => "✓",
-        "failed" => "✕",
-        "running" => "•",
-        "mixed" => "±",
+        "passed" => icon(icon_style, "✓", ""),
+        "failed" => icon(icon_style, "✕", ""),
+        "running" => icon(icon_style, "•", ""),
+        "mixed" => icon(icon_style, "±", ""),
         "unknown" => "?",
         _ => "!",
+    }
+}
+
+fn icon(icon_style: IconStyle, unicode: &'static str, nerd_font: &'static str) -> &'static str {
+    match icon_style {
+        IconStyle::Unicode => unicode,
+        IconStyle::NerdFont => nerd_font,
     }
 }
 
@@ -2928,6 +3023,31 @@ fn selected_style(focused: bool) -> Style {
         Style::default().fg(Color::Black).bg(highlight_color())
     } else {
         Style::default().bg(Color::DarkGray)
+    };
+    if focused {
+        style.add_modifier(Modifier::BOLD)
+    } else {
+        style
+    }
+}
+
+fn selected_sidebar_row_style(focused: bool) -> Style {
+    if focused {
+        Style::default()
+            .underline_color(highlight_color())
+            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+    } else {
+        Style::default()
+            .underline_color(Color::DarkGray)
+            .add_modifier(Modifier::UNDERLINED)
+    }
+}
+
+fn selected_sidebar_outline_style(focused: bool) -> Style {
+    let style = if focused {
+        highlight_style()
+    } else {
+        Style::default().fg(Color::DarkGray)
     };
     if focused {
         style.add_modifier(Modifier::BOLD)
@@ -3047,7 +3167,9 @@ fn diff_text_style(kind: PlanOutputKind, text: &str) -> Style {
 }
 
 fn pr_state_style(summary: &crate::github::PrSummary) -> Style {
-    if summary.merged {
+    if pr_has_merge_conflict(summary) {
+        error_style()
+    } else if summary.merged {
         Style::default()
             .fg(Color::Magenta)
             .add_modifier(Modifier::BOLD)
@@ -3103,7 +3225,9 @@ fn pr_check_style(status: &str) -> Style {
 }
 
 fn pr_style(summary: &crate::github::PrSummary) -> Style {
-    if summary.merged {
+    if pr_has_merge_conflict(summary) {
+        Style::default().fg(Color::Red)
+    } else if summary.merged {
         Style::default().fg(Color::Magenta)
     } else if summary.draft {
         muted_style()
@@ -3155,7 +3279,15 @@ mod tests {
         assert_region_contains(&buffer, 0..56, 0..30, "[1] Status");
         assert_region_contains(&buffer, 0..56, 0..30, "[2] Repos");
         assert_region_contains(&buffer, 0..56, 0..30, "[3] Worktrees");
-        assert_cell_style(&buffer, 0, 20, highlight_style().bg(Color::Reset));
+        let row = find_line(&buffer, "●");
+        assert_cell_style(
+            &buffer,
+            0,
+            row,
+            highlight_style()
+                .bg(Color::Reset)
+                .add_modifier(Modifier::BOLD),
+        );
         assert_region_contains(&buffer, 56..120, 0..29, "Main");
         assert_region_contains(&buffer, 0..56, 0..30, "feature");
         assert!(!line_text(&buffer, 29).contains("normal"));
@@ -3169,7 +3301,15 @@ mod tests {
         let buffer = render_to_buffer(&model, 48, 12);
 
         assert_region_contains(&buffer, 0..48, 0..11, "[2] Repos");
-        assert_cell_style(&buffer, 0, 6, highlight_style().bg(Color::Reset));
+        let row = find_line(&buffer, "repo  ok");
+        assert_cell_style(
+            &buffer,
+            0,
+            row,
+            highlight_style()
+                .bg(Color::Reset)
+                .add_modifier(Modifier::BOLD),
+        );
         assert_region_contains(&buffer, 0..48, 0..11, "repo");
         assert!(!line_text(&buffer, 11).contains("normal"));
     }
@@ -3184,11 +3324,27 @@ mod tests {
 
         assert_cell_style(
             &buffer,
+            0,
+            row,
+            highlight_style()
+                .bg(Color::Reset)
+                .add_modifier(Modifier::BOLD),
+        );
+        assert_cell_style(
+            &buffer,
             4,
             row,
             Style::default()
-                .fg(Color::Black)
-                .bg(highlight_color())
+                .fg(Color::Reset)
+                .bg(Color::Reset)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        );
+        assert_cell_style(
+            &buffer,
+            55,
+            row,
+            highlight_style()
+                .bg(Color::Reset)
                 .add_modifier(Modifier::BOLD),
         );
 
@@ -3198,11 +3354,36 @@ mod tests {
 
         assert_cell_style(
             &buffer,
+            0,
+            row,
+            highlight_style()
+                .bg(Color::Reset)
+                .add_modifier(Modifier::BOLD),
+        );
+        assert_cell_style(
+            &buffer,
             5,
             row,
             Style::default()
-                .fg(Color::Black)
-                .bg(highlight_color())
+                .fg(Color::Reset)
+                .bg(Color::Reset)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        );
+        assert_cell_style(
+            &buffer,
+            16,
+            row,
+            Style::default()
+                .fg(Color::Green)
+                .bg(Color::Reset)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+        );
+        assert_cell_style(
+            &buffer,
+            55,
+            row,
+            highlight_style()
+                .bg(Color::Reset)
                 .add_modifier(Modifier::BOLD),
         );
     }
@@ -3252,6 +3433,24 @@ mod tests {
     }
 
     #[test]
+    fn renders_nerd_font_worktree_icons_when_configured() {
+        let mut config = test_config();
+        config.icon_style = IconStyle::NerdFont;
+        let mut session = test_session("feature", AgentState::Running);
+        session.status_label = "dirty 2".to_string();
+        let mut summary = test_pr_summary();
+        summary.check_status = "passed".to_string();
+        session.pr.summary = Some(summary);
+        let sessions = vec![session];
+        let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+        let buffer = render_to_string(&model, 160, 30);
+
+        assert!(buffer.contains(""));
+        assert!(buffer.contains(""));
+        assert!(buffer.contains(""));
+    }
+
+    #[test]
     fn worktree_sidebar_renders_missing_configured_columns_as_placeholders() {
         let mut config = test_config();
         config.worktree_columns = vec!["todo".to_string(), "owner".to_string()];
@@ -3265,6 +3464,42 @@ mod tests {
 
         assert!(buffer.contains("12345678901234567~"));
         assert!(buffer.contains("·"));
+    }
+
+    #[test]
+    fn clean_worktree_git_check_is_green() {
+        let session = test_session("feature", AgentState::Running);
+        let worktree = WorktreeRow {
+            session_index: 0,
+            repo_root: "/repo".to_string(),
+            worktree_path: "/repo/feature".to_string(),
+            branch: session.branch.clone(),
+            kind: WorktreeKind::FeatureWorktree,
+            agent_state: session.agent_state,
+            status_label: session.status_label.clone(),
+            pr: session.pr.clone(),
+            wt_columns: session.wt_columns.clone(),
+            auto_status: None,
+            unseen_comments: session.unseen_comments,
+            prompt_summary: session.prompt_summary.clone(),
+            classification: session.classification,
+            selected: true,
+        };
+
+        let (label, style) = worktree_git_column(&worktree, IconStyle::Unicode);
+
+        assert_eq!(label, "✓");
+        assert_eq!(style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn pr_merge_conflict_uses_conflict_icon() {
+        let mut summary = test_pr_summary();
+        summary.merge_state_status = "DIRTY".to_string();
+
+        assert_eq!(pr_state_label(&summary), "conflict");
+        assert_eq!(pr_state_icon(&summary, IconStyle::Unicode), "⚔");
+        assert_eq!(pr_state_style(&summary).fg, Some(Color::Red));
     }
 
     #[test]
@@ -3599,6 +3834,8 @@ mod tests {
             opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
+            icon_style: IconStyle::Unicode,
+            icon_style_configured: false,
             auto: crate::config::AutoConfig::default(),
             layout: crate::config::LayoutConfig::default(),
             checks: Checks::default(),
@@ -3647,6 +3884,7 @@ mod tests {
             head_sha: "abc123".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             check_status: "failed".to_string(),
+            merge_state_status: "CLEAN".to_string(),
             comment_count: 5,
             merged: false,
             draft: false,

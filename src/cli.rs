@@ -1,5 +1,5 @@
 use crate::args::{
-    self, Args, AutoCommand, AutoCommandSource, CommandKind, DbCommand, DebugCommand,
+    self, Args, AutoCommand, AutoCommandSource, CommandKind, ConfigCommand, DbCommand, DebugCommand,
 };
 use crate::auto_flow::{
     AutoExecutorConfig, AutoImplementationSource, AutoLaunch, AutoLaunchOptions, AutoRunMode,
@@ -42,9 +42,9 @@ pub fn run() -> Result<(), String> {
         CommandKind::Help | CommandKind::Version | CommandKind::DebugHelp | CommandKind::DbHelp => {
             run_static_command(args.command)
         }
-        CommandKind::Config => {
+        CommandKind::Config(command) => {
             let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
-            config::print_config(&repo, &config);
+            run_config_command(command, &repo, &config);
             Ok(())
         }
         CommandKind::Doctor => {
@@ -68,6 +68,19 @@ pub fn run() -> Result<(), String> {
             run_db_command(command, &repo)
         }
         CommandKind::Tui => run_tui(args.repo.as_deref()),
+    }
+}
+
+fn run_config_command(command: ConfigCommand, repo: &Repository, config: &Config) {
+    match command {
+        ConfigCommand::Show => config::print_config(repo, config),
+        ConfigCommand::Example => print!("{}", config::config_example()),
+        ConfigCommand::Schema => print!("{}", config::CONFIG_SCHEMA_JSON),
+        ConfigCommand::Paths => {
+            println!("user_config = {}", config.user_path.display());
+            println!("repo_config = {}", config.repo_config_path.display());
+            println!("schema_url = {}", config::CONFIG_SCHEMA_URL);
+        }
     }
 }
 
@@ -148,6 +161,13 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
                 config::ensure_default_agent(&mut config)
             })?;
             repos.push(ManagedRepo::new(repo, config, entry.key));
+        }
+        if let Some(repo) = repos.get(selected_repo)
+            && setup::maybe_prompt_icon_style(&repo.config)?.is_some()
+        {
+            for repo in &mut repos {
+                repo.config = Config::load(&repo.repo);
+            }
         }
         let selected_repo = selected_repo.min(repos.len().saturating_sub(1));
         if let Some(repo) = repos.get(selected_repo) {

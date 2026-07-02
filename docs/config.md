@@ -2,6 +2,10 @@
 
 Tracked repositories live in `~/.config/prism/repos.toml`.
 
+Global Prism settings live in `~/.config/prism/config.toml`. Press `E` in the TUI to edit this file and reload configuration.
+
+Run `prism config example` to print a complete commented config template, `prism config schema` to print the JSON Schema used by TOML editor tooling, and `prism config paths` to inspect the active config paths and schema URL.
+
 Each repository entry has a path and may have a digit key. Digit keys are used as `Space <digit>` shortcuts in the TUI.
 
 ```toml
@@ -10,13 +14,15 @@ path = "/path/to/repo"
 key = "1"
 ```
 
-Repository-specific Prism config lives under the repository config path shown by `e` from the Repos panel. Common settings include `default_base`, layout width, worktree columns, merge method, OpenCode runtime settings, tools, and prompt templates.
+Repository-specific Prism config lives under the repository config path opened by `e`. Common settings include `default_base`, layout width, worktree columns, merge method, OpenCode runtime settings, tools, and prompt templates.
 
 Per-repository Prism state also lives under that repository config directory, not inside the project repository. The state database is named `prism.db` and stores worktree session metadata, OpenCode runtime records, Plan Mode and Auto Flow runs, PR cache data, and observability records.
 
 Use `R` from Prism to edit repository order, keys, and tracked repositories.
 
 ```toml
+#:schema https://raw.githubusercontent.com/NathanaelRea/prism/main/schemas/config.schema.json
+
 default_base = "main"
 merge_method = "squash"
 
@@ -30,6 +36,9 @@ opencode_shutdown_owned_servers = false
 [layout]
 sidebar_width = 56
 
+[ui]
+icon_style = "unicode" # or "nerd-font"
+
 [worktrees]
 columns = ["url", "ci.status", "vars.localdev"]
 
@@ -41,6 +50,8 @@ review_fix = "Here are review comments on PR {pr_number}.\n\nIf they are applica
 ci_failure = "Here are CI failures on PR {pr_number}.\n\nFix the failing checks. Use the log tails below as the primary clues.\n\nPR: {url}\nBranch: {branch}\nHead SHA: {head_sha}\n\n---\n\n{failures}"
 ```
 
+The `#:schema` line is an optional TOML comment. Prism ignores it, while Taplo-compatible TOML language servers can use it for completions, descriptions, enum values, and type validation.
+
 Prism treats `main` as the default branch by default. The default branch is not polled or shown as a pull request branch.
 
 Prism uses squash merges for pull requests by default. Set `merge_method` to `merge` or `rebase` if a repository requires a different GitHub merge method.
@@ -48,6 +59,8 @@ Prism uses squash merges for pull requests by default. Set `merge_method` to `me
 Prism manages one local OpenCode server per worktree session. `opencode_port_base` and `opencode_port_span` define the deterministic local port range used for those servers. By default Prism keeps servers warm after the TUI exits; set `opencode_shutdown_owned_servers = true` to send SIGTERM to OpenCode servers that Prism spawned during the session.
 
 `[layout] sidebar_width` controls the Status/Repos/Worktrees sidebar width in terminal columns. Values are bounded to `20..=120`. When the terminal is too narrow, Prism reduces the configured width so the main panel keeps usable space; this preserves the board layout instead of strictly honoring a width that would hide the main panel.
+
+`[ui] icon_style` controls TUI status glyphs. `unicode` is the portable default. `nerd-font` uses richer Nerd Font glyphs for pull requests, merge state, Git status, and CI, and requires a Nerd Font configured in your terminal.
 
 `[worktrees] columns` controls the visible extra columns in the TUI worktree list. Columns are shown in the configured order after Prism's built-in worktree indicators. Missing values render as a compact placeholder so neighboring columns stay aligned.
 

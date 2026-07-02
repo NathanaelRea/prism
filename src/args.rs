@@ -20,11 +20,19 @@ pub enum CommandKind {
     DebugHelp,
     DbHelp,
     Doctor,
-    Config,
+    Config(ConfigCommand),
     Auto(AutoCommand),
     RunPlan(Option<PathBuf>),
     Debug(DebugCommand),
     Db(DbCommand),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConfigCommand {
+    Show,
+    Example,
+    Schema,
+    Paths,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -91,7 +99,21 @@ impl Args {
                     })?);
                 }
                 "doctor" => command = CommandKind::Doctor,
-                "config" => command = CommandKind::Config,
+                "config" => {
+                    let Some(value) = iter.next() else {
+                        command = CommandKind::Config(ConfigCommand::Show);
+                        break;
+                    };
+                    let value = value.to_string_lossy();
+                    command = CommandKind::Config(match value.as_ref() {
+                        "show" => ConfigCommand::Show,
+                        "example" => ConfigCommand::Example,
+                        "schema" => ConfigCommand::Schema,
+                        "paths" => ConfigCommand::Paths,
+                        other => return Err(format!("unknown config subcommand: {other}")),
+                    });
+                    break;
+                }
                 "auto" => {
                     let first = iter.next().map(|arg| arg.to_string_lossy().to_string());
                     let (source, prompt, plan_path) = match first.as_deref() {
@@ -174,7 +196,7 @@ impl Args {
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config\n  prism [--repo <path>] auto [prompt]\n  prism [--repo <path>] auto run-plan <plan.md>\n  prism [--repo <path>] auto plan [prompt]\n  prism [--repo <path>] auto plan-first [prompt]\n  prism [--repo <path>] auto intensive [prompt]\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] debug --help\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n  prism [--repo <path>] db --help\n\nDebugging:\n  Use `debug paths` to find Prism state, `debug logs` to tail the runtime log,\n  and `db path` or `db <read-only-sql>` to inspect persisted repo state.\n  Use `--print-logs --log-level trace` to print detailed subprocess logs.\n\nAliases:\n  auto plan-first and auto intensive are aliases for auto plan."
+    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config [show|example|schema|paths]\n  prism [--repo <path>] auto [prompt]\n  prism [--repo <path>] auto run-plan <plan.md>\n  prism [--repo <path>] auto plan [prompt]\n  prism [--repo <path>] auto plan-first [prompt]\n  prism [--repo <path>] auto intensive [prompt]\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] debug --help\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n  prism [--repo <path>] db --help\n\nDebugging:\n  Use `debug paths` to find Prism state, `debug logs` to tail the runtime log,\n  and `db path` or `db <read-only-sql>` to inspect persisted repo state.\n  Use `--print-logs --log-level trace` to print detailed subprocess logs.\n\nAliases:\n  auto plan-first and auto intensive are aliases for auto plan."
 }
 
 pub fn debug_help_text() -> &'static str {
@@ -248,6 +270,27 @@ mod tests {
     #[test]
     fn db_without_arguments_parses_as_shell() {
         assert_eq!(parse(&["db"]), CommandKind::Db(DbCommand::Shell));
+    }
+
+    #[test]
+    fn config_subcommands_parse() {
+        assert_eq!(parse(&["config"]), CommandKind::Config(ConfigCommand::Show));
+        assert_eq!(
+            parse(&["config", "show"]),
+            CommandKind::Config(ConfigCommand::Show)
+        );
+        assert_eq!(
+            parse(&["config", "example"]),
+            CommandKind::Config(ConfigCommand::Example)
+        );
+        assert_eq!(
+            parse(&["config", "schema"]),
+            CommandKind::Config(ConfigCommand::Schema)
+        );
+        assert_eq!(
+            parse(&["config", "paths"]),
+            CommandKind::Config(ConfigCommand::Paths)
+        );
     }
 
     #[test]

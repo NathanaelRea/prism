@@ -778,10 +778,15 @@ impl Tui {
                 Key::EditConfig => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.focused_panel != PanelFocus::Repos {
-                        self.show_message("focus repos to edit repository config")?;
-                    } else if let Err(error) = self.edit_config(&mut runtime) {
+                    if let Err(error) = self.edit_config(&mut runtime) {
                         self.show_error("edit config failed", &error)?;
+                    }
+                }
+                Key::EditUserConfig => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if let Err(error) = self.edit_user_config(&mut runtime) {
+                        self.show_error("edit user config failed", &error)?;
                     }
                 }
                 Key::Search => {
@@ -897,7 +902,8 @@ impl Tui {
             "R            edit repositories/order/keys/remove",
             "c            create worktree session in selected repo",
             "x            worktrees: abort selected OpenCode session",
-            "e            repos: edit Prism repo config, then reload",
+            "e            edit selected repository config, then reload",
+            "E            edit user config, then reload",
             "C            repos: edit visible worktree columns in repo config",
             "/            search/filter focused panel",
             "?            show keybindings; / filters this dialog",
@@ -2961,6 +2967,8 @@ mod tests {
             opencode_plan_plugin: false,
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
+            icon_style: crate::config::IconStyle::Unicode,
+            icon_style_configured: false,
             auto: crate::config::AutoConfig::default(),
             layout: crate::config::LayoutConfig::default(),
             checks: Checks::default(),
