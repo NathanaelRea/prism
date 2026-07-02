@@ -256,6 +256,11 @@ fn remove_worktree_session_db_records(repo: &Repository, branch: &str) -> Result
             remove_agent_state_with_conn(conn, branch)?;
             crate::opencode::remove_runtime_for_branch_with_conn(conn, branch)?;
             clear_hidden_session_marker_with_conn(conn, branch)?;
+            conn.execute(
+                "delete from archived_worktree where branch = ?1",
+                rusqlite::params![branch],
+            )
+            .map_err(|error| format!("remove archived worktree metadata: {error}"))?;
             Ok(())
         })();
         match result {
@@ -614,6 +619,7 @@ exit 0
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             auto: crate::config::AutoConfig::default(),
+            layout: crate::config::LayoutConfig::default(),
             checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
