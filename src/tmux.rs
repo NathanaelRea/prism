@@ -259,22 +259,55 @@ pub fn kill_agent_session(
     kill_session(config, runtime.name())
 }
 
+pub fn kill_agent_sessions_for_branch(
+    repo: &Repository,
+    config: &Config,
+    branch: &str,
+) -> Result<(), String> {
+    let prefix = agent_session_prefix(repo, branch);
+    for name in agent_session_names_with_prefix(config, &prefix)? {
+        kill_session(config, &name)?;
+    }
+    Ok(())
+}
+
 pub fn latest_agent_session_generation(
     repo: &Repository,
     config: &Config,
     branch: &str,
 ) -> Option<u64> {
     let prefix = agent_session_prefix(repo, branch);
-    let output = run_capture(Command::new(config.tool("tmux")).env_remove("TMUX").args([
-        "list-sessions",
-        "-F",
-        "#{session_name}",
-    ]))
-    .ok()?;
-    output
-        .lines()
+    agent_session_names_with_prefix(config, &prefix)
+        .ok()?
+        .into_iter()
         .filter_map(|name| name.strip_prefix(&prefix)?.parse::<u64>().ok())
         .max()
+}
+
+fn agent_session_names_with_prefix(config: &Config, prefix: &str) -> Result<Vec<String>, String> {
+    let output =
+        run_output_allow_failure(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+        ]))?;
+    if !output.status.success() {
+        let stderr = output.stderr.trim();
+        if tmux_missing_session_error(stderr) {
+            return Ok(Vec::new());
+        }
+        return Err(if stderr.is_empty() {
+            format!("tmux exited with {}", output.status)
+        } else {
+            stderr.to_string()
+        });
+    }
+    Ok(output
+        .stdout
+        .lines()
+        .filter(|name| name.starts_with(prefix))
+        .map(str::to_string)
+        .collect())
 }
 
 fn agent_session_prefix(repo: &Repository, branch: &str) -> String {
@@ -556,6 +589,7 @@ fn tmux_missing_session_error(error: &str) -> bool {
     error.contains("can't find session")
         || error.contains("can't find window")
         || error.contains("can't find pane")
+        || error.contains("no server running")
 }
 
 fn agent_shell_command(
