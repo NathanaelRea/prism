@@ -52,16 +52,17 @@ The shims must not call real network services, read real tokens, or depend on co
 - `cargo` from Rust, for building Prism.
 - `git`, for the fake repository and worktrees.
 - `python3`, for lightweight shim/server behavior.
+- `tmux`, for sandboxed terminal sessions used by the demo.
 - `vhs`, the supported recorder.
 - `ttyd` and `ffmpeg`, required by VHS.
 - `gifsicle`, optional, for GIF optimization.
 
 Known package names:
 
-- Arch Linux: `rust`, `git`, `python`, `vhs`, `ttyd`, `ffmpeg`, `gifsicle`.
-- Debian/Ubuntu: `cargo`, `git`, `python3`, `ffmpeg`, `gifsicle`; install `vhs` from Charm's apt repository or GitHub releases, and install `ttyd` from the distro package if available or from `https://github.com/tsl0922/ttyd`.
-- Fedora: `cargo`, `git`, `python3`, `ffmpeg`, `gifsicle`; install `vhs` from Charm's yum repository or GitHub releases, and install `ttyd` from the distro package if available or from `https://github.com/tsl0922/ttyd`.
-- macOS with Homebrew: `rust`, `git`, `python`, `vhs`, `ttyd`, `ffmpeg`, `gifsicle`.
+- Arch Linux: `rust`, `git`, `python`, `tmux`, `vhs`, `ttyd`, `ffmpeg`, `gifsicle`.
+- Debian/Ubuntu: `cargo`, `git`, `python3`, `tmux`, `ffmpeg`, `gifsicle`; install `vhs` from Charm's apt repository or GitHub releases, and install `ttyd` from the distro package if available or from `https://github.com/tsl0922/ttyd`.
+- Fedora: `cargo`, `git`, `python3`, `tmux`, `ffmpeg`, `gifsicle`; install `vhs` from Charm's yum repository or GitHub releases, and install `ttyd` from the distro package if available or from `https://github.com/tsl0922/ttyd`.
+- macOS with Homebrew: `rust`, `git`, `python`, `tmux`, `vhs`, `ttyd`, `ffmpeg`, `gifsicle`.
 
 ## Debugging
 

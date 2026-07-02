@@ -166,10 +166,23 @@ assert_no_unsupported_shim_calls() {
 }
 
 smoke_opencode_server() {
-  local port=49381
+  local port
   local pid
+  local ready=0
+
+  port="$(python3 <<'PY'
+import socket
+
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)"
+
   "$sandbox_path/bin/opencode" serve --hostname 127.0.0.1 --port "$port" >/dev/null 2>&1 &
   pid=$!
+  trap 'kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true; trap - RETURN' RETURN
+
   for _ in 1 2 3 4 5 6 7 8 9 10; do
     if python3 - "$port" <<'PY' >/dev/null 2>&1
 import sys
@@ -178,10 +191,15 @@ import urllib.request
 urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/global/health", timeout=0.25).read()
 PY
     then
+      ready=1
       break
     fi
+    kill -0 "$pid" >/dev/null 2>&1 || return 1
     sleep 0.1
   done
+
+  [[ "$ready" -eq 1 ]] || return 1
+
   python3 - "$port" "$PRISM_DEMO_REPO" <<'PY'
 import json
 import sys
@@ -206,14 +224,13 @@ for path in [
 ]:
     urllib.request.urlopen(f"{base}{path}", timeout=1).read()
 PY
-  kill "$pid" >/dev/null 2>&1 || true
-  wait "$pid" >/dev/null 2>&1 || true
 }
 
 printf 'Checking screenshot dependencies...\n'
 require_tool cargo "Install Rust from https://rustup.rs/."
 require_tool git "Install Git with your system package manager."
 require_tool python3 "Install Python 3 with your system package manager."
+require_tool tmux "Install tmux with your system package manager."
 require_recording_tool vhs "Install VHS from https://github.com/charmbracelet/vhs before refreshing the demo GIF."
 require_recording_tool ttyd "VHS requires ttyd. Install it with your system package manager or from https://github.com/tsl0922/ttyd."
 require_recording_tool ffmpeg "VHS requires ffmpeg. Install it with your system package manager."
