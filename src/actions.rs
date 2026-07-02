@@ -1169,21 +1169,6 @@ impl Tui {
         Ok(())
     }
 
-    pub(crate) fn start_selected_repo_plan_run(
-        &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
-    ) -> Result<(), String> {
-        let context = self
-            .selected_repo_context()
-            .ok_or_else(|| "no selected repository".to_string())?;
-        self.start_plan_run_for_scope(
-            raw,
-            context.repo.clone(),
-            context.config.clone(),
-            context.repo.root,
-        )
-    }
-
     pub(crate) fn start_selected_worktree_plan_run(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,

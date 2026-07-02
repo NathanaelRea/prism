@@ -710,12 +710,8 @@ impl Tui {
                 Key::PlanMode => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.focused_panel == PanelFocus::Status {
-                        self.show_message("focus repos or worktrees to run plan mode")?;
-                    } else if self.focused_panel == PanelFocus::Repos {
-                        if let Err(error) = self.start_selected_repo_plan_run(&mut runtime) {
-                            self.show_error("plan mode failed", &error)?;
-                        }
+                    if self.focused_panel != PanelFocus::Worktrees {
+                        self.show_message("focus worktrees to run plan mode")?;
                     } else if let Err(error) = self.start_selected_worktree_plan_run(&mut runtime) {
                         self.show_error("plan mode failed", &error)?;
                     }
@@ -1731,12 +1727,8 @@ impl Tui {
     }
 
     pub(crate) fn current_plan_dashboard(&self) -> Option<view::PlanDashboard> {
-        if self.focused_panel == PanelFocus::Status && self.selected_status_auto_run_id().is_some()
-        {
-            return None;
-        }
-        if self.focused_panel == PanelFocus::Worktrees
-            && self.worktree_main_view == view::WorktreeMainView::Details
+        if self.focused_panel != PanelFocus::Worktrees
+            || self.worktree_main_view == view::WorktreeMainView::Details
         {
             return None;
         }
@@ -1774,13 +1766,7 @@ impl Tui {
 
     fn selected_plan_run_id(&self) -> Option<(Repository, String)> {
         let (repo, scope_path) = self.selected_plan_scope()?;
-        let exact_runs = self.plan_run_ids_for_scope(&repo.root, &scope_path);
-        let (scope_path, run_ids) = if exact_runs.is_empty() && scope_path != repo.root {
-            let repo_runs = self.plan_run_ids_for_scope(&repo.root, &repo.root);
-            (repo.root.clone(), repo_runs)
-        } else {
-            (scope_path, exact_runs)
-        };
+        let run_ids = self.plan_run_ids_for_scope(&repo.root, &scope_path);
         let selected = self
             .active_plan_runs
             .get(&scope_path)
@@ -2081,10 +2067,7 @@ impl Tui {
                     self.sessions.get(context.session_index)?.path.clone(),
                 ))
             }
-            PanelFocus::Status | PanelFocus::Repos => {
-                let context = self.selected_repo_context()?;
-                Some((context.repo.clone(), context.repo.root))
-            }
+            PanelFocus::Status | PanelFocus::Repos => None,
         }
     }
 
@@ -2782,10 +2765,10 @@ mod tests {
     }
 
     #[test]
-    fn open_tmux_session_target_operates_status_dashboard_when_visible() {
+    fn open_tmux_session_target_operates_status_dashboard_for_auto_run() {
         let mut tui = test_tui();
         tui.focused_panel = PanelFocus::Status;
-        tui.remember_plan_run(test_plan_run("plan", "/repo-one"));
+        tui.remember_auto_run(test_auto_run("auto", "/repo-one/feature-one", 20));
 
         assert_eq!(
             tui.open_tmux_session_target(),
@@ -2876,12 +2859,14 @@ mod tests {
     }
 
     #[test]
-    fn status_plan_dashboard_is_hidden_when_auto_run_is_selected() {
+    fn standalone_plan_dashboard_is_hidden_outside_worktrees() {
         let mut tui = test_tui();
         tui.focused_panel = PanelFocus::Status;
         tui.remember_plan_run(test_plan_run("plan", "/repo-one"));
-        tui.remember_auto_run(test_auto_run("auto", "/repo-one/feature-one", 20));
-        tui.selected_auto_run = Some("auto".to_string());
+
+        assert!(tui.current_plan_dashboard().is_none());
+
+        tui.focused_panel = PanelFocus::Repos;
 
         assert!(tui.current_plan_dashboard().is_none());
     }
@@ -2889,7 +2874,7 @@ mod tests {
     #[test]
     fn plan_step_selection_follows_persisted_active_step_until_manual_navigation() {
         let mut tui = test_tui();
-        let mut run = test_plan_run_with_steps("plan", "/repo-one", 1);
+        let mut run = test_plan_run_with_steps("plan", "/repo-one/feature-one", 1);
 
         tui.remember_plan_run(run.clone());
         assert_eq!(tui.selected_plan_step_by_run.get("plan"), Some(&1));
@@ -2902,7 +2887,9 @@ mod tests {
         tui.remember_plan_run(run.clone());
         assert_eq!(tui.selected_plan_step_by_run.get("plan"), Some(&2));
 
-        tui.focused_panel = PanelFocus::Status;
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.select_worktree(1);
+        tui.worktree_main_view = WorktreeMainView::Plan;
         tui.move_plan_step_selection(-1);
         assert_eq!(tui.selected_plan_step_by_run.get("plan"), Some(&1));
 
