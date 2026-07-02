@@ -1530,7 +1530,7 @@ pub fn reconcile_plan_step_from_opencode_status(
     status: &OpencodeStatus,
     max_output_lines_per_step: usize,
 ) -> Result<bool, String> {
-    let before = step.clone();
+    let mut changed = false;
     if let Some(status_session_id) = status.session_id.as_deref() {
         if let Some(step_session_id) = step.opencode_session_id.as_deref()
             && step_session_id != status_session_id
@@ -1539,11 +1539,14 @@ pub fn reconcile_plan_step_from_opencode_status(
         }
         if step.opencode_session_id.is_none() {
             step.opencode_session_id = Some(status_session_id.to_string());
+            changed = true;
         }
     }
     if step.opencode_server_url.is_none() {
+        changed |= status.server_url.is_some();
         step.opencode_server_url = status.server_url.clone();
     }
+    changed |= step.opencode_state != Some(status.state);
     step.opencode_state = Some(status.state);
 
     let mut events = Vec::new();
@@ -1559,17 +1562,20 @@ pub fn reconcile_plan_step_from_opencode_status(
     if let Some(text) = status.latest_message.as_ref()
         && step.latest_message.as_deref() != Some(text.as_str())
     {
+        changed = true;
         events.push(PlanAgentEvent::AssistantText { text: text.clone() });
     }
     if let Some(tool) = status.active_tool.as_ref()
         && step.active_tool.as_deref() != Some(tool.as_str())
     {
+        changed = true;
         events.push(PlanAgentEvent::ToolStarted {
             id: None,
             name: tool.clone(),
             args_summary: None,
         });
     } else if status.active_tool.is_none() && step.active_tool.is_some() {
+        changed = true;
         events.push(PlanAgentEvent::ToolFinished {
             id: None,
             status: "idle".to_string(),
@@ -1581,11 +1587,12 @@ pub fn reconcile_plan_step_from_opencode_status(
         .map(|todo| PlanTodo::new(&todo.text, &todo.status))
         .collect::<Vec<_>>();
     if step.todos != todos {
+        changed = true;
         events.push(PlanAgentEvent::TodoUpdated { todos });
     }
 
     ingest_plan_agent_events(conn, step, events, max_output_lines_per_step)?;
-    Ok(*step != before)
+    Ok(changed)
 }
 
 fn execute_one_step(

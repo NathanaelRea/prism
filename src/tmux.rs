@@ -1810,7 +1810,9 @@ exit 0
         let mut request_body = Vec::new();
         if content_length > 0 {
             let mut body = vec![0; content_length];
-            let _ = reader.read_exact(&mut body);
+            if reader.read_exact(&mut body).is_err() {
+                return;
+            }
             request_body = body;
         }
         drop(reader);
