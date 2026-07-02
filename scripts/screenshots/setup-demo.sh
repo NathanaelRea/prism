@@ -38,7 +38,7 @@ shims_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/shims" && pwd)"
 
 mkdir -p "$bin_dir" "$config_dir" "$lazygit_config_dir" "$lazygit_state_dir" "$PRISM_DEMO_ROOT/state" "$PRISM_DEMO_ROOT/logs"
 
-for tool in gh tmux wt wl-copy date; do
+for tool in gh tmux wt wl-copy date fzf opencode; do
   cp "$shims_dir/$tool" "$bin_dir/$tool"
   chmod +x "$bin_dir/$tool"
 done
@@ -85,9 +85,66 @@ cat >"$PRISM_DEMO_REPO/docs/runbook.md" <<'EOF'
 - Keep inventory updates small.
 - Review checkout changes before release.
 EOF
-git -C "$PRISM_DEMO_REPO" add README.md src docs
+cat >"$PRISM_DEMO_REPO/plan-demo.md" <<'EOF'
+# Demo Storefront Plan
+
+## Phase 1: Map Current Flow
+
+Review catalog, checkout, and release notes to identify the smallest demo-safe change.
+
+## Phase 2: Implement Agent-Visible Fix
+
+Patch the recommendation copy and keep the OpenCode todo list visible while work is running.
+
+## Phase 3: Verify And Prepare PR
+
+Run the focused smoke check, summarize CI status, and prepare the merge follow-up.
+EOF
+git -C "$PRISM_DEMO_REPO" add README.md plan-demo.md src docs
 git -C "$PRISM_DEMO_REPO" commit -m "Initial storefront skeleton" >/dev/null
 git -C "$PRISM_DEMO_REPO" push -u origin main >/dev/null
+
+git -C "$PRISM_DEMO_REPO" worktree add -b feat/agent-session "$PRISM_DEMO_ROOT/worktrees/agent-session" main >/dev/null
+cat >"$PRISM_DEMO_ROOT/worktrees/agent-session/src/recommendations.js" <<'EOF'
+export function recommendations(customer) {
+  return customer.tags.includes("tea") ? ["Jasmine Tea"] : [];
+}
+EOF
+git -C "$PRISM_DEMO_ROOT/worktrees/agent-session" add src/recommendations.js
+git -C "$PRISM_DEMO_ROOT/worktrees/agent-session" commit -m "Sketch recommendation helper" >/dev/null
+git -C "$PRISM_DEMO_ROOT/worktrees/agent-session" push -u origin feat/agent-session >/dev/null
+mkdir -p "$PRISM_DEMO_ROOT/worktrees/agent-session/.agent/tasks"
+cat >"$PRISM_DEMO_ROOT/worktrees/agent-session/.agent/tasks/feat_agent-session.json" <<'EOF'
+{ "prompt_summary": "Improve recommendation copy while CI runs" }
+EOF
+
+git -C "$PRISM_DEMO_REPO" worktree add -b feat/review-fix "$PRISM_DEMO_ROOT/worktrees/review-fix" main >/dev/null
+cat >"$PRISM_DEMO_ROOT/worktrees/review-fix/src/review.js" <<'EOF'
+export function reviewSummary(comments) {
+  return comments.filter((comment) => !comment.resolved).map((comment) => comment.body);
+}
+EOF
+git -C "$PRISM_DEMO_ROOT/worktrees/review-fix" add src/review.js
+git -C "$PRISM_DEMO_ROOT/worktrees/review-fix" commit -m "Collect unresolved review comments" >/dev/null
+git -C "$PRISM_DEMO_ROOT/worktrees/review-fix" push -u origin feat/review-fix >/dev/null
+mkdir -p "$PRISM_DEMO_ROOT/worktrees/review-fix/.agent/tasks"
+cat >"$PRISM_DEMO_ROOT/worktrees/review-fix/.agent/tasks/feat_review-fix.json" <<'EOF'
+{ "prompt_summary": "Fix unresolved review thread on PR 17" }
+EOF
+
+git -C "$PRISM_DEMO_REPO" worktree add -b feat/ci-green "$PRISM_DEMO_ROOT/worktrees/ci-green" main >/dev/null
+cat >"$PRISM_DEMO_ROOT/worktrees/ci-green/src/health.js" <<'EOF'
+export function storefrontHealth() {
+  return { checkout: "ready", catalog: "ready" };
+}
+EOF
+git -C "$PRISM_DEMO_ROOT/worktrees/ci-green" add src/health.js
+git -C "$PRISM_DEMO_ROOT/worktrees/ci-green" commit -m "Add storefront health helper" >/dev/null
+git -C "$PRISM_DEMO_ROOT/worktrees/ci-green" push -u origin feat/ci-green >/dev/null
+mkdir -p "$PRISM_DEMO_ROOT/worktrees/ci-green/.agent/tasks"
+cat >"$PRISM_DEMO_ROOT/worktrees/ci-green/.agent/tasks/feat_ci-green.json" <<'EOF'
+{ "prompt_summary": "Prepare green PR for merge cleanup" }
+EOF
 
 touch "$lazygit_config_dir/config.yml"
 cat >"$lazygit_state_dir/state.yml" <<EOF
@@ -120,6 +177,8 @@ columns = ["url", "vars.localdev", "ci"]
 gh = "$bin_dir/gh"
 tmux = "$bin_dir/tmux"
 wt = "$bin_dir/wt"
+fzf = "$bin_dir/fzf"
+opencode = "$bin_dir/opencode"
 wl-copy = "$bin_dir/wl-copy"
 xclip = "$bin_dir/missing-xclip"
 xsel = "$bin_dir/missing-xsel"

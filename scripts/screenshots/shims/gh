@@ -134,18 +134,19 @@ PY
 fi
 
 if [[ "${1:-}" == "pr" && "${2:-}" == "view" ]]; then
-  branch="${3:-}"
-  [[ -n "$branch" ]] || unsupported "$@"
-  python3 - "$state_file" "$branch" <<'PY'
+  selector="${3:-}"
+  [[ -n "$selector" ]] || unsupported "$@"
+  python3 - "$state_file" "$selector" <<'PY'
 import json, subprocess, sys
 
-state_path, branch = sys.argv[1], sys.argv[2]
+state_path, selector = sys.argv[1], sys.argv[2]
 with open(state_path, encoding="utf-8") as handle:
     state = json.load(handle)
-pr = next((item for item in state["prs"] if item.get("branch") == branch), None)
+pr = next((item for item in state["prs"] if item.get("branch") == selector or str(item.get("number")) == selector), None)
 if pr is None:
-    print(f"no pull requests found for branch {branch}", file=sys.stderr)
+    print(f"no pull requests found for {selector}", file=sys.stderr)
     sys.exit(1)
+branch = pr.get("branch", selector)
 
 def head_sha(branch):
     try:
@@ -291,6 +292,71 @@ with open(state_path, "w", encoding="utf-8") as handle:
     json.dump(state, handle, indent=2)
     handle.write("\n")
 PY
+  exit 0
+fi
+
+if [[ "${1:-}" == "run" && "${2:-}" == "list" ]]; then
+  branch=""
+  commit=""
+  shift 2
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --branch)
+        [[ $# -ge 2 ]] || unsupported run list "$@"
+        branch="$2"
+        shift 2
+        ;;
+      --commit)
+        [[ $# -ge 2 ]] || unsupported run list "$@"
+        commit="$2"
+        shift 2
+        ;;
+      --limit|--json)
+        [[ $# -ge 2 ]] || unsupported run list "$@"
+        shift 2
+        ;;
+      *)
+        unsupported run list "$@"
+        ;;
+    esac
+  done
+  python3 - "$state_file" "$branch" "$commit" <<'PY'
+import json, sys
+
+state_path, branch, commit = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(state_path, encoding="utf-8") as handle:
+    state = json.load(handle)
+pr = next((item for item in state["prs"] if item.get("branch") == branch), None)
+runs = []
+if pr and pr.get("checkStatus") == "failed":
+    for index, name in enumerate(pr.get("failingChecks") or ["cargo test"], start=1):
+        runs.append({
+            "databaseId": 9000 + index,
+            "workflowName": "Demo CI",
+            "displayTitle": name,
+            "name": name,
+            "conclusion": "FAILURE",
+            "status": "COMPLETED",
+            "headSha": commit,
+            "url": f"https://github.com/prism-demo/shop/actions/runs/{9000 + index}",
+        })
+print(json.dumps(runs))
+PY
+  exit 0
+fi
+
+if [[ "${1:-}" == "run" && "${2:-}" == "view" ]]; then
+  run_id="${3:-}"
+  [[ -n "$run_id" ]] || unsupported "$@"
+  if [[ "${4:-}" == "--log-failed" ]]; then
+    printf 'Demo CI / cargo test\nerror: expected checkout status ready\nhelp: update the fake fixture assertion\n'
+    exit 0
+  fi
+  unsupported "$@"
+fi
+
+if [[ "${1:-}" == "browse" || ( "${1:-}" == "repo" && "${2:-}" == "view" ) ]]; then
+  printf 'https://github.com/prism-demo/shop\n'
   exit 0
 fi
 

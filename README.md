@@ -16,6 +16,8 @@ It gives you one place to manage local worktrees in different stages of progress
 
 ![Prism demo](docs/prism-demo.gif)
 
+Regenerate it with `./scripts/screenshot.sh`; see [Demo GIF notes](docs/prism-demo.md) for dependencies and debugging.
+
 ## What it enables
 
 It's basically a local dashboard to manage agent implementation. From planning, impl, PR, CI checks, CR comments and fixes. All this for different things in different stages or progress.
