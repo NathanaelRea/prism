@@ -479,6 +479,19 @@ pub(crate) fn clear_hidden_session_marker(repo: &Repository, branch: &str) -> Re
     })
 }
 
+pub(crate) fn hidden_session_exists(repo: &Repository, branch: &str) -> Result<bool, String> {
+    observability::with_writable_db(repo, |conn| {
+        let count = conn
+            .query_row(
+                "select count(*) from hidden_session where branch = ?1",
+                params![branch],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| format!("read hidden marker: {error}"))?;
+        Ok(count > 0)
+    })
+}
+
 pub fn append_runtime_log(repo: &Repository, message: &str) -> Result<(), String> {
     crate::observability::append_runtime_message(repo, message)
 }
