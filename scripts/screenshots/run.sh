@@ -79,10 +79,21 @@ cleanup() {
   local status=$?
 
   if command -v tmux >/dev/null 2>&1 && [[ -n "${PRISM_DEMO_ROOT:-}" ]]; then
-    tmux -S "$PRISM_DEMO_ROOT/tmux.sock" kill-server >/dev/null 2>&1 || true
+    tmux -S "${PRISM_DEMO_TMUX_SOCKET:-$PRISM_DEMO_ROOT/tmux.sock}" kill-server >/dev/null 2>&1 || true
   fi
 
-  if [[ "$keep" -eq 0 && -n "$sandbox_path" && -d "$sandbox_path" ]]; then
+  if [[ "$status" -ne 0 && -n "$sandbox_path" ]]; then
+    printf 'Screenshot recording failed.\n' >&2
+    printf 'Sandbox: %s\n' "$sandbox_path" >&2
+    printf 'Shim logs: %s\n' "$logs_path" >&2
+    printf 'Debug environment: %s\n' "$sandbox_path/run.env" >&2
+    printf 'Rerun with: ./scripts/screenshot.sh --keep --skip-build --output %q\n' "$output_path" >&2
+    if [[ "$keep" -eq 0 && "$frames" -eq 0 ]]; then
+      printf 'Sandbox will be removed because --keep was not passed.\n' >&2
+    fi
+  fi
+
+  if [[ "$keep" -eq 0 && "$frames" -eq 0 && -n "$sandbox_path" && -d "$sandbox_path" ]]; then
     rm -rf "$sandbox_path"
   fi
 
@@ -92,24 +103,21 @@ trap cleanup EXIT
 
 require_tool() {
   local tool="$1"
+  local guidance="${2:-}"
 
   if ! command -v "$tool" >/dev/null 2>&1; then
+    if [[ -n "$guidance" ]]; then
+      die "required tool '$tool' was not found in PATH. $guidance"
+    fi
     die "required tool '$tool' was not found in PATH"
   fi
 }
 
-recording_tool() {
+require_recording_tool() {
   local tool="$1"
+  local guidance="$2"
 
-  if command -v "$tool" >/dev/null 2>&1; then
-    return 0
-  fi
-
-  if [[ "$check" -eq 1 ]]; then
-    warn "recording tool '$tool' was not found; install it before running without --check"
-  else
-    die "required recording tool '$tool' was not found in PATH"
-  fi
+  require_tool "$tool" "$guidance"
 }
 
 optional_tool() {
@@ -157,16 +165,76 @@ assert_no_unsupported_shim_calls() {
   fi
 }
 
+smoke_opencode_server() {
+  local port
+  local pid
+  local ready=0
+
+  port="$(python3 <<'PY'
+import socket
+
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+)"
+
+  "$sandbox_path/bin/opencode" serve --hostname 127.0.0.1 --port "$port" >/dev/null 2>&1 &
+  pid=$!
+  trap 'kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true; trap - RETURN' RETURN
+
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if python3 - "$port" <<'PY' >/dev/null 2>&1
+import sys
+import urllib.request
+
+urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/global/health", timeout=0.25).read()
+PY
+    then
+      ready=1
+      break
+    fi
+    kill -0 "$pid" >/dev/null 2>&1 || return 1
+    sleep 0.1
+  done
+
+  [[ "$ready" -eq 1 ]] || return 1
+
+  python3 - "$port" "$PRISM_DEMO_REPO" <<'PY'
+import json
+import sys
+import urllib.request
+
+port, repo = sys.argv[1], sys.argv[2]
+base = f"http://127.0.0.1:{port}"
+request = urllib.request.Request(
+    f"{base}/session",
+    data=json.dumps({"directory": repo}).encode(),
+    headers={"Content-Type": "application/json"},
+)
+session = json.loads(urllib.request.urlopen(request, timeout=1).read())
+session_id = session["id"]
+for path in [
+    "/session",
+    f"/session/{session_id}",
+    "/session/status",
+    f"/session/{session_id}/message?limit=5",
+    f"/session/{session_id}/todo",
+    "/event",
+]:
+    urllib.request.urlopen(f"{base}{path}", timeout=1).read()
+PY
+}
+
 printf 'Checking screenshot dependencies...\n'
-require_tool cargo
-require_tool git
-require_tool tmux
-require_tool python3
-require_tool lazygit
-require_tool opencode
-recording_tool vhs
+require_tool cargo "Install Rust from https://rustup.rs/."
+require_tool git "Install Git with your system package manager."
+require_tool python3 "Install Python 3 with your system package manager."
+require_tool tmux "Install tmux with your system package manager."
+require_recording_tool vhs "Install VHS from https://github.com/charmbracelet/vhs before refreshing the demo GIF."
+require_recording_tool ttyd "VHS requires ttyd. Install it with your system package manager or from https://github.com/tsl0922/ttyd."
+require_recording_tool ffmpeg "VHS requires ffmpeg. Install it with your system package manager."
 optional_tool gifsicle
-optional_tool magick
 
 if [[ "$skip_build" -eq 1 ]]; then
   [[ -x "$prism_binary" ]] || die "--skip-build requested, but Prism binary is missing or not executable: $prism_binary"
@@ -208,6 +276,11 @@ export PATH="$sandbox_path/bin:$PATH"
 export PRISM_DEMO_ROOT="$sandbox_path"
 export PRISM_DEMO_REPO="$sandbox_path/work/prism-shop"
 export PRISM_DEMO_ORIGIN="$sandbox_path/origin.git"
+export PRISM_DEMO_TMUX_SOCKET="$sandbox_path/tmux.sock"
+export TERM=xterm-256color
+export COLORTERM=truecolor
+export COLUMNS=140
+export LINES=46
 export TZ=UTC
 export LC_ALL=C.UTF-8
 export LANG=C.UTF-8
@@ -233,6 +306,24 @@ printf 'Shim logs: %s\n' "$logs_path"
 printf 'Fake HOME: %s\n' "$HOME"
 printf 'Fake XDG_CONFIG_HOME: %s\n' "$XDG_CONFIG_HOME"
 
+cat >"$sandbox_path/run.env" <<EOF
+PATH=$PATH
+HOME=$HOME
+XDG_CONFIG_HOME=$XDG_CONFIG_HOME
+XDG_CACHE_HOME=$XDG_CACHE_HOME
+XDG_STATE_HOME=$XDG_STATE_HOME
+GIT_CONFIG_GLOBAL=$GIT_CONFIG_GLOBAL
+PRISM_BINARY=$prism_binary
+RECORDER=$(command -v vhs)
+TERM=$TERM
+COLORTERM=$COLORTERM
+COLUMNS=$COLUMNS
+LINES=$LINES
+PRISM_DEMO_TMUX_SOCKET=$PRISM_DEMO_TMUX_SOCKET
+OUTPUT=$output_path
+EOF
+printf 'Debug environment: %s\n' "$sandbox_path/run.env"
+
 if [[ ! -x "$setup_helper" ]]; then
   die "demo setup helper is missing or not executable: $setup_helper"
 fi
@@ -246,16 +337,17 @@ printf 'Running Prism startup smoke check...\n'
 
 printf 'Running screenshot shim smoke checks...\n'
 "$sandbox_path/bin/gh" auth status >/dev/null
+"$sandbox_path/bin/opencode" run --format json --dir "$PRISM_DEMO_REPO" "Smoke test demo plan" >/dev/null
+smoke_opencode_server
 "$sandbox_path/bin/wt" -C "$PRISM_DEMO_REPO" list --format=json >/dev/null
 "$sandbox_path/bin/tmux" -V >/dev/null
-opencode --version >/dev/null
-lazygit --version >/dev/null
+printf 'README.md\nplan-demo.md\n' | "$sandbox_path/bin/fzf" >/dev/null
 printf 'shim clipboard smoke\n' | "$sandbox_path/bin/wl-copy"
 "$sandbox_path/bin/date" +%H:%M:%S >/dev/null
 
 assert_no_unsupported_shim_calls
 
-for log in gh wt tmux wl-copy date; do
+for log in gh opencode wt tmux wl-copy date fzf; do
   if [[ ! -s "$logs_path/$log.log" ]]; then
     die "expected shim log was not written: $logs_path/$log.log"
   fi
@@ -275,13 +367,20 @@ mkdir -p "$(dirname "$output_path")"
 rendered_tape="$sandbox_path/prism-demo.tape"
 raw_gif="$sandbox_path/prism-demo.raw.gif"
 optimized_gif="$sandbox_path/prism-demo.optimized.gif"
+frames_output=""
+
+if [[ "$frames" -eq 1 ]]; then
+  frames_output="Output \"$sandbox_path/frames/\""
+fi
+
 sed \
   -e "s|__OUTPUT__|$(escape_sed_replacement "$raw_gif")|g" \
+  -e "s|__FRAMES_OUTPUT__|$(escape_sed_replacement "$frames_output")|g" \
   -e "s|__REPO__|$(escape_sed_replacement "$PRISM_DEMO_REPO")|g" \
   "$tape_template" >"$rendered_tape"
 
 if [[ "$frames" -eq 1 ]]; then
-  printf 'Frame directory reserved for this run: %s\n' "$sandbox_path/frames"
+  printf 'Frame directory for this run: %s\n' "$sandbox_path/frames"
 fi
 
 (
