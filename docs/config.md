@@ -51,7 +51,7 @@ Use `prism db` commands to inspect a repository's local Prism state:
 ```sh
 prism db
 prism db path
-prism db '.tables'
+prism db "select name from sqlite_schema where type = 'table' order by name"
 prism db 'select id, status from plan_run order by updated_unix_ms desc'
 ```
 
