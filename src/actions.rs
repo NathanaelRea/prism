@@ -2494,23 +2494,7 @@ impl Tui {
             return Ok(());
         }
         run_pre_push_checks(&context.config, &path)?;
-        let set_upstream = if has_upstream(&path, &context.config)? {
-            false
-        } else {
-            let Some(answer) = self.prompt_line_dialog(
-                raw,
-                "Push Branch",
-                &format!("No upstream. Push -u origin {branch}? [y/N] "),
-                "",
-            )?
-            else {
-                return Ok(());
-            };
-            if !yes(&answer) {
-                return Ok(());
-            }
-            true
-        };
+        let set_upstream = !has_upstream(&path, &context.config)?;
         self.show_loading_dialog(raw, "Push Branch", "Pushing selected branch")?;
         push_branch(&context.config, &path, &branch, set_upstream)?;
         {
