@@ -1143,9 +1143,12 @@ exit 1
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
-        paste_agent_prompt(&repo, &config, &session, 0, "hello\nworld").unwrap();
+        let prompt =
+            "  fix review comments\nquote: \"that's fine\"\n$PATH && rm -rf nope\n--leading-dash";
 
-        assert_eq!(fs::read_to_string(&prompt_file).unwrap(), "hello\nworld");
+        paste_agent_prompt(&repo, &config, &session, 0, prompt).unwrap();
+
+        assert_eq!(fs::read_to_string(&prompt_file).unwrap(), prompt);
         let commands = fs::read_to_string(&log).unwrap();
         assert!(commands.contains("load-buffer -b"));
         assert!(commands.contains("paste-buffer -d -b"));
@@ -1385,12 +1388,18 @@ exit 1
         )
         .unwrap();
 
-        paste_agent_prompt(&repo, &config, &session, 0, "hello").unwrap();
+        let prompt =
+            "  fix review comments\nquote: \"that's fine\"\n$PATH && rm -rf nope\n--leading-dash";
+
+        paste_agent_prompt(&repo, &config, &session, 0, prompt).unwrap();
 
         assert!(!prompt_file.exists());
         let api_requests = fs::read_to_string(&api_log).unwrap();
         assert!(api_requests.contains("POST /tui/append-prompt"));
         assert!(api_requests.contains("POST /tui/submit-prompt"));
+        assert!(api_requests.contains(
+            r#"{"sessionID":"ses_123","text":"  fix review comments\nquote: \"that's fine\"\n$PATH && rm -rf nope\n--leading-dash"}"#
+        ));
         let commands = fs::read_to_string(&log).unwrap_or_default();
         assert!(!commands.contains("capture-pane"));
         assert!(!commands.contains("load-buffer"));
@@ -1798,9 +1807,11 @@ exit 0
                 content_length = value.trim().parse().unwrap_or_default();
             }
         }
+        let mut request_body = Vec::new();
         if content_length > 0 {
             let mut body = vec![0; content_length];
             let _ = reader.read_exact(&mut body);
+            request_body = body;
         }
         drop(reader);
 
@@ -1811,6 +1822,9 @@ exit 0
                 .open(path)
                 .unwrap();
             let _ = writeln!(file, "{}", request_line.trim_end());
+            if !request_body.is_empty() {
+                let _ = writeln!(file, "{}", String::from_utf8_lossy(&request_body));
+            }
         }
 
         let session = format!(

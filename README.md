@@ -25,6 +25,7 @@ It's basically a local dashboard to manage agent implementation. From planning, 
 - See repository, worktree, pull request, CI, and agent state in one TUI.
 - Kick off repeatable agent flows for implementation, review repair, CI repair, and merge readiness.
 - Kick off automatic flows from prompt or plan through reviewed and CI-validated ready to merge PR
+- Send review-fix and CI-failure prompts from `Space g f` and `Space g c` directly into the selected agent session.
 
 ## Prerequisites
 

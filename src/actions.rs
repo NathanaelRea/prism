@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -43,6 +43,7 @@ use crate::repo::Repository;
 use crate::review::build_review_fix_prompt;
 use crate::session::{
     append_runtime_log, discover_sessions, save_agent_state, write_task_metadata,
+    write_task_summary_metadata,
 };
 use crate::tmux::TmuxWindow;
 use crate::tui::{
@@ -164,12 +165,11 @@ impl Tui {
             self.worktree_filter.clear();
         }
         self.select_worktree(index);
-        let initial_prompt = initial_prompt.trim();
-        write_task_metadata(&context.repo, &self.sessions[index], initial_prompt)?;
-        self.sessions[index].mark_adopted_with_prompt(initial_prompt);
-        if !initial_prompt.is_empty() {
+        write_task_metadata(&context.repo, &self.sessions[index], &initial_prompt)?;
+        self.sessions[index].mark_adopted_with_prompt(&initial_prompt);
+        if !initial_prompt.trim().is_empty() {
             self.show_loading_dialog(raw, "Create Session", "Starting agent session")?;
-            self.paste_prompt_into_tmux_agent(index, initial_prompt)?;
+            self.paste_prompt_into_tmux_agent(index, &initial_prompt)?;
             self.show_message("pasted initial prompt into agent session")?;
         }
         Ok(true)
@@ -401,7 +401,7 @@ impl Tui {
                 continue;
             }
             let key = opencode_poll_key(session);
-            if self.opencode_polls_in_flight.contains(&key) {
+            if !force && self.opencode_polls_in_flight.contains(&key) {
                 continue;
             }
             let interval = if Some(session_index) == selected {
@@ -418,7 +418,6 @@ impl Tui {
                 continue;
             }
             let repo = managed.repo.clone();
-            let config = managed.config.clone();
             let branch = session.branch.clone();
             let path = session.path.clone();
             let tx = self.opencode_poll_tx.clone();
@@ -426,16 +425,10 @@ impl Tui {
             self.opencode_last_polled.insert(key.clone(), now);
             std::thread::spawn(move || {
                 let status = load_runtime(&repo, &branch, &path).and_then(|runtime| {
-                    if runtime
-                        .as_ref()
-                        .is_none_or(|runtime| !opencode::check_health(&runtime.server_url))
-                    {
-                        return opencode::ensure_opencode_session(&repo, &config, &branch, &path)
-                            .and_then(|runtime| opencode::poll_status(&runtime));
-                    }
-                    runtime
-                        .map(|runtime| opencode::poll_status(&runtime))
-                        .unwrap_or_else(|| unreachable!())
+                    let Some(runtime) = runtime else {
+                        return Err("no OpenCode runtime exists yet".to_string());
+                    };
+                    opencode::poll_status(&runtime)
                 });
                 let _ = tx.send(OpencodePollResult { key, status });
             });
@@ -535,6 +528,9 @@ impl Tui {
                     }
                 }
                 Err(error) => {
+                    if error == "no OpenCode runtime exists yet" {
+                        continue;
+                    }
                     if let Some(repo) = self.repos.get(result.key.repo_index) {
                         let _ = append_runtime_log(
                             &repo.repo,
@@ -1025,6 +1021,8 @@ impl Tui {
             &use_.slot,
             running,
         );
+        self.start_opencode_status_poll(true);
+        self.start_opencode_event_listeners();
         Ok(())
     }
 
@@ -1186,6 +1184,7 @@ impl Tui {
             .insert(scope_path.clone(), run_id.clone());
         self.selected_plan_step_by_run
             .insert(run_id.clone(), persisted.run.selected_step);
+        self.manual_plan_step_selection_by_run.remove(&run_id);
 
         if should_execute {
             self.spawn_plan_run_executor(repo, config, persisted);
@@ -1629,9 +1628,6 @@ impl Tui {
         let Some(dashboard) = self.current_auto_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
@@ -1700,9 +1696,6 @@ impl Tui {
         let Some(dashboard) = self.current_auto_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
@@ -1761,9 +1754,6 @@ impl Tui {
         let Some(dashboard) = self.current_auto_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
@@ -1791,9 +1781,6 @@ impl Tui {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
@@ -1875,9 +1862,6 @@ impl Tui {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let selected_step = dashboard.run.run.selected_step;
         let answer = self.prompt_line_dialog(
             raw,
@@ -1909,9 +1893,6 @@ impl Tui {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
@@ -1931,9 +1912,6 @@ impl Tui {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
@@ -1970,9 +1948,6 @@ impl Tui {
         let Some(dashboard) = self.current_plan_dashboard() else {
             return Ok(false);
         };
-        if self.focused_panel != PanelFocus::Status {
-            return Ok(false);
-        }
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
@@ -1985,6 +1960,7 @@ impl Tui {
         self.plan_runs.remove(&run_id);
         self.active_plan_runs.retain(|_, active| active != &run_id);
         self.selected_plan_step_by_run.remove(&run_id);
+        self.manual_plan_step_selection_by_run.remove(&run_id);
         self.plan_output_state_by_run.remove(&run_id);
         self.show_message("dismissed plan run")?;
         Ok(true)
@@ -2082,10 +2058,10 @@ impl Tui {
             "Review Fix Prompt",
             "Refreshing pull request review details",
         )?;
-        self.copy_review_fix_prompt()
+        self.send_review_fix_prompt()
     }
 
-    fn copy_review_fix_prompt(&mut self) -> Result<(), String> {
+    fn send_review_fix_prompt(&mut self) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
@@ -2106,14 +2082,14 @@ impl Tui {
             );
         }
         let prompt = build_review_fix_prompt(&self.sessions[selected], &context.config)?;
-        copy_to_clipboard(&context.config, &prompt)?;
-        self.show_message("review-fix prompt copied to clipboard")?;
+        self.submit_action_prompt_to_agent(selected, &context.repo, "review fix", &prompt)?;
+        self.show_message("review-fix prompt sent to agent session")?;
         Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn start_review_fix_for_test(&mut self) -> Result<(), String> {
-        self.copy_review_fix_prompt()
+        self.send_review_fix_prompt()
     }
 
     pub(crate) fn start_ci_fix(
@@ -2133,6 +2109,18 @@ impl Tui {
             "CI Failure Prompt",
             "Refreshing pull request CI details",
         )?;
+        self.send_ci_fix_prompt()
+    }
+
+    fn send_ci_fix_prompt(&mut self) -> Result<(), String> {
+        let Some(context) = self.selected_worktree_context() else {
+            return Ok(());
+        };
+        let selected = context.session_index;
+        if self.sessions[selected].is_default_branch(&context.config) {
+            self.show_message("default branch has no PR CI failures")?;
+            return Ok(());
+        }
         {
             let session = &mut self.sessions[selected];
             refresh_branch_pr_cache(
@@ -2145,9 +2133,14 @@ impl Tui {
             );
         }
         let prompt = build_ci_failure_prompt(&self.sessions[selected], &context.config)?;
-        copy_to_clipboard(&context.config, &prompt)?;
-        self.show_message("CI-failure prompt copied to clipboard")?;
+        self.submit_action_prompt_to_agent(selected, &context.repo, "ci fix", &prompt)?;
+        self.show_message("CI-failure prompt sent to agent session")?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_ci_fix_for_test(&mut self) -> Result<(), String> {
+        self.send_ci_fix_prompt()
     }
 
     pub(crate) fn open_selected_pr(
@@ -2288,6 +2281,12 @@ impl Tui {
     }
 
     fn paste_prompt_into_tmux_agent(&mut self, index: usize, prompt: &str) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(submissions) = &mut self.prompt_submissions {
+            submissions.push((index, prompt.to_string()));
+            return Ok(());
+        }
+
         let session = self
             .sessions
             .get(index)
@@ -2310,6 +2309,20 @@ impl Tui {
             &use_.slot,
             running,
         );
+        Ok(())
+    }
+
+    fn submit_action_prompt_to_agent(
+        &mut self,
+        index: usize,
+        repo: &crate::repo::Repository,
+        summary: &str,
+        prompt: &str,
+    ) -> Result<(), String> {
+        self.paste_prompt_into_tmux_agent(index, prompt)
+            .map_err(|error| format!("send {summary} prompt to agent session: {error}"))?;
+        write_task_summary_metadata(repo, &self.sessions[index], summary)?;
+        self.sessions[index].mark_adopted_with_summary(summary);
         Ok(())
     }
 
@@ -2507,30 +2520,6 @@ impl Tui {
     }
 }
 
-fn copy_to_clipboard(config: &crate::config::Config, text: &str) -> Result<(), String> {
-    let candidates: [(&str, &[&str]); 4] = [
-        (&config.tool("wl-copy"), &[]),
-        (&config.tool("xclip"), &["-selection", "clipboard"]),
-        (&config.tool("xsel"), &["--clipboard", "--input"]),
-        (&config.tool("pbcopy"), &[]),
-    ];
-    let mut errors = Vec::new();
-    for (program, args) in candidates {
-        if !clipboard_command_exists(program) {
-            continue;
-        }
-        match write_clipboard_command(program, args, text) {
-            Ok(()) => return Ok(()),
-            Err(error) => errors.push(error),
-        }
-    }
-    if errors.is_empty() {
-        Err("no clipboard tool found; install wl-copy, xclip, xsel, or pbcopy".to_string())
-    } else {
-        Err(format!("clipboard copy failed: {}", errors.join("; ")))
-    }
-}
-
 fn open_url_in_browser(url: &str) -> Result<(), String> {
     run_browser_opener(&browser_opener_candidates(), url).map(|_| ())
 }
@@ -2581,37 +2570,6 @@ fn run_browser_opener(candidates: &[(&str, &[&str])], url: &str) -> Result<Strin
         Err(format!("no browser opener found; tried {names}"))
     } else {
         Err(format!("browser open failed: {}", errors.join("; ")))
-    }
-}
-
-fn clipboard_command_exists(program: &str) -> bool {
-    let program = program.split_whitespace().next().unwrap_or(program);
-    !program.is_empty() && command_exists(program)
-}
-
-fn write_clipboard_command(program: &str, args: &[&str], text: &str) -> Result<(), String> {
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| format!("{program}: {error}"))?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| format!("{program}: stdin unavailable"))?;
-    stdin
-        .write_all(text.as_bytes())
-        .map_err(|error| format!("{program}: {error}"))?;
-    drop(stdin);
-    let status = child
-        .wait()
-        .map_err(|error| format!("{program}: {error}"))?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("{program}: exited with {status}"))
     }
 }
 
@@ -2751,7 +2709,7 @@ mod tests {
     use crate::session::Session;
     use crate::tui::Tui;
 
-    use super::{copy_to_clipboard, run_browser_opener, status_label_with_behind};
+    use super::{run_browser_opener, status_label_with_behind};
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -2798,54 +2756,13 @@ exit 0
     }
 
     #[test]
-    fn clipboard_copy_does_not_wait_for_daemonized_stdio() {
-        let temp = unique_temp_dir("prism-clipboard-copy-test");
-        fs::create_dir_all(&temp).unwrap();
-        let copied = temp.join("copied.txt");
-        let clipboard = temp.join("wl-copy");
-        fs::write(
-            &clipboard,
-            format!(
-                r#"#!/bin/sh
-cat > '{}'
-(sleep 1) &
-exit 0
-"#,
-                copied.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&clipboard).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&clipboard, permissions).unwrap();
-
-        let mut config = test_config();
-        config
-            .tools
-            .insert("wl-copy".to_string(), clipboard.display().to_string());
-
-        let started = Instant::now();
-        copy_to_clipboard(&config, "review prompt").unwrap();
-
-        assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "clipboard copy waited for daemonized stdio for {:?}",
-            started.elapsed()
-        );
-        assert_eq!(fs::read_to_string(&copied).unwrap(), "review prompt");
-        let _ = fs::remove_dir_all(temp);
-    }
-
-    #[test]
-    fn review_fix_refreshes_pr_details_before_copying_prompt() {
+    fn review_fix_refreshes_pr_details_before_sending_prompt() {
         let temp = unique_temp_dir("prism-review-fix-refresh-test");
         let repo_root = temp.join("repo");
         let worktree = repo_root.join("feature");
         fs::create_dir_all(&worktree).unwrap();
-        let copied = temp.join("copied.txt");
         let gh = temp.join("gh");
         let git = temp.join("git");
-        let clipboard = temp.join("wl-copy");
 
         fs::write(
             &gh,
@@ -2881,17 +2798,7 @@ esac
 "#,
         )
         .unwrap();
-        fs::write(
-            &clipboard,
-            format!(
-                r#"#!/bin/sh
-cat > '{}'
-"#,
-                copied.display()
-            ),
-        )
-        .unwrap();
-        for executable in [&gh, &git, &clipboard] {
+        for executable in [&gh, &git] {
             let mut permissions = fs::metadata(executable).unwrap().permissions();
             permissions.set_mode(0o755);
             fs::set_permissions(executable, permissions).unwrap();
@@ -2905,9 +2812,6 @@ cat > '{}'
         config
             .tools
             .insert("git".to_string(), git.display().to_string());
-        config
-            .tools
-            .insert("wl-copy".to_string(), clipboard.display().to_string());
         let repo = Repository::with_config_dir_for_test(repo_root.clone(), temp.join("config"));
         let mut session = test_session(worktree, "feature");
         session.pr = PrCache {
@@ -2939,13 +2843,87 @@ cat > '{}'
             ..PrCache::default()
         };
         let mut tui = Tui::new_single(repo, config, vec![session]);
+        tui.prompt_submissions = Some(Vec::new());
 
         tui.start_review_fix_for_test().unwrap();
 
-        let prompt = fs::read_to_string(&copied).unwrap();
+        let submissions = tui.prompt_submissions.take().unwrap();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].0, 0);
+        let prompt = &submissions[0].1;
         assert!(prompt.contains("fresh top-level comment"));
         assert!(prompt.contains("fresh review body"));
         assert!(!prompt.contains("stale cached comment"));
+        assert_eq!(tui.sessions[0].prompt_summary, "review fix");
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn ci_fix_sends_prompt_to_agent_session() {
+        let temp = unique_temp_dir("prism-ci-fix-send-test");
+        let repo_root = temp.join("repo");
+        let worktree = repo_root.join("feature");
+        fs::create_dir_all(&worktree).unwrap();
+        let gh = temp.join("gh");
+        let git = temp.join("git");
+
+        fs::write(
+            &gh,
+            r#"#!/bin/sh
+case "$*" in
+  "pr view feature --json comments,reviews,files,statusCheckRollup")
+    cat <<'JSON'
+{"comments":[],"reviews":[],"files":[],"statusCheckRollup":{"contexts":{"nodes":[{"name":"test","status":"COMPLETED","conclusion":"FAILURE"}]}}}
+JSON
+    ;;
+  *)
+    cat <<'JSON'
+{"number":42,"title":"CI refresh","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"","reviewRequests":{"nodes":[]},"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","updatedAt":"2026-06-14T12:02:00Z","comments":{"totalCount":0},"statusCheckRollup":{"contexts":{"nodes":[{"name":"test","status":"COMPLETED","conclusion":"FAILURE"}]}},"isDraft":false}
+JSON
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::write(
+            &git,
+            r#"#!/bin/sh
+case "$*" in
+  *"remote get-url origin"*)
+    echo "https://github.com/example/repo.git"
+    ;;
+esac
+"#,
+        )
+        .unwrap();
+        for executable in [&gh, &git] {
+            let mut permissions = fs::metadata(executable).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(executable, permissions).unwrap();
+        }
+
+        let mut config = test_config();
+        config.default_base = Some("main".to_string());
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        let repo = Repository::with_config_dir_for_test(repo_root.clone(), temp.join("config"));
+        let session = test_session(worktree, "feature");
+        let mut tui = Tui::new_single(repo, config, vec![session]);
+        tui.prompt_submissions = Some(Vec::new());
+
+        tui.start_ci_fix_for_test().unwrap();
+
+        let submissions = tui.prompt_submissions.take().unwrap();
+        assert_eq!(submissions.len(), 1);
+        assert_eq!(submissions[0].0, 0);
+        assert!(submissions[0].1.contains("Here are CI failures on PR 42."));
+        assert!(submissions[0].1.contains("- test"));
+        assert_eq!(tui.sessions[0].prompt_summary, "ci fix");
 
         let _ = fs::remove_dir_all(temp);
     }

@@ -16,7 +16,7 @@ use crate::github::{PrCache, PrSummary};
 use crate::input::{Key, KeyInput};
 use crate::opencode::{OpencodeEvent, OpencodeStatus};
 use crate::plan_run::{
-    DEFAULT_OUTPUT_LINES_PER_STEP, PersistedPlanRun, PlanRunStatus,
+    DEFAULT_OUTPUT_LINES_PER_STEP, PersistedPlanRun, PlanRunStatus, PlanStepStatus,
     cleanup_stale_archived_plan_runs, load_output_lines, load_plan_run,
     load_recent_plan_runs_for_repo, plan_output_block_key, reconcile_stale_plan_run,
 };
@@ -63,6 +63,7 @@ pub struct Tui {
     pub(crate) plan_runs: BTreeMap<String, PersistedPlanRun>,
     pub(crate) active_plan_runs: BTreeMap<PathBuf, String>,
     pub(crate) selected_plan_step_by_run: BTreeMap<String, usize>,
+    pub(crate) manual_plan_step_selection_by_run: BTreeSet<String>,
     pub(crate) plan_output_state_by_run: BTreeMap<String, view::PlanOutputViewerState>,
     pub(crate) auto_runs: BTreeMap<String, PersistedAutoRun>,
     pub(crate) active_auto_runs: BTreeMap<PathBuf, String>,
@@ -76,6 +77,8 @@ pub struct Tui {
     pub(crate) dialog: Option<view::DialogModel>,
     status_message: Option<String>,
     status_message_until: Option<Instant>,
+    #[cfg(test)]
+    pub(crate) prompt_submissions: Option<Vec<(usize, String)>>,
 }
 
 const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
@@ -213,6 +216,54 @@ impl OpencodePollKey {
     }
 }
 
+fn preferred_plan_step(run: &PersistedPlanRun) -> usize {
+    run.steps
+        .iter()
+        .filter(|step| {
+            matches!(
+                step.status,
+                PlanStepStatus::Starting | PlanStepStatus::Running
+            )
+        })
+        .max_by_key(|step| (step.started_unix_ms.unwrap_or(0), step.step))
+        .or_else(|| {
+            run.steps
+                .iter()
+                .filter(|step| {
+                    !matches!(step.status, PlanStepStatus::Done | PlanStepStatus::Skipped)
+                })
+                .filter(|step| step.started_unix_ms.is_some() || step.finished_unix_ms.is_some())
+                .max_by_key(|step| {
+                    (
+                        step.started_unix_ms.or(step.finished_unix_ms).unwrap_or(0),
+                        step.step,
+                    )
+                })
+        })
+        .or_else(|| {
+            run.steps
+                .iter()
+                .filter(|step| {
+                    matches!(
+                        step.status,
+                        PlanStepStatus::Done
+                            | PlanStepStatus::Failed
+                            | PlanStepStatus::Aborted
+                            | PlanStepStatus::Skipped
+                    )
+                })
+                .max_by_key(|step| (step.finished_unix_ms.unwrap_or(0), step.step))
+        })
+        .or_else(|| {
+            run.steps
+                .iter()
+                .find(|step| step.step == run.run.selected_step)
+        })
+        .or_else(|| run.steps.iter().max_by_key(|step| step.step))
+        .map(|step| step.step)
+        .unwrap_or(run.run.selected_step)
+}
+
 #[derive(Default)]
 struct TuiBackgroundChanges {
     tmux: bool,
@@ -307,6 +358,7 @@ impl Tui {
             plan_runs: BTreeMap::new(),
             active_plan_runs: BTreeMap::new(),
             selected_plan_step_by_run: BTreeMap::new(),
+            manual_plan_step_selection_by_run: BTreeSet::new(),
             plan_output_state_by_run: BTreeMap::new(),
             auto_runs: BTreeMap::new(),
             active_auto_runs: BTreeMap::new(),
@@ -320,6 +372,8 @@ impl Tui {
             dialog: None,
             status_message: None,
             status_message_until: None,
+            #[cfg(test)]
+            prompt_submissions: None,
         };
         tui.selected_repo_root = tui
             .repos
@@ -581,7 +635,7 @@ impl Tui {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message("focus worktrees to stage a review-fix prompt")?;
+                        self.show_message("focus worktrees to send a review-fix prompt")?;
                     } else if let Err(error) = self.start_review_fix(&mut runtime) {
                         self.show_error("review fix failed", &error)?;
                     }
@@ -590,7 +644,7 @@ impl Tui {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message("focus worktrees to copy a CI-failure prompt")?;
+                        self.show_message("focus worktrees to send a CI-failure prompt")?;
                     } else if let Err(error) = self.start_ci_fix(&mut runtime) {
                         self.show_error("CI failure prompt failed", &error)?;
                     }
@@ -627,6 +681,7 @@ impl Tui {
                     pending_g = false;
                     if self.focused_panel == PanelFocus::Status {
                         self.show_message("focus repos or worktrees to run plan mode")?;
+                    } else if self.focus_existing_plan_panel() {
                     } else if self.focused_panel == PanelFocus::Repos {
                         if let Err(error) = self.start_selected_repo_plan_run(&mut runtime) {
                             self.show_error("plan mode failed", &error)?;
@@ -819,8 +874,8 @@ impl Tui {
             "Space g o    open selected PR in browser",
             "Space g P    push branch, create PR if needed",
             "Space g M    merge selected PR",
-            "Space g c    copy CI-failure prompt",
-            "Space g f    stage review-fix prompt",
+            "Space g c    send CI-failure prompt to agent session",
+            "Space g f    send review-fix prompt to agent session",
             "Space g p    repos/worktrees: pull default branch",
             "p            repos/worktrees: pull default branch",
             "P            repos/worktrees: start or focus a plan run dashboard",
@@ -1487,11 +1542,7 @@ impl Tui {
 
     pub(crate) fn remember_plan_run(&mut self, run: PersistedPlanRun) -> bool {
         let run_id = run.run.id.clone();
-        let selected_step = self
-            .selected_plan_step_by_run
-            .get(&run_id)
-            .copied()
-            .unwrap_or(run.run.selected_step);
+        let selected_step = self.resolved_plan_step_selection(&run);
         self.selected_plan_step_by_run
             .insert(run_id.clone(), selected_step);
         self.active_plan_runs
@@ -1513,9 +1564,7 @@ impl Tui {
         }
         let (repo, run_id) = self.selected_plan_run_id()?;
         let mut run = self.plan_runs.get(run_id)?.clone();
-        if let Some(selected_step) = self.selected_plan_step_by_run.get(run_id).copied() {
-            run.run.selected_step = selected_step;
-        }
+        run.run.selected_step = self.resolved_plan_step_selection(&run);
         let output_lines = crate::observability::with_writable_db(&repo, |conn| {
             load_output_lines(conn, &run.run.id, run.run.selected_step)
         })
@@ -1550,6 +1599,23 @@ impl Tui {
             .get(&scope_path)
             .or_else(|| self.active_plan_runs.get(&repo.root))?;
         Some((repo, run_id))
+    }
+
+    fn focus_existing_plan_panel(&mut self) -> bool {
+        if self.selected_plan_run_id().is_none() {
+            return false;
+        }
+        match self.focused_panel {
+            PanelFocus::Worktrees => {
+                self.worktree_main_view = view::WorktreeMainView::Plan;
+                true
+            }
+            PanelFocus::Repos => {
+                self.focused_panel = PanelFocus::Status;
+                true
+            }
+            PanelFocus::Status => true,
+        }
     }
 
     fn poll_auto_runs(&mut self) -> bool {
@@ -1672,9 +1738,7 @@ impl Tui {
                 .ok()
                 .flatten()
         })?;
-        if let Some(selected_step) = self.selected_plan_step_by_run.get(plan_run_id).copied() {
-            run.run.selected_step = selected_step;
-        }
+        run.run.selected_step = self.resolved_plan_step_selection(&run);
         let output_lines = crate::observability::with_writable_db(repo, |conn| {
             load_output_lines(conn, &run.run.id, run.run.selected_step)
         })
@@ -1700,6 +1764,18 @@ impl Tui {
             output_lines,
             output_state,
         })
+    }
+
+    fn resolved_plan_step_selection(&self, run: &PersistedPlanRun) -> usize {
+        if self.manual_plan_step_selection_by_run.contains(&run.run.id) {
+            return self
+                .selected_plan_step_by_run
+                .get(&run.run.id)
+                .copied()
+                .filter(|selected| run.steps.iter().any(|step| step.step == *selected))
+                .unwrap_or_else(|| preferred_plan_step(run));
+        }
+        preferred_plan_step(run)
     }
 
     fn selected_auto_scope(&self) -> Option<(Repository, PathBuf)> {
@@ -1783,6 +1859,8 @@ impl Tui {
             .iter()
             .position(|step| *step == current_step)
             .unwrap_or(0);
+        self.manual_plan_step_selection_by_run
+            .insert(run_id.clone());
         let next = current as isize + direction;
         if next < 0 {
             return true;
@@ -2236,7 +2314,7 @@ impl Tui {
             }
             (Some(LeaderHint::Git), PanelFocus::Repos) => Some("p: pull default branch"),
             (Some(LeaderHint::Git), PanelFocus::Worktrees) => Some(
-                "a: auto flow  g: lazygit  p: pull default  o: open PR  P: push/create PR  M: merge  c: copy CI prompt  f: review fix",
+                "a: auto flow  g: lazygit  p: pull default  o: open PR  P: push/create PR  M: merge  c: send CI fix  f: send review fix",
             ),
             (None, _) => None,
         }
@@ -2254,7 +2332,9 @@ mod tests {
     };
     use crate::config::{Checks, Config, EscapeKey, MergeMethod};
     use crate::github::PrCache;
-    use crate::plan_run::{PersistedPlanRun, PlanRun, PlanRunMode, PlanRunStatus};
+    use crate::plan_run::{
+        PersistedPlanRun, PlanRun, PlanRunMode, PlanRunStatus, PlanStepRun, PlanStepStatus,
+    };
     use crate::repo::Repository;
     use crate::session::Session;
     use crate::view::{RepoMainView, WorktreeMainView};
@@ -2391,6 +2471,51 @@ mod tests {
         assert!(tui.current_plan_dashboard().is_none());
     }
 
+    #[test]
+    fn plan_step_selection_follows_persisted_active_step_until_manual_navigation() {
+        let mut tui = test_tui();
+        let mut run = test_plan_run_with_steps("plan", "/repo-one", 1);
+
+        tui.remember_plan_run(run.clone());
+        assert_eq!(tui.selected_plan_step_by_run.get("plan"), Some(&1));
+
+        run.run.selected_step = 2;
+        run.steps[0].status = PlanStepStatus::Done;
+        run.steps[0].finished_unix_ms = Some(20);
+        run.steps[1].status = PlanStepStatus::Running;
+        run.steps[1].started_unix_ms = Some(30);
+        tui.remember_plan_run(run.clone());
+        assert_eq!(tui.selected_plan_step_by_run.get("plan"), Some(&2));
+
+        tui.focused_panel = PanelFocus::Status;
+        tui.move_plan_step_selection(-1);
+        assert_eq!(tui.selected_plan_step_by_run.get("plan"), Some(&1));
+
+        run.run.selected_step = 3;
+        run.steps[1].status = PlanStepStatus::Done;
+        run.steps[1].finished_unix_ms = Some(40);
+        run.steps[2].status = PlanStepStatus::Running;
+        run.steps[2].started_unix_ms = Some(50);
+        tui.remember_plan_run(run);
+        assert_eq!(tui.selected_plan_step_by_run.get("plan"), Some(&1));
+    }
+
+    #[test]
+    fn plan_step_selection_prefers_latest_finished_step_after_completion() {
+        let mut tui = test_tui();
+        let mut run = test_plan_run_with_steps("plan", "/repo-one", 1);
+        run.run.status = PlanRunStatus::Done;
+        run.run.selected_step = 1;
+        for (index, step) in run.steps.iter_mut().enumerate() {
+            step.status = PlanStepStatus::Done;
+            step.finished_unix_ms = Some(10 + index as u64);
+        }
+
+        tui.remember_plan_run(run);
+
+        assert_eq!(tui.selected_plan_step_by_run.get("plan"), Some(&3));
+    }
+
     fn test_tui() -> Tui {
         let repos = vec![
             ManagedRepo::new(
@@ -2468,6 +2593,42 @@ mod tests {
             },
             steps: Vec::new(),
         }
+    }
+
+    fn test_plan_run_with_steps(
+        id: &str,
+        scope_path: &str,
+        selected_step: usize,
+    ) -> PersistedPlanRun {
+        let mut run = test_plan_run(id, scope_path);
+        run.run.total_steps = 3;
+        run.run.selected_step = selected_step;
+        run.steps = (1..=3)
+            .map(|step| PlanStepRun {
+                run_id: id.to_string(),
+                step,
+                prompt: format!("phase {step}"),
+                status: if step == selected_step {
+                    PlanStepStatus::Running
+                } else {
+                    PlanStepStatus::Queued
+                },
+                opencode_state: None,
+                opencode_server_url: None,
+                opencode_session_id: None,
+                process_id: None,
+                agent_variant: None,
+                started_unix_ms: (step == selected_step).then_some(step as u64),
+                finished_unix_ms: None,
+                exit_code: None,
+                latest_message: None,
+                active_tool: None,
+                todos: Vec::new(),
+                summary: None,
+                error: None,
+            })
+            .collect();
+        run
     }
 
     fn test_session(repo_index: usize, root: &str, branch: &str) -> Session {

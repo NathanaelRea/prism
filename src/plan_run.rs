@@ -12,6 +12,7 @@ use serde_json::Value;
 
 use crate::opencode::{OpencodeState, OpencodeStatus};
 use crate::plan::{build_task, display_plan_path};
+use crate::repo::Repository;
 use crate::util::stable_hash;
 
 pub const DEFAULT_OUTPUT_LINES_PER_STEP: usize = 2_000;
@@ -41,8 +42,10 @@ pub struct PlanStepRun {
     pub step: usize,
     pub prompt: String,
     pub status: PlanStepStatus,
+    pub opencode_state: Option<OpencodeState>,
     pub opencode_server_url: Option<String>,
     pub opencode_session_id: Option<String>,
+    pub agent_variant: Option<String>,
     pub process_id: Option<u32>,
     pub started_unix_ms: Option<u64>,
     pub finished_unix_ms: Option<u64>,
@@ -112,6 +115,13 @@ pub enum PlanOutputKind {
     Error,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordedProcessState {
+    Missing,
+    Live(u32),
+    Dead(u32),
+}
+
 pub fn plan_output_block_key(line: &PlanOutputLine) -> Option<String> {
     match line.kind {
         PlanOutputKind::Tool | PlanOutputKind::ToolOutput => line
@@ -156,7 +166,10 @@ pub struct PlanExecutorConfig {
     pub max_output_lines_per_step: usize,
     pub plugin_config_dir: Option<PathBuf>,
     pub plugin_event_log_path: Option<PathBuf>,
+    pub agent_variant: Option<String>,
 }
+
+pub const DEFAULT_PLAN_AGENT_VARIANT: &str = "medium";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanPluginConfig {
@@ -407,8 +420,10 @@ impl PlanStepRun {
             step,
             prompt,
             status: PlanStepStatus::Queued,
+            opencode_state: None,
             opencode_server_url: None,
             opencode_session_id: None,
+            agent_variant: None,
             process_id: None,
             started_unix_ms: None,
             finished_unix_ms: None,
@@ -437,6 +452,7 @@ impl PlanExecutorConfig {
             max_output_lines_per_step: DEFAULT_OUTPUT_LINES_PER_STEP,
             plugin_config_dir: None,
             plugin_event_log_path: None,
+            agent_variant: Some(DEFAULT_PLAN_AGENT_VARIANT.to_string()),
         }
     }
 
@@ -552,8 +568,10 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
           step integer not null,
           prompt text not null,
           status text not null,
+          opencode_state text,
           opencode_server_url text,
           opencode_session_id text,
+          agent_variant text,
           process_id integer,
           started_unix_ms integer,
           finished_unix_ms integer,
@@ -600,6 +618,18 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
         "plan_run",
         "pause_requested",
         "alter table plan_run add column pause_requested integer not null default 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "plan_step_run",
+        "opencode_state",
+        "alter table plan_step_run add column opencode_state text",
+    )?;
+    add_column_if_missing(
+        conn,
+        "plan_step_run",
+        "agent_variant",
+        "alter table plan_step_run add column agent_variant text",
     )?;
     Ok(())
 }
@@ -849,6 +879,7 @@ pub fn execute_plan_parallel(
             step.status = PlanStepStatus::Starting;
             step.started_unix_ms = Some(unix_ms());
             step.opencode_server_url = executor.server_url.clone();
+            step.agent_variant = executor.agent_variant.clone();
             step.error = None;
             save_step_with_conn(conn, step)?;
         }
@@ -899,6 +930,7 @@ pub fn execute_plan_parallel(
 
         persisted.steps[index].status = PlanStepStatus::Running;
         persisted.steps[index].process_id = Some(child.id());
+        identify_attached_plan_session(executor, &mut persisted.steps[index]);
         save_step_with_conn(conn, &persisted.steps[index])?;
         spawn_parallel_child(index, child, used_attach, tx.clone())?;
         running += 1;
@@ -1033,6 +1065,9 @@ pub fn reconcile_stale_plan_run(
     max_output_lines_per_step: usize,
 ) -> Result<bool, String> {
     let mut changed = false;
+    let mut changed_run_status = false;
+    let repo_root = persisted.run.repo_root.clone();
+    let run_id = persisted.run.id.clone();
     for step in &mut persisted.steps {
         if !matches!(
             step.status,
@@ -1040,44 +1075,160 @@ pub fn reconcile_stale_plan_run(
         ) {
             continue;
         }
-        let message = match step.process_id {
-            Some(process_id) if process_is_running(process_id) => format!(
-                "Prism restarted while phase {} was running in process {process_id}; stdout cannot be reattached, so the phase was marked failed for retry.",
-                step.step
-            ),
-            Some(process_id) => format!(
-                "Prism restarted while phase {} was running, and recorded process {process_id} is no longer running.",
-                step.step
-            ),
-            None => format!(
-                "Prism restarted while phase {} was marked running, but no child process id was recorded.",
-                step.step
-            ),
-        };
-        step.status = PlanStepStatus::Failed;
-        step.process_id = None;
-        step.finished_unix_ms = Some(unix_ms());
-        step.error = Some(message.clone());
-        append_system_output(
-            conn,
-            step,
-            PlanOutputKind::Error,
-            &message,
-            max_output_lines_per_step,
-        )?;
-        save_step_with_conn(conn, step)?;
-        changed = true;
+        match recorded_process_state(step.process_id) {
+            RecordedProcessState::Live(process_id) => {
+                if reconcile_plan_step_from_server(conn, step, max_output_lines_per_step)
+                    .unwrap_or(false)
+                {
+                    changed = true;
+                }
+                let message = format!(
+                    "Prism restarted while phase {} was running in process {process_id}; stdout cannot be reattached, so Prism is showing persisted state until new OpenCode status is available.",
+                    step.step
+                );
+                if append_unique_system_output(
+                    conn,
+                    step,
+                    PlanOutputKind::System,
+                    &message,
+                    max_output_lines_per_step,
+                )? {
+                    changed = true;
+                }
+                append_stale_reconciliation_log(
+                    &repo_root,
+                    &run_id,
+                    step,
+                    "kept-running-live-process",
+                );
+            }
+            RecordedProcessState::Dead(process_id) => {
+                let message = format!(
+                    "Prism restarted while phase {} was running, and recorded process {process_id} is no longer running.",
+                    step.step
+                );
+                mark_stale_step_failed(conn, step, &message, max_output_lines_per_step)?;
+                changed = true;
+                changed_run_status = true;
+                append_stale_reconciliation_log(&repo_root, &run_id, step, "failed-dead-process");
+            }
+            RecordedProcessState::Missing => {
+                let message = format!(
+                    "Prism restarted while phase {} was marked running, but no child process id was recorded.",
+                    step.step
+                );
+                mark_stale_step_failed(conn, step, &message, max_output_lines_per_step)?;
+                changed = true;
+                changed_run_status = true;
+                append_stale_reconciliation_log(
+                    &repo_root,
+                    &run_id,
+                    step,
+                    "failed-missing-process",
+                );
+            }
+        }
     }
-    if matches!(
-        persisted.run.status,
-        PlanRunStatus::Queued | PlanRunStatus::Running | PlanRunStatus::Paused
-    ) {
+    if changed_run_status
+        && matches!(
+            persisted.run.status,
+            PlanRunStatus::Queued | PlanRunStatus::Running | PlanRunStatus::Paused
+        )
+    {
         persisted.run.status = persisted.aggregate_status();
         persisted.run.updated_unix_ms = unix_ms();
         save_run_with_conn(conn, &persisted.run)?;
         changed = true;
     }
     Ok(changed)
+}
+
+fn mark_stale_step_failed(
+    conn: &rusqlite::Connection,
+    step: &mut PlanStepRun,
+    message: &str,
+    max_output_lines_per_step: usize,
+) -> Result<(), String> {
+    step.status = PlanStepStatus::Failed;
+    step.process_id = None;
+    step.finished_unix_ms = Some(unix_ms());
+    step.error = Some(message.to_string());
+    append_unique_system_output(
+        conn,
+        step,
+        PlanOutputKind::Error,
+        message,
+        max_output_lines_per_step,
+    )?;
+    save_step_with_conn(conn, step)
+}
+
+fn recorded_process_state(process_id: Option<u32>) -> RecordedProcessState {
+    match process_id {
+        Some(process_id) if process_is_running(process_id) => {
+            RecordedProcessState::Live(process_id)
+        }
+        Some(process_id) => RecordedProcessState::Dead(process_id),
+        None => RecordedProcessState::Missing,
+    }
+}
+
+fn append_unique_system_output(
+    conn: &rusqlite::Connection,
+    step: &PlanStepRun,
+    kind: PlanOutputKind,
+    text: &str,
+    max_output_lines_per_step: usize,
+) -> Result<bool, String> {
+    if output_line_exists(conn, &step.run_id, step.step, kind, text)? {
+        return Ok(false);
+    }
+    append_system_output(conn, step, kind, text, max_output_lines_per_step)?;
+    Ok(true)
+}
+
+fn output_line_exists(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+    step: usize,
+    kind: PlanOutputKind,
+    text: &str,
+) -> Result<bool, String> {
+    let exists: i64 = conn
+        .query_row(
+            "select exists(
+               select 1 from plan_output_line
+               where run_id = ?1 and step = ?2 and kind = ?3 and text = ?4
+             )",
+            params![run_id, usize_to_i64(step), kind.as_str(), text],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("check plan output line existence: {error}"))?;
+    Ok(exists != 0)
+}
+
+fn append_stale_reconciliation_log(
+    repo_root: &str,
+    run_id: &str,
+    step: &PlanStepRun,
+    transition: &str,
+) {
+    let repo = Repository {
+        root: PathBuf::from(repo_root),
+    };
+    let server_url = step.opencode_server_url.as_deref().unwrap_or("none");
+    let session_id = step.opencode_session_id.as_deref().unwrap_or("none");
+    let process_id = step
+        .process_id
+        .map(|process_id| process_id.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let _ = crate::observability::append_runtime_message(
+        &repo,
+        &format!(
+            "plan stale reconciliation run_id={run_id} step={} process_id={process_id} server_url={server_url} session_id={session_id} transition={transition}",
+            step.step
+        ),
+    );
 }
 
 pub fn retry_failed_steps(
@@ -1362,12 +1513,12 @@ pub fn reconcile_plan_step_from_server(
     conn: &rusqlite::Connection,
     step: &mut PlanStepRun,
     max_output_lines_per_step: usize,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let (Some(server_url), Some(session_id)) = (
         step.opencode_server_url.as_deref(),
         step.opencode_session_id.as_deref(),
     ) else {
-        return Ok(());
+        return Ok(false);
     };
     let status = crate::opencode::poll_session_status(server_url, session_id)?;
     reconcile_plan_step_from_opencode_status(conn, step, &status, max_output_lines_per_step)
@@ -1378,12 +1529,13 @@ pub fn reconcile_plan_step_from_opencode_status(
     step: &mut PlanStepRun,
     status: &OpencodeStatus,
     max_output_lines_per_step: usize,
-) -> Result<(), String> {
+) -> Result<bool, String> {
+    let before = step.clone();
     if let Some(status_session_id) = status.session_id.as_deref() {
         if let Some(step_session_id) = step.opencode_session_id.as_deref()
             && step_session_id != status_session_id
         {
-            return Ok(());
+            return Ok(false);
         }
         if step.opencode_session_id.is_none() {
             step.opencode_session_id = Some(status_session_id.to_string());
@@ -1392,6 +1544,7 @@ pub fn reconcile_plan_step_from_opencode_status(
     if step.opencode_server_url.is_none() {
         step.opencode_server_url = status.server_url.clone();
     }
+    step.opencode_state = Some(status.state);
 
     let mut events = Vec::new();
     if let Some(session_id) = status.session_id.clone() {
@@ -1431,7 +1584,8 @@ pub fn reconcile_plan_step_from_opencode_status(
         events.push(PlanAgentEvent::TodoUpdated { todos });
     }
 
-    ingest_plan_agent_events(conn, step, events, max_output_lines_per_step)
+    ingest_plan_agent_events(conn, step, events, max_output_lines_per_step)?;
+    Ok(*step != before)
 }
 
 fn execute_one_step(
@@ -1446,6 +1600,7 @@ fn execute_one_step(
         step.status = PlanStepStatus::Starting;
         step.started_unix_ms = Some(unix_ms());
         step.opencode_server_url = executor.server_url.clone();
+        step.agent_variant = executor.agent_variant.clone();
         step.error = None;
         persisted.run.selected_step = step.step;
         persisted.run.updated_unix_ms = unix_ms();
@@ -1498,6 +1653,7 @@ fn execute_one_step(
         let step = &mut persisted.steps[step_index];
         step.status = PlanStepStatus::Running;
         step.process_id = Some(child.id());
+        identify_attached_plan_session(executor, step);
         save_step_with_conn(conn, step)?;
     }
 
@@ -1589,6 +1745,9 @@ fn opencode_run_command(
     if attach && let Some(server_url) = executor.server_url.as_deref() {
         command.arg("--attach").arg(server_url);
     }
+    if let Some(variant) = executor.agent_variant.as_deref() {
+        command.arg("--variant").arg(variant);
+    }
     command
         .arg("--format")
         .arg("json")
@@ -1608,6 +1767,25 @@ fn opencode_run_command(
         command.env("PRISM_PLAN_HOOK_LOG", event_log_path);
     }
     command
+}
+
+fn identify_attached_plan_session(executor: &PlanExecutorConfig, step: &mut PlanStepRun) {
+    let Some(server_url) = executor.server_url.as_deref() else {
+        return;
+    };
+    if step.opencode_session_id.is_some() {
+        return;
+    }
+    let title = format!("{} phase {}", executor.title_prefix, step.step);
+    if let Ok(sessions) = crate::opencode::list_sessions(server_url)
+        && let Some(session) = sessions
+            .iter()
+            .filter(|session| session.title.as_deref() == Some(title.as_str()))
+            .max_by(|left, right| left.time_updated.cmp(&right.time_updated))
+    {
+        step.opencode_server_url = Some(server_url.to_string());
+        step.opencode_session_id = Some(session.id.clone());
+    }
 }
 
 fn opencode_plan_plugin_config_json() -> &'static str {
@@ -1709,7 +1887,9 @@ fn terminate_process(process_id: u32) -> Result<(), String> {
 
 fn reset_step_for_retry(step: &mut PlanStepRun) {
     step.status = PlanStepStatus::Queued;
+    step.opencode_state = None;
     step.opencode_session_id = None;
+    step.agent_variant = None;
     step.process_id = None;
     step.started_unix_ms = None;
     step.finished_unix_ms = None;
@@ -1977,6 +2157,7 @@ fn apply_agent_event(
             )
         }
         PlanAgentEvent::StateChanged { state } => {
+            step.opencode_state = OpencodeState::parse(&state);
             if state == OpencodeState::Idle.label() {
                 step.active_tool = None;
             }
@@ -2223,31 +2404,35 @@ fn save_step_with_conn(conn: &rusqlite::Connection, step: &PlanStepRun) -> Resul
     .map_err(|error| format!("serialize plan todos: {error}"))?;
     conn.execute(
         "insert into plan_step_run (
-           run_id, step, prompt, status, opencode_server_url, opencode_session_id,
-           process_id, started_unix_ms, finished_unix_ms, exit_code, latest_message,
+           run_id, step, prompt, status, opencode_state, opencode_server_url, opencode_session_id,
+           agent_variant, process_id, started_unix_ms, finished_unix_ms, exit_code, latest_message,
            active_tool, todos_json, summary, error
-         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
-         on conflict(run_id, step) do update set
-           prompt = excluded.prompt,
-           status = excluded.status,
-           opencode_server_url = excluded.opencode_server_url,
-           opencode_session_id = excluded.opencode_session_id,
-           process_id = excluded.process_id,
-           started_unix_ms = excluded.started_unix_ms,
-           finished_unix_ms = excluded.finished_unix_ms,
-           exit_code = excluded.exit_code,
-           latest_message = excluded.latest_message,
-           active_tool = excluded.active_tool,
-           todos_json = excluded.todos_json,
-           summary = excluded.summary,
-           error = excluded.error",
+          ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+          on conflict(run_id, step) do update set
+            prompt = excluded.prompt,
+            status = excluded.status,
+             opencode_state = excluded.opencode_state,
+             opencode_server_url = excluded.opencode_server_url,
+             opencode_session_id = excluded.opencode_session_id,
+             agent_variant = excluded.agent_variant,
+             process_id = excluded.process_id,
+             started_unix_ms = excluded.started_unix_ms,
+             finished_unix_ms = excluded.finished_unix_ms,
+             exit_code = excluded.exit_code,
+             latest_message = excluded.latest_message,
+             active_tool = excluded.active_tool,
+             todos_json = excluded.todos_json,
+             summary = excluded.summary,
+             error = excluded.error",
         params![
             step.run_id.as_str(),
             usize_to_i64(step.step),
             step.prompt.as_str(),
             step.status.as_str(),
+            step.opencode_state.map(OpencodeState::label),
             step.opencode_server_url.as_deref(),
             step.opencode_session_id.as_deref(),
+            step.agent_variant.as_deref(),
             step.process_id.map(i64::from),
             step.started_unix_ms.map(u64_to_i64),
             step.finished_unix_ms.map(u64_to_i64),
@@ -2308,9 +2493,9 @@ fn load_steps_with_conn(
 ) -> Result<Vec<PlanStepRun>, String> {
     let mut statement = conn
         .prepare(
-            "select run_id, step, prompt, status, opencode_server_url, opencode_session_id,
-                    process_id, started_unix_ms, finished_unix_ms, exit_code, latest_message,
-                    active_tool, todos_json, summary, error
+            "select run_id, step, prompt, status, opencode_state, opencode_server_url, opencode_session_id,
+                agent_variant, process_id, started_unix_ms, finished_unix_ms, exit_code,
+                    latest_message, active_tool, todos_json, summary, error
              from plan_step_run
              where run_id = ?1
              order by step",
@@ -2319,29 +2504,32 @@ fn load_steps_with_conn(
     let rows = statement
         .query_map(params![run_id], |row| {
             let status: String = row.get(3)?;
-            let todos_json: String = row.get(12)?;
+            let opencode_state: Option<String> = row.get(4)?;
+            let todos_json: String = row.get(14)?;
             Ok(PlanStepRun {
                 run_id: row.get(0)?,
                 step: i64_to_usize(row.get(1)?, 1),
                 prompt: row.get(2)?,
                 status: PlanStepStatus::parse(&status).map_err(from_string_error)?,
-                opencode_server_url: row.get(4)?,
-                opencode_session_id: row.get(5)?,
+                opencode_state: opencode_state.as_deref().and_then(OpencodeState::parse),
+                opencode_server_url: row.get(5)?,
+                opencode_session_id: row.get(6)?,
+                agent_variant: row.get(7)?,
                 process_id: row
-                    .get::<_, Option<i64>>(6)?
+                    .get::<_, Option<i64>>(8)?
                     .map(|value| value.max(0) as u32),
                 started_unix_ms: row
-                    .get::<_, Option<i64>>(7)?
+                    .get::<_, Option<i64>>(9)?
                     .map(|value| value.max(0) as u64),
                 finished_unix_ms: row
-                    .get::<_, Option<i64>>(8)?
+                    .get::<_, Option<i64>>(10)?
                     .map(|value| value.max(0) as u64),
-                exit_code: row.get(9)?,
-                latest_message: row.get(10)?,
-                active_tool: row.get(11)?,
+                exit_code: row.get(11)?,
+                latest_message: row.get(12)?,
+                active_tool: row.get(13)?,
                 todos: parse_todos_json(&todos_json).map_err(from_string_error)?,
-                summary: row.get(13)?,
-                error: row.get(14)?,
+                summary: row.get(15)?,
+                error: row.get(16)?,
             })
         })
         .map_err(|error| format!("load plan steps: {error}"))?;
@@ -2517,6 +2705,30 @@ mod tests {
                 "Implement plan-plan.md phase 4",
             ]
         );
+    }
+
+    #[test]
+    fn opencode_run_command_passes_prompt_as_single_raw_argument() {
+        let scope_path = PathBuf::from("/repo/prism");
+        let executor = PlanExecutorConfig::new(
+            "opencode".to_string(),
+            Some("http://127.0.0.1:41234".to_string()),
+            scope_path.clone(),
+            "plan with spaces.md",
+        );
+        let prompt = "  Implement plan phase 3\n\"quotes\" and $PATH && true\n--leading-dash";
+
+        let command = opencode_run_command(&executor, 3, prompt, true);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(args.last().map(String::as_str), Some(prompt));
+        assert!(args.windows(2).any(|args| args == ["--variant", "medium"]));
+        assert!(!args.iter().any(|arg| arg == &format!("'{prompt}'")));
+        assert_eq!(args.iter().filter(|arg| arg.as_str() == prompt).count(), 1);
+        assert_eq!(command.get_current_dir(), Some(scope_path.as_path()));
     }
 
     #[test]
@@ -3184,6 +3396,70 @@ fi
                 .any(|line| line.kind == PlanOutputKind::Error
                     && line.text.contains("Prism restarted"))
         );
+    }
+
+    #[test]
+    fn reconcile_keeps_running_step_with_live_process() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&conn).unwrap();
+        let temp = unique_temp_dir("prism-plan-live-reconcile");
+        let mut persisted = PlanLaunch::new(
+            &temp,
+            &temp,
+            &temp.join("plan.md"),
+            "phase",
+            1,
+            1,
+            PlanRunMode::Sequential,
+        )
+        .unwrap()
+        .create_run();
+        persisted.run.status = PlanRunStatus::Running;
+        persisted.run.selected_step = 1;
+        persisted.run.updated_unix_ms = 123;
+        persisted.steps[0].status = PlanStepStatus::Running;
+        persisted.steps[0].process_id = Some(std::process::id());
+        persisted.steps[0].opencode_server_url = Some("http://127.0.0.1:41234".to_string());
+        persisted.steps[0].opencode_session_id = Some("ses_live".to_string());
+        persisted.steps[0].started_unix_ms = Some(111);
+        save_plan_run(&conn, &persisted).unwrap();
+
+        let changed =
+            reconcile_stale_plan_run(&conn, &mut persisted, DEFAULT_OUTPUT_LINES_PER_STEP).unwrap();
+        let changed_again =
+            reconcile_stale_plan_run(&conn, &mut persisted, DEFAULT_OUTPUT_LINES_PER_STEP).unwrap();
+
+        assert!(changed);
+        assert!(!changed_again);
+        let loaded = load_plan_run(&conn, &persisted.run.id)
+            .unwrap()
+            .expect("persisted run");
+        assert_eq!(loaded.run.status, PlanRunStatus::Running);
+        assert_eq!(loaded.run.selected_step, 1);
+        assert_eq!(loaded.run.updated_unix_ms, 123);
+        assert_eq!(loaded.steps[0].status, PlanStepStatus::Running);
+        assert_eq!(loaded.steps[0].process_id, Some(std::process::id()));
+        assert_eq!(loaded.steps[0].started_unix_ms, Some(111));
+        assert_eq!(loaded.steps[0].finished_unix_ms, None);
+        assert_eq!(
+            loaded.steps[0].opencode_server_url.as_deref(),
+            Some("http://127.0.0.1:41234")
+        );
+        assert_eq!(
+            loaded.steps[0].opencode_session_id.as_deref(),
+            Some("ses_live")
+        );
+        let output = load_output_lines(&conn, &persisted.run.id, 1).unwrap();
+        assert_eq!(
+            output
+                .iter()
+                .filter(|line| line.kind == PlanOutputKind::System
+                    && line.text.contains("stdout cannot be reattached"))
+                .count(),
+            1
+        );
+
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[test]
