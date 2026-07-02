@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::params;
+use rusqlite::{Connection, OpenFlags, params};
 
 use crate::agent::AgentState;
 use crate::config::Config;
@@ -480,16 +480,33 @@ pub(crate) fn clear_hidden_session_marker(repo: &Repository, branch: &str) -> Re
 }
 
 pub(crate) fn hidden_session_exists(repo: &Repository, branch: &str) -> Result<bool, String> {
-    observability::with_writable_db(repo, |conn| {
-        let count = conn
-            .query_row(
-                "select count(*) from hidden_session where branch = ?1",
-                params![branch],
-                |row| row.get::<_, i64>(0),
-            )
-            .map_err(|error| format!("read hidden marker: {error}"))?;
-        Ok(count > 0)
-    })
+    let path = observability::db_path(repo);
+    if !path.exists() {
+        return Ok(false);
+    }
+    let conn = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("open {} read-only: {error}", path.display()))?;
+    let table_count = conn
+        .query_row(
+            "select count(*) from sqlite_master where type = 'table' and name = 'hidden_session'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("inspect hidden marker table: {error}"))?;
+    if table_count == 0 {
+        return Ok(false);
+    }
+    let count = conn
+        .query_row(
+            "select count(*) from hidden_session where branch = ?1",
+            params![branch],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("read hidden marker: {error}"))?;
+    Ok(count > 0)
 }
 
 pub fn append_runtime_log(repo: &Repository, message: &str) -> Result<(), String> {
@@ -747,6 +764,31 @@ exit 0
         assert_eq!(row.1, worktree.display().to_string());
         assert_eq!(row.2, "planning");
         assert!(load_hidden_sessions(&repo).contains_key("feature"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn hidden_session_exists_missing_db_is_false_without_creating_db() {
+        let temp = unique_temp_dir("prism-hidden-session-missing-db-test");
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        let db = observability::db_path(&repo);
+
+        assert!(!hidden_session_exists(&repo, "feature").unwrap());
+        assert!(!db.exists());
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn hidden_session_exists_missing_table_is_false() {
+        let temp = unique_temp_dir("prism-hidden-session-missing-table-test");
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        let db = observability::db_path(&repo);
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        rusqlite::Connection::open(&db).unwrap();
+
+        assert!(!hidden_session_exists(&repo, "feature").unwrap());
 
         let _ = fs::remove_dir_all(temp);
     }
