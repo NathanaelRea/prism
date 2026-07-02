@@ -115,8 +115,18 @@ pub(crate) struct WorktreeRow {
 
 pub(crate) struct PlanDashboard {
     pub run: PersistedPlanRun,
+    pub runs: Vec<PlanRunSummary>,
     pub output_lines: Vec<PlanOutputLine>,
     pub output_state: PlanOutputViewerState,
+}
+
+pub(crate) struct PlanRunSummary {
+    pub id: String,
+    pub plan_display: String,
+    pub scope_path: String,
+    pub status: crate::plan_run::PlanRunStatus,
+    pub updated_unix_ms: u64,
+    pub selected: bool,
 }
 
 pub(crate) struct AutoDashboard {

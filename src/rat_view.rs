@@ -554,6 +554,19 @@ fn plan_dashboard_lines(
             ]));
         }
     }
+    if dashboard.runs.len() > 1 {
+        lines.push(Line::from(""));
+        lines.push(heading_line("Runs"));
+        let selected_run = dashboard
+            .runs
+            .iter()
+            .position(|run| run.selected)
+            .unwrap_or(0);
+        let start = scroll_start(selected_run, 5);
+        for run in dashboard.runs.iter().skip(start).take(5) {
+            lines.push(plan_run_row(run));
+        }
+    }
     lines.push(Line::from(vec![
         Span::styled("counts queued ", muted_style()),
         Span::raw((counts.queued + counts.starting).to_string()),
@@ -615,6 +628,26 @@ fn plan_dashboard_lines(
     }
     lines.truncate(visible_rows);
     lines
+}
+
+fn plan_run_row(run: &view::PlanRunSummary) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            if run.selected { "▶ " } else { "  " },
+            title_style(run.selected),
+        ),
+        Span::styled(
+            format!("{:<8}", plan_run_status_label(run.status)),
+            plan_run_status_style(run.status),
+        ),
+        Span::styled(
+            format!(" {} ", age_label(run.updated_unix_ms)),
+            muted_style(),
+        ),
+        Span::raw(run.plan_display.clone()),
+        Span::styled(format!("  {}", short_id(&run.id)), muted_style()),
+        Span::styled(format!("  {}", run.scope_path), muted_style()),
+    ])
 }
 
 fn auto_dashboard_lines(
@@ -3813,6 +3846,31 @@ mod tests {
     }
 
     #[test]
+    fn renders_plan_run_window_around_selected_run() {
+        let config = test_config();
+        let sessions = vec![test_session("feature", AgentState::Running)];
+        let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+        let mut dashboard = test_plan_dashboard(false);
+        dashboard.runs = (1..=8)
+            .map(|index| crate::view::PlanRunSummary {
+                id: format!("plan-run-{index}"),
+                plan_display: format!("plan-{index}.md"),
+                scope_path: "/repo".to_string(),
+                status: PlanRunStatus::Done,
+                updated_unix_ms: 4_000 + index,
+                selected: index == 7,
+            })
+            .collect();
+        model.plan_dashboard = Some(dashboard);
+
+        let buffer = render_to_string(&model, 120, 40);
+
+        assert!(buffer.contains("plan-7.md"));
+        assert!(buffer.contains("▶ done"));
+        assert!(!buffer.contains("plan-1.md"));
+    }
+
+    #[test]
     fn renders_auto_dashboard_steps_and_output_cursor() {
         let config = test_config();
         let sessions = vec![test_session("feature", AgentState::Running)];
@@ -4114,6 +4172,14 @@ mod tests {
                     },
                 ],
             },
+            runs: vec![crate::view::PlanRunSummary {
+                id: "plan-run".to_string(),
+                plan_display: "plan.md".to_string(),
+                scope_path: "/repo".to_string(),
+                status: PlanRunStatus::Running,
+                updated_unix_ms: 4_000,
+                selected: true,
+            }],
             output_lines: vec![
                 PlanOutputLine {
                     run_id: "plan-run".to_string(),
