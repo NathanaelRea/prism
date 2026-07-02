@@ -89,6 +89,33 @@ fn help_prints_usage_without_repo() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).contains("Usage:\n  prism"));
     assert!(stdout(&output).contains("auto run-plan <plan.md>"));
+    assert!(stdout(&output).contains("debug --help"));
+    assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn debug_help_prints_without_repo() {
+    let temp = TempDir::new("debug-help");
+    let output = run(["debug", "--help"], temp.path(), temp.path());
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout = stdout(&output);
+    assert!(stdout.contains("Usage:\n  prism [--repo <path>] debug paths"));
+    assert!(stdout.contains("debug logs"));
+    assert!(stdout.contains("--log-level trace"));
+    assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn db_help_prints_without_repo() {
+    let temp = TempDir::new("db-help");
+    let output = run(["db", "--help"], temp.path(), temp.path());
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let stdout = stdout(&output);
+    assert!(stdout.contains("Usage:\n  prism [--repo <path>] db"));
+    assert!(stdout.contains("db path"));
+    assert!(stdout.contains("db <read-only-sql>"));
     assert!(stderr(&output).is_empty());
 }
 
