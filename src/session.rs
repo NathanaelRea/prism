@@ -17,6 +17,40 @@ use crate::process::run_capture;
 use crate::repo::Repository;
 use crate::util::{safe_branch_filename, status_count, truncate};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SessionClassification {
+    #[default]
+    Work,
+    Planning,
+    Exploration,
+}
+
+impl SessionClassification {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Work => "work",
+            Self::Planning => "planning",
+            Self::Exploration => "exploration",
+        }
+    }
+
+    fn sort_rank(self) -> u8 {
+        match self {
+            Self::Work => 0,
+            Self::Planning => 1,
+            Self::Exploration => 2,
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value.trim() {
+            "planning" => Self::Planning,
+            "exploration" => Self::Exploration,
+            _ => Self::Work,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Session {
     pub repo_index: usize,
@@ -26,6 +60,7 @@ pub struct Session {
     pub path_display: String,
     pub branch: String,
     pub prompt_summary: String,
+    pub classification: SessionClassification,
     pub adopted: bool,
     pub hidden: bool,
     pub status_label: String,
@@ -98,6 +133,7 @@ impl Session {
             path_display: self.path_display.clone(),
             branch: self.branch.clone(),
             prompt_summary: self.prompt_summary.clone(),
+            classification: self.classification,
             adopted: self.adopted,
             hidden: self.hidden,
             status_label: self.status_label.clone(),
@@ -151,6 +187,7 @@ pub fn discover_sessions(repo: &Repository, config: &Config) -> Result<Vec<Sessi
             .arg(&repo.root)
             .args(["worktree", "list", "--porcelain"]),
     )?;
+    let hidden = load_hidden_sessions(repo);
     let mut sessions = Vec::new();
     let mut current_path: Option<PathBuf> = None;
     let mut current_branch: Option<String> = None;
@@ -161,7 +198,19 @@ pub fn discover_sessions(repo: &Repository, config: &Config) -> Result<Vec<Sessi
                 let branch = current_branch
                     .take()
                     .unwrap_or_else(|| "(detached)".to_string());
-                if path.exists() {
+                if hidden.contains_key(&branch) {
+                    observability::emit(observability::EventInput {
+                        level: LogLevel::Debug,
+                        target: "session",
+                        action: "skip_archived_worktree",
+                        operation_id: None,
+                        parent_operation_id: None,
+                        branch: Some(branch),
+                        session: Some(path.display().to_string()),
+                        message: format!("skipping archived worktree {}", path.display()),
+                        data_json: None,
+                    });
+                } else if path.exists() {
                     sessions.push(build_session(repo, path, branch, config));
                 } else {
                     observability::emit(observability::EventInput {
@@ -204,6 +253,11 @@ pub(crate) fn session_discovery_order(
 ) -> std::cmp::Ordering {
     b.is_default_branch(config)
         .cmp(&a.is_default_branch(config))
+        .then_with(|| {
+            a.classification
+                .sort_rank()
+                .cmp(&b.classification.sort_rank())
+        })
         .then_with(|| a.branch.cmp(&b.branch))
         .then_with(|| a.path.cmp(&b.path))
 }
@@ -218,6 +272,10 @@ fn build_session(repo: &Repository, path: PathBuf, branch: String, config: &Conf
         .map(|metadata| metadata.prompt_summary.clone())
         .or_else(|| read_prompt_summary(&legacy_metadata_path))
         .unwrap_or_default();
+    let classification = metadata
+        .as_ref()
+        .map(|metadata| metadata.classification)
+        .unwrap_or_default();
     let adopted = metadata.is_some() || legacy_metadata_path.exists();
     let status_label = git_status_label(&path, config);
     let path_display = path.display().to_string();
@@ -231,6 +289,7 @@ fn build_session(repo: &Repository, path: PathBuf, branch: String, config: &Conf
         path_display,
         branch,
         prompt_summary,
+        classification,
         adopted,
         hidden: false,
         status_label,
@@ -251,18 +310,20 @@ pub fn write_task_metadata(
     observability::with_writable_db(repo, |conn| {
         conn.execute(
             "insert into task_metadata (
-                branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
-             ) values (?1, ?2, ?3, ?4, ?5)
+                branch, prompt_summary, initial_prompt, worktree, classification, updated_unix_ms
+             ) values (?1, ?2, ?3, ?4, ?5, ?6)
              on conflict(branch) do update set
                 prompt_summary = excluded.prompt_summary,
                 initial_prompt = excluded.initial_prompt,
                 worktree = excluded.worktree,
+                classification = excluded.classification,
                 updated_unix_ms = excluded.updated_unix_ms",
             params![
                 session.branch.as_str(),
                 summary.as_str(),
                 initial_prompt,
                 session.path_display.as_str(),
+                session.classification.label(),
                 unix_seconds(),
             ],
         )
@@ -279,12 +340,21 @@ pub(crate) fn migrate_worktree_session_schema(conn: &rusqlite::Connection) -> Re
           prompt_summary text not null,
           initial_prompt text not null,
           worktree text not null,
+          classification text not null default 'work',
           updated_unix_ms integer not null
         );
 
         create table if not exists hidden_session (
           branch text primary key,
           hidden_unix_ms integer not null
+        );
+
+        create table if not exists archived_worktree (
+          branch text primary key,
+          repo_root text not null,
+          worktree_path text not null,
+          archived_unix_ms integer not null,
+          classification text not null default 'work'
         );
 
         create table if not exists agent_state (
@@ -295,7 +365,57 @@ pub(crate) fn migrate_worktree_session_schema(conn: &rusqlite::Connection) -> Re
         ",
     )
     .map_err(|error| format!("create worktree session schema: {error}"))?;
+    add_column_if_missing(
+        conn,
+        "task_metadata",
+        "classification",
+        "alter table task_metadata add column classification text not null default 'work'",
+    )?;
     Ok(())
+}
+
+pub(crate) fn archive_worktree_session(repo: &Repository, session: &Session) -> Result<(), String> {
+    observability::with_writable_db(repo, |conn| {
+        conn.execute_batch("begin transaction")
+            .map_err(|error| format!("begin archive transaction: {error}"))?;
+        let result = (|| -> Result<(), String> {
+            conn.execute(
+                "insert into hidden_session (branch, hidden_unix_ms)
+                 values (?1, ?2)
+                 on conflict(branch) do update set hidden_unix_ms = excluded.hidden_unix_ms",
+                params![session.branch.as_str(), unix_seconds()],
+            )
+            .map_err(|error| format!("write hidden marker: {error}"))?;
+            conn.execute(
+                "insert into archived_worktree (
+                    branch, repo_root, worktree_path, archived_unix_ms, classification
+                 ) values (?1, ?2, ?3, ?4, ?5)
+                 on conflict(branch) do update set
+                    repo_root = excluded.repo_root,
+                    worktree_path = excluded.worktree_path,
+                    archived_unix_ms = excluded.archived_unix_ms,
+                    classification = excluded.classification",
+                params![
+                    session.branch.as_str(),
+                    repo.root.display().to_string(),
+                    session.path_display.as_str(),
+                    unix_seconds(),
+                    session.classification.label(),
+                ],
+            )
+            .map_err(|error| format!("write archived worktree metadata: {error}"))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn
+                .execute_batch("commit")
+                .map_err(|error| format!("commit archive transaction: {error}")),
+            Err(error) => {
+                let _ = conn.execute_batch("rollback");
+                Err(error)
+            }
+        }
+    })
 }
 
 pub(crate) fn remove_task_metadata_with_conn(
@@ -371,22 +491,66 @@ fn load_agent_state(repo: &Repository, branch: &str) -> Option<AgentState> {
 
 struct TaskMetadata {
     prompt_summary: String,
+    classification: SessionClassification,
 }
 
 fn load_task_metadata(repo: &Repository, branch: &str) -> Option<TaskMetadata> {
     observability::with_writable_db(repo, |conn| {
         conn.query_row(
-            "select prompt_summary from task_metadata where branch = ?1",
+            "select prompt_summary, classification from task_metadata where branch = ?1",
             params![branch],
             |row| {
                 Ok(TaskMetadata {
                     prompt_summary: row.get(0)?,
+                    classification: SessionClassification::parse(&row.get::<_, String>(1)?),
                 })
             },
         )
         .map_err(|error| format!("read task metadata: {error}"))
     })
     .ok()
+}
+
+fn load_hidden_sessions(repo: &Repository) -> BTreeMap<String, i64> {
+    observability::with_writable_db(repo, |conn| {
+        let mut statement = conn
+            .prepare("select branch, hidden_unix_ms from hidden_session")
+            .map_err(|error| format!("read hidden sessions: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|error| format!("read hidden sessions: {error}"))?;
+        let mut hidden = BTreeMap::new();
+        for row in rows {
+            let (branch, hidden_unix_ms) =
+                row.map_err(|error| format!("read hidden session: {error}"))?;
+            hidden.insert(branch, hidden_unix_ms);
+        }
+        Ok(hidden)
+    })
+    .unwrap_or_default()
+}
+
+fn add_column_if_missing(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    sql: &str,
+) -> Result<(), String> {
+    let mut statement = conn
+        .prepare(&format!("pragma table_info({table})"))
+        .map_err(|error| format!("inspect {table} schema: {error}"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("inspect {table} schema: {error}"))?;
+    for value in columns {
+        if value.map_err(|error| format!("inspect {table} schema: {error}"))? == column {
+            return Ok(());
+        }
+    }
+    conn.execute_batch(sql)
+        .map_err(|error| format!("migrate {table}.{column}: {error}"))
 }
 
 fn read_prompt_summary(path: &Path) -> Option<String> {
@@ -494,6 +658,56 @@ exit 0
     }
 
     #[test]
+    fn planning_and_exploration_sessions_sort_below_work_sessions() {
+        let config = test_config();
+        let work = test_session("feature-a", "/repo/a");
+        let mut planning = test_session("feature-b", "/repo/b");
+        planning.classification = SessionClassification::Planning;
+        let mut exploration = test_session("feature-c", "/repo/c");
+        exploration.classification = SessionClassification::Exploration;
+
+        assert_eq!(
+            session_discovery_order(&config, &work, &planning),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            session_discovery_order(&config, &planning, &exploration),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
+    fn archived_worktree_metadata_records_restore_details_and_hides_session() {
+        let temp = unique_temp_dir("prism-archive-worktree-test");
+        let repo_path = temp.join("repo");
+        let worktree = temp.join("worktree");
+        fs::create_dir_all(&repo_path).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        let repo = Repository::with_config_dir_for_test(repo_path.clone(), temp.join("config"));
+        let mut session = test_session("feature", &worktree.display().to_string());
+        session.classification = SessionClassification::Planning;
+
+        archive_worktree_session(&repo, &session).unwrap();
+
+        let row = observability::with_writable_db(&repo, |conn| {
+            conn.query_row(
+                "select repo_root, worktree_path, classification from archived_worktree where branch = ?1",
+                params!["feature"],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+            )
+            .map_err(|error| format!("read archived metadata: {error}"))
+        })
+        .unwrap();
+
+        assert_eq!(row.0, repo_path.display().to_string());
+        assert_eq!(row.1, worktree.display().to_string());
+        assert_eq!(row.2, "planning");
+        assert!(load_hidden_sessions(&repo).contains_key("feature"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn refresh_state_preserves_runtime_pr_columns_and_unseen_comments() {
         let config = test_config();
         let mut fresh = test_session("feature", "/repo/feature");
@@ -580,6 +794,7 @@ exit 0
             path_display: path.to_string(),
             branch: branch.to_string(),
             prompt_summary: String::new(),
+            classification: SessionClassification::Work,
             adopted: true,
             hidden: false,
             status_label: "clean".to_string(),
@@ -605,6 +820,7 @@ exit 0
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             auto: crate::config::AutoConfig::default(),
+            layout: crate::config::LayoutConfig::default(),
             checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools: BTreeMap::new(),

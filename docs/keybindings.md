@@ -6,13 +6,14 @@ Prism uses a lazygit-style panel model.
 - `2` focuses Repos.
 - `3` focuses Worktrees / Sessions.
 - `Tab` cycles focus between panels.
-- `h` / `l` or left/right switches horizontal views in the Repos panel, and switches the Worktrees main panel between details and the active plan dashboard when a plan run exists.
+- `0` focuses the main panel for the selected sidebar context.
+- `h` / `l` or left/right switches horizontal views in the Repos main panel, and switches the Worktrees main panel between details and the active plan dashboard when a plan run exists.
 - `j` / `k` or up/down moves within the focused row panel.
 - `g g` jumps to the top of the focused list or output viewer.
 - `G` jumps to the bottom of the focused list or output viewer.
 - `{` / `}` jumps between Plan output tool blocks when a Plan dashboard is focused.
-- `Enter` focuses the next useful panel from Status or Repos, and opens the selected agent from Worktrees when valid.
-- `Space Space` opens tmux window 1 for the current plan phase from Status when available; otherwise it focuses the next useful panel or opens the selected agent from Worktrees when valid.
+- `Enter` and `Space Space` share the same go-deeper behavior: Status operates the active dashboard or focuses Repos, Repos focuses Worktrees for the selected repository, and Worktrees opens the selected agent session when valid.
+- Default branch worktrees are not agent targets; `Enter` and `Space Space` show the same blocked message there.
 - `Space Enter` opens tmux window 3: terminal.
 - `Ctrl-/` also opens tmux window 3 where the terminal reports that key combination distinctly; use `Space Enter` as the reliable alternative.
 - `Space g g` opens tmux window 2: lazygit.
@@ -34,9 +35,11 @@ Prism uses a lazygit-style panel model.
 - `x` aborts the selected OpenCode session from the Worktrees panel.
 - `x` also aborts the selected Plan phase from the active Plan dashboard, or accepts `all` when prompted to abort all running phases.
 - `e` edits the Prism repository config from the Repos panel and reloads after save.
+- `C` opens the repository config at `[worktrees] columns` from the Repos panel, then reloads after save.
 - `/` filters the focused Repos or Worktrees panel.
 - `?` opens the in-app keybinding dialog.
-- `D` confirms and deletes the selected non-default worktree/session.
+- `D` archives the selected non-default worktree/session, hiding it from normal navigation while leaving files and branch intact.
+- `X` permanently deletes the selected non-default worktree/session after explicit confirmation.
 - `r` refreshes cached repository, worktree, PR, and agent state.
 - `q` or `Ctrl-C` quits.
 
