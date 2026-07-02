@@ -186,34 +186,28 @@ fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<
             let (ci_label, ci_style) = worktree_ci_column(worktree, model.config.icon_style);
             let (comments_label, comments_style) = worktree_comments_column(worktree);
             let (error_label, error_style) = worktree_error_column(worktree);
+            let (agent_label, agent_style) =
+                if matches!(worktree.kind, view::WorktreeKind::DefaultBranch) {
+                    (" ", muted_style())
+                } else {
+                    (
+                        agent_icon(worktree.agent_state),
+                        agent_style(worktree.agent_state),
+                    )
+                };
             let mut spans = vec![
                 Span::raw(format!("{:<12} ", truncate_column(&worktree.branch, 12))),
                 Span::styled(
                     format!("{} ", classification_marker(worktree.classification)),
                     classification_style(worktree.classification),
                 ),
-                Span::styled(
-                    format!("{} ", agent_icon(worktree.agent_state)),
-                    agent_style(worktree.agent_state),
-                ),
+                Span::styled(format!("{agent_label} "), agent_style),
                 Span::styled(format!("{pr_label} "), pr_style),
                 Span::styled(format!("{git_label} "), git_style),
                 Span::styled(format!("{ci_label} "), ci_style),
                 Span::styled(format!("{comments_label:<5} "), comments_style),
                 Span::styled(error_label, error_style),
             ];
-            if worktree.pr.summary.is_none() && !worktree.prompt_summary.is_empty() {
-                spans.push(Span::styled(
-                    format!("  {}", worktree.prompt_summary),
-                    muted_style(),
-                ));
-            }
-            if let Some(status) = worktree.auto_status {
-                spans.push(Span::styled(
-                    format!("  auto:{}", auto_status_label(status)),
-                    auto_style(status),
-                ));
-            }
             spans.extend(configured_column_widths.iter().map(|(key, width)| {
                 let value = worktree
                     .wt_columns
@@ -226,6 +220,18 @@ fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<
                     muted_style(),
                 )
             }));
+            if worktree.pr.summary.is_none() && !worktree.prompt_summary.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {}", worktree.prompt_summary),
+                    muted_style(),
+                ));
+            }
+            if let Some(status) = worktree.auto_status {
+                spans.push(Span::styled(
+                    format!("  auto:{}", auto_status_label(status)),
+                    auto_style(status),
+                ));
+            }
             let focused = model.focus == PanelFocus::Worktrees && !model.main_focused;
             ListItem::new(Line::from(spans)).style(if worktree.selected {
                 selected_sidebar_row_style(focused)
@@ -744,7 +750,7 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>
             "j/k select  0 main  Enter worktrees  C columns  R manage  / search  q quit"
         }
         PanelFocus::Worktrees => {
-            "j/k select  0 main  Enter tmux  Space g git  c create  D archive  X delete  q quit"
+            "j/k select  0 main  Enter tmux  c create  D archive  U unarchive  X delete  q quit"
         }
     };
     let mut spans = vec![
@@ -2851,7 +2857,7 @@ fn worktree_pr_column(
     icon_style: IconStyle,
 ) -> (&'static str, Style) {
     if matches!(worktree.kind, view::WorktreeKind::DefaultBranch) {
-        return ("·", muted_style());
+        return (" ", muted_style());
     }
     if worktree.pr.error.is_some() {
         return (icon(icon_style, "!", ""), error_style());
@@ -2866,6 +2872,9 @@ fn worktree_git_column(
     worktree: &view::WorktreeRow,
     icon_style: IconStyle,
 ) -> (&'static str, Style) {
+    if matches!(worktree.kind, view::WorktreeKind::DefaultBranch) {
+        return (" ", muted_style());
+    }
     if status_count(&worktree.status_label, "dirty").is_some() {
         (
             icon(icon_style, "✗", ""),
@@ -2892,7 +2901,7 @@ fn worktree_ci_column(
     icon_style: IconStyle,
 ) -> (&'static str, Style) {
     if matches!(worktree.kind, view::WorktreeKind::DefaultBranch) {
-        return ("·", muted_style());
+        return (" ", muted_style());
     }
     let Some(summary) = &worktree.pr.summary else {
         return ("·", muted_style());
@@ -2904,6 +2913,9 @@ fn worktree_ci_column(
 }
 
 fn worktree_comments_column(worktree: &view::WorktreeRow) -> (String, Style) {
+    if matches!(worktree.kind, view::WorktreeKind::DefaultBranch) {
+        return (" ".to_string(), muted_style());
+    }
     let label = if let Some(details) = &worktree.pr.details {
         let unresolved = details.comments.len()
             + details
@@ -2946,6 +2958,9 @@ fn worktree_comments_column(worktree: &view::WorktreeRow) -> (String, Style) {
 }
 
 fn worktree_error_column(worktree: &view::WorktreeRow) -> (&'static str, Style) {
+    if matches!(worktree.kind, view::WorktreeKind::DefaultBranch) {
+        return (" ", muted_style());
+    }
     if worktree.pr.error.is_some() || worktree.agent_state == AgentState::ExitedError {
         ("!", error_style())
     } else if matches!(
@@ -3433,6 +3448,72 @@ mod tests {
     }
 
     #[test]
+    fn worktree_sidebar_keeps_configured_columns_before_prompt_text() {
+        let mut config = test_config();
+        config.worktree_columns = vec!["todo".to_string(), "owner".to_string()];
+        let mut session = test_session("feature", AgentState::Running);
+        session
+            .wt_columns
+            .insert("todo".to_string(), "3".to_string());
+        session
+            .wt_columns
+            .insert("owner".to_string(), "agent".to_string());
+        let sessions = vec![session];
+        let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+        let buffer = render_to_buffer(&model, 160, 30);
+        let row = line_text(&buffer, find_line(&buffer, "●"));
+
+        assert!(row.contains("3"), "got {row:?}");
+        assert!(row.contains("agent"), "got {row:?}");
+    }
+
+    #[test]
+    fn default_branch_row_hides_git_status_marker_but_keeps_wt_columns() {
+        let mut config = test_config();
+        config.worktree_columns = vec!["url".to_string()];
+        let mut session = test_session("main", AgentState::Idle);
+        session.status_label = "clean".to_string();
+        session
+            .wt_columns
+            .insert("url".to_string(), "https://example.test".to_string());
+        let sessions = vec![session];
+        let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+        model.worktrees[0].kind = WorktreeKind::DefaultBranch;
+        let buffer = render_to_buffer(&model, 140, 30);
+        let row = line_text(&buffer, find_line(&buffer, "https://example"));
+
+        assert!(row.contains("https://example"), "got {row:?}");
+        assert!(!row.contains("✓"), "got {row:?}");
+    }
+
+    #[test]
+    fn default_branch_row_preserves_column_alignment() {
+        let mut config = test_config();
+        config.worktree_columns = vec!["url".to_string()];
+        let mut main = test_session("main", AgentState::Idle);
+        main.wt_columns
+            .insert("url".to_string(), "main-url".to_string());
+        let mut feature = test_session("feature", AgentState::Running);
+        feature
+            .wt_columns
+            .insert("url".to_string(), "feature-url".to_string());
+        let sessions = vec![main, feature];
+        let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+        model.worktrees[0].kind = WorktreeKind::DefaultBranch;
+        let buffer = render_to_buffer(&model, 140, 30);
+        let (main_x, main_y) = sidebar_cell_containing(&buffer, "main-url");
+        let (feature_x, feature_y) = sidebar_cell_containing(&buffer, "feature-url");
+
+        assert_eq!(
+            main_x,
+            feature_x,
+            "default row should keep configured columns aligned\nmain: {main_row:?}\nfeature: {feature_row:?}",
+            main_row = line_text(&buffer, main_y),
+            feature_row = line_text(&buffer, feature_y),
+        );
+    }
+
+    #[test]
     fn renders_nerd_font_worktree_icons_when_configured() {
         let mut config = test_config();
         config.icon_style = IconStyle::NerdFont;
@@ -3819,6 +3900,22 @@ mod tests {
         (buffer.area.y..buffer.area.y + buffer.area.height)
             .find(|&y| line_text(buffer, y).contains(expected))
             .unwrap_or_else(|| panic!("expected buffer to contain line fragment {expected:?}"))
+    }
+
+    fn sidebar_cell_containing(buffer: &Buffer, expected: &str) -> (u16, u16) {
+        let expected = expected.chars().collect::<Vec<_>>();
+        for y in buffer.area.y..buffer.area.y + buffer.area.height {
+            for x in buffer.area.x..buffer.area.x + buffer.area.width.min(56) {
+                if expected.iter().enumerate().all(|(offset, expected)| {
+                    let x = x + offset as u16;
+                    x < buffer.area.x + buffer.area.width
+                        && buffer[(x, y)].symbol() == expected.to_string()
+                }) {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("expected sidebar to contain line fragment {expected:?}")
     }
 
     fn test_config() -> Config {
