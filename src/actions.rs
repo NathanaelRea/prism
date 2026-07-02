@@ -171,7 +171,7 @@ impl Tui {
         self.sessions[index].mark_adopted_with_prompt(&initial_prompt);
         if !initial_prompt.trim().is_empty() {
             self.show_loading_dialog(raw, "Create Session", "Starting agent session")?;
-            self.paste_prompt_into_tmux_agent(index, &initial_prompt)?;
+            self.paste_prompt_into_tmux_agent(index, &initial_prompt, false)?;
             self.show_message("pasted initial prompt into agent session")?;
         }
         Ok(true)
@@ -2232,7 +2232,7 @@ impl Tui {
         }
         let prompt = build_review_fix_prompt(&self.sessions[selected], &context.config)?;
         self.submit_action_prompt_to_agent(selected, &context.repo, "review fix", &prompt)?;
-        self.show_message("review-fix prompt sent to agent session")?;
+        self.show_message("review-fix prompt sent to new agent session")?;
         Ok(())
     }
 
@@ -2283,7 +2283,7 @@ impl Tui {
         }
         let prompt = build_ci_failure_prompt(&self.sessions[selected], &context.config)?;
         self.submit_action_prompt_to_agent(selected, &context.repo, "ci fix", &prompt)?;
-        self.show_message("CI-failure prompt sent to agent session")?;
+        self.show_message("CI-failure prompt sent to new agent session")?;
         Ok(())
     }
 
@@ -2429,13 +2429,12 @@ impl Tui {
         }
     }
 
-    fn paste_prompt_into_tmux_agent(&mut self, index: usize, prompt: &str) -> Result<(), String> {
-        #[cfg(test)]
-        if let Some(submissions) = &mut self.prompt_submissions {
-            submissions.push((index, prompt.to_string()));
-            return Ok(());
-        }
-
+    fn paste_prompt_into_tmux_agent(
+        &mut self,
+        index: usize,
+        prompt: &str,
+        force_new_generation: bool,
+    ) -> Result<(), String> {
         let session = self
             .sessions
             .get(index)
@@ -2447,8 +2446,26 @@ impl Tui {
             .ok_or_else(|| "selected session repository no longer exists".to_string())?;
         let repo = managed.repo.clone();
         let config = managed.config.clone();
-        let use_ =
+        let mut use_ =
             crate::agent_session::session_use(&self.repos, &mut self.tmux_generations, &session);
+        if force_new_generation {
+            use_.generation = crate::agent_session::rotate_generation(
+                &self.repos,
+                &mut self.tmux_generations,
+                use_.slot.clone(),
+            );
+            use_.warmup_key = crate::agent_session::AgentSessionWarmupKey::new(
+                use_.slot.clone(),
+                use_.generation,
+            );
+        }
+
+        #[cfg(test)]
+        if let Some(submissions) = &mut self.prompt_submissions {
+            submissions.push((index, prompt.to_string(), use_.generation));
+            return Ok(());
+        }
+
         self.finish_tmux_warmup_for_key(&use_.warmup_key);
         let running =
             crate::agent_session::submit_prompt(&repo, &config, &session, use_.generation, prompt)?;
@@ -2468,7 +2485,7 @@ impl Tui {
         summary: &str,
         prompt: &str,
     ) -> Result<(), String> {
-        self.paste_prompt_into_tmux_agent(index, prompt)
+        self.paste_prompt_into_tmux_agent(index, prompt, true)
             .map_err(|error| format!("send {summary} prompt to agent session: {error}"))?;
         write_task_summary_metadata(repo, &self.sessions[index], summary)?;
         self.sessions[index].mark_adopted_with_summary(summary);
@@ -3105,6 +3122,7 @@ esac
         let submissions = tui.prompt_submissions.take().unwrap();
         assert_eq!(submissions.len(), 1);
         assert_eq!(submissions[0].0, 0);
+        assert_eq!(submissions[0].2, 1);
         let prompt = &submissions[0].1;
         assert!(prompt.contains("fresh top-level comment"));
         assert!(prompt.contains("fresh review body"));
@@ -3176,6 +3194,7 @@ esac
         let submissions = tui.prompt_submissions.take().unwrap();
         assert_eq!(submissions.len(), 1);
         assert_eq!(submissions[0].0, 0);
+        assert_eq!(submissions[0].2, 1);
         assert!(submissions[0].1.contains("Here are CI failures on PR 42."));
         assert!(submissions[0].1.contains("- test"));
         assert_eq!(tui.sessions[0].prompt_summary, "ci fix");
@@ -3473,7 +3492,7 @@ exit 1
         let session = test_session(temp.join("worktree"), "feature");
         let mut tui = Tui::new_single(repo, config, vec![session]);
 
-        tui.paste_prompt_into_tmux_agent(0, "build the thing")
+        tui.paste_prompt_into_tmux_agent(0, "build the thing", false)
             .unwrap();
 
         assert_eq!(fs::read_to_string(&prompt_file).unwrap(), "build the thing");

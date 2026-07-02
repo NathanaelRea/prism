@@ -7,7 +7,7 @@ use crate::observability;
 use crate::process::{run_capture, run_configured_commands, run_status};
 use crate::repo::Repository;
 use crate::session::{
-    clear_hidden_session_marker, clear_hidden_session_marker_with_conn,
+    clear_hidden_session_marker, clear_hidden_session_marker_with_conn, hidden_session_exists,
     remove_agent_state_with_conn, remove_task_metadata_with_conn,
 };
 use crate::util::safe_branch_filename;
@@ -17,6 +17,10 @@ pub(crate) fn create_worktree_session(
     config: &Config,
     branch: &str,
 ) -> Result<(), String> {
+    if hidden_session_exists(repo, branch)? && branch_has_worktree(repo, config, branch)? {
+        clear_hidden_session_marker(repo, branch)?;
+        return Ok(());
+    }
     run_capture(
         Command::new(config.tool(&config.worktree_command)).args(create_worktree_args(
             &repo.root,
@@ -26,6 +30,19 @@ pub(crate) fn create_worktree_session(
     )?;
     clear_hidden_session_marker(repo, branch)?;
     Ok(())
+}
+
+fn branch_has_worktree(repo: &Repository, config: &Config, branch: &str) -> Result<bool, String> {
+    let output = run_capture(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(&repo.root)
+            .args(["worktree", "list", "--porcelain"]),
+    )?;
+    Ok(output.lines().any(|line| {
+        line.strip_prefix("branch refs/heads/")
+            .is_some_and(|current| current == branch)
+    }))
 }
 
 pub(crate) fn move_current_branch_to_worktree(
@@ -342,8 +359,16 @@ mod tests {
         let mut permissions = fs::metadata(&wt).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&wt, permissions).unwrap();
+        let git = temp.join("git");
+        fs::write(&git, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&git, permissions).unwrap();
 
         let mut config = test_config();
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
         config
             .tools
             .insert("wt".to_string(), wt.display().to_string());
@@ -362,6 +387,50 @@ mod tests {
 
         let hidden = count_rows(&repo, "hidden_session", "feature");
         assert_eq!(hidden, 0);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn create_worktree_session_restores_archived_worktree_without_creating() {
+        let temp = unique_temp_dir("prism-create-restores-archived-test");
+        fs::create_dir_all(&temp).unwrap();
+        let git = temp.join("git");
+        fs::write(
+            &git,
+            "#!/bin/sh\nprintf 'worktree /repo/prism.feature\\nHEAD abc\\nbranch refs/heads/feature\\n\\n'\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&git, permissions).unwrap();
+        let wt = temp.join("wt");
+        fs::write(&wt, "#!/bin/sh\nexit 99\n").unwrap();
+        let mut permissions = fs::metadata(&wt).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wt, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        observability::with_writable_db(&repo, |conn| {
+            conn.execute(
+                "insert into hidden_session (branch, hidden_unix_ms) values (?1, ?2)",
+                params!["feature", 123_i64],
+            )
+            .unwrap();
+            Ok(())
+        })
+        .unwrap();
+
+        super::create_worktree_session(&repo, &config, "feature").unwrap();
+
+        assert_eq!(count_rows(&repo, "hidden_session", "feature"), 0);
 
         let _ = fs::remove_dir_all(temp);
     }
