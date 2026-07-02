@@ -22,9 +22,9 @@ use crate::config::Config;
 use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
 use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCacheRepository, apply_pr_details_poll_result,
-    fetch_pr_summary_index, pr_cache_comment_count, pr_cache_pollable, pr_cache_render_signature,
-    pr_details_pollable, pr_summary_or_error, refresh_pr_cache, refresh_pr_details_cache,
-    refresh_pr_summary_index_for_sessions, wait_for_pr_merged,
+    fetch_pr_summary_index, github_remote_configured, pr_cache_comment_count, pr_cache_pollable,
+    pr_cache_render_signature, pr_details_pollable, pr_summary_or_error, refresh_pr_cache,
+    refresh_pr_details_cache, refresh_pr_summary_index_for_sessions, wait_for_pr_merged,
 };
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::lifecycle::{
@@ -44,13 +44,13 @@ use crate::process::{command_exists, run_capture};
 use crate::repo::Repository;
 use crate::review::build_review_fix_prompt;
 use crate::session::{
-    append_runtime_log, archive_worktree_session, discover_sessions, save_agent_state,
-    write_task_metadata, write_task_summary_metadata,
+    append_runtime_log, archive_worktree_session, discover_sessions, list_archived_worktrees,
+    save_agent_state, unarchive_worktree_session, write_task_metadata, write_task_summary_metadata,
 };
 use crate::tmux::TmuxWindow;
 use crate::tui::{
-    DEFAULT_BRANCH_AGENT_MESSAGE, DefaultBranchPollResult, ManagedRepo, OpencodeEventResult,
-    OpencodePollKey, OpencodePollResult, PlanRunResult, PrPollKey, PrPollResult, Tui, WtPollResult,
+    DefaultBranchPollResult, ManagedRepo, OpencodeEventResult, OpencodePollKey, OpencodePollResult,
+    PlanRunResult, PrPollKey, PrPollResult, Tui, WtPollResult,
 };
 
 enum AutoStartupSource {
@@ -679,7 +679,7 @@ impl Tui {
     }
 
     pub(crate) fn poll_pull_requests(&mut self, force: bool) -> bool {
-        let changed = self.drain_pr_poll_results();
+        let mut changed = self.drain_pr_poll_results();
         for repo_index in 0..self.repos.len() {
             let Some(managed) = self.repos.get(repo_index) else {
                 continue;
@@ -695,13 +695,33 @@ impl Tui {
                 .unwrap_or(true);
             let has_pr_branches = self.sessions.iter().any(|session| {
                 session.repo_index == repo_index
+                    && !session.hidden
                     && pr_cache_pollable(&managed.config, &session.branch, &session.pr)
             });
             if has_pr_branches && (force || summaries_due) && !managed.pr_summary_poll_in_flight {
+                let poll_started_at = std::time::Instant::now();
+                if !github_remote_configured(&managed.repo.root, &managed.config) {
+                    if let Some(managed) = self.repos.get_mut(repo_index) {
+                        managed.pr_summary_last_polled = Some(poll_started_at);
+                    }
+                    for session in self
+                        .sessions
+                        .iter_mut()
+                        .filter(|session| session.repo_index == repo_index)
+                    {
+                        if pr_cache_render_signature(&session.pr)
+                            != pr_cache_render_signature(&Default::default())
+                        {
+                            session.pr = Default::default();
+                            session.unseen_comments = false;
+                            changed = true;
+                        }
+                    }
+                    continue;
+                }
                 let path = managed.repo.root.clone();
                 let config = managed.config.clone();
                 let tx = self.pr_poll_tx.clone();
-                let poll_started_at = std::time::Instant::now();
                 if let Some(managed) = self.repos.get_mut(repo_index) {
                     managed.pr_summary_last_polled = Some(poll_started_at);
                     managed.pr_summary_poll_in_flight = true;
@@ -723,7 +743,9 @@ impl Tui {
                 return changed;
             };
             let key = pr_poll_key(session);
-            if pr_details_pollable(&managed.config, &session.branch, &session.pr)
+            if !session.hidden
+                && github_remote_configured(&session.path, &managed.config)
+                && pr_details_pollable(&managed.config, &session.branch, &session.pr)
                 && !self.pr_polls_in_flight.contains(&key)
             {
                 let config = managed.config.clone();
@@ -789,7 +811,7 @@ impl Tui {
                         }
                         Err(error) => {
                             for session in &mut self.sessions {
-                                if session.repo_index == repo_index {
+                                if session.repo_index == repo_index && !session.hidden {
                                     session.pr.error = Some(error.clone());
                                 }
                             }
@@ -980,10 +1002,6 @@ impl Tui {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
-        if self.sessions[context.session_index].is_default_branch(&context.config) {
-            self.show_message(DEFAULT_BRANCH_AGENT_MESSAGE)?;
-            return Ok(());
-        }
         let session = self.sessions[context.session_index].background_job_snapshot();
         let use_ =
             crate::agent_session::session_use(&self.repos, &mut self.tmux_generations, &session);
@@ -2687,7 +2705,7 @@ impl Tui {
         }
         let path = self.sessions[selected].path.clone();
         let path_display = self.sessions[selected].path_display.clone();
-        let warnings = self.sessions[selected].deletion_warnings();
+        let warnings = self.sessions[selected].archive_warnings();
         if !self.confirm_archive_dialog(raw, &branch, &path_display, &warnings)? {
             return Ok(());
         }
@@ -2696,7 +2714,75 @@ impl Tui {
             self.selected_worktree_by_repo.remove(&context.repo.root);
         }
         self.refresh_sessions()?;
-        self.show_message("archived worktree; files and branch were left intact")?;
+        self.show_message("archived worktree; files and branch were kept")?;
+        Ok(())
+    }
+
+    pub(crate) fn unarchive_session(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let context = self
+            .selected_repo_context()
+            .ok_or_else(|| "no selected repository".to_string())?;
+        let archived = list_archived_worktrees(&context.repo)?;
+        if archived.is_empty() {
+            self.show_message("no archived worktrees for selected repo")?;
+            return Ok(());
+        }
+        let keys = archive_choice_keys();
+        let choices = archived
+            .iter()
+            .zip(keys.iter())
+            .map(|(worktree, key)| crate::view::KeyChoice {
+                key: key.to_string(),
+                label: format!(
+                    "{}  {}  {}",
+                    worktree.branch,
+                    worktree.classification.label(),
+                    worktree.worktree_path
+                ),
+            })
+            .collect::<Vec<_>>();
+        let Some(answer) = self.prompt_choice_dialog(
+            raw,
+            crate::view::ChoiceList {
+                title: "Unarchive Worktree".to_string(),
+                choices,
+            },
+        )?
+        else {
+            return Ok(());
+        };
+        let Some(index) = keys.iter().position(|key| *key == answer) else {
+            return Ok(());
+        };
+        let Some(worktree) = archived.get(index) else {
+            return Ok(());
+        };
+        self.show_loading_dialog(
+            raw,
+            "Unarchive Worktree",
+            &format!("Restoring {}", worktree.branch),
+        )?;
+        create_worktree_session(&context.repo, &context.config, &worktree.branch)?;
+        unarchive_worktree_session(&context.repo, &worktree.branch)?;
+        self.refresh_sessions()?;
+        self.start_tmux_agent_warmup();
+        self.start_wt_column_poll();
+        if let Some(index) = self
+            .sessions
+            .iter()
+            .position(|session| session.matches_branch(context.repo_index, &worktree.branch))
+        {
+            if !self.visible_session_indices().contains(&index) {
+                self.worktree_filter.clear();
+            }
+            self.select_worktree(index);
+            self.focused_panel = crate::tui::PanelFocus::Worktrees;
+            self.main_focused = false;
+        }
+        self.show_message("unarchived worktree")?;
         Ok(())
     }
 
@@ -2760,6 +2846,13 @@ fn ensure_user_config_file(path: &Path) -> Result<(), String> {
     }
     let text = crate::config::user_config_template();
     fs::write(path, text).map_err(|error| format!("create user config file: {error}"))
+}
+
+fn archive_choice_keys() -> Vec<String> {
+    ('1'..='9')
+        .chain('a'..='z')
+        .map(|key| key.to_string())
+        .collect()
 }
 
 fn open_url_in_browser(url: &str) -> Result<(), String> {

@@ -71,6 +71,13 @@ pub struct Session {
     pub unseen_comments: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ArchivedWorktree {
+    pub branch: String,
+    pub worktree_path: String,
+    pub classification: SessionClassification,
+}
+
 impl Session {
     pub(crate) fn is_default_branch(&self, config: &Config) -> bool {
         config.is_default_branch(&self.branch)
@@ -110,7 +117,7 @@ impl Session {
         self.agent_state = previous.agent_state;
         self.opencode_status = previous.opencode_status;
         self.wt_columns = previous.wt_columns;
-        if self.is_task_branch(config) {
+        if self.is_task_branch(config) && !self.hidden {
             self.pr = previous.pr;
             self.unseen_comments = previous.unseen_comments;
         } else {
@@ -177,6 +184,34 @@ impl Session {
         }
         warnings
     }
+
+    pub(crate) fn archive_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        if status_count(&self.status_label, "dirty").is_some() {
+            warnings.push("dirty worktree: uncommitted changes stay on disk".to_string());
+        }
+        if status_count(&self.status_label, "ahead").is_some() {
+            warnings.push("branch is ahead of upstream: unpushed commits stay local".to_string());
+        }
+        if status_count(&self.status_label, "behind").is_some() {
+            warnings.push("branch is behind upstream".to_string());
+        }
+        if !self.adopted {
+            warnings.push("session was not created by Prism".to_string());
+        }
+        if self.is_detached() {
+            warnings.push("detached worktree: no local branch is associated".to_string());
+        }
+        if self.agent_state == AgentState::Running {
+            warnings.push("agent is still running".to_string());
+        }
+        if let Some(summary) = &self.pr.summary
+            && !summary.merged
+        {
+            warnings.push(format!("open PR #{} still exists", summary.number));
+        }
+        warnings
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -203,20 +238,25 @@ pub fn discover_sessions(repo: &Repository, config: &Config) -> Result<Vec<Sessi
                 let branch = current_branch
                     .take()
                     .unwrap_or_else(|| "(detached)".to_string());
-                if hidden.contains_key(&branch) {
-                    observability::emit(observability::EventInput {
-                        level: LogLevel::Debug,
-                        target: "session",
-                        action: "skip_archived_worktree",
-                        operation_id: None,
-                        parent_operation_id: None,
-                        branch: Some(branch),
-                        session: Some(path.display().to_string()),
-                        message: format!("skipping archived worktree {}", path.display()),
-                        data_json: None,
-                    });
-                } else if path.exists() {
-                    sessions.push(build_session(repo, path, branch, config));
+                if path.exists() {
+                    let mut session = build_session(repo, path, branch, config);
+                    session.hidden = hidden.contains_key(&session.branch);
+                    if session.hidden {
+                        session.pr = PrCache::default();
+                        session.unseen_comments = false;
+                        observability::emit(observability::EventInput {
+                            level: LogLevel::Debug,
+                            target: "session",
+                            action: "unfocused_worktree",
+                            operation_id: None,
+                            parent_operation_id: None,
+                            branch: Some(session.branch.clone()),
+                            session: Some(session.path.display().to_string()),
+                            message: format!("worktree is unfocused {}", session.path.display()),
+                            data_json: None,
+                        });
+                    }
+                    sessions.push(session);
                 } else {
                     observability::emit(observability::EventInput {
                         level: LogLevel::Warn,
@@ -256,8 +296,12 @@ pub(crate) fn session_discovery_order(
     a: &Session,
     b: &Session,
 ) -> std::cmp::Ordering {
-    b.is_default_branch(config)
-        .cmp(&a.is_default_branch(config))
+    a.hidden
+        .cmp(&b.hidden)
+        .then_with(|| {
+            b.is_default_branch(config)
+                .cmp(&a.is_default_branch(config))
+        })
         .then_with(|| {
             a.classification
                 .sort_rank()
@@ -477,6 +521,71 @@ pub(crate) fn clear_hidden_session_marker(repo: &Repository, branch: &str) -> Re
     observability::with_writable_db(repo, |conn| {
         clear_hidden_session_marker_with_conn(conn, branch)
     })
+}
+
+pub(crate) fn unarchive_worktree_session(repo: &Repository, branch: &str) -> Result<(), String> {
+    observability::with_writable_db(repo, |conn| {
+        conn.execute_batch("begin transaction")
+            .map_err(|error| format!("begin unarchive transaction: {error}"))?;
+        let result = (|| -> Result<(), String> {
+            clear_hidden_session_marker_with_conn(conn, branch)?;
+            conn.execute(
+                "delete from archived_worktree where branch = ?1",
+                params![branch],
+            )
+            .map_err(|error| format!("remove archived worktree metadata: {error}"))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => conn
+                .execute_batch("commit")
+                .map_err(|error| format!("commit unarchive transaction: {error}")),
+            Err(error) => {
+                let _ = conn.execute_batch("rollback");
+                Err(error)
+            }
+        }
+    })
+}
+
+pub(crate) fn list_archived_worktrees(repo: &Repository) -> Result<Vec<ArchivedWorktree>, String> {
+    let path = observability::db_path(repo);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("open {} read-only: {error}", path.display()))?;
+    let table_count = conn
+        .query_row(
+            "select count(*) from sqlite_master where type = 'table' and name = 'archived_worktree'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("inspect archived worktree table: {error}"))?;
+    if table_count == 0 {
+        return Ok(Vec::new());
+    }
+    let mut statement = conn
+        .prepare(
+            "select branch, worktree_path, classification
+             from archived_worktree
+             order by archived_unix_ms desc, branch asc",
+        )
+        .map_err(|error| format!("prepare archived worktree query: {error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(ArchivedWorktree {
+                branch: row.get(0)?,
+                worktree_path: row.get(1)?,
+                classification: SessionClassification::parse(&row.get::<_, String>(2)?),
+            })
+        })
+        .map_err(|error| format!("read archived worktrees: {error}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("read archived worktree row: {error}"))
 }
 
 pub(crate) fn hidden_session_exists(repo: &Repository, branch: &str) -> Result<bool, String> {
@@ -738,6 +847,19 @@ exit 0
     }
 
     #[test]
+    fn hidden_sessions_sort_below_focused_sessions() {
+        let config = test_config();
+        let focused = test_session("feature-a", "/repo/a");
+        let mut hidden = test_session("feature-b", "/repo/b");
+        hidden.hidden = true;
+
+        assert_eq!(
+            session_discovery_order(&config, &focused, &hidden),
+            std::cmp::Ordering::Less
+        );
+    }
+
+    #[test]
     fn archived_worktree_metadata_records_restore_details_and_hides_session() {
         let temp = unique_temp_dir("prism-archive-worktree-test");
         let repo_path = temp.join("repo");
@@ -764,6 +886,30 @@ exit 0
         assert_eq!(row.1, worktree.display().to_string());
         assert_eq!(row.2, "planning");
         assert!(load_hidden_sessions(&repo).contains_key("feature"));
+        let archived = list_archived_worktrees(&repo).unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].branch, "feature");
+        assert_eq!(archived[0].worktree_path, worktree.display().to_string());
+        assert_eq!(archived[0].classification, SessionClassification::Planning);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn unarchive_worktree_session_clears_hidden_and_archived_markers() {
+        let temp = unique_temp_dir("prism-unarchive-worktree-test");
+        let repo_path = temp.join("repo");
+        let worktree = temp.join("worktree");
+        fs::create_dir_all(&repo_path).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        let repo = Repository::with_config_dir_for_test(repo_path, temp.join("config"));
+        let session = test_session("feature", &worktree.display().to_string());
+        archive_worktree_session(&repo, &session).unwrap();
+
+        unarchive_worktree_session(&repo, "feature").unwrap();
+
+        assert!(list_archived_worktrees(&repo).unwrap().is_empty());
+        assert!(!load_hidden_sessions(&repo).contains_key("feature"));
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -830,6 +976,21 @@ exit 0
     }
 
     #[test]
+    fn refresh_state_clears_pr_state_for_hidden_branches() {
+        let config = test_config();
+        let mut fresh = test_session("feature", "/repo/feature");
+        fresh.hidden = true;
+        let mut previous = test_session("feature", "/repo/feature");
+        previous.pr.error = Some("stale".to_string());
+        previous.unseen_comments = true;
+
+        fresh.preserve_refresh_state_from(previous, &config);
+
+        assert!(fresh.pr.error.is_none());
+        assert!(!fresh.unseen_comments);
+    }
+
+    #[test]
     fn mark_adopted_with_prompt_updates_local_metadata_facts() {
         let mut session = test_session("feature", "/repo/feature");
 
@@ -869,6 +1030,27 @@ exit 0
                 .iter()
                 .any(|warning| warning.contains("agent is still running"))
         );
+    }
+
+    #[test]
+    fn archive_warnings_describe_non_destructive_hiding() {
+        let mut session = test_session("feature", "/repo/feature");
+        session.status_label = "dirty 1 ahead 2".to_string();
+
+        let warnings = session.archive_warnings();
+
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("stay on disk"))
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("stay local"))
+        );
+        assert!(!warnings.iter().any(|warning| warning.contains("deleted")));
+        assert!(!warnings.iter().any(|warning| warning.contains("lost")));
     }
 
     fn test_session(branch: &str, path: &str) -> Session {

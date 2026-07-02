@@ -658,7 +658,7 @@ pub(crate) fn refresh_pr_summary_index_for_sessions(
     let refreshed = timestamp_label();
     for session in sessions
         .iter_mut()
-        .filter(|session| session.repo_index == repo_index)
+        .filter(|session| session.repo_index == repo_index && !session.hidden)
     {
         if session
             .pr
@@ -705,6 +705,19 @@ pub(crate) fn pr_cache_pollable(config: &Config, branch: &str, cache: &PrCache) 
 
 pub(crate) fn pr_details_pollable(config: &Config, branch: &str, cache: &PrCache) -> bool {
     pr_cache_pollable(config, branch, cache) && pr_details_due(cache)
+}
+
+pub(crate) fn github_remote_configured(path: &std::path::Path, config: &Config) -> bool {
+    run_output_allow_failure(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["remote", "get-url", "origin"]),
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .and_then(|output| parse_github_remote(output.stdout.trim()))
+    .is_some()
 }
 
 pub(crate) fn pr_summary_or_error(cache: &PrCache) -> Result<Option<PrSummary>, String> {

@@ -84,9 +84,6 @@ pub struct Tui {
 
 const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
 const ARCHIVED_PLAN_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 30);
-pub(crate) const DEFAULT_BRANCH_AGENT_MESSAGE: &str =
-    "default branch does not have an agent session";
-
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedRepo {
     pub repo: Repository,
@@ -752,6 +749,15 @@ impl Tui {
                         self.show_error("archive failed", &error)?;
                     }
                 }
+                Key::Unarchive => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.focused_panel == PanelFocus::Status {
+                        self.show_message("focus repos or worktrees to unarchive a worktree")?;
+                    } else if let Err(error) = self.unarchive_session(&mut runtime) {
+                        self.show_error("unarchive failed", &error)?;
+                    }
+                }
                 Key::DeletePermanent => {
                     self.clear_leader_hint();
                     pending_g = false;
@@ -839,14 +845,7 @@ impl Tui {
     }
 
     fn enter_agent_mode(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
-        let Some(context) = self.selected_worktree_context() else {
-            return Ok(());
-        };
-        if context
-            .config
-            .is_default_branch(&self.sessions[context.session_index].branch)
-        {
-            self.show_message(DEFAULT_BRANCH_AGENT_MESSAGE)?;
+        if self.selected_worktree_context().is_none() {
             return Ok(());
         }
         runtime.suspend()?;
@@ -908,6 +907,7 @@ impl Tui {
             "/            search/filter focused panel",
             "?            show keybindings; / filters this dialog",
             "D            archive non-default worktree/session",
+            "U            choose an archived worktree to unarchive",
             "X            permanently delete non-default worktree/session",
             "j/k, up/down move selection",
             "g g / G      top / bottom",
@@ -1356,19 +1356,12 @@ impl Tui {
                 }
             }
             PanelFocus::Worktrees => {
-                let Some(context) = self.selected_worktree_context() else {
+                if self.selected_worktree_context().is_none() {
                     return OpenTmuxSessionTarget::Blocked(
                         "selected repository has no visible worktrees",
                     );
-                };
-                if context
-                    .config
-                    .is_default_branch(&self.sessions[context.session_index].branch)
-                {
-                    OpenTmuxSessionTarget::Blocked(DEFAULT_BRANCH_AGENT_MESSAGE)
-                } else {
-                    OpenTmuxSessionTarget::WorktreeAgent
                 }
+                OpenTmuxSessionTarget::WorktreeAgent
             }
         }
     }
@@ -1471,6 +1464,7 @@ impl Tui {
             .enumerate()
             .filter_map(|(index, session)| {
                 (session.repo_index == self.current_repo
+                    && !session.hidden
                     && (filter.is_empty()
                         || session.branch.to_ascii_lowercase().contains(&filter)
                         || session
@@ -2496,6 +2490,7 @@ impl Tui {
                     ("p", "plan actions"),
                     ("0", "focus main"),
                     ("enter", "terminal"),
+                    ("U", "unarchive"),
                     ("space", "agent if valid"),
                 ],
             )),
@@ -2555,9 +2550,7 @@ mod tests {
     use crate::session::Session;
     use crate::view::{RepoMainView, WorktreeMainView};
 
-    use super::{
-        DEFAULT_BRANCH_AGENT_MESSAGE, ManagedRepo, OpenTmuxSessionTarget, PanelFocus, Tui,
-    };
+    use super::{ManagedRepo, OpenTmuxSessionTarget, PanelFocus, Tui};
 
     #[test]
     fn tui_defaults_to_repos_panel_focus() {
@@ -2596,6 +2589,16 @@ mod tests {
         tui.restore_selected_worktree_for_repo();
 
         assert_eq!(tui.selected_worktree_index(), Some(1));
+    }
+
+    #[test]
+    fn hidden_sessions_are_not_visible_in_normal_worktree_list() {
+        let mut tui = test_tui();
+        tui.sessions[1].hidden = true;
+        tui.selected = 1;
+
+        assert!(!tui.visible_session_indices().contains(&1));
+        assert_eq!(tui.selected_worktree_index(), None);
     }
 
     #[test]
@@ -2716,14 +2719,14 @@ mod tests {
     }
 
     #[test]
-    fn open_tmux_session_target_blocks_default_branch_worktree() {
+    fn open_tmux_session_target_opens_default_branch_worktree_agent() {
         let mut tui = test_tui();
         tui.focused_panel = PanelFocus::Worktrees;
         tui.select_worktree(0);
 
         assert_eq!(
             tui.open_tmux_session_target(),
-            OpenTmuxSessionTarget::Blocked(DEFAULT_BRANCH_AGENT_MESSAGE)
+            OpenTmuxSessionTarget::WorktreeAgent
         );
     }
 

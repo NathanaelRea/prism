@@ -71,6 +71,7 @@ impl KeyInput {
             KeyCode::Char('e') if plain_char(event) => Key::EditConfig,
             KeyCode::Char('E') if plain_char(event) => Key::EditUserConfig,
             KeyCode::Char('D') if plain_char(event) => Key::Delete,
+            KeyCode::Char('U') if plain_char(event) => Key::Unarchive,
             KeyCode::Char('?') if plain_char(event) => Key::Help,
             KeyCode::Char('/') if plain_char(event) => Key::Search,
             _ => Key::Other,
@@ -176,6 +177,7 @@ pub enum Key {
     Create,
     AbortOpencode,
     Delete,
+    Unarchive,
     DeletePermanent,
     EditConfig,
     EditUserConfig,
@@ -345,6 +347,10 @@ mod tests {
     fn key_input_handles_cleanup_keys() {
         let mut input = KeyInput::default();
         assert_eq!(map(&mut input, shift_key(KeyCode::Char('D'))), Key::Delete);
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('U'))),
+            Key::Unarchive
+        );
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('X'))),
             Key::DeletePermanent

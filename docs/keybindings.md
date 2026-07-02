@@ -40,6 +40,7 @@ Prism uses a lazygit-style panel model.
 - `/` filters the focused Repos or Worktrees panel.
 - `?` opens the in-app keybinding dialog.
 - `D` archives the selected non-default worktree/session, hiding it from normal navigation while leaving files and branch intact.
+- `U` opens a picker of archived worktrees for the selected repository and restores the chosen one.
 - `X` permanently deletes the selected non-default worktree/session after explicit confirmation.
 - `r` refreshes cached repository, worktree, PR, and agent state.
 - `q` or `Ctrl-C` quits.
