@@ -782,6 +782,13 @@ impl Tui {
                         self.show_error("edit config failed", &error)?;
                     }
                 }
+                Key::EditUserConfig => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if let Err(error) = self.edit_user_config(&mut runtime) {
+                        self.show_error("edit user config failed", &error)?;
+                    }
+                }
                 Key::Search => {
                     self.clear_leader_hint();
                     pending_g = false;
@@ -896,6 +903,7 @@ impl Tui {
             "c            create worktree session in selected repo",
             "x            worktrees: abort selected OpenCode session",
             "e            edit selected repository config, then reload",
+            "E            edit user config, then reload",
             "C            repos: edit visible worktree columns in repo config",
             "/            search/filter focused panel",
             "?            show keybindings; / filters this dialog",

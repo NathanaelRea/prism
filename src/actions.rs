@@ -285,6 +285,37 @@ impl Tui {
         Ok(())
     }
 
+    pub(crate) fn edit_user_config(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let path = self
+            .repos
+            .get(self.current_repo)
+            .map(|repo| repo.config.user_path.clone())
+            .ok_or_else(|| "no selected repository".to_string())?;
+        ensure_user_config_file(&path)?;
+        let editor =
+            editor_command().ok_or_else(|| "no editor found; set VISUAL or EDITOR".to_string())?;
+        raw.suspend()?;
+        let result = Command::new(&editor).arg(&path).status();
+        let resume_result = raw.resume();
+        resume_result?;
+        let status = result.map_err(|error| format!("{editor}: {error}"))?;
+        if !status.success() {
+            return Err(format!("{editor} exited with {status}"));
+        }
+        for repo in &mut self.repos {
+            repo.config = Config::load(&repo.repo);
+        }
+        self.sync_selected_repo_context();
+        self.refresh_sessions()?;
+        self.start_tmux_agent_warmup();
+        self.start_wt_column_poll();
+        self.show_message("user config reloaded")?;
+        Ok(())
+    }
+
     pub(crate) fn edit_worktree_columns(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
@@ -2704,6 +2735,17 @@ fn ensure_repo_config_file(path: &Path, include_worktree_columns: bool) -> Resul
         text.push_str("\n[worktrees]\ncolumns = [\"url\", \"vars.localdev\"]\n");
     }
     fs::write(path, text).map_err(|error| format!("create config file: {error}"))
+}
+
+fn ensure_user_config_file(path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("create config dir: {error}"))?;
+    }
+    if path.exists() {
+        return Ok(());
+    }
+    let text = "# Prism user config\n# Applies to all repositories unless overridden by repository config.\n\n[ui]\nicon_style = \"unicode\" # or \"nerd-font\"\n";
+    fs::write(path, text).map_err(|error| format!("create user config file: {error}"))
 }
 
 fn open_url_in_browser(url: &str) -> Result<(), String> {

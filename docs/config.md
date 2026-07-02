@@ -2,6 +2,8 @@
 
 Tracked repositories live in `~/.config/prism/repos.toml`.
 
+Global Prism settings live in `~/.config/prism/config.toml`. Press `E` in the TUI to edit this file and reload configuration.
+
 Each repository entry has a path and may have a digit key. Digit keys are used as `Space <digit>` shortcuts in the TUI.
 
 ```toml
@@ -10,7 +12,7 @@ path = "/path/to/repo"
 key = "1"
 ```
 
-Repository-specific Prism config lives under the repository config path shown by `e` from the Repos panel. Common settings include `default_base`, layout width, worktree columns, merge method, OpenCode runtime settings, tools, and prompt templates.
+Repository-specific Prism config lives under the repository config path opened by `e`. Common settings include `default_base`, layout width, worktree columns, merge method, OpenCode runtime settings, tools, and prompt templates.
 
 Per-repository Prism state also lives under that repository config directory, not inside the project repository. The state database is named `prism.db` and stores worktree session metadata, OpenCode runtime records, Plan Mode and Auto Flow runs, PR cache data, and observability records.
 

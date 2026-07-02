@@ -35,6 +35,7 @@ Prism uses a lazygit-style panel model.
 - `x` aborts the selected OpenCode session from the Worktrees panel.
 - `x` also aborts the selected Plan phase from the active Plan dashboard, or accepts `all` when prompted to abort all running phases.
 - `e` edits the selected Prism repository config and reloads after save.
+- `E` edits the Prism user config and reloads after save.
 - `C` opens the repository config at `[worktrees] columns` from the Repos panel, then reloads after save.
 - `/` filters the focused Repos or Worktrees panel.
 - `?` opens the in-app keybinding dialog.

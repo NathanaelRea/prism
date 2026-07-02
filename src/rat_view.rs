@@ -319,7 +319,7 @@ fn status_dashboard_lines(model: &view::FrameModel<'_>) -> Vec<Line<'static>> {
         heading_line("Navigation"),
         Line::from("1 status  2 repos  3 worktrees"),
         Line::from("Tab cycles focus; repos h/l switches views"),
-        Line::from("e edits selected repository config"),
+        Line::from("e edits repo config; E edits user config"),
         Line::from(""),
         heading_line("Documentation"),
         Line::from("GitHub repository  https://github.com/NathanaelRea/prism"),
