@@ -23,6 +23,9 @@ use crate::{
     view,
 };
 
+const MIN_MAIN_WIDTH: u16 = 20;
+const PROMPT_INPUT_DISPLAY_WIDTH: u16 = 40;
+
 pub(crate) fn render(frame: &mut Frame<'_>, model: &view::FrameModel<'_>) {
     let area = frame.area();
     let vertical = Layout::default()
@@ -32,8 +35,8 @@ pub(crate) fn render(frame: &mut Frame<'_>, model: &view::FrameModel<'_>) {
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(sidebar_width(area.width)),
-            Constraint::Min(20),
+            Constraint::Length(sidebar_width(area.width, model.config.layout.sidebar_width)),
+            Constraint::Min(MIN_MAIN_WIDTH),
         ])
         .split(vertical[0]);
 
@@ -143,15 +146,30 @@ fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<
             muted_style(),
         )))]
     } else {
-        let mut rows = vec![ListItem::new(Line::from(vec![
-            Span::styled(format!("{:<12} ", "branch"), muted_style()),
-            Span::styled("A ", muted_style()),
-            Span::styled("P ", muted_style()),
-            Span::styled("G ", muted_style()),
-            Span::styled("C ", muted_style()),
-            Span::styled(format!("{:<5} ", "@"), muted_style()),
-            Span::styled("!", muted_style()),
-        ]))];
+        let configured_column_widths = configured_worktree_column_widths(
+            area.width.saturating_sub(2) as usize,
+            &model.config.worktree_columns,
+        );
+        let mut rows = vec![ListItem::new(Line::from(
+            vec![
+                Span::styled(format!("{:<12} ", "branch"), muted_style()),
+                Span::styled("K ", muted_style()),
+                Span::styled("A ", muted_style()),
+                Span::styled("P ", muted_style()),
+                Span::styled("G ", muted_style()),
+                Span::styled("C ", muted_style()),
+                Span::styled(format!("{:<5} ", "@"), muted_style()),
+                Span::styled("!", muted_style()),
+            ]
+            .into_iter()
+            .chain(configured_column_widths.iter().map(|(key, width)| {
+                Span::styled(
+                    format!("  {:<width$}", truncate_column(key, *width)),
+                    muted_style(),
+                )
+            }))
+            .collect::<Vec<_>>(),
+        ))];
         rows.extend(model.worktrees.iter().map(|worktree| {
             let (pr_label, pr_style) = worktree_pr_column(worktree);
             let (git_label, git_style) = worktree_git_column(worktree);
@@ -160,6 +178,10 @@ fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<
             let (error_label, error_style) = worktree_error_column(worktree);
             let mut spans = vec![
                 Span::raw(format!("{:<12} ", truncate_column(&worktree.branch, 12))),
+                Span::styled(
+                    format!("{} ", classification_marker(worktree.classification)),
+                    classification_style(worktree.classification),
+                ),
                 Span::styled(
                     format!("{} ", agent_icon(worktree.agent_state)),
                     agent_style(worktree.agent_state),
@@ -182,11 +204,18 @@ fn render_worktrees(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<
                     auto_style(status),
                 ));
             }
-            for (key, value) in &worktree.wt_columns {
-                if !value.is_empty() {
-                    spans.push(Span::styled(format!("  {key}:{value}"), muted_style()));
-                }
-            }
+            spans.extend(configured_column_widths.iter().map(|(key, width)| {
+                let value = worktree
+                    .wt_columns
+                    .get(*key)
+                    .filter(|value| !value.is_empty())
+                    .map(String::as_str)
+                    .unwrap_or("·");
+                Span::styled(
+                    format!("  {:<width$}", truncate_column(value, *width)),
+                    muted_style(),
+                )
+            }));
             ListItem::new(Line::from(spans)).style(if worktree.selected {
                 selected_style(model.focus == PanelFocus::Worktrees && !model.main_focused)
             } else {
@@ -374,6 +403,8 @@ fn worktree_detail_lines(model: &view::FrameModel<'_>) -> Vec<Line<'static>> {
                 agent_label(session.agent_state),
                 agent_style(session.agent_state),
             ),
+            Span::styled("  kind ", muted_style()),
+            Span::raw(session.classification.label().to_string()),
             Span::styled("  adopted ", muted_style()),
             Span::raw(if session.adopted { "yes" } else { "no" }),
         ]),
@@ -385,7 +416,40 @@ fn worktree_detail_lines(model: &view::FrameModel<'_>) -> Vec<Line<'static>> {
         lines.extend(opencode_status_lines(status));
     }
     lines.push(Line::from(""));
+    lines.extend(wt_column_detail_lines(session));
+    lines.push(Line::from(""));
     lines.extend(pr_panel_lines(model.config, Some(session)));
+    lines
+}
+
+fn classification_marker(classification: crate::session::SessionClassification) -> &'static str {
+    match classification {
+        crate::session::SessionClassification::Work => " ",
+        crate::session::SessionClassification::Planning => "p",
+        crate::session::SessionClassification::Exploration => "e",
+    }
+}
+
+fn classification_style(classification: crate::session::SessionClassification) -> Style {
+    match classification {
+        crate::session::SessionClassification::Work => muted_style(),
+        crate::session::SessionClassification::Planning => Style::default().fg(Color::Cyan),
+        crate::session::SessionClassification::Exploration => Style::default().fg(Color::Blue),
+    }
+}
+
+fn wt_column_detail_lines(session: &Session) -> Vec<Line<'static>> {
+    let mut lines = vec![heading_line("wt columns")];
+    if session.wt_columns.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "not loaded yet, or wt reported no column values",
+            muted_style(),
+        )));
+        return lines;
+    }
+    for (key, value) in &session.wt_columns {
+        lines.push(dynamic_labelled_line(key.clone(), value.clone()));
+    }
     lines
 }
 
@@ -643,10 +707,10 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>
     let actions = match model.focus {
         PanelFocus::Status => "1/2/3 sidebars  0 main  Tab next  P plan  A auto  ? help  q quit",
         PanelFocus::Repos => {
-            "j/k select  0 main  Enter open  r refresh  R manage  / search  q quit"
+            "j/k select  0 main  Enter worktrees  C columns  R manage  / search  q quit"
         }
         PanelFocus::Worktrees => {
-            "j/k select  0 main  Enter tmux  Space g git  c create  D delete  q quit"
+            "j/k select  0 main  Enter tmux  Space g git  c create  D archive  X delete  q quit"
         }
     };
     let mut spans = vec![
@@ -692,37 +756,93 @@ fn render_leader_hint(frame: &mut Frame<'_>, area: Rect, hint: &view::LeaderHint
 }
 
 fn render_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &view::DialogModel) {
-    let lines = dialog_lines(dialog);
-    let content_width = lines
-        .iter()
-        .map(|line| line.width() as u16)
-        .max()
-        .unwrap_or(0)
-        .max(dialog_title(dialog).chars().count() as u16)
-        .saturating_add(4);
-    let width = content_width
-        .min(area.width.saturating_sub(2))
-        .max(24.min(area.width));
-    let height = (lines.len() as u16)
-        .saturating_add(2)
-        .min(area.height.saturating_sub(2))
-        .max(5.min(area.height));
-    let popup = centered_rect(width, height, area);
+    let geometry = dialog_geometry(area, dialog);
+    let lines = padded_dialog_lines(dialog, geometry.inner.width as usize);
     let block = panel_block(
         Line::from(Span::styled(dialog_title(dialog), title_style(true))),
         false,
     );
-    let inner = block.inner(popup);
-    frame.render_widget(Clear, popup);
+    frame.render_widget(Clear, geometry.popup);
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
             .wrap(Wrap { trim: false }),
-        popup,
+        geometry.popup,
     );
     if let view::DialogModel::Prompt { prompt, input, .. } = dialog {
-        set_prompt_cursor(frame, inner, prompt, input);
+        set_prompt_cursor(frame, geometry.inner, prompt, input);
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DialogGeometry {
+    popup: Rect,
+    inner: Rect,
+}
+
+fn dialog_geometry(area: Rect, dialog: &view::DialogModel) -> DialogGeometry {
+    let title_width = dialog_title(dialog).chars().count() as u16;
+    let raw_lines = dialog_lines(dialog);
+    let content_width = match dialog {
+        view::DialogModel::Prompt { prompt, .. } => {
+            prompt_dialog_content_width(prompt, title_width)
+        }
+        _ => raw_lines
+            .iter()
+            .map(|line| line.width() as u16)
+            .max()
+            .unwrap_or(0)
+            .max(title_width),
+    };
+    let width = content_width
+        .saturating_add(4)
+        .min(area.width.saturating_sub(2))
+        .max(24.min(area.width));
+    let height = (raw_lines.len() as u16)
+        .saturating_add(2)
+        .min(area.height.saturating_sub(2))
+        .max(5.min(area.height));
+    let popup = centered_rect(width, height, area);
+    let inner = Rect {
+        x: popup.x.saturating_add(1),
+        y: popup.y.saturating_add(1),
+        width: popup.width.saturating_sub(2),
+        height: popup.height.saturating_sub(2),
+    };
+    DialogGeometry { popup, inner }
+}
+
+fn prompt_dialog_content_width(prompt: &str, title_width: u16) -> u16 {
+    let prompt_lines = prompt.split('\n').collect::<Vec<_>>();
+    let last_prefix_width = prompt_lines
+        .last()
+        .copied()
+        .unwrap_or(prompt)
+        .chars()
+        .count() as u16;
+    prompt_lines
+        .iter()
+        .map(|line| line.chars().count() as u16)
+        .max()
+        .unwrap_or(0)
+        .max(last_prefix_width.saturating_add(PROMPT_INPUT_DISPLAY_WIDTH))
+        .max("Enter to continue, Esc to cancel".chars().count() as u16)
+        .max(title_width)
+}
+
+fn padded_dialog_lines(dialog: &view::DialogModel, width: usize) -> Vec<Line<'static>> {
+    dialog_lines(dialog)
+        .into_iter()
+        .map(|line| pad_line(line, width))
+        .collect()
+}
+
+fn pad_line(mut line: Line<'static>, width: usize) -> Line<'static> {
+    let line_width = line.width();
+    if line_width < width {
+        line.spans.push(Span::raw(" ".repeat(width - line_width)));
+    }
+    line
 }
 
 fn set_prompt_cursor(frame: &mut Frame<'_>, area: Rect, prompt: &str, input: &str) {
@@ -731,21 +851,24 @@ fn set_prompt_cursor(frame: &mut Frame<'_>, area: Rect, prompt: &str, input: &st
     }
     let prompt_prefix_lines = prompt.split('\n').collect::<Vec<_>>();
     let prompt_prefix = prompt_prefix_lines.last().copied().unwrap_or(prompt);
-    let prompt_line = Line::from(vec![
-        Span::raw(prompt_prefix.to_string()),
-        Span::raw(input.to_string()),
-    ]);
-    let width = prompt_line.width() as u16;
-    let line_offset = width / area.width;
-    let x_offset = width % area.width;
+    let prompt_width = prompt_prefix.chars().count() as u16;
+    let input_width = visible_prompt_input_width(area.width, prompt_width);
+    let input_cursor = input.chars().count().min(input_width as usize) as u16;
+    let x_offset = prompt_width
+        .saturating_add(input_cursor)
+        .min(area.width.saturating_sub(1));
     let prompt_y = prompt_prefix_lines.len().saturating_sub(1) as u16;
     frame.set_cursor_position((
-        area.x + x_offset.min(area.width.saturating_sub(1)),
-        area.y
-            + prompt_y
-                .saturating_add(line_offset)
-                .min(area.height.saturating_sub(1)),
+        area.x + x_offset,
+        area.y + prompt_y.min(area.height.saturating_sub(1)),
     ));
+}
+
+fn visible_prompt_input_width(area_width: u16, prompt_width: u16) -> u16 {
+    area_width
+        .saturating_sub(prompt_width)
+        .saturating_sub(1)
+        .min(PROMPT_INPUT_DISPLAY_WIDTH)
 }
 
 fn dialog_title(dialog: &view::DialogModel) -> String {
@@ -868,11 +991,20 @@ fn prompt_dialog_lines(prompt: &str, input: &str) -> Vec<Line<'static>> {
     for (index, line) in prompt_lines.iter().enumerate() {
         let mut spans = styled_prompt_spans(line);
         if index + 1 == prompt_lines.len() {
-            spans.push(Span::raw(input.to_string()));
+            spans.push(Span::raw(visible_prompt_input(
+                input,
+                PROMPT_INPUT_DISPLAY_WIDTH,
+            )));
         }
         lines.push(Line::from(spans));
     }
     lines
+}
+
+fn visible_prompt_input(input: &str, max_width: u16) -> String {
+    let len = input.chars().count();
+    let skip = len.saturating_sub(max_width as usize);
+    input.chars().skip(skip).collect()
 }
 
 fn styled_prompt_spans(text: &str) -> Vec<Span<'static>> {
@@ -2139,6 +2271,13 @@ fn labelled_line(label: &'static str, value: String) -> Line<'static> {
     ])
 }
 
+fn dynamic_labelled_line(label: String, value: String) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label} "), muted_style()),
+        Span::raw(value),
+    ])
+}
+
 fn heading_line(label: &'static str) -> Line<'static> {
     Line::from(Span::styled(label, title_style(true)))
 }
@@ -2486,14 +2625,40 @@ fn todo_summary(todos: &[crate::opencode::OpencodeTodo]) -> String {
     parts.join("  ")
 }
 
-fn sidebar_width(cols: u16) -> u16 {
-    if cols >= 160 {
+fn sidebar_width(cols: u16, configured_width: Option<u16>) -> u16 {
+    let width = if let Some(width) = configured_width {
+        width
+    } else if cols >= 160 {
         72
     } else if cols >= 120 {
         56
     } else {
         cols.saturating_mul(2).saturating_div(5).clamp(20, 42)
+    };
+    width.min(cols.saturating_sub(MIN_MAIN_WIDTH))
+}
+
+fn configured_worktree_column_widths(
+    inner_width: usize,
+    configured_columns: &[String],
+) -> Vec<(&str, usize)> {
+    if configured_columns.is_empty() {
+        return Vec::new();
     }
+    let base_width = 28;
+    let available = inner_width.saturating_sub(base_width);
+    if available < 6 {
+        return Vec::new();
+    }
+    let separator_width = configured_columns.len() * 2;
+    let value_width = available.saturating_sub(separator_width) / configured_columns.len();
+    if value_width < 4 {
+        return Vec::new();
+    }
+    configured_columns
+        .iter()
+        .map(|column| (column.as_str(), value_width.clamp(4, 18)))
+        .collect()
 }
 
 fn panel_block(title: Line<'static>, highlighted: bool) -> Block<'static> {
@@ -2915,12 +3080,12 @@ mod tests {
         let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
         let buffer = render_to_buffer(&model, 120, 30);
 
-        assert_region_contains(&buffer, 0..44, 0..30, "[1] Status");
-        assert_region_contains(&buffer, 0..44, 0..30, "[2] Repos");
-        assert_region_contains(&buffer, 0..44, 0..30, "[3] Worktrees");
+        assert_region_contains(&buffer, 0..56, 0..30, "[1] Status");
+        assert_region_contains(&buffer, 0..56, 0..30, "[2] Repos");
+        assert_region_contains(&buffer, 0..56, 0..30, "[3] Worktrees");
         assert_cell_style(&buffer, 0, 20, highlight_style().bg(Color::Reset));
-        assert_region_contains(&buffer, 44..120, 0..29, "Main");
-        assert_region_contains(&buffer, 0..44, 0..30, "feature");
+        assert_region_contains(&buffer, 56..120, 0..29, "Main");
+        assert_region_contains(&buffer, 0..56, 0..30, "feature");
         assert!(!line_text(&buffer, 29).contains("normal"));
     }
 
@@ -2957,7 +3122,7 @@ mod tests {
 
         let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
         let buffer = render_to_buffer(&model, 120, 30);
-        let row = find_line(&buffer, "feature      ●");
+        let row = find_line(&buffer, "●");
 
         assert_cell_style(
             &buffer,
@@ -2972,7 +3137,8 @@ mod tests {
 
     #[test]
     fn renders_worktree_sidebar_metadata() {
-        let config = test_config();
+        let mut config = test_config();
+        config.worktree_columns = vec!["todo".to_string(), "owner".to_string()];
         let mut session = test_session("feature", AgentState::Running);
         session.status_label = "dirty 2 ahead 1".to_string();
         session.pr.summary = Some(test_pr_summary());
@@ -2994,6 +3160,9 @@ mod tests {
         session
             .wt_columns
             .insert("todo".to_string(), "3".to_string());
+        session
+            .wt_columns
+            .insert("owner".to_string(), "agent".to_string());
         session.unseen_comments = true;
         let sessions = vec![session];
         let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
@@ -3005,7 +3174,46 @@ mod tests {
         assert!(buffer.contains("✗"));
         assert!(buffer.contains("✕"));
         assert!(buffer.contains("1/1"));
-        assert!(buffer.contains("todo:3"));
+        assert!(buffer.contains("todo"));
+        assert!(buffer.contains("owner"));
+        assert!(buffer.contains("agent"));
+    }
+
+    #[test]
+    fn worktree_sidebar_renders_missing_configured_columns_as_placeholders() {
+        let mut config = test_config();
+        config.worktree_columns = vec!["todo".to_string(), "owner".to_string()];
+        let mut session = test_session("feature", AgentState::Running);
+        session
+            .wt_columns
+            .insert("todo".to_string(), "12345678901234567890".to_string());
+        let sessions = vec![session];
+        let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+        let buffer = render_to_string(&model, 160, 30);
+
+        assert!(buffer.contains("12345678901234567~"));
+        assert!(buffer.contains("·"));
+    }
+
+    #[test]
+    fn worktree_detail_lists_all_loaded_wt_columns() {
+        let config = test_config();
+        let mut session = test_session("feature", AgentState::Running);
+        session
+            .wt_columns
+            .insert("ci.status".to_string(), "success".to_string());
+        session
+            .wt_columns
+            .insert("vars.localdev".to_string(), "on".to_string());
+        let sessions = vec![session];
+        let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+        let buffer = render_to_string(&model, 140, 30);
+
+        assert!(buffer.contains("wt columns"));
+        assert!(buffer.contains("ci.status"));
+        assert!(buffer.contains("success"));
+        assert!(buffer.contains("vars.localdev"));
+        assert!(buffer.contains("on"));
     }
 
     #[test]
@@ -3020,9 +3228,30 @@ mod tests {
         let repo_buffer = render_to_buffer(&repo_model, 120, 30);
         let worktree_buffer = render_to_buffer(&worktree_model, 120, 30);
 
-        assert_region_contains(&status_buffer, 44..120, 0..29, "Documentation");
-        assert_region_contains(&repo_buffer, 44..120, 0..29, "view github");
-        assert_region_contains(&worktree_buffer, 44..120, 0..29, "prompt implement feature");
+        assert_region_contains(&status_buffer, 56..120, 0..29, "Documentation");
+        assert_region_contains(&repo_buffer, 56..120, 0..29, "view github");
+        assert_region_contains(&worktree_buffer, 56..120, 0..29, "prompt implement feature");
+    }
+
+    #[test]
+    fn sidebar_width_preserves_defaults_and_clamps_configured_width() {
+        assert_eq!(sidebar_width(48, None), 20);
+        assert_eq!(sidebar_width(120, None), 56);
+        assert_eq!(sidebar_width(160, None), 72);
+        assert_eq!(sidebar_width(120, Some(64)), 64);
+        assert_eq!(sidebar_width(70, Some(64)), 50);
+    }
+
+    #[test]
+    fn renders_configured_sidebar_width() {
+        let mut config = test_config();
+        config.layout.sidebar_width = Some(64);
+        let sessions = vec![test_session("feature", AgentState::Running)];
+        let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+        let buffer = render_to_buffer(&model, 120, 30);
+
+        assert_region_contains(&buffer, 0..64, 0..30, "[3] Worktrees");
+        assert_region_contains(&buffer, 64..120, 0..29, "Main");
     }
 
     #[test]
@@ -3137,12 +3366,33 @@ mod tests {
         let backend = render_to_backend(&model, 80, 20);
 
         assert!(backend.cursor_visible());
-        assert_eq!(backend.cursor_position(), Position::new(34, 8));
+        assert_eq!(backend.cursor_position(), Position::new(26, 8));
 
         model.dialog = None;
         let backend = render_to_backend(&model, 80, 20);
 
         assert!(!backend.cursor_visible());
+    }
+
+    #[test]
+    fn prompt_dialog_geometry_is_stable_and_tail_truncates_input() {
+        let area = Rect::new(0, 0, 80, 20);
+        let short = DialogModel::Prompt {
+            title: "Search Repositories".to_string(),
+            prompt: "Filter: ".to_string(),
+            input: String::new(),
+        };
+        let long = DialogModel::Prompt {
+            title: "Search Repositories".to_string(),
+            prompt: "Filter: ".to_string(),
+            input: "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ".to_string(),
+        };
+
+        assert_eq!(dialog_geometry(area, &short), dialog_geometry(area, &long));
+        let visible = dialog_lines(&long)[0].to_string();
+
+        assert!(visible.contains("ghijklmnopqrstuvwxyz0123456789ABCDEFGHIJ"));
+        assert!(!visible.contains("abcdef"));
     }
 
     #[test]
@@ -3278,6 +3528,7 @@ mod tests {
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             auto: crate::config::AutoConfig::default(),
+            layout: crate::config::LayoutConfig::default(),
             checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools: BTreeMap::new(),
@@ -3298,6 +3549,7 @@ mod tests {
             path_display: format!("/repo/{branch}"),
             branch: branch.to_string(),
             prompt_summary: "implement feature".to_string(),
+            classification: crate::session::SessionClassification::Work,
             adopted: false,
             hidden: false,
             status_label: "clean".to_string(),
@@ -3367,6 +3619,7 @@ mod tests {
                     auto_status: None,
                     unseen_comments: session.unseen_comments,
                     prompt_summary: session.prompt_summary.clone(),
+                    classification: session.classification,
                     selected: index == 0,
                 })
                 .collect(),

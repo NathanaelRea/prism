@@ -34,6 +34,11 @@ pub struct AutoConfig {
     pub ci_poll_interval_seconds: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayoutConfig {
+    pub sidebar_width: Option<u16>,
+}
+
 impl Default for AutoConfig {
     fn default() -> Self {
         Self {
@@ -122,6 +127,7 @@ pub struct Config {
     pub escape_key: EscapeKey,
     pub merge_method: MergeMethod,
     pub auto: AutoConfig,
+    pub layout: LayoutConfig,
     pub checks: Checks,
     pub worktree_columns: Vec<String>,
     pub tools: BTreeMap<String, String>,
@@ -147,6 +153,7 @@ struct RawConfig {
     merge_method: Option<String>,
     checks: Option<RawChecks>,
     auto: Option<RawAutoConfig>,
+    layout: Option<RawLayoutConfig>,
     worktrees: Option<RawWorktrees>,
     tools: Option<BTreeMap<String, String>>,
     agents: Option<BTreeMap<String, RawAgentConfig>>,
@@ -172,6 +179,11 @@ struct RawAutoConfig {
     ci_wait_enabled: Option<bool>,
     ci_max_wait_seconds: Option<u64>,
     ci_poll_interval_seconds: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawLayoutConfig {
+    sidebar_width: Option<u16>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -225,6 +237,7 @@ impl Config {
             escape_key: EscapeKey::EscEsc,
             merge_method: MergeMethod::Squash,
             auto: AutoConfig::default(),
+            layout: LayoutConfig::default(),
             checks: Checks::default(),
             worktree_columns: vec!["url".to_string()],
             tools,
@@ -326,6 +339,11 @@ impl Config {
                 self.auto.ci_poll_interval_seconds = seconds.max(1);
             }
         }
+        if let Some(layout) = raw.layout
+            && let Some(width) = layout.sidebar_width
+        {
+            self.layout.sidebar_width = Some(width.clamp(20, 120));
+        }
         if let Some(worktrees) = raw.worktrees
             && let Some(values) = worktrees.columns
         {
@@ -409,6 +427,14 @@ pub fn print_config(repo: &Repository, config: &Config) {
     println!("opencode_plan_plugin = {}", config.opencode_plan_plugin);
     println!("escape_key = {}", config.escape_key.label());
     println!("merge_method = {}", config.merge_method.label());
+    println!(
+        "layout.sidebar_width = {}",
+        config
+            .layout
+            .sidebar_width
+            .map(|width| width.to_string())
+            .unwrap_or_default()
+    );
     println!("auto.merge = {}", config.auto.merge);
     println!(
         "auto.cleanup_after_merge = {}",
@@ -726,6 +752,7 @@ mod tests {
         assert_eq!(config.default_agent, "opencode");
         assert_eq!(config.default_base.as_deref(), Some("main"));
         assert_eq!(config.merge_method, MergeMethod::Squash);
+        assert_eq!(config.layout.sidebar_width, None);
         assert_eq!(config.opencode_port_base, 41_000);
         assert_eq!(config.opencode_port_span, 1_000);
         assert!(!config.opencode_shutdown_owned_servers);
@@ -826,6 +853,9 @@ default_base = "release/main"
 review_packet_dir = ".agent/review \"packets\""
 escape_key = "ctrl-space"
 
+[layout]
+sidebar_width = 64
+
 [checks]
 pre_pr = ["cargo test", "printf \"done\""] # trailing comment
 
@@ -851,12 +881,37 @@ review = "fix\nreview"
         assert_eq!(config.default_base.as_deref(), Some("release/main"));
         assert_eq!(config.review_packet_dir, ".agent/review \"packets\"");
         assert_eq!(config.escape_key, EscapeKey::CtrlSpace);
+        assert_eq!(config.layout.sidebar_width, Some(64));
         assert_eq!(config.checks.pre_pr, vec!["cargo test", "printf \"done\""]);
         assert_eq!(config.worktree_columns, vec!["url", "ci.status"]);
         assert_eq!(config.tool("gh"), "/opt/tools/gh");
         assert_eq!(config.prompt_template("review"), Some("fix\nreview"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn layout_sidebar_width_is_bounded() {
+        let mut config = Config::defaults(
+            PathBuf::from("/tmp/user.toml"),
+            PathBuf::from("/tmp/prism-repo-config.toml"),
+        );
+
+        config.apply_raw_config(RawConfig {
+            layout: Some(RawLayoutConfig {
+                sidebar_width: Some(4),
+            }),
+            ..RawConfig::default()
+        });
+        assert_eq!(config.layout.sidebar_width, Some(20));
+
+        config.apply_raw_config(RawConfig {
+            layout: Some(RawLayoutConfig {
+                sidebar_width: Some(999),
+            }),
+            ..RawConfig::default()
+        });
+        assert_eq!(config.layout.sidebar_width, Some(120));
     }
 
     #[test]
