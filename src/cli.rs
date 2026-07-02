@@ -13,6 +13,7 @@ use crate::plan_run::PlanRunMode;
 use crate::repo::Repository;
 use crate::tui::ManagedRepo;
 use crate::{config, plan, session, setup, tui, workspace};
+use std::process::{Command as ProcessCommand, Stdio};
 
 pub fn run() -> Result<(), String> {
     let args = Args::parse(std::env::args_os().skip(1))?;
@@ -476,10 +477,36 @@ fn print_startup_phases() {
 
 fn run_db_command(command: DbCommand, repo: &Repository) -> Result<(), String> {
     match command {
+        DbCommand::Shell => open_interactive_db(repo),
         DbCommand::Path => {
             println!("{}", observability::db_path(repo).display());
             Ok(())
         }
         DbCommand::Query(query) => observability::run_readonly_query(repo, &query),
+    }
+}
+
+fn open_interactive_db(repo: &Repository) -> Result<(), String> {
+    observability::with_writable_db(repo, |_| Ok(()))?;
+
+    let path = observability::db_path(repo);
+    let status = ProcessCommand::new("sqlite3")
+        .arg(&path)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                "sqlite3 not found; install sqlite3".to_string()
+            } else {
+                format!("launch sqlite3 for {}: {error}", path.display())
+            }
+        })?;
+
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("sqlite3 exited with status {status}"))
     }
 }
