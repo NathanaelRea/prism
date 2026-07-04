@@ -2598,12 +2598,16 @@ impl Tui {
             let target_repo =
                 if let Ok(upstream) = github_remote_repo(&path, &context.config, "upstream") {
                     let origin = github_remote_repo(&path, &context.config, "origin")?;
-                    let Some(choice) =
-                        self.prompt_choice_dialog(raw, pr_target_choice_list(&origin, &upstream))?
-                    else {
-                        return Ok(());
-                    };
-                    pr_target_repo_for_choice(&choice, &origin, &upstream)
+                    if !should_prompt_pr_target_choice(&origin, &upstream) {
+                        None
+                    } else {
+                        let Some(choice) = self
+                            .prompt_choice_dialog(raw, pr_target_choice_list(&origin, &upstream))?
+                        else {
+                            return Ok(());
+                        };
+                        pr_target_repo_for_choice(&choice, &origin, &upstream)
+                    }
                 } else {
                     None
                 };
@@ -2921,6 +2925,10 @@ fn pr_target_choice_list(origin: &str, upstream: &str) -> crate::view::ChoiceLis
     }
 }
 
+fn should_prompt_pr_target_choice(origin: &str, upstream: &str) -> bool {
+    origin != upstream
+}
+
 fn pr_target_repo_for_choice(choice: &str, origin: &str, upstream: &str) -> Option<String> {
     match choice {
         "u" => Some(upstream.to_string()),
@@ -3159,7 +3167,8 @@ mod tests {
 
     use super::{
         archived_picker_overflow_message, discover_wt_columns, pr_target_choice_list,
-        pr_target_repo_for_choice, run_browser_opener, status_label_with_behind,
+        pr_target_repo_for_choice, run_browser_opener, should_prompt_pr_target_choice,
+        status_label_with_behind,
     };
     use std::collections::BTreeMap;
     use std::fs;
@@ -3255,6 +3264,8 @@ exit 0
             Some("me/repo".to_string())
         );
         assert_eq!(pr_target_repo_for_choice("x", "me/repo", "org/repo"), None);
+        assert!(should_prompt_pr_target_choice("me/repo", "org/repo"));
+        assert!(!should_prompt_pr_target_choice("me/repo", "me/repo"));
     }
 
     #[test]
