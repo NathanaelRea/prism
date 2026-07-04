@@ -114,11 +114,16 @@ pub(crate) fn create_pull_request(
     branch: &str,
     path: &Path,
     body: &str,
+    target_repo: Option<&str>,
     cache: &mut PrCache,
 ) -> Result<(), String> {
     run_capture(
         Command::new(config.tool("gh"))
-            .args(create_pr_args(config.default_base.as_deref(), body))
+            .args(create_pr_args(
+                config.default_base.as_deref(),
+                body,
+                target_repo,
+            ))
             .current_dir(path),
     )?;
     refresh_branch_pr_cache(repo, config, branch, path, cache, true);
@@ -211,7 +216,11 @@ fn move_branch_to_worktree_args(repo_root: &Path, branch: &str) -> Vec<String> {
     ]
 }
 
-fn create_pr_args(default_base: Option<&str>, body: &str) -> Vec<String> {
+fn create_pr_args(
+    default_base: Option<&str>,
+    body: &str,
+    target_repo: Option<&str>,
+) -> Vec<String> {
     let mut args = vec![
         "pr".to_string(),
         "create".to_string(),
@@ -219,6 +228,10 @@ fn create_pr_args(default_base: Option<&str>, body: &str) -> Vec<String> {
         "--body".to_string(),
         body.to_string(),
     ];
+    if let Some(repo) = target_repo.map(str::trim).filter(|repo| !repo.is_empty()) {
+        args.push("--repo".to_string());
+        args.push(repo.to_string());
+    }
     if let Some(base) = default_base.map(str::trim).filter(|base| !base.is_empty()) {
         args.push("--base".to_string());
         args.push(base.to_string());
@@ -474,12 +487,26 @@ mod tests {
     #[test]
     fn create_pr_uses_fill_with_explicit_empty_body_and_default_base_when_configured() {
         assert_eq!(
-            create_pr_args(Some("main"), ""),
+            create_pr_args(Some("main"), "", None),
             vec!["pr", "create", "--fill", "--body", "", "--base", "main"]
         );
         assert_eq!(
-            create_pr_args(None, "manual description"),
+            create_pr_args(None, "manual description", None),
             vec!["pr", "create", "--fill", "--body", "manual description"]
+        );
+        assert_eq!(
+            create_pr_args(Some("main"), "manual description", Some("owner/repo")),
+            vec![
+                "pr",
+                "create",
+                "--fill",
+                "--body",
+                "manual description",
+                "--repo",
+                "owner/repo",
+                "--base",
+                "main"
+            ]
         );
     }
 

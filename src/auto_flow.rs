@@ -2651,6 +2651,7 @@ fn execute_push_pr_step(
             &persisted.run.branch,
             &persisted.run.worktree_path,
             &body,
+            None,
             &mut cache,
         )?;
     }

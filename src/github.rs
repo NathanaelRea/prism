@@ -720,6 +720,15 @@ pub(crate) fn github_remote_configured(path: &std::path::Path, config: &Config) 
     .is_some()
 }
 
+pub(crate) fn github_remote_repo(
+    path: &std::path::Path,
+    config: &Config,
+    remote_name: &str,
+) -> Result<String, String> {
+    let (owner, name) = github_remote_owner_repo(path, config, remote_name)?;
+    Ok(format!("{owner}/{name}"))
+}
+
 pub(crate) fn pr_summary_or_error(cache: &PrCache) -> Result<Option<PrSummary>, String> {
     if let Some(summary) = &cache.summary {
         Ok(Some(summary.clone()))
@@ -893,15 +902,22 @@ query($owner: String!, $name: String!) {
 "#;
 
 fn github_owner_repo(path: &std::path::Path, config: &Config) -> Result<(String, String), String> {
-    let remote = run_capture(
-        Command::new(config.tool("git"))
-            .arg("-C")
-            .arg(path)
-            .args(["remote", "get-url", "origin"]),
-    )?;
+    github_remote_owner_repo(path, config, "origin")
+}
+
+fn github_remote_owner_repo(
+    path: &std::path::Path,
+    config: &Config,
+    remote_name: &str,
+) -> Result<(String, String), String> {
+    let remote = run_capture(Command::new(config.tool("git")).arg("-C").arg(path).args([
+        "remote",
+        "get-url",
+        remote_name,
+    ]))?;
     parse_github_remote(remote.trim()).ok_or_else(|| {
         format!(
-            "origin remote is not a GitHub repository: {}",
+            "{remote_name} remote is not a GitHub repository: {}",
             remote.trim()
         )
     })
