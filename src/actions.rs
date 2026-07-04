@@ -22,9 +22,10 @@ use crate::config::Config;
 use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
 use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCacheRepository, apply_pr_details_poll_result,
-    fetch_pr_summary_index, github_remote_configured, pr_cache_comment_count, pr_cache_pollable,
-    pr_cache_render_signature, pr_details_pollable, pr_summary_or_error, refresh_pr_cache,
-    refresh_pr_details_cache, refresh_pr_summary_index_for_sessions, wait_for_pr_merged,
+    fetch_pr_summary_index, github_remote_configured, github_remote_repo, pr_cache_comment_count,
+    pr_cache_pollable, pr_cache_render_signature, pr_details_pollable, pr_summary_or_error,
+    refresh_pr_cache, refresh_pr_details_cache, refresh_pr_summary_index_for_sessions,
+    wait_for_pr_merged,
 };
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::lifecycle::{
@@ -2594,6 +2595,22 @@ impl Tui {
             && !self.sessions[selected].is_default_branch(&context.config)
         {
             run_pre_pr_checks(&context.config, &path)?;
+            let target_repo =
+                if let Ok(upstream) = github_remote_repo(&path, &context.config, "upstream") {
+                    let origin = github_remote_repo(&path, &context.config, "origin")?;
+                    if !should_prompt_pr_target_choice(&origin, &upstream) {
+                        None
+                    } else {
+                        let Some(choice) = self
+                            .prompt_choice_dialog(raw, pr_target_choice_list(&origin, &upstream))?
+                        else {
+                            return Ok(());
+                        };
+                        pr_target_repo_for_choice(&choice, &origin, &upstream)
+                    }
+                } else {
+                    None
+                };
             let Some(pr_body) = self.prompt_pr_description(raw)? else {
                 return Ok(());
             };
@@ -2605,6 +2622,7 @@ impl Tui {
                 &session.branch,
                 &session.path,
                 &pr_body,
+                target_repo.as_deref(),
                 &mut session.pr,
             )?;
             self.show_message("push complete; pull request created")?;
@@ -2891,6 +2909,34 @@ fn archived_picker_overflow_message(archived_count: usize, key_count: usize) -> 
     })
 }
 
+fn pr_target_choice_list(origin: &str, upstream: &str) -> crate::view::ChoiceList {
+    crate::view::ChoiceList {
+        title: "Create Pull Request Target".to_string(),
+        choices: vec![
+            crate::view::KeyChoice {
+                key: "u".to_string(),
+                label: format!("upstream ({upstream})"),
+            },
+            crate::view::KeyChoice {
+                key: "o".to_string(),
+                label: format!("origin ({origin})"),
+            },
+        ],
+    }
+}
+
+fn should_prompt_pr_target_choice(origin: &str, upstream: &str) -> bool {
+    origin != upstream
+}
+
+fn pr_target_repo_for_choice(choice: &str, origin: &str, upstream: &str) -> Option<String> {
+    match choice {
+        "u" => Some(upstream.to_string()),
+        "o" => Some(origin.to_string()),
+        _ => None,
+    }
+}
+
 fn open_url_in_browser(url: &str) -> Result<(), String> {
     run_browser_opener(&browser_opener_candidates(), url).map(|_| ())
 }
@@ -3120,7 +3166,8 @@ mod tests {
     use crate::tui::Tui;
 
     use super::{
-        archived_picker_overflow_message, discover_wt_columns, run_browser_opener,
+        archived_picker_overflow_message, discover_wt_columns, pr_target_choice_list,
+        pr_target_repo_for_choice, run_browser_opener, should_prompt_pr_target_choice,
         status_label_with_behind,
     };
     use std::collections::BTreeMap;
@@ -3196,6 +3243,29 @@ exit 0
         assert!(!columns.contains_key("path"));
         assert!(!columns.contains_key("empty"));
         assert!(!columns.contains_key("labels"));
+    }
+
+    #[test]
+    fn pr_target_choices_offer_upstream_and_origin() {
+        let choices = pr_target_choice_list("me/repo", "org/repo");
+
+        assert_eq!(choices.title, "Create Pull Request Target");
+        assert_eq!(choices.choices.len(), 2);
+        assert_eq!(choices.choices[0].key, "u");
+        assert_eq!(choices.choices[0].label, "upstream (org/repo)");
+        assert_eq!(choices.choices[1].key, "o");
+        assert_eq!(choices.choices[1].label, "origin (me/repo)");
+        assert_eq!(
+            pr_target_repo_for_choice("u", "me/repo", "org/repo"),
+            Some("org/repo".to_string())
+        );
+        assert_eq!(
+            pr_target_repo_for_choice("o", "me/repo", "org/repo"),
+            Some("me/repo".to_string())
+        );
+        assert_eq!(pr_target_repo_for_choice("x", "me/repo", "org/repo"), None);
+        assert!(should_prompt_pr_target_choice("me/repo", "org/repo"));
+        assert!(!should_prompt_pr_target_choice("me/repo", "me/repo"));
     }
 
     #[test]
