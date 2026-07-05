@@ -73,12 +73,18 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>
             muted_style(),
         )))]
     } else {
+        let label_width = model
+            .status
+            .iter()
+            .map(|row| row.label.chars().count())
+            .max()
+            .unwrap_or(0);
         model
             .status
             .iter()
             .map(|row| {
                 ListItem::new(Line::from(vec![
-                    Span::styled(format!("{} ", row.label), muted_style()),
+                    Span::styled(format!("{:<label_width$} ", row.label), muted_style()),
                     Span::styled(
                         row.value.clone(),
                         if row.attention {
@@ -107,14 +113,23 @@ fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &view::FrameModel<'_>)
             muted_style(),
         )))]
     } else {
+        let label_width = model
+            .repos
+            .iter()
+            .map(|repo| repo.label.chars().count())
+            .max()
+            .unwrap_or(0);
         model
             .repos
             .iter()
             .map(|repo| {
-                let key = repo.key.map(|key| format!("{key} ")).unwrap_or_default();
+                let key = repo
+                    .key
+                    .map(|key| format!("{key} "))
+                    .unwrap_or_else(|| "  ".to_string());
                 let line = Line::from(vec![
                     Span::styled(key, muted_style()),
-                    Span::raw(repo.label.clone()),
+                    Span::raw(format!("{:<label_width$}", repo.label)),
                     Span::styled(format!("  {}", repo.health), health_style(&repo.health)),
                 ]);
                 let focused = model.focus == PanelFocus::Repos && !model.main_focused;
@@ -3437,6 +3452,62 @@ mod tests {
     }
 
     #[test]
+    fn status_and_repo_sidebar_columns_align() {
+        let config = test_config();
+        let sessions = vec![test_session("feature", AgentState::Running)];
+        let mut model = test_model(&config, &sessions, PanelFocus::Repos, None, None);
+        model.status = vec![
+            StatusRow {
+                label: "short".to_string(),
+                value: "7".to_string(),
+                attention: false,
+            },
+            StatusRow {
+                label: "long label".to_string(),
+                value: "13".to_string(),
+                attention: false,
+            },
+        ];
+        model.repos = vec![
+            RepoRow {
+                label: "alpha".to_string(),
+                root: "/repo/alpha".to_string(),
+                key: None,
+                health: "ok".to_string(),
+                selected: true,
+            },
+            RepoRow {
+                label: "long-repo".to_string(),
+                root: "/repo/long".to_string(),
+                key: Some('2'),
+                health: "CI!".to_string(),
+                selected: false,
+            },
+        ];
+        let buffer = render_to_buffer(&model, 120, 30);
+        let short_status_y = find_line(&buffer, "short");
+        let long_status_y = find_line(&buffer, "long label");
+        let alpha_y = find_line(&buffer, "alpha");
+        let long_repo_y = find_line(&buffer, "long-repo");
+
+        assert_eq!(
+            line_column(&buffer, short_status_y, "7"),
+            line_column(&buffer, long_status_y, "13"),
+            "status values should start in the same column",
+        );
+        assert_eq!(
+            line_column(&buffer, alpha_y, "alpha"),
+            line_column(&buffer, long_repo_y, "long-repo"),
+            "repo labels should not shift when the key column is empty",
+        );
+        assert_eq!(
+            line_column(&buffer, alpha_y, "ok"),
+            line_column(&buffer, long_repo_y, "CI!"),
+            "repo health values should start in the same column",
+        );
+    }
+
+    #[test]
     fn renders_worktree_sidebar_metadata() {
         let mut config = test_config();
         config.worktree_columns = vec!["todo".to_string(), "owner".to_string()];
@@ -3958,6 +4029,12 @@ mod tests {
         (buffer.area.y..buffer.area.y + buffer.area.height)
             .find(|&y| line_text(buffer, y).contains(expected))
             .unwrap_or_else(|| panic!("expected buffer to contain line fragment {expected:?}"))
+    }
+
+    fn line_column(buffer: &Buffer, y: u16, expected: &str) -> usize {
+        line_text(buffer, y)
+            .find(expected)
+            .unwrap_or_else(|| panic!("expected line {y} to contain {expected:?}"))
     }
 
     fn sidebar_cell_containing(buffer: &Buffer, expected: &str) -> (u16, u16) {
