@@ -1,17 +1,25 @@
 use std::path::Path;
 use std::process::Command;
+use std::sync::LazyLock;
 
 use crate::config::{Config, MergeMethod};
 use crate::github::{PrCache, refresh_pr_cache};
 use crate::observability;
 use crate::opencode;
-use crate::process::{run_capture, run_configured_commands, run_status};
+use crate::process::{
+    ProcessOutput, run_capture, run_configured_commands, run_output, run_output_allow_failure,
+    run_status, run_status_inherited,
+};
 use crate::repo::Repository;
 use crate::session::{
     clear_hidden_session_marker, clear_hidden_session_marker_with_conn, hidden_session_exists,
     remove_agent_state_with_conn, remove_task_metadata_with_conn,
 };
 use crate::util::safe_branch_filename;
+
+static WORKTRUNK_APPROVAL_FAILURE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"(?is)needs\s+approval.*cannot\s+prompt.*non[- ]interactive").unwrap()
+});
 
 pub(crate) fn create_worktree_session(
     repo: &Repository,
@@ -22,15 +30,73 @@ pub(crate) fn create_worktree_session(
         clear_hidden_session_marker(repo, branch)?;
         return Ok(());
     }
-    run_capture(
-        Command::new(config.tool(&config.worktree_command)).args(create_worktree_args(
-            &repo.root,
-            branch,
-            config.default_base.as_deref(),
-        )),
-    )?;
+    let mut command = Command::new(config.tool(&config.worktree_command));
+    command.args(create_worktree_args(
+        &repo.root,
+        branch,
+        config.default_base.as_deref(),
+    ));
+    let command_display = observability::command_display(&command);
+    let output = run_output(&mut command)?;
+    if !output.status.success() {
+        return Err(worktree_command_failure_message(
+            &command_display,
+            &output,
+            repo,
+            config,
+        ));
+    }
     clear_hidden_session_marker(repo, branch)?;
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorktrunkApprovalStatus {
+    NotWorktrunk,
+    Approved,
+    Pending,
+}
+
+pub(crate) fn check_worktrunk_approval_status(
+    repo: &Repository,
+    config: &Config,
+) -> Result<WorktrunkApprovalStatus, String> {
+    if config.worktree_command != "wt" {
+        return Ok(WorktrunkApprovalStatus::NotWorktrunk);
+    }
+    let output = run_output_allow_failure(
+        Command::new(config.tool(&config.worktree_command))
+            .arg("-C")
+            .arg(&repo.root)
+            .args(["config", "approvals", "add"]),
+    )?;
+    if output.status.success() {
+        return Ok(WorktrunkApprovalStatus::Approved);
+    }
+    if is_worktrunk_approval_failure(&process_output_text(&output)) {
+        return Ok(WorktrunkApprovalStatus::Pending);
+    }
+    Err(format!(
+        "{}: {}",
+        worktrunk_approval_command_display(repo, config),
+        process_failure_message(&output)
+    ))
+}
+
+pub(crate) fn run_worktrunk_approval_prompt(
+    repo: &Repository,
+    config: &Config,
+) -> Result<(), String> {
+    run_status_inherited(
+        Command::new(config.tool(&config.worktree_command))
+            .arg("-C")
+            .arg(&repo.root)
+            .args(["config", "approvals", "add"]),
+    )
+}
+
+pub(crate) fn is_worktrunk_approval_failure(output: &str) -> bool {
+    WORKTRUNK_APPROVAL_FAILURE_RE.is_match(output)
 }
 
 fn branch_has_worktree(repo: &Repository, config: &Config, branch: &str) -> Result<bool, String> {
@@ -195,6 +261,71 @@ fn create_worktree_args(repo_root: &Path, branch: &str, default_base: Option<&st
     args
 }
 
+fn worktree_command_failure_message(
+    command_display: &str,
+    output: &ProcessOutput,
+    repo: &Repository,
+    config: &Config,
+) -> String {
+    let message = format!("{command_display}: {}", process_failure_message(output));
+    if is_worktrunk_approval_failure(&process_output_text(output)) {
+        format!("{message}\n\n{}", worktrunk_approval_hint(repo, config))
+    } else {
+        message
+    }
+}
+
+fn worktrunk_approval_hint(repo: &Repository, config: &Config) -> String {
+    format!(
+        "This repo has Worktrunk project commands that must be approved before Prism can create worktrees.\n\nRun:\n{}",
+        worktrunk_approval_command_display(repo, config)
+    )
+}
+
+fn worktrunk_approval_command_display(repo: &Repository, config: &Config) -> String {
+    format!(
+        "{} -C {} config approvals add",
+        shell_quote(&config.tool(&config.worktree_command)),
+        shell_quote(&repo.root.display().to_string())
+    )
+}
+
+fn process_failure_message(output: &ProcessOutput) -> String {
+    let stderr = first_non_empty_line(&output.stderr);
+    let stdout = first_non_empty_line(&output.stdout);
+    if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("exited with {}", output.status)
+    }
+}
+
+fn process_output_text(output: &ProcessOutput) -> String {
+    format!("{}\n{}", output.stdout, output.stderr)
+}
+
+fn first_non_empty_line(output: &str) -> String {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn shell_quote(value: &str) -> String {
+    if !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':'))
+    {
+        return value.to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
 fn switch_checkout_args(repo_root: &Path, branch: &str) -> Vec<String> {
     vec![
         "-C".to_string(),
@@ -339,8 +470,9 @@ fn remove_if_exists(path: std::path::PathBuf, label: &str) -> Result<(), String>
 #[cfg(test)]
 mod tests {
     use super::{
-        create_pr_args, create_worktree_args, merge_pr_args, move_branch_to_worktree_args,
-        remove_worktree, switch_checkout_args,
+        WorktrunkApprovalStatus, check_worktrunk_approval_status, create_pr_args,
+        create_worktree_args, is_worktrunk_approval_failure, merge_pr_args,
+        move_branch_to_worktree_args, remove_worktree, switch_checkout_args,
     };
     use crate::config::{Checks, Config, EscapeKey, MergeMethod};
     use crate::observability;
@@ -458,6 +590,67 @@ mod tests {
         super::create_worktree_session(&repo, &config, "feature").unwrap();
 
         assert_eq!(count_rows(&repo, "hidden_session", "feature"), 0);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn detects_worktrunk_approval_failure() {
+        let output = "mock-repo needs approval before running commands:\ncannot prompt for approval in non-interactive environment";
+
+        assert!(is_worktrunk_approval_failure(output));
+        assert!(!is_worktrunk_approval_failure(
+            "All commands already approved"
+        ));
+        assert!(!is_worktrunk_approval_failure(
+            "mock-repo cannot prompt in non-interactive mode before it needs approval"
+        ));
+    }
+
+    #[test]
+    fn check_worktrunk_approval_status_reports_pending() {
+        let temp = unique_temp_dir("prism-wt-approval-status-test");
+        fs::create_dir_all(&temp).unwrap();
+        let wt = temp.join("wt");
+        write_executable(
+            &wt,
+            "#!/bin/sh\nprintf '%s\\n' 'repo needs approval to execute 1 command:' >&2\nprintf '%s\\n' 'Cannot prompt for approval in non-interactive environment' >&2\nexit 1\n",
+        );
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+
+        let status = check_worktrunk_approval_status(&repo, &config).unwrap();
+
+        assert_eq!(status, WorktrunkApprovalStatus::Pending);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn create_worktree_session_adds_worktrunk_approval_hint() {
+        let temp = unique_temp_dir("prism-create-wt-approval-hint-test");
+        fs::create_dir_all(&temp).unwrap();
+        let wt = temp.join("wt");
+        write_executable(
+            &wt,
+            "#!/bin/sh\nprintf '%s\\n' 'repo needs approval to execute 1 command:' >&2\nprintf '%s\\n' 'Cannot prompt for approval in non-interactive environment' >&2\nexit 1\n",
+        );
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+
+        let error = super::create_worktree_session(&repo, &config, "feature").unwrap_err();
+
+        assert!(error.contains("repo needs approval to execute 1 command"));
+        assert!(error.contains("Worktrunk project commands"));
+        assert!(error.contains("config approvals add"));
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -845,6 +1038,13 @@ exit 0
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{id}"))
+    }
+
+    fn write_executable(path: &Path, text: &str) {
+        fs::write(path, text).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
     }
 
     fn count_rows(repo: &Repository, table: &str, branch: &str) -> i64 {
