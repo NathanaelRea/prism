@@ -1184,7 +1184,7 @@ impl Tui {
         Ok(())
     }
 
-    fn confirm_dialog(
+    pub(crate) fn confirm_dialog(
         &mut self,
         runtime: &mut TerminalRuntime,
         title: &str,

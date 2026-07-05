@@ -29,8 +29,10 @@ use crate::github::{
 };
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::lifecycle::{
-    create_pull_request, create_worktree_session, delete_worktree_session, merge_pull_request,
-    push_branch, refresh_branch_pr_cache, run_pre_pr_checks, run_pre_push_checks,
+    WorktrunkApprovalStatus, check_worktrunk_approval_status, create_pull_request,
+    create_worktree_session, delete_worktree_session, is_worktrunk_approval_failure,
+    merge_pull_request, push_branch, refresh_branch_pr_cache, run_pre_pr_checks,
+    run_pre_push_checks, run_worktrunk_approval_prompt,
 };
 use crate::opencode::{self, OpencodeStatus, load_runtime};
 use crate::plan::{PlanExecution, infer_total_phases, open_plan_mode, select_plan_path};
@@ -150,7 +152,19 @@ impl Tui {
             "Create Session",
             &format!("Creating worktree for {}", branch.trim()),
         )?;
-        create_worktree_session(&context.repo, &context.config, branch.trim())?;
+        if let Err(error) = create_worktree_session(&context.repo, &context.config, branch.trim()) {
+            if !is_worktrunk_approval_failure(&error)
+                || !self.offer_worktrunk_approval(raw, &context.repo, &context.config)?
+            {
+                return Err(error);
+            }
+            self.show_loading_dialog(
+                raw,
+                "Create Session",
+                &format!("Creating worktree for {}", branch.trim()),
+            )?;
+            create_worktree_session(&context.repo, &context.config, branch.trim())?;
+        }
         self.refresh_sessions()?;
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
@@ -332,6 +346,11 @@ impl Tui {
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
+        let old_roots = self
+            .repos
+            .iter()
+            .map(|repo| repo.repo.root.clone())
+            .collect::<BTreeSet<_>>();
         let Some(path) = self.prompt_line_dialog(raw, "Add Repository", "Base/main path: ", "")?
         else {
             return Ok(());
@@ -346,6 +365,11 @@ impl Tui {
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
         self.start_default_branch_status_poll(true);
+        if let Some(context) = self.selected_repo_context()
+            && !old_roots.contains(&context.repo.root)
+        {
+            self.offer_worktrunk_approval_if_pending(raw, &context.repo, &context.config)?;
+        }
         self.show_message("repository added")?;
         Ok(())
     }
@@ -380,6 +404,11 @@ impl Tui {
         if entries.is_empty() {
             return Err("repository list is empty; add at least one [[repos]] block".to_string());
         }
+        let old_roots = self
+            .repos
+            .iter()
+            .map(|repo| repo.repo.root.clone())
+            .collect::<BTreeSet<_>>();
         let current_root = self
             .selected_repo_context()
             .map(|context| context.repo.root)
@@ -394,8 +423,78 @@ impl Tui {
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
         self.start_default_branch_status_poll(true);
+        let new_repos = self
+            .repos
+            .iter()
+            .filter(|repo| !old_roots.contains(&repo.repo.root))
+            .map(|repo| (repo.repo.clone(), repo.config.clone()))
+            .collect::<Vec<_>>();
+        for (repo, config) in new_repos {
+            self.offer_worktrunk_approval_if_pending(raw, &repo, &config)?;
+        }
         self.show_message("repositories reloaded")?;
         Ok(())
+    }
+
+    fn offer_worktrunk_approval_if_pending(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+        repo: &Repository,
+        config: &Config,
+    ) -> Result<(), String> {
+        let status = match check_worktrunk_approval_status(repo, config) {
+            Ok(status) => status,
+            Err(error) => {
+                let _ =
+                    append_runtime_log(repo, &format!("Worktrunk approval check skipped: {error}"));
+                return Ok(());
+            }
+        };
+        match status {
+            WorktrunkApprovalStatus::Pending => {
+                if self.offer_worktrunk_approval(raw, repo, config)? {
+                    match check_worktrunk_approval_status(repo, config)? {
+                        WorktrunkApprovalStatus::Pending => {
+                            self.show_message("Worktrunk approvals still pending")?;
+                        }
+                        WorktrunkApprovalStatus::Approved => {
+                            self.show_message("Worktrunk approvals enabled")?;
+                        }
+                        WorktrunkApprovalStatus::NotWorktrunk => {}
+                    }
+                }
+            }
+            WorktrunkApprovalStatus::Approved | WorktrunkApprovalStatus::NotWorktrunk => {}
+        }
+        Ok(())
+    }
+
+    fn offer_worktrunk_approval(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+        repo: &Repository,
+        config: &Config,
+    ) -> Result<bool, String> {
+        let command = format!("wt -C {} config approvals add", repo.root.display());
+        let lines = vec![
+            crate::view::DialogLine {
+                text: "This repo has Worktrunk project commands that must be approved before Prism can create worktrees.".to_string(),
+                attention: true,
+            },
+            crate::view::DialogLine {
+                text: "Run Worktrunk's approval prompt now?".to_string(),
+                attention: false,
+            },
+            crate::view::DialogLine {
+                text: command,
+                attention: false,
+            },
+        ];
+        if !self.confirm_dialog(raw, "Worktrunk Approvals", lines, "Run", "Skip")? {
+            return Ok(false);
+        }
+        raw.suspend_for(|| run_worktrunk_approval_prompt(repo, config))?;
+        Ok(true)
     }
 
     fn reload_repositories(
