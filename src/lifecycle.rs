@@ -267,10 +267,11 @@ fn worktree_command_failure_message(
     repo: &Repository,
     config: &Config,
 ) -> String {
-    let message = format!("{command_display}: {}", process_failure_message(output));
     if is_worktrunk_approval_failure(&process_output_text(output)) {
+        let message = format!("{command_display}: {}", process_output_text(output).trim());
         format!("{message}\n\n{}", worktrunk_approval_hint(repo, config))
     } else {
+        let message = format!("{command_display}: {}", process_failure_message(output));
         message
     }
 }
@@ -649,6 +650,7 @@ mod tests {
         let error = super::create_worktree_session(&repo, &config, "feature").unwrap_err();
 
         assert!(error.contains("repo needs approval to execute 1 command"));
+        assert!(error.contains("Cannot prompt for approval in non-interactive environment"));
         assert!(error.contains("Worktrunk project commands"));
         assert!(error.contains("config approvals add"));
 
