@@ -16,7 +16,6 @@ mod opencode;
 mod plan;
 pub mod plan_run;
 mod process;
-mod rat_view;
 mod repo;
 mod review;
 mod session;

@@ -47,7 +47,7 @@ impl TerminalRuntime {
 
     pub(crate) fn draw(&mut self, model: &view::FrameModel<'_>) -> Result<(), String> {
         self.terminal
-            .draw(|frame| crate::rat_view::render(frame, model))
+            .draw(|frame| crate::view::render(frame, model))
             .map(|_| ())
             .map_err(|error| error.to_string())
     }

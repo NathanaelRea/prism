@@ -2,14 +2,31 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::agent::AgentState;
-use crate::auto_flow::{AutoOutputLine, AutoRunStatus, PersistedAutoRun};
-use crate::config::Config;
-use crate::github::PrCache;
-use crate::plan_run::{PersistedPlanRun, PlanOutputLine};
-use crate::session::Session;
-use crate::session::SessionClassification;
-use crate::tui::PanelFocus;
+use ratatui::{
+    Frame,
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+};
+
+use crate::{
+    agent::AgentState,
+    auto_flow::{
+        AutoImplementationSource, AutoOutputKind, AutoOutputLine, AutoRunMode, AutoRunStatus,
+        AutoStepKey, AutoStepRun, AutoStepStatus, PersistedAutoRun,
+    },
+    config::{Config, IconStyle},
+    github::PrCache,
+    opencode::{OpencodeState, OpencodeStatus},
+    plan_run::{
+        PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRunMode, PlanRunStatus, PlanStepRun,
+        PlanStepStatus, plan_output_block_key,
+    },
+    session::{Session, SessionClassification},
+    tui::PanelFocus,
+    util::{status_count, truncate},
+};
 
 pub(crate) struct FrameModel<'a> {
     pub config: &'a Config,
@@ -176,3 +193,33 @@ pub(crate) enum WorktreeKind {
     FeatureWorktree,
     Detached,
 }
+
+mod auto_dashboard;
+mod dialog;
+mod format;
+mod layout;
+mod main_panel;
+mod plan_dashboard;
+mod pr;
+mod repo_panel;
+mod shell;
+mod sidebar;
+mod style;
+mod worktree_panel;
+
+#[cfg(test)]
+mod tests;
+
+pub(crate) use shell::render;
+
+use auto_dashboard::*;
+use dialog::*;
+use format::*;
+use layout::*;
+use main_panel::*;
+use plan_dashboard::*;
+use pr::*;
+use repo_panel::*;
+use sidebar::*;
+use style::*;
+use worktree_panel::*;
