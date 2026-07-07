@@ -15,7 +15,7 @@ pub(super) fn ensure_repo_config_file(
                 if !text.ends_with('\n') && !text.is_empty() {
                     text.push('\n');
                 }
-                text.push_str("\n[worktrees]\ncolumns = [\"url\", \"vars.localdev\"]\n");
+                text.push_str("\n[worktrees]\ncolumns = []\n");
                 fs::write(path, text).map_err(|error| format!("update config file: {error}"))?;
             }
         }

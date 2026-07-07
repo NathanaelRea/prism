@@ -40,7 +40,7 @@ sidebar_width = 56
 icon_style = "unicode" # or "nerd-font"
 
 [worktrees]
-columns = ["url", "ci.status", "vars.localdev"]
+columns = []
 
 [tools]
 opencode = "opencode"
@@ -62,7 +62,7 @@ Prism manages one local OpenCode server per worktree session. `opencode_port_bas
 
 `[ui] icon_style` controls TUI status glyphs. `unicode` is the portable default. `nerd-font` uses richer Nerd Font glyphs for pull requests, merge state, Git status, and CI, and requires a Nerd Font configured in your terminal.
 
-`[worktrees] columns` controls the visible extra columns in the TUI worktree list. Columns are shown in the configured order after Prism's built-in worktree indicators. Missing values render as a compact placeholder so neighboring columns stay aligned.
+`[worktrees] columns` controls the visible extra columns in the TUI worktree list. There are no extra columns enabled by default. Columns are shown in the configured order after Prism's built-in worktree indicators. Missing values render as a compact placeholder so neighboring columns stay aligned.
 
 Columns are read from `wt list --format=json`. Common names include `url`, `url_active`, `ci.status`, and `vars.<name>`, such as `vars.localdev`:
 
@@ -71,7 +71,7 @@ Columns are read from `wt list --format=json`. Common names include `url`, `url_
 columns = ["url", "url_active", "ci.status", "vars.localdev"]
 ```
 
-The selected worktree detail panel shows all currently loaded `wt` column keys and values, sorted by key, so you can discover names before adding them to config. Use `C` from the Repos panel to open the repository config at the worktree column section, then save and return to Prism to reload.
+Use `C` in the TUI to open the selected repository's worktree column selector. The selector lists configured columns first and then discovered `wt` column keys, so you can enable/disable columns and move enabled columns up/down without editing TOML directly.
 
 ## Database Access
 
