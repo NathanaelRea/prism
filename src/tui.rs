@@ -18,7 +18,7 @@ use crate::opencode::{OpencodeEvent, OpencodeStatus};
 use crate::plan_run::{
     DEFAULT_OUTPUT_LINES_PER_STEP, PersistedPlanRun, PlanRunStatus, PlanStepStatus,
     cleanup_stale_archived_plan_runs, load_output_lines, load_plan_run,
-    load_recent_plan_runs_for_repo, plan_output_block_key, reconcile_stale_plan_run,
+    load_recent_plan_runs_for_repo, reconcile_stale_plan_run,
 };
 use crate::repo::Repository;
 use crate::session::{Session, append_runtime_log};
@@ -533,16 +533,12 @@ impl Tui {
                 Key::Bottom => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if !self.move_plan_output_bottom() {
-                        self.select_bottom_visible();
-                    }
+                    self.select_bottom_visible();
                 }
                 Key::G => {
                     self.clear_leader_hint();
                     if pending_g {
-                        if !self.move_plan_output_top() {
-                            self.select_top_visible();
-                        }
+                        self.select_top_visible();
                         pending_g = false;
                     } else {
                         pending_g = true;
@@ -551,12 +547,10 @@ impl Tui {
                 Key::PreviousBlock => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    self.move_plan_output_block(-1);
                 }
                 Key::NextBlock => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    self.move_plan_output_block(1);
                 }
                 Key::Leader => {
                     self.leader_hint = Some(LeaderHint::Root);
@@ -570,7 +564,7 @@ impl Tui {
                     match self.open_tmux_session_target() {
                         OpenTmuxSessionTarget::StatusDashboard => {
                             if self.open_current_plan_tmux_session(&mut runtime)? {
-                            } else if !self.toggle_plan_output_block() {
+                            } else {
                                 self.focus_repos();
                             }
                         }
@@ -781,9 +775,7 @@ impl Tui {
                 Key::EditWorktreeColumns => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.focused_panel != PanelFocus::Repos {
-                        self.show_message("focus repos to edit worktree columns")?;
-                    } else if let Err(error) = self.edit_worktree_columns(&mut runtime) {
+                    if let Err(error) = self.edit_worktree_columns(&mut runtime) {
                         self.show_error("edit worktree columns failed", &error)?;
                     }
                 }
@@ -1253,9 +1245,7 @@ impl Tui {
 
     fn move_down(&mut self) {
         if self.main_focused {
-            if !self.move_plan_output_cursor(1) {
-                self.move_plan_step_selection(1);
-            }
+            self.move_plan_step_selection(1);
             return;
         }
         match self.focused_panel {
@@ -1267,9 +1257,7 @@ impl Tui {
 
     fn move_up(&mut self) {
         if self.main_focused {
-            if !self.move_plan_output_cursor(-1) {
-                self.move_plan_step_selection(-1);
-            }
+            self.move_plan_step_selection(-1);
             return;
         }
         match self.focused_panel {
@@ -1290,9 +1278,7 @@ impl Tui {
             PanelFocus::Repos => {
                 self.repo_main_view = view::RepoMainView::Github;
             }
-            PanelFocus::Worktrees => {
-                self.worktree_main_view = view::WorktreeMainView::Details;
-            }
+            PanelFocus::Worktrees => {}
         }
     }
 
@@ -1307,11 +1293,7 @@ impl Tui {
             PanelFocus::Repos => {
                 self.repo_main_view = view::RepoMainView::Kanban;
             }
-            PanelFocus::Worktrees => {
-                if self.selected_plan_run_id().is_some() {
-                    self.worktree_main_view = view::WorktreeMainView::Plan;
-                }
-            }
+            PanelFocus::Worktrees => {}
         }
     }
 
@@ -1404,7 +1386,6 @@ impl Tui {
 
     pub(crate) fn select_top_visible(&mut self) {
         if self.main_focused {
-            let _ = self.move_plan_output_top();
             return;
         }
         match self.focused_panel {
@@ -1424,7 +1405,6 @@ impl Tui {
 
     fn select_bottom_visible(&mut self) {
         if self.main_focused {
-            let _ = self.move_plan_output_bottom();
             return;
         }
         match self.focused_panel {
@@ -1637,7 +1617,7 @@ impl Tui {
         false
     }
 
-    fn draw(&self, runtime: &mut TerminalRuntime) -> Result<(), String> {
+    pub(crate) fn draw(&self, runtime: &mut TerminalRuntime) -> Result<(), String> {
         let model = self.frame_model();
         runtime.draw(&model)
     }
@@ -1727,9 +1707,7 @@ impl Tui {
     }
 
     pub(crate) fn current_plan_dashboard(&self) -> Option<view::PlanDashboard> {
-        if self.focused_panel != PanelFocus::Worktrees
-            || self.worktree_main_view == view::WorktreeMainView::Details
-        {
+        if self.focused_panel != PanelFocus::Worktrees {
             return None;
         }
         let (repo, run_id) = self.selected_plan_run_id()?;
@@ -2100,131 +2078,6 @@ impl Tui {
         if let Some(step) = steps.get(next as usize).copied() {
             self.selected_plan_step_by_run.insert(run_id, step);
         }
-        true
-    }
-
-    fn move_plan_output_cursor(&mut self, direction: isize) -> bool {
-        let Some(dashboard) = self.current_plan_dashboard() else {
-            return false;
-        };
-        if !self.main_focused || dashboard.output_lines.is_empty() {
-            return false;
-        }
-        let run_id = dashboard.run.run.id;
-        let max = dashboard.output_lines.len().saturating_sub(1);
-        let state = self
-            .plan_output_state_by_run
-            .entry(run_id)
-            .or_insert_with(|| dashboard.output_state.clone());
-        let current = state.cursor.min(max);
-        let next = if direction < 0 {
-            current.saturating_sub(direction.unsigned_abs())
-        } else {
-            current.saturating_add(direction as usize).min(max)
-        };
-        state.cursor = next;
-        state.follow = next == max;
-        true
-    }
-
-    fn move_plan_output_top(&mut self) -> bool {
-        let Some(dashboard) = self.current_plan_dashboard() else {
-            return false;
-        };
-        if !self.main_focused || dashboard.output_lines.is_empty() {
-            return false;
-        }
-        let state = self
-            .plan_output_state_by_run
-            .entry(dashboard.run.run.id.clone())
-            .or_insert_with(|| dashboard.output_state.clone());
-        state.cursor = 0;
-        state.follow = false;
-        true
-    }
-
-    fn move_plan_output_bottom(&mut self) -> bool {
-        let Some(dashboard) = self.current_plan_dashboard() else {
-            return false;
-        };
-        if !self.main_focused || dashboard.output_lines.is_empty() {
-            return false;
-        }
-        let state = self
-            .plan_output_state_by_run
-            .entry(dashboard.run.run.id.clone())
-            .or_insert_with(|| dashboard.output_state.clone());
-        state.cursor = dashboard.output_lines.len().saturating_sub(1);
-        state.follow = true;
-        true
-    }
-
-    fn move_plan_output_block(&mut self, direction: isize) -> bool {
-        let Some(dashboard) = self.current_plan_dashboard() else {
-            return false;
-        };
-        if !self.main_focused || dashboard.output_lines.is_empty() {
-            return false;
-        }
-        let run_id = dashboard.run.run.id.clone();
-        let current = self
-            .plan_output_state_by_run
-            .get(&run_id)
-            .map(|state| state.cursor)
-            .unwrap_or_else(|| dashboard.output_lines.len().saturating_sub(1))
-            .min(dashboard.output_lines.len().saturating_sub(1));
-        let mut target = None;
-        if direction < 0 {
-            for index in (0..current).rev() {
-                if plan_output_block_key(&dashboard.output_lines[index]).is_some() {
-                    target = Some(index);
-                    break;
-                }
-            }
-        } else {
-            for index in current.saturating_add(1)..dashboard.output_lines.len() {
-                if plan_output_block_key(&dashboard.output_lines[index]).is_some() {
-                    target = Some(index);
-                    break;
-                }
-            }
-        }
-        if let Some(target) = target {
-            let state = self
-                .plan_output_state_by_run
-                .entry(run_id)
-                .or_insert_with(|| dashboard.output_state.clone());
-            state.cursor = target;
-            state.follow = target == dashboard.output_lines.len().saturating_sub(1);
-        }
-        true
-    }
-
-    fn toggle_plan_output_block(&mut self) -> bool {
-        let Some(dashboard) = self.current_plan_dashboard() else {
-            return false;
-        };
-        if !self.main_focused || dashboard.output_lines.is_empty() {
-            return false;
-        }
-        let run_id = dashboard.run.run.id.clone();
-        let cursor = self
-            .plan_output_state_by_run
-            .get(&run_id)
-            .map(|state| state.cursor)
-            .unwrap_or_else(|| dashboard.output_lines.len().saturating_sub(1))
-            .min(dashboard.output_lines.len().saturating_sub(1));
-        let Some(block_key) = plan_output_block_key(&dashboard.output_lines[cursor]) else {
-            return false;
-        };
-        let state = self
-            .plan_output_state_by_run
-            .entry(run_id)
-            .or_insert_with(|| dashboard.output_state.clone());
-        if !state.expanded_blocks.remove(&block_key) {
-            state.expanded_blocks.insert(block_key);
-        }
-        state.follow = false;
         true
     }
 
@@ -2699,33 +2552,33 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_keys_switch_worktree_plan_dashboard_view() {
+    fn worktree_plan_dashboard_is_not_gated_by_horizontal_keys() {
         let mut tui = test_tui();
         tui.focused_panel = PanelFocus::Worktrees;
         tui.select_worktree(1);
         tui.remember_plan_run(test_plan_run("plan", "/repo-one/feature-one"));
 
         assert_eq!(tui.worktree_main_view, WorktreeMainView::Details);
-        assert!(tui.current_plan_dashboard().is_none());
-
-        tui.move_left();
-
-        assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
-        assert_eq!(tui.worktree_main_view, WorktreeMainView::Details);
-        assert!(tui.current_plan_dashboard().is_none());
-
-        tui.focus_main();
-        tui.move_right();
-
-        assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
-        assert_eq!(tui.worktree_main_view, WorktreeMainView::Plan);
         assert!(tui.current_plan_dashboard().is_some());
 
         tui.move_left();
 
         assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
         assert_eq!(tui.worktree_main_view, WorktreeMainView::Details);
-        assert!(tui.current_plan_dashboard().is_none());
+        assert!(tui.current_plan_dashboard().is_some());
+
+        tui.focus_main();
+        tui.move_right();
+
+        assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
+        assert_eq!(tui.worktree_main_view, WorktreeMainView::Details);
+        assert!(tui.current_plan_dashboard().is_some());
+
+        tui.move_left();
+
+        assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
+        assert_eq!(tui.worktree_main_view, WorktreeMainView::Details);
+        assert!(tui.current_plan_dashboard().is_some());
     }
 
     #[test]

@@ -383,7 +383,7 @@ fn pr_merge_conflict_uses_conflict_icon() {
 }
 
 #[test]
-fn worktree_detail_lists_all_loaded_wt_columns() {
+fn worktree_detail_omits_loaded_wt_columns() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Running);
     session
@@ -396,11 +396,9 @@ fn worktree_detail_lists_all_loaded_wt_columns() {
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     let buffer = render_to_string(&model, 140, 30);
 
-    assert!(buffer.contains("wt columns"));
-    assert!(buffer.contains("ci.status"));
-    assert!(buffer.contains("success"));
-    assert!(buffer.contains("vars.localdev"));
-    assert!(buffer.contains("on"));
+    assert!(!buffer.contains("wt columns"));
+    assert!(!buffer.contains("ci.status"));
+    assert!(!buffer.contains("vars.localdev"));
 }
 
 #[test]
@@ -583,7 +581,7 @@ fn prompt_dialog_geometry_is_stable_and_tail_truncates_input() {
 }
 
 #[test]
-fn renders_plan_dashboard_output_cursor_and_collapsed_tool_blocks() {
+fn renders_plan_dashboard_compact_step_tails() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Running)];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
@@ -591,24 +589,25 @@ fn renders_plan_dashboard_output_cursor_and_collapsed_tool_blocks() {
     let buffer = render_to_string(&model, 120, 32);
 
     assert!(buffer.contains("Plan Run"));
-    assert!(buffer.contains("phase"));
-    assert!(buffer.contains("Output"));
-    assert!(buffer.contains("[+]"));
-    assert!(buffer.contains("L2"));
-    assert!(buffer.contains("tool"));
+    assert!(buffer.contains("current"));
+    assert!(buffer.contains("Steps"));
+    assert!(buffer.contains("[-] Step 1"));
+    assert!(buffer.contains("command output"));
+    assert!(!buffer.contains("Output"));
+    assert!(!buffer.contains("[+]"));
+    assert!(!buffer.contains("L2"));
 }
 
 #[test]
-fn renders_plan_dashboard_expanded_tool_block() {
+fn renders_plan_dashboard_ignores_output_block_expansion() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Running)];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.plan_dashboard = Some(test_plan_dashboard(true));
     let buffer = render_to_string(&model, 120, 32);
 
-    assert!(buffer.contains("[-]"));
-    assert!(buffer.contains("running command"));
     assert!(buffer.contains("command output"));
+    assert!(!buffer.contains("running command"));
 }
 
 #[test]
@@ -650,8 +649,8 @@ fn renders_auto_dashboard_steps_and_output_cursor() {
     assert!(buffer.contains("Implement \"implement feature\""));
     assert!(buffer.contains("Local validation loop"));
     assert!(buffer.contains("Run local validation"));
-    assert!(buffer.contains("Output (follow)"));
     assert!(buffer.contains("auto output"));
+    assert!(!buffer.contains("Output"));
 }
 
 fn render_to_string(model: &FrameModel<'_>, cols: u16, rows: u16) -> String {

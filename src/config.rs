@@ -46,7 +46,7 @@ pub fn config_example() -> String {
 icon_style = \"unicode\" # or \"nerd-font\"\n\
 \n\
 # [worktrees]\n\
-# columns = [\"url\", \"ci.status\", \"vars.localdev\"]\n\
+# columns = []\n\
 \n\
 # [tools]\n\
 # opencode = \"opencode\"\n\
@@ -89,7 +89,7 @@ pub fn user_config_template() -> String {
 pub fn repo_config_template(include_worktree_columns: bool) -> String {
     let mut text = config_example();
     if include_worktree_columns {
-        text.push_str("\n[worktrees]\ncolumns = [\"url\", \"vars.localdev\"]\n");
+        text.push_str("\n[worktrees]\ncolumns = []\n");
     }
     text
 }
@@ -353,7 +353,7 @@ impl Config {
             auto: AutoConfig::default(),
             layout: LayoutConfig::default(),
             checks: Checks::default(),
-            worktree_columns: vec!["url".to_string()],
+            worktree_columns: Vec::new(),
             tools,
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
@@ -922,6 +922,7 @@ mod tests {
         assert_eq!(config.icon_style, IconStyle::Unicode);
         assert!(!config.icon_style_configured);
         assert_eq!(config.layout.sidebar_width, None);
+        assert!(config.worktree_columns.is_empty());
         assert_eq!(config.opencode_port_base, 41_000);
         assert_eq!(config.opencode_port_span, 1_000);
         assert!(!config.opencode_shutdown_owned_servers);

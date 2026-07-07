@@ -15,7 +15,7 @@ pub(super) fn ensure_repo_config_file(
                 if !text.ends_with('\n') && !text.is_empty() {
                     text.push('\n');
                 }
-                text.push_str("\n[worktrees]\ncolumns = [\"url\", \"vars.localdev\"]\n");
+                text.push_str("\n[worktrees]\ncolumns = []\n");
                 fs::write(path, text).map_err(|error| format!("update config file: {error}"))?;
             }
         }
@@ -125,7 +125,90 @@ impl Tui {
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
         ensure_repo_config_file(&context.config.repo_config_path, true)?;
-        self.edit_config(raw)
+        let Some(columns) = self.worktree_column_editor(raw, context.repo_index)? else {
+            return Ok(());
+        };
+        update_worktree_columns_config(&context.config.repo_config_path, &columns)?;
+        let config = crate::config::Config::load(&context.repo);
+        if let Some(repo) = self.repos.get_mut(context.repo_index) {
+            repo.config = config.clone();
+        }
+        self.sync_selected_repo_context();
+        self.start_wt_column_poll();
+        self.show_message("worktree columns updated")?;
+        Ok(())
+    }
+
+    pub(crate) fn worktree_column_editor(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+        repo_index: usize,
+    ) -> Result<Option<Vec<String>>, String> {
+        let (repo_label, configured_columns) = self
+            .repos
+            .get(repo_index)
+            .map(|repo| (repo.label.clone(), repo.config.worktree_columns.clone()))
+            .ok_or_else(|| "no selected repository".to_string())?;
+        let mut columns = worktree_column_choices(&configured_columns, &self.sessions, repo_index);
+        let mut selected = 0usize;
+        loop {
+            self.dialog = Some(crate::view::DialogModel::WorktreeColumns {
+                title: format!("Worktree Columns: {repo_label}"),
+                columns: columns.clone(),
+                selected,
+            });
+            self.draw(raw)?;
+            let Some(event) = raw.poll_event(std::time::Duration::from_millis(100))? else {
+                continue;
+            };
+            let crate::tui_runtime::RuntimeEvent::Key(event) = event else {
+                continue;
+            };
+            if event.kind != crossterm::event::KeyEventKind::Press {
+                continue;
+            }
+            match event.code {
+                crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::Char('c')
+                    if event.code == crossterm::event::KeyCode::Esc
+                        || event
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    self.dialog = None;
+                    self.draw(raw)?;
+                    return Ok(None);
+                }
+                crossterm::event::KeyCode::Enter => {
+                    self.dialog = None;
+                    self.draw(raw)?;
+                    return Ok(Some(
+                        columns
+                            .iter()
+                            .filter(|column| column.enabled)
+                            .map(|column| column.key.clone())
+                            .collect(),
+                    ));
+                }
+                crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
+                    selected = selected.saturating_sub(1);
+                }
+                crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
+                    selected = selected
+                        .saturating_add(1)
+                        .min(columns.len().saturating_sub(1));
+                }
+                crossterm::event::KeyCode::Char(' ') => {
+                    toggle_worktree_column(&mut columns, &mut selected);
+                }
+                crossterm::event::KeyCode::Char('K') => {
+                    move_enabled_worktree_column(&mut columns, &mut selected, -1);
+                }
+                crossterm::event::KeyCode::Char('J') => {
+                    move_enabled_worktree_column(&mut columns, &mut selected, 1);
+                }
+                _ => {}
+            }
+        }
     }
 
     pub(crate) fn add_repository(
@@ -303,4 +386,130 @@ impl Tui {
         self.sync_selected_repo_context();
         Ok(())
     }
+}
+
+pub(super) fn worktree_column_choices(
+    configured: &[String],
+    sessions: &[crate::session::Session],
+    repo_index: usize,
+) -> Vec<crate::view::WorktreeColumnChoice> {
+    let configured_set = configured.iter().cloned().collect::<BTreeSet<_>>();
+    let mut discovered = sessions
+        .iter()
+        .filter(|session| session.repo_index == repo_index)
+        .flat_map(|session| session.wt_columns.keys().cloned())
+        .filter(|key| !configured_set.contains(key))
+        .collect::<BTreeSet<_>>();
+    let mut choices = configured
+        .iter()
+        .map(|key| crate::view::WorktreeColumnChoice {
+            key: key.clone(),
+            enabled: true,
+        })
+        .collect::<Vec<_>>();
+    choices.extend(
+        discovered
+            .pop_first()
+            .into_iter()
+            .chain(std::iter::from_fn(move || discovered.pop_first()))
+            .map(|key| crate::view::WorktreeColumnChoice {
+                key,
+                enabled: false,
+            }),
+    );
+    choices
+}
+
+pub(super) fn toggle_worktree_column(
+    columns: &mut Vec<crate::view::WorktreeColumnChoice>,
+    selected: &mut usize,
+) {
+    if columns.is_empty() || *selected >= columns.len() {
+        return;
+    }
+    let mut column = columns.remove(*selected);
+    column.enabled = !column.enabled;
+    let insert_at = if column.enabled {
+        columns.iter().take_while(|choice| choice.enabled).count()
+    } else {
+        columns.len()
+    };
+    columns.insert(insert_at, column);
+    *selected = insert_at;
+}
+
+pub(super) fn move_enabled_worktree_column(
+    columns: &mut [crate::view::WorktreeColumnChoice],
+    selected: &mut usize,
+    direction: isize,
+) {
+    if columns.is_empty() || *selected >= columns.len() || !columns[*selected].enabled {
+        return;
+    }
+    let target = if direction < 0 {
+        (0..*selected).rev().find(|index| columns[*index].enabled)
+    } else {
+        (*selected + 1..columns.len()).find(|index| columns[*index].enabled)
+    };
+    if let Some(target) = target {
+        columns.swap(*selected, target);
+        *selected = target;
+    }
+}
+
+pub(super) fn update_worktree_columns_config(
+    path: &Path,
+    columns: &[String],
+) -> Result<(), String> {
+    let mut text =
+        fs::read_to_string(path).map_err(|error| format!("read config file: {error}"))?;
+    let line = format!(
+        "columns = [{}]",
+        columns
+            .iter()
+            .map(|column| serde_json::to_string(column).unwrap_or_else(|_| "\"\"".to_string()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    text = set_worktree_columns_text(&text, &line);
+    fs::write(path, text).map_err(|error| format!("write config file: {error}"))
+}
+
+pub(super) fn set_worktree_columns_text(text: &str, columns_line: &str) -> String {
+    let mut lines = text.lines().map(str::to_string).collect::<Vec<_>>();
+    let worktrees_index = lines.iter().position(|line| line.trim() == "[worktrees]");
+    let Some(worktrees_index) = worktrees_index else {
+        let mut updated = text.trim_end_matches('\n').to_string();
+        if !updated.is_empty() {
+            updated.push_str("\n\n");
+        }
+        updated.push_str("[worktrees]\n");
+        updated.push_str(columns_line);
+        updated.push('\n');
+        return updated;
+    };
+
+    let table_end = lines
+        .iter()
+        .enumerate()
+        .skip(worktrees_index + 1)
+        .find(|(_, line)| line.trim_start().starts_with('['))
+        .map(|(index, _)| index)
+        .unwrap_or(lines.len());
+    if let Some(columns_index) = lines[worktrees_index + 1..table_end]
+        .iter()
+        .position(|line| line.trim_start().starts_with("columns"))
+        .map(|index| worktrees_index + 1 + index)
+    {
+        let indent = lines[columns_index]
+            .chars()
+            .take_while(|ch| ch.is_whitespace())
+            .collect::<String>();
+        lines[columns_index] = format!("{indent}{columns_line}");
+    } else {
+        lines.insert(worktrees_index + 1, columns_line.to_string());
+    }
+    let mut updated = lines.join("\n");
+    updated.push('\n');
+    updated
 }

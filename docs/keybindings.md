@@ -7,11 +7,10 @@ Prism uses a lazygit-style panel model.
 - `3` focuses Worktrees / Sessions.
 - `Tab` cycles focus between panels.
 - `0` focuses the main panel for the selected sidebar context.
-- `h` / `l` or left/right switches horizontal views in the Repos main panel, and switches the Worktrees main panel between details and the active plan dashboard when a plan run exists.
+- `h` / `l` or left/right switches horizontal views in the Repos main panel.
 - `j` / `k` or up/down moves within the focused row panel.
-- `g g` jumps to the top of the focused list or output viewer.
-- `G` jumps to the bottom of the focused list or output viewer.
-- `{` / `}` jumps between Plan output tool blocks when a Plan dashboard is focused.
+- `g g` jumps to the top of the focused list.
+- `G` jumps to the bottom of the focused list.
 - `Enter` and `Space Space` share the same go-deeper behavior: Status operates the active dashboard or focuses Repos, Repos focuses Worktrees for the selected repository, and Worktrees opens the selected agent session when valid.
 - Default branch worktrees are not agent targets; `Enter` and `Space Space` show the same blocked message there.
 - `Space Enter` opens tmux window 3: terminal.
@@ -22,9 +21,9 @@ Prism uses a lazygit-style panel model.
 - `Space g M` merges the selected pull request.
 - `Space g c` sends a CI-failure prompt to a new agent session for the selected worktree.
 - `Space g f` sends a review-fix prompt to a new agent session for the selected worktree.
-- `P` focuses an existing selected plan dashboard when one is available; otherwise it opens plan mode from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through `opencode run`.
+- `P` opens plan mode from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through `opencode run`. Active plan runs render automatically in the Worktrees main panel for the selected worktree.
 - `A` starts or focuses Auto Flow for the selected non-default worktree.
-- `u` pauses/resumes the selected Auto Flow or plan run from Status or the active Worktrees plan dashboard; paused Auto Flow resumes only after a dialog describes the next step.
+- `u` pauses/resumes the selected Auto Flow or plan run from Status or the Worktrees main panel; paused Auto Flow resumes only after a dialog describes the next step.
 - `f` retries failed Auto Flow or Plan steps from the active dashboard.
 - `B` retries Auto Flow or Plan execution from the selected step.
 - `s` skips the selected Plan step from the active Plan dashboard.
@@ -36,7 +35,7 @@ Prism uses a lazygit-style panel model.
 - `x` also aborts the selected Plan phase from the active Plan dashboard, or accepts `all` when prompted to abort all running phases.
 - `e` edits the selected Prism repository config and reloads after save.
 - `E` edits the Prism user config and reloads after save.
-- `C` opens the repository config at `[worktrees] columns` from the Repos panel, then reloads after save.
+- `C` opens the in-app worktree column selector for the selected repository. Use `Space` to enable/disable a column, `J`/`K` to move an enabled column down/up, and `Enter` to save.
 - `/` filters the focused Repos or Worktrees panel.
 - `?` opens the in-app keybinding dialog.
 - `D` archives the selected non-default worktree/session, hiding it from normal navigation while leaving files and branch intact.
@@ -45,4 +44,4 @@ Prism uses a lazygit-style panel model.
 - `r` refreshes cached repository, worktree, PR, and agent state.
 - `q` or `Ctrl-C` quits.
 
-Most repository actions are only active from the Repos panel. Pulling the default branch is active from the Repos and Worktrees panels. Worktree actions are only active from the Worktrees panel.
+Most repository actions are only active from the Repos panel. Pulling the default branch and editing worktree columns are active from the selected repository context. Worktree actions are only active from the Worktrees panel.

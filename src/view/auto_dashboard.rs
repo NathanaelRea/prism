@@ -11,18 +11,43 @@ pub(super) fn auto_dashboard_lines(
         .and_then(|id| dashboard.run.steps.iter().find(|step| step.id == Some(id)))
         .or_else(|| dashboard.run.steps.first());
     let counts = dashboard.run.status_counts();
+    let output_tail = dashboard
+        .output_lines
+        .last()
+        .map(|line| short_log_tail(&line.text));
     let mut lines = vec![
         heading_line("Auto Flow"),
         labelled_line("task", run.prompt_summary.clone()),
-        labelled_line("work", run.worktree_path.display().to_string()),
-        Line::from(vec![
-            Span::styled("mode ", muted_style()),
-            Span::raw(auto_mode_label(run.mode)),
-            Span::styled("  status ", muted_style()),
-            Span::styled(auto_status_label(run.status), auto_style(run.status)),
-            Span::styled("  elapsed ", muted_style()),
-            Span::raw(elapsed_label(run.created_unix_ms, run.updated_unix_ms)),
-        ]),
+    ];
+    if let Some(step) = selected_step {
+        lines.push(Line::from(vec![
+            Span::styled("current ", muted_style()),
+            Span::raw(format!(
+                "{} attempt {} ",
+                step.step_key.as_str(),
+                step.attempt
+            )),
+            Span::styled(
+                auto_step_status_label(step.status),
+                auto_step_status_style(step.status),
+            ),
+            Span::raw(
+                output_tail
+                    .as_ref()
+                    .map(|tail| format!("  {tail}"))
+                    .unwrap_or_default(),
+            ),
+        ]));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("mode ", muted_style()),
+        Span::raw(auto_mode_label(run.mode)),
+        Span::styled("  status ", muted_style()),
+        Span::styled(auto_status_label(run.status), auto_style(run.status)),
+        Span::styled("  elapsed ", muted_style()),
+        Span::raw(elapsed_label(run.created_unix_ms, run.updated_unix_ms)),
+    ]));
+    lines.extend([
         Line::from(vec![
             Span::styled("source ", muted_style()),
             Span::raw(auto_source_label(run.implementation_source)),
@@ -34,24 +59,11 @@ pub(super) fn auto_dashboard_lines(
             ),
         ]),
         labelled_line("branch", run.branch.clone()),
-    ];
+    ]);
     if let Some(pr_number) = run.pr_number {
         lines.push(labelled_line("pr", format!("#{pr_number}")));
     }
     if let Some(step) = selected_step {
-        lines.push(Line::from(vec![
-            Span::styled("step ", muted_style()),
-            Span::raw(format!(
-                "#{} {} attempt {} ",
-                step.sequence,
-                step.step_key.as_str(),
-                step.attempt
-            )),
-            Span::styled(
-                auto_step_status_label(step.status),
-                auto_step_status_style(step.status),
-            ),
-        ]));
         if let Some(session_id) = step.opencode_session_id.as_deref() {
             lines.push(labelled_line(
                 "opencode session",
@@ -83,45 +95,16 @@ pub(super) fn auto_dashboard_lines(
     lines.push(Line::from(""));
     lines.push(heading_line("Checklist"));
     let linked_plan_rows_reserved = linked_plan_summary_lines(dashboard).len();
-    let output_rows_reserved = dashboard.output_lines.len().min(8) + linked_plan_rows_reserved + 2;
     let step_rows_available = visible_rows
         .saturating_sub(lines.len())
-        .saturating_sub(output_rows_reserved)
+        .saturating_sub(linked_plan_rows_reserved)
         .max(3);
-    lines.extend(auto_checklist_lines(dashboard, step_rows_available));
-    lines.push(Line::from(""));
-    lines.push(heading_line(if dashboard.output_state.follow {
-        "Output (follow)"
-    } else {
-        "Output"
-    }));
+    lines.extend(auto_checklist_lines(
+        dashboard,
+        step_rows_available,
+        output_tail.as_deref(),
+    ));
     lines.extend(linked_plan_summary_lines(dashboard));
-    if dashboard.output_lines.is_empty() {
-        lines.push(Line::from(Span::styled("No output yet", muted_style())));
-    } else {
-        let output_rows_available = visible_rows.saturating_sub(lines.len()).max(1);
-        let cursor = dashboard
-            .output_state
-            .cursor
-            .min(dashboard.output_lines.len().saturating_sub(1));
-        let start = if dashboard.output_state.follow {
-            dashboard
-                .output_lines
-                .len()
-                .saturating_sub(output_rows_available)
-        } else {
-            scroll_start(cursor, output_rows_available)
-        };
-        for (index, line) in dashboard
-            .output_lines
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(output_rows_available)
-        {
-            lines.push(auto_output_row(line, index == cursor));
-        }
-    }
     lines.truncate(visible_rows);
     lines
 }
@@ -204,40 +187,59 @@ pub(super) fn linked_plan_summary_lines(
 pub(super) fn auto_checklist_lines(
     dashboard: &crate::view::AutoDashboard,
     max_rows: usize,
+    output_tail: Option<&str>,
 ) -> Vec<Line<'static>> {
     let run = &dashboard.run.run;
     let steps = &dashboard.run.steps;
+    let selected_step_run_id = run
+        .selected_step_run_id
+        .or_else(|| dashboard.run.steps.first().and_then(|step| step.id));
     let mut lines = Vec::new();
-    lines.push(checklist_line(
+    lines.push(checklist_line_for_key(
         0,
-        auto_status_for_key(steps, AutoStepKey::Prepare),
+        steps,
+        AutoStepKey::Prepare,
         "Prepare worktree".to_string(),
+        selected_step_run_id,
+        output_tail,
     ));
 
     if run.implementation_source == AutoImplementationSource::DraftPlan {
-        lines.push(checklist_line(
+        lines.push(checklist_line_for_key(
             0,
-            auto_status_for_key(steps, AutoStepKey::CreatePlan),
+            steps,
+            AutoStepKey::CreatePlan,
             "Create implementation plan".to_string(),
+            selected_step_run_id,
+            output_tail,
         ));
-        lines.push(checklist_line(
+        lines.push(checklist_line_for_key(
             0,
-            auto_status_for_key(steps, AutoStepKey::ReviewPlan),
+            steps,
+            AutoStepKey::ReviewPlan,
             "Review implementation plan".to_string(),
+            selected_step_run_id,
+            output_tail,
         ));
-        lines.push(checklist_line(
+        lines.push(checklist_line_for_key(
             0,
-            auto_status_for_key(steps, AutoStepKey::ApprovePlan),
+            steps,
+            AutoStepKey::ApprovePlan,
             "Approve implementation plan".to_string(),
+            selected_step_run_id,
+            output_tail,
         ));
     }
 
     if run.implementation_source == AutoImplementationSource::Prompt {
         let label = format!("Implement \"{}\"", truncate(&run.prompt_summary, 50));
-        lines.push(checklist_line(
+        lines.push(checklist_line_for_key(
             0,
-            auto_status_for_key(steps, AutoStepKey::Implement),
+            steps,
+            AutoStepKey::Implement,
             label,
+            selected_step_run_id,
+            output_tail,
         ));
     } else {
         let plan_name = dashboard
@@ -266,28 +268,40 @@ pub(super) fn auto_checklist_lines(
         }
     }
 
-    push_local_validation_loop(&mut lines, steps);
-    lines.push(checklist_line(
+    push_local_validation_loop(&mut lines, steps, selected_step_run_id, output_tail);
+    lines.push(checklist_line_for_key(
         0,
-        auto_status_for_key(steps, AutoStepKey::CommitImpl),
+        steps,
+        AutoStepKey::CommitImpl,
         "Commit implementation".to_string(),
+        selected_step_run_id,
+        output_tail,
     ));
-    lines.push(checklist_line(
+    lines.push(checklist_line_for_key(
         0,
-        auto_status_for_key(steps, AutoStepKey::PushPr),
+        steps,
+        AutoStepKey::PushPr,
         "Create or update PR".to_string(),
+        selected_step_run_id,
+        output_tail,
     ));
-    push_review_loop(&mut lines, steps);
-    push_ci_loop(&mut lines, steps);
-    lines.push(checklist_line(
+    push_review_loop(&mut lines, steps, selected_step_run_id, output_tail);
+    push_ci_loop(&mut lines, steps, selected_step_run_id, output_tail);
+    lines.push(checklist_line_for_key(
         0,
-        auto_status_for_key(steps, AutoStepKey::Merge),
+        steps,
+        AutoStepKey::Merge,
         "Run final merge safety gate".to_string(),
+        selected_step_run_id,
+        output_tail,
     ));
-    lines.push(checklist_line(
+    lines.push(checklist_line_for_key(
         0,
-        auto_status_for_key(steps, AutoStepKey::Cleanup),
+        steps,
+        AutoStepKey::Cleanup,
         "Clean up merged worktree/session".to_string(),
+        selected_step_run_id,
+        output_tail,
     ));
 
     if lines.len() > max_rows {
@@ -297,7 +311,12 @@ pub(super) fn auto_checklist_lines(
     lines
 }
 
-pub(super) fn push_local_validation_loop(lines: &mut Vec<Line<'static>>, steps: &[AutoStepRun]) {
+pub(super) fn push_local_validation_loop(
+    lines: &mut Vec<Line<'static>>,
+    steps: &[AutoStepRun],
+    selected_step_run_id: Option<i64>,
+    output_tail: Option<&str>,
+) {
     let group_status = first_active_or_latest_status(
         steps,
         &[AutoStepKey::FixLocalVerify, AutoStepKey::LocalVerify],
@@ -307,10 +326,13 @@ pub(super) fn push_local_validation_loop(lines: &mut Vec<Line<'static>>, steps: 
         group_status,
         "Local validation loop".to_string(),
     ));
-    lines.push(checklist_line(
+    lines.push(checklist_line_for_key(
         1,
-        auto_status_for_key(steps, AutoStepKey::LocalVerify),
+        steps,
+        AutoStepKey::LocalVerify,
         "Run local validation".to_string(),
+        selected_step_run_id,
+        output_tail,
     ));
     if step_seen(steps, &AutoStepKey::FixLocalVerify) {
         lines.push(checklist_line(
@@ -329,7 +351,12 @@ pub(super) fn push_local_validation_loop(lines: &mut Vec<Line<'static>>, steps: 
     }
 }
 
-pub(super) fn push_review_loop(lines: &mut Vec<Line<'static>>, steps: &[AutoStepRun]) {
+pub(super) fn push_review_loop(
+    lines: &mut Vec<Line<'static>>,
+    steps: &[AutoStepRun],
+    selected_step_run_id: Option<i64>,
+    output_tail: Option<&str>,
+) {
     let group_status = if step_seen(steps, &AutoStepKey::WaitCi) {
         AutoStepStatus::Done
     } else {
@@ -348,10 +375,13 @@ pub(super) fn push_review_loop(lines: &mut Vec<Line<'static>>, steps: &[AutoStep
         group_status,
         "Review feedback loop".to_string(),
     ));
-    lines.push(checklist_line(
+    lines.push(checklist_line_for_key(
         1,
-        auto_status_for_key(steps, AutoStepKey::WaitReview),
+        steps,
+        AutoStepKey::WaitReview,
         "Wait for automated review".to_string(),
+        selected_step_run_id,
+        output_tail,
     ));
     if step_seen(steps, &AutoStepKey::FixReview) {
         lines.push(checklist_line(
@@ -382,7 +412,12 @@ pub(super) fn push_review_loop(lines: &mut Vec<Line<'static>>, steps: &[AutoStep
     }
 }
 
-pub(super) fn push_ci_loop(lines: &mut Vec<Line<'static>>, steps: &[AutoStepRun]) {
+pub(super) fn push_ci_loop(
+    lines: &mut Vec<Line<'static>>,
+    steps: &[AutoStepRun],
+    selected_step_run_id: Option<i64>,
+    output_tail: Option<&str>,
+) {
     let group_status = if step_seen(steps, &AutoStepKey::Merge) {
         AutoStepStatus::Done
     } else {
@@ -397,10 +432,13 @@ pub(super) fn push_ci_loop(lines: &mut Vec<Line<'static>>, steps: &[AutoStepRun]
         )
     };
     lines.push(checklist_line(0, group_status, "CI loop".to_string()));
-    lines.push(checklist_line(
+    lines.push(checklist_line_for_key(
         1,
-        auto_status_for_key(steps, AutoStepKey::WaitCi),
+        steps,
+        AutoStepKey::WaitCi,
         "Wait for PR checks".to_string(),
+        selected_step_run_id,
+        output_tail,
     ));
     if step_seen(steps, &AutoStepKey::FixCi) {
         lines.push(checklist_line(
@@ -429,6 +467,52 @@ pub(super) fn push_ci_loop(lines: &mut Vec<Line<'static>>, steps: &[AutoStepRun]
             ));
         }
     }
+}
+
+pub(super) fn checklist_line_for_key(
+    indent: usize,
+    steps: &[AutoStepRun],
+    key: AutoStepKey,
+    label: String,
+    selected_step_run_id: Option<i64>,
+    output_tail: Option<&str>,
+) -> Line<'static> {
+    let status = auto_status_for_key(steps, key.clone());
+    let tail = auto_step_tail(steps, &key, selected_step_run_id, output_tail);
+    checklist_line_with_tail(indent, status, label, tail)
+}
+
+pub(super) fn checklist_line_with_tail(
+    indent: usize,
+    status: AutoStepStatus,
+    label: String,
+    tail: Option<String>,
+) -> Line<'static> {
+    let mut line = checklist_line(indent, status, label);
+    if let Some(tail) = tail.filter(|tail| !tail.is_empty()) {
+        line.spans
+            .push(Span::styled(format!("  {tail}"), muted_style()));
+    }
+    line
+}
+
+pub(super) fn auto_step_tail(
+    steps: &[AutoStepRun],
+    key: &AutoStepKey,
+    selected_step_run_id: Option<i64>,
+    output_tail: Option<&str>,
+) -> Option<String> {
+    let step = latest_step_for_key(steps, key)?;
+    if step.id == selected_step_run_id
+        && let Some(output_tail) = output_tail
+    {
+        return Some(output_tail.to_string());
+    }
+    step.error
+        .as_deref()
+        .or(step.summary.as_deref())
+        .or(step.reason.as_deref())
+        .map(short_log_tail)
 }
 
 pub(super) fn checklist_line(
