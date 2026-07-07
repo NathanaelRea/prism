@@ -2,7 +2,7 @@ use super::*;
 
 pub(super) fn plan_dashboard_lines(
     dashboard: &crate::view::PlanDashboard,
-    width: usize,
+    _width: usize,
     visible_rows: usize,
 ) -> Vec<Line<'static>> {
     let run = &dashboard.run.run;
@@ -13,45 +13,49 @@ pub(super) fn plan_dashboard_lines(
         .find(|step| step.step == run.selected_step)
         .or_else(|| dashboard.run.steps.first());
     let counts = dashboard.run.status_counts();
+    let output_tail = dashboard
+        .output_lines
+        .last()
+        .map(|line| short_log_tail(&line.text));
     let mut lines = vec![
         heading_line("Plan Run"),
         labelled_line("plan", run.plan_display.clone()),
         labelled_line("scope", run.scope_path.display().to_string()),
-        Line::from(vec![
-            Span::styled("mode ", muted_style()),
-            Span::raw(plan_mode_label(run.mode)),
-            Span::styled("  status ", muted_style()),
-            Span::styled(
-                plan_run_status_label(run.status),
-                plan_run_status_style(run.status),
-            ),
-            Span::styled("  elapsed ", muted_style()),
-            Span::raw(elapsed_label(run.created_unix_ms, run.updated_unix_ms)),
-        ]),
     ];
     if let Some(step) = selected_step {
         lines.push(Line::from(vec![
-            Span::styled("phase ", muted_style()),
+            Span::styled("current ", muted_style()),
             Span::raw(format!("{}/{} ", step.step, run.total_steps)),
             Span::styled(
                 plan_step_status_label(step.status),
                 plan_step_status_style(step.status),
             ),
-            Span::styled("  variant ", muted_style()),
             Span::raw(
-                step.agent_variant
-                    .as_deref()
-                    .unwrap_or("default")
-                    .to_string(),
+                output_tail
+                    .as_ref()
+                    .map(|tail| format!("  {tail}"))
+                    .unwrap_or_default(),
             ),
         ]));
-        lines.extend(plan_opencode_status_lines(step));
-        if let Some(error) = step.error.as_deref() {
-            lines.push(Line::from(vec![
-                Span::styled("error ", muted_style()),
-                Span::styled(error.to_string(), error_style()),
-            ]));
-        }
+    }
+    lines.push(Line::from(vec![
+        Span::styled("mode ", muted_style()),
+        Span::raw(plan_mode_label(run.mode)),
+        Span::styled("  status ", muted_style()),
+        Span::styled(
+            plan_run_status_label(run.status),
+            plan_run_status_style(run.status),
+        ),
+        Span::styled("  elapsed ", muted_style()),
+        Span::raw(elapsed_label(run.created_unix_ms, run.updated_unix_ms)),
+    ]));
+    if let Some(step) = selected_step
+        && let Some(error) = step.error.as_deref()
+    {
+        lines.push(Line::from(vec![
+            Span::styled("error ", muted_style()),
+            Span::styled(error.to_string(), error_style()),
+        ]));
     }
     if dashboard.runs.len() > 1 {
         lines.push(Line::from(""));
@@ -77,13 +81,8 @@ pub(super) fn plan_dashboard_lines(
         Span::raw(counts.failed.to_string()),
     ]));
     lines.push(Line::from(""));
-    lines.push(heading_line("Phases"));
-    let rendered_output = render_plan_output_rows(dashboard, width);
-    let output_rows_reserved = rendered_output.len().min(8) + 2;
-    let phase_rows_available = visible_rows
-        .saturating_sub(lines.len())
-        .saturating_sub(output_rows_reserved)
-        .max(3);
+    lines.push(heading_line("Steps"));
+    let phase_rows_available = visible_rows.saturating_sub(lines.len()).max(3);
     let selected_index = dashboard
         .run
         .steps
@@ -98,32 +97,12 @@ pub(super) fn plan_dashboard_lines(
         .skip(start)
         .take(phase_rows_available)
     {
-        lines.push(plan_step_row(step, run.selected_step, run.total_steps));
-    }
-    lines.push(Line::from(""));
-    lines.push(heading_line(if dashboard.output_state.follow {
-        "Output (follow)"
-    } else {
-        "Output"
-    }));
-    if rendered_output.is_empty() {
-        lines.push(Line::from(Span::styled("No output yet", muted_style())));
-    } else {
-        let output_rows_available = visible_rows.saturating_sub(lines.len()).max(1);
-        let cursor = selected_rendered_output_index(dashboard, &rendered_output);
-        let start = if dashboard.output_state.follow {
-            rendered_output.len().saturating_sub(output_rows_available)
+        let tail = if step.step == run.selected_step {
+            output_tail.as_deref()
         } else {
-            scroll_start(cursor, output_rows_available)
+            None
         };
-        for (index, row) in rendered_output
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(output_rows_available)
-        {
-            lines.push(plan_output_row(row, index == cursor));
-        }
+        lines.push(plan_step_row(step, run.selected_step, tail));
     }
     lines.truncate(visible_rows);
     lines
@@ -300,25 +279,47 @@ pub(super) fn output_display_lines(line: &PlanOutputLine) -> Vec<String> {
 pub(super) fn plan_step_row(
     step: &PlanStepRun,
     selected_step: usize,
-    total_steps: usize,
+    output_tail: Option<&str>,
 ) -> Line<'static> {
     let selected = step.step == selected_step;
     let detail = step
-        .active_tool
+        .error
         .as_deref()
+        .or(output_tail)
+        .or(step.active_tool.as_deref())
         .or(step.latest_message.as_deref())
-        .or(step.error.as_deref())
         .unwrap_or("");
     Line::from(vec![
         Span::styled(if selected { "▶ " } else { "  " }, title_style(selected)),
-        Span::styled(format!("{}/{} ", step.step, total_steps), muted_style()),
+        Span::styled(
+            plan_checklist_mark(step.status),
+            plan_step_status_style(step.status),
+        ),
+        Span::raw(" "),
+        Span::styled(
+            format!("Step {} ", step.step),
+            plan_step_status_style(step.status),
+        ),
         Span::styled(
             format!("{:<10}", plan_step_status_label(step.status)),
             plan_step_status_style(step.status),
         ),
         Span::styled(format!(" {:<8}", elapsed_step_label(step)), muted_style()),
-        Span::raw(detail.to_string()),
+        Span::raw(format!(" {}", short_log_tail(detail))),
     ])
+}
+
+pub(super) fn plan_checklist_mark(status: PlanStepStatus) -> &'static str {
+    match status {
+        PlanStepStatus::Done | PlanStepStatus::Skipped => "[x]",
+        PlanStepStatus::Failed | PlanStepStatus::Aborted => "[!]",
+        PlanStepStatus::Starting | PlanStepStatus::Running => "[-]",
+        PlanStepStatus::Queued => "[ ]",
+    }
+}
+
+pub(super) fn short_log_tail(text: &str) -> String {
+    truncate(&text.replace('\n', " "), 50)
 }
 
 pub(super) fn plan_output_row(row: &RenderedPlanOutputRow, selected: bool) -> Line<'static> {

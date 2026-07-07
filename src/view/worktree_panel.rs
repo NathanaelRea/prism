@@ -44,24 +44,7 @@ pub(super) fn worktree_detail_lines(model: &crate::view::FrameModel<'_>) -> Vec<
         }
     }
     lines.push(Line::from(""));
-    lines.extend(wt_column_detail_lines(session));
-    lines.push(Line::from(""));
     lines.extend(pr_panel_lines(model.config, Some(session)));
-    lines
-}
-
-pub(super) fn wt_column_detail_lines(session: &Session) -> Vec<Line<'static>> {
-    let mut lines = vec![heading_line("wt columns")];
-    if session.wt_columns.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "not loaded yet, or wt reported no column values",
-            muted_style(),
-        )));
-        return lines;
-    }
-    for (key, value) in &session.wt_columns {
-        lines.push(dynamic_labelled_line(key.clone(), value.clone()));
-    }
     lines
 }
 

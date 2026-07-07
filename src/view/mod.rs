@@ -73,6 +73,11 @@ pub(crate) enum DialogModel {
     Choice {
         choices: ChoiceList,
     },
+    WorktreeColumns {
+        title: String,
+        columns: Vec<WorktreeColumnChoice>,
+        selected: usize,
+    },
     Progress {
         title: String,
         message: String,
@@ -95,6 +100,12 @@ pub(crate) struct ChoiceList {
 pub(crate) struct KeyChoice {
     pub key: String,
     pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorktreeColumnChoice {
+    pub key: String,
+    pub enabled: bool,
 }
 
 pub(crate) type LeaderHintModel = ChoiceList;
