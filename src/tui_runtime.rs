@@ -2,11 +2,11 @@ use std::{io, time::Duration};
 
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyEvent},
+    event::{self, EnableMouseCapture, Event, KeyEvent, MouseEvent},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-use ratatui::{Terminal, backend::CrosstermBackend};
+use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 
 use crate::view;
 
@@ -17,6 +17,7 @@ pub(crate) struct TerminalRuntime {
 
 pub(crate) enum RuntimeEvent {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Resize,
 }
 
@@ -24,8 +25,8 @@ impl TerminalRuntime {
     pub(crate) fn enter() -> Result<Self, String> {
         enable_raw_mode().map_err(|error| error.to_string())?;
         let mut stdout = io::stdout();
-        if let Err(error) =
-            execute!(stdout, EnterAlternateScreen, Hide).map_err(|error| error.to_string())
+        if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)
+            .map_err(|error| error.to_string())
         {
             let _ = disable_raw_mode();
             return Err(error);
@@ -52,6 +53,13 @@ impl TerminalRuntime {
             .map_err(|error| error.to_string())
     }
 
+    pub(crate) fn area(&self) -> Result<Rect, String> {
+        self.terminal
+            .size()
+            .map(|size| Rect::new(0, 0, size.width, size.height))
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn suspend(&mut self) -> Result<(), String> {
         if !self.active {
             return Ok(());
@@ -66,7 +74,8 @@ impl TerminalRuntime {
             return Ok(());
         }
         enable_raw_mode().map_err(|error| error.to_string())?;
-        execute!(io::stdout(), EnterAlternateScreen, Hide).map_err(|error| error.to_string())?;
+        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, Hide)
+            .map_err(|error| error.to_string())?;
         self.active = true;
         self.terminal.clear().map_err(|error| error.to_string())?;
         Ok(())
@@ -78,8 +87,9 @@ impl TerminalRuntime {
         }
         match event::read().map_err(|error| error.to_string())? {
             Event::Key(event) => Ok(Some(RuntimeEvent::Key(event))),
+            Event::Mouse(event) => Ok(Some(RuntimeEvent::Mouse(event))),
             Event::Resize(_, _) => Ok(Some(RuntimeEvent::Resize)),
-            Event::FocusGained | Event::FocusLost | Event::Mouse(_) | Event::Paste(_) => Ok(None),
+            Event::FocusGained | Event::FocusLost | Event::Paste(_) => Ok(None),
         }
     }
 
@@ -96,14 +106,25 @@ impl TerminalRuntime {
     }
 
     fn leave_active_terminal(&mut self) -> Result<(), String> {
-        execute!(io::stdout(), LeaveAlternateScreen, Show).map_err(|error| error.to_string())?;
+        execute!(
+            io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            LeaveAlternateScreen,
+            Show
+        )
+        .map_err(|error| error.to_string())?;
         disable_raw_mode().map_err(|error| error.to_string())
     }
 }
 
 impl Drop for TerminalRuntime {
     fn drop(&mut self) {
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        let _ = execute!(
+            io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            LeaveAlternateScreen,
+            Show
+        );
         let _ = disable_raw_mode();
     }
 }

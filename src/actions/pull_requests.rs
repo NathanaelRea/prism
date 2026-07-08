@@ -112,13 +112,11 @@ impl Tui {
         }
         {
             let session = &mut self.sessions[selected];
-            refresh_branch_pr_cache(
-                &context.repo,
-                &context.config,
+            crate::github::refresh_pr_details_cache(
                 &session.branch,
-                &session.path,
                 &mut session.pr,
-                true,
+                &session.path,
+                &context.config,
             );
         }
         let prompt = build_review_fix_prompt(&self.sessions[selected], &context.config)?;

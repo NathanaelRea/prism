@@ -1,27 +1,39 @@
 use super::*;
 
 impl Tui {
+    #[cfg(test)]
     pub(crate) fn attach_selected_tmux_session(&mut self) -> Result<(), String> {
-        let Some(context) = self.selected_worktree_context() else {
+        let Some(index) = self.selected_worktree_index() else {
             return Ok(());
         };
-        let session = self.sessions[context.session_index].background_job_snapshot();
+        self.attach_tmux_session_for_index(index)
+    }
+
+    pub(crate) fn attach_tmux_session_for_index(
+        &mut self,
+        session_index: usize,
+    ) -> Result<(), String> {
+        let Some(session) = self.sessions.get(session_index) else {
+            return Ok(());
+        };
+        let Some(managed) = self.repos.get(session.repo_index) else {
+            return Ok(());
+        };
+        let repo = managed.repo.clone();
+        let config = managed.config.clone();
+        let session = self.sessions[session_index].background_job_snapshot();
         let use_ =
             crate::agent_session::session_use(&self.repos, &mut self.tmux_generations, &session);
         self.finish_tmux_warmup_for_key(&use_.warmup_key);
-        let running = crate::agent_session::attach_session(
-            &context.repo,
-            &context.config,
-            &session,
-            use_.generation,
-        )?;
+        let running =
+            crate::agent_session::attach_session(&repo, &config, &session, use_.generation)?;
         let outcome = crate::agent_session::apply_attach_result(
             &self.repos,
             &mut self.sessions,
             &mut self.tmux_generations,
             crate::agent_session::AgentSessionAttachCompletion {
-                repo: &context.repo,
-                config: &context.config,
+                repo: &repo,
+                config: &config,
                 session_use: use_,
                 branch: &session.branch,
                 running,

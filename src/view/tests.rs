@@ -120,7 +120,7 @@ fn renders_selected_sidebar_rows_with_focused_style() {
     );
     assert_cell_style(
         &buffer,
-        5,
+        8,
         row,
         Style::default()
             .fg(Color::Reset)
@@ -129,7 +129,7 @@ fn renders_selected_sidebar_rows_with_focused_style() {
     );
     assert_cell_style(
         &buffer,
-        16,
+        23,
         row,
         Style::default()
             .fg(Color::Green)
@@ -279,9 +279,9 @@ fn default_branch_row_hides_git_status_marker_but_keeps_wt_columns() {
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.worktrees[0].kind = WorktreeKind::DefaultBranch;
     let buffer = render_to_buffer(&model, 140, 30);
-    let row = line_text(&buffer, find_line(&buffer, "https://example"));
+    let row = line_text(&buffer, find_line(&buffer, "https://e"));
 
-    assert!(row.contains("https://example"), "got {row:?}");
+    assert!(row.contains("https://e"), "got {row:?}");
     assert!(!row.contains("✓"), "got {row:?}");
 }
 
@@ -301,7 +301,7 @@ fn default_branch_row_preserves_column_alignment() {
     model.worktrees[0].kind = WorktreeKind::DefaultBranch;
     let buffer = render_to_buffer(&model, 140, 30);
     let (main_x, main_y) = sidebar_cell_containing(&buffer, "main-url");
-    let (feature_x, feature_y) = sidebar_cell_containing(&buffer, "feature-url");
+    let (feature_x, feature_y) = sidebar_cell_containing(&buffer, "feature-u");
 
     assert_eq!(
         main_x,
@@ -342,7 +342,7 @@ fn worktree_sidebar_renders_missing_configured_columns_as_placeholders() {
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     let buffer = render_to_string(&model, 160, 30);
 
-    assert!(buffer.contains("12345678901234567~"));
+    assert!(buffer.contains("12345678901~"));
     assert!(buffer.contains("·"));
 }
 
@@ -351,9 +351,11 @@ fn clean_worktree_git_check_is_green() {
     let session = test_session("feature", AgentState::Running);
     let worktree = WorktreeRow {
         session_index: 0,
+        repo_label: "repo".to_string(),
         repo_root: "/repo".to_string(),
         worktree_path: "/repo/feature".to_string(),
         branch: session.branch.clone(),
+        visibility: session.visibility,
         kind: WorktreeKind::FeatureWorktree,
         agent_state: session.agent_state,
         status_label: session.status_label.clone(),
@@ -785,6 +787,7 @@ fn test_session(branch: &str, agent_state: AgentState) -> Session {
         branch: branch.to_string(),
         prompt_summary: "implement feature".to_string(),
         classification: crate::session::SessionClassification::Work,
+        visibility: 0,
         adopted: false,
         hidden: false,
         status_label: "clean".to_string(),
@@ -844,9 +847,11 @@ fn test_model<'a>(
             .enumerate()
             .map(|(index, session)| WorktreeRow {
                 session_index: index,
+                repo_label: "repo".to_string(),
                 repo_root: "/repo".to_string(),
                 worktree_path: session.path_display.clone(),
                 branch: session.branch.clone(),
+                visibility: session.visibility,
                 kind: WorktreeKind::FeatureWorktree,
                 agent_state: session.agent_state,
                 status_label: session.status_label.clone(),
@@ -863,6 +868,7 @@ fn test_model<'a>(
         selected_repo_label: "repo".to_string(),
         selected_repo_root: "/repo".to_string(),
         selected_session: Some(0),
+        selected_comment: 0,
         focus,
         main_focused: false,
         repo_main_view: RepoMainView::Github,

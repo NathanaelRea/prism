@@ -44,7 +44,11 @@ pub(super) fn worktree_detail_lines(model: &crate::view::FrameModel<'_>) -> Vec<
         }
     }
     lines.push(Line::from(""));
-    lines.extend(pr_panel_lines(model.config, Some(session)));
+    lines.extend(pr_panel_lines(
+        model.config,
+        Some(session),
+        model.selected_comment,
+    ));
     lines
 }
 

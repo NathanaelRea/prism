@@ -47,6 +47,27 @@ impl Tui {
         Ok(())
     }
 
+    pub(crate) fn open_home_terminal(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let home = crate::util::home_dir().ok_or_else(|| "HOME is not set".to_string())?;
+        let shell = std::env::var("SHELL")
+            .ok()
+            .filter(|shell| !shell.trim().is_empty())
+            .unwrap_or_else(|| "/bin/sh".to_string());
+        raw.suspend()?;
+        let result = Command::new(&shell).current_dir(&home).status();
+        let resume_result = raw.resume();
+        resume_result?;
+        let status = result.map_err(|error| format!("{shell}: {error}"))?;
+        if !status.success() {
+            return Err(format!("{shell} exited with {status}"));
+        }
+        self.show_message("returned from home terminal")?;
+        Ok(())
+    }
+
     #[allow(dead_code)]
     pub(crate) fn open_selected_repo_plan_mode(
         &mut self,

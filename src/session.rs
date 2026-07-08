@@ -61,6 +61,7 @@ pub struct Session {
     pub branch: String,
     pub prompt_summary: String,
     pub classification: SessionClassification,
+    pub visibility: i16,
     pub adopted: bool,
     pub hidden: bool,
     pub status_label: String,
@@ -146,6 +147,7 @@ impl Session {
             branch: self.branch.clone(),
             prompt_summary: self.prompt_summary.clone(),
             classification: self.classification,
+            visibility: self.visibility,
             adopted: self.adopted,
             hidden: self.hidden,
             status_label: self.status_label.clone(),
@@ -325,6 +327,10 @@ fn build_session(repo: &Repository, path: PathBuf, branch: String, config: &Conf
         .as_ref()
         .map(|metadata| metadata.classification)
         .unwrap_or_default();
+    let visibility = metadata
+        .as_ref()
+        .map(|metadata| metadata.visibility)
+        .unwrap_or_default();
     let adopted = metadata.is_some() || legacy_metadata_path.exists();
     let status_label = git_status_label(&path, config);
     let path_display = path.display().to_string();
@@ -339,6 +345,7 @@ fn build_session(repo: &Repository, path: PathBuf, branch: String, config: &Conf
         branch,
         prompt_summary,
         classification,
+        visibility,
         adopted,
         hidden: false,
         status_label,
@@ -359,13 +366,14 @@ pub fn write_task_metadata(
     observability::with_writable_db(repo, |conn| {
         conn.execute(
             "insert into task_metadata (
-                branch, prompt_summary, initial_prompt, worktree, classification, updated_unix_ms
-             ) values (?1, ?2, ?3, ?4, ?5, ?6)
+                branch, prompt_summary, initial_prompt, worktree, classification, visibility, updated_unix_ms
+             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              on conflict(branch) do update set
                 prompt_summary = excluded.prompt_summary,
                 initial_prompt = excluded.initial_prompt,
                 worktree = excluded.worktree,
                 classification = excluded.classification,
+                visibility = excluded.visibility,
                 updated_unix_ms = excluded.updated_unix_ms",
             params![
                 session.branch.as_str(),
@@ -373,6 +381,7 @@ pub fn write_task_metadata(
                 initial_prompt,
                 session.path_display.as_str(),
                 session.classification.label(),
+                session.visibility,
                 unix_seconds(),
             ],
         )
@@ -389,20 +398,51 @@ pub fn write_task_summary_metadata(
     observability::with_writable_db(repo, |conn| {
         conn.execute(
             "insert into task_metadata (
-                branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
-             ) values (?1, ?2, '', ?3, ?4)
+                branch, prompt_summary, initial_prompt, worktree, visibility, updated_unix_ms
+             ) values (?1, ?2, '', ?3, ?4, ?5)
              on conflict(branch) do update set
                 prompt_summary = excluded.prompt_summary,
                 worktree = excluded.worktree,
+                visibility = excluded.visibility,
                 updated_unix_ms = excluded.updated_unix_ms",
             params![
                 session.branch.as_str(),
                 summary,
                 session.path_display.as_str(),
+                session.visibility,
                 unix_seconds(),
             ],
         )
         .map_err(|error| format!("write task summary metadata: {error}"))?;
+        Ok(())
+    })
+}
+
+pub(crate) fn set_worktree_visibility(
+    repo: &Repository,
+    session: &Session,
+    visibility: i16,
+) -> Result<(), String> {
+    observability::with_writable_db(repo, |conn| {
+        conn.execute(
+            "insert into task_metadata (
+                branch, prompt_summary, initial_prompt, worktree, classification, visibility, updated_unix_ms
+             ) values (?1, ?2, '', ?3, ?4, ?5, ?6)
+             on conflict(branch) do update set
+                worktree = excluded.worktree,
+                classification = excluded.classification,
+                visibility = excluded.visibility,
+                updated_unix_ms = excluded.updated_unix_ms",
+            params![
+                session.branch.as_str(),
+                session.prompt_summary.as_str(),
+                session.path_display.as_str(),
+                session.classification.label(),
+                visibility,
+                unix_seconds(),
+            ],
+        )
+        .map_err(|error| format!("write worktree visibility: {error}"))?;
         Ok(())
     })
 }
@@ -416,6 +456,7 @@ pub(crate) fn migrate_worktree_session_schema(conn: &rusqlite::Connection) -> Re
           initial_prompt text not null,
           worktree text not null,
           classification text not null default 'work',
+          visibility integer not null default 0,
           updated_unix_ms integer not null
         );
 
@@ -445,6 +486,12 @@ pub(crate) fn migrate_worktree_session_schema(conn: &rusqlite::Connection) -> Re
         "task_metadata",
         "classification",
         "alter table task_metadata add column classification text not null default 'work'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "task_metadata",
+        "visibility",
+        "alter table task_metadata add column visibility integer not null default 0",
     )?;
     Ok(())
 }
@@ -662,17 +709,19 @@ fn load_agent_state(repo: &Repository, branch: &str) -> Option<AgentState> {
 struct TaskMetadata {
     prompt_summary: String,
     classification: SessionClassification,
+    visibility: i16,
 }
 
 fn load_task_metadata(repo: &Repository, branch: &str) -> Option<TaskMetadata> {
     observability::with_writable_db(repo, |conn| {
         conn.query_row(
-            "select prompt_summary, classification from task_metadata where branch = ?1",
+            "select prompt_summary, classification, visibility from task_metadata where branch = ?1",
             params![branch],
             |row| {
                 Ok(TaskMetadata {
                     prompt_summary: row.get(0)?,
                     classification: SessionClassification::parse(&row.get::<_, String>(1)?),
+                    visibility: row.get(2)?,
                 })
             },
         )
@@ -1063,6 +1112,7 @@ exit 0
             branch: branch.to_string(),
             prompt_summary: String::new(),
             classification: SessionClassification::Work,
+            visibility: 0,
             adopted: true,
             hidden: false,
             status_label: "clean".to_string(),

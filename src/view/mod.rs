@@ -38,6 +38,7 @@ pub(crate) struct FrameModel<'a> {
     pub selected_repo_label: String,
     pub selected_repo_root: String,
     pub selected_session: Option<usize>,
+    pub selected_comment: usize,
     pub focus: PanelFocus,
     pub main_focused: bool,
     pub repo_main_view: RepoMainView,
@@ -126,9 +127,11 @@ pub(crate) struct RepoRow {
 
 pub(crate) struct WorktreeRow {
     pub session_index: usize,
+    pub repo_label: String,
     pub repo_root: String,
     pub worktree_path: String,
     pub branch: String,
+    pub visibility: i16,
     pub kind: WorktreeKind,
     pub agent_state: AgentState,
     pub status_label: String,
@@ -223,13 +226,17 @@ mod tests;
 
 pub(crate) use shell::render;
 
+pub(crate) fn sidebar_width_for(cols: u16, configured_width: Option<u16>) -> u16 {
+    layout::sidebar_width(cols, configured_width)
+}
+
 use auto_dashboard::*;
 use dialog::*;
 use format::*;
 use layout::*;
 use main_panel::*;
 use plan_dashboard::*;
-use pr::*;
+pub(crate) use pr::*;
 use repo_panel::*;
 use sidebar::*;
 use style::*;

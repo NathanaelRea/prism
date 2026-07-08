@@ -138,6 +138,8 @@ pub struct PrComment {
     pub author: String,
     pub body: String,
     #[serde(default)]
+    pub severity: Option<String>,
+    #[serde(default)]
     pub created_at: String,
 }
 
@@ -148,6 +150,8 @@ pub struct PrReview {
     pub author: String,
     pub state: String,
     pub body: String,
+    #[serde(default)]
+    pub severity: Option<String>,
     #[serde(default)]
     pub submitted_at: String,
 }
@@ -160,6 +164,8 @@ pub struct PrReviewComment {
     pub path: String,
     pub line: String,
     pub body: String,
+    #[serde(default)]
+    pub severity: Option<String>,
     pub created_at: String,
     pub resolved: bool,
 }
@@ -1232,6 +1238,7 @@ fn parse_pr_comments(details: &GhPrViewDetails) -> Vec<PrComment> {
             id: object.id.clone(),
             author: first_non_empty([object.author.login.as_str(), object.user.login.as_str()]),
             body: object.body.clone(),
+            severity: None,
             created_at: object.created_at.clone(),
         })
         .filter(|comment| !comment.body.trim().is_empty())
@@ -1248,6 +1255,7 @@ fn parse_pr_reviews(details: &GhPrViewDetails) -> Vec<PrReview> {
             author: first_non_empty([object.author.login.as_str(), object.user.login.as_str()]),
             state: object.state.clone(),
             body: object.body.clone(),
+            severity: None,
             submitted_at: object.submitted_at.clone(),
         })
         .filter(|review| !review.state.trim().is_empty() || !review.body.trim().is_empty())
@@ -1314,6 +1322,7 @@ fn parse_inline_review_comments(raw: &str) -> Vec<PrReviewComment> {
                 .map(|line| line.to_string())
                 .unwrap_or_default(),
             body: object.body,
+            severity: None,
             created_at: object.created_at,
             resolved: false,
         })
@@ -1342,6 +1351,7 @@ pub fn parse_review_thread_comments(raw: &str) -> Vec<PrReviewComment> {
                     .map(|line| line.to_string())
                     .unwrap_or_default(),
                 body: object.body,
+                severity: None,
                 created_at: object.created_at,
                 resolved: thread.is_resolved,
             };
@@ -2563,6 +2573,7 @@ JSON
             branch: branch.to_string(),
             prompt_summary: String::new(),
             classification: crate::session::SessionClassification::Work,
+            visibility: 0,
             adopted: false,
             hidden: false,
             status_label: String::new(),

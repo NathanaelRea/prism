@@ -9,17 +9,22 @@ pub(super) fn render_main(frame: &mut Frame<'_>, area: Rect, model: &crate::view
     .height
     .saturating_sub(0) as usize;
     let width = area.width.saturating_sub(2) as usize;
-    let lines = if let Some(dashboard) = &model.auto_dashboard {
-        auto_dashboard_lines(dashboard, width, content_area)
-    } else if let Some(dashboard) = &model.plan_dashboard {
-        plan_dashboard_lines(dashboard, width, content_area)
-    } else {
-        match model.focus {
-            PanelFocus::Status => status_dashboard_lines(model),
-            PanelFocus::Repos => repo_overview_lines(model, width, content_area),
-            PanelFocus::Worktrees => worktree_detail_lines(model),
-        }
+    let mut lines = match model.focus {
+        PanelFocus::Status => status_dashboard_lines(model),
+        PanelFocus::Repos => repo_overview_lines(model, width, content_area),
+        PanelFocus::Worktrees => worktree_detail_lines(model),
     };
+    if model.focus == PanelFocus::Worktrees {
+        if let Some(dashboard) = &model.plan_dashboard {
+            lines.push(Line::from(""));
+            lines.extend(plan_dashboard_lines(dashboard, width, content_area));
+        }
+        if let Some(dashboard) = &model.auto_dashboard {
+            lines.push(Line::from(""));
+            lines.extend(auto_dashboard_lines(dashboard, width, content_area));
+        }
+        lines.truncate(content_area);
+    }
     frame.render_widget(
         Paragraph::new(lines)
             .block(panel_block(
@@ -48,7 +53,8 @@ pub(super) fn status_dashboard_lines(model: &crate::view::FrameModel<'_>) -> Vec
         Line::from(""),
         heading_line("Navigation"),
         Line::from("1 status  2 repos  3 worktrees"),
-        Line::from("Tab cycles focus; repos h/l switches views"),
+        Line::from("Enter opens terminal ~/; Tab cycles focus"),
+        Line::from("repos h/l switches views"),
         Line::from("e edits repo config; E edits user config"),
         Line::from(""),
         heading_line("Documentation"),

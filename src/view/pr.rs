@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn pr_panel_lines(
     config: &crate::config::Config,
     session: Option<&Session>,
+    selected_comment: usize,
 ) -> Vec<Line<'static>> {
     let Some(session) = session else {
         return vec![Line::from(Span::styled(
@@ -87,7 +88,7 @@ pub(super) fn pr_panel_lines(
             Span::styled("  files ", muted_style()),
             Span::raw(details.files.len().to_string()),
         ]));
-        lines.extend(pr_comment_lines(details, 5));
+        lines.extend(pr_comment_lines(details, 5, selected_comment));
         if !details.failing_checks.is_empty() {
             lines.push(Line::from(Span::styled("Failing checks", error_style())));
             for check in details.failing_checks.iter().take(3) {
@@ -120,55 +121,22 @@ pub(super) fn pr_panel_lines(
 pub(super) fn pr_comment_lines(
     details: &crate::github::PrDetails,
     max_comments: usize,
+    selected: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(""), heading_line("Comments")];
-    let mut shown = 0;
-    for comment in details.comments.iter().rev() {
-        if shown >= max_comments {
-            break;
-        }
-        append_comment(&mut lines, &comment.author, "", &comment.body);
-        shown += 1;
-    }
-    for review in details
-        .reviews
-        .iter()
-        .rev()
-        .filter(|review| !review.body.trim().is_empty())
-    {
-        if shown >= max_comments {
-            break;
-        }
-        append_comment(
-            &mut lines,
-            &review.author,
-            review_label(&review.state),
-            &review.body,
-        );
-        shown += 1;
-    }
-    for comment in details.review_comments.iter().rev() {
-        if shown >= max_comments {
-            break;
-        }
-        let context = if comment.line.is_empty() {
-            comment.path.clone()
-        } else {
-            format!("{}:{}", comment.path, comment.line)
-        };
-        append_comment(&mut lines, &comment.author, &context, &comment.body);
-        shown += 1;
+    lines.push(Line::from(vec![Span::styled(
+        "  kind   sev res author       text",
+        muted_style(),
+    )]));
+    let rows = pr_comment_rows(details);
+    let shown = rows.len().min(max_comments);
+    for (index, row) in rows.iter().take(max_comments).enumerate() {
+        lines.push(pr_comment_row_line(row, index == selected));
     }
     if shown == 0 {
         lines.push(Line::from(Span::styled("No comments", muted_style())));
     }
-    let total = details.comments.len()
-        + details.review_comments.len()
-        + details
-            .reviews
-            .iter()
-            .filter(|review| !review.body.trim().is_empty())
-            .count();
+    let total = rows.len();
     if total > shown {
         lines.push(Line::from(Span::styled(
             format!("+{} more", total - shown),
@@ -176,6 +144,120 @@ pub(super) fn pr_comment_lines(
         )));
     }
     lines
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PrCommentDisplayRow {
+    pub kind: String,
+    pub author: String,
+    pub context: String,
+    pub body: String,
+    pub severity: String,
+    pub resolved: String,
+}
+
+pub(crate) fn pr_comment_rows(details: &crate::github::PrDetails) -> Vec<PrCommentDisplayRow> {
+    let mut rows = Vec::new();
+    for comment in details.comments.iter().rev() {
+        rows.push(PrCommentDisplayRow {
+            kind: "root".to_string(),
+            author: display_author(&comment.author),
+            context: String::new(),
+            body: one_line_comment(&comment.body),
+            severity: comment.severity.clone().unwrap_or_else(|| ".".to_string()),
+            resolved: ".".to_string(),
+        });
+    }
+    for review in details
+        .reviews
+        .iter()
+        .rev()
+        .filter(|review| !review.body.trim().is_empty())
+    {
+        rows.push(PrCommentDisplayRow {
+            kind: "review".to_string(),
+            author: display_author(&review.author),
+            context: review_label(&review.state).to_string(),
+            body: one_line_comment(&review.body),
+            severity: review.severity.clone().unwrap_or_else(|| ".".to_string()),
+            resolved: ".".to_string(),
+        });
+    }
+    for comment in details.review_comments.iter().rev() {
+        let context = if comment.line.is_empty() {
+            comment.path.clone()
+        } else {
+            format!("{}:{}", comment.path, comment.line)
+        };
+        rows.push(PrCommentDisplayRow {
+            kind: "inline".to_string(),
+            author: display_author(&comment.author),
+            context,
+            body: one_line_comment(&comment.body),
+            severity: comment.severity.clone().unwrap_or_else(|| ".".to_string()),
+            resolved: if comment.resolved { "yes" } else { "no" }.to_string(),
+        });
+    }
+    rows
+}
+
+pub(super) fn pr_comment_row_line(row: &PrCommentDisplayRow, selected: bool) -> Line<'static> {
+    let marker = if selected { ">" } else { " " };
+    Line::from(vec![
+        Span::styled(format!("{marker} "), title_style(selected)),
+        Span::styled(format!("{:<6} ", truncate(&row.kind, 6)), muted_style()),
+        Span::styled(
+            format!("{:<3} ", truncate(&row.severity, 3)),
+            severity_style(&row.severity),
+        ),
+        Span::styled(
+            format!("{:<3} ", truncate(&row.resolved, 3)),
+            resolved_style(&row.resolved),
+        ),
+        Span::styled(format!("{:<12} ", truncate(&row.author, 12)), muted_style()),
+        Span::styled(
+            truncate(&row.body, 50),
+            if selected {
+                selected_text_style()
+            } else {
+                Style::default()
+            },
+        ),
+    ])
+}
+
+fn display_author(author: &str) -> String {
+    if author.trim().is_empty() {
+        "unknown".to_string()
+    } else {
+        author.trim().to_string()
+    }
+}
+
+fn one_line_comment(body: &str) -> String {
+    let text = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if text.is_empty() {
+        "empty comment".to_string()
+    } else {
+        text
+    }
+}
+
+fn severity_style(severity: &str) -> Style {
+    match severity.to_ascii_lowercase().as_str() {
+        "high" => error_style(),
+        "medium" => attention_style(),
+        "low" => muted_style(),
+        _ => muted_style(),
+    }
+}
+
+fn resolved_style(resolved: &str) -> Style {
+    if resolved.eq_ignore_ascii_case("no") {
+        attention_style()
+    } else {
+        muted_style()
+    }
 }
 
 pub(super) fn append_comment(

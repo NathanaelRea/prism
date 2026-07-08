@@ -998,6 +998,7 @@ fn review_poll_detects_new_actionable_pr_comments() {
             id: "comment-1".to_string(),
             author: "github-copilot".to_string(),
             body: "Please simplify this branch.".to_string(),
+            severity: None,
             created_at: "2026-01-01T00:01:00Z".to_string(),
         }],
         ..crate::github::PrDetails::default()
@@ -1036,6 +1037,7 @@ fn review_poll_skips_feedback_at_or_before_baseline() {
             id: "comment-1".to_string(),
             author: "github-copilot".to_string(),
             body: "Already handled.".to_string(),
+            severity: None,
             created_at: "2026-01-01T00:05:00Z".to_string(),
         }],
         ..crate::github::PrDetails::default()
@@ -1249,6 +1251,7 @@ fn merge_gate_blocks_dirty_draft_failed_ci_stale_head_and_review_feedback() {
             id: "comment-1".to_string(),
             author: "github-copilot".to_string(),
             body: "Please fix this before merging.".to_string(),
+            severity: None,
             created_at: "2026-01-01T00:01:00Z".to_string(),
         }],
         ..PrDetails::default()

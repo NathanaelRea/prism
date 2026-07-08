@@ -472,6 +472,7 @@ mod tests {
             branch: branch.to_string(),
             prompt_summary: String::new(),
             classification: crate::session::SessionClassification::Work,
+            visibility: 0,
             adopted: true,
             hidden: false,
             status_label: String::new(),

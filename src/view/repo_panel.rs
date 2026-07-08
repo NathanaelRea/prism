@@ -282,7 +282,7 @@ pub(super) fn repo_preview_lines(
             Span::styled("  files ", muted_style()),
             Span::raw(details.files.len().to_string()),
         ]));
-        lines.extend(pr_comment_lines(details, 3));
+        lines.extend(pr_comment_lines(details, 3, 0));
         if !details.failing_checks.is_empty() {
             lines.push(Line::from(Span::styled("Failing checks", error_style())));
             for check in details.failing_checks.iter().take(2) {
