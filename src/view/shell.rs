@@ -31,12 +31,12 @@ pub(super) fn render_footer(
     model: &crate::view::FrameModel<'_>,
 ) {
     let actions = match model.focus {
-        PanelFocus::Status => "1/2/3 sidebars  0 main  Tab next  P plan  A auto  ? help  q quit",
+        PanelFocus::Status => "1/2/3 panels  0 main  Enter ~/  Tab/S-Tab  ? help  q quit",
         PanelFocus::Repos => {
-            "j/k select  0 main  Enter worktrees  C columns  R manage  / search  q quit"
+            "j/k select  Enter tmux  c create  U unarchive  C columns  R manage  / search  q quit"
         }
         PanelFocus::Worktrees => {
-            "j/k select  0 main  Enter tmux  c create  D archive  U unarchive  X delete  q quit"
+            "j/k select  +/- visibility  0 main  Enter tmux  D archive  X delete  / search  q quit"
         }
     };
     let mut spans = vec![

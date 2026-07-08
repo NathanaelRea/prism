@@ -135,8 +135,17 @@ pub(super) fn render_worktrees(
             area.width.saturating_sub(2) as usize,
             &model.config.worktree_columns,
         );
+        let repo_width = model
+            .worktrees
+            .iter()
+            .map(|worktree| worktree.repo_label.chars().count())
+            .max()
+            .unwrap_or(4)
+            .clamp(4, 10);
         let mut rows = vec![ListItem::new(Line::from(
             vec![
+                Span::styled(format!("{:<repo_width$} ", "repo"), muted_style()),
+                Span::styled("V ", muted_style()),
                 Span::styled(format!("{:<12} ", "branch"), muted_style()),
                 Span::styled("K ", muted_style()),
                 Span::styled("A ", muted_style()),
@@ -171,6 +180,17 @@ pub(super) fn render_worktrees(
                     )
                 };
             let mut spans = vec![
+                Span::styled(
+                    format!(
+                        "{:<repo_width$} ",
+                        truncate_column(&worktree.repo_label, repo_width)
+                    ),
+                    muted_style(),
+                ),
+                Span::styled(
+                    format!("{} ", visibility_marker(worktree.visibility)),
+                    visibility_style(worktree.visibility),
+                ),
                 Span::raw(format!("{:<12} ", truncate_column(&worktree.branch, 12))),
                 Span::styled(
                     format!("{} ", classification_marker(worktree.classification)),
@@ -256,6 +276,21 @@ pub(super) fn render_selected_row_outline(
     );
 }
 
+pub(super) fn visibility_marker(visibility: i16) -> &'static str {
+    match visibility.cmp(&0) {
+        std::cmp::Ordering::Greater => "^",
+        std::cmp::Ordering::Less => "V",
+        std::cmp::Ordering::Equal => ".",
+    }
+}
+
+pub(super) fn visibility_style(visibility: i16) -> Style {
+    match visibility.cmp(&0) {
+        std::cmp::Ordering::Greater => attention_style(),
+        std::cmp::Ordering::Less | std::cmp::Ordering::Equal => muted_style(),
+    }
+}
+
 pub(super) fn classification_marker(
     classification: crate::session::SessionClassification,
 ) -> &'static str {
@@ -281,7 +316,7 @@ pub(super) fn configured_worktree_column_widths(
     if configured_columns.is_empty() {
         return Vec::new();
     }
-    let base_width = 28;
+    let base_width = 42;
     let available = inner_width.saturating_sub(base_width);
     if available < 6 {
         return Vec::new();

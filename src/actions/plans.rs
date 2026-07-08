@@ -116,6 +116,7 @@ impl Tui {
         });
     }
 
+    #[allow(dead_code)]
     pub(crate) fn open_current_plan_tmux_session(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,

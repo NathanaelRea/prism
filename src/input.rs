@@ -41,6 +41,7 @@ impl KeyInput {
                 Key::Leader
             }
             KeyCode::Tab => Key::FocusNext,
+            KeyCode::BackTab => Key::FocusPrevious,
             KeyCode::Enter => Key::OpenTmuxSession,
             KeyCode::Up => Key::Up,
             KeyCode::Down => Key::Down,
@@ -55,6 +56,8 @@ impl KeyInput {
             KeyCode::Char('{') if plain_char(event) => Key::PreviousBlock,
             KeyCode::Char('}') if plain_char(event) => Key::NextBlock,
             KeyCode::Char('r') if plain_char(event) => Key::Refresh,
+            KeyCode::Char('+') | KeyCode::Char('=') if plain_char(event) => Key::VisibilityUp,
+            KeyCode::Char('-') if plain_char(event) => Key::VisibilityDown,
             KeyCode::Char('0') if plain_char(event) => Key::FocusMain,
             KeyCode::Char('1') if plain_char(event) => Key::FocusStatus,
             KeyCode::Char('2') if plain_char(event) => Key::FocusRepos,
@@ -147,6 +150,7 @@ pub enum Key {
     Left,
     Right,
     FocusNext,
+    FocusPrevious,
     FocusMain,
     FocusStatus,
     FocusRepos,
@@ -165,6 +169,8 @@ pub enum Key {
     Terminal,
     Help,
     Refresh,
+    VisibilityUp,
+    VisibilityDown,
     RepoShortcut(char),
     ManageRepos,
     EditWorktreeColumns,

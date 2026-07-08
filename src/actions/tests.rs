@@ -702,6 +702,7 @@ fn test_session(path: PathBuf, branch: &str) -> Session {
         branch: branch.to_string(),
         prompt_summary: String::new(),
         classification: crate::session::SessionClassification::Work,
+        visibility: 0,
         adopted: false,
         hidden: false,
         status_label: "clean".to_string(),
