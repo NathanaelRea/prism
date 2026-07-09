@@ -463,8 +463,18 @@ fn worktree_path_registered(
     )?;
     Ok(output.lines().any(|line| {
         line.strip_prefix("worktree ")
-            .is_some_and(|current| Path::new(current) == path)
+            .is_some_and(|current| worktree_paths_match(Path::new(current), path))
     }))
+}
+
+fn worktree_paths_match(registered: &Path, selected: &Path) -> bool {
+    if registered == selected {
+        return true;
+    }
+    matches!(
+        (registered.canonicalize(), selected.canonicalize()),
+        (Ok(registered), Ok(selected)) if registered == selected
+    )
 }
 
 fn prune_worktrees(repo: &Repository, config: &Config) -> Result<(), String> {
@@ -871,6 +881,61 @@ exit 0
 
         let commands = fs::read_to_string(&log).unwrap();
         assert!(commands.contains("worktree prune"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn remove_worktree_does_not_recover_when_equivalent_path_is_registered() {
+        let temp = unique_temp_dir("prism-remove-worktree-registered-path-test");
+        fs::create_dir_all(&temp).unwrap();
+        let actual_path = temp.join("worktree");
+        let alternate_parent = temp.join("alternate-parent");
+        fs::create_dir_all(&actual_path).unwrap();
+        fs::create_dir_all(&alternate_parent).unwrap();
+        fs::write(actual_path.join("leftover.txt"), "leftover\n").unwrap();
+        let selected_path = alternate_parent.join("..").join("worktree");
+        let log = temp.join("git.log");
+        let git = temp.join("git");
+        write_executable(
+            &git,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"worktree remove --force"*)
+    echo "failed to delete '{}': Directory not empty" >&2
+    exit 1
+    ;;
+  *"worktree list --porcelain"*)
+    printf 'worktree {}\nbranch refs/heads/feature/delete\n\n'
+    exit 0
+    ;;
+  *"worktree prune"*)
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+                log.display(),
+                selected_path.display(),
+                actual_path.display()
+            ),
+        );
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+
+        let error = remove_worktree(&repo, &config, &selected_path).unwrap_err();
+
+        assert!(error.contains("Directory not empty"));
+        assert!(actual_path.exists());
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(commands.contains("worktree list --porcelain"));
+        assert!(!commands.contains("worktree prune"));
 
         let _ = fs::remove_dir_all(temp);
     }
