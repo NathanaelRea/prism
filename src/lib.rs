@@ -24,6 +24,7 @@ mod terminal;
 mod tmux;
 mod tui;
 mod tui_runtime;
+mod ui_state;
 mod util;
 mod verify;
 mod view;

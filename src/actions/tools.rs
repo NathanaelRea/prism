@@ -78,10 +78,12 @@ impl Tui {
             .ok_or_else(|| "no selected repository".to_string())?;
         let root = context.repo.root.clone();
         let config = context.config.clone();
+        let navigation = self.navigation_snapshot();
         raw.suspend()?;
         let result = open_plan_mode(&config, &root);
         let resume_result = raw.resume();
         self.refresh_sessions()?;
+        self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
         resume_result?;
@@ -100,10 +102,12 @@ impl Tui {
         };
         let path = self.sessions[context.session_index].path.clone();
         let config = context.config.clone();
+        let navigation = self.navigation_snapshot();
         raw.suspend()?;
         let result = open_plan_mode(&config, &path);
         let resume_result = raw.resume();
         self.refresh_sessions()?;
+        self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
         resume_result?;

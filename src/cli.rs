@@ -12,7 +12,7 @@ use crate::observability::{self, LogLevel, ObserverOptions};
 use crate::plan_run::PlanRunMode;
 use crate::repo::Repository;
 use crate::tui::ManagedRepo;
-use crate::{config, plan, session, setup, tui, workspace};
+use crate::{config, plan, session, setup, tui, ui_state, workspace};
 use std::process::{Command as ProcessCommand, Stdio};
 
 pub fn run() -> Result<(), String> {
@@ -64,7 +64,7 @@ pub fn run() -> Result<(), String> {
             run_debug_command(command, &repo, &mut config)
         }
         CommandKind::Db(command) => {
-            let (repo, _) = load_single_repo_context(args.repo.as_deref())?;
+            let repo = load_db_repo_context(args.repo.as_deref())?;
             run_db_command(command, &repo)
         }
         CommandKind::Tui => run_tui(args.repo.as_deref()),
@@ -129,6 +129,27 @@ fn load_single_repo_context(
     Ok((repo, config))
 }
 
+fn load_db_repo_context(repo_arg: Option<&std::path::Path>) -> Result<Repository, String> {
+    if repo_arg.is_some() {
+        let (repo, _) = load_single_repo_context(repo_arg)?;
+        return Ok(repo);
+    }
+    match Repository::discover(None) {
+        Ok(repo) => {
+            observability::attach_repo(&repo);
+            Ok(repo)
+        }
+        Err(discover_error) => {
+            let entries = workspace::discover_valid_entries(workspace::load_entries());
+            let Some(entry) = entries.into_iter().next() else {
+                return Err(discover_error);
+            };
+            observability::attach_repo(&entry.repo);
+            Ok(entry.repo)
+        }
+    }
+}
+
 fn observer_options(args: &Args) -> ObserverOptions {
     let log_level = args.log_level.unwrap_or(if args.debug {
         LogLevel::Debug
@@ -183,6 +204,7 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
         let mut tui = observability::phase("initialize_tui", || {
             Ok(tui::Tui::new(repos, selected_repo, sessions))
         })?;
+        tui.use_persisted_ui_state(ui_state::path());
         tui.select_repo(selected_repo);
         observability::phase("run_tui", || tui.run())
     })();
