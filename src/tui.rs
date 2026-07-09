@@ -177,6 +177,7 @@ pub(crate) enum PanelFocus {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OpenTmuxSessionTarget {
     HomeTerminal,
+    PlanPhaseAgent,
     WorktreeAgent,
     RepoDefaultAgent(usize),
     Blocked(&'static str),
@@ -591,6 +592,11 @@ impl Tui {
                         OpenTmuxSessionTarget::RepoDefaultAgent(index) => {
                             self.enter_agent_mode_for_index(&mut runtime, index)?
                         }
+                        OpenTmuxSessionTarget::PlanPhaseAgent => {
+                            if let Err(error) = self.open_current_plan_tmux_session(&mut runtime) {
+                                self.show_error("plan phase tmux failed", &error)?;
+                            }
+                        }
                         OpenTmuxSessionTarget::WorktreeAgent => {
                             self.enter_agent_mode(&mut runtime)?
                         }
@@ -937,7 +943,7 @@ impl Tui {
             "0            focus main panel for the selected sidebar",
             "Tab / Shift-Tab  move focus between panels",
             "h/l, left/right arrows  repos: switch view; status plan: switch phase",
-            "Enter       status: terminal ~/; repos: open default-branch tmux; worktrees: open agent; main comments: details",
+            "Enter       status: terminal ~/; repos: open default-branch tmux; worktrees: open agent or selected plan phase; main comments: details",
             "Ctrl-/       open tmux window 3: terminal",
             "p            repos: pull default branch",
             "P            worktrees: start or focus a plan run dashboard",
@@ -1399,6 +1405,9 @@ impl Tui {
                 }
             }
             PanelFocus::Worktrees => {
+                if self.main_focused && self.current_plan_dashboard().is_some() {
+                    return OpenTmuxSessionTarget::PlanPhaseAgent;
+                }
                 if self.selected_worktree_context().is_none() {
                     return OpenTmuxSessionTarget::Blocked(
                         "selected repository has no visible worktrees",
@@ -2914,6 +2923,20 @@ mod tests {
         assert_eq!(
             tui.open_tmux_session_target(),
             OpenTmuxSessionTarget::WorktreeAgent
+        );
+    }
+
+    #[test]
+    fn open_tmux_session_target_opens_selected_plan_phase_from_main() {
+        let mut tui = test_tui();
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.select_worktree(1);
+        tui.focus_main();
+        tui.remember_plan_run(test_plan_run_with_steps("plan", "/repo-one/feature-one", 1));
+
+        assert_eq!(
+            tui.open_tmux_session_target(),
+            OpenTmuxSessionTarget::PlanPhaseAgent
         );
     }
 

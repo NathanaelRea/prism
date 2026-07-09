@@ -11,7 +11,7 @@ Prism uses a lazygit-style panel model.
 - `j` / `k` or up/down moves within the focused row panel.
 - `g g` jumps to the top of the focused list.
 - `G` jumps to the bottom of the focused list.
-- `Enter` and `Space Space` share the same go-deeper behavior: Status operates the active dashboard or focuses Repos, Repos focuses Worktrees for the selected repository, and Worktrees opens the selected agent session when valid.
+- `Enter` and `Space Space` share the same go-deeper behavior: Status operates the active dashboard or focuses Repos, Repos focuses Worktrees for the selected repository, and Worktrees opens the selected agent session when valid. From a focused Worktrees plan dashboard, `Enter` switches the worktree OpenCode runtime to the selected phase session and opens tmux.
 - Default branch worktrees are not agent targets; `Enter` and `Space Space` show the same blocked message there.
 - `Space Enter` opens tmux window 3: terminal.
 - `Ctrl-/` also opens tmux window 3 where the terminal reports that key combination distinctly; use `Space Enter` as the reliable alternative.
@@ -21,7 +21,7 @@ Prism uses a lazygit-style panel model.
 - `Space g M` merges the selected pull request.
 - `Space g c` sends a CI-failure prompt to a new agent session for the selected worktree.
 - `Space g f` sends a review-fix prompt to a new agent session for the selected worktree.
-- `P` opens plan mode from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through `opencode run`. Active plan runs render automatically in the Worktrees main panel for the selected worktree.
+- `P` opens plan mode from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through `opencode run`. Active plan runs render automatically in the Worktrees main panel for the selected worktree; focus the main panel with `0`, select phases with `j/k`, and press `Enter` to step into that phase's OpenCode session in tmux.
 - `A` starts or focuses Auto Flow for the selected non-default worktree.
 - `u` pauses/resumes the selected Auto Flow or plan run from Status or the Worktrees main panel; paused Auto Flow resumes only after a dialog describes the next step.
 - `f` retries failed Auto Flow or Plan steps from the active dashboard.

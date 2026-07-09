@@ -124,29 +124,24 @@ impl Tui {
         let Some((repo, plan_run)) = self.current_tmux_plan_run() else {
             return Ok(false);
         };
+        let selected_step = plan_run.run.selected_step;
         let Some(plan_step) = plan_run
             .steps
             .iter()
-            .find(|step| {
-                matches!(
-                    step.status,
-                    PlanStepStatus::Starting | PlanStepStatus::Running
-                ) && step.opencode_session_id.is_some()
-            })
-            .or_else(|| {
-                plan_run
-                    .steps
-                    .iter()
-                    .find(|step| step.step == plan_run.run.selected_step)
-            })
+            .find(|step| step.step == selected_step)
         else {
-            self.show_message("selected plan run has no phase session yet")?;
+            self.show_message("selected plan phase was not found")?;
             return Ok(false);
         };
-        let Some(session_id) = plan_step.opencode_session_id.as_deref() else {
+        let Some(server_url) = plan_step.opencode_server_url.clone() else {
+            self.show_message("selected plan phase has no OpenCode server yet")?;
+            return Ok(false);
+        };
+        let Some(session_id) = plan_step.opencode_session_id.clone() else {
             self.show_message("selected plan phase has no OpenCode session yet")?;
             return Ok(false);
         };
+        let (_, server_port) = crate::opencode::parse_localhost_url(&server_url)?;
         let Some(session_index) = self.sessions.iter().position(|session| {
             session.path == plan_run.run.scope_path
                 && self
@@ -161,17 +156,48 @@ impl Tui {
             return Ok(true);
         };
         let config = managed.config.clone();
+        if config.default_agent != "opencode" {
+            self.show_message("selected worktree is not using OpenCode")?;
+            return Ok(false);
+        }
         let session = self.sessions[session_index].background_job_snapshot();
-        let mut runtime = crate::opencode::ensure_opencode_server(
-            &repo,
-            &config,
-            &session.branch,
-            &session.path,
-        )?;
-        let changed_session = runtime.opencode_session_id.as_deref() != Some(session_id);
-        if changed_session {
-            runtime.opencode_session_id = Some(session_id.to_string());
-            runtime.generation = runtime.generation.saturating_add(1);
+        let plan_runtime = crate::opencode::load_runtime(&repo, "plan", &session.path)
+            .ok()
+            .flatten()
+            .filter(|runtime| runtime.server_url == server_url);
+        let mut runtime = crate::opencode::load_runtime(&repo, &session.branch, &session.path)?
+            .unwrap_or_else(|| crate::opencode::OpencodeRuntime {
+                repo_root: repo.root.display().to_string(),
+                branch: session.branch.clone(),
+                worktree_path: session.path.display().to_string(),
+                server_port,
+                server_url: server_url.clone(),
+                server_pid: plan_runtime.as_ref().and_then(|runtime| runtime.server_pid),
+                opencode_session_id: None,
+                generation: 0,
+                updated_unix_ms: 0,
+            });
+        let server_pid = plan_runtime
+            .as_ref()
+            .and_then(|runtime| runtime.server_pid)
+            .or_else(|| {
+                (runtime.server_url == server_url)
+                    .then_some(runtime.server_pid)
+                    .flatten()
+            });
+        let changed_attach_target = runtime.server_url != server_url
+            || runtime.opencode_session_id.as_deref() != Some(session_id.as_str());
+        let changed_runtime = changed_attach_target
+            || runtime.server_port != server_port
+            || runtime.server_pid != server_pid;
+        if changed_runtime {
+            runtime.server_port = server_port;
+            runtime.server_url = server_url;
+            runtime.server_pid = server_pid;
+            runtime.opencode_session_id = Some(session_id);
+            if changed_attach_target {
+                runtime.generation = runtime.generation.saturating_add(1);
+            }
             runtime.updated_unix_ms = crate::auto_flow::unix_ms();
             crate::opencode::save_runtime(&repo, &runtime)?;
         }
@@ -179,7 +205,7 @@ impl Tui {
         let result = self.attach_tmux_window_for_session_index(
             session_index,
             TmuxWindow::Agent,
-            changed_session,
+            changed_attach_target,
         );
         let resume_result = raw.resume();
         self.refresh_sessions()?;
@@ -192,6 +218,14 @@ impl Tui {
     pub(super) fn current_tmux_plan_run(
         &self,
     ) -> Option<(crate::repo::Repository, crate::plan_run::PersistedPlanRun)> {
+        if let Some(dashboard) = self.current_plan_dashboard() {
+            return Some((
+                Repository {
+                    root: PathBuf::from(&dashboard.run.run.repo_root),
+                },
+                dashboard.run,
+            ));
+        }
         if let Some(dashboard) = self
             .current_auto_dashboard()
             .and_then(|dashboard| dashboard.linked_plan_dashboard)
@@ -203,13 +237,7 @@ impl Tui {
                 dashboard.run,
             ));
         }
-        let dashboard = self.current_plan_dashboard()?;
-        Some((
-            Repository {
-                root: PathBuf::from(&dashboard.run.run.repo_root),
-            },
-            dashboard.run,
-        ))
+        None
     }
 
     pub(crate) fn show_plan_actions_dialog(
