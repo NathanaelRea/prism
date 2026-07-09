@@ -19,6 +19,7 @@ pub(crate) enum RuntimeEvent {
     Key(KeyEvent),
     Mouse(MouseEvent),
     Resize,
+    FocusGained,
 }
 
 impl TerminalRuntime {
@@ -89,7 +90,8 @@ impl TerminalRuntime {
             Event::Key(event) => Ok(Some(RuntimeEvent::Key(event))),
             Event::Mouse(event) => Ok(Some(RuntimeEvent::Mouse(event))),
             Event::Resize(_, _) => Ok(Some(RuntimeEvent::Resize)),
-            Event::FocusGained | Event::FocusLost | Event::Paste(_) => Ok(None),
+            Event::FocusGained => Ok(Some(RuntimeEvent::FocusGained)),
+            Event::FocusLost | Event::Paste(_) => Ok(None),
         }
     }
 

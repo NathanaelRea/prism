@@ -25,7 +25,7 @@ use crate::{
         PlanStepStatus, plan_output_block_key,
     },
     session::{Session, SessionClassification},
-    tui::PanelFocus,
+    tui::{PanelFocus, WorktreeListMode},
     util::{status_count, truncate},
 };
 
@@ -44,6 +44,7 @@ pub(crate) struct FrameModel<'a> {
     pub main_focused: bool,
     pub repo_main_view: RepoMainView,
     pub worktree_main_view: WorktreeMainView,
+    pub worktree_list_mode: WorktreeListMode,
     pub mode_label: &'a str,
     pub status_message: Option<&'a str>,
     pub repo_filter: &'a str,
@@ -139,6 +140,8 @@ pub(crate) struct WorktreeRow {
     pub pr: PrCache,
     pub wt_columns: BTreeMap<String, String>,
     pub auto_status: Option<AutoRunStatus>,
+    pub plan_status: Option<PlanRunStatus>,
+    pub updated_label: String,
     pub unseen_comments: bool,
     pub prompt_summary: String,
     pub classification: SessionClassification,

@@ -878,22 +878,24 @@ pub fn load_runtime(
     })
 }
 
-pub(crate) fn load_runtimes_for_branch(
+pub(crate) fn load_runtimes_for_worktree_session(
     repo: &Repository,
     branch: &str,
+    worktree: &Path,
 ) -> Result<Vec<OpencodeRuntime>, String> {
     let repo_root = repo.root.display().to_string();
+    let worktree_path = worktree.display().to_string();
     observability::with_writable_db(repo, |conn| {
         let mut statement = conn
             .prepare(
                 "select repo_root, branch, worktree_path, server_port, server_url, server_pid,
                         opencode_session_id, generation, updated_unix_ms
                    from opencode_runtime
-                  where repo_root = ?1 and branch = ?2",
+                  where repo_root = ?1 and (branch = ?2 or worktree_path = ?3)",
             )
             .map_err(|error| format!("prepare opencode runtime lookup: {error}"))?;
         let rows = statement
-            .query_map(params![repo_root, branch], |row| {
+            .query_map(params![repo_root, branch, worktree_path], |row| {
                 let server_pid = row
                     .get::<_, Option<i64>>(5)?
                     .and_then(|pid| u32::try_from(pid).ok());
@@ -982,13 +984,15 @@ pub(crate) fn migrate_runtime_schema(conn: &rusqlite::Connection) -> Result<(), 
     Ok(())
 }
 
-pub(crate) fn remove_runtime_for_branch_with_conn(
+pub(crate) fn remove_runtime_for_worktree_session_with_conn(
     conn: &rusqlite::Connection,
+    repo_root: &str,
     branch: &str,
+    worktree_path: &str,
 ) -> Result<(), String> {
     conn.execute(
-        "delete from opencode_runtime where branch = ?1",
-        params![branch],
+        "delete from opencode_runtime where repo_root = ?1 and (branch = ?2 or worktree_path = ?3)",
+        params![repo_root, branch, worktree_path],
     )
     .map_err(|error| format!("remove opencode runtime: {error}"))?;
     Ok(())
@@ -1017,7 +1021,7 @@ pub fn allocate_port(
         let Some(port) = start.checked_add(step) else {
             break;
         };
-        if matches!(status(port), PortStatus::Free | PortStatus::OpenCode) {
+        if matches!(status(port), PortStatus::Free) {
             return Ok(port);
         }
     }
@@ -1144,7 +1148,7 @@ fn request(
     parse_response(&response)
 }
 
-fn parse_localhost_url(url: &str) -> Result<(String, u16), String> {
+pub(crate) fn parse_localhost_url(url: &str) -> Result<(String, u16), String> {
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| format!("unsupported opencode URL: {url}"))?;
@@ -1488,6 +1492,24 @@ mod tests {
                 }
             },
         )
+        .unwrap();
+
+        assert_eq!(port, derived + 1);
+    }
+
+    #[test]
+    fn allocate_port_skips_unstored_open_code_port() {
+        let derived = allocate_port("/repo", "/repo/wt", None, 41_000, 1_000, |_| {
+            PortStatus::Free
+        })
+        .unwrap();
+        let port = allocate_port("/repo", "/repo/wt", None, 41_000, 1_000, |candidate| {
+            if candidate == derived {
+                PortStatus::OpenCode
+            } else {
+                PortStatus::Free
+            }
+        })
         .unwrap();
 
         assert_eq!(port, derived + 1);

@@ -28,6 +28,8 @@ use crate::{
     },
 };
 
+use crate::tui::WorktreeListMode;
+
 use super::*;
 
 #[test]
@@ -96,9 +98,9 @@ fn renders_selected_sidebar_rows_with_focused_style() {
         4,
         row,
         Style::default()
-            .fg(Color::Reset)
-            .bg(Color::Reset)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            .fg(Color::White)
+            .bg(Color::Rgb(0, 96, 96))
+            .add_modifier(Modifier::BOLD),
     );
     assert_cell_style(
         &buffer,
@@ -126,9 +128,9 @@ fn renders_selected_sidebar_rows_with_focused_style() {
         8,
         row,
         Style::default()
-            .fg(Color::Reset)
-            .bg(Color::Reset)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            .fg(Color::White)
+            .bg(Color::Rgb(0, 96, 96))
+            .add_modifier(Modifier::BOLD),
     );
     assert_cell_style(
         &buffer,
@@ -136,8 +138,8 @@ fn renders_selected_sidebar_rows_with_focused_style() {
         row,
         Style::default()
             .fg(Color::Green)
-            .bg(Color::Reset)
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            .bg(Color::Rgb(0, 96, 96))
+            .add_modifier(Modifier::BOLD),
     );
     assert_cell_style(
         &buffer,
@@ -146,6 +148,58 @@ fn renders_selected_sidebar_rows_with_focused_style() {
         highlight_style()
             .bg(Color::Reset)
             .add_modifier(Modifier::BOLD),
+    );
+}
+
+#[test]
+fn renders_selected_sidebar_rows_with_unfocused_style() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Running)];
+
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let buffer = render_to_buffer(&model, 120, 30);
+    let (label_x, row) = sidebar_cell_containing(&buffer, "repo  ok");
+
+    assert_cell_style(
+        &buffer,
+        0,
+        row,
+        Style::default().fg(Color::DarkGray).bg(Color::Reset),
+    );
+    assert_cell_style(
+        &buffer,
+        label_x,
+        row,
+        Style::default().fg(Color::Reset).bg(Color::DarkGray),
+    );
+    assert_cell_style(
+        &buffer,
+        55,
+        row,
+        Style::default().fg(Color::DarkGray).bg(Color::Reset),
+    );
+
+    let model = test_model(&config, &sessions, PanelFocus::Repos, None, None);
+    let buffer = render_to_buffer(&model, 120, 30);
+    let (branch_x, row) = sidebar_cell_containing(&buffer, "feature");
+
+    assert_cell_style(
+        &buffer,
+        0,
+        row,
+        Style::default().fg(Color::DarkGray).bg(Color::Reset),
+    );
+    assert_cell_style(
+        &buffer,
+        branch_x,
+        row,
+        Style::default().fg(Color::Reset).bg(Color::DarkGray),
+    );
+    assert_cell_style(
+        &buffer,
+        55,
+        row,
+        Style::default().fg(Color::DarkGray).bg(Color::Reset),
     );
 }
 
@@ -365,6 +419,8 @@ fn clean_worktree_git_check_is_green() {
         pr: session.pr.clone(),
         wt_columns: session.wt_columns.clone(),
         auto_status: None,
+        plan_status: None,
+        updated_label: "-".to_string(),
         unseen_comments: session.unseen_comments,
         prompt_summary: session.prompt_summary.clone(),
         classification: session.classification,
@@ -979,6 +1035,8 @@ fn test_model<'a>(
                 pr: session.pr.clone(),
                 wt_columns: session.wt_columns.clone(),
                 auto_status: None,
+                plan_status: None,
+                updated_label: "-".to_string(),
                 unseen_comments: session.unseen_comments,
                 prompt_summary: session.prompt_summary.clone(),
                 classification: session.classification,
@@ -994,6 +1052,7 @@ fn test_model<'a>(
         main_focused: false,
         repo_main_view: RepoMainView::Github,
         worktree_main_view: WorktreeMainView::Details,
+        worktree_list_mode: WorktreeListMode::Repo,
         mode_label: "normal",
         status_message,
         repo_filter: "",

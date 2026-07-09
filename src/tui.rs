@@ -43,11 +43,16 @@ pub struct Tui {
     pub(crate) main_focused: bool,
     pub(crate) repo_main_view: view::RepoMainView,
     pub(crate) worktree_main_view: view::WorktreeMainView,
+    pub(crate) worktree_list_mode: WorktreeListMode,
+    ui_state_path: Option<PathBuf>,
     pub(crate) selected_comment: usize,
     pub(crate) selected_worktree_by_repo: BTreeMap<PathBuf, PathBuf>,
     pub(crate) pr_poll_tx: Sender<PrPollResult>,
     pub(crate) pr_poll_rx: Receiver<PrPollResult>,
     pub(crate) pr_polls_in_flight: BTreeSet<PrPollKey>,
+    pub(crate) delete_session_tx: Sender<DeleteSessionResult>,
+    pub(crate) delete_session_rx: Receiver<DeleteSessionResult>,
+    pub(crate) delete_sessions_in_flight: BTreeSet<DeleteSessionKey>,
     pub(crate) tmux_warmup_tx: Sender<AgentSessionWarmupResult>,
     pub(crate) tmux_warmup_rx: Receiver<AgentSessionWarmupResult>,
     pub(crate) tmux_warmups_in_flight: BTreeSet<AgentSessionWarmupKey>,
@@ -151,6 +156,17 @@ pub(crate) enum PrPollResult {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DeleteSessionKey {
+    pub repo_root: PathBuf,
+    pub path: PathBuf,
+}
+
+pub(crate) struct DeleteSessionResult {
+    pub key: DeleteSessionKey,
+    pub result: Result<(), String>,
+}
+
 impl PrPollKey {
     pub(crate) fn for_session(session: &Session) -> Self {
         Self {
@@ -175,11 +191,44 @@ pub(crate) enum PanelFocus {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorktreeListMode {
+    Repo,
+    Global,
+}
+
+impl WorktreeListMode {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Repo => "repo",
+            Self::Global => "all",
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            Self::Repo => Self::Global,
+            Self::Global => Self::Repo,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OpenTmuxSessionTarget {
     HomeTerminal,
+    PlanPhaseAgent,
     WorktreeAgent,
     RepoDefaultAgent(usize),
     Blocked(&'static str),
+}
+
+#[derive(Clone)]
+pub(crate) struct NavigationSnapshot {
+    focused_panel: PanelFocus,
+    main_focused: bool,
+    current_repo_root: Option<PathBuf>,
+    selected_worktree_path: Option<PathBuf>,
+    selected_comment: usize,
+    worktree_list_mode: WorktreeListMode,
 }
 
 pub(crate) struct WtPollResult {
@@ -297,6 +346,7 @@ struct TuiBackgroundChanges {
     plan_runs: bool,
     auto_runs: bool,
     pull_requests: bool,
+    delete_sessions: bool,
     status_message: bool,
 }
 
@@ -310,6 +360,7 @@ impl TuiBackgroundChanges {
             || self.plan_runs
             || self.auto_runs
             || self.pull_requests
+            || self.delete_sessions
             || self.status_message
     }
 }
@@ -328,6 +379,7 @@ fn ctrl_key(event: KeyEvent) -> bool {
 impl Tui {
     pub fn new(repos: Vec<ManagedRepo>, current_repo: usize, sessions: Vec<Session>) -> Self {
         let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
+        let (delete_session_tx, delete_session_rx) = mpsc::channel();
         let (tmux_warmup_tx, tmux_warmup_rx) = mpsc::channel();
         let (wt_poll_tx, wt_poll_rx) = mpsc::channel();
         let (default_branch_poll_tx, default_branch_poll_rx) = mpsc::channel();
@@ -358,11 +410,16 @@ impl Tui {
             main_focused: false,
             repo_main_view: view::RepoMainView::Github,
             worktree_main_view: view::WorktreeMainView::Details,
+            worktree_list_mode: WorktreeListMode::Repo,
+            ui_state_path: None,
             selected_comment: 0,
             selected_worktree_by_repo: BTreeMap::new(),
             pr_poll_tx,
             pr_poll_rx,
             pr_polls_in_flight: BTreeSet::new(),
+            delete_session_tx,
+            delete_session_rx,
+            delete_sessions_in_flight: BTreeSet::new(),
             tmux_warmup_tx,
             tmux_warmup_rx,
             tmux_warmups_in_flight: BTreeSet::new(),
@@ -411,6 +468,14 @@ impl Tui {
     #[cfg(test)]
     pub(crate) fn new_single(repo: Repository, config: Config, sessions: Vec<Session>) -> Self {
         Self::new(vec![ManagedRepo::new(repo, config, None)], 0, sessions)
+    }
+
+    pub(crate) fn use_persisted_ui_state(&mut self, path: PathBuf) {
+        if let Some(mode) = crate::ui_state::load_from_path(&path) {
+            self.worktree_list_mode = mode;
+            self.restore_selected_worktree_for_repo();
+        }
+        self.ui_state_path = Some(path);
     }
 
     pub(crate) fn sync_selected_repo_context(&mut self) {
@@ -482,6 +547,12 @@ impl Tui {
                     continue;
                 }
                 RuntimeEvent::Resize => {
+                    self.draw(&mut runtime)?;
+                    continue;
+                }
+                RuntimeEvent::FocusGained => {
+                    self.start_default_branch_status_poll(true);
+                    self.poll_pull_requests(true);
                     self.draw(&mut runtime)?;
                     continue;
                 }
@@ -590,6 +661,11 @@ impl Tui {
                         }
                         OpenTmuxSessionTarget::RepoDefaultAgent(index) => {
                             self.enter_agent_mode_for_index(&mut runtime, index)?
+                        }
+                        OpenTmuxSessionTarget::PlanPhaseAgent => {
+                            if let Err(error) = self.open_current_plan_tmux_session(&mut runtime) {
+                                self.show_error("plan phase tmux failed", &error)?;
+                            }
                         }
                         OpenTmuxSessionTarget::WorktreeAgent => {
                             self.enter_agent_mode(&mut runtime)?
@@ -867,6 +943,7 @@ impl Tui {
             plan_runs: self.poll_plan_runs(),
             auto_runs: self.poll_auto_runs(),
             pull_requests: self.poll_pull_requests(false),
+            delete_sessions: self.poll_delete_sessions(),
             status_message: self.expire_status_message(),
         };
         self.start_default_branch_status_poll(false);
@@ -876,6 +953,10 @@ impl Tui {
     }
 
     fn confirm_quit(&mut self, runtime: &mut TerminalRuntime) -> Result<bool, String> {
+        if !self.delete_sessions_in_flight.is_empty() {
+            self.show_message("delete in progress; wait for it to finish before quitting")?;
+            return Ok(false);
+        }
         if !self
             .sessions
             .iter()
@@ -902,10 +983,12 @@ impl Tui {
         runtime: &mut TerminalRuntime,
         index: usize,
     ) -> Result<(), String> {
+        let navigation = self.navigation_snapshot();
         runtime.suspend()?;
         let result = self.attach_tmux_session_for_index(index);
         let resume_result = runtime.resume();
         self.refresh_sessions()?;
+        self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();
         resume_result?;
         if let Err(error) = result {
@@ -922,10 +1005,12 @@ impl Tui {
         if self.selected >= self.sessions.len() {
             return Ok(());
         }
+        let navigation = self.navigation_snapshot();
         runtime.suspend()?;
         let result = self.attach_selected_tmux_window(window);
         let resume_result = runtime.resume();
         self.refresh_sessions()?;
+        self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();
         resume_result?;
         result
@@ -933,11 +1018,11 @@ impl Tui {
 
     fn show_keybindings_dialog(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
         let items = [
-            "1 / 2 / 3    focus status / repos / worktrees sidebars",
+            "1 / 2 / 3    focus status / repos / worktrees sidebars; 3 toggles repo/all worktrees",
             "0            focus main panel for the selected sidebar",
             "Tab / Shift-Tab  move focus between panels",
             "h/l, left/right arrows  repos: switch view; status plan: switch phase",
-            "Enter       status: terminal ~/; repos: open default-branch tmux; worktrees: open agent; main comments: details",
+            "Enter       status: terminal ~/; repos: open default-branch tmux; worktrees: open agent or selected plan phase; main comments: details",
             "Ctrl-/       open tmux window 3: terminal",
             "p            repos: pull default branch",
             "P            worktrees: start or focus a plan run dashboard",
@@ -1380,8 +1465,25 @@ impl Tui {
     }
 
     fn focus_worktrees(&mut self) {
+        let already_focused = self.focused_panel == PanelFocus::Worktrees && !self.main_focused;
+        if already_focused {
+            self.worktree_list_mode = self.worktree_list_mode.toggled();
+            self.persist_worktree_list_mode();
+        }
         self.focused_panel = PanelFocus::Worktrees;
         self.main_focused = false;
+        if self.worktree_list_mode == WorktreeListMode::Repo {
+            self.restore_selected_worktree_for_repo();
+        }
+    }
+
+    fn persist_worktree_list_mode(&self) {
+        let Some(path) = self.ui_state_path.as_deref() else {
+            return;
+        };
+        if let Err(error) = crate::ui_state::save_to_path(path, self.worktree_list_mode) {
+            let _ = append_runtime_log(&self.repo, &format!("UI state save failed: {error}"));
+        }
     }
 
     fn focus_main(&mut self) {
@@ -1399,6 +1501,9 @@ impl Tui {
                 }
             }
             PanelFocus::Worktrees => {
+                if self.main_focused && self.current_plan_dashboard().is_some() {
+                    return OpenTmuxSessionTarget::PlanPhaseAgent;
+                }
                 if self.selected_worktree_context().is_none() {
                     return OpenTmuxSessionTarget::Blocked(
                         "selected repository has no visible worktrees",
@@ -1506,6 +1611,8 @@ impl Tui {
             .enumerate()
             .filter_map(|(index, session)| {
                 (!session.hidden
+                    && (self.worktree_list_mode == WorktreeListMode::Global
+                        || session.repo_index == self.current_repo)
                     && !self
                         .repos
                         .get(session.repo_index)
@@ -1529,12 +1636,12 @@ impl Tui {
         indices
     }
 
-    fn worktree_sort_key(&self, index: usize) -> (std::cmp::Reverse<i16>, String, String) {
+    fn worktree_sort_key(&self, index: usize) -> (u8, String, String) {
         let Some(session) = self.sessions.get(index) else {
-            return (std::cmp::Reverse(0), String::new(), String::new());
+            return (1, String::new(), String::new());
         };
         (
-            std::cmp::Reverse(session.visibility),
+            worktree_priority_rank(session.visibility),
             session.repo_label.clone(),
             worktree_sort_name(session),
         )
@@ -1562,6 +1669,53 @@ impl Tui {
             self.selected_worktree_by_repo.insert(repo_root, path);
         }
         self.mark_selected_seen();
+    }
+
+    pub(crate) fn navigation_snapshot(&self) -> NavigationSnapshot {
+        NavigationSnapshot {
+            focused_panel: self.focused_panel,
+            main_focused: self.main_focused,
+            current_repo_root: self
+                .repos
+                .get(self.current_repo)
+                .map(|repo| repo.repo.root.clone()),
+            selected_worktree_path: self
+                .selected_worktree_index()
+                .and_then(|index| self.sessions.get(index))
+                .map(|session| session.path.clone()),
+            selected_comment: self.selected_comment,
+            worktree_list_mode: self.worktree_list_mode,
+        }
+    }
+
+    pub(crate) fn restore_navigation_snapshot(&mut self, snapshot: NavigationSnapshot) {
+        self.worktree_list_mode = snapshot.worktree_list_mode;
+        if let Some(root) = snapshot.current_repo_root.as_ref()
+            && let Some(index) = self.repos.iter().position(|repo| repo.repo.root == *root)
+        {
+            self.current_repo = index;
+            self.selected_repo_root = Some(root.clone());
+            self.sync_selected_repo_context();
+        }
+        if let Some(path) = snapshot.selected_worktree_path.as_ref()
+            && let Some(index) = self
+                .sessions
+                .iter()
+                .position(|session| session.path == *path)
+        {
+            self.selected = index;
+            if let Some(session) = self.sessions.get(index)
+                && let Some(repo) = self.repos.get(session.repo_index)
+            {
+                self.selected_worktree_by_repo
+                    .insert(repo.repo.root.clone(), session.path.clone());
+            }
+        } else if self.selected_worktree_index().is_none() {
+            self.restore_selected_worktree_for_repo();
+        }
+        self.selected_comment = snapshot.selected_comment;
+        self.focused_panel = snapshot.focused_panel;
+        self.main_focused = snapshot.main_focused;
     }
 
     fn selected_repo_default_session_index(&self) -> Option<usize> {
@@ -1752,7 +1906,6 @@ impl Tui {
             .get(self.current_repo)
             .map(|repo| repo.repo.root.clone());
         self.sync_selected_repo_context();
-        self.restore_selected_worktree_for_repo();
     }
 
     fn clear_leader_hint(&mut self) {
@@ -2345,6 +2498,11 @@ impl Tui {
                     .get(&session.path)
                     .and_then(|run_id| self.auto_runs.get(run_id))
                     .map(|run| run.run.status);
+                let plan_status = self
+                    .active_plan_runs
+                    .get(&session.path)
+                    .and_then(|run_id| self.plan_runs.get(run_id))
+                    .map(|run| run.run.status);
                 Some(view::WorktreeRow {
                     session_index: index,
                     repo_label,
@@ -2368,6 +2526,8 @@ impl Tui {
                     pr: session.pr.clone(),
                     wt_columns: session.wt_columns.clone(),
                     auto_status,
+                    plan_status,
+                    updated_label: worktree_updated_label(session),
                     unseen_comments: session.unseen_comments,
                     prompt_summary: session.prompt_summary.clone(),
                     classification: session.classification,
@@ -2400,6 +2560,7 @@ impl Tui {
             main_focused: self.main_focused,
             repo_main_view: self.repo_main_view,
             worktree_main_view: self.worktree_main_view,
+            worktree_list_mode: self.worktree_list_mode,
             mode_label: "normal",
             status_message: self.status_message.as_deref(),
             repo_filter: &self.repo_filter,
@@ -2699,6 +2860,24 @@ fn worktree_sort_name(session: &Session) -> String {
         .to_ascii_lowercase()
 }
 
+fn worktree_priority_rank(visibility: i16) -> u8 {
+    match visibility.cmp(&0) {
+        std::cmp::Ordering::Greater => 0,
+        std::cmp::Ordering::Equal => 1,
+        std::cmp::Ordering::Less => 2,
+    }
+}
+
+fn worktree_updated_label(session: &Session) -> String {
+    if let Some(label) = session.pr.last_refreshed.as_deref() {
+        return label.to_string();
+    }
+    if let Some(summary) = &session.pr.summary {
+        return summary.updated_at.chars().take(10).collect();
+    }
+    "-".to_string()
+}
+
 fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
     x >= rect.x
         && x < rect.x.saturating_add(rect.width)
@@ -2710,6 +2889,7 @@ fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
 mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::agent::AgentState;
     use crate::auto_flow::{
@@ -2724,7 +2904,7 @@ mod tests {
     use crate::session::Session;
     use crate::view::{RepoMainView, WorktreeMainView};
 
-    use super::{ManagedRepo, OpenTmuxSessionTarget, PanelFocus, Tui};
+    use super::{ManagedRepo, OpenTmuxSessionTarget, PanelFocus, Tui, WorktreeListMode};
 
     #[test]
     fn tui_defaults_to_repos_panel_focus() {
@@ -2734,19 +2914,58 @@ mod tests {
     }
 
     #[test]
-    fn switching_repos_restores_each_repos_selected_worktree() {
+    fn switching_repos_does_not_change_worktree_selection_until_worktrees_focus() {
         let mut tui = test_tui();
 
         tui.select_worktree(1);
         tui.select_repo(1);
-        tui.select_worktree(3);
-        tui.select_repo(0);
 
-        assert_eq!(tui.selected_worktree_index(), Some(1));
+        assert_eq!(tui.selected, 1);
 
-        tui.select_repo(1);
+        tui.focus_worktrees();
 
         assert_eq!(tui.selected_worktree_index(), Some(3));
+    }
+
+    #[test]
+    fn repeated_worktree_focus_toggles_repo_and_global_modes() {
+        let mut tui = test_tui();
+        tui.focus_worktrees();
+
+        assert_eq!(tui.worktree_list_mode, WorktreeListMode::Repo);
+        assert_eq!(tui.visible_session_indices(), vec![1]);
+
+        tui.focus_worktrees();
+
+        assert_eq!(tui.worktree_list_mode, WorktreeListMode::Global);
+        assert_eq!(tui.visible_session_indices(), vec![1, 3]);
+
+        tui.focus_worktrees();
+
+        assert_eq!(tui.worktree_list_mode, WorktreeListMode::Repo);
+    }
+
+    #[test]
+    fn persisted_worktree_list_mode_loads_and_updates_on_toggle() {
+        let temp = unique_temp_dir("prism-tui-ui-state-test");
+        let path = temp.join("ui-state.toml");
+        crate::ui_state::save_to_path(&path, WorktreeListMode::Global).unwrap();
+        let mut tui = test_tui();
+
+        tui.use_persisted_ui_state(path.clone());
+
+        assert_eq!(tui.worktree_list_mode, WorktreeListMode::Global);
+
+        tui.focus_worktrees();
+        tui.focus_worktrees();
+
+        assert_eq!(tui.worktree_list_mode, WorktreeListMode::Repo);
+        assert_eq!(
+            crate::ui_state::load_from_path(&path),
+            Some(WorktreeListMode::Repo)
+        );
+
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -2914,6 +3133,20 @@ mod tests {
         assert_eq!(
             tui.open_tmux_session_target(),
             OpenTmuxSessionTarget::WorktreeAgent
+        );
+    }
+
+    #[test]
+    fn open_tmux_session_target_opens_selected_plan_phase_from_main() {
+        let mut tui = test_tui();
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.select_worktree(1);
+        tui.focus_main();
+        tui.remember_plan_run(test_plan_run_with_steps("plan", "/repo-one/feature-one", 1));
+
+        assert_eq!(
+            tui.open_tmux_session_target(),
+            OpenTmuxSessionTarget::PlanPhaseAgent
         );
     }
 
@@ -3191,5 +3424,13 @@ mod tests {
             user_path: PathBuf::from("/tmp/prism-user.toml"),
             repo_config_path: PathBuf::from("/tmp/prism-repo.toml"),
         }
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()))
     }
 }

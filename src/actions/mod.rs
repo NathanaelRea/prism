@@ -55,8 +55,9 @@ use crate::session::{
 };
 use crate::tmux::TmuxWindow;
 use crate::tui::{
-    DefaultBranchPollResult, ManagedRepo, OpencodeEventResult, OpencodePollKey, OpencodePollResult,
-    PlanRunResult, PrPollKey, PrPollResult, Tui, WtPollResult,
+    DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, ManagedRepo,
+    OpencodeEventResult, OpencodePollKey, OpencodePollResult, PlanRunResult, PrPollKey,
+    PrPollResult, Tui, WtPollResult,
 };
 
 use crate::util::{status_count, yes};

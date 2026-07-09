@@ -4,14 +4,14 @@ Prism uses a lazygit-style panel model.
 
 - `1` focuses Status.
 - `2` focuses Repos.
-- `3` focuses Worktrees / Sessions.
+- `3` focuses Worktrees / Sessions. Press `3` again while Worktrees is focused to toggle repo-scoped and all-repos modes.
 - `Tab` cycles focus between panels.
 - `0` focuses the main panel for the selected sidebar context.
 - `h` / `l` or left/right switches horizontal views in the Repos main panel.
 - `j` / `k` or up/down moves within the focused row panel.
 - `g g` jumps to the top of the focused list.
 - `G` jumps to the bottom of the focused list.
-- `Enter` and `Space Space` share the same go-deeper behavior: Status operates the active dashboard or focuses Repos, Repos focuses Worktrees for the selected repository, and Worktrees opens the selected agent session when valid.
+- `Enter` and `Space Space` share the same go-deeper behavior: Status operates the active dashboard or focuses Repos, Repos focuses Worktrees for the selected repository, and Worktrees opens the selected agent session when valid. From a focused Worktrees plan dashboard, `Enter` switches the worktree OpenCode runtime to the selected phase session and opens tmux.
 - Default branch worktrees are not agent targets; `Enter` and `Space Space` show the same blocked message there.
 - `Space Enter` opens tmux window 3: terminal.
 - `Ctrl-/` also opens tmux window 3 where the terminal reports that key combination distinctly; use `Space Enter` as the reliable alternative.
