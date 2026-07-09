@@ -79,12 +79,7 @@ pub(super) fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &crate::vie
             .repos
             .iter()
             .map(|repo| {
-                let key = repo
-                    .key
-                    .map(|key| format!("{key} "))
-                    .unwrap_or_else(|| "  ".to_string());
                 let line = Line::from(vec![
-                    Span::styled(key, muted_style()),
                     Span::raw(format!("{:<label_width$}", repo.label)),
                     Span::styled(format!("  {}", repo.health), health_style(&repo.health)),
                 ]);
@@ -170,13 +165,6 @@ pub(super) fn render_worktrees(
                 };
             let mut spans = if repo_mode {
                 let mut spans = vec![
-                    Span::styled(
-                        format!(
-                            "{:<repo_width$} ",
-                            truncate_column(&worktree.repo_label, repo_width)
-                        ),
-                        muted_style(),
-                    ),
                     Span::styled(
                         format!("{} ", visibility_marker(worktree.visibility)),
                         visibility_style(worktree.visibility),
@@ -282,7 +270,7 @@ pub(super) fn worktree_header_row(
     if !repo_mode {
         return ListItem::new(Line::from(vec![
             Span::styled(format!("{:<repo_width$} ", "repo"), muted_style()),
-            Span::styled("V ", muted_style()),
+            Span::styled("↕ ", muted_style()),
             Span::styled(format!("{:<16} ", "branch/wt"), muted_style()),
             Span::styled("PR ", muted_style()),
             Span::styled("CI ", muted_style()),
@@ -293,8 +281,7 @@ pub(super) fn worktree_header_row(
     }
     ListItem::new(Line::from(
         vec![
-            Span::styled(format!("{:<repo_width$} ", "repo"), muted_style()),
-            Span::styled("V ", muted_style()),
+            Span::styled("↕ ", muted_style()),
             Span::styled(format!("{:<12} ", "branch"), muted_style()),
             Span::styled("K ", muted_style()),
             Span::styled("A ", muted_style()),
@@ -338,9 +325,9 @@ pub(super) fn render_selected_row_outline(
 
 pub(super) fn visibility_marker(visibility: i16) -> &'static str {
     match visibility.cmp(&0) {
-        std::cmp::Ordering::Greater => "^",
-        std::cmp::Ordering::Less => "V",
-        std::cmp::Ordering::Equal => ".",
+        std::cmp::Ordering::Greater => "↑",
+        std::cmp::Ordering::Less => "↓",
+        std::cmp::Ordering::Equal => "·",
     }
 }
 
@@ -376,7 +363,7 @@ pub(super) fn configured_worktree_column_widths(
     if configured_columns.is_empty() {
         return Vec::new();
     }
-    let base_width = 42;
+    let base_width = 32;
     let available = inner_width.saturating_sub(base_width);
     if available < 6 {
         return Vec::new();
