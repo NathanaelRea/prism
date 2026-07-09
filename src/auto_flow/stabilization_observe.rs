@@ -46,6 +46,7 @@ pub(crate) fn build_stabilization_snapshot(
     {
         pull_request.review.approval_required = true;
     }
+    let policy = policy_facts_from_cache(policy_cache.as_ref(), pull_request.as_ref());
 
     StabilizationSnapshot {
         run: run.map(AutoRunRef::from),
@@ -69,7 +70,7 @@ pub(crate) fn build_stabilization_snapshot(
             remote_head_sha,
         },
         pull_request,
-        policy: policy_facts_from_cache(policy_cache.as_ref()),
+        policy,
         goal: StabilizationGoal {
             auto_merge: config.auto.merge,
             cleanup_after_merge: config.auto.cleanup_after_merge,
@@ -117,6 +118,7 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
     {
         pull_request.review.approval_required = true;
     }
+    let policy = policy_facts_from_cache(policy_cache.as_ref(), pull_request.as_ref());
 
     StabilizationSnapshot {
         run: Some(AutoRunRef::from(run)),
@@ -139,7 +141,7 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
             remote_head_sha,
         },
         pull_request,
-        policy: policy_facts_from_cache(policy_cache.as_ref()),
+        policy,
         goal: StabilizationGoal {
             auto_merge: config.auto.merge,
             cleanup_after_merge: config.auto.cleanup_after_merge,
@@ -148,7 +150,10 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
     }
 }
 
-fn policy_facts_from_cache(policy: Option<&RepoPolicyCache>) -> PolicyFacts {
+fn policy_facts_from_cache(
+    policy: Option<&RepoPolicyCache>,
+    pull_request: Option<&PullRequestFacts>,
+) -> PolicyFacts {
     let Some(policy) = policy else {
         return PolicyFacts::Unknown {
             reason: Some("repository policy cache is not available yet".to_string()),
@@ -160,6 +165,44 @@ fn policy_facts_from_cache(policy: Option<&RepoPolicyCache>) -> PolicyFacts {
         return PolicyFacts::Unknown {
             reason: Some(error.clone()),
         };
+    }
+    let mut blockers = Vec::new();
+    if let Some(pull_request) = pull_request {
+        if policy.required_approvals > 0
+            && !pull_request
+                .review
+                .decision
+                .eq_ignore_ascii_case("APPROVED")
+        {
+            blockers.push(PolicyBlocker::RequiredApprovalMissing);
+        }
+        for check in &pull_request.ci.required {
+            match check.state {
+                crate::github::PrCheckState::Unknown => {
+                    blockers.push(PolicyBlocker::RequiredCheckMissing(check.name.clone()));
+                }
+                crate::github::PrCheckState::Failed | crate::github::PrCheckState::Mixed => {
+                    blockers.push(PolicyBlocker::RequiredCheckFailing(check.name.clone()));
+                }
+                crate::github::PrCheckState::Pending | crate::github::PrCheckState::Success => {}
+            }
+        }
+        if policy.require_conversation_resolution
+            && !pull_request.review.unresolved_threads.is_empty()
+        {
+            blockers.push(PolicyBlocker::ConversationsUnresolved);
+        }
+        if policy.require_branch_up_to_date
+            && matches!(&pull_request.mergeability, MergeabilityFacts::Blocked { reason } if reason.contains("BEHIND"))
+        {
+            blockers.push(PolicyBlocker::BranchOutOfDate);
+        }
+    }
+    if policy.merge_queue_required {
+        blockers.push(PolicyBlocker::MergeQueueRequired);
+    }
+    if !blockers.is_empty() {
+        return PolicyFacts::Blocked { blockers };
     }
     PolicyFacts::Satisfied
 }
@@ -680,7 +723,12 @@ exit 1
 
         assert_eq!(snapshot.repository.policy_refreshed_unix_ms, Some(123));
         assert_eq!(snapshot.repository.policy_error, None);
-        assert_eq!(snapshot.policy, PolicyFacts::Satisfied);
+        assert_eq!(
+            snapshot.policy,
+            PolicyFacts::Blocked {
+                blockers: vec![PolicyBlocker::RequiredApprovalMissing]
+            }
+        );
         assert!(snapshot.pull_request.unwrap().review.approval_required);
 
         let _ = fs::remove_dir_all(temp);

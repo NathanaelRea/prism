@@ -401,7 +401,7 @@ impl Tui {
         };
 
         self.show_loading_dialog(raw, "Guarded Push", "Reobserving guarded repair push")?;
-        let _ = crate::git::fetch_origin(&path, config);
+        crate::git::fetch_origin(&path, config)?;
         {
             let session = &mut self.sessions[selected];
             refresh_branch_pr_cache(

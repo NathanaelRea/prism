@@ -426,6 +426,25 @@ pub(super) fn execute_push_pr_step(
     step_index: usize,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
+    if !config.auto.push_initial {
+        let step = &mut persisted.steps[step_index];
+        let step_id = step
+            .id
+            .ok_or_else(|| "auto push PR step must be saved before output".to_string())?;
+        let message = "initial push/create PR disabled by auto.push_initial".to_string();
+        append_system_output(
+            conn,
+            step_id,
+            AutoOutputKind::Status,
+            &message,
+            None,
+            max_output_lines_per_step,
+        )?;
+        finish_non_agent_step(conn, step, AutoStepStatus::Skipped, Some(message), None)?;
+        persisted.run.updated_unix_ms = unix_ms();
+        return save_run_with_conn(conn, &persisted.run);
+    }
+
     let head_sha = crate::git::current_head_sha(&persisted.run.worktree_path, config)?;
     crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
 
@@ -698,8 +717,8 @@ pub(super) fn execute_commit_review_fix_step(
         persisted.run.pending_push = result.commit_sha.clone().map(|commit_sha| {
             pending_push_guard(
                 stabilization_model::RepairKind::Review,
-                commit_sha,
-                head_sha.clone().unwrap_or_default(),
+                commit_sha.clone(),
+                head_sha.clone().unwrap_or(commit_sha),
                 guard_facts,
                 persisted.steps[step_index]
                     .work_guard
@@ -961,8 +980,8 @@ pub(super) fn execute_commit_ci_fix_step(
         persisted.run.pending_push = result.commit_sha.clone().map(|commit_sha| {
             pending_push_guard(
                 stabilization_model::RepairKind::Ci,
-                commit_sha,
-                local_head.clone().unwrap_or_default(),
+                commit_sha.clone(),
+                local_head.clone().unwrap_or(commit_sha),
                 guard_facts,
                 Vec::new(),
             )

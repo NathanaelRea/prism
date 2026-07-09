@@ -81,7 +81,7 @@ pub(crate) fn stabilization_panel_model(
         ci: ci_gate_label(session, &blocker),
         review: review_gate_label(model.config, session),
         merge: merge_gate_label(session),
-        policy: policy_gate_label(run.and_then(|run| run.stabilization_blocker.as_ref())),
+        policy: policy_gate_label(&blocker),
         pending_commit: pending_push.map(pending_commit_label),
         pending_hint: pending_push
             .map(|_| "inspect the pending commit diff, then press <Space> g P".to_string()),
@@ -275,12 +275,7 @@ fn ci_gate_label(session: &Session, blocker: &StabilizationBlocker) -> String {
         .as_ref()
         .map(|details| details.failing_checks.len())
         .unwrap_or(0);
-    if optional_failure_count > 0
-        && !matches!(
-            blocker,
-            StabilizationBlocker::CiFailed | StabilizationBlocker::CiMissingRequiredChecks
-        )
-    {
+    if optional_failure_count > 0 && ci_blockers_ruled_out(blocker) {
         return format!(
             "required passing ({} optional failing)",
             optional_failure_count
@@ -296,6 +291,18 @@ fn ci_gate_label(session: &Session, blocker: &StabilizationBlocker) -> String {
         label = format!("{label} ({} failing)", details.failing_checks.len());
     }
     label
+}
+
+fn ci_blockers_ruled_out(blocker: &StabilizationBlocker) -> bool {
+    matches!(
+        blocker,
+        StabilizationBlocker::ReviewApprovalMissing
+            | StabilizationBlocker::PolicyBlocked
+            | StabilizationBlocker::PolicyUnknown
+            | StabilizationBlocker::ReadyForManualMerge
+            | StabilizationBlocker::ReadyToAutoMerge
+            | StabilizationBlocker::Merged
+    )
 }
 
 fn review_gate_label(config: &crate::config::Config, session: &Session) -> String {
@@ -332,10 +339,10 @@ fn merge_gate_label(session: &Session) -> String {
     }
 }
 
-fn policy_gate_label(blocker: Option<&StabilizationBlocker>) -> String {
+fn policy_gate_label(blocker: &StabilizationBlocker) -> String {
     match blocker {
-        Some(StabilizationBlocker::PolicyBlocked) => "blocked".to_string(),
-        Some(StabilizationBlocker::PolicyUnknown) => "unknown".to_string(),
+        StabilizationBlocker::PolicyBlocked => "blocked".to_string(),
+        StabilizationBlocker::PolicyUnknown => "unknown".to_string(),
         _ => "satisfied".to_string(),
     }
 }
