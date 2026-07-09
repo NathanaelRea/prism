@@ -29,32 +29,10 @@ pub(super) fn worktree_detail_lines(model: &crate::view::FrameModel<'_>) -> Vec<
     let mut lines = vec![
         Line::from(Span::styled(session.branch.clone(), title_style(true))),
         Line::from(Span::styled(session.path_display.clone(), muted_style())),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("status ", muted_style()),
-            Span::raw(git_status_indicator(
-                &session.status_label,
-                model.config.icon_style,
-            )),
-            Span::styled("  agent ", muted_style()),
-            Span::styled(
-                agent_label(session.agent_state),
-                agent_style(session.agent_state),
-            ),
-            Span::styled("  kind ", muted_style()),
-            Span::raw(session.classification.label().to_string()),
-            Span::styled("  adopted ", muted_style()),
-            Span::raw(if session.adopted { "yes" } else { "no" }),
-        ]),
     ];
     if !session.prompt_summary.trim().is_empty() {
+        lines.push(Line::from(""));
         lines.push(labelled_line("prompt", session.prompt_summary.clone()));
-    }
-    if session.is_task_branch(model.config) && model.config.default_agent == "opencode" {
-        match &session.opencode_status {
-            Some(status) => lines.extend(opencode_status_lines(status)),
-            None => lines.extend(opencode_not_started_lines()),
-        }
     }
     if let Some(stabilization) = stabilization_panel_model(model, session) {
         lines.push(Line::from(""));
@@ -67,60 +45,6 @@ pub(super) fn worktree_detail_lines(model: &crate::view::FrameModel<'_>) -> Vec<
         model.selected_comment,
     ));
     lines
-}
-
-pub(super) fn opencode_status_lines(status: &OpencodeStatus) -> Vec<Line<'static>> {
-    let session = status.session_id.as_deref().map(short_id).unwrap_or("none");
-    let server = status
-        .server_url
-        .as_deref()
-        .map(short_server)
-        .unwrap_or("none");
-    let title = status.title.as_deref().filter(|title| !title.is_empty());
-    let mut lines = vec![match title {
-        Some(title) => Line::from(vec![
-            Span::styled("opencode ", muted_style()),
-            Span::raw(status.state.label().to_string()),
-            Span::styled("  server ", muted_style()),
-            Span::raw(server.to_string()),
-            Span::styled("  session ", muted_style()),
-            Span::raw(session.to_string()),
-            Span::raw(format!("  {title}")),
-        ]),
-        None => Line::from(vec![
-            Span::styled("opencode ", muted_style()),
-            Span::raw(status.state.label().to_string()),
-            Span::styled("  server ", muted_style()),
-            Span::raw(server.to_string()),
-            Span::styled("  session ", muted_style()),
-            Span::raw(session.to_string()),
-        ]),
-    }];
-    if let Some(tool) = &status.active_tool {
-        lines.push(labelled_line("tool", tool.clone()));
-    }
-    if let Some(message) = &status.latest_message {
-        lines.push(labelled_line("latest", message.clone()));
-    }
-    let todo = todo_summary(&status.todos);
-    if !todo.is_empty() {
-        lines.push(labelled_line("todos", todo));
-    }
-    if let Some(updated) = status.last_updated_unix_ms {
-        lines.push(labelled_line("updated", age_label(updated)));
-    }
-    lines
-}
-
-pub(super) fn opencode_not_started_lines() -> Vec<Line<'static>> {
-    vec![Line::from(vec![
-        Span::styled("opencode ", muted_style()),
-        Span::raw("not started"),
-        Span::styled("  server ", muted_style()),
-        Span::raw("none"),
-        Span::styled("  session ", muted_style()),
-        Span::raw("none"),
-    ])]
 }
 
 pub(crate) fn stabilization_panel_model(
@@ -165,10 +89,21 @@ pub(crate) fn stabilization_panel_model(
 }
 
 pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        heading_line("PR Stabilization"),
+    let mut lines = vec![heading_line("PR Stabilization")];
+    lines.extend(stabilization_signal_lines(model));
+    lines
+}
+
+fn stabilization_signal_lines(model: &StabilizationPanelModel) -> Vec<Line<'static>> {
+    vec![
         Line::from(vec![
-            Span::styled("state ", muted_style()),
+            Span::styled(" Observe  ", muted_style()),
+            Span::styled(" Blockers  ", muted_style()),
+            Span::styled(" Work  ", muted_style()),
+            Span::styled(" Reobserve", muted_style()),
+        ]),
+        Line::from(vec![
+            Span::styled("   state ", muted_style()),
             Span::styled(
                 model.blocker.clone(),
                 stabilization_state_style(&model.blocker),
@@ -177,28 +112,52 @@ pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<
             Span::styled(model.next.clone(), attention_style()),
         ]),
         Line::from(vec![
-            Span::styled("ci ", muted_style()),
-            Span::raw(model.ci.clone()),
-            Span::styled("  review ", muted_style()),
-            Span::raw(model.review.clone()),
+            Span::styled("   ", muted_style()),
+            lane_cell("current", attention_style()),
+            lane_cell(&model.blocker, stabilization_state_style(&model.blocker)),
+            lane_cell(&model.next, attention_style()),
+            lane_cell("pending", muted_style()),
         ]),
         Line::from(vec![
-            Span::styled("merge ", muted_style()),
-            Span::raw(model.merge.clone()),
-            Span::styled("  policy ", muted_style()),
-            Span::raw(model.policy.clone()),
+            Span::styled("   ", muted_style()),
+            lane_cell("checks", gate_style(&model.ci)),
+            lane_cell(&model.ci, gate_style(&model.ci)),
+            lane_cell("verify", muted_style()),
+            lane_cell("reobserve", muted_style()),
         ]),
-    ];
-    if let Some(guard) = &model.guard {
-        lines.push(labelled_line("guard", guard.clone()));
-    }
-    if let Some(commit) = &model.pending_commit {
-        lines.push(labelled_line("pending commit", commit.clone()));
-    }
-    if let Some(hint) = &model.pending_hint {
-        lines.push(Line::from(Span::styled(hint.clone(), attention_style())));
-    }
-    lines
+        Line::from(vec![
+            Span::styled("   ", muted_style()),
+            lane_cell("review", gate_style(&model.review)),
+            lane_cell(&model.review, gate_style(&model.review)),
+            lane_cell("commit", muted_style()),
+            lane_cell("wait", muted_style()),
+        ]),
+        Line::from(vec![
+            Span::styled("   ", muted_style()),
+            lane_cell("merge", gate_style(&model.merge)),
+            lane_cell(&model.merge, gate_style(&model.merge)),
+            lane_cell("push", muted_style()),
+            lane_cell("refresh", muted_style()),
+        ]),
+        Line::from(vec![
+            Span::styled("   ", muted_style()),
+            lane_cell("policy", gate_style(&model.policy)),
+            lane_cell(&model.policy, gate_style(&model.policy)),
+            lane_cell("guard", muted_style()),
+            lane_cell("refresh", muted_style()),
+        ]),
+        Line::from(vec![
+            Span::styled("   ", muted_style()),
+            lane_cell("fresh", Style::default().fg(Color::Green)),
+            lane_cell("clear", Style::default().fg(Color::Green)),
+            lane_cell("done", Style::default().fg(Color::Green)),
+            lane_cell("Ready", Style::default().fg(Color::Green)),
+        ]),
+    ]
+}
+
+fn lane_cell(value: &str, style: Style) -> Span<'static> {
+    Span::styled(format!("{:<12}", truncate(value, 11)), style)
 }
 
 fn cached_pr_blocker(
@@ -411,5 +370,25 @@ fn stabilization_state_style(label: &str) -> Style {
         "CiFailed" | "MergeBlocked" | "PolicyBlocked" | "Escalate" => error_style(),
         "PendingPush" | "PolicyUnknown" | "ReviewFeedbackFound" => attention_style(),
         _ => Style::default(),
+    }
+}
+
+fn gate_style(label: &str) -> Style {
+    let normalized = label.to_ascii_lowercase();
+    if normalized.contains("fail")
+        || normalized.contains("blocked")
+        || normalized.contains("missing")
+    {
+        error_style()
+    } else if normalized.contains("pending") || normalized.contains("unknown") {
+        attention_style()
+    } else if normalized.contains("pass")
+        || normalized.contains("approved")
+        || normalized.contains("clean")
+        || normalized.contains("satisfied")
+    {
+        Style::default().fg(Color::Green)
+    } else {
+        muted_style()
     }
 }

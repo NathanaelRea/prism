@@ -715,6 +715,25 @@ fn renders_auto_dashboard_steps_and_output_cursor() {
 }
 
 #[test]
+fn worktree_main_panel_omits_runtime_metadata_block() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Running)];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let buffer = render_to_buffer(&model, 120, 30);
+    let main = region_text(&buffer, 56..120, 0..29);
+
+    assert!(main.contains("feature"));
+    assert!(main.contains("prompt implement feature"));
+    assert!(!main.contains("status "));
+    assert!(!main.contains("kind "));
+    assert!(!main.contains("adopted "));
+    assert!(!main.contains("opencode "));
+    assert!(!main.contains("server "));
+    assert!(!main.contains("session "));
+    assert!(!main.contains("updated "));
+}
+
+#[test]
 fn renders_stabilization_pending_push_in_worktree_main_panel() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
@@ -730,13 +749,13 @@ fn renders_stabilization_pending_push_in_worktree_main_panel() {
     let buffer = render_to_string(&model, 120, 40);
 
     assert!(buffer.contains("PR Stabilization"));
+    assert!(buffer.contains("Observe"));
+    assert!(buffer.contains("Blockers"));
+    assert!(buffer.contains("Work"));
+    assert!(buffer.contains("Reobserve"));
     assert!(buffer.contains("state PendingPush"));
     assert!(buffer.contains("next PushPendingRepair"));
-    assert!(buffer.contains("guard"));
-    assert!(buffer.contains("head abc1234"));
-    assert!(buffer.contains("base def5678"));
-    assert!(buffer.contains("pending commit fedcba9 ci repair"));
-    assert!(buffer.contains("inspect the pending commit diff, then press <Space> g P"));
+    assert!(buffer.contains("Ready"));
 }
 
 #[test]
@@ -756,7 +775,7 @@ fn renders_stabilization_ci_failed_in_worktree_main_panel() {
 
     assert!(buffer.contains("state CiFailed"));
     assert!(buffer.contains("next FixCi"));
-    assert!(buffer.contains("ci failed"));
+    assert!(buffer.contains("failed"));
 }
 
 #[test]
@@ -779,7 +798,8 @@ fn renders_stabilization_merge_blocked_in_worktree_main_panel() {
 
     assert!(buffer.contains("state MergeBlocked"));
     assert!(buffer.contains("next Escalate"));
-    assert!(buffer.contains("merge blocked (DIRTY)"));
+    assert!(buffer.contains("blocked"));
+    assert!(buffer.contains("Ready"));
 }
 
 #[test]
@@ -801,7 +821,8 @@ fn renders_stabilization_policy_unknown_in_worktree_main_panel() {
 
     assert!(buffer.contains("state PolicyUnknown"));
     assert!(buffer.contains("next Escalate"));
-    assert!(buffer.contains("policy unknown"));
+    assert!(buffer.contains("unknown"));
+    assert!(buffer.contains("Ready"));
 }
 
 #[test]
@@ -828,8 +849,8 @@ fn renders_stabilization_ready_for_manual_merge_in_worktree_main_panel() {
 
     assert!(buffer.contains("state ReadyForManualMerge"));
     assert!(buffer.contains("next MarkReadyForManualMerge"));
-    assert!(buffer.contains("ci required passing (1 optional failing)"));
-    assert!(buffer.contains("merge clean"));
+    assert!(buffer.contains("required"));
+    assert!(buffer.contains("Ready"));
 }
 
 fn render_to_string(model: &FrameModel<'_>, cols: u16, rows: u16) -> String {

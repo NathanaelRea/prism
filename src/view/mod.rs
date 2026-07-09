@@ -19,7 +19,7 @@ use crate::{
     },
     config::{Config, IconStyle},
     github::PrCache,
-    opencode::{OpencodeState, OpencodeStatus},
+    opencode::OpencodeState,
     plan_run::{
         PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRunMode, PlanRunStatus, PlanStepRun,
         PlanStepStatus, plan_output_block_key,
