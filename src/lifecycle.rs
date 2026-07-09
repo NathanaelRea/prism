@@ -211,9 +211,10 @@ pub(crate) fn merge_pull_request(
 
 pub(crate) fn delete_worktree_session_local_data(
     repo: &Repository,
+    path: &Path,
     branch: &str,
 ) -> Result<(), String> {
-    remove_worktree_session_db_records(repo, branch)?;
+    remove_worktree_session_db_records(repo, path, branch)?;
     remove_worktree_session_logs(repo, branch)?;
     Ok(())
 }
@@ -224,9 +225,19 @@ pub(crate) fn delete_worktree_session(
     path: &Path,
     branch: &str,
 ) -> Result<(), String> {
-    delete_worktree_session_processes(repo, config, branch)?;
-    delete_worktree_session_local_data(repo, branch)?;
-    remove_worktree(repo, config, path)?;
+    delete_worktree_session_processes(repo, config, path, branch)?;
+    let remove_result = remove_worktree(repo, config, path);
+    let cleanup_result = delete_worktree_session_local_data(repo, path, branch);
+    match (remove_result, cleanup_result) {
+        (Ok(()), Ok(())) => {}
+        (Err(remove_error), Ok(())) => return Err(remove_error),
+        (Ok(()), Err(cleanup_error)) => return Err(cleanup_error),
+        (Err(remove_error), Err(cleanup_error)) => {
+            return Err(format!(
+                "{remove_error}; also failed to remove local session data: {cleanup_error}"
+            ));
+        }
+    }
     delete_branch_if_attached(repo, config, branch)?;
     Ok(())
 }
@@ -234,10 +245,11 @@ pub(crate) fn delete_worktree_session(
 fn delete_worktree_session_processes(
     repo: &Repository,
     config: &Config,
+    path: &Path,
     branch: &str,
 ) -> Result<(), String> {
     crate::tmux::kill_agent_sessions_for_branch(repo, config, branch)?;
-    for runtime in opencode::load_runtimes_for_branch(repo, branch)? {
+    for runtime in opencode::load_runtimes_for_worktree_session(repo, branch, path)? {
         opencode::shutdown_stored_server(&runtime)?;
     }
     Ok(())
@@ -406,11 +418,53 @@ fn remove_worktree(repo: &Repository, config: &Config, path: &Path) -> Result<()
     );
     match remove_result {
         Ok(()) => Ok(()),
-        Err(error) if !path.exists() => prune_worktrees(repo, config).map_err(|prune_error| {
-            format!("{error}; also failed to prune worktrees: {prune_error}")
-        }),
-        Err(error) => Err(error),
+        Err(error) => {
+            if !path.exists() {
+                return prune_worktrees(repo, config).map_err(|prune_error| {
+                    format!("{error}; also failed to prune worktrees: {prune_error}")
+                });
+            }
+            recover_deregistered_worktree_remove_failure(repo, config, path, error)
+        }
     }
+}
+
+fn recover_deregistered_worktree_remove_failure(
+    repo: &Repository,
+    config: &Config,
+    path: &Path,
+    error: String,
+) -> Result<(), String> {
+    if worktree_path_registered(repo, config, path).map_err(|list_error| {
+        format!("{error}; also failed to inspect registered worktrees: {list_error}")
+    })? {
+        return Err(error);
+    }
+    std::fs::remove_dir_all(path).map_err(|remove_error| {
+        format!(
+            "{error}; worktree was deregistered but failed to delete {}: {remove_error}",
+            path.display()
+        )
+    })?;
+    prune_worktrees(repo, config)
+        .map_err(|prune_error| format!("{error}; also failed to prune worktrees: {prune_error}"))
+}
+
+fn worktree_path_registered(
+    repo: &Repository,
+    config: &Config,
+    path: &Path,
+) -> Result<bool, String> {
+    let output = run_capture(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(&repo.root)
+            .args(["worktree", "list", "--porcelain"]),
+    )?;
+    Ok(output.lines().any(|line| {
+        line.strip_prefix("worktree ")
+            .is_some_and(|current| Path::new(current) == path)
+    }))
 }
 
 fn prune_worktrees(repo: &Repository, config: &Config) -> Result<(), String> {
@@ -422,7 +476,13 @@ fn prune_worktrees(repo: &Repository, config: &Config) -> Result<(), String> {
     )
 }
 
-fn remove_worktree_session_db_records(repo: &Repository, branch: &str) -> Result<(), String> {
+fn remove_worktree_session_db_records(
+    repo: &Repository,
+    path: &Path,
+    branch: &str,
+) -> Result<(), String> {
+    let repo_root = repo.root.display().to_string();
+    let worktree_path = path.display().to_string();
     observability::with_writable_db(repo, |conn| {
         conn.execute_batch("begin transaction")
             .map_err(|error| format!("begin worktree session cleanup transaction: {error}"))?;
@@ -430,7 +490,12 @@ fn remove_worktree_session_db_records(repo: &Repository, branch: &str) -> Result
             remove_task_metadata_with_conn(conn, branch)?;
             crate::github::remove_pr_cache_with_conn(conn, branch)?;
             remove_agent_state_with_conn(conn, branch)?;
-            crate::opencode::remove_runtime_for_branch_with_conn(conn, branch)?;
+            crate::opencode::remove_runtime_for_worktree_session_with_conn(
+                conn,
+                &repo_root,
+                branch,
+                &worktree_path,
+            )?;
             clear_hidden_session_marker_with_conn(conn, branch)?;
             conn.execute(
                 "delete from archived_worktree where branch = ?1",
@@ -945,6 +1010,137 @@ exit 0
     }
 
     #[test]
+    fn delete_worktree_session_recovers_after_deregistered_remove_failure() {
+        let temp = unique_temp_dir("prism-delete-deregistered-failure-test");
+        fs::create_dir_all(&temp).unwrap();
+        let tmux_log = temp.join("tmux.log");
+        let git_log = temp.join("git.log");
+        let tmux = temp.join("tmux");
+        let git = temp.join("git");
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        let branch = "feature/delete";
+        let stale_branch = "feature/old-delete";
+        let path = temp.join("worktree");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("leftover.txt"), "leftover\n").unwrap();
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  list-sessions)
+    exit 0
+    ;;
+  kill-session)
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+                tmux_log.display()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &git,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"worktree remove --force"*)
+    echo "failed to delete '{}': Directory not empty" >&2
+    exit 1
+    ;;
+  *"worktree list --porcelain"*)
+    exit 0
+    ;;
+  *"worktree prune"*)
+    exit 0
+    ;;
+  *"branch -D feature/delete"*)
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+                git_log.display(),
+                path.display()
+            ),
+        )
+        .unwrap();
+        for shim in [&tmux, &git] {
+            let mut permissions = fs::metadata(shim).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(shim, permissions).unwrap();
+        }
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        observability::with_writable_db(&repo, |conn| {
+            conn.execute(
+                "insert into task_metadata (
+                    branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
+                 ) values (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    branch,
+                    "summary",
+                    "prompt",
+                    path.display().to_string(),
+                    123_i64
+                ],
+            )
+            .unwrap();
+            for runtime_branch in [branch, stale_branch] {
+                conn.execute(
+                    "insert into opencode_runtime (
+                        repo_root, branch, worktree_path, server_port, server_url,
+                        generation, updated_unix_ms
+                     ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        repo.root.display().to_string(),
+                        runtime_branch,
+                        path.display().to_string(),
+                        41000_i64,
+                        "http://127.0.0.1:41000",
+                        1_i64,
+                        123_i64,
+                    ],
+                )
+                .unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+        let log = repo
+            .prism_dir()
+            .join("logs")
+            .join(format!("{}.log", crate::util::safe_branch_filename(branch)));
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        fs::write(&log, "agent log\n").unwrap();
+
+        super::delete_worktree_session(&repo, &config, &path, branch).unwrap();
+
+        let git_commands = fs::read_to_string(&git_log).unwrap();
+        assert!(git_commands.contains("worktree remove --force"));
+        assert!(git_commands.contains("worktree list --porcelain"));
+        assert!(git_commands.contains("worktree prune"));
+        assert!(git_commands.contains("branch -D feature/delete"));
+        assert!(!path.exists());
+        assert_eq!(count_rows(&repo, "task_metadata", branch), 0);
+        assert_eq!(count_rows(&repo, "opencode_runtime", branch), 0);
+        assert_eq!(count_rows(&repo, "opencode_runtime", stale_branch), 0);
+        assert!(!log.exists());
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn delete_worktree_session_local_data_removes_owned_state_and_logs() {
         let temp = unique_temp_dir("prism-delete-local-data-test");
         fs::create_dir_all(&temp).unwrap();
@@ -995,7 +1191,7 @@ exit 0
         fs::create_dir_all(log.parent().unwrap()).unwrap();
         fs::write(&log, "agent log\n").unwrap();
 
-        super::delete_worktree_session_local_data(&repo, branch).unwrap();
+        super::delete_worktree_session_local_data(&repo, Path::new("/repo/wt"), branch).unwrap();
 
         assert_eq!(count_rows(&repo, "task_metadata", branch), 0);
         assert_eq!(count_rows(&repo, "hidden_session", branch), 0);
