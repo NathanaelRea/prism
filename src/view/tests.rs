@@ -96,7 +96,7 @@ fn renders_selected_sidebar_rows_with_focused_style() {
         row,
         Style::default()
             .fg(Color::White)
-            .bg(Color::Rgb(0, 96, 96))
+            .bg(Color::Rgb(0, 64, 64))
             .add_modifier(Modifier::BOLD),
     );
     assert_cell_style(
@@ -126,7 +126,7 @@ fn renders_selected_sidebar_rows_with_focused_style() {
         row,
         Style::default()
             .fg(Color::White)
-            .bg(Color::Rgb(0, 96, 96))
+            .bg(Color::Rgb(0, 64, 64))
             .add_modifier(Modifier::BOLD),
     );
     assert_cell_style(
@@ -135,7 +135,7 @@ fn renders_selected_sidebar_rows_with_focused_style() {
         row,
         Style::default()
             .fg(Color::Green)
-            .bg(Color::Rgb(0, 96, 96))
+            .bg(Color::Rgb(0, 64, 64))
             .add_modifier(Modifier::BOLD),
     );
     assert_cell_style(
@@ -167,7 +167,7 @@ fn renders_selected_sidebar_rows_with_unfocused_style() {
         &buffer,
         label_x,
         row,
-        Style::default().fg(Color::Reset).bg(Color::DarkGray),
+        Style::default().fg(Color::Reset).bg(Color::Rgb(32, 32, 32)),
     );
     assert_cell_style(
         &buffer,
@@ -190,7 +190,7 @@ fn renders_selected_sidebar_rows_with_unfocused_style() {
         &buffer,
         branch_x,
         row,
-        Style::default().fg(Color::Reset).bg(Color::DarkGray),
+        Style::default().fg(Color::Reset).bg(Color::Rgb(32, 32, 32)),
     );
     assert_cell_style(
         &buffer,
