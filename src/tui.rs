@@ -1051,10 +1051,14 @@ impl Tui {
             .collect::<Vec<_>>();
         let mut filter = String::new();
         let mut editing_filter = false;
+        let mut scroll = 0usize;
+        let info_lines = view::keybinding_info_lines(self.focused_panel, self.config.icon_style);
         self.dialog = Some(view::DialogModel::Help {
             filter: filter.clone(),
             editing_filter,
+            info_lines: info_lines.clone(),
             items: items.clone(),
+            scroll,
         });
         self.draw(runtime)?;
         loop {
@@ -1076,16 +1080,25 @@ impl Tui {
                 KeyCode::Char('/') if plain_key(event) && !editing_filter => {
                     editing_filter = true;
                     filter.clear();
+                    scroll = 0;
                 }
                 KeyCode::Enter if editing_filter => editing_filter = false,
                 KeyCode::Backspace if editing_filter => {
                     filter.pop();
+                    scroll = 0;
+                }
+                KeyCode::Up | KeyCode::Char('k') if !editing_filter => {
+                    scroll = scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') if !editing_filter => {
+                    scroll = scroll.saturating_add(1);
                 }
                 KeyCode::Esc => close = true,
                 KeyCode::Char('c') if ctrl_key(event) => close = true,
                 KeyCode::Char('q') if plain_key(event) => close = true,
                 KeyCode::Char(ch) if editing_filter && plain_key(event) && !ch.is_control() => {
                     filter.push(ch);
+                    scroll = 0;
                 }
                 _ if !editing_filter => close = true,
                 _ => {}
@@ -1098,7 +1111,9 @@ impl Tui {
             self.dialog = Some(view::DialogModel::Help {
                 filter: filter.clone(),
                 editing_filter,
+                info_lines: info_lines.clone(),
                 items: items.clone(),
+                scroll,
             });
             self.draw(runtime)?;
         }
@@ -2620,31 +2635,28 @@ impl Tui {
             }
         }
 
-        let mut parts = Vec::new();
-        if dirty > 0 {
-            parts.push(format!("D{dirty}"));
-        }
-        if running > 0 {
-            parts.push(format!("A{running}"));
-        }
-        if attention > 0 {
-            parts.push(format!("!{attention}"));
-        }
-        if prs > 0 {
-            parts.push(format!("PR{prs}"));
-        }
-        if ci_failed > 0 {
-            parts.push(format!("CIx{ci_failed}"));
-        } else if ci_running > 0 {
-            parts.push(format!("CI~{ci_running}"));
-        }
-        if behind > 0 {
-            parts.push(format!("↓{behind}"));
-        }
-        if parts.is_empty() {
+        let parts = [
+            (view::RepoHealthKind::Dirty, dirty),
+            (view::RepoHealthKind::Agents, running),
+            (view::RepoHealthKind::Attention, attention),
+            (view::RepoHealthKind::PullRequests, prs),
+            (view::RepoHealthKind::CiFailed, ci_failed),
+            (view::RepoHealthKind::CiRunning, ci_running),
+            (view::RepoHealthKind::Behind, behind),
+        ];
+        if parts.iter().all(|(_, count)| *count == 0) {
             "ok".to_string()
         } else {
-            parts.join(" ")
+            parts
+                .iter()
+                .map(|(kind, count)| {
+                    format!(
+                        "{}{count}",
+                        view::repo_health_icon(*kind, self.config.icon_style)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
         }
     }
 

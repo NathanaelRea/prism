@@ -69,6 +69,7 @@ pub(super) fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &crate::vie
             muted_style(),
         )))]
     } else {
+        let key_width = 1usize;
         let label_width = model
             .repos
             .iter()
@@ -81,13 +82,18 @@ pub(super) fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &crate::vie
             .map(|repo| {
                 let key = repo
                     .key
-                    .map(|key| format!("{key} "))
-                    .unwrap_or_else(|| "  ".to_string());
-                let line = Line::from(vec![
-                    Span::styled(key, muted_style()),
-                    Span::raw(format!("{:<label_width$}", repo.label)),
-                    Span::styled(format!("  {}", repo.health), health_style(&repo.health)),
-                ]);
+                    .map(|key| key.to_string())
+                    .unwrap_or_else(|| " ".to_string());
+                let line = Line::from(
+                    vec![
+                        Span::styled(format!("{key:<key_width$} "), muted_style()),
+                        Span::raw(format!("{:<label_width$}", repo.label)),
+                        Span::raw("  "),
+                    ]
+                    .into_iter()
+                    .chain(repo_health_spans(&repo.health, model.config.icon_style))
+                    .collect::<Vec<_>>(),
+                );
                 let focused = model.focus == PanelFocus::Repos && !model.main_focused;
                 ListItem::new(line).style(if repo.selected {
                     selected_sidebar_row_style(focused)
@@ -114,6 +120,65 @@ pub(super) fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &crate::vie
     if let Some(row) = selected_row {
         render_selected_row_outline(frame, area, row, focused);
     }
+}
+
+pub(super) fn repo_health_spans(health: &str, icon_style: IconStyle) -> Vec<Span<'static>> {
+    if health == "ok" {
+        return vec![Span::styled("ok".to_string(), health_style(health))];
+    }
+
+    let tokens = health.split_whitespace().collect::<Vec<_>>();
+    if !tokens
+        .iter()
+        .all(|token| repo_health_token(token, icon_style).is_some())
+    {
+        return vec![Span::styled(health.to_string(), health_style(health))];
+    }
+
+    let mut spans = Vec::new();
+    for token in tokens {
+        let Some((kind, symbol, count)) = repo_health_token(token, icon_style) else {
+            continue;
+        };
+        if count == "0" {
+            spans.push(Span::raw("     "));
+        } else {
+            spans.push(Span::styled(symbol, repo_health_style(kind)));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(format!("{count:<2}"), repo_health_style(kind)));
+        }
+        spans.push(Span::raw(" "));
+    }
+    spans
+}
+
+fn repo_health_token(
+    token: &str,
+    icon_style: IconStyle,
+) -> Option<(RepoHealthKind, &'static str, &str)> {
+    let split = token
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_ascii_digit())
+        .map(|(index, ch)| index + ch.len_utf8())?;
+    let (symbol, count) = token.split_at(split);
+    if count.is_empty() || !count.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    [
+        RepoHealthKind::Dirty,
+        RepoHealthKind::Agents,
+        RepoHealthKind::Attention,
+        RepoHealthKind::PullRequests,
+        RepoHealthKind::CiFailed,
+        RepoHealthKind::CiRunning,
+        RepoHealthKind::Behind,
+    ]
+    .into_iter()
+    .find_map(|kind| {
+        let icon = repo_health_icon(kind, icon_style);
+        (symbol == icon).then_some((kind, icon, count))
+    })
 }
 
 pub(super) fn render_worktrees(
@@ -170,13 +235,6 @@ pub(super) fn render_worktrees(
                 };
             let mut spans = if repo_mode {
                 let mut spans = vec![
-                    Span::styled(
-                        format!(
-                            "{:<repo_width$} ",
-                            truncate_column(&worktree.repo_label, repo_width)
-                        ),
-                        muted_style(),
-                    ),
                     Span::styled(
                         format!("{} ", visibility_marker(worktree.visibility)),
                         visibility_style(worktree.visibility),
@@ -282,7 +340,7 @@ pub(super) fn worktree_header_row(
     if !repo_mode {
         return ListItem::new(Line::from(vec![
             Span::styled(format!("{:<repo_width$} ", "repo"), muted_style()),
-            Span::styled("V ", muted_style()),
+            Span::styled("↕ ", muted_style()),
             Span::styled(format!("{:<16} ", "branch/wt"), muted_style()),
             Span::styled("PR ", muted_style()),
             Span::styled("CI ", muted_style()),
@@ -293,8 +351,7 @@ pub(super) fn worktree_header_row(
     }
     ListItem::new(Line::from(
         vec![
-            Span::styled(format!("{:<repo_width$} ", "repo"), muted_style()),
-            Span::styled("V ", muted_style()),
+            Span::styled("↕ ", muted_style()),
             Span::styled(format!("{:<12} ", "branch"), muted_style()),
             Span::styled("K ", muted_style()),
             Span::styled("A ", muted_style()),
@@ -338,9 +395,9 @@ pub(super) fn render_selected_row_outline(
 
 pub(super) fn visibility_marker(visibility: i16) -> &'static str {
     match visibility.cmp(&0) {
-        std::cmp::Ordering::Greater => "^",
-        std::cmp::Ordering::Less => "V",
-        std::cmp::Ordering::Equal => ".",
+        std::cmp::Ordering::Greater => "↑",
+        std::cmp::Ordering::Less => "↓",
+        std::cmp::Ordering::Equal => "·",
     }
 }
 
@@ -376,7 +433,7 @@ pub(super) fn configured_worktree_column_widths(
     if configured_columns.is_empty() {
         return Vec::new();
     }
-    let base_width = 42;
+    let base_width = 32;
     let available = inner_width.saturating_sub(base_width);
     if available < 6 {
         return Vec::new();
@@ -388,7 +445,7 @@ pub(super) fn configured_worktree_column_widths(
     }
     configured_columns
         .iter()
-        .map(|column| (column.as_str(), value_width.clamp(4, 18)))
+        .map(|column| (column.as_str(), value_width.clamp(4, 12)))
         .collect()
 }
 

@@ -96,7 +96,7 @@ fn renders_selected_sidebar_rows_with_focused_style() {
         row,
         Style::default()
             .fg(Color::White)
-            .bg(Color::Rgb(0, 96, 96))
+            .bg(Color::Rgb(0, 64, 64))
             .add_modifier(Modifier::BOLD),
     );
     assert_cell_style(
@@ -126,7 +126,7 @@ fn renders_selected_sidebar_rows_with_focused_style() {
         row,
         Style::default()
             .fg(Color::White)
-            .bg(Color::Rgb(0, 96, 96))
+            .bg(Color::Rgb(0, 64, 64))
             .add_modifier(Modifier::BOLD),
     );
     assert_cell_style(
@@ -135,7 +135,7 @@ fn renders_selected_sidebar_rows_with_focused_style() {
         row,
         Style::default()
             .fg(Color::Green)
-            .bg(Color::Rgb(0, 96, 96))
+            .bg(Color::Rgb(0, 64, 64))
             .add_modifier(Modifier::BOLD),
     );
     assert_cell_style(
@@ -167,7 +167,7 @@ fn renders_selected_sidebar_rows_with_unfocused_style() {
         &buffer,
         label_x,
         row,
-        Style::default().fg(Color::Reset).bg(Color::DarkGray),
+        Style::default().fg(Color::Reset).bg(Color::Rgb(32, 32, 32)),
     );
     assert_cell_style(
         &buffer,
@@ -190,7 +190,7 @@ fn renders_selected_sidebar_rows_with_unfocused_style() {
         &buffer,
         branch_x,
         row,
-        Style::default().fg(Color::Reset).bg(Color::DarkGray),
+        Style::default().fg(Color::Reset).bg(Color::Rgb(32, 32, 32)),
     );
     assert_cell_style(
         &buffer,
@@ -382,6 +382,27 @@ fn renders_nerd_font_worktree_icons_when_configured() {
     assert!(buffer.contains(""));
     assert!(buffer.contains(""));
     assert!(buffer.contains(""));
+}
+
+#[test]
+fn nerd_font_status_counts_have_spacing() {
+    assert_eq!(
+        git_status_indicator("dirty 2 ahead 1 behind 3", IconStyle::NerdFont),
+        " 2 ↑1 ↓3"
+    );
+}
+
+#[test]
+fn nerd_font_repo_health_counts_have_spacing() {
+    let spans = repo_health_spans("2 0 1", IconStyle::NerdFont);
+    let text = spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+
+    assert!(text.contains(" 2"), "got {text:?}");
+    assert!(text.contains(" 1"), "got {text:?}");
+    assert!(!text.contains("2"), "got {text:?}");
 }
 
 #[test]
@@ -594,6 +615,32 @@ fn renders_dialog_overlays() {
     assert!(buffer.contains("remove local state"));
     assert!(buffer.contains("Enter Delete"));
     assert!(buffer.contains("Esc/q Cancel"));
+}
+
+#[test]
+fn worktree_info_dialog_groups_agent_with_dense_columns() {
+    let rows = keybinding_info_lines(PanelFocus::Worktrees, IconStyle::Unicode)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    let compact_header = rows
+        .iter()
+        .position(|line| line.contains("visibility") && line.contains("kind"))
+        .expect("compact worktree header");
+    let dense_header = rows
+        .iter()
+        .position(|line| {
+            line.contains("agent")
+                && line.contains("PR")
+                && line.contains("git")
+                && line.contains("CI")
+        })
+        .expect("dense worktree header");
+
+    assert!(!rows[compact_header].contains("agent"));
+    assert!(dense_header > compact_header);
+    assert!(rows[dense_header + 1].contains("idle"));
+    assert!(rows[dense_header + 1].contains("open"));
 }
 
 #[test]

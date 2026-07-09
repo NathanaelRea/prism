@@ -25,7 +25,9 @@ pub(super) fn repo_overview_lines(
         )),
     ];
     if let Some(row) = model.repos.iter().find(|row| row.selected) {
-        lines.push(labelled_line("health", row.health.clone()));
+        let mut spans = vec![Span::styled("health ", muted_style())];
+        spans.extend(repo_health_spans(&row.health, model.config.icon_style));
+        lines.push(Line::from(spans));
     }
     lines.push(Line::from(vec![
         Span::styled("view ", muted_style()),
