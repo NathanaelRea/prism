@@ -36,7 +36,7 @@ pub(super) fn render_footer(
             "j/k select  Enter tmux  c create  U unarchive  C columns  R manage  / search  q quit"
         }
         PanelFocus::Worktrees => {
-            "j/k select  +/- visibility  0 main  Enter tmux  D archive  X delete  / search  q quit"
+            "j/k select  0 main  Enter tmux/phase  +/- visibility  D archive  X delete  / search  q quit"
         }
     };
     let mut spans = vec![

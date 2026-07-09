@@ -1148,7 +1148,7 @@ fn request(
     parse_response(&response)
 }
 
-fn parse_localhost_url(url: &str) -> Result<(String, u16), String> {
+pub(crate) fn parse_localhost_url(url: &str) -> Result<(String, u16), String> {
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| format!("unsupported opencode URL: {url}"))?;
