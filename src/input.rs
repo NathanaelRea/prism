@@ -56,7 +56,7 @@ impl KeyInput {
             KeyCode::Char('{') if plain_char(event) => Key::PreviousBlock,
             KeyCode::Char('}') if plain_char(event) => Key::NextBlock,
             KeyCode::Char('r') if plain_char(event) => Key::Refresh,
-            KeyCode::Char('+') | KeyCode::Char('=') if plain_char(event) => Key::VisibilityUp,
+            KeyCode::Char('+') if plain_char(event) => Key::VisibilityUp,
             KeyCode::Char('-') if plain_char(event) => Key::VisibilityDown,
             KeyCode::Char('0') if plain_char(event) => Key::FocusMain,
             KeyCode::Char('1') if plain_char(event) => Key::FocusStatus,
@@ -373,6 +373,20 @@ mod tests {
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('P'))),
             Key::PlanMode
+        );
+    }
+
+    #[test]
+    fn key_input_requires_plus_for_visibility_up() {
+        let mut input = KeyInput::default();
+        assert_eq!(map(&mut input, key(KeyCode::Char('='))), Key::Other);
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('+'))),
+            Key::VisibilityUp
+        );
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('-'))),
+            Key::VisibilityDown
         );
     }
 

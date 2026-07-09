@@ -37,20 +37,29 @@ pub(super) fn agent_icon(state: AgentState) -> &'static str {
 }
 
 pub(super) fn git_status_indicator(status: &str, icon_style: IconStyle) -> String {
-    let mut out = String::new();
+    let mut parts = Vec::new();
     if let Some(count) = status_count(status, "dirty") {
-        out.push_str(icon(icon_style, "✗", ""));
-        out.push_str(&count.to_string());
+        parts.push(counted_icon(icon_style, "✗", "", count));
     }
     if let Some(count) = status_count(status, "ahead") {
-        out.push('↑');
-        out.push_str(&count.to_string());
+        parts.push(format!("↑{count}"));
     }
     if let Some(count) = status_count(status, "behind") {
-        out.push('↓');
-        out.push_str(&count.to_string());
+        parts.push(format!("↓{count}"));
     }
-    out
+    parts.join(" ")
+}
+
+fn counted_icon(
+    icon_style: IconStyle,
+    unicode: &'static str,
+    nerd_font: &'static str,
+    count: usize,
+) -> String {
+    match icon_style {
+        IconStyle::Unicode => format!("{unicode}{count}"),
+        IconStyle::NerdFont => format!("{nerd_font} {count}"),
+    }
 }
 
 pub(super) fn plan_mode_label(mode: PlanRunMode) -> &'static str {

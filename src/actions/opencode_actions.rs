@@ -62,6 +62,7 @@ impl Tui {
                     let Some(runtime) = runtime else {
                         return Err("no OpenCode runtime exists yet".to_string());
                     };
+                    let runtime = opencode::refresh_opencode_session(&repo, runtime, &path)?;
                     opencode::poll_status(&runtime)
                 });
                 let _ = tx.send(OpencodePollResult { key, status });
