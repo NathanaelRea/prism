@@ -597,6 +597,32 @@ fn renders_dialog_overlays() {
 }
 
 #[test]
+fn worktree_info_dialog_groups_agent_with_dense_columns() {
+    let rows = keybinding_info_lines(PanelFocus::Worktrees, IconStyle::Unicode)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+    let compact_header = rows
+        .iter()
+        .position(|line| line.contains("visibility") && line.contains("kind"))
+        .expect("compact worktree header");
+    let dense_header = rows
+        .iter()
+        .position(|line| {
+            line.contains("agent")
+                && line.contains("PR")
+                && line.contains("git")
+                && line.contains("CI")
+        })
+        .expect("dense worktree header");
+
+    assert!(!rows[compact_header].contains("agent"));
+    assert!(dense_header > compact_header);
+    assert!(rows[dense_header + 1].contains("idle"));
+    assert!(rows[dense_header + 1].contains("open"));
+}
+
+#[test]
 fn prompt_dialog_sets_cursor_at_end_of_input() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Idle)];

@@ -300,7 +300,6 @@ pub(crate) fn keybinding_info_lines(
             info_columns_row(&[
                 info_cell("↕", muted_style(), "visibility"),
                 info_cell("K", muted_style(), "kind"),
-                info_cell("A", muted_style(), "agent"),
             ]),
             info_columns_row(&[
                 info_cell("↑", visibility_style(1), "raised"),
@@ -309,7 +308,6 @@ pub(crate) fn keybinding_info_lines(
                     classification_style(SessionClassification::Planning),
                     "planning",
                 ),
-                info_cell("○", agent_style(AgentState::Idle), "idle"),
             ]),
             info_columns_row(&[
                 info_cell("↓", visibility_style(-1), "lowered"),
@@ -318,7 +316,6 @@ pub(crate) fn keybinding_info_lines(
                     classification_style(SessionClassification::Exploration),
                     "explore",
                 ),
-                info_cell("●", agent_style(AgentState::Running), "running"),
             ]),
             info_columns_row(&[
                 info_cell("·", visibility_style(0), "normal"),
@@ -327,53 +324,49 @@ pub(crate) fn keybinding_info_lines(
                     classification_style(SessionClassification::Work),
                     "work",
                 ),
-                info_cell("✓", agent_style(AgentState::ExitedOk), "done"),
-            ]),
-            info_columns_row(&[
-                info_blank_cell(),
-                info_blank_cell(),
-                info_cell("✕", agent_style(AgentState::ExitedError), "failed"),
-            ]),
-            info_columns_row(&[
-                info_blank_cell(),
-                info_blank_cell(),
-                info_cell("↻", agent_style(AgentState::NeedsRestart), "restart"),
-            ]),
-            info_columns_row(&[
-                info_blank_cell(),
-                info_blank_cell(),
-                info_cell("!", agent_style(AgentState::NeedsInput), "input"),
             ]),
             Line::from(""),
             info_columns_row(&[
+                info_cell("A", muted_style(), "agent"),
                 info_cell("P", muted_style(), "PR"),
                 info_cell("G", muted_style(), "git"),
                 info_cell("C", muted_style(), "CI"),
             ]),
             info_columns_row(&[
+                info_cell("○", agent_style(AgentState::Idle), "idle"),
                 info_cell("⇄", Style::default().fg(Color::Green), "open"),
                 info_cell("✓", Style::default().fg(Color::Green), "clean"),
                 info_cell("✓", pr_check_style("passed"), "passed"),
             ]),
             info_columns_row(&[
+                info_cell("●", agent_style(AgentState::Running), "running"),
                 info_cell("◐", muted_style(), "draft"),
                 info_cell("✗", error_style(), "dirty"),
                 info_cell("✕", pr_check_style("failed"), "failed"),
             ]),
             info_columns_row(&[
+                info_cell("✓", agent_style(AgentState::ExitedOk), "done"),
                 info_cell("⋈", Style::default().fg(Color::Magenta), "merged"),
                 info_cell("↑", attention_style(), "ahead"),
                 info_cell("•", pr_check_style("running"), "running"),
             ]),
             info_columns_row(&[
+                info_cell("✕", agent_style(AgentState::ExitedError), "failed"),
                 info_cell("×", Style::default().fg(Color::Red), "closed"),
                 info_cell("↓", attention_style(), "behind"),
                 info_cell("±", pr_check_style("mixed"), "mixed"),
             ]),
             info_columns_row(&[
+                info_cell("↻", agent_style(AgentState::NeedsRestart), "restart"),
                 info_cell("⚔", Style::default().fg(Color::Red), "conflict"),
                 info_cell("↕", attention_style(), "diverged"),
                 info_cell("?", pr_check_style("unknown"), "unknown"),
+            ]),
+            info_columns_row(&[
+                info_cell("!", agent_style(AgentState::NeedsInput), "input"),
+                info_blank_cell(),
+                info_blank_cell(),
+                info_blank_cell(),
             ]),
             Line::from(""),
             info_symbol_line("@", muted_style(), "unresolved/resolved review comments"),
@@ -418,14 +411,20 @@ fn info_blank_cell() -> Option<InfoCell> {
 
 fn info_columns_row(cells: &[Option<InfoCell>]) -> Line<'static> {
     const CELL_WIDTH: usize = 24;
+    const COMPACT_CELL_WIDTH: usize = 18;
     const SYMBOL_WIDTH: usize = 2;
 
     let mut spans = Vec::new();
+    let padded_cell_width = if cells.len() > 3 {
+        COMPACT_CELL_WIDTH
+    } else {
+        CELL_WIDTH
+    };
     for (index, cell) in cells.iter().enumerate() {
         let cell_width = if index + 1 == cells.len() {
             0
         } else {
-            CELL_WIDTH
+            padded_cell_width
         };
         match cell {
             Some(cell) => {
