@@ -120,8 +120,14 @@ impl Tui {
             );
         }
         let prompt = build_review_fix_prompt(&self.sessions[selected], &context.config)?;
-        self.submit_action_prompt_to_agent(selected, &context.repo, "review fix", &prompt)?;
-        self.show_message("review-fix prompt sent to new agent session")?;
+        self.start_managed_repair(
+            selected,
+            &context.repo,
+            &context.config,
+            AutoStepKey::FixReview,
+            prompt,
+        )?;
+        self.show_message("started managed review repair; commit will wait for guarded push")?;
         Ok(())
     }
 
@@ -171,8 +177,81 @@ impl Tui {
             );
         }
         let prompt = build_ci_failure_prompt(&self.sessions[selected], &context.config)?;
-        self.submit_action_prompt_to_agent(selected, &context.repo, "ci fix", &prompt)?;
-        self.show_message("CI-failure prompt sent to new agent session")?;
+        self.start_managed_repair(
+            selected,
+            &context.repo,
+            &context.config,
+            AutoStepKey::FixCi,
+            prompt,
+        )?;
+        self.show_message("started managed CI repair; commit will wait for guarded push")?;
+        Ok(())
+    }
+
+    fn start_managed_repair(
+        &mut self,
+        selected: usize,
+        repo: &crate::repo::Repository,
+        config: &crate::config::Config,
+        step_key: AutoStepKey,
+        prompt: String,
+    ) -> Result<(), String> {
+        let session_path = self.sessions[selected].path.clone();
+        let session_branch = self.sessions[selected].branch.clone();
+        let mut persisted = if let Some(run_id) = self.active_auto_runs.get(&session_path).cloned()
+        {
+            crate::observability::with_writable_db(repo, |conn| load_auto_run(conn, &run_id))?
+                .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?
+        } else {
+            let initial_prompt = self.sessions[selected].prompt_summary.trim();
+            let initial_prompt = if initial_prompt.is_empty() {
+                format!("Repair PR branch {session_branch}")
+            } else {
+                initial_prompt.to_string()
+            };
+            let launch = AutoLaunch::with_options(
+                &repo.root,
+                &session_path,
+                AutoLaunchOptions {
+                    branch: session_branch.clone(),
+                    mode: AutoRunMode::Standard,
+                    implementation_source: AutoImplementationSource::Prompt,
+                    plan_path: None,
+                    plan_run_mode: PlanRunMode::Sequential,
+                    variant: "repair".to_string(),
+                    agent_profile: None,
+                    initial_prompt,
+                },
+            )?;
+            let mut run = launch.create_run();
+            run.steps.clear();
+            run.run.pr_number = self.sessions[selected]
+                .pr
+                .summary
+                .as_ref()
+                .map(|summary| summary.number);
+            run.run.pr_url = self.sessions[selected]
+                .pr
+                .summary
+                .as_ref()
+                .map(|summary| summary.url.clone());
+            run.run.current_head_sha = crate::git::current_head_sha(&session_path, config).ok();
+            run
+        };
+
+        crate::observability::with_writable_db(repo, |conn| {
+            save_auto_run(conn, &mut persisted)?;
+            append_step_run(conn, &mut persisted, step_key, Some(prompt))
+        })?;
+        self.remember_auto_run(persisted.clone());
+        self.selected_auto_run = Some(persisted.run.id.clone());
+        #[cfg(test)]
+        if self.prompt_submissions.is_some() {
+            self.focus_status();
+            return Ok(());
+        }
+        self.spawn_auto_run_executor(repo.clone(), config.clone(), persisted);
+        self.focus_status();
         Ok(())
     }
 
@@ -240,6 +319,11 @@ impl Tui {
             self.show_message("cannot push a detached worktree")?;
             return Ok(());
         }
+
+        if self.push_guarded_pending_repair(raw, selected, &context.repo, &context.config)? {
+            return Ok(());
+        }
+
         run_pre_push_checks(&context.config, &path)?;
         let set_upstream = !has_upstream(&path, &context.config)?;
         self.show_loading_dialog(raw, "Push Branch", "Pushing selected branch")?;
@@ -294,6 +378,155 @@ impl Tui {
             self.show_message("push complete")?;
         }
         Ok(())
+    }
+
+    fn push_guarded_pending_repair(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+        selected: usize,
+        repo: &crate::repo::Repository,
+        config: &crate::config::Config,
+    ) -> Result<bool, String> {
+        let path = self.sessions[selected].path.clone();
+        let branch = self.sessions[selected].branch.clone();
+        let Some(run_id) = self.active_auto_runs.get(&path).cloned() else {
+            return Ok(false);
+        };
+
+        let mut persisted =
+            crate::observability::with_writable_db(repo, |conn| load_auto_run(conn, &run_id))?
+                .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?;
+        let Some(guard) = persisted.run.pending_push.clone() else {
+            return Ok(false);
+        };
+
+        self.show_loading_dialog(raw, "Guarded Push", "Reobserving guarded repair push")?;
+        let _ = crate::git::fetch_origin(&path, config);
+        {
+            let session = &mut self.sessions[selected];
+            refresh_branch_pr_cache(
+                repo,
+                config,
+                &session.branch,
+                &session.path,
+                &mut session.pr,
+                true,
+            );
+        }
+        let local_head = crate::git::current_head_sha(&path, config).ok();
+        let remote_head = crate::git::remote_branch_head_sha(&path, &branch, config)
+            .ok()
+            .flatten();
+        let pr_head = self.sessions[selected]
+            .pr
+            .summary
+            .as_ref()
+            .map(|summary| summary.head_sha.clone());
+
+        match decide_guarded_push(
+            &guard,
+            local_head.as_deref(),
+            remote_head.as_deref(),
+            pr_head.as_deref(),
+        ) {
+            GuardedPushDecision::AlreadySatisfied => {
+                self.finish_guarded_push(repo, config, selected, &mut persisted, true)?;
+                self.show_message(
+                    "guarded repair push already satisfied; reobserved PR Stabilization",
+                )?;
+            }
+            GuardedPushDecision::Invalidated { reason } => {
+                persisted.run.pending_push = None;
+                self.update_persisted_stabilization(repo, config, selected, &mut persisted)?;
+                self.remember_auto_run(persisted);
+                self.show_message(&format!("guarded repair push invalidated: {reason}"))?;
+            }
+            GuardedPushDecision::ValidToPush => {
+                run_pre_push_checks(config, &path)?;
+                self.show_loading_dialog(raw, "Guarded Push", "Pushing guarded repair commit")?;
+                crate::git::push_current_branch(&path, config)?;
+                self.finish_guarded_push(repo, config, selected, &mut persisted, false)?;
+                self.show_message("guarded repair pushed; reobserved PR Stabilization")?;
+            }
+        }
+        Ok(true)
+    }
+
+    fn finish_guarded_push(
+        &mut self,
+        repo: &crate::repo::Repository,
+        config: &crate::config::Config,
+        selected: usize,
+        persisted: &mut PersistedAutoRun,
+        already_satisfied: bool,
+    ) -> Result<(), String> {
+        if let Some(guard) = persisted.run.pending_push.as_ref()
+            && matches!(
+                guard.repair_kind,
+                crate::auto_flow::stabilization_model::RepairKind::Review
+            )
+            && !guard.guarded_review_thread_ids.is_empty()
+        {
+            let _ = crate::github::resolve_review_threads(
+                &persisted.run.worktree_path,
+                config,
+                &guard.guarded_review_thread_ids,
+            )?;
+        }
+        persisted.run.pending_push = None;
+        if !already_satisfied {
+            let session = &mut self.sessions[selected];
+            refresh_branch_pr_cache(
+                repo,
+                config,
+                &session.branch,
+                &session.path,
+                &mut session.pr,
+                true,
+            );
+        }
+        self.update_persisted_stabilization(repo, config, selected, persisted)?;
+        self.remember_auto_run(persisted.clone());
+        Ok(())
+    }
+
+    fn update_persisted_stabilization(
+        &mut self,
+        repo: &crate::repo::Repository,
+        config: &crate::config::Config,
+        selected: usize,
+        persisted: &mut PersistedAutoRun,
+    ) -> Result<(), String> {
+        persisted.run.current_head_sha =
+            crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
+        let snapshot = build_stabilization_snapshot(
+            repo,
+            &self.sessions[selected],
+            Some(&persisted.run),
+            config,
+        );
+        let work = plan_stabilization(&snapshot);
+        persisted.run.stabilization_status = Some(match work.blocker {
+            crate::auto_flow::stabilization_model::StabilizationBlocker::ReadyForManualMerge
+            | crate::auto_flow::stabilization_model::StabilizationBlocker::ReadyToAutoMerge => {
+                crate::auto_flow::stabilization_model::StabilizationStatus::Ready
+            }
+            crate::auto_flow::stabilization_model::StabilizationBlocker::Merged => {
+                crate::auto_flow::stabilization_model::StabilizationStatus::Done
+            }
+            crate::auto_flow::stabilization_model::StabilizationBlocker::CiPending => {
+                crate::auto_flow::stabilization_model::StabilizationStatus::Waiting
+            }
+            crate::auto_flow::stabilization_model::StabilizationBlocker::Escalate
+            | crate::auto_flow::stabilization_model::StabilizationBlocker::MergeBlocked => {
+                crate::auto_flow::stabilization_model::StabilizationStatus::Escalated
+            }
+            _ => crate::auto_flow::stabilization_model::StabilizationStatus::Blocked,
+        });
+        persisted.run.stabilization_blocker = Some(work.blocker);
+        persisted.run.stabilization_next_work = Some(work.kind);
+        persisted.run.updated_unix_ms = crate::auto_flow::unix_ms();
+        crate::observability::with_writable_db(repo, |conn| save_auto_run(conn, persisted))
     }
 
     pub(super) fn prompt_pr_description(

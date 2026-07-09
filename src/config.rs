@@ -63,6 +63,9 @@ icon_style = \"unicode\" # or \"nerd-font\"\n\
 # [auto]\n\
 # merge = false\n\
 # cleanup_after_merge = false\n\
+# require_review_approval = false\n\
+# push_initial = true\n\
+# push_repairs = false\n\
 # review_wait_enabled = true\n\
 # review_reviewer_identities = [\"Copilot\", \"github-copilot\"]\n\
 # review_max_wait_seconds = 300\n\
@@ -78,7 +81,10 @@ icon_style = \"unicode\" # or \"nerd-font\"\n\
 \n\
 # [prompt_templates]\n\
 # review_fix = \"Here are review comments on PR {{pr_number}}.\\n\\nIf they are applicable, fix them. Otherwise, say why not.\\n\\n---\\n\\n{{comments}}\"\n\
-# ci_failure = \"Here are CI failures on PR {{pr_number}}.\\n\\nFix the failing checks. Use the log tails below as the primary clues.\\n\\nPR: {{url}}\\nBranch: {{branch}}\\nHead SHA: {{head_sha}}\\n\\n---\\n\\n{{failures}}\"\n"
+# ci_failure = \"Here are CI failures on PR {{pr_number}}.\\n\\nFix the failing checks. Use the log tails below as the primary clues.\\n\\nPR: {{url}}\\nBranch: {{branch}}\\nHead SHA: {{head_sha}}\\n\\n---\\n\\n{{failures}}\"\n\
+# repair_commit_review = \"fix: cr\"\n\
+# repair_commit_ci = \"fix: ci\"\n\
+# repair_commit_merge = \"fix: merge\"\n"
     )
 }
 
@@ -105,6 +111,9 @@ pub struct Checks {
 pub struct AutoConfig {
     pub merge: bool,
     pub cleanup_after_merge: bool,
+    pub require_review_approval: bool,
+    pub push_initial: bool,
+    pub push_repairs: bool,
     pub review_wait_enabled: bool,
     pub review_reviewer_identities: Vec<String>,
     pub review_max_wait_seconds: u64,
@@ -148,6 +157,9 @@ impl Default for AutoConfig {
         Self {
             merge: false,
             cleanup_after_merge: false,
+            require_review_approval: false,
+            push_initial: true,
+            push_repairs: false,
             review_wait_enabled: true,
             review_reviewer_identities: vec!["Copilot".to_string(), "github-copilot".to_string()],
             review_max_wait_seconds: 300,
@@ -283,6 +295,9 @@ struct RawChecks {
 struct RawAutoConfig {
     merge: Option<bool>,
     cleanup_after_merge: Option<bool>,
+    require_review_approval: Option<bool>,
+    push_initial: Option<bool>,
+    push_repairs: Option<bool>,
     review_wait_enabled: Option<bool>,
     review_reviewer_identities: Option<Vec<String>>,
     review_max_wait_seconds: Option<u64>,
@@ -433,6 +448,15 @@ impl Config {
             }
             if let Some(enabled) = auto.cleanup_after_merge {
                 self.auto.cleanup_after_merge = enabled;
+            }
+            if let Some(enabled) = auto.require_review_approval {
+                self.auto.require_review_approval = enabled;
+            }
+            if let Some(enabled) = auto.push_initial {
+                self.auto.push_initial = enabled;
+            }
+            if let Some(enabled) = auto.push_repairs {
+                self.auto.push_repairs = enabled;
             }
             if let Some(enabled) = auto.review_wait_enabled {
                 self.auto.review_wait_enabled = enabled;
@@ -607,6 +631,12 @@ pub fn print_config(repo: &Repository, config: &Config) {
         "auto.cleanup_after_merge = {}",
         config.auto.cleanup_after_merge
     );
+    println!(
+        "auto.require_review_approval = {}",
+        config.auto.require_review_approval
+    );
+    println!("auto.push_initial = {}", config.auto.push_initial);
+    println!("auto.push_repairs = {}", config.auto.push_repairs);
     println!(
         "auto.review_wait_enabled = {}",
         config.auto.review_wait_enabled

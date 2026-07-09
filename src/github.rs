@@ -27,6 +27,19 @@ pub struct PrCache {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RepoPolicyCache {
+    pub repo_remote: String,
+    pub default_branch: Option<String>,
+    pub required_approvals: u64,
+    pub require_conversation_resolution: bool,
+    pub require_branch_up_to_date: bool,
+    pub required_checks: Vec<String>,
+    pub merge_queue_required: bool,
+    pub refreshed_unix_ms: u64,
+    pub error: Option<String>,
+}
+
 pub(crate) struct PrCacheRepository<'a> {
     pub repo: &'a Repository,
     pub config: &'a Config,
@@ -80,12 +93,13 @@ impl PrSummary {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub enum PrCheckState {
     Pending,
     Success,
     Failed,
     Mixed,
+    #[default]
     Unknown,
 }
 
@@ -118,10 +132,17 @@ pub struct PrDetails {
     pub review_comments: Vec<PrReviewComment>,
     pub files: Vec<String>,
     pub failing_checks: Vec<String>,
+    pub check_contexts: Vec<PrCheckContext>,
     pub ci_failures: Vec<CiFailure>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub struct PrCheckContext {
+    pub name: String,
+    pub state: PrCheckState,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CiFailure {
     pub workflow: String,
     pub name: String,
@@ -159,6 +180,8 @@ pub struct PrReview {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct PrReviewComment {
     #[serde(default)]
+    pub thread_id: String,
+    #[serde(default)]
     pub id: String,
     pub author: String,
     pub path: String,
@@ -186,6 +209,36 @@ struct GithubRepository {
     pull_requests: GithubPullRequestConnection,
     #[serde(default, rename = "pullRequest")]
     pull_request: GithubPullRequest,
+    #[serde(default, rename = "defaultBranchRef")]
+    default_branch_ref: GithubBranchRef,
+    #[serde(default, rename = "branchProtectionRules")]
+    branch_protection_rules: GithubBranchProtectionRuleConnection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubBranchRef {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubBranchProtectionRuleConnection {
+    #[serde(default)]
+    nodes: Vec<GithubBranchProtectionRule>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubBranchProtectionRule {
+    #[serde(default)]
+    pattern: String,
+    #[serde(default, rename = "requiredApprovingReviewCount")]
+    required_approving_review_count: u64,
+    #[serde(default, rename = "requiresConversationResolution")]
+    requires_conversation_resolution: bool,
+    #[serde(default, rename = "requiresStrictStatusChecks")]
+    requires_strict_status_checks: bool,
+    #[serde(default, rename = "requiredStatusCheckContexts")]
+    required_status_check_contexts: Vec<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -288,6 +341,8 @@ struct GithubReviewThreadConnection {
 
 #[derive(Debug, Default, Deserialize)]
 struct GithubReviewThread {
+    #[serde(default)]
+    id: String,
     #[serde(default, rename = "isResolved")]
     is_resolved: bool,
     #[serde(default)]
@@ -842,6 +897,142 @@ pub fn fetch_pr_summary_index(
     Ok(parse_pr_summary_index(&raw))
 }
 
+pub(crate) fn refresh_repo_policy_cache(
+    repo: &Repository,
+    path: &std::path::Path,
+    config: &Config,
+) -> Result<RepoPolicyCache, String> {
+    let remote = github_remote_repo(path, config, "origin")?;
+    let policy = match fetch_repo_policy(path, config) {
+        Ok(mut policy) => {
+            policy.repo_remote = remote.clone();
+            policy
+        }
+        Err(error) => RepoPolicyCache {
+            repo_remote: remote.clone(),
+            refreshed_unix_ms: unix_seconds().max(0) as u64,
+            error: Some(error),
+            ..RepoPolicyCache::default()
+        },
+    };
+    save_repo_policy_cache(repo, &policy)?;
+    Ok(policy)
+}
+
+pub(crate) fn resolve_review_threads(
+    path: &std::path::Path,
+    config: &Config,
+    thread_ids: &[String],
+) -> Result<usize, String> {
+    let mut resolved = 0;
+    for thread_id in thread_ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !id.trim().is_empty())
+    {
+        run_capture(
+            Command::new(config.tool("gh"))
+                .args(resolve_review_thread_args(thread_id))
+                .current_dir(path),
+        )?;
+        resolved += 1;
+    }
+    Ok(resolved)
+}
+
+fn resolve_review_thread_args(thread_id: &str) -> Vec<String> {
+    vec![
+        "api".to_string(),
+        "graphql".to_string(),
+        "-F".to_string(),
+        format!("thread={thread_id}"),
+        "-f".to_string(),
+        format!("query={RESOLVE_REVIEW_THREAD_MUTATION}"),
+    ]
+}
+
+const RESOLVE_REVIEW_THREAD_MUTATION: &str = r#"
+mutation($thread: ID!) {
+  resolveReviewThread(input: {threadId: $thread}) {
+    thread {
+      id
+      isResolved
+    }
+  }
+}
+"#;
+
+pub(crate) fn load_repo_policy_cache(
+    repo: &Repository,
+    repo_remote: &str,
+) -> Option<RepoPolicyCache> {
+    observability::with_writable_db(repo, |conn| {
+        conn.query_row(
+            "select repo_remote, default_branch, required_approvals,
+                    require_conversation_resolution, require_branch_up_to_date,
+                    required_checks, merge_queue_required, refreshed_unix_ms, error
+               from repo_policy_cache
+              where repo_remote = ?1",
+            params![repo_remote],
+            |row| {
+                Ok(RepoPolicyCache {
+                    repo_remote: row.get(0)?,
+                    default_branch: row.get(1)?,
+                    required_approvals: row_u64(row, 2)?,
+                    require_conversation_resolution: row.get::<_, i64>(3)? != 0,
+                    require_branch_up_to_date: row.get::<_, i64>(4)? != 0,
+                    required_checks: decode_string_values(&row.get::<_, String>(5)?),
+                    merge_queue_required: row.get::<_, i64>(6)? != 0,
+                    refreshed_unix_ms: row_u64(row, 7)?,
+                    error: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("read repo policy cache: {error}"))
+    })
+    .ok()
+    .flatten()
+}
+
+fn fetch_repo_policy(path: &std::path::Path, config: &Config) -> Result<RepoPolicyCache, String> {
+    let (owner, name) = github_owner_repo(path, config)?;
+    let raw = run_capture(
+        Command::new(config.tool("gh"))
+            .arg("api")
+            .arg("graphql")
+            .arg("-F")
+            .arg(format!("owner={owner}"))
+            .arg("-F")
+            .arg(format!("name={name}"))
+            .arg("-f")
+            .arg(format!("query={REPO_POLICY_QUERY}"))
+            .current_dir(path),
+    )?;
+    parse_repo_policy(&format!("{owner}/{name}"), &raw).ok_or_else(|| {
+        "GitHub repository policy response did not include repository data".to_string()
+    })
+}
+
+const REPO_POLICY_QUERY: &str = r#"
+query($owner: String!, $name: String!) {
+  repository(owner: $owner, name: $name) {
+    defaultBranchRef {
+      name
+    }
+    branchProtectionRules(first: 20) {
+      nodes {
+        pattern
+        requiredApprovingReviewCount
+        requiresConversationResolution
+        requiresStrictStatusChecks
+        requiredStatusCheckContexts
+      }
+    }
+  }
+}
+"#;
+
 const PR_SUMMARY_INDEX_QUERY: &str = r#"
 query($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
@@ -958,6 +1149,60 @@ pub fn parse_pr_summary_index(raw: &str) -> Vec<PrSummary> {
         .iter()
         .filter_map(pr_summary_from_node)
         .collect()
+}
+
+pub(crate) fn parse_repo_policy(repo_remote: &str, raw: &str) -> Option<RepoPolicyCache> {
+    let response = serde_json::from_str::<GithubPrSummaryIndexResponse>(raw).ok()?;
+    let repository = response.data.repository;
+    let default_branch = (!repository.default_branch_ref.name.trim().is_empty())
+        .then_some(repository.default_branch_ref.name);
+    let selected_rule = select_branch_protection_rule(
+        &repository.branch_protection_rules.nodes,
+        default_branch.as_deref(),
+    );
+    Some(RepoPolicyCache {
+        repo_remote: repo_remote.to_string(),
+        default_branch,
+        required_approvals: selected_rule
+            .map(|rule| rule.required_approving_review_count)
+            .unwrap_or(0),
+        require_conversation_resolution: selected_rule
+            .map(|rule| rule.requires_conversation_resolution)
+            .unwrap_or(false),
+        require_branch_up_to_date: selected_rule
+            .map(|rule| rule.requires_strict_status_checks)
+            .unwrap_or(false),
+        required_checks: selected_rule
+            .map(|rule| normalized_required_checks(&rule.required_status_check_contexts))
+            .unwrap_or_default(),
+        merge_queue_required: false,
+        refreshed_unix_ms: unix_seconds().max(0) as u64,
+        error: None,
+    })
+}
+
+fn select_branch_protection_rule<'a>(
+    rules: &'a [GithubBranchProtectionRule],
+    default_branch: Option<&str>,
+) -> Option<&'a GithubBranchProtectionRule> {
+    let default_branch = default_branch.unwrap_or_default();
+    rules
+        .iter()
+        .find(|rule| rule.pattern == default_branch)
+        .or_else(|| rules.iter().find(|rule| rule.pattern == "*"))
+        .or_else(|| rules.first())
+}
+
+fn normalized_required_checks(checks: &[String]) -> Vec<String> {
+    let mut normalized = Vec::new();
+    for check in checks {
+        let check = check.trim();
+        if check.is_empty() || normalized.iter().any(|existing| existing == check) {
+            continue;
+        }
+        normalized.push(check.to_string());
+    }
+    normalized
 }
 
 fn pr_summary_from_node(node: &GithubPullRequest) -> Option<PrSummary> {
@@ -1079,6 +1324,7 @@ pub fn parse_pr_details(raw: &str) -> PrDetails {
     };
     let comments = parse_pr_comments(&details);
     let reviews = parse_pr_reviews(&details);
+    let check_contexts = collect_check_contexts(&details.status_check_rollup);
     let failing_checks = collect_failing_checks(&details.status_check_rollup);
     PrDetails {
         comments,
@@ -1092,6 +1338,7 @@ pub fn parse_pr_details(raw: &str) -> PrDetails {
             .take(8)
             .collect(),
         failing_checks,
+        check_contexts,
         ci_failures: Vec::new(),
     }
 }
@@ -1209,6 +1456,7 @@ query($owner: String!, $name: String!, $number: Int!) {
     pullRequest(number: $number) {
       reviewThreads(first: 100) {
         nodes {
+          id
           isResolved
           comments(first: 100) {
             nodes {
@@ -1313,6 +1561,7 @@ fn parse_inline_review_comments(raw: &str) -> Vec<PrReviewComment> {
     comments
         .into_iter()
         .map(|object| PrReviewComment {
+            thread_id: String::new(),
             id: object.id,
             author: object.user.login,
             path: object.path,
@@ -1342,6 +1591,7 @@ pub fn parse_review_thread_comments(raw: &str) -> Vec<PrReviewComment> {
                 return comments;
             }
             let comment = PrReviewComment {
+                thread_id: thread.id.clone(),
                 id: object.id,
                 author: object.author.login,
                 path: object.path,
@@ -1432,6 +1682,69 @@ fn collect_failing_checks(rollup: &GithubStatusCheckRollup) -> Vec<String> {
         })
         .take(8)
         .collect()
+}
+
+fn collect_check_contexts(rollup: &GithubStatusCheckRollup) -> Vec<PrCheckContext> {
+    status_contexts_from_rollup(rollup)
+        .into_iter()
+        .filter_map(|context| {
+            let name = context.name.clone().or(context.context.clone())?;
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                return None;
+            }
+            Some(PrCheckContext {
+                name,
+                state: check_context_state(&context),
+            })
+        })
+        .take(64)
+        .collect()
+}
+
+fn check_context_state(context: &GithubStatusContext) -> PrCheckState {
+    let conclusion = context
+        .conclusion
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_uppercase();
+    if matches!(
+        conclusion.as_str(),
+        "FAILURE" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED"
+    ) {
+        return PrCheckState::Failed;
+    }
+    if matches!(conclusion.as_str(), "SUCCESS" | "SKIPPED" | "NEUTRAL") {
+        return PrCheckState::Success;
+    }
+
+    let status = context
+        .status
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_uppercase();
+    if matches!(
+        status.as_str(),
+        "QUEUED" | "IN_PROGRESS" | "PENDING" | "REQUESTED"
+    ) {
+        return PrCheckState::Pending;
+    }
+
+    match context
+        .state
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_uppercase()
+        .as_str()
+    {
+        "SUCCESS" => PrCheckState::Success,
+        "FAILURE" | "ERROR" => PrCheckState::Failed,
+        "PENDING" => PrCheckState::Pending,
+        _ => PrCheckState::Unknown,
+    }
 }
 
 fn parse_merged_status(raw: &str) -> bool {
@@ -1566,8 +1879,21 @@ pub(crate) fn migrate_pr_cache_schema(conn: &rusqlite::Connection) -> Result<(),
           review_comments text not null,
           files text not null,
           failing_checks text not null,
+          check_contexts text not null default '[]',
           ci_failures text not null default '[]',
           refreshed_unix_ms integer not null
+        );
+
+        create table if not exists repo_policy_cache (
+          repo_remote text primary key,
+          default_branch text,
+          required_approvals integer not null default 0,
+          require_conversation_resolution integer not null default 0,
+          require_branch_up_to_date integer not null default 0,
+          required_checks text not null default '[]',
+          merge_queue_required integer not null default 0,
+          refreshed_unix_ms integer not null,
+          error text
         );
         ",
     )
@@ -1606,6 +1932,13 @@ pub(crate) fn migrate_pr_cache_schema(conn: &rusqlite::Connection) -> Result<(),
             [],
         )
         .map_err(|error| format!("migrate pr_details_cache ci_failures column: {error}"))?;
+    }
+    if !table_has_column(conn, "pr_details_cache", "check_contexts")? {
+        conn.execute(
+            "alter table pr_details_cache add column check_contexts text not null default '[]'",
+            [],
+        )
+        .map_err(|error| format!("migrate pr_details_cache check_contexts column: {error}"))?;
     }
     Ok(())
 }
@@ -1668,7 +2001,7 @@ fn remove_pr_details_cache_with_conn(
 fn load_pr_details_cache(repo: &Repository, branch: &str) -> Option<PrDetails> {
     observability::with_writable_db(repo, |conn| {
         conn.query_row(
-            "select comments, reviews, review_comments, files, failing_checks, ci_failures
+            "select comments, reviews, review_comments, files, failing_checks, ci_failures, check_contexts
                from pr_details_cache
               where branch = ?1",
             params![branch],
@@ -1680,6 +2013,7 @@ fn load_pr_details_cache(repo: &Repository, branch: &str) -> Option<PrDetails> {
                     files: decode_string_values(&row.get::<_, String>(3)?),
                     failing_checks: decode_string_values(&row.get::<_, String>(4)?),
                     ci_failures: decode_ci_failures(&row.get::<_, String>(5)?),
+                    check_contexts: decode_check_contexts(&row.get::<_, String>(6)?),
                 })
             },
         )
@@ -1698,8 +2032,8 @@ pub fn save_pr_details_cache(
     observability::with_writable_db(repo, |conn| {
         conn.execute(
             "insert into pr_details_cache (
-                branch, comments, reviews, review_comments, files, failing_checks, ci_failures, refreshed_unix_ms
-             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                branch, comments, reviews, review_comments, files, failing_checks, ci_failures, check_contexts, refreshed_unix_ms
+             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
               on conflict(branch) do update set
                 comments = excluded.comments,
                 reviews = excluded.reviews,
@@ -1707,6 +2041,7 @@ pub fn save_pr_details_cache(
                 files = excluded.files,
                 failing_checks = excluded.failing_checks,
                 ci_failures = excluded.ci_failures,
+                check_contexts = excluded.check_contexts,
                 refreshed_unix_ms = excluded.refreshed_unix_ms",
             params![
                 branch,
@@ -1716,6 +2051,7 @@ pub fn save_pr_details_cache(
                 encode_string_values(&details.files),
                 encode_string_values(&details.failing_checks),
                 encode_ci_failures(&details.ci_failures),
+                encode_check_contexts(&details.check_contexts),
                 unix_seconds(),
             ],
         )
@@ -1783,6 +2119,43 @@ pub fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result
     })
 }
 
+pub(crate) fn save_repo_policy_cache(
+    repo: &Repository,
+    policy: &RepoPolicyCache,
+) -> Result<(), String> {
+    observability::with_writable_db(repo, |conn| {
+        conn.execute(
+            "insert into repo_policy_cache (
+                repo_remote, default_branch, required_approvals,
+                require_conversation_resolution, require_branch_up_to_date,
+                required_checks, merge_queue_required, refreshed_unix_ms, error
+             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+              on conflict(repo_remote) do update set
+                default_branch = excluded.default_branch,
+                required_approvals = excluded.required_approvals,
+                require_conversation_resolution = excluded.require_conversation_resolution,
+                require_branch_up_to_date = excluded.require_branch_up_to_date,
+                required_checks = excluded.required_checks,
+                merge_queue_required = excluded.merge_queue_required,
+                refreshed_unix_ms = excluded.refreshed_unix_ms,
+                error = excluded.error",
+            params![
+                policy.repo_remote.as_str(),
+                policy.default_branch.as_deref(),
+                sqlite_i64(policy.required_approvals, "required approvals")?,
+                policy.require_conversation_resolution,
+                policy.require_branch_up_to_date,
+                encode_string_values(&policy.required_checks),
+                policy.merge_queue_required,
+                sqlite_i64(policy.refreshed_unix_ms, "policy refresh time")?,
+                policy.error.as_deref(),
+            ],
+        )
+        .map_err(|error| format!("write repo policy cache: {error}"))?;
+        Ok(())
+    })
+}
+
 fn encode_requested_reviewers(reviewers: &[String]) -> String {
     reviewers.join("\n")
 }
@@ -1833,6 +2206,14 @@ fn encode_ci_failures(failures: &[CiFailure]) -> String {
 }
 
 fn decode_ci_failures(raw: &str) -> Vec<CiFailure> {
+    serde_json::from_str(raw).unwrap_or_default()
+}
+
+fn encode_check_contexts(contexts: &[PrCheckContext]) -> String {
+    serde_json::to_string(contexts).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn decode_check_contexts(raw: &str) -> Vec<PrCheckContext> {
     serde_json::from_str(raw).unwrap_or_default()
 }
 
@@ -1902,6 +2283,8 @@ mod tests {
         let details = parse_pr_details(raw);
         assert_eq!(details.files, vec!["src/main.rs"]);
         assert_eq!(details.failing_checks, vec!["test"]);
+        assert_eq!(details.check_contexts[0].name, "test");
+        assert_eq!(details.check_contexts[0].state, PrCheckState::Failed);
         assert_eq!(details.comments[0].id, "PRC_kw123");
         assert_eq!(details.comments[0].body, "hello");
         assert_eq!(details.comments[0].created_at, "2026-01-01T00:00:00Z");
@@ -1920,6 +2303,18 @@ mod tests {
         assert_eq!(PrCheckState::from_label("failed"), PrCheckState::Failed);
         assert_eq!(PrCheckState::from_label("mixed"), PrCheckState::Mixed);
         assert_eq!(PrCheckState::from_label(""), PrCheckState::Unknown);
+    }
+
+    #[test]
+    fn resolve_review_thread_args_target_exact_thread_id() {
+        let args = resolve_review_thread_args("PRRT_thread_1");
+
+        assert_eq!(args[0], "api");
+        assert_eq!(args[1], "graphql");
+        assert!(args.contains(&"thread=PRRT_thread_1".to_string()));
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("resolveReviewThread") && arg.contains("threadId: $thread")));
     }
 
     #[test]
@@ -1970,6 +2365,10 @@ mod tests {
             }],
             files: vec!["src/main.rs".to_string()],
             failing_checks: vec!["test".to_string()],
+            check_contexts: vec![PrCheckContext {
+                name: "test".to_string(),
+                state: PrCheckState::Failed,
+            }],
             ci_failures: vec![CiFailure {
                 workflow: "CI".to_string(),
                 name: "test".to_string(),
@@ -2009,6 +2408,8 @@ mod tests {
         assert!(loaded_details.review_comments[0].resolved);
         assert_eq!(loaded_details.files, vec!["src/main.rs"]);
         assert_eq!(loaded_details.failing_checks, vec!["test"]);
+        assert_eq!(loaded_details.check_contexts[0].name, "test");
+        assert_eq!(loaded_details.check_contexts[0].state, PrCheckState::Failed);
         assert_eq!(loaded_details.ci_failures[0].log_tail, "");
 
         let _ = fs::remove_dir_all(prism_dir);
@@ -2340,6 +2741,84 @@ mod tests {
     }
 
     #[test]
+    fn parses_repo_policy_for_default_branch_rule() {
+        let raw = r#"{
+          "data": {
+            "repository": {
+              "defaultBranchRef": {"name": "main"},
+              "branchProtectionRules": {
+                "nodes": [
+                  {
+                    "pattern": "release/*",
+                    "requiredApprovingReviewCount": 2,
+                    "requiresConversationResolution": false,
+                    "requiresStrictStatusChecks": false,
+                    "requiredStatusCheckContexts": ["release"]
+                  },
+                  {
+                    "pattern": "main",
+                    "requiredApprovingReviewCount": 1,
+                    "requiresConversationResolution": true,
+                    "requiresStrictStatusChecks": true,
+                    "requiredStatusCheckContexts": ["ci", "ci", " lint ", ""]
+                  }
+                ]
+              }
+            }
+          }
+        }"#;
+
+        let policy = parse_repo_policy("owner/repo", raw).unwrap();
+
+        assert_eq!(policy.repo_remote, "owner/repo");
+        assert_eq!(policy.default_branch.as_deref(), Some("main"));
+        assert_eq!(policy.required_approvals, 1);
+        assert!(policy.require_conversation_resolution);
+        assert!(policy.require_branch_up_to_date);
+        assert_eq!(policy.required_checks, vec!["ci", "lint"]);
+        assert!(!policy.merge_queue_required);
+        assert!(policy.error.is_none());
+    }
+
+    #[test]
+    fn repo_policy_cache_round_trips_success_and_error() {
+        let temp = unique_temp_dir("prism-repo-policy-cache-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let policy = RepoPolicyCache {
+            repo_remote: "owner/repo".to_string(),
+            default_branch: Some("main".to_string()),
+            required_approvals: 1,
+            require_conversation_resolution: true,
+            require_branch_up_to_date: true,
+            required_checks: vec!["ci".to_string(), "lint".to_string()],
+            merge_queue_required: false,
+            refreshed_unix_ms: 123,
+            error: None,
+        };
+
+        save_repo_policy_cache(&repo, &policy).unwrap();
+        let loaded = load_repo_policy_cache(&repo, "owner/repo").unwrap();
+
+        assert_eq!(loaded, policy);
+
+        let error_policy = RepoPolicyCache {
+            repo_remote: "owner/repo".to_string(),
+            refreshed_unix_ms: 456,
+            error: Some("gh auth failed".to_string()),
+            ..RepoPolicyCache::default()
+        };
+        save_repo_policy_cache(&repo, &error_policy).unwrap();
+        assert_eq!(
+            load_repo_policy_cache(&repo, "owner/repo"),
+            Some(error_policy)
+        );
+
+        let _ = fs::remove_dir_all(repo.prism_dir());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn parses_requested_reviewers_from_gh_pr_view() {
         let raw = r#"{
           "reviewRequests": [
@@ -2396,6 +2875,7 @@ mod tests {
                 "reviewThreads": {
                   "nodes": [
                     {
+                      "id": "PRRT_kw123",
                       "isResolved": true,
                       "comments": {
                         "nodes": [
@@ -2411,6 +2891,7 @@ mod tests {
                       }
                     },
                     {
+                      "id": "PRRT_kw456",
                       "isResolved": false,
                       "comments": {
                         "nodes": [
@@ -2436,11 +2917,13 @@ mod tests {
 
         assert_eq!(comments.len(), 2);
         assert_eq!(comments[0].author, "reviewer");
+        assert_eq!(comments[0].thread_id, "PRRT_kw123");
         assert_eq!(comments[0].id, "PRRC_kw123");
         assert_eq!(comments[0].path, "src/main.rs");
         assert_eq!(comments[0].line, "12");
         assert!(comments[0].resolved);
         assert_eq!(comments[1].author, "maintainer");
+        assert_eq!(comments[1].thread_id, "PRRT_kw456");
         assert_eq!(comments[1].id, "PRRC_kw456");
         assert_eq!(comments[1].path, "src/lib.rs");
         assert_eq!(comments[1].line, "20");

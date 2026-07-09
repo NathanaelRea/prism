@@ -10,6 +10,9 @@ use crate::{
     auto_flow::{
         AutoImplementationSource, AutoOutputKind, AutoOutputLine, AutoRun, AutoRunMode,
         AutoRunStatus, AutoStepKey, AutoStepRun, AutoStepStatus, PersistedAutoRun,
+        stabilization_model::{
+            PendingPushGuard, RepairKind, StabilizationBlocker, StabilizationWorkKind,
+        },
     },
     config::{Checks, Config, EscapeKey, MergeMethod},
     github::{PrCache, PrDetails, PrReviewComment, PrSummary},
@@ -655,6 +658,124 @@ fn renders_auto_dashboard_steps_and_output_cursor() {
     assert!(!buffer.contains("Output"));
 }
 
+#[test]
+fn renders_stabilization_pending_push_in_worktree_main_panel() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Idle);
+    session.pr.summary = Some(test_pr_summary());
+    let sessions = vec![session];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.auto_dashboard = Some(stabilization_dashboard(
+        StabilizationBlocker::PendingPush,
+        StabilizationWorkKind::PushPendingRepair,
+        Some(test_pending_push_guard()),
+    ));
+
+    let buffer = render_to_string(&model, 120, 40);
+
+    assert!(buffer.contains("PR Stabilization"));
+    assert!(buffer.contains("state PendingPush"));
+    assert!(buffer.contains("next PushPendingRepair"));
+    assert!(buffer.contains("guard"));
+    assert!(buffer.contains("head abc1234"));
+    assert!(buffer.contains("base def5678"));
+    assert!(buffer.contains("pending commit fedcba9 ci repair"));
+    assert!(buffer.contains("inspect the pending commit diff, then press <Space> g P"));
+}
+
+#[test]
+fn renders_stabilization_ci_failed_in_worktree_main_panel() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Idle);
+    session.pr.summary = Some(test_pr_summary());
+    let sessions = vec![session];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.auto_dashboard = Some(stabilization_dashboard(
+        StabilizationBlocker::CiFailed,
+        StabilizationWorkKind::FixCi,
+        None,
+    ));
+
+    let buffer = render_to_string(&model, 120, 40);
+
+    assert!(buffer.contains("state CiFailed"));
+    assert!(buffer.contains("next FixCi"));
+    assert!(buffer.contains("ci failed"));
+}
+
+#[test]
+fn renders_stabilization_merge_blocked_in_worktree_main_panel() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Idle);
+    let mut summary = test_pr_summary();
+    summary.check_status = "passed".to_string();
+    summary.merge_state_status = "DIRTY".to_string();
+    session.pr.summary = Some(summary);
+    let sessions = vec![session];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.auto_dashboard = Some(stabilization_dashboard(
+        StabilizationBlocker::MergeBlocked,
+        StabilizationWorkKind::Escalate,
+        None,
+    ));
+
+    let buffer = render_to_string(&model, 120, 40);
+
+    assert!(buffer.contains("state MergeBlocked"));
+    assert!(buffer.contains("next Escalate"));
+    assert!(buffer.contains("merge blocked (DIRTY)"));
+}
+
+#[test]
+fn renders_stabilization_policy_unknown_in_worktree_main_panel() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Idle);
+    let mut summary = test_pr_summary();
+    summary.check_status = "passed".to_string();
+    session.pr.summary = Some(summary);
+    let sessions = vec![session];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.auto_dashboard = Some(stabilization_dashboard(
+        StabilizationBlocker::PolicyUnknown,
+        StabilizationWorkKind::Escalate,
+        None,
+    ));
+
+    let buffer = render_to_string(&model, 120, 40);
+
+    assert!(buffer.contains("state PolicyUnknown"));
+    assert!(buffer.contains("next Escalate"));
+    assert!(buffer.contains("policy unknown"));
+}
+
+#[test]
+fn renders_stabilization_ready_for_manual_merge_in_worktree_main_panel() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Idle);
+    let mut summary = test_pr_summary();
+    summary.check_status = "failed".to_string();
+    summary.review_decision = "APPROVED".to_string();
+    session.pr.summary = Some(summary);
+    session.pr.details = Some(PrDetails {
+        failing_checks: vec!["docs".to_string()],
+        ..PrDetails::default()
+    });
+    let sessions = vec![session];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.auto_dashboard = Some(stabilization_dashboard(
+        StabilizationBlocker::ReadyForManualMerge,
+        StabilizationWorkKind::MarkReadyForManualMerge,
+        None,
+    ));
+
+    let buffer = render_to_string(&model, 120, 40);
+
+    assert!(buffer.contains("state ReadyForManualMerge"));
+    assert!(buffer.contains("next MarkReadyForManualMerge"));
+    assert!(buffer.contains("ci required passing (1 optional failing)"));
+    assert!(buffer.contains("merge clean"));
+}
+
 fn render_to_string(model: &FrameModel<'_>, cols: u16, rows: u16) -> String {
     buffer_to_string(&render_to_buffer(model, cols, rows))
 }
@@ -1017,6 +1138,10 @@ fn test_auto_dashboard() -> AutoDashboard {
                 pr_url: None,
                 current_head_sha: None,
                 review_baseline_json: None,
+                stabilization_status: None,
+                stabilization_blocker: None,
+                stabilization_next_work: None,
+                pending_push: None,
                 created_unix_ms: 1_000,
                 updated_unix_ms: 3_000,
                 archived_unix_ms: None,
@@ -1037,6 +1162,8 @@ fn test_auto_dashboard() -> AutoDashboard {
                 plan_run_id: None,
                 commit_sha: None,
                 head_sha: None,
+                work_guard: None,
+                blocker: None,
                 summary: Some("working".to_string()),
                 error: None,
             }],
@@ -1054,5 +1181,30 @@ fn test_auto_dashboard() -> AutoDashboard {
             cursor: 0,
             follow: true,
         },
+    }
+}
+
+fn stabilization_dashboard(
+    blocker: StabilizationBlocker,
+    next_work: StabilizationWorkKind,
+    pending_push: Option<PendingPushGuard>,
+) -> AutoDashboard {
+    let mut dashboard = test_auto_dashboard();
+    dashboard.run.run.stabilization_blocker = Some(blocker);
+    dashboard.run.run.stabilization_next_work = Some(next_work);
+    dashboard.run.run.pending_push = pending_push;
+    dashboard
+}
+
+fn test_pending_push_guard() -> PendingPushGuard {
+    PendingPushGuard {
+        repair_kind: RepairKind::Ci,
+        commit_sha: "fedcba9876543210".to_string(),
+        expected_local_head_sha: "abc1234567890000".to_string(),
+        expected_remote_head_sha: Some("1234567890abcdef".to_string()),
+        pr_number: Some(42),
+        expected_pr_head_sha: Some("9999999999999999".to_string()),
+        expected_base_sha: Some("def5678901234567".to_string()),
+        guarded_review_thread_ids: Vec::new(),
     }
 }

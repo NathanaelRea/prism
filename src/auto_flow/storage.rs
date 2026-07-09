@@ -23,6 +23,10 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
           pr_url text,
           current_head_sha text,
           review_baseline_json text,
+          stabilization_status text,
+          stabilization_blocker text,
+          stabilization_next_work text,
+          pending_push_json text,
           created_unix_ms integer not null,
           updated_unix_ms integer not null,
           archived_unix_ms integer,
@@ -45,6 +49,8 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
           plan_run_id text,
           commit_sha text,
           head_sha text,
+          work_guard_json text,
+          blocker text,
           summary text,
           error text,
           unique(run_id, sequence)
@@ -83,6 +89,11 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
           on auto_output_line(step_run_id, line_number);
         create index if not exists auto_event_run_idx
           on auto_event(run_id, time_unix_ms);
+
+        create table if not exists auto_schema_version (
+          id integer primary key check (id = 1),
+          version integer not null
+        );
         ",
     )
     .map_err(|error| format!("create auto flow schema: {error}"))?;
@@ -121,6 +132,26 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
         conn.execute("alter table auto_step_run add column plan_run_id text", [])
             .map_err(|error| format!("migrate auto_step_run plan_run_id column: {error}"))?;
     }
+    for (table, column) in [
+        ("auto_run", "stabilization_status"),
+        ("auto_run", "stabilization_blocker"),
+        ("auto_run", "stabilization_next_work"),
+        ("auto_run", "pending_push_json"),
+        ("auto_step_run", "work_guard_json"),
+        ("auto_step_run", "blocker"),
+    ] {
+        if !table_has_column(conn, table, column)? {
+            conn.execute(&format!("alter table {table} add column {column} text"), [])
+                .map_err(|error| format!("migrate {table} {column} column: {error}"))?;
+        }
+    }
+    reset_incompatible_active_runs(conn)?;
+    conn.execute(
+        "insert into auto_schema_version (id, version) values (1, 4)
+         on conflict(id) do update set version = excluded.version",
+        [],
+    )
+    .map_err(|error| format!("write auto schema version: {error}"))?;
     Ok(())
 }
 
@@ -198,8 +229,9 @@ pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &AutoRun) -> 
            id, repo_root, worktree_path, branch, mode, implementation_source, plan_path,
            plan_run_mode, variant, agent_profile, prompt_summary, initial_prompt, status, pause_requested,
            selected_step_run_id, pr_number, pr_url, current_head_sha, review_baseline_json,
+           stabilization_status, stabilization_blocker, stabilization_next_work, pending_push_json,
            created_unix_ms, updated_unix_ms, archived_unix_ms
-         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
          on conflict(id) do update set
            repo_root = excluded.repo_root,
            worktree_path = excluded.worktree_path,
@@ -216,11 +248,15 @@ pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &AutoRun) -> 
            pause_requested = excluded.pause_requested,
            selected_step_run_id = excluded.selected_step_run_id,
            pr_number = excluded.pr_number,
-           pr_url = excluded.pr_url,
-           current_head_sha = excluded.current_head_sha,
-           review_baseline_json = excluded.review_baseline_json,
-           updated_unix_ms = excluded.updated_unix_ms,
-           archived_unix_ms = excluded.archived_unix_ms",
+            pr_url = excluded.pr_url,
+            current_head_sha = excluded.current_head_sha,
+            review_baseline_json = excluded.review_baseline_json,
+            stabilization_status = excluded.stabilization_status,
+            stabilization_blocker = excluded.stabilization_blocker,
+            stabilization_next_work = excluded.stabilization_next_work,
+            pending_push_json = excluded.pending_push_json,
+            updated_unix_ms = excluded.updated_unix_ms,
+            archived_unix_ms = excluded.archived_unix_ms",
         params![
             run.id.as_str(),
             run.repo_root.as_str(),
@@ -241,6 +277,10 @@ pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &AutoRun) -> 
             run.pr_url.as_deref(),
             run.current_head_sha.as_deref(),
             run.review_baseline_json.as_deref(),
+            run.stabilization_status.map(|status| status.as_str()),
+            run.stabilization_blocker.as_ref().map(|blocker| blocker.as_str()),
+            run.stabilization_next_work.as_ref().map(|work| work.as_str()),
+            optional_json(&run.pending_push)?,
             u64_to_i64(run.created_unix_ms),
             u64_to_i64(run.updated_unix_ms),
             run.archived_unix_ms.map(u64_to_i64),
@@ -272,9 +312,11 @@ pub(super) fn save_step_with_conn(
                   plan_run_id = ?12,
                   commit_sha = ?13,
                   head_sha = ?14,
-                  summary = ?15,
-                  error = ?16
-             where id = ?17",
+                  work_guard_json = ?15,
+                  blocker = ?16,
+                  summary = ?17,
+                  error = ?18
+             where id = ?19",
             params![
                 step.run_id.as_str(),
                 usize_to_i64(step.sequence),
@@ -290,6 +332,8 @@ pub(super) fn save_step_with_conn(
                 step.plan_run_id.as_deref(),
                 step.commit_sha.as_deref(),
                 step.head_sha.as_deref(),
+                optional_json(&step.work_guard)?,
+                step.blocker.as_ref().map(|blocker| blocker.as_str()),
                 step.summary.as_deref(),
                 step.error.as_deref(),
                 id,
@@ -303,8 +347,8 @@ pub(super) fn save_step_with_conn(
             "insert into auto_step_run (
                run_id, sequence, step_key, reason, status, attempt, started_unix_ms,
                finished_unix_ms, opencode_server_url, opencode_session_id, process_id,
-               plan_run_id, commit_sha, head_sha, summary, error
-             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                plan_run_id, commit_sha, head_sha, work_guard_json, blocker, summary, error
+              ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
             params![
                 step.run_id.as_str(),
                 usize_to_i64(step.sequence),
@@ -320,6 +364,8 @@ pub(super) fn save_step_with_conn(
                 step.plan_run_id.as_deref(),
                 step.commit_sha.as_deref(),
                 step.head_sha.as_deref(),
+                optional_json(&step.work_guard)?,
+                step.blocker.as_ref().map(|blocker| blocker.as_str()),
                 step.summary.as_deref(),
                 step.error.as_deref(),
             ],
@@ -339,8 +385,9 @@ pub(super) fn load_run_with_conn(
     conn.query_row(
         "select id, repo_root, worktree_path, branch, mode, implementation_source, plan_path,
                 plan_run_mode, variant, agent_profile, prompt_summary, initial_prompt, status, pause_requested,
-                selected_step_run_id, pr_number, pr_url, current_head_sha, review_baseline_json,
-                created_unix_ms, updated_unix_ms, archived_unix_ms
+                 selected_step_run_id, pr_number, pr_url, current_head_sha, review_baseline_json,
+                 stabilization_status, stabilization_blocker, stabilization_next_work, pending_push_json,
+                 created_unix_ms, updated_unix_ms, archived_unix_ms
          from auto_run
          where id = ?1",
         params![run_id],
@@ -372,10 +419,14 @@ pub(super) fn load_run_with_conn(
                 pr_url: row.get(16)?,
                 current_head_sha: row.get(17)?,
                 review_baseline_json: row.get(18)?,
-                created_unix_ms: i64_to_u64(row.get(19)?, 19),
-                updated_unix_ms: i64_to_u64(row.get(20)?, 20),
+                stabilization_status: optional_stabilization_status(row.get(19)?)?,
+                stabilization_blocker: optional_stabilization_blocker(row.get(20)?)?,
+                stabilization_next_work: optional_stabilization_work_kind(row.get(21)?)?,
+                pending_push: optional_json_value(row.get::<_, Option<String>>(22)?)?,
+                created_unix_ms: i64_to_u64(row.get(23)?, 23),
+                updated_unix_ms: i64_to_u64(row.get(24)?, 24),
                 archived_unix_ms: row
-                    .get::<_, Option<i64>>(21)?
+                    .get::<_, Option<i64>>(25)?
                     .map(|value| value.max(0) as u64),
             })
         },
@@ -392,7 +443,7 @@ pub(super) fn load_steps_with_conn(
         .prepare(
             "select id, run_id, sequence, step_key, reason, status, attempt, started_unix_ms,
                     finished_unix_ms, opencode_server_url, opencode_session_id, process_id,
-                    plan_run_id, commit_sha, head_sha, summary, error
+                    plan_run_id, commit_sha, head_sha, work_guard_json, blocker, summary, error
              from auto_step_run
              where run_id = ?1
              order by sequence",
@@ -424,13 +475,106 @@ pub(super) fn load_steps_with_conn(
                 plan_run_id: row.get(12)?,
                 commit_sha: row.get(13)?,
                 head_sha: row.get(14)?,
-                summary: row.get(15)?,
-                error: row.get(16)?,
+                work_guard: optional_json_value(row.get::<_, Option<String>>(15)?)?,
+                blocker: optional_stabilization_blocker(row.get(16)?)?,
+                summary: row.get(17)?,
+                error: row.get(18)?,
             })
         })
         .map_err(|error| format!("load auto steps: {error}"))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("read auto steps: {error}"))
+}
+
+fn reset_incompatible_active_runs(conn: &rusqlite::Connection) -> Result<(), String> {
+    let version = conn
+        .query_row(
+            "select version from auto_schema_version where id = 1",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|error| format!("read auto schema version: {error}"))?
+        .unwrap_or(0);
+    if version >= 4 {
+        return Ok(());
+    }
+
+    let now = u64_to_i64(unix_ms());
+    conn.execute(
+        "update auto_step_run
+         set status = 'aborted',
+             finished_unix_ms = coalesce(finished_unix_ms, ?1),
+             error = coalesce(error, 'Archived during PR Stabilization persistence migration')
+         where run_id in (
+           select id from auto_run
+           where archived_unix_ms is null
+             and status in ('queued', 'running', 'paused', 'failed')
+         )
+           and status in ('queued', 'starting', 'running', 'waiting', 'failed')",
+        params![now],
+    )
+    .map_err(|error| format!("archive incompatible auto steps: {error}"))?;
+    conn.execute(
+        "update auto_run
+         set status = 'aborted',
+             archived_unix_ms = coalesce(archived_unix_ms, ?1),
+             updated_unix_ms = ?1
+         where archived_unix_ms is null
+           and status in ('queued', 'running', 'paused', 'failed')",
+        params![now],
+    )
+    .map_err(|error| format!("archive incompatible auto runs: {error}"))?;
+    Ok(())
+}
+
+fn optional_json<T: Serialize>(value: &Option<T>) -> Result<Option<String>, String> {
+    value
+        .as_ref()
+        .map(|value| {
+            serde_json::to_string(value).map_err(|error| format!("serialize auto json: {error}"))
+        })
+        .transpose()
+}
+
+fn optional_json_value<T: for<'de> Deserialize<'de>>(
+    value: Option<String>,
+) -> Result<Option<T>, rusqlite::Error> {
+    value
+        .map(|value| {
+            serde_json::from_str(&value).map_err(|error| from_string_error(error.to_string()))
+        })
+        .transpose()
+}
+
+fn optional_stabilization_status(
+    value: Option<String>,
+) -> Result<Option<stabilization_model::StabilizationStatus>, rusqlite::Error> {
+    value
+        .map(|value| {
+            stabilization_model::StabilizationStatus::parse(&value).map_err(from_string_error)
+        })
+        .transpose()
+}
+
+fn optional_stabilization_blocker(
+    value: Option<String>,
+) -> Result<Option<stabilization_model::StabilizationBlocker>, rusqlite::Error> {
+    value
+        .map(|value| {
+            stabilization_model::StabilizationBlocker::parse(&value).map_err(from_string_error)
+        })
+        .transpose()
+}
+
+fn optional_stabilization_work_kind(
+    value: Option<String>,
+) -> Result<Option<stabilization_model::StabilizationWorkKind>, rusqlite::Error> {
+    value
+        .map(|value| {
+            stabilization_model::StabilizationWorkKind::parse(&value).map_err(from_string_error)
+        })
+        .transpose()
 }
 
 pub(super) fn from_string_error(error: String) -> rusqlite::Error {

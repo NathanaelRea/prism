@@ -15,6 +15,7 @@ use crate::{
     auto_flow::{
         AutoImplementationSource, AutoOutputKind, AutoOutputLine, AutoRunMode, AutoRunStatus,
         AutoStepKey, AutoStepRun, AutoStepStatus, PersistedAutoRun,
+        stabilization_model::{PendingPushGuard, StabilizationBlocker, StabilizationWorkKind},
     },
     config::{Config, IconStyle},
     github::PrCache,

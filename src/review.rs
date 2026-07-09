@@ -332,6 +332,7 @@ mod tests {
             ],
             files: vec!["src/lib.rs".to_string()],
             failing_checks: vec!["cargo test".to_string()],
+            check_contexts: Vec::new(),
             ci_failures: Vec::new(),
         });
 

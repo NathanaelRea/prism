@@ -1,5 +1,6 @@
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
+use crate::auto_flow::{AutoStepKey, load_auto_run};
 use crate::config::{Checks, Config, EscapeKey, MergeMethod};
 use crate::github::{PrCache, PrComment, PrDetails, PrSummary, pr_summary_or_error};
 use crate::repo::Repository;
@@ -202,15 +203,22 @@ esac
 
     tui.start_review_fix_for_test().unwrap();
 
-    let submissions = tui.prompt_submissions.take().unwrap();
-    assert_eq!(submissions.len(), 1);
-    assert_eq!(submissions[0].0, 0);
-    assert_eq!(submissions[0].2, 1);
-    let prompt = &submissions[0].1;
+    let run_id = tui
+        .active_auto_runs
+        .get(&tui.sessions[0].path)
+        .unwrap()
+        .clone();
+    let persisted =
+        crate::observability::with_writable_db(&tui.repo, |conn| load_auto_run(conn, &run_id))
+            .unwrap()
+            .unwrap();
+    assert_eq!(persisted.steps.len(), 1);
+    assert_eq!(persisted.steps[0].step_key, AutoStepKey::FixReview);
+    let prompt = persisted.steps[0].reason.as_deref().unwrap();
     assert!(prompt.contains("fresh top-level comment"));
     assert!(prompt.contains("fresh review body"));
     assert!(!prompt.contains("stale cached comment"));
-    assert_eq!(tui.sessions[0].prompt_summary, "review fix");
+    assert_eq!(persisted.run.variant, "repair");
 
     let _ = fs::remove_dir_all(temp);
 }
@@ -274,13 +282,21 @@ esac
 
     tui.start_ci_fix_for_test().unwrap();
 
-    let submissions = tui.prompt_submissions.take().unwrap();
-    assert_eq!(submissions.len(), 1);
-    assert_eq!(submissions[0].0, 0);
-    assert_eq!(submissions[0].2, 1);
-    assert!(submissions[0].1.contains("Here are CI failures on PR 42."));
-    assert!(submissions[0].1.contains("- test"));
-    assert_eq!(tui.sessions[0].prompt_summary, "ci fix");
+    let run_id = tui
+        .active_auto_runs
+        .get(&tui.sessions[0].path)
+        .unwrap()
+        .clone();
+    let persisted =
+        crate::observability::with_writable_db(&tui.repo, |conn| load_auto_run(conn, &run_id))
+            .unwrap()
+            .unwrap();
+    assert_eq!(persisted.steps.len(), 1);
+    assert_eq!(persisted.steps[0].step_key, AutoStepKey::FixCi);
+    let prompt = persisted.steps[0].reason.as_deref().unwrap();
+    assert!(prompt.contains("Here are CI failures on PR 42."));
+    assert!(prompt.contains("- test"));
+    assert_eq!(persisted.run.variant, "repair");
 
     let _ = fs::remove_dir_all(temp);
 }

@@ -59,6 +59,7 @@ impl Tui {
         if selected_dirty(&session_path, &context.config)? {
             return Err("Auto Flow requires a clean worktree at launch".to_string());
         }
+        let _ = refresh_repo_policy_cache(&context.repo, &session_path, &context.config);
         let Some(source) = self.prompt_auto_implementation_source(raw)? else {
             return Ok(());
         };

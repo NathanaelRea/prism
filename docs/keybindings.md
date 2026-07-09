@@ -17,10 +17,10 @@ Prism uses a lazygit-style panel model.
 - `Ctrl-/` also opens tmux window 3 where the terminal reports that key combination distinctly; use `Space Enter` as the reliable alternative.
 - `Space g g` opens tmux window 2: lazygit.
 - `Space g o` opens the selected pull request in a browser.
-- `Space g P` pushes the selected branch and creates a pull request if needed.
+- `Space g P` pushes a guarded pending PR Stabilization repair commit and continues stabilization. If no pending push exists, Prism reobserves the selected Worktree Session and reports the current blocker/next work.
 - `Space g M` merges the selected pull request.
-- `Space g c` sends a CI-failure prompt to a new agent session for the selected worktree.
-- `Space g f` sends a review-fix prompt to a new agent session for the selected worktree.
+- `Space g c` starts or appends a managed PR Stabilization CI repair for the selected worktree.
+- `Space g f` starts or appends a managed PR Stabilization review repair for the selected worktree.
 - `P` opens plan mode from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through `opencode run`. Active plan runs render automatically in the Worktrees main panel for the selected worktree.
 - `A` starts or focuses Auto Flow for the selected non-default worktree.
 - `u` pauses/resumes the selected Auto Flow or plan run from Status or the Worktrees main panel; paused Auto Flow resumes only after a dialog describes the next step.

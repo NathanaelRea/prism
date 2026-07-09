@@ -14,7 +14,7 @@ path = "/path/to/repo"
 key = "1"
 ```
 
-Repository-specific Prism config lives under the repository config path opened by `e`. Common settings include `default_base`, layout width, worktree columns, merge method, OpenCode runtime settings, tools, and prompt templates.
+Repository-specific Prism config lives under the repository config path opened by `e`. Common settings include `default_base`, layout width, worktree columns, merge method, Auto Flow and PR Stabilization behavior, OpenCode runtime settings, tools, and prompt templates.
 
 Per-repository Prism state also lives under that repository config directory, not inside the project repository. The state database is named `prism.db` and stores worktree session metadata, OpenCode runtime records, Plan Mode and Auto Flow runs, PR cache data, and observability records.
 
@@ -48,6 +48,9 @@ opencode = "opencode"
 [prompt_templates]
 review_fix = "Here are review comments on PR {pr_number}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n{comments}"
 ci_failure = "Here are CI failures on PR {pr_number}.\n\nFix the failing checks. Use the log tails below as the primary clues.\n\nPR: {url}\nBranch: {branch}\nHead SHA: {head_sha}\n\n---\n\n{failures}"
+repair_commit_review = "fix: cr"
+repair_commit_ci = "fix: ci"
+repair_commit_merge = "fix: merge"
 ```
 
 The `#:schema` line is an optional TOML comment. Prism ignores it, while Taplo-compatible TOML language servers can use it for completions, descriptions, enum values, and type validation.
@@ -55,6 +58,38 @@ The `#:schema` line is an optional TOML comment. Prism ignores it, while Taplo-c
 Prism treats `main` as the default branch by default. The default branch is not polled or shown as a pull request branch.
 
 Prism uses squash merges for pull requests by default. Set `merge_method` to `merge` or `rebase` if a repository requires a different GitHub merge method.
+
+## Auto Flow and PR Stabilization
+
+`[auto]` controls Auto Flow implementation automation and PR Stabilization gate behavior:
+
+```toml
+[auto]
+merge = false
+cleanup_after_merge = false
+require_review_approval = false
+push_initial = true
+push_repairs = false
+review_wait_enabled = true
+ci_wait_enabled = true
+```
+
+`merge = false` makes successful stabilization stop at `ReadyForManualMerge`. Set it to `true` only when Prism may merge after all required gates pass and repository policy is known.
+
+`push_initial = true` allows Auto Flow to push the initial implementation commit and open or refresh the PR. `push_repairs = false` keeps managed review and CI repair commits local as guarded pending pushes for user inspection; use `Space g P` to push them after review.
+
+`require_review_approval = false` means review approval is not required unless repository policy requires it. When enabled, PR Stabilization treats missing approval as a blocker.
+
+`review_wait_enabled` and `ci_wait_enabled` control whether Auto Flow waits for review and CI observations when those work items are selected.
+
+Repair commit subjects are configured with prompt templates. If omitted, Prism uses these defaults:
+
+```toml
+[prompt_templates]
+repair_commit_review = "fix: cr"
+repair_commit_ci = "fix: ci"
+repair_commit_merge = "fix: merge"
+```
 
 Prism manages one local OpenCode server per worktree session. `opencode_port_base` and `opencode_port_span` define the deterministic local port range used for those servers. By default Prism keeps servers warm after the TUI exits; set `opencode_shutdown_owned_servers = true` to send SIGTERM to OpenCode servers that Prism spawned during the session.
 

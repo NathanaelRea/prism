@@ -171,7 +171,7 @@ pub fn pull_branch(path: &std::path::Path, branch: &str, config: &Config) -> Res
     ]))
 }
 
-fn fetch_origin(path: &std::path::Path, config: &Config) -> Result<(), String> {
+pub(crate) fn fetch_origin(path: &std::path::Path, config: &Config) -> Result<(), String> {
     crate::process::run_status(
         Command::new(config.tool("git"))
             .arg("-C")
@@ -325,6 +325,33 @@ pub(crate) fn current_branch_name(
         Ok(None)
     } else {
         Ok(Some(branch.to_string()))
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn remote_branch_head_sha(
+    path: &std::path::Path,
+    branch: &str,
+    config: &Config,
+) -> Result<Option<String>, String> {
+    if branch.trim().is_empty() || branch == "(detached)" {
+        return Ok(None);
+    }
+    let output = run_output_allow_failure(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "--verify"])
+            .arg(format!("refs/remotes/origin/{branch}")),
+    )?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let sha = output.stdout.trim();
+    if sha.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(sha.to_string()))
     }
 }
 
