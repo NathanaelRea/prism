@@ -322,12 +322,82 @@ impl Tui {
         if !self.confirm_delete_dialog(raw, &branch, &path_display, &warnings)? {
             return Ok(());
         }
-        delete_worktree_session(&context.repo, &context.config, &path, &branch)?;
-        if self.selected_worktree_by_repo.get(&context.repo.root) == Some(&path) {
-            self.selected_worktree_by_repo.remove(&context.repo.root);
-        }
-        self.refresh_sessions()?;
-        self.show_message("deleted local session data, worktree, and branch")?;
+        self.start_delete_worktree_session(context.repo, context.config, path, branch)?;
         Ok(())
+    }
+
+    pub(crate) fn start_delete_worktree_session(
+        &mut self,
+        repo: Repository,
+        config: Config,
+        path: PathBuf,
+        branch: String,
+    ) -> Result<(), String> {
+        let key = DeleteSessionKey {
+            repo_root: repo.root.clone(),
+            path: path.clone(),
+        };
+        if !self.delete_sessions_in_flight.insert(key.clone()) {
+            self.show_message("delete already in progress")?;
+            return Ok(());
+        }
+        let tx = self.delete_session_tx.clone();
+        let branch_for_job = branch.clone();
+        thread::spawn(move || {
+            let result = delete_worktree_session(&repo, &config, &path, &branch_for_job);
+            let _ = tx.send(DeleteSessionResult { key, result });
+        });
+        self.show_message(&format!("deleting {branch}..."))
+    }
+
+    pub(crate) fn poll_delete_sessions(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(result) = self.delete_session_rx.try_recv() {
+            self.delete_sessions_in_flight.remove(&result.key);
+            changed = true;
+            match result.result {
+                Ok(()) => {
+                    if self.selected_worktree_by_repo.get(&result.key.repo_root)
+                        == Some(&result.key.path)
+                    {
+                        self.selected_worktree_by_repo.remove(&result.key.repo_root);
+                    }
+                    match self.refresh_sessions() {
+                        Ok(()) => {
+                            self.start_tmux_agent_warmup();
+                            self.start_wt_column_poll();
+                            self.start_default_branch_status_poll(true);
+                            let _ = self
+                                .show_message("deleted local session data, worktree, and branch");
+                        }
+                        Err(error) => {
+                            let _ = self
+                                .show_message(&format!("delete complete; refresh failed: {error}"));
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = self.show_message(&format!("delete failed: {error}"));
+                }
+            }
+        }
+        changed
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_delete_session_for_test(&mut self) -> Result<(), String> {
+        let context = self
+            .selected_worktree_context()
+            .ok_or_else(|| "no selected worktree".to_string())?;
+        let session = self
+            .sessions
+            .get(context.session_index)
+            .ok_or_else(|| "no selected worktree".to_string())?;
+        self.start_delete_worktree_session(
+            context.repo,
+            context.config,
+            session.path.clone(),
+            session.branch.clone(),
+        )
     }
 }

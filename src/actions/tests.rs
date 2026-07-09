@@ -357,6 +357,93 @@ exit 1
 }
 
 #[test]
+fn delete_session_does_not_block_input_loop() {
+    let temp = unique_temp_dir("prism-delete-nonblocking-test");
+    fs::create_dir_all(&temp).unwrap();
+    let git_log = temp.join("git.log");
+    let git = temp.join("git");
+    let tmux = temp.join("tmux");
+    fs::write(
+        &git,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"worktree remove --force"*)
+    sleep 1
+    exit 0
+    ;;
+  *"worktree list --porcelain"*)
+    exit 0
+    ;;
+  *"branch -D feature/delete"*)
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+            git_log.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &tmux,
+        r#"#!/bin/sh
+case "$1" in
+  list-sessions|kill-session)
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+    )
+    .unwrap();
+    for executable in [&git, &tmux] {
+        let mut permissions = fs::metadata(executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(executable, permissions).unwrap();
+    }
+
+    let mut config = test_config();
+    config
+        .tools
+        .insert("git".to_string(), git.display().to_string());
+    config
+        .tools
+        .insert("tmux".to_string(), tmux.display().to_string());
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(temp.join("worktree"), "feature/delete");
+    let mut tui = Tui::new_single(repo, config, vec![session]);
+
+    let started = Instant::now();
+    tui.start_delete_session_for_test().unwrap();
+
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "delete blocked input loop for {:?}",
+        started.elapsed()
+    );
+    assert_eq!(tui.sessions.len(), 1);
+    assert_eq!(tui.delete_sessions_in_flight.len(), 1);
+
+    let wait_started = Instant::now();
+    while !tui.delete_sessions_in_flight.is_empty()
+        && wait_started.elapsed() < Duration::from_secs(3)
+    {
+        tui.poll_delete_sessions();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(tui.delete_sessions_in_flight.is_empty());
+    assert!(tui.sessions.is_empty());
+    let commands = fs::read_to_string(&git_log).unwrap();
+    assert!(commands.contains("worktree remove --force"));
+    assert!(commands.contains("branch -D feature/delete"));
+
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
 fn default_branch_does_not_start_pr_polling() {
     let temp = unique_temp_dir("prism-default-branch-pr-poll-test");
     fs::create_dir_all(&temp).unwrap();

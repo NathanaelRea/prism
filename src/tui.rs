@@ -50,6 +50,9 @@ pub struct Tui {
     pub(crate) pr_poll_tx: Sender<PrPollResult>,
     pub(crate) pr_poll_rx: Receiver<PrPollResult>,
     pub(crate) pr_polls_in_flight: BTreeSet<PrPollKey>,
+    pub(crate) delete_session_tx: Sender<DeleteSessionResult>,
+    pub(crate) delete_session_rx: Receiver<DeleteSessionResult>,
+    pub(crate) delete_sessions_in_flight: BTreeSet<DeleteSessionKey>,
     pub(crate) tmux_warmup_tx: Sender<AgentSessionWarmupResult>,
     pub(crate) tmux_warmup_rx: Receiver<AgentSessionWarmupResult>,
     pub(crate) tmux_warmups_in_flight: BTreeSet<AgentSessionWarmupKey>,
@@ -151,6 +154,17 @@ pub(crate) enum PrPollResult {
         key: PrPollKey,
         cache: Box<PrCache>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct DeleteSessionKey {
+    pub repo_root: PathBuf,
+    pub path: PathBuf,
+}
+
+pub(crate) struct DeleteSessionResult {
+    pub key: DeleteSessionKey,
+    pub result: Result<(), String>,
 }
 
 impl PrPollKey {
@@ -332,6 +346,7 @@ struct TuiBackgroundChanges {
     plan_runs: bool,
     auto_runs: bool,
     pull_requests: bool,
+    delete_sessions: bool,
     status_message: bool,
 }
 
@@ -345,6 +360,7 @@ impl TuiBackgroundChanges {
             || self.plan_runs
             || self.auto_runs
             || self.pull_requests
+            || self.delete_sessions
             || self.status_message
     }
 }
@@ -363,6 +379,7 @@ fn ctrl_key(event: KeyEvent) -> bool {
 impl Tui {
     pub fn new(repos: Vec<ManagedRepo>, current_repo: usize, sessions: Vec<Session>) -> Self {
         let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
+        let (delete_session_tx, delete_session_rx) = mpsc::channel();
         let (tmux_warmup_tx, tmux_warmup_rx) = mpsc::channel();
         let (wt_poll_tx, wt_poll_rx) = mpsc::channel();
         let (default_branch_poll_tx, default_branch_poll_rx) = mpsc::channel();
@@ -400,6 +417,9 @@ impl Tui {
             pr_poll_tx,
             pr_poll_rx,
             pr_polls_in_flight: BTreeSet::new(),
+            delete_session_tx,
+            delete_session_rx,
+            delete_sessions_in_flight: BTreeSet::new(),
             tmux_warmup_tx,
             tmux_warmup_rx,
             tmux_warmups_in_flight: BTreeSet::new(),
@@ -923,6 +943,7 @@ impl Tui {
             plan_runs: self.poll_plan_runs(),
             auto_runs: self.poll_auto_runs(),
             pull_requests: self.poll_pull_requests(false),
+            delete_sessions: self.poll_delete_sessions(),
             status_message: self.expire_status_message(),
         };
         self.start_default_branch_status_poll(false);
@@ -932,6 +953,10 @@ impl Tui {
     }
 
     fn confirm_quit(&mut self, runtime: &mut TerminalRuntime) -> Result<bool, String> {
+        if !self.delete_sessions_in_flight.is_empty() {
+            self.show_message("delete in progress; wait for it to finish before quitting")?;
+            return Ok(false);
+        }
         if !self
             .sessions
             .iter()
