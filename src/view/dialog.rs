@@ -62,7 +62,7 @@ pub(super) struct DialogGeometry {
 }
 
 pub(super) fn dialog_geometry(area: Rect, dialog: &crate::view::DialogModel) -> DialogGeometry {
-    let title_width = dialog_title(dialog).chars().count() as u16;
+    let title_width = Line::from(dialog_title(dialog)).width() as u16;
     let raw_lines = dialog_lines(dialog);
     let content_width = match dialog {
         crate::view::DialogModel::Prompt { prompt, .. } => {
@@ -282,15 +282,15 @@ pub(super) fn help_dialog_content_width(
     info_lines: &[Line<'static>],
     title_width: u16,
 ) -> u16 {
-    let filter_width = "Filter: /  / to search".chars().count() as u16;
+    let filter_width = Line::from("Filter: /  / to search").width() as u16;
     items
         .iter()
-        .map(|line| line.chars().count() as u16)
+        .map(|line| Line::from(line.as_str()).width() as u16)
         .chain(info_lines.iter().map(|line| line.width() as u16))
         .max()
         .unwrap_or(0)
         .max(filter_width)
-        .max("Esc/q closes. / searches.".chars().count() as u16)
+        .max(Line::from("Esc/q closes. / searches.").width() as u16)
         .max(title_width)
 }
 

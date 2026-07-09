@@ -143,8 +143,8 @@ pub(super) fn repo_health_spans(health: &str, icon_style: IconStyle) -> Vec<Span
         if count == "0" {
             spans.push(Span::raw("     "));
         } else {
-            spans.push(Span::styled(symbol.to_string(), repo_health_style(kind)));
-            let symbol_width = Line::from(symbol.to_string()).width();
+            spans.push(Span::styled(symbol, repo_health_style(kind)));
+            let symbol_width = Line::from(symbol).width();
             if symbol_width < 2 {
                 spans.push(Span::raw(" ".repeat(2 - symbol_width)));
             }

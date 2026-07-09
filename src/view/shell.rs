@@ -30,40 +30,49 @@ pub(super) fn render_footer(
     area: Rect,
     model: &crate::view::FrameModel<'_>,
 ) {
-    let actions = match model.focus {
-        PanelFocus::Status => vec![
-            ("Panels", "1/2/3"),
-            ("Main", "0"),
-            ("Home", "Enter"),
-            ("Focus", "Tab/S-Tab"),
-            ("Info", "?"),
-            ("Quit", "q"),
-        ],
-        PanelFocus::Repos => vec![
-            ("Select", "j/k"),
-            ("Tmux", "Enter"),
-            ("Create", "c"),
-            ("Unarchive", "U"),
-            ("Columns", "C"),
-            ("Manage", "R"),
-            ("Search", "/"),
-            ("Info", "?"),
-            ("Quit", "q"),
-        ],
-        PanelFocus::Worktrees => vec![
-            ("Select", "j/k"),
-            ("Open", "Enter"),
-            ("Visibility", "+/-"),
-            ("Search", "/"),
-            ("Info", "?"),
-            ("Quit", "q"),
-        ],
-    };
-    let mut spans = footer_action_spans(&actions);
+    let mut spans = footer_action_spans(footer_actions(model.focus));
     if let Some(message) = model.status_message {
         spans.push(Span::styled(format!(" | {message}"), attention_style()));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+const STATUS_FOOTER_ACTIONS: &[(&str, &str)] = &[
+    ("Panels", "1/2/3"),
+    ("Main", "0"),
+    ("Home", "Enter"),
+    ("Focus", "Tab/S-Tab"),
+    ("Info", "?"),
+    ("Quit", "q"),
+];
+
+const REPOS_FOOTER_ACTIONS: &[(&str, &str)] = &[
+    ("Select", "j/k"),
+    ("Tmux", "Enter"),
+    ("Create", "c"),
+    ("Unarchive", "U"),
+    ("Columns", "C"),
+    ("Manage", "R"),
+    ("Search", "/"),
+    ("Info", "?"),
+    ("Quit", "q"),
+];
+
+const WORKTREES_FOOTER_ACTIONS: &[(&str, &str)] = &[
+    ("Select", "j/k"),
+    ("Open", "Enter"),
+    ("Visibility", "+/-"),
+    ("Search", "/"),
+    ("Info", "?"),
+    ("Quit", "q"),
+];
+
+fn footer_actions(focus: PanelFocus) -> &'static [(&'static str, &'static str)] {
+    match focus {
+        PanelFocus::Status => STATUS_FOOTER_ACTIONS,
+        PanelFocus::Repos => REPOS_FOOTER_ACTIONS,
+        PanelFocus::Worktrees => WORKTREES_FOOTER_ACTIONS,
+    }
 }
 
 fn footer_action_spans(actions: &[(&str, &str)]) -> Vec<Span<'static>> {

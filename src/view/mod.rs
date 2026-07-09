@@ -418,6 +418,7 @@ fn info_blank_cell() -> Option<InfoCell> {
 
 fn info_columns_row(cells: &[Option<InfoCell>]) -> Line<'static> {
     const CELL_WIDTH: usize = 24;
+    const SYMBOL_WIDTH: usize = 2;
 
     let mut spans = Vec::new();
     for (index, cell) in cells.iter().enumerate() {
@@ -430,16 +431,21 @@ fn info_columns_row(cells: &[Option<InfoCell>]) -> Line<'static> {
             Some(cell) => {
                 spans.push(Span::styled(cell.symbol, cell.style));
                 let symbol_width = display_width(cell.symbol);
-                if symbol_width < 2 {
-                    spans.push(Span::raw(" ".repeat(2 - symbol_width)));
+                if symbol_width < SYMBOL_WIDTH {
+                    spans.push(Span::raw(" ".repeat(SYMBOL_WIDTH - symbol_width)));
                 }
-                if let Some(marker) = cell.count_marker {
+                let marker_width = if let Some(marker) = cell.count_marker {
                     spans.push(Span::styled(marker, muted_style()));
+                    display_width(marker)
                 } else {
                     spans.push(Span::raw(" "));
-                }
+                    1
+                };
                 spans.push(Span::raw(format!(" {}", cell.description)));
-                let width = 3 + 1 + display_width(cell.description);
+                let width = symbol_width.max(SYMBOL_WIDTH)
+                    + marker_width
+                    + 1
+                    + display_width(cell.description);
                 if width < cell_width {
                     spans.push(Span::raw(" ".repeat(cell_width - width)));
                 }
@@ -455,7 +461,7 @@ fn info_columns_row(cells: &[Option<InfoCell>]) -> Line<'static> {
 }
 
 fn display_width(text: &str) -> usize {
-    Line::from(text.to_string()).width()
+    Line::from(text).width()
 }
 
 fn info_symbol_line(
