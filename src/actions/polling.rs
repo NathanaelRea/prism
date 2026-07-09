@@ -186,6 +186,11 @@ impl Tui {
                     managed.pr_summary_poll_in_flight = true;
                 }
                 std::thread::spawn(move || {
+                    let _ = refresh_repo_policy_cache(
+                        &crate::repo::Repository { root: path.clone() },
+                        &path,
+                        &config,
+                    );
                     let summaries = fetch_pr_summary_index(&path, &config);
                     let _ = tx.send(PrPollResult::Summary {
                         repo_index,

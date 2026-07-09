@@ -75,8 +75,10 @@ pub(super) fn has_pending_auto_work(persisted: &PersistedAutoRun) -> bool {
         || implementation_follow_up_step_needed(persisted)
 }
 
-pub(super) fn pause_before_next_auto_step(
+pub(super) fn pause_before_next_auto_step_with_context(
     conn: &rusqlite::Connection,
+    repo: &Repository,
+    config: &Config,
     persisted: &mut PersistedAutoRun,
 ) -> Result<(), String> {
     if matches!(
@@ -86,7 +88,7 @@ pub(super) fn pause_before_next_auto_step(
         return Ok(());
     }
     if !has_queued_auto_step(persisted) {
-        ensure_next_auto_step(conn, persisted)?;
+        ensure_next_auto_step_with_context(conn, repo, config, persisted)?;
     }
     if !has_pending_auto_work(persisted) {
         return Ok(());
@@ -135,8 +137,18 @@ pub(super) fn implementation_follow_up_step_needed(persisted: &PersistedAutoRun)
         && !has_step_key(persisted, &AutoStepKey::LocalVerify)
 }
 
+#[cfg(test)]
 pub(super) fn ensure_next_auto_step(
     conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+) -> Result<bool, String> {
+    ensure_next_auto_step_legacy(conn, persisted)
+}
+
+pub(super) fn ensure_next_auto_step_with_context(
+    conn: &rusqlite::Connection,
+    repo: &Repository,
+    config: &Config,
     persisted: &mut PersistedAutoRun,
 ) -> Result<bool, String> {
     if merge_or_manual_merge_complete(persisted) {
@@ -144,15 +156,6 @@ pub(super) fn ensure_next_auto_step(
         persisted.run.updated_unix_ms = unix_ms();
         save_run_with_conn(conn, &persisted.run)?;
         return Ok(false);
-    }
-    if ci_loop_complete(persisted) && !has_step_key(persisted, &AutoStepKey::Merge) {
-        append_step_run(
-            conn,
-            persisted,
-            AutoStepKey::Merge,
-            Some("run final merge safety gate".to_string()),
-        )?;
-        return Ok(true);
     }
     if latest_step_status(persisted, &AutoStepKey::Merge) == Some(AutoStepStatus::Done)
         && !has_step_key(persisted, &AutoStepKey::Cleanup)
@@ -165,6 +168,63 @@ pub(super) fn ensure_next_auto_step(
         )?;
         return Ok(true);
     }
+    if ensure_next_implementation_step(conn, persisted)? {
+        return Ok(true);
+    }
+    if matches!(
+        latest_step_status(persisted, &AutoStepKey::CommitImpl),
+        Some(AutoStepStatus::Done | AutoStepStatus::Skipped)
+    ) && !has_step_key(persisted, &AutoStepKey::PushPr)
+    {
+        append_step_run(
+            conn,
+            persisted,
+            AutoStepKey::PushPr,
+            Some("push branch and create or refresh pull request".to_string()),
+        )?;
+        return Ok(true);
+    }
+    if !has_step_status(persisted, &AutoStepKey::PushPr, AutoStepStatus::Done) {
+        return Ok(false);
+    }
+    if ensure_next_repair_follow_up_step(conn, persisted)? {
+        return Ok(true);
+    }
+    ensure_next_stabilization_step(conn, repo, config, persisted)
+}
+
+#[cfg(test)]
+fn ensure_next_auto_step_legacy(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+) -> Result<bool, String> {
+    if merge_or_manual_merge_complete(persisted) {
+        persisted.run.status = AutoRunStatus::Done;
+        persisted.run.updated_unix_ms = unix_ms();
+        save_run_with_conn(conn, &persisted.run)?;
+        return Ok(false);
+    }
+    if latest_step_status(persisted, &AutoStepKey::Merge) == Some(AutoStepStatus::Done)
+        && !has_step_key(persisted, &AutoStepKey::Cleanup)
+    {
+        append_step_run(
+            conn,
+            persisted,
+            AutoStepKey::Cleanup,
+            Some("clean up merged local worktree/session data".to_string()),
+        )?;
+        return Ok(true);
+    }
+    if ensure_next_implementation_step(conn, persisted)? {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+fn ensure_next_implementation_step(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+) -> Result<bool, String> {
     if persisted.run.implementation_source == AutoImplementationSource::DraftPlan
         && !has_step_key(persisted, &AutoStepKey::CreatePlan)
     {
@@ -272,17 +332,13 @@ pub(super) fn ensure_next_auto_step(
         )?;
         return Ok(true);
     }
-    if has_step_status(persisted, &AutoStepKey::PushPr, AutoStepStatus::Done)
-        && !has_step_key(persisted, &AutoStepKey::WaitReview)
-    {
-        append_step_run(
-            conn,
-            persisted,
-            AutoStepKey::WaitReview,
-            Some("wait for automated review feedback".to_string()),
-        )?;
-        return Ok(true);
-    }
+    Ok(false)
+}
+
+fn ensure_next_repair_follow_up_step(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+) -> Result<bool, String> {
     if latest_step_status(persisted, &AutoStepKey::FixReview) == Some(AutoStepStatus::Done)
         && latest_step_status(persisted, &AutoStepKey::VerifyReviewFix)
             != Some(AutoStepStatus::Queued)
@@ -317,22 +373,7 @@ pub(super) fn ensure_next_auto_step(
         latest_step_status(persisted, &AutoStepKey::CommitReviewFix),
         Some(AutoStepStatus::Done | AutoStepStatus::Skipped)
     ) {
-        append_step_run(
-            conn,
-            persisted,
-            AutoStepKey::WaitReview,
-            Some("wait for fresh automated review feedback after review-fix push".to_string()),
-        )?;
-        return Ok(true);
-    }
-    if review_loop_complete(persisted) && !has_step_key(persisted, &AutoStepKey::WaitCi) {
-        append_step_run(
-            conn,
-            persisted,
-            AutoStepKey::WaitCi,
-            Some("wait for pull request checks".to_string()),
-        )?;
-        return Ok(true);
+        return Ok(false);
     }
     if latest_step_status(persisted, &AutoStepKey::FixCi) == Some(AutoStepStatus::Done)
         && latest_step_status(persisted, &AutoStepKey::VerifyCiFix) != Some(AutoStepStatus::Queued)
@@ -370,19 +411,130 @@ pub(super) fn ensure_next_auto_step(
         )?;
         return Ok(true);
     }
-    if matches!(
-        latest_step_status(persisted, &AutoStepKey::CommitCiFix),
-        Some(AutoStepStatus::Done)
-    ) {
-        append_step_run(
-            conn,
-            persisted,
-            AutoStepKey::WaitCi,
-            Some("wait for pull request checks after CI-fix push".to_string()),
-        )?;
-        return Ok(true);
-    }
     Ok(false)
+}
+
+fn ensure_next_stabilization_step(
+    conn: &rusqlite::Connection,
+    repo: &Repository,
+    config: &Config,
+    persisted: &mut PersistedAutoRun,
+) -> Result<bool, String> {
+    let snapshot =
+        stabilization_observe::build_auto_run_stabilization_snapshot(repo, &persisted.run, config);
+    let work = stabilization_plan::plan(&snapshot);
+    persisted.run.stabilization_status = Some(stabilization_status_for_work(&work.kind));
+    persisted.run.stabilization_blocker = Some(work.blocker.clone());
+    persisted.run.stabilization_next_work = Some(work.kind.clone());
+    persisted.run.updated_unix_ms = unix_ms();
+
+    let Some(step_key) = auto_step_for_stabilization_work(&work.kind) else {
+        if work.kind == stabilization_model::StabilizationWorkKind::Done {
+            persisted.run.status = AutoRunStatus::Done;
+        }
+        save_run_with_conn(conn, &persisted.run)?;
+        return Ok(false);
+    };
+    if has_active_or_completed_step_after_latest_pr(persisted, &step_key) {
+        save_run_with_conn(conn, &persisted.run)?;
+        return Ok(false);
+    }
+    let step_id = append_step_run(conn, persisted, step_key, Some(work.reason.clone()))?;
+    if let Some(step) = persisted
+        .steps
+        .iter_mut()
+        .find(|step| step.id == Some(step_id))
+    {
+        step.work_guard = Some(work.guard);
+        step.blocker = Some(work.blocker);
+        save_step_with_conn(conn, step)?;
+    }
+    Ok(true)
+}
+
+fn auto_step_for_stabilization_work(
+    work_kind: &stabilization_model::StabilizationWorkKind,
+) -> Option<AutoStepKey> {
+    match work_kind {
+        stabilization_model::StabilizationWorkKind::RunImplementation => {
+            Some(AutoStepKey::Implement)
+        }
+        stabilization_model::StabilizationWorkKind::RunPlan => Some(AutoStepKey::RunPlan),
+        stabilization_model::StabilizationWorkKind::RunLocalVerification => {
+            Some(AutoStepKey::LocalVerify)
+        }
+        stabilization_model::StabilizationWorkKind::CommitImplementation => {
+            Some(AutoStepKey::CommitImpl)
+        }
+        stabilization_model::StabilizationWorkKind::PushInitialAndOpenPr => {
+            Some(AutoStepKey::PushPr)
+        }
+        stabilization_model::StabilizationWorkKind::FixReview => Some(AutoStepKey::FixReview),
+        stabilization_model::StabilizationWorkKind::VerifyReviewFix => {
+            Some(AutoStepKey::VerifyReviewFix)
+        }
+        stabilization_model::StabilizationWorkKind::CommitReviewFix => {
+            Some(AutoStepKey::CommitReviewFix)
+        }
+        stabilization_model::StabilizationWorkKind::FixCi => Some(AutoStepKey::FixCi),
+        stabilization_model::StabilizationWorkKind::VerifyCiFix => Some(AutoStepKey::VerifyCiFix),
+        stabilization_model::StabilizationWorkKind::CommitCiFix => Some(AutoStepKey::CommitCiFix),
+        stabilization_model::StabilizationWorkKind::WaitForCi => Some(AutoStepKey::WaitCi),
+        stabilization_model::StabilizationWorkKind::WaitForReview => Some(AutoStepKey::WaitReview),
+        stabilization_model::StabilizationWorkKind::MarkReadyForManualMerge
+        | stabilization_model::StabilizationWorkKind::Merge => Some(AutoStepKey::Merge),
+        stabilization_model::StabilizationWorkKind::PushPendingRepair
+        | stabilization_model::StabilizationWorkKind::Done
+        | stabilization_model::StabilizationWorkKind::Escalate => None,
+    }
+}
+
+fn stabilization_status_for_work(
+    work_kind: &stabilization_model::StabilizationWorkKind,
+) -> stabilization_model::StabilizationStatus {
+    match work_kind {
+        stabilization_model::StabilizationWorkKind::WaitForCi
+        | stabilization_model::StabilizationWorkKind::WaitForReview => {
+            stabilization_model::StabilizationStatus::Waiting
+        }
+        stabilization_model::StabilizationWorkKind::MarkReadyForManualMerge
+        | stabilization_model::StabilizationWorkKind::Merge => {
+            stabilization_model::StabilizationStatus::Ready
+        }
+        stabilization_model::StabilizationWorkKind::Done => {
+            stabilization_model::StabilizationStatus::Done
+        }
+        stabilization_model::StabilizationWorkKind::Escalate => {
+            stabilization_model::StabilizationStatus::Escalated
+        }
+        _ => stabilization_model::StabilizationStatus::Blocked,
+    }
+}
+
+fn has_active_or_completed_step_after_latest_pr(
+    persisted: &PersistedAutoRun,
+    key: &AutoStepKey,
+) -> bool {
+    let pr_sequence = persisted
+        .steps
+        .iter()
+        .rev()
+        .find(|step| step.step_key == AutoStepKey::PushPr && step.status == AutoStepStatus::Done)
+        .map(|step| step.sequence)
+        .unwrap_or(0);
+    persisted.steps.iter().any(|step| {
+        step.sequence > pr_sequence
+            && step.step_key.as_str() == key.as_str()
+            && matches!(
+                step.status,
+                AutoStepStatus::Queued
+                    | AutoStepStatus::Starting
+                    | AutoStepStatus::Running
+                    | AutoStepStatus::Waiting
+                    | AutoStepStatus::Done
+                    | AutoStepStatus::Skipped
+            )
+    })
 }
 
 pub(super) fn initial_agent_step(persisted: &PersistedAutoRun) -> (AutoStepKey, &'static str) {
@@ -470,50 +622,6 @@ pub(super) fn latest_unfinished_verify_after_fix(
                 && step.status == AutoStepStatus::Failed
         })
         .map(|step| step.step_key.clone())
-}
-
-pub(super) fn review_loop_complete(persisted: &PersistedAutoRun) -> bool {
-    let Some(wait) = persisted
-        .steps
-        .iter()
-        .rev()
-        .find(|step| step.step_key == AutoStepKey::WaitReview)
-    else {
-        return false;
-    };
-    wait.status == AutoStepStatus::Skipped
-        && persisted
-            .steps
-            .iter()
-            .filter(|step| step.sequence > wait.sequence)
-            .all(|step| {
-                matches!(
-                    step.status,
-                    AutoStepStatus::Done | AutoStepStatus::Skipped | AutoStepStatus::Failed
-                )
-            })
-}
-
-pub(super) fn ci_loop_complete(persisted: &PersistedAutoRun) -> bool {
-    let Some(wait) = persisted
-        .steps
-        .iter()
-        .rev()
-        .find(|step| step.step_key == AutoStepKey::WaitCi)
-    else {
-        return false;
-    };
-    wait.status == AutoStepStatus::Done
-        && persisted
-            .steps
-            .iter()
-            .filter(|step| step.sequence > wait.sequence)
-            .all(|step| {
-                matches!(
-                    step.status,
-                    AutoStepStatus::Done | AutoStepStatus::Skipped | AutoStepStatus::Failed
-                )
-            })
 }
 
 pub(super) fn merge_or_manual_merge_complete(persisted: &PersistedAutoRun) -> bool {

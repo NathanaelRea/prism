@@ -12,10 +12,13 @@ use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{
     AutoExecutorConfig, AutoImplementationSource, AutoLaunch, AutoLaunchOptions, AutoRunMode,
-    AutoRunStatus, AutoStepKey, AutoStepStatus, PersistedAutoRun, abort_auto_step,
+    AutoRunStatus, AutoStepKey, AutoStepStatus, PersistedAutoRun, abort_auto_step, append_step_run,
     archive_auto_run, execute_auto_initial_step, load_auto_run, prepare_auto_run_for_resume,
     request_auto_run_pause, resume_paused_auto_run, retry_auto_from_step,
     retry_failed_auto_step as retry_auto_failed_step, save_auto_run,
+    stabilization_execute::{GuardedPushDecision, decide_guarded_push},
+    stabilization_observe::build_stabilization_snapshot,
+    stabilization_plan::plan as plan_stabilization,
 };
 use crate::ci::build_ci_failure_prompt;
 use crate::config::Config;
@@ -25,7 +28,7 @@ use crate::github::{
     fetch_pr_summary_index, github_remote_configured, github_remote_repo, pr_cache_comment_count,
     pr_cache_pollable, pr_cache_render_signature, pr_details_pollable, pr_summary_or_error,
     refresh_pr_cache, refresh_pr_details_cache, refresh_pr_summary_index_for_sessions,
-    wait_for_pr_merged,
+    refresh_repo_policy_cache, wait_for_pr_merged,
 };
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::lifecycle::{
@@ -48,7 +51,7 @@ use crate::repo::Repository;
 use crate::review::build_review_fix_prompt;
 use crate::session::{
     append_runtime_log, archive_worktree_session, discover_sessions, list_archived_worktrees,
-    save_agent_state, unarchive_worktree_session, write_task_metadata, write_task_summary_metadata,
+    save_agent_state, unarchive_worktree_session, write_task_metadata,
 };
 use crate::tmux::TmuxWindow;
 use crate::tui::{

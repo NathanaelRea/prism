@@ -237,6 +237,7 @@ impl Tui {
         if let Some(context) = self.selected_repo_context()
             && !old_roots.contains(&context.repo.root)
         {
+            let _ = refresh_repo_policy_cache(&context.repo, &context.repo.root, &context.config);
             self.offer_worktrunk_approval_if_pending(raw, &context.repo, &context.config)?;
         }
         self.show_message("repository added")?;
@@ -299,6 +300,7 @@ impl Tui {
             .map(|repo| (repo.repo.clone(), repo.config.clone()))
             .collect::<Vec<_>>();
         for (repo, config) in new_repos {
+            let _ = refresh_repo_policy_cache(&repo, &repo.root, &config);
             self.offer_worktrunk_approval_if_pending(raw, &repo, &config)?;
         }
         self.show_message("repositories reloaded")?;

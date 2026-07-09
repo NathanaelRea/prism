@@ -115,6 +115,21 @@
           "default": false,
           "description": "Whether Auto Flow should clean up branches/worktrees after merging."
         },
+        "require_review_approval": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether PR Stabilization treats missing review approval as a blocker independent of repository policy."
+        },
+        "push_initial": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether Auto Flow may push the initial implementation commit and open a pull request automatically."
+        },
+        "push_repairs": {
+          "type": "boolean",
+          "default": false,
+          "description": "Whether managed PR repair commits may be pushed automatically instead of waiting for user inspection."
+        },
         "review_wait_enabled": {
           "type": "boolean",
           "default": true,

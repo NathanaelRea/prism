@@ -128,6 +128,36 @@ of duplicating each phase as an Auto Flow step. The Auto pipeline records one
 `RunPlan` step with a linked `PlanRun`, waits for that plan run to finish, and
 then continues with local verification and the rest of the PR pipeline.
 
+### PR Stabilization
+
+PR Stabilization is Prism's core workflow for taking an existing pull request
+from its current observed state to all required gates passing. It starts after
+Auto Flow creates or updates a pull request, or when a user asks Prism to manage
+a review, CI, or mergeability repair for an existing Worktree Session. Auto Flow
+delegates pull request gate decisions to PR Stabilization instead of owning a
+separate linear PR checklist.
+
+Prism treats PR Stabilization as derived work rather than a fixed checklist. It
+observes local Git state, cached pull request state, repository policy, and the
+configured Auto Flow goal, derives the current blocker, and chooses one safe next
+work item such as review repair, CI repair, waiting for checks, or ready for
+manual merge.
+
+Managed repair work remains auditable in Prism state. A managed repair may ask an
+agent to prepare a change, verify it, and create a local repair commit. The
+commit can then wait in a pending-push state for user review. If a guarded review
+repair is pushed, Prism may resolve only the exact GitHub review threads that the
+repair was based on.
+
+Actionable review feedback means feedback submitted through GitHub review
+mechanisms, such as review bodies and inline review-thread comments. Top-level
+pull request comments are not treated as review feedback by default.
+
+A pending repair push is guarded by the repair commit and observed branch state.
+If the commit is pushed outside Prism, Prism can mark the push satisfied and
+re-observe. If the branch moves away from the guarded commit, Prism invalidates
+the pending push and replans instead of pushing blindly.
+
 ### Startup Setup
 
 Startup setup is Prism's first-run or misaligned-checkout prompt for a tracked

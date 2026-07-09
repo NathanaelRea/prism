@@ -15,10 +15,11 @@ use crate::{
     auto_flow::{
         AutoImplementationSource, AutoOutputKind, AutoOutputLine, AutoRunMode, AutoRunStatus,
         AutoStepKey, AutoStepRun, AutoStepStatus, PersistedAutoRun,
+        stabilization_model::{PendingPushGuard, StabilizationBlocker, StabilizationWorkKind},
     },
     config::{Config, IconStyle},
     github::PrCache,
-    opencode::{OpencodeState, OpencodeStatus},
+    opencode::OpencodeState,
     plan_run::{
         PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRunMode, PlanRunStatus, PlanStepRun,
         PlanStepStatus, plan_output_block_key,

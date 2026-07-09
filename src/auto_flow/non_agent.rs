@@ -426,6 +426,25 @@ pub(super) fn execute_push_pr_step(
     step_index: usize,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
+    if !config.auto.push_initial {
+        let step = &mut persisted.steps[step_index];
+        let step_id = step
+            .id
+            .ok_or_else(|| "auto push PR step must be saved before output".to_string())?;
+        let message = "initial push/create PR disabled by auto.push_initial".to_string();
+        append_system_output(
+            conn,
+            step_id,
+            AutoOutputKind::Status,
+            &message,
+            None,
+            max_output_lines_per_step,
+        )?;
+        finish_non_agent_step(conn, step, AutoStepStatus::Skipped, Some(message), None)?;
+        persisted.run.updated_unix_ms = unix_ms();
+        return save_run_with_conn(conn, &persisted.run);
+    }
+
     let head_sha = crate::git::current_head_sha(&persisted.run.worktree_path, config)?;
     crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
 
@@ -672,12 +691,6 @@ pub(super) fn execute_commit_review_fix_step(
     step_index: usize,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
-    let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, "fix: cr")?;
-    if result.committed {
-        crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
-    }
-    let head_sha = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
-    persisted.run.current_head_sha = head_sha.clone();
     let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
     crate::lifecycle::refresh_branch_pr_cache(
         repo,
@@ -687,15 +700,39 @@ pub(super) fn execute_commit_review_fix_step(
         &mut cache,
         true,
     );
+    let guard_facts = repair_guard_facts(config, persisted, cache.summary.as_ref());
+    let message = repair_commit_message(config, "repair_commit_review", "fix: cr");
+    let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
+    let head_sha = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
+    persisted.run.current_head_sha = head_sha.clone();
     if let Some(summary) = cache.summary.as_ref() {
         persisted.run.pr_number = Some(summary.number);
         persisted.run.pr_url = Some(summary.url.clone());
-        persisted.run.current_head_sha = Some(if summary.head_sha.trim().is_empty() {
-            head_sha.unwrap_or_default()
-        } else {
-            summary.head_sha.clone()
-        });
         persisted.run.review_baseline_json = Some(review_baseline_json(summary));
+    }
+    if result.committed && config.auto.push_repairs {
+        crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
+        persisted.run.pending_push = None;
+    } else if result.committed {
+        persisted.run.pending_push = result.commit_sha.clone().map(|commit_sha| {
+            pending_push_guard(
+                stabilization_model::RepairKind::Review,
+                commit_sha.clone(),
+                head_sha.clone().unwrap_or(commit_sha),
+                guard_facts,
+                persisted.steps[step_index]
+                    .work_guard
+                    .as_ref()
+                    .map(|guard| guard.review_thread_ids.clone())
+                    .unwrap_or_default(),
+            )
+        });
+        persisted.run.stabilization_status =
+            Some(stabilization_model::StabilizationStatus::Blocked);
+        persisted.run.stabilization_blocker =
+            Some(stabilization_model::StabilizationBlocker::PendingPush);
+        persisted.run.stabilization_next_work =
+            Some(stabilization_model::StabilizationWorkKind::PushPendingRepair);
     }
 
     let step = &mut persisted.steps[step_index];
@@ -707,9 +744,10 @@ pub(super) fn execute_commit_review_fix_step(
         AutoStepStatus::Skipped
     };
     let summary = if result.committed {
-        format!(
-            "committed review fixes as {} and pushed",
-            result.commit_sha.as_deref().unwrap_or("unknown")
+        repair_commit_summary(
+            config,
+            "review",
+            result.commit_sha.as_deref().unwrap_or("unknown"),
         )
     } else {
         result.message
@@ -905,7 +943,18 @@ pub(super) fn execute_commit_ci_fix_step(
     step_index: usize,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
-    let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, "fix: ci")?;
+    let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
+    crate::lifecycle::refresh_branch_pr_cache(
+        repo,
+        config,
+        &persisted.run.branch,
+        &persisted.run.worktree_path,
+        &mut cache,
+        true,
+    );
+    let guard_facts = repair_guard_facts(config, persisted, cache.summary.as_ref());
+    let message = repair_commit_message(config, "repair_commit_ci", "fix: ci");
+    let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
     if !result.committed {
         let summary = "CI fix produced no commitable changes".to_string();
         finish_non_agent_step(
@@ -917,35 +966,41 @@ pub(super) fn execute_commit_ci_fix_step(
         )?;
         return Err(summary);
     }
-    crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
     let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
     persisted.run.current_head_sha = local_head.clone();
-    let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
-    crate::lifecycle::refresh_branch_pr_cache(
-        repo,
-        config,
-        &persisted.run.branch,
-        &persisted.run.worktree_path,
-        &mut cache,
-        true,
-    );
     if let Some(summary) = cache.summary.as_ref() {
         persisted.run.pr_number = Some(summary.number);
         persisted.run.pr_url = Some(summary.url.clone());
-        persisted.run.current_head_sha = Some(if summary.head_sha.trim().is_empty() {
-            local_head.unwrap_or_default()
-        } else {
-            summary.head_sha.clone()
-        });
         persisted.run.review_baseline_json = Some(review_baseline_json(summary));
+    }
+    if config.auto.push_repairs {
+        crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
+        persisted.run.pending_push = None;
+    } else {
+        persisted.run.pending_push = result.commit_sha.clone().map(|commit_sha| {
+            pending_push_guard(
+                stabilization_model::RepairKind::Ci,
+                commit_sha.clone(),
+                local_head.clone().unwrap_or(commit_sha),
+                guard_facts,
+                Vec::new(),
+            )
+        });
+        persisted.run.stabilization_status =
+            Some(stabilization_model::StabilizationStatus::Blocked);
+        persisted.run.stabilization_blocker =
+            Some(stabilization_model::StabilizationBlocker::PendingPush);
+        persisted.run.stabilization_next_work =
+            Some(stabilization_model::StabilizationWorkKind::PushPendingRepair);
     }
 
     let step = &mut persisted.steps[step_index];
     step.commit_sha = result.commit_sha.clone();
     step.head_sha = persisted.run.current_head_sha.clone();
-    let summary = format!(
-        "committed CI fixes as {} and pushed",
-        result.commit_sha.as_deref().unwrap_or("unknown")
+    let summary = repair_commit_summary(
+        config,
+        "CI",
+        result.commit_sha.as_deref().unwrap_or("unknown"),
     );
     let step_id = step
         .id
@@ -1627,6 +1682,80 @@ pub(super) fn implementation_commit_message(run: &AutoRun) -> String {
         "implement auto flow task".to_string()
     } else {
         format!("implement {summary}")
+    }
+}
+
+#[derive(Clone)]
+struct RepairGuardFacts {
+    remote_head_sha: Option<String>,
+    pr_number: Option<u64>,
+    pr_head_sha: Option<String>,
+    base_sha: Option<String>,
+}
+
+fn repair_guard_facts(
+    config: &Config,
+    persisted: &PersistedAutoRun,
+    summary: Option<&PrSummary>,
+) -> RepairGuardFacts {
+    let remote_head_sha = crate::git::remote_branch_head_sha(
+        &persisted.run.worktree_path,
+        &persisted.run.branch,
+        config,
+    )
+    .ok()
+    .flatten();
+    let base_sha = summary.and_then(|summary| {
+        crate::git::remote_branch_head_sha(&persisted.run.worktree_path, &summary.base_ref, config)
+            .ok()
+            .flatten()
+    });
+    RepairGuardFacts {
+        remote_head_sha,
+        pr_number: summary
+            .map(|summary| summary.number)
+            .or(persisted.run.pr_number),
+        pr_head_sha: summary
+            .map(|summary| summary.head_sha.clone())
+            .filter(|sha| !sha.trim().is_empty())
+            .or_else(|| persisted.run.current_head_sha.clone()),
+        base_sha,
+    }
+}
+
+fn pending_push_guard(
+    repair_kind: stabilization_model::RepairKind,
+    commit_sha: String,
+    expected_local_head_sha: String,
+    facts: RepairGuardFacts,
+    guarded_review_thread_ids: Vec<String>,
+) -> stabilization_model::PendingPushGuard {
+    stabilization_model::PendingPushGuard {
+        repair_kind,
+        commit_sha,
+        expected_local_head_sha,
+        expected_remote_head_sha: facts.remote_head_sha,
+        pr_number: facts.pr_number,
+        expected_pr_head_sha: facts.pr_head_sha,
+        expected_base_sha: facts.base_sha,
+        guarded_review_thread_ids,
+    }
+}
+
+fn repair_commit_message(config: &Config, template_name: &str, default: &str) -> String {
+    config
+        .prompt_template(template_name)
+        .map(str::trim)
+        .filter(|message| !message.is_empty())
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn repair_commit_summary(config: &Config, label: &str, commit_sha: &str) -> String {
+    if config.auto.push_repairs {
+        format!("committed {label} fixes as {commit_sha} and pushed")
+    } else {
+        format!("committed {label} fixes as {commit_sha}; pending guarded push")
     }
 }
 

@@ -232,18 +232,4 @@ impl Tui {
         );
         Ok(())
     }
-
-    pub(super) fn submit_action_prompt_to_agent(
-        &mut self,
-        index: usize,
-        repo: &crate::repo::Repository,
-        summary: &str,
-        prompt: &str,
-    ) -> Result<(), String> {
-        self.paste_prompt_into_tmux_agent(index, prompt, true)
-            .map_err(|error| format!("send {summary} prompt to agent session: {error}"))?;
-        write_task_summary_metadata(repo, &self.sessions[index], summary)?;
-        self.sessions[index].mark_adopted_with_summary(summary);
-        Ok(())
-    }
 }

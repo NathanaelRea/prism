@@ -49,7 +49,7 @@ pub fn execute_auto_initial_step(
                 save_run_with_conn(conn, &persisted.run)?;
                 return Err(error);
             }
-            pause_before_next_auto_step(conn, persisted)?;
+            pause_before_next_auto_step_with_context(conn, repo, config, persisted)?;
             continue;
         }
 
@@ -63,11 +63,11 @@ pub fn execute_auto_initial_step(
                 save_run_with_conn(conn, &persisted.run)?;
                 return Err(error);
             }
-            pause_before_next_auto_step(conn, persisted)?;
+            pause_before_next_auto_step_with_context(conn, repo, config, persisted)?;
             continue;
         }
 
-        if ensure_next_auto_step(conn, persisted)? {
+        if ensure_next_auto_step_with_context(conn, repo, config, persisted)? {
             continue;
         }
 
