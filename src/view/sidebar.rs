@@ -84,11 +84,16 @@ pub(super) fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &crate::vie
                     .key
                     .map(|key| key.to_string())
                     .unwrap_or_else(|| " ".to_string());
-                let line = Line::from(vec![
-                    Span::styled(format!("{key:<key_width$} "), muted_style()),
-                    Span::raw(format!("{:<label_width$}", repo.label)),
-                    Span::styled(format!("  {}", repo.health), health_style(&repo.health)),
-                ]);
+                let line = Line::from(
+                    vec![
+                        Span::styled(format!("{key:<key_width$} "), muted_style()),
+                        Span::raw(format!("{:<label_width$}", repo.label)),
+                        Span::raw("  "),
+                    ]
+                    .into_iter()
+                    .chain(repo_health_spans(&repo.health, model.config.icon_style))
+                    .collect::<Vec<_>>(),
+                );
                 let focused = model.focus == PanelFocus::Repos && !model.main_focused;
                 ListItem::new(line).style(if repo.selected {
                     selected_sidebar_row_style(focused)
@@ -115,6 +120,68 @@ pub(super) fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &crate::vie
     if let Some(row) = selected_row {
         render_selected_row_outline(frame, area, row, focused);
     }
+}
+
+pub(super) fn repo_health_spans(health: &str, icon_style: IconStyle) -> Vec<Span<'static>> {
+    if health == "ok" {
+        return vec![Span::styled("ok".to_string(), health_style(health))];
+    }
+
+    let tokens = health.split_whitespace().collect::<Vec<_>>();
+    if !tokens
+        .iter()
+        .all(|token| repo_health_token(token, icon_style).is_some())
+    {
+        return vec![Span::styled(health.to_string(), health_style(health))];
+    }
+
+    let mut spans = Vec::new();
+    for token in tokens {
+        let Some((kind, symbol, count)) = repo_health_token(token, icon_style) else {
+            continue;
+        };
+        if count == "0" {
+            spans.push(Span::raw("     "));
+        } else {
+            spans.push(Span::styled(symbol.to_string(), repo_health_style(kind)));
+            let symbol_width = Line::from(symbol.to_string()).width();
+            if symbol_width < 2 {
+                spans.push(Span::raw(" ".repeat(2 - symbol_width)));
+            }
+            spans.push(Span::styled(format!("{count:<2}"), repo_health_style(kind)));
+        }
+        spans.push(Span::raw(" "));
+    }
+    spans
+}
+
+fn repo_health_token(
+    token: &str,
+    icon_style: IconStyle,
+) -> Option<(RepoHealthKind, &'static str, &str)> {
+    let split = token
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| !ch.is_ascii_digit())
+        .map(|(index, ch)| index + ch.len_utf8())?;
+    let (symbol, count) = token.split_at(split);
+    if count.is_empty() || !count.chars().all(|ch| ch.is_ascii_digit()) {
+        return None;
+    }
+    [
+        RepoHealthKind::Dirty,
+        RepoHealthKind::Agents,
+        RepoHealthKind::Attention,
+        RepoHealthKind::PullRequests,
+        RepoHealthKind::CiFailed,
+        RepoHealthKind::CiRunning,
+        RepoHealthKind::Behind,
+    ]
+    .into_iter()
+    .find_map(|kind| {
+        let icon = repo_health_icon(kind, icon_style);
+        (symbol == icon).then_some((kind, icon, count))
+    })
 }
 
 pub(super) fn render_worktrees(

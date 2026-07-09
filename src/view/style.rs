@@ -85,7 +85,11 @@ pub(super) fn muted_style() -> Style {
 pub(super) fn health_style(health: &str) -> Style {
     if health == "ok" {
         Style::default().fg(Color::Green)
-    } else if health.contains('!') || health.contains("CIx") {
+    } else if health.contains('!')
+        || health.contains('✕')
+        || health.contains('')
+        || health.contains("CIx")
+    {
         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::Yellow)

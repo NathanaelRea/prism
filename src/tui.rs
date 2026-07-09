@@ -1052,7 +1052,7 @@ impl Tui {
         let mut filter = String::new();
         let mut editing_filter = false;
         let mut scroll = 0usize;
-        let info_lines = self.keybinding_info_lines();
+        let info_lines = view::keybinding_info_lines(self.focused_panel, self.config.icon_style);
         self.dialog = Some(view::DialogModel::Help {
             filter: filter.clone(),
             editing_filter,
@@ -2635,31 +2635,28 @@ impl Tui {
             }
         }
 
-        let mut parts = Vec::new();
-        if dirty > 0 {
-            parts.push(format!("D{dirty}"));
-        }
-        if running > 0 {
-            parts.push(format!("A{running}"));
-        }
-        if attention > 0 {
-            parts.push(format!("!{attention}"));
-        }
-        if prs > 0 {
-            parts.push(format!("PR{prs}"));
-        }
-        if ci_failed > 0 {
-            parts.push(format!("CIx{ci_failed}"));
-        } else if ci_running > 0 {
-            parts.push(format!("CI~{ci_running}"));
-        }
-        if behind > 0 {
-            parts.push(format!("↓{behind}"));
-        }
-        if parts.is_empty() {
+        let parts = [
+            (view::RepoHealthKind::Dirty, dirty),
+            (view::RepoHealthKind::Agents, running),
+            (view::RepoHealthKind::Attention, attention),
+            (view::RepoHealthKind::PullRequests, prs),
+            (view::RepoHealthKind::CiFailed, ci_failed),
+            (view::RepoHealthKind::CiRunning, ci_running),
+            (view::RepoHealthKind::Behind, behind),
+        ];
+        if parts.iter().all(|(_, count)| *count == 0) {
             "ok".to_string()
         } else {
-            parts.join(" ")
+            parts
+                .iter()
+                .map(|(kind, count)| {
+                    format!(
+                        "{}{count}",
+                        view::repo_health_icon(*kind, self.config.icon_style)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
         }
     }
 
@@ -2848,37 +2845,6 @@ impl Tui {
                 ],
             )),
             (None, _) => None,
-        }
-    }
-
-    fn keybinding_info_lines(&self) -> Vec<String> {
-        match self.focused_panel {
-            PanelFocus::Status => Vec::new(),
-            PanelFocus::Repos => vec![
-                "Repository columns".to_string(),
-                "repo: repository label".to_string(),
-                "health: ok when clear; otherwise one or more status tokens".to_string(),
-                "D#: dirty worktrees".to_string(),
-                "A#: running agents".to_string(),
-                "!#: needs input, restart, error, or unseen comments".to_string(),
-                "PR#: open pull requests".to_string(),
-                "CIx#: failed CI checks".to_string(),
-                "CI~#: running CI checks".to_string(),
-                "↓#: default branch commits behind".to_string(),
-            ],
-            PanelFocus::Worktrees => vec![
-                "Worktree columns".to_string(),
-                "↕: visibility, ↑ raised, ↓ lowered, · normal".to_string(),
-                "branch or branch/wt: branch and worktree name".to_string(),
-                "K: kind, p planning, e exploration, blank work".to_string(),
-                "A: agent, ○ idle, ● running, ✓ done, ✕ failed, ↻ restart, ! input".to_string(),
-                "P: PR, ⇄ open, ◐ draft, ⋈ merged, × closed, ⚔ conflict".to_string(),
-                "G: git, ✓ clean, ✗ dirty, ↑ ahead, ↓ behind, ↕ diverged".to_string(),
-                "C: CI, ✓ passed, ✕ failed, • running, ± mixed, ? unknown".to_string(),
-                "@: unresolved/resolved review comments".to_string(),
-                "!: errors or attention needed".to_string(),
-                "auto/plan: active automation or plan status".to_string(),
-            ],
         }
     }
 }

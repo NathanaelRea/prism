@@ -203,7 +203,7 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
             lines.push(Line::from(""));
             if query.is_empty() && !*editing_filter && !info_lines.is_empty() {
                 for line in info_lines {
-                    lines.push(Line::from(line.clone()));
+                    lines.push(line.clone());
                 }
                 lines.push(Line::from(""));
             }
@@ -279,14 +279,14 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
 
 pub(super) fn help_dialog_content_width(
     items: &[String],
-    info_lines: &[String],
+    info_lines: &[Line<'static>],
     title_width: u16,
 ) -> u16 {
     let filter_width = "Filter: /  / to search".chars().count() as u16;
     items
         .iter()
-        .chain(info_lines.iter())
         .map(|line| line.chars().count() as u16)
+        .chain(info_lines.iter().map(|line| line.width() as u16))
         .max()
         .unwrap_or(0)
         .max(filter_width)
