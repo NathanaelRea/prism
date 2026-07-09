@@ -31,17 +31,49 @@ pub(super) fn render_footer(
     model: &crate::view::FrameModel<'_>,
 ) {
     let actions = match model.focus {
-        PanelFocus::Status => "1/2/3 panels  0 main  Enter ~/  Tab/S-Tab  ? help  q quit",
-        PanelFocus::Repos => {
-            "j/k select  Enter tmux  c create  U unarchive  C columns  R manage  / search  q quit"
-        }
-        PanelFocus::Worktrees => {
-            "j/k select  3 toggle repo/all  0 main  Enter tmux/phase  +/- visibility  / search  q quit"
-        }
+        PanelFocus::Status => vec![
+            ("Panels", "1/2/3"),
+            ("Main", "0"),
+            ("Home", "Enter"),
+            ("Focus", "Tab/S-Tab"),
+            ("Info", "?"),
+            ("Quit", "q"),
+        ],
+        PanelFocus::Repos => vec![
+            ("Select", "j/k"),
+            ("Tmux", "Enter"),
+            ("Create", "c"),
+            ("Unarchive", "U"),
+            ("Columns", "C"),
+            ("Manage", "R"),
+            ("Search", "/"),
+            ("Info", "?"),
+            ("Quit", "q"),
+        ],
+        PanelFocus::Worktrees => vec![
+            ("Select", "j/k"),
+            ("Open", "Enter"),
+            ("Visibility", "+/-"),
+            ("Search", "/"),
+            ("Info", "?"),
+            ("Quit", "q"),
+        ],
     };
-    let mut spans = vec![Span::raw(actions.to_string())];
+    let mut spans = footer_action_spans(&actions);
     if let Some(message) = model.status_message {
         spans.push(Span::styled(format!(" | {message}"), attention_style()));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn footer_action_spans(actions: &[(&str, &str)]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (index, (label, binding)) in actions.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::styled(" | ", muted_style()));
+        }
+        spans.push(Span::styled(format!("{label} "), muted_style()));
+        spans.push(Span::raw((*binding).to_string()));
+    }
+    spans
 }

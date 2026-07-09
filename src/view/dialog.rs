@@ -43,12 +43,13 @@ pub(super) fn render_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &crate::v
         false,
     );
     frame.render_widget(Clear, geometry.popup);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .wrap(Wrap { trim: false }),
-        geometry.popup,
-    );
+    let mut paragraph = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
+    if let crate::view::DialogModel::Help { scroll, .. } = dialog {
+        paragraph = paragraph.scroll(((*scroll).min(u16::MAX as usize) as u16, 0));
+    }
+    frame.render_widget(paragraph, geometry.popup);
     if let crate::view::DialogModel::Prompt { prompt, input, .. } = dialog {
         set_prompt_cursor(frame, geometry.inner, prompt, input);
     }
@@ -67,6 +68,15 @@ pub(super) fn dialog_geometry(area: Rect, dialog: &crate::view::DialogModel) -> 
         crate::view::DialogModel::Prompt { prompt, .. } => {
             prompt_dialog_content_width(prompt, title_width)
         }
+        crate::view::DialogModel::Help {
+            items, info_lines, ..
+        } => help_dialog_content_width(items, info_lines, title_width).max(
+            raw_lines
+                .iter()
+                .map(|line| line.width() as u16)
+                .max()
+                .unwrap_or(0),
+        ),
         _ => raw_lines
             .iter()
             .map(|line| line.width() as u16)
@@ -173,7 +183,9 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
         crate::view::DialogModel::Help {
             filter,
             editing_filter,
+            info_lines,
             items,
+            ..
         } => {
             let query = filter.trim().to_ascii_lowercase();
             let mut lines = vec![Line::from(vec![
@@ -189,6 +201,12 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
                 ),
             ])];
             lines.push(Line::from(""));
+            if query.is_empty() && !*editing_filter && !info_lines.is_empty() {
+                for line in info_lines {
+                    lines.push(Line::from(line.clone()));
+                }
+                lines.push(Line::from(""));
+            }
             let mut matched = 0;
             for item in items {
                 if query.is_empty() || item.to_ascii_lowercase().contains(&query) {
@@ -257,6 +275,23 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
             lines
         }
     }
+}
+
+pub(super) fn help_dialog_content_width(
+    items: &[String],
+    info_lines: &[String],
+    title_width: u16,
+) -> u16 {
+    let filter_width = "Filter: /  / to search".chars().count() as u16;
+    items
+        .iter()
+        .chain(info_lines.iter())
+        .map(|line| line.chars().count() as u16)
+        .max()
+        .unwrap_or(0)
+        .max(filter_width)
+        .max("Esc/q closes. / searches.".chars().count() as u16)
+        .max(title_width)
 }
 
 pub(super) fn choice_lines(choices: &crate::view::ChoiceList) -> Vec<Line<'static>> {

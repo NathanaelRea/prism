@@ -59,7 +59,9 @@ pub(crate) enum DialogModel {
     Help {
         filter: String,
         editing_filter: bool,
+        info_lines: Vec<String>,
         items: Vec<String>,
+        scroll: usize,
     },
     Confirm {
         title: String,

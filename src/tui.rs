@@ -1051,10 +1051,14 @@ impl Tui {
             .collect::<Vec<_>>();
         let mut filter = String::new();
         let mut editing_filter = false;
+        let mut scroll = 0usize;
+        let info_lines = self.keybinding_info_lines();
         self.dialog = Some(view::DialogModel::Help {
             filter: filter.clone(),
             editing_filter,
+            info_lines: info_lines.clone(),
             items: items.clone(),
+            scroll,
         });
         self.draw(runtime)?;
         loop {
@@ -1076,16 +1080,25 @@ impl Tui {
                 KeyCode::Char('/') if plain_key(event) && !editing_filter => {
                     editing_filter = true;
                     filter.clear();
+                    scroll = 0;
                 }
                 KeyCode::Enter if editing_filter => editing_filter = false,
                 KeyCode::Backspace if editing_filter => {
                     filter.pop();
+                    scroll = 0;
+                }
+                KeyCode::Up | KeyCode::Char('k') if !editing_filter => {
+                    scroll = scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') if !editing_filter => {
+                    scroll = scroll.saturating_add(1);
                 }
                 KeyCode::Esc => close = true,
                 KeyCode::Char('c') if ctrl_key(event) => close = true,
                 KeyCode::Char('q') if plain_key(event) => close = true,
                 KeyCode::Char(ch) if editing_filter && plain_key(event) && !ch.is_control() => {
                     filter.push(ch);
+                    scroll = 0;
                 }
                 _ if !editing_filter => close = true,
                 _ => {}
@@ -1098,7 +1111,9 @@ impl Tui {
             self.dialog = Some(view::DialogModel::Help {
                 filter: filter.clone(),
                 editing_filter,
+                info_lines: info_lines.clone(),
                 items: items.clone(),
+                scroll,
             });
             self.draw(runtime)?;
         }
@@ -2833,6 +2848,37 @@ impl Tui {
                 ],
             )),
             (None, _) => None,
+        }
+    }
+
+    fn keybinding_info_lines(&self) -> Vec<String> {
+        match self.focused_panel {
+            PanelFocus::Status => Vec::new(),
+            PanelFocus::Repos => vec![
+                "Repository columns".to_string(),
+                "repo: repository label".to_string(),
+                "health: ok when clear; otherwise one or more status tokens".to_string(),
+                "D#: dirty worktrees".to_string(),
+                "A#: running agents".to_string(),
+                "!#: needs input, restart, error, or unseen comments".to_string(),
+                "PR#: open pull requests".to_string(),
+                "CIx#: failed CI checks".to_string(),
+                "CI~#: running CI checks".to_string(),
+                "↓#: default branch commits behind".to_string(),
+            ],
+            PanelFocus::Worktrees => vec![
+                "Worktree columns".to_string(),
+                "↕: visibility, ↑ raised, ↓ lowered, · normal".to_string(),
+                "branch or branch/wt: branch and worktree name".to_string(),
+                "K: kind, p planning, e exploration, blank work".to_string(),
+                "A: agent, ○ idle, ● running, ✓ done, ✕ failed, ↻ restart, ! input".to_string(),
+                "P: PR, ⇄ open, ◐ draft, ⋈ merged, × closed, ⚔ conflict".to_string(),
+                "G: git, ✓ clean, ✗ dirty, ↑ ahead, ↓ behind, ↕ diverged".to_string(),
+                "C: CI, ✓ passed, ✕ failed, • running, ± mixed, ? unknown".to_string(),
+                "@: unresolved/resolved review comments".to_string(),
+                "!: errors or attention needed".to_string(),
+                "auto/plan: active automation or plan status".to_string(),
+            ],
         }
     }
 }

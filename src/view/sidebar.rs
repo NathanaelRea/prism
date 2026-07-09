@@ -69,6 +69,7 @@ pub(super) fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &crate::vie
             muted_style(),
         )))]
     } else {
+        let key_width = 1usize;
         let label_width = model
             .repos
             .iter()
@@ -79,7 +80,12 @@ pub(super) fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &crate::vie
             .repos
             .iter()
             .map(|repo| {
+                let key = repo
+                    .key
+                    .map(|key| key.to_string())
+                    .unwrap_or_else(|| " ".to_string());
                 let line = Line::from(vec![
+                    Span::styled(format!("{key:<key_width$} "), muted_style()),
                     Span::raw(format!("{:<label_width$}", repo.label)),
                     Span::styled(format!("  {}", repo.health), health_style(&repo.health)),
                 ]);
@@ -375,7 +381,7 @@ pub(super) fn configured_worktree_column_widths(
     }
     configured_columns
         .iter()
-        .map(|column| (column.as_str(), value_width.clamp(4, 18)))
+        .map(|column| (column.as_str(), value_width.clamp(4, 12)))
         .collect()
 }
 
