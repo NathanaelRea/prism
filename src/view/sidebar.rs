@@ -89,7 +89,7 @@ pub(super) fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &crate::vie
                     Span::styled(format!("  {}", repo.health), health_style(&repo.health)),
                 ]);
                 let focused = model.focus == PanelFocus::Repos && !model.main_focused;
-                ListItem::new(line).style(if repo.selected && focused {
+                ListItem::new(line).style(if repo.selected {
                     selected_sidebar_row_style(focused)
                 } else {
                     Style::default()
@@ -108,7 +108,7 @@ pub(super) fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &crate::vie
     let selected_row = model
         .repos
         .iter()
-        .position(|repo| repo.selected && focused)
+        .position(|repo| repo.selected)
         .map(|row| row as u16);
     frame.render_widget(List::new(rows).block(panel_block(title, focused)), area);
     if let Some(row) = selected_row {
@@ -243,7 +243,7 @@ pub(super) fn render_worktrees(
                 ));
             }
             let focused = model.focus == PanelFocus::Worktrees && !model.main_focused;
-            ListItem::new(Line::from(spans)).style(if worktree.selected && focused {
+            ListItem::new(Line::from(spans)).style(if worktree.selected {
                 selected_sidebar_row_style(focused)
             } else {
                 Style::default()
@@ -266,7 +266,7 @@ pub(super) fn render_worktrees(
     let selected_row = model
         .worktrees
         .iter()
-        .position(|worktree| worktree.selected && focused)
+        .position(|worktree| worktree.selected)
         .map(|row| row as u16 + 1);
     frame.render_widget(List::new(rows).block(panel_block(title, focused)), area);
     if let Some(row) = selected_row {

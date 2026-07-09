@@ -149,6 +149,58 @@ fn renders_selected_sidebar_rows_with_focused_style() {
 }
 
 #[test]
+fn renders_selected_sidebar_rows_with_unfocused_style() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Running)];
+
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let buffer = render_to_buffer(&model, 120, 30);
+    let (label_x, row) = sidebar_cell_containing(&buffer, "repo  ok");
+
+    assert_cell_style(
+        &buffer,
+        0,
+        row,
+        Style::default().fg(Color::DarkGray).bg(Color::Reset),
+    );
+    assert_cell_style(
+        &buffer,
+        label_x,
+        row,
+        Style::default().fg(Color::Reset).bg(Color::DarkGray),
+    );
+    assert_cell_style(
+        &buffer,
+        55,
+        row,
+        Style::default().fg(Color::DarkGray).bg(Color::Reset),
+    );
+
+    let model = test_model(&config, &sessions, PanelFocus::Repos, None, None);
+    let buffer = render_to_buffer(&model, 120, 30);
+    let (branch_x, row) = sidebar_cell_containing(&buffer, "feature");
+
+    assert_cell_style(
+        &buffer,
+        0,
+        row,
+        Style::default().fg(Color::DarkGray).bg(Color::Reset),
+    );
+    assert_cell_style(
+        &buffer,
+        branch_x,
+        row,
+        Style::default().fg(Color::Reset).bg(Color::DarkGray),
+    );
+    assert_cell_style(
+        &buffer,
+        55,
+        row,
+        Style::default().fg(Color::DarkGray).bg(Color::Reset),
+    );
+}
+
+#[test]
 fn status_and_repo_sidebar_columns_align() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Running)];
