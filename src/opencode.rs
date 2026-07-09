@@ -224,7 +224,8 @@ pub fn refresh_opencode_session(
     mut runtime: OpencodeRuntime,
     worktree: &Path,
 ) -> Result<OpencodeRuntime, String> {
-    let Some(session) = newest_listed_session_for_worktree(&runtime, worktree)? else {
+    let Some(session) = newest_listed_session_for_worktree(&runtime, worktree).unwrap_or(None)
+    else {
         return Ok(runtime);
     };
     save_runtime_session(repo, &mut runtime, session.id)?;
@@ -1704,6 +1705,33 @@ mod tests {
         let selected = resolve_session(&runtime, &worktree).unwrap();
 
         assert_eq!(selected.id, "new");
+    }
+
+    #[test]
+    fn refresh_session_keeps_runtime_when_session_listing_fails() {
+        let temp = unique_temp_dir("prism-opencode-refresh-offline-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let worktree = temp.join("feature");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let runtime = OpencodeRuntime {
+            repo_root: temp.display().to_string(),
+            branch: "feature".to_string(),
+            worktree_path: worktree.display().to_string(),
+            server_port: port,
+            server_url: server_url(port),
+            server_pid: None,
+            opencode_session_id: Some("stored".to_string()),
+            generation: 3,
+            updated_unix_ms: 42,
+        };
+
+        let refreshed = refresh_opencode_session(&repo, runtime.clone(), &worktree).unwrap();
+
+        assert_eq!(refreshed, runtime);
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
