@@ -215,12 +215,19 @@ pub fn ensure_opencode_session(
 ) -> Result<OpencodeRuntime, String> {
     let mut runtime = ensure_opencode_server(repo, config, branch, worktree)?;
     let session = resolve_session(&runtime, worktree)?;
-    if runtime.opencode_session_id.as_deref() != Some(session.id.as_str()) {
-        runtime.opencode_session_id = Some(session.id);
-        runtime.generation = runtime.generation.saturating_add(1);
-        runtime.updated_unix_ms = unix_ms();
-        save_runtime(repo, &runtime)?;
-    }
+    save_runtime_session(repo, &mut runtime, session.id)?;
+    Ok(runtime)
+}
+
+pub fn refresh_opencode_session(
+    repo: &Repository,
+    mut runtime: OpencodeRuntime,
+    worktree: &Path,
+) -> Result<OpencodeRuntime, String> {
+    let Some(session) = newest_listed_session_for_worktree(&runtime, worktree)? else {
+        return Ok(runtime);
+    };
+    save_runtime_session(repo, &mut runtime, session.id)?;
     Ok(runtime)
 }
 
@@ -818,19 +825,50 @@ fn fetch_todos(server_url: &str, session_id: &str) -> Result<Vec<OpencodeTodo>, 
 
 fn resolve_session(runtime: &OpencodeRuntime, worktree: &Path) -> Result<OpencodeSession, String> {
     let worktree_path = worktree.display().to_string();
-    if let Some(session_id) = runtime.opencode_session_id.as_deref()
+    let stored_session = if let Some(session_id) = runtime.opencode_session_id.as_deref()
         && let Some(session) = get_session(&runtime.server_url, session_id)?
         && session_matches_worktree(&session, &worktree_path)
     {
+        Some(session)
+    } else {
+        None
+    };
+
+    match newest_listed_session_for_worktree(runtime, worktree) {
+        Ok(Some(session)) => return Ok(session),
+        Ok(None) => {}
+        Err(_) if stored_session.is_some() => return Ok(stored_session.unwrap()),
+        Err(error) => return Err(error),
+    }
+
+    if let Some(session) = stored_session {
         return Ok(session);
     }
 
-    let sessions = list_sessions(&runtime.server_url)?;
-    if let Some(session) = newest_session_for_worktree(&sessions, &worktree_path) {
-        return Ok(session.clone());
-    }
-
     create_session(&runtime.server_url, worktree)
+}
+
+fn newest_listed_session_for_worktree(
+    runtime: &OpencodeRuntime,
+    worktree: &Path,
+) -> Result<Option<OpencodeSession>, String> {
+    let worktree_path = worktree.display().to_string();
+    let sessions = list_sessions(&runtime.server_url)?;
+    Ok(newest_session_for_worktree(&sessions, &worktree_path).cloned())
+}
+
+fn save_runtime_session(
+    repo: &Repository,
+    runtime: &mut OpencodeRuntime,
+    session_id: String,
+) -> Result<(), String> {
+    if runtime.opencode_session_id.as_deref() != Some(session_id.as_str()) {
+        runtime.opencode_session_id = Some(session_id);
+        runtime.generation = runtime.generation.saturating_add(1);
+        runtime.updated_unix_ms = unix_ms();
+        save_runtime(repo, runtime)?;
+    }
+    Ok(())
 }
 
 pub fn load_runtime(
@@ -1375,8 +1413,12 @@ fn newest_session_for_worktree<'a>(
 ) -> Option<&'a OpencodeSession> {
     sessions
         .iter()
-        .filter(|session| session_matches_worktree(session, worktree_path))
+        .filter(|session| listed_session_matches_worktree(session, worktree_path))
         .max_by(|left, right| left.time_updated.cmp(&right.time_updated))
+}
+
+fn listed_session_matches_worktree(session: &OpencodeSession, worktree_path: &str) -> bool {
+    session.directory.as_deref() == Some(worktree_path)
 }
 
 fn session_matches_worktree(session: &OpencodeSession, worktree_path: &str) -> bool {
@@ -1418,6 +1460,8 @@ fn stable_hash_text(value: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::PathBuf;
 
     use super::*;
@@ -1614,6 +1658,55 @@ mod tests {
     }
 
     #[test]
+    fn newest_session_for_worktree_ignores_sessions_without_matching_directory() {
+        let sessions = vec![
+            OpencodeSession {
+                id: "old".to_string(),
+                directory: Some("/repo/wt".to_string()),
+                title: None,
+                time_updated: Some("2026-01-01T00:00:00Z".to_string()),
+            },
+            OpencodeSession {
+                id: "new_without_directory".to_string(),
+                directory: None,
+                title: None,
+                time_updated: Some("2026-01-03T00:00:00Z".to_string()),
+            },
+            OpencodeSession {
+                id: "new_other_worktree".to_string(),
+                directory: Some("/repo/other".to_string()),
+                title: None,
+                time_updated: Some("2026-01-04T00:00:00Z".to_string()),
+            },
+        ];
+
+        let selected = newest_session_for_worktree(&sessions, "/repo/wt").unwrap();
+
+        assert_eq!(selected.id, "old");
+    }
+
+    #[test]
+    fn resolve_session_prefers_newer_worktree_session_over_stored_session() {
+        let worktree = PathBuf::from("/repo/wt");
+        let server_url = start_session_resolution_server();
+        let runtime = OpencodeRuntime {
+            repo_root: "/repo".to_string(),
+            branch: "feature".to_string(),
+            worktree_path: worktree.display().to_string(),
+            server_port: 41_234,
+            server_url,
+            server_pid: None,
+            opencode_session_id: Some("old".to_string()),
+            generation: 0,
+            updated_unix_ms: 0,
+        };
+
+        let selected = resolve_session(&runtime, &worktree).unwrap();
+
+        assert_eq!(selected.id, "new");
+    }
+
+    #[test]
     fn url_path_segment_percent_encodes_non_segment_bytes() {
         assert_eq!(url_path_segment("session/id 1"), "session%2Fid%201");
         assert_eq!(url_path_segment("ses_1-2.3~4"), "ses_1-2.3~4");
@@ -1747,5 +1840,45 @@ mod tests {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    fn start_session_resolution_server() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0_u8; 256];
+                    let count = stream.read(&mut buffer).unwrap();
+                    if count == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request);
+                let body = if request.starts_with("GET /session/old ") {
+                    r#"{"id":"old","directory":"/repo/wt","timeUpdated":"2026-01-01T00:00:00Z"}"#
+                } else if request.starts_with("GET /session ") {
+                    r#"[
+                        {"id":"old","directory":"/repo/wt","timeUpdated":"2026-01-01T00:00:00Z"},
+                        {"id":"new","directory":"/repo/wt","timeUpdated":"2026-01-02T00:00:00Z"}
+                    ]"#
+                } else {
+                    r#"{}"#
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        url
     }
 }
