@@ -385,6 +385,27 @@ fn renders_nerd_font_worktree_icons_when_configured() {
 }
 
 #[test]
+fn nerd_font_status_counts_have_spacing() {
+    assert_eq!(
+        git_status_indicator("dirty 2 ahead 1 behind 3", IconStyle::NerdFont),
+        " 2 ↑1 ↓3"
+    );
+}
+
+#[test]
+fn nerd_font_repo_health_counts_have_spacing() {
+    let spans = repo_health_spans("2 0 1", IconStyle::NerdFont);
+    let text = spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+
+    assert!(text.contains(" 2"), "got {text:?}");
+    assert!(text.contains(" 1"), "got {text:?}");
+    assert!(!text.contains("2"), "got {text:?}");
+}
+
+#[test]
 fn worktree_sidebar_renders_missing_configured_columns_as_placeholders() {
     let mut config = test_config();
     config.worktree_columns = vec!["todo".to_string(), "owner".to_string()];
