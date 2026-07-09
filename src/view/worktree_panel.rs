@@ -97,57 +97,53 @@ pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<
 fn stabilization_signal_lines(model: &StabilizationPanelModel) -> Vec<Line<'static>> {
     vec![
         Line::from(vec![
-            Span::styled(" Observe  ", muted_style()),
-            Span::styled(" Blockers  ", muted_style()),
-            Span::styled(" Work  ", muted_style()),
-            Span::styled(" Reobserve", muted_style()),
-        ]),
-        Line::from(vec![
-            Span::styled("   state ", muted_style()),
+            Span::styled("state ", muted_style()),
             Span::styled(
                 model.blocker.clone(),
                 stabilization_state_style(&model.blocker),
             ),
-            Span::styled("  next ", muted_style()),
+        ]),
+        Line::from(vec![
+            Span::styled("next ", muted_style()),
             Span::styled(model.next.clone(), attention_style()),
         ]),
         Line::from(vec![
-            Span::styled("   ", muted_style()),
+            lane_cell("Observe", muted_style()),
+            lane_cell("Blockers", muted_style()),
+            lane_cell("Work", muted_style()),
+            lane_cell("Reobserve", muted_style()),
+        ]),
+        Line::from(vec![
             lane_cell("current", attention_style()),
             lane_cell(&model.blocker, stabilization_state_style(&model.blocker)),
             lane_cell(&model.next, attention_style()),
             lane_cell("pending", muted_style()),
         ]),
         Line::from(vec![
-            Span::styled("   ", muted_style()),
             lane_cell("checks", gate_style(&model.ci)),
             lane_cell(&model.ci, gate_style(&model.ci)),
             lane_cell("verify", muted_style()),
             lane_cell("reobserve", muted_style()),
         ]),
         Line::from(vec![
-            Span::styled("   ", muted_style()),
             lane_cell("review", gate_style(&model.review)),
             lane_cell(&model.review, gate_style(&model.review)),
             lane_cell("commit", muted_style()),
             lane_cell("wait", muted_style()),
         ]),
         Line::from(vec![
-            Span::styled("   ", muted_style()),
             lane_cell("merge", gate_style(&model.merge)),
             lane_cell(&model.merge, gate_style(&model.merge)),
             lane_cell("push", muted_style()),
             lane_cell("refresh", muted_style()),
         ]),
         Line::from(vec![
-            Span::styled("   ", muted_style()),
             lane_cell("policy", gate_style(&model.policy)),
             lane_cell(&model.policy, gate_style(&model.policy)),
             lane_cell("guard", muted_style()),
             lane_cell("refresh", muted_style()),
         ]),
         Line::from(vec![
-            Span::styled("   ", muted_style()),
             lane_cell("fresh", Style::default().fg(Color::Green)),
             lane_cell("clear", Style::default().fg(Color::Green)),
             lane_cell("done", Style::default().fg(Color::Green)),
@@ -157,7 +153,7 @@ fn stabilization_signal_lines(model: &StabilizationPanelModel) -> Vec<Line<'stat
 }
 
 fn lane_cell(value: &str, style: Style) -> Span<'static> {
-    Span::styled(format!("{:<12}", truncate(value, 11)), style)
+    Span::styled(format!("{:<16}", truncate(value, 15)), style)
 }
 
 fn cached_pr_blocker(
