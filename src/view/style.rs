@@ -47,12 +47,11 @@ pub(super) fn selected_style(focused: bool) -> Style {
 pub(super) fn selected_sidebar_row_style(focused: bool) -> Style {
     if focused {
         Style::default()
-            .underline_color(highlight_color())
-            .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            .fg(Color::White)
+            .bg(Color::Rgb(0, 96, 96))
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default()
-            .underline_color(Color::DarkGray)
-            .add_modifier(Modifier::UNDERLINED)
+        Style::default().bg(Color::DarkGray)
     }
 }
 

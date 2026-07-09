@@ -89,7 +89,7 @@ pub(super) fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &crate::vie
                     Span::styled(format!("  {}", repo.health), health_style(&repo.health)),
                 ]);
                 let focused = model.focus == PanelFocus::Repos && !model.main_focused;
-                ListItem::new(line).style(if repo.selected {
+                ListItem::new(line).style(if repo.selected && focused {
                     selected_sidebar_row_style(focused)
                 } else {
                     Style::default()
@@ -108,7 +108,7 @@ pub(super) fn render_repos(frame: &mut Frame<'_>, area: Rect, model: &crate::vie
     let selected_row = model
         .repos
         .iter()
-        .position(|repo| repo.selected)
+        .position(|repo| repo.selected && focused)
         .map(|row| row as u16);
     frame.render_widget(List::new(rows).block(panel_block(title, focused)), area);
     if let Some(row) = selected_row {
@@ -131,10 +131,15 @@ pub(super) fn render_worktrees(
             muted_style(),
         )))]
     } else {
-        let configured_column_widths = configured_worktree_column_widths(
-            area.width.saturating_sub(2) as usize,
-            &model.config.worktree_columns,
-        );
+        let repo_mode = model.worktree_list_mode == WorktreeListMode::Repo;
+        let configured_column_widths = if repo_mode {
+            configured_worktree_column_widths(
+                area.width.saturating_sub(2) as usize,
+                &model.config.worktree_columns,
+            )
+        } else {
+            Vec::new()
+        };
         let repo_width = model
             .worktrees
             .iter()
@@ -142,34 +147,18 @@ pub(super) fn render_worktrees(
             .max()
             .unwrap_or(4)
             .clamp(4, 10);
-        let mut rows = vec![ListItem::new(Line::from(
-            vec![
-                Span::styled(format!("{:<repo_width$} ", "repo"), muted_style()),
-                Span::styled("V ", muted_style()),
-                Span::styled(format!("{:<12} ", "branch"), muted_style()),
-                Span::styled("K ", muted_style()),
-                Span::styled("A ", muted_style()),
-                Span::styled("P ", muted_style()),
-                Span::styled("G ", muted_style()),
-                Span::styled("C ", muted_style()),
-                Span::styled(format!("{:<5} ", "@"), muted_style()),
-                Span::styled("!", muted_style()),
-            ]
-            .into_iter()
-            .chain(configured_column_widths.iter().map(|(key, width)| {
-                Span::styled(
-                    format!("  {:<width$}", truncate_column(key, *width)),
-                    muted_style(),
-                )
-            }))
-            .collect::<Vec<_>>(),
-        ))];
+        let mut rows = vec![worktree_header_row(
+            repo_mode,
+            repo_width,
+            &configured_column_widths,
+        )];
         rows.extend(model.worktrees.iter().map(|worktree| {
             let (pr_label, pr_style) = worktree_pr_column(worktree, model.config.icon_style);
             let (git_label, git_style) = worktree_git_column(worktree, model.config.icon_style);
             let (ci_label, ci_style) = worktree_ci_column(worktree, model.config.icon_style);
             let (comments_label, comments_style) = worktree_comments_column(worktree);
             let (error_label, error_style) = worktree_error_column(worktree);
+            let (activity_label, activity_style) = worktree_activity_column(worktree);
             let (agent_label, agent_style) =
                 if matches!(worktree.kind, crate::view::WorktreeKind::DefaultBranch) {
                     (" ", muted_style())
@@ -179,56 +168,82 @@ pub(super) fn render_worktrees(
                         agent_style(worktree.agent_state),
                     )
                 };
-            let mut spans = vec![
-                Span::styled(
-                    format!(
-                        "{:<repo_width$} ",
-                        truncate_column(&worktree.repo_label, repo_width)
+            let mut spans = if repo_mode {
+                let mut spans = vec![
+                    Span::styled(
+                        format!(
+                            "{:<repo_width$} ",
+                            truncate_column(&worktree.repo_label, repo_width)
+                        ),
+                        muted_style(),
                     ),
-                    muted_style(),
-                ),
-                Span::styled(
-                    format!("{} ", visibility_marker(worktree.visibility)),
-                    visibility_style(worktree.visibility),
-                ),
-                Span::raw(format!("{:<12} ", truncate_column(&worktree.branch, 12))),
-                Span::styled(
-                    format!("{} ", classification_marker(worktree.classification)),
-                    classification_style(worktree.classification),
-                ),
-                Span::styled(format!("{agent_label} "), agent_style),
-                Span::styled(format!("{pr_label} "), pr_style),
-                Span::styled(format!("{git_label} "), git_style),
-                Span::styled(format!("{ci_label} "), ci_style),
-                Span::styled(format!("{comments_label:<5} "), comments_style),
-                Span::styled(error_label, error_style),
-            ];
-            spans.extend(configured_column_widths.iter().map(|(key, width)| {
-                let value = worktree
-                    .wt_columns
-                    .get(*key)
-                    .filter(|value| !value.is_empty())
-                    .map(String::as_str)
-                    .unwrap_or("·");
-                Span::styled(
-                    format!("  {:<width$}", truncate_column(value, *width)),
-                    muted_style(),
-                )
-            }));
-            if worktree.pr.summary.is_none() && !worktree.prompt_summary.is_empty() {
+                    Span::styled(
+                        format!("{} ", visibility_marker(worktree.visibility)),
+                        visibility_style(worktree.visibility),
+                    ),
+                    Span::raw(format!("{:<12} ", truncate_column(&worktree.branch, 12))),
+                    Span::styled(
+                        format!("{} ", classification_marker(worktree.classification)),
+                        classification_style(worktree.classification),
+                    ),
+                    Span::styled(format!("{agent_label} "), agent_style),
+                    Span::styled(format!("{pr_label} "), pr_style),
+                    Span::styled(format!("{git_label} "), git_style),
+                    Span::styled(format!("{ci_label} "), ci_style),
+                    Span::styled(format!("{comments_label:<5} "), comments_style),
+                    Span::styled(error_label, error_style),
+                ];
+                spans.extend(configured_column_widths.iter().map(|(key, width)| {
+                    let value = worktree
+                        .wt_columns
+                        .get(*key)
+                        .filter(|value| !value.is_empty())
+                        .map(String::as_str)
+                        .unwrap_or("·");
+                    Span::styled(
+                        format!("  {:<width$}", truncate_column(value, *width)),
+                        muted_style(),
+                    )
+                }));
+                spans
+            } else {
+                vec![
+                    Span::styled(
+                        format!(
+                            "{:<repo_width$} ",
+                            truncate_column(&worktree.repo_label, repo_width)
+                        ),
+                        muted_style(),
+                    ),
+                    Span::styled(
+                        format!("{} ", visibility_marker(worktree.visibility)),
+                        visibility_style(worktree.visibility),
+                    ),
+                    Span::raw(format!(
+                        "{:<16} ",
+                        truncate_column(&branch_wt_label(worktree), 16)
+                    )),
+                    Span::styled(format!("{pr_label} "), pr_style),
+                    Span::styled(format!("{ci_label} "), ci_style),
+                    Span::styled(format!("{agent_label:<5} "), agent_style),
+                    Span::styled(format!("{activity_label:<9} "), activity_style),
+                    Span::styled(worktree.updated_label.clone(), muted_style()),
+                ]
+            };
+            if repo_mode && worktree.pr.summary.is_none() && !worktree.prompt_summary.is_empty() {
                 spans.push(Span::styled(
                     format!("  {}", worktree.prompt_summary),
                     muted_style(),
                 ));
             }
-            if let Some(status) = worktree.auto_status {
+            if repo_mode && let Some(status) = worktree.auto_status {
                 spans.push(Span::styled(
                     format!("  auto:{}", auto_status_label(status)),
                     auto_style(status),
                 ));
             }
             let focused = model.focus == PanelFocus::Worktrees && !model.main_focused;
-            ListItem::new(Line::from(spans)).style(if worktree.selected {
+            ListItem::new(Line::from(spans)).style(if worktree.selected && focused {
                 selected_sidebar_row_style(focused)
             } else {
                 Style::default()
@@ -238,6 +253,10 @@ pub(super) fn render_worktrees(
     };
     let focused = model.focus == PanelFocus::Worktrees && !model.main_focused;
     let mut title = panel_title("3", "Worktrees", focused);
+    title.push_span(Span::styled(
+        format!(" {}", model.worktree_list_mode.label()),
+        muted_style(),
+    ));
     if !model.worktree_filter.is_empty() {
         title.push_span(Span::styled(
             format!(" /{}", model.worktree_filter),
@@ -247,12 +266,53 @@ pub(super) fn render_worktrees(
     let selected_row = model
         .worktrees
         .iter()
-        .position(|worktree| worktree.selected)
+        .position(|worktree| worktree.selected && focused)
         .map(|row| row as u16 + 1);
     frame.render_widget(List::new(rows).block(panel_block(title, focused)), area);
     if let Some(row) = selected_row {
         render_selected_row_outline(frame, area, row, focused);
     }
+}
+
+pub(super) fn worktree_header_row(
+    repo_mode: bool,
+    repo_width: usize,
+    configured_column_widths: &[(&str, usize)],
+) -> ListItem<'static> {
+    if !repo_mode {
+        return ListItem::new(Line::from(vec![
+            Span::styled(format!("{:<repo_width$} ", "repo"), muted_style()),
+            Span::styled("V ", muted_style()),
+            Span::styled(format!("{:<16} ", "branch/wt"), muted_style()),
+            Span::styled("PR ", muted_style()),
+            Span::styled("CI ", muted_style()),
+            Span::styled(format!("{:<5} ", "agent"), muted_style()),
+            Span::styled(format!("{:<9} ", "auto/plan"), muted_style()),
+            Span::styled("updated", muted_style()),
+        ]));
+    }
+    ListItem::new(Line::from(
+        vec![
+            Span::styled(format!("{:<repo_width$} ", "repo"), muted_style()),
+            Span::styled("V ", muted_style()),
+            Span::styled(format!("{:<12} ", "branch"), muted_style()),
+            Span::styled("K ", muted_style()),
+            Span::styled("A ", muted_style()),
+            Span::styled("P ", muted_style()),
+            Span::styled("G ", muted_style()),
+            Span::styled("C ", muted_style()),
+            Span::styled(format!("{:<5} ", "@"), muted_style()),
+            Span::styled("!", muted_style()),
+        ]
+        .into_iter()
+        .chain(configured_column_widths.iter().map(|(key, width)| {
+            Span::styled(
+                format!("  {:<width$}", truncate_column(key, *width)),
+                muted_style(),
+            )
+        }))
+        .collect::<Vec<_>>(),
+    ))
 }
 
 pub(super) fn render_selected_row_outline(
@@ -340,6 +400,17 @@ pub(super) fn truncate_column(value: &str, width: usize) -> String {
         out.push('~');
     }
     out
+}
+
+pub(super) fn branch_wt_label(worktree: &crate::view::WorktreeRow) -> String {
+    let worktree_name = std::path::Path::new(&worktree.worktree_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty());
+    match worktree_name {
+        Some(name) if name != worktree.branch => format!("{}/{}", worktree.branch, name),
+        _ => worktree.branch.clone(),
+    }
 }
 
 pub(super) fn worktree_pr_column(
@@ -461,4 +532,20 @@ pub(super) fn worktree_error_column(worktree: &crate::view::WorktreeRow) -> (&'s
     } else {
         ("·", muted_style())
     }
+}
+
+pub(super) fn worktree_activity_column(worktree: &crate::view::WorktreeRow) -> (String, Style) {
+    if let Some(status) = worktree.auto_status {
+        return (
+            format!("a:{}", auto_status_label(status)),
+            auto_style(status),
+        );
+    }
+    if let Some(status) = worktree.plan_status {
+        return (
+            format!("p:{}", plan_run_status_label(status)),
+            plan_run_status_style(status),
+        );
+    }
+    ("-".to_string(), muted_style())
 }

@@ -36,16 +36,10 @@ pub(super) fn render_footer(
             "j/k select  Enter tmux  c create  U unarchive  C columns  R manage  / search  q quit"
         }
         PanelFocus::Worktrees => {
-            "j/k select  0 main  Enter tmux/phase  +/- visibility  D archive  X delete  / search  q quit"
+            "j/k select  3 toggle repo/all  0 main  Enter tmux/phase  +/- visibility  / search  q quit"
         }
     };
-    let mut spans = vec![
-        Span::styled(
-            format!(" repo {} ", model.selected_repo_root),
-            muted_style(),
-        ),
-        Span::raw(actions.to_string()),
-    ];
+    let mut spans = vec![Span::raw(actions.to_string())];
     if let Some(message) = model.status_message {
         spans.push(Span::styled(format!(" | {message}"), attention_style()));
     }

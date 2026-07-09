@@ -204,7 +204,7 @@ pub fn debug_help_text() -> &'static str {
 }
 
 pub fn db_help_text() -> &'static str {
-    "Usage:\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n\nDB commands:\n  db                  open sqlite3 on the repo Prism database\n  db path             print the repo Prism database path\n  db <read-only-sql>  run a read-only SQL query against persisted repo state"
+    "Usage:\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n\nDB commands:\n  db                  open sqlite3 on the repo Prism database\n  db path             print the repo Prism database path\n  db <read-only-sql>  run a read-only SQL query against persisted repo state\n\nWhen --repo is omitted outside a Git repo, db uses the first configured Prism repository."
 }
 
 #[cfg(test)]
