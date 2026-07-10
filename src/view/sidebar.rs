@@ -146,7 +146,7 @@ fn push_repo_health_cell(
     count: &str,
 ) {
     const SYMBOL_WIDTH: usize = 2;
-    const COUNT_WIDTH: usize = 1;
+    const COUNT_WIDTH: usize = 2;
     let cell_width = SYMBOL_WIDTH + COUNT_WIDTH + 1;
     if count == "0" {
         spans.push(Span::raw(" ".repeat(cell_width)));
@@ -160,6 +160,10 @@ fn push_repo_health_cell(
         spans.push(Span::raw(" ".repeat(SYMBOL_WIDTH - symbol_width)));
     }
     spans.push(Span::styled(count.to_string(), style));
+    let count_width = Line::from(count).width();
+    if count_width < COUNT_WIDTH {
+        spans.push(Span::raw(" ".repeat(COUNT_WIDTH - count_width)));
+    }
     spans.push(Span::raw(" "));
 }
 
@@ -338,7 +342,7 @@ fn worktree_base_header_spans() -> Vec<Span<'static>> {
         Span::styled("P ", muted_style()),
         Span::styled("G ", muted_style()),
         Span::styled("C ", muted_style()),
-        Span::styled(format!("{:<5} ", "@"), Style::default()),
+        Span::styled(format!("{:<5} ", "@"), muted_style()),
         Span::styled("!", muted_style()),
     ]
 }

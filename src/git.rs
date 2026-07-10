@@ -187,7 +187,7 @@ pub(crate) fn fetch_pull_request_branch(
     branch: &str,
 ) -> Result<(), String> {
     if branch.trim().is_empty() || branch == "(detached)" {
-        return Err("cannot fetch pull request into an empty branch name".to_string());
+        return Err("cannot fetch pull request into an empty or detached branch name".to_string());
     }
     crate::process::run_status(
         Command::new(config.tool("git"))

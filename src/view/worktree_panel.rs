@@ -3,6 +3,8 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StabilizationPanelModel {
     pub icon_style: IconStyle,
+    pub blocker: String,
+    pub next: String,
     pub guard: Option<String>,
     pub ci: String,
     pub review: String,
@@ -66,10 +68,16 @@ pub(crate) fn stabilization_panel_model(
         })
         .or_else(|| cached_pr_blocker(model.config, session));
     let blocker = blocker?;
+    let next = run
+        .and_then(|run| run.stabilization_next_work.as_ref())
+        .cloned()
+        .unwrap_or_else(|| cached_next_work(&blocker));
     let pending_push = run.and_then(|run| run.pending_push.as_ref());
 
     Some(StabilizationPanelModel {
         icon_style: model.config.icon_style,
+        blocker: blocker_label(&blocker),
+        next: work_label(&next),
         guard: pending_push.map(guard_label),
         ci: ci_gate_label(session, &blocker),
         review: review_gate_label(model.config, session),
@@ -82,7 +90,12 @@ pub(crate) fn stabilization_panel_model(
 pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<Line<'static>> {
     let mut lines = vec![
         heading_line("PR Stabilization"),
-        stabilization_gate_header(),
+        stabilization_value_line(
+            "state",
+            &model.blocker,
+            stabilization_state_style(&model.blocker),
+        ),
+        stabilization_value_line("next", &model.next, attention_style()),
     ];
     lines.push(stabilization_gate_line("ci", &model.ci, model.icon_style));
     lines.push(stabilization_gate_line(
@@ -113,11 +126,10 @@ pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<
     lines
 }
 
-fn stabilization_gate_header() -> Line<'static> {
+fn stabilization_value_line(label: &'static str, value: &str, style: Style) -> Line<'static> {
     Line::from(vec![
-        Span::styled(format!("{:<16}", "gate"), muted_style()),
-        Span::styled("  ", muted_style()),
-        Span::styled(format!("{:<30}", "status"), muted_style()),
+        Span::styled(format!("{:<16}", label), muted_style()),
+        Span::styled(format!("{:<30}", truncate(value, 30)), style),
     ])
 }
 
@@ -194,6 +206,46 @@ fn cached_pr_blocker(
     } else {
         Some(StabilizationBlocker::ReadyForManualMerge)
     }
+}
+
+fn cached_next_work(blocker: &StabilizationBlocker) -> StabilizationWorkKind {
+    match blocker {
+        StabilizationBlocker::PendingPush => StabilizationWorkKind::PushPendingRepair,
+        StabilizationBlocker::ReviewFeedbackFound => StabilizationWorkKind::FixReview,
+        StabilizationBlocker::CiFailed | StabilizationBlocker::CiMissingRequiredChecks => {
+            StabilizationWorkKind::FixCi
+        }
+        StabilizationBlocker::CiPending => StabilizationWorkKind::WaitForCi,
+        StabilizationBlocker::ReviewApprovalMissing => StabilizationWorkKind::WaitForReview,
+        StabilizationBlocker::ReadyForManualMerge => StabilizationWorkKind::MarkReadyForManualMerge,
+        StabilizationBlocker::ReadyToAutoMerge => StabilizationWorkKind::Merge,
+        StabilizationBlocker::Merged => StabilizationWorkKind::Done,
+        StabilizationBlocker::NeedsPullRequest => StabilizationWorkKind::PushInitialAndOpenPr,
+        StabilizationBlocker::NeedsImplementation => StabilizationWorkKind::RunImplementation,
+        _ => StabilizationWorkKind::Escalate,
+    }
+}
+
+fn blocker_label(blocker: &StabilizationBlocker) -> String {
+    pascal_label(blocker.as_str())
+}
+
+fn work_label(work: &StabilizationWorkKind) -> String {
+    pascal_label(work.as_str())
+}
+
+fn pascal_label(value: &str) -> String {
+    value
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_ascii_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<String>()
 }
 
 fn guard_label(guard: &PendingPushGuard) -> String {
@@ -337,6 +389,15 @@ fn has_actionable_review_feedback(session: &Session) -> bool {
                 .iter()
                 .any(|comment| !comment.resolved && !comment.body.trim().is_empty())
     })
+}
+
+fn stabilization_state_style(label: &str) -> Style {
+    match label {
+        "ReadyForManualMerge" | "ReadyToAutoMerge" | "Merged" => Style::default().fg(Color::Green),
+        "CiFailed" | "MergeBlocked" | "PolicyBlocked" | "Escalate" => error_style(),
+        "PendingPush" | "PolicyUnknown" | "ReviewFeedbackFound" => attention_style(),
+        _ => Style::default(),
+    }
 }
 
 fn gate_style(label: &str) -> Style {

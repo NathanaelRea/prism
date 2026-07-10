@@ -291,9 +291,16 @@ fn renders_worktree_sidebar_metadata() {
     let sessions = vec![session];
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     let buffer = render_to_string(&model, 160, 30);
+    let style_buffer = render_to_buffer(&model, 160, 30);
 
     assert!(buffer.contains("branch"));
     assert!(buffer.contains("A P G C @"));
+    let header_y = find_line(&style_buffer, "A P G C @");
+    let at_x = line_column(&style_buffer, header_y, "@");
+    assert_eq!(
+        style_buffer[(at_x as u16, header_y)].style().fg,
+        muted_style().fg
+    );
     assert!(buffer.contains("⇄"));
     assert!(buffer.contains("✗"));
     assert!(buffer.contains("✕"));
@@ -416,14 +423,14 @@ fn nerd_font_status_counts_have_spacing() {
 
 #[test]
 fn nerd_font_repo_health_counts_have_spacing() {
-    let spans = repo_health_spans("2 0 1", IconStyle::NerdFont);
+    let spans = repo_health_spans("2 0 12", IconStyle::NerdFont);
     let text = spans
         .iter()
         .map(|span| span.content.as_ref())
         .collect::<String>();
 
-    assert!(text.contains(" 2"), "got {text:?}");
-    assert!(text.contains(" 1"), "got {text:?}");
+    assert!(text.contains(" 2 "), "got {text:?}");
+    assert!(text.contains(" 12"), "got {text:?}");
     assert!(!text.contains("2"), "got {text:?}");
 }
 
@@ -820,8 +827,12 @@ fn renders_stabilization_pending_push_in_worktree_main_panel() {
     assert!(buffer.contains("merge conflicts"));
     assert!(buffer.contains("pending push"));
     assert!(buffer.contains("guard"));
+    assert!(buffer.contains("state"));
+    assert!(buffer.contains("PendingPush"));
+    assert!(buffer.contains("next"));
+    assert!(buffer.contains("PushPendingRepair"));
     assert!(!buffer.contains("state PendingPush"));
-    assert!(!buffer.contains("next PushPendingRepair"));
+    assert!(!buffer.contains("gate"));
 }
 
 #[test]
@@ -841,7 +852,10 @@ fn renders_stabilization_ci_failed_in_worktree_main_panel() {
 
     assert!(buffer.contains("ci"));
     assert!(buffer.contains("failed"));
-    assert!(!buffer.contains("state CiFailed"));
+    assert!(buffer.contains("state"));
+    assert!(buffer.contains("CiFailed"));
+    assert!(buffer.contains("next"));
+    assert!(buffer.contains("FixCi"));
 }
 
 #[test]
@@ -864,7 +878,10 @@ fn renders_stabilization_merge_blocked_in_worktree_main_panel() {
 
     assert!(buffer.contains("merge conflicts"));
     assert!(buffer.contains("blocked"));
-    assert!(!buffer.contains("state MergeBlocked"));
+    assert!(buffer.contains("state"));
+    assert!(buffer.contains("MergeBlocked"));
+    assert!(buffer.contains("next"));
+    assert!(buffer.contains("Escalate"));
 }
 
 #[test]
@@ -886,7 +903,10 @@ fn renders_stabilization_policy_unknown_in_worktree_main_panel() {
 
     assert!(buffer.contains("policy"));
     assert!(buffer.contains("unknown"));
-    assert!(!buffer.contains("state PolicyUnknown"));
+    assert!(buffer.contains("state"));
+    assert!(buffer.contains("PolicyUnknown"));
+    assert!(buffer.contains("next"));
+    assert!(buffer.contains("Escalate"));
 }
 
 #[test]
@@ -914,7 +934,10 @@ fn renders_stabilization_ready_for_manual_merge_in_worktree_main_panel() {
     assert!(buffer.contains("ci"));
     assert!(buffer.contains("code review"));
     assert!(buffer.contains("required"));
-    assert!(!buffer.contains("state ReadyForManualMerge"));
+    assert!(buffer.contains("state"));
+    assert!(buffer.contains("ReadyForManualMerge"));
+    assert!(buffer.contains("next"));
+    assert!(buffer.contains("MarkReadyForManualMerge"));
 }
 
 fn render_to_string(model: &FrameModel<'_>, cols: u16, rows: u16) -> String {
