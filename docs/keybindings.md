@@ -11,7 +11,7 @@ Prism uses a lazygit-style panel model.
 - `j` / `k` or up/down moves within the focused row panel.
 - `g g` jumps to the top of the focused list.
 - `G` jumps to the bottom of the focused list.
-- `Enter` and `Space Space` share the same go-deeper behavior: Status operates the active dashboard or focuses Repos, Repos focuses Worktrees for the selected repository, and Worktrees opens the selected agent session when valid. From a focused Worktrees plan dashboard, `Enter` switches the worktree OpenCode runtime to the selected phase session and opens tmux.
+- `Enter` and `Space Space` share the same go-deeper behavior from Repos and Worktrees: Repos opens the selected repository's default tmux session, and Worktrees opens the selected agent session when valid. Status has no `Enter` action. From a focused Worktrees plan dashboard, `Enter` switches the worktree OpenCode runtime to the selected phase session and opens tmux.
 - Default branch worktrees are not agent targets; `Enter` and `Space Space` show the same blocked message there.
 - `Space Enter` opens tmux window 3: terminal.
 - `Ctrl-/` also opens tmux window 3 where the terminal reports that key combination distinctly; use `Space Enter` as the reliable alternative.
@@ -35,7 +35,8 @@ Prism uses a lazygit-style panel model.
 - `x` also aborts the selected Plan phase from the active Plan dashboard, or accepts `all` when prompted to abort all running phases.
 - `e` edits the selected Prism repository config and reloads after save.
 - `E` edits the Prism user config and reloads after save.
-- `C` opens the in-app worktree column selector for the selected repository. Use `Space` to enable/disable a column, `J`/`K` to move an enabled column down/up, and `Enter` to save.
+- `C` opens a picker of remote pull requests for the selected repository and creates or selects a local `pr/<number>` worktree for the chosen PR.
+- `W` opens the in-app worktree column selector for the selected repository. Use `Space` to enable/disable a column, `J`/`K` to move an enabled column down/up, and `Enter` to save.
 - `/` filters the focused Repos or Worktrees panel.
 - `?` opens the in-app keybinding dialog.
 - `D` archives the selected non-default worktree/session, hiding it from normal navigation while leaving files and branch intact.

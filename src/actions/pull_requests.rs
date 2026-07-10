@@ -32,6 +32,24 @@ pub(super) fn pr_target_repo_for_choice(
     }
 }
 
+pub(super) fn remote_pr_choice_keys() -> Vec<String> {
+    ('1'..='9')
+        .chain('a'..='z')
+        .map(|key| key.to_string())
+        .collect()
+}
+
+pub(super) fn remote_pr_worktree_branch(number: u64) -> String {
+    format!("pr/{number}")
+}
+
+fn remote_pr_choice_label(summary: &crate::github::PrSummary) -> String {
+    format!(
+        "#{}  {}  {} -> {}",
+        summary.number, summary.title, summary.head_ref, summary.base_ref
+    )
+}
+
 pub(super) fn open_url_in_browser(url: &str) -> Result<(), String> {
     run_browser_opener(&browser_opener_candidates(), url).map(|_| ())
 }
@@ -89,6 +107,153 @@ pub(super) fn run_browser_opener(
 }
 
 impl Tui {
+    pub(crate) fn open_remote_pr_worktree(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let context = self
+            .selected_repo_context()
+            .ok_or_else(|| "no selected repository".to_string())?;
+        self.show_loading_dialog(raw, "Remote Pull Requests", "Loading open pull requests")?;
+        let mut prs = fetch_pr_summary_index(&context.repo.root, &context.config)?;
+        prs.retain(|summary| !summary.merged && summary.state.eq_ignore_ascii_case("OPEN"));
+        if prs.is_empty() {
+            self.show_message("selected repository has no open pull requests")?;
+            return Ok(());
+        }
+
+        let keys = remote_pr_choice_keys();
+        let choices = prs
+            .iter()
+            .take(keys.len())
+            .zip(keys.iter())
+            .map(|(summary, key)| crate::view::KeyChoice {
+                key: key.clone(),
+                label: remote_pr_choice_label(summary),
+            })
+            .collect::<Vec<_>>();
+        let Some(answer) = self.prompt_choice_dialog(
+            raw,
+            crate::view::ChoiceList {
+                title: format!(
+                    "Open Pull Request Worktree: {}",
+                    context.repo.root.display()
+                ),
+                choices,
+            },
+        )?
+        else {
+            return Ok(());
+        };
+        let Some(index) = keys.iter().position(|key| *key == answer) else {
+            return Ok(());
+        };
+        let Some(summary) = prs.get(index).cloned() else {
+            return Ok(());
+        };
+
+        if self.select_existing_pr_worktree(context.repo_index, &summary)? {
+            return Ok(());
+        }
+
+        let branch = remote_pr_worktree_branch(summary.number);
+        self.show_loading_dialog(
+            raw,
+            "Remote Pull Requests",
+            &format!("Fetching PR #{}", summary.number),
+        )?;
+        fetch_pull_request_branch(&context.repo.root, &context.config, summary.number, &branch)?;
+        self.show_loading_dialog(
+            raw,
+            "Remote Pull Requests",
+            &format!("Opening worktree for PR #{}", summary.number),
+        )?;
+        if let Err(error) = checkout_worktree_session(&context.repo, &context.config, &branch) {
+            if !is_worktrunk_approval_failure(&error)
+                || !self.offer_worktrunk_approval(raw, &context.repo, &context.config)?
+            {
+                return Err(error);
+            }
+            self.show_loading_dialog(
+                raw,
+                "Remote Pull Requests",
+                &format!("Opening worktree for PR #{}", summary.number),
+            )?;
+            checkout_worktree_session(&context.repo, &context.config, &branch)?;
+        }
+
+        self.refresh_sessions()?;
+        self.start_tmux_agent_warmup();
+        self.start_wt_column_poll();
+        self.select_pr_worktree_by_branch(context.repo_index, &branch, Some(summary.clone()));
+        self.focus_worktrees();
+        self.show_message(&format!("opened worktree for PR #{}", summary.number))?;
+        Ok(())
+    }
+
+    fn select_existing_pr_worktree(
+        &mut self,
+        repo_index: usize,
+        summary: &crate::github::PrSummary,
+    ) -> Result<bool, String> {
+        if let Some(index) = self.sessions.iter().position(|session| {
+            !session.hidden
+                && session.repo_index == repo_index
+                && session
+                    .pr
+                    .summary
+                    .as_ref()
+                    .is_some_and(|cached| cached.number == summary.number)
+        }) {
+            self.select_worktree(index);
+            self.focus_worktrees();
+            self.show_message(&format!(
+                "selected existing worktree for PR #{}",
+                summary.number
+            ))?;
+            return Ok(true);
+        }
+        let branch = remote_pr_worktree_branch(summary.number);
+        if let Some(index) = self.sessions.iter().position(|session| {
+            !session.hidden && session.repo_index == repo_index && session.branch == branch
+        }) {
+            if let Some(session) = self.sessions.get_mut(index) {
+                session.pr.summary = Some(summary.clone());
+            }
+            self.select_worktree(index);
+            self.focus_worktrees();
+            self.show_message(&format!(
+                "selected existing worktree for PR #{}",
+                summary.number
+            ))?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn select_pr_worktree_by_branch(
+        &mut self,
+        repo_index: usize,
+        branch: &str,
+        summary: Option<crate::github::PrSummary>,
+    ) {
+        if let Some(index) = self
+            .sessions
+            .iter()
+            .position(|session| session.repo_index == repo_index && session.branch == branch)
+        {
+            if let Some(summary) = summary
+                && let Some(session) = self.sessions.get_mut(index)
+            {
+                session.pr.summary = Some(summary);
+            }
+            if !self.visible_session_indices().contains(&index) {
+                self.worktree_filter.clear();
+            }
+            self.select_worktree(index);
+        }
+    }
+
     pub(crate) fn start_review_fix(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
@@ -247,11 +412,9 @@ impl Tui {
         self.selected_auto_run = Some(persisted.run.id.clone());
         #[cfg(test)]
         if self.prompt_submissions.is_some() {
-            self.focus_status();
             return Ok(());
         }
         self.spawn_auto_run_executor(repo.clone(), config.clone(), persisted);
-        self.focus_status();
         Ok(())
     }
 

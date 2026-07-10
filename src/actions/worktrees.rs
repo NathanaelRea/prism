@@ -341,6 +341,20 @@ impl Tui {
             self.show_message("delete already in progress")?;
             return Ok(());
         }
+        let selected_path = self
+            .sessions
+            .get(self.selected)
+            .map(|session| session.path.clone());
+        if let Some(session) = self
+            .sessions
+            .iter_mut()
+            .find(|session| session.path == path)
+        {
+            session.hidden = true;
+        }
+        if selected_path.as_ref() == Some(&path) {
+            self.ensure_navigation_valid();
+        }
         let tx = self.delete_session_tx.clone();
         let branch_for_job = branch.clone();
         thread::spawn(move || {
@@ -377,6 +391,14 @@ impl Tui {
                     }
                 }
                 Err(error) => {
+                    if let Some(session) = self
+                        .sessions
+                        .iter_mut()
+                        .find(|session| session.path == result.key.path)
+                    {
+                        session.hidden = false;
+                    }
+                    self.ensure_navigation_valid();
                     let _ = self.show_message(&format!("delete failed: {error}"));
                 }
             }

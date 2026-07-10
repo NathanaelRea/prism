@@ -22,7 +22,10 @@ use crate::auto_flow::{
 };
 use crate::ci::build_ci_failure_prompt;
 use crate::config::Config;
-use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
+use crate::git::{
+    branch_behind, fetch_pull_request_branch, git_status_label, has_upstream, pull_branch,
+    selected_dirty,
+};
 use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, PrCacheRepository, apply_pr_details_poll_result,
     fetch_pr_summary_index, github_remote_configured, github_remote_repo, pr_cache_comment_count,
@@ -32,10 +35,10 @@ use crate::github::{
 };
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::lifecycle::{
-    WorktrunkApprovalStatus, check_worktrunk_approval_status, create_pull_request,
-    create_worktree_session, delete_worktree_session, is_worktrunk_approval_failure,
-    merge_pull_request, push_branch, refresh_branch_pr_cache, run_pre_pr_checks,
-    run_pre_push_checks, run_worktrunk_approval_prompt,
+    WorktrunkApprovalStatus, check_worktrunk_approval_status, checkout_worktree_session,
+    create_pull_request, create_worktree_session, delete_worktree_session,
+    is_worktrunk_approval_failure, merge_pull_request, push_branch, refresh_branch_pr_cache,
+    run_pre_pr_checks, run_pre_push_checks, run_worktrunk_approval_prompt,
 };
 use crate::opencode::{self, OpencodeStatus, load_runtime};
 use crate::plan::{PlanExecution, infer_total_phases, open_plan_mode, select_plan_path};
@@ -79,8 +82,8 @@ mod tests;
 use polling::{discover_wt_columns, status_label_with_behind};
 #[cfg(test)]
 use pull_requests::{
-    pr_target_choice_list, pr_target_repo_for_choice, run_browser_opener,
-    should_prompt_pr_target_choice,
+    pr_target_choice_list, pr_target_repo_for_choice, remote_pr_choice_keys,
+    remote_pr_worktree_branch, run_browser_opener, should_prompt_pr_target_choice,
 };
 #[cfg(test)]
 use worktrees::archived_picker_overflow_message;

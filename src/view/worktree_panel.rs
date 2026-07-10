@@ -2,6 +2,7 @@ use super::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StabilizationPanelModel {
+    pub icon_style: IconStyle,
     pub blocker: String,
     pub next: String,
     pub guard: Option<String>,
@@ -10,7 +11,6 @@ pub(crate) struct StabilizationPanelModel {
     pub merge: String,
     pub policy: String,
     pub pending_commit: Option<String>,
-    pub pending_hint: Option<String>,
 }
 
 pub(super) fn worktree_detail_lines(model: &crate::view::FrameModel<'_>) -> Vec<Line<'static>> {
@@ -75,6 +75,7 @@ pub(crate) fn stabilization_panel_model(
     let pending_push = run.and_then(|run| run.pending_push.as_ref());
 
     Some(StabilizationPanelModel {
+        icon_style: model.config.icon_style,
         blocker: blocker_label(&blocker),
         next: work_label(&next),
         guard: pending_push.map(guard_label),
@@ -83,77 +84,100 @@ pub(crate) fn stabilization_panel_model(
         merge: merge_gate_label(session),
         policy: policy_gate_label(&blocker),
         pending_commit: pending_push.map(pending_commit_label),
-        pending_hint: pending_push
-            .map(|_| "inspect the pending commit diff, then press <Space> g P".to_string()),
     })
 }
 
 pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<Line<'static>> {
-    let mut lines = vec![heading_line("PR Stabilization")];
-    lines.extend(stabilization_signal_lines(model));
+    let mut lines = vec![
+        heading_line("PR Stabilization"),
+        stabilization_value_line(
+            "state",
+            &model.blocker,
+            stabilization_state_style(&model.blocker),
+        ),
+        stabilization_value_line("next", &model.next, attention_style()),
+    ];
+    lines.push(stabilization_gate_line("ci", &model.ci, model.icon_style));
+    lines.push(stabilization_gate_line(
+        "code review",
+        &model.review,
+        model.icon_style,
+    ));
+    lines.push(stabilization_gate_line(
+        "merge conflicts",
+        &model.merge,
+        model.icon_style,
+    ));
+    lines.push(stabilization_gate_line(
+        "policy",
+        &model.policy,
+        model.icon_style,
+    ));
+    if let Some(commit) = &model.pending_commit {
+        lines.push(stabilization_gate_line(
+            "pending push",
+            commit,
+            model.icon_style,
+        ));
+    }
+    if let Some(guard) = &model.guard {
+        lines.push(stabilization_gate_line("guard", guard, model.icon_style));
+    }
     lines
 }
 
-fn stabilization_signal_lines(model: &StabilizationPanelModel) -> Vec<Line<'static>> {
-    vec![
-        Line::from(vec![
-            Span::styled("state ", muted_style()),
-            Span::styled(
-                model.blocker.clone(),
-                stabilization_state_style(&model.blocker),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("next ", muted_style()),
-            Span::styled(model.next.clone(), attention_style()),
-        ]),
-        Line::from(vec![
-            lane_cell("Observe", muted_style()),
-            lane_cell("Blockers", muted_style()),
-            lane_cell("Work", muted_style()),
-            lane_cell("Reobserve", muted_style()),
-        ]),
-        Line::from(vec![
-            lane_cell("current", attention_style()),
-            lane_cell(&model.blocker, stabilization_state_style(&model.blocker)),
-            lane_cell(&model.next, attention_style()),
-            lane_cell("pending", muted_style()),
-        ]),
-        Line::from(vec![
-            lane_cell("checks", gate_style(&model.ci)),
-            lane_cell(&model.ci, gate_style(&model.ci)),
-            lane_cell("verify", muted_style()),
-            lane_cell("reobserve", muted_style()),
-        ]),
-        Line::from(vec![
-            lane_cell("review", gate_style(&model.review)),
-            lane_cell(&model.review, gate_style(&model.review)),
-            lane_cell("commit", muted_style()),
-            lane_cell("wait", muted_style()),
-        ]),
-        Line::from(vec![
-            lane_cell("merge", gate_style(&model.merge)),
-            lane_cell(&model.merge, gate_style(&model.merge)),
-            lane_cell("push", muted_style()),
-            lane_cell("refresh", muted_style()),
-        ]),
-        Line::from(vec![
-            lane_cell("policy", gate_style(&model.policy)),
-            lane_cell(&model.policy, gate_style(&model.policy)),
-            lane_cell("guard", muted_style()),
-            lane_cell("refresh", muted_style()),
-        ]),
-        Line::from(vec![
-            lane_cell("fresh", Style::default().fg(Color::Green)),
-            lane_cell("clear", Style::default().fg(Color::Green)),
-            lane_cell("done", Style::default().fg(Color::Green)),
-            lane_cell("Ready", Style::default().fg(Color::Green)),
-        ]),
-    ]
+fn stabilization_value_line(label: &'static str, value: &str, style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{:<16}", label), muted_style()),
+        Span::styled(format!("{:<30}", truncate(value, 30)), style),
+    ])
 }
 
-fn lane_cell(value: &str, style: Style) -> Span<'static> {
-    Span::styled(format!("{:<16}", truncate(value, 15)), style)
+fn stabilization_gate_line(
+    gate: &'static str,
+    status: &str,
+    icon_style: IconStyle,
+) -> Line<'static> {
+    let pending_detail = matches!(gate, "pending push" | "guard");
+    let style = if pending_detail {
+        attention_style()
+    } else {
+        gate_style(status)
+    };
+    let status_icon = if pending_detail {
+        icon(icon_style, "…", "")
+    } else {
+        stabilization_status_icon(status, icon_style)
+    };
+    Line::from(vec![
+        Span::styled(format!("{:<16}", gate), muted_style()),
+        Span::styled(status_icon, style),
+        Span::raw(" "),
+        Span::styled(format!("{:<30}", truncate(status, 30)), style),
+    ])
+}
+
+fn stabilization_status_icon(status: &str, icon_style: IconStyle) -> &'static str {
+    let normalized = status.to_ascii_lowercase();
+    if normalized.contains("fail") || normalized.contains("blocked") {
+        icon(icon_style, "✕", "")
+    } else if normalized.contains("missing") || normalized.contains("feedback") {
+        icon(icon_style, "!", "")
+    } else if normalized.contains("pending") || normalized.contains("running") {
+        icon(icon_style, "…", "")
+    } else if normalized.contains("unknown") {
+        icon(icon_style, "?", "")
+    } else if normalized.contains("disabled") {
+        icon(icon_style, "⊘", "")
+    } else if normalized.contains("pass")
+        || normalized.contains("approved")
+        || normalized.contains("clean")
+        || normalized.contains("satisfied")
+    {
+        icon(icon_style, "✓", "")
+    } else {
+        icon(icon_style, "·", "")
+    }
 }
 
 fn cached_pr_blocker(
@@ -383,7 +407,10 @@ fn gate_style(label: &str) -> Style {
         || normalized.contains("missing")
     {
         error_style()
-    } else if normalized.contains("pending") || normalized.contains("unknown") {
+    } else if normalized.contains("pending")
+        || normalized.contains("unknown")
+        || normalized.contains("feedback")
+    {
         attention_style()
     } else if normalized.contains("pass")
         || normalized.contains("approved")

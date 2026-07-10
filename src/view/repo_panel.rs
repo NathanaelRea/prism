@@ -109,15 +109,10 @@ pub(super) fn repo_github_panel_lines(
     sessions: &[Session],
     session_indices: &[usize],
     selected: Option<usize>,
-    width: usize,
+    _width: usize,
     visible_rows: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = repo_work_list_lines(config, sessions, session_indices, selected, visible_rows);
-    if lines.len() < visible_rows {
-        lines.push(Line::from(""));
-    }
-    let preview = selected.and_then(|index| sessions.get(index));
-    lines.extend(repo_preview_lines(config, preview, width));
     lines.truncate(visible_rows);
     lines
 }
@@ -195,115 +190,6 @@ pub(super) fn repo_work_item_line(
             muted_style(),
         ),
     ])
-}
-
-pub(super) fn repo_preview_lines(
-    config: &crate::config::Config,
-    session: Option<&Session>,
-    _width: usize,
-) -> Vec<Line<'static>> {
-    let Some(session) = session else {
-        return vec![
-            heading_line("Preview"),
-            Line::from(Span::styled("No selected worktree", muted_style())),
-            Line::from(Span::styled("Enter focuses worktrees", attention_style())),
-        ];
-    };
-    let mut lines = vec![heading_line("Preview")];
-    if session.is_default_branch(config) {
-        lines.push(Line::from(Span::styled(
-            "Default branch",
-            selected_text_style(),
-        )));
-        lines.push(labelled_line("branch", session.branch.clone()));
-        lines.push(labelled_line("status", session.status_label.clone()));
-        lines.push(Line::from(Span::styled(
-            "PR tracking disabled",
-            muted_style(),
-        )));
-        return lines;
-    }
-    if let Some(error) = &session.pr.error {
-        lines.push(Line::from(Span::styled(
-            "✕ PR refresh error",
-            error_style(),
-        )));
-        lines.push(Line::from(error.clone()));
-        return lines;
-    }
-    let Some(summary) = &session.pr.summary else {
-        lines.push(Line::from(Span::styled("○ No PR detected", muted_style())));
-        lines.push(labelled_line("branch", session.branch.clone()));
-        lines.push(labelled_line("status", session.status_label.clone()));
-        lines.push(Line::from(Span::styled(
-            "Space g P creates one",
-            attention_style(),
-        )));
-        return lines;
-    };
-    let review = review_decision_for_display(summary, session.pr.details.as_ref());
-    lines.push(Line::from(vec![
-        Span::styled(
-            pr_state_icon(summary, config.icon_style),
-            pr_state_style(summary),
-        ),
-        Span::styled(
-            format!(" PR #{} {}", summary.number, pr_state_label(summary)),
-            pr_state_style(summary),
-        ),
-    ]));
-    lines.push(Line::from(Span::styled(
-        summary.title.clone(),
-        selected_text_style(),
-    )));
-    lines.push(Line::from(vec![
-        Span::styled("review ", muted_style()),
-        Span::styled(review_label(&review).to_string(), review_style(&review)),
-        Span::styled("  ci ", muted_style()),
-        Span::styled(summary.check_status.clone(), ci_style(config, session)),
-    ]));
-    lines.push(Line::from(vec![
-        Span::styled("base ", muted_style()),
-        Span::raw(summary.base_ref.clone()),
-        Span::styled("  head ", muted_style()),
-        Span::raw(summary.head_ref.clone()),
-    ]));
-    if !summary.requested_reviewers.is_empty() {
-        lines.push(labelled_line(
-            "awaiting",
-            summary.requested_reviewers.join(", "),
-        ));
-    }
-    if let Some(details) = &session.pr.details {
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("comments ", muted_style()),
-            Span::raw((details.comments.len() + details.review_comments.len()).to_string()),
-            Span::styled("  reviews ", muted_style()),
-            Span::raw(details.reviews.len().to_string()),
-            Span::styled("  files ", muted_style()),
-            Span::raw(details.files.len().to_string()),
-        ]));
-        lines.extend(pr_comment_lines(details, 3, 0));
-        if !details.failing_checks.is_empty() {
-            lines.push(Line::from(Span::styled("Failing checks", error_style())));
-            for check in details.failing_checks.iter().take(2) {
-                lines.push(Line::from(vec![
-                    Span::styled("✕ ", error_style()),
-                    Span::raw(check.clone()),
-                ]));
-            }
-        }
-        if !details.ci_failures.is_empty() {
-            lines.push(labelled_line(
-                "CI failures cached",
-                details.ci_failures.len().to_string(),
-            ));
-        }
-    } else {
-        lines.push(Line::from(Span::styled("Activity pending", muted_style())));
-    }
-    lines
 }
 
 #[derive(Clone, Copy)]

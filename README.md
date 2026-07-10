@@ -12,7 +12,7 @@ Prism is a terminal board for running agent-backed coding sessions across Git wo
 
 It gives you one place to manage local worktrees in different stages of progress, watch GH PR comments and CI status. It uses tmux as the backbone for persistent OpenCode runs in the background, and enables you to quickly switch between sessions.
 
-The TUI uses Status, Repos, and Worktrees sidebars with a contextual main panel. `Enter` and `Space Space` move deeper through the board: Status operates the active dashboard or focuses Repos, Repos focuses Worktrees, and Worktrees opens the selected non-default branch agent session.
+The TUI uses Status, Repos, and Worktrees sidebars with a contextual main panel. `Enter` and `Space Space` move deeper through the board from Repos and Worktrees: Repos opens the selected repository's default tmux session, and Worktrees opens the selected non-default branch agent session. Status has no `Enter` action.
 
 ## Demo
 
