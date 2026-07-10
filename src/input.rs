@@ -69,7 +69,8 @@ impl KeyInput {
             KeyCode::Char('x') if plain_char(event) => Key::AbortOpencode,
             KeyCode::Char('X') if plain_char(event) => Key::DeletePermanent,
             KeyCode::Char('A') if plain_char(event) => Key::AutoFlow,
-            KeyCode::Char('C') if plain_char(event) => Key::EditWorktreeColumns,
+            KeyCode::Char('C') if plain_char(event) => Key::OpenRemotePrs,
+            KeyCode::Char('W') if plain_char(event) => Key::EditWorktreeColumns,
             KeyCode::Char('R') if plain_char(event) => Key::ManageRepos,
             KeyCode::Char('e') if plain_char(event) => Key::EditConfig,
             KeyCode::Char('E') if plain_char(event) => Key::EditUserConfig,
@@ -173,6 +174,7 @@ pub enum Key {
     VisibilityDown,
     RepoShortcut(char),
     ManageRepos,
+    OpenRemotePrs,
     EditWorktreeColumns,
     CiFix,
     ReviewFix,
@@ -363,6 +365,10 @@ mod tests {
         );
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('C'))),
+            Key::OpenRemotePrs
+        );
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('W'))),
             Key::EditWorktreeColumns
         );
         assert_eq!(map(&mut input, key(KeyCode::Char('e'))), Key::EditConfig);

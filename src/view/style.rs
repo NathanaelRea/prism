@@ -79,7 +79,7 @@ pub(super) fn attention_style() -> Style {
 }
 
 pub(super) fn muted_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default().fg(Color::Gray)
 }
 
 pub(super) fn health_style(health: &str) -> Style {

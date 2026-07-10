@@ -83,7 +83,7 @@ fn renders_selected_sidebar_rows_with_focused_style() {
     let sessions = vec![test_session("feature", AgentState::Running)];
     let model = test_model(&config, &sessions, PanelFocus::Repos, None, None);
     let buffer = render_to_buffer(&model, 120, 30);
-    let row = find_line(&buffer, "1 repo");
+    let (repo_x, row) = sidebar_cell_containing(&buffer, "repo  ok");
 
     assert_cell_style(
         &buffer,
@@ -95,7 +95,7 @@ fn renders_selected_sidebar_rows_with_focused_style() {
     );
     assert_cell_style(
         &buffer,
-        4,
+        repo_x,
         row,
         Style::default()
             .fg(Color::White)
@@ -324,6 +324,25 @@ fn worktree_sidebar_keeps_configured_columns_before_prompt_text() {
 }
 
 #[test]
+fn all_worktree_mode_uses_base_columns_without_configured_columns() {
+    let mut config = test_config();
+    config.worktree_columns = vec!["owner".to_string()];
+    let mut session = test_session("feature", AgentState::Running);
+    session
+        .wt_columns
+        .insert("owner".to_string(), "agent".to_string());
+    let sessions = vec![session];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.worktree_list_mode = WorktreeListMode::Global;
+    let buffer = render_to_string(&model, 160, 30);
+
+    assert!(buffer.contains("repo"));
+    assert!(buffer.contains("A P G C @"));
+    assert!(!buffer.contains("owner"));
+    assert!(!buffer.contains("agent  implement feature"));
+}
+
+#[test]
 fn default_branch_row_hides_git_status_marker_but_keeps_wt_columns() {
     let mut config = test_config();
     config.worktree_columns = vec!["url".to_string()];
@@ -497,6 +516,7 @@ fn main_panel_switches_by_focus() {
 
     assert_region_contains(&status_buffer, 56..120, 0..29, "Documentation");
     assert_region_contains(&repo_buffer, 56..120, 0..29, "view github");
+    assert!(!region_text(&repo_buffer, 56..120, 0..29).contains("Preview"));
     assert_region_contains(&worktree_buffer, 56..120, 0..29, "prompt implement feature");
 }
 
@@ -796,13 +816,12 @@ fn renders_stabilization_pending_push_in_worktree_main_panel() {
     let buffer = render_to_string(&model, 120, 40);
 
     assert!(buffer.contains("PR Stabilization"));
-    assert!(buffer.contains("Observe"));
-    assert!(buffer.contains("Blockers"));
-    assert!(buffer.contains("Work"));
-    assert!(buffer.contains("Reobserve"));
-    assert!(buffer.contains("state PendingPush"));
-    assert!(buffer.contains("next PushPendingRepair"));
-    assert!(buffer.contains("Ready"));
+    assert!(buffer.contains("code review"));
+    assert!(buffer.contains("merge conflicts"));
+    assert!(buffer.contains("pending push"));
+    assert!(buffer.contains("guard"));
+    assert!(!buffer.contains("state PendingPush"));
+    assert!(!buffer.contains("next PushPendingRepair"));
 }
 
 #[test]
@@ -820,9 +839,9 @@ fn renders_stabilization_ci_failed_in_worktree_main_panel() {
 
     let buffer = render_to_string(&model, 120, 40);
 
-    assert!(buffer.contains("state CiFailed"));
-    assert!(buffer.contains("next FixCi"));
+    assert!(buffer.contains("ci"));
     assert!(buffer.contains("failed"));
+    assert!(!buffer.contains("state CiFailed"));
 }
 
 #[test]
@@ -843,10 +862,9 @@ fn renders_stabilization_merge_blocked_in_worktree_main_panel() {
 
     let buffer = render_to_string(&model, 120, 40);
 
-    assert!(buffer.contains("state MergeBlocked"));
-    assert!(buffer.contains("next Escalate"));
+    assert!(buffer.contains("merge conflicts"));
     assert!(buffer.contains("blocked"));
-    assert!(buffer.contains("Ready"));
+    assert!(!buffer.contains("state MergeBlocked"));
 }
 
 #[test]
@@ -866,10 +884,9 @@ fn renders_stabilization_policy_unknown_in_worktree_main_panel() {
 
     let buffer = render_to_string(&model, 120, 40);
 
-    assert!(buffer.contains("state PolicyUnknown"));
-    assert!(buffer.contains("next Escalate"));
+    assert!(buffer.contains("policy"));
     assert!(buffer.contains("unknown"));
-    assert!(buffer.contains("Ready"));
+    assert!(!buffer.contains("state PolicyUnknown"));
 }
 
 #[test]
@@ -894,10 +911,10 @@ fn renders_stabilization_ready_for_manual_merge_in_worktree_main_panel() {
 
     let buffer = render_to_string(&model, 120, 40);
 
-    assert!(buffer.contains("state ReadyForManualMerge"));
-    assert!(buffer.contains("next MarkReadyForManualMerge"));
+    assert!(buffer.contains("ci"));
+    assert!(buffer.contains("code review"));
     assert!(buffer.contains("required"));
-    assert!(buffer.contains("Ready"));
+    assert!(!buffer.contains("state ReadyForManualMerge"));
 }
 
 fn render_to_string(model: &FrameModel<'_>, cols: u16, rows: u16) -> String {

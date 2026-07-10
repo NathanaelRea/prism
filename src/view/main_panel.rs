@@ -53,7 +53,7 @@ pub(super) fn status_dashboard_lines(model: &crate::view::FrameModel<'_>) -> Vec
         Line::from(""),
         heading_line("Navigation"),
         Line::from("1 status  2 repos  3 worktrees"),
-        Line::from("Enter opens terminal ~/; Tab cycles focus"),
+        Line::from("Enter opens selected repo/worktree; Tab cycles focus"),
         Line::from("repos h/l switches views"),
         Line::from("e edits repo config; E edits user config"),
         Line::from(""),

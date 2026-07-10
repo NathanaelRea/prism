@@ -214,7 +214,6 @@ impl WorktreeListMode {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OpenTmuxSessionTarget {
-    HomeTerminal,
     PlanPhaseAgent,
     WorktreeAgent,
     RepoDefaultAgent(usize),
@@ -654,11 +653,6 @@ impl Tui {
                         continue;
                     }
                     match self.open_tmux_session_target() {
-                        OpenTmuxSessionTarget::HomeTerminal => {
-                            if let Err(error) = self.open_home_terminal(&mut runtime) {
-                                self.show_error("home terminal failed", &error)?;
-                            }
-                        }
                         OpenTmuxSessionTarget::RepoDefaultAgent(index) => {
                             self.enter_agent_mode_for_index(&mut runtime, index)?
                         }
@@ -856,6 +850,15 @@ impl Tui {
                         self.show_error("edit repositories failed", &error)?;
                     }
                 }
+                Key::OpenRemotePrs => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.focused_panel != PanelFocus::Repos {
+                        self.show_message("focus repos to open a remote PR worktree")?;
+                    } else if let Err(error) = self.open_remote_pr_worktree(&mut runtime) {
+                        self.show_error("open remote PR worktree failed", &error)?;
+                    }
+                }
                 Key::Delete => {
                     self.clear_leader_hint();
                     pending_g = false;
@@ -1022,19 +1025,20 @@ impl Tui {
             "0            focus main panel for the selected sidebar",
             "Tab / Shift-Tab  move focus between panels",
             "h/l, left/right arrows  repos: switch view; status plan: switch phase",
-            "Enter       status: terminal ~/; repos: open default-branch tmux; worktrees: open agent or selected plan phase; main comments: details",
+            "Enter       repos: open default-branch tmux; worktrees: open agent or selected plan phase; main comments: details",
             "Ctrl-/       open tmux window 3: terminal",
             "p            repos: pull default branch",
             "P            worktrees: start or focus a plan run dashboard",
             "j/k          main comments: move comment selection; status dashboard: move plan output or phase selection",
             "A            worktrees: start/focus Auto Flow; choose prompt, plan file, or draft plan",
             "R            edit repositories/order/keys/remove",
+            "C            repos: open a worktree for a remote pull request",
             "c            repos: create worktree session in selected repo",
             "+ / -        worktrees: raise/lower visibility sort",
             "x            worktrees: abort selected OpenCode session",
             "e            edit selected repository config, then reload",
             "E            edit user config, then reload",
-            "C            repos: edit visible worktree columns in repo config",
+            "W            repos: edit visible worktree columns in repo config",
             "/            search/filter focused panel",
             "?            show keybindings; / filters this dialog",
             "D            archive non-default worktree/session",
@@ -1479,7 +1483,7 @@ impl Tui {
         self.main_focused = false;
     }
 
-    fn focus_worktrees(&mut self) {
+    pub(crate) fn focus_worktrees(&mut self) {
         let already_focused = self.focused_panel == PanelFocus::Worktrees && !self.main_focused;
         if already_focused {
             self.worktree_list_mode = self.worktree_list_mode.toggled();
@@ -1507,7 +1511,7 @@ impl Tui {
 
     fn open_tmux_session_target(&self) -> OpenTmuxSessionTarget {
         match self.focused_panel {
-            PanelFocus::Status => OpenTmuxSessionTarget::HomeTerminal,
+            PanelFocus::Status => OpenTmuxSessionTarget::Blocked("status has no Enter action"),
             PanelFocus::Repos => {
                 if let Some(index) = self.selected_repo_default_session_index() {
                     OpenTmuxSessionTarget::RepoDefaultAgent(index)
@@ -2803,13 +2807,14 @@ impl Tui {
                     ("g", "git actions"),
                     ("p", "plan actions"),
                     ("0", "focus main"),
-                    ("space/enter", "terminal ~/"),
                 ],
             )),
             (Some(LeaderHint::Root), PanelFocus::Repos) => Some(choice_list(
                 "Shortcuts",
                 &[
                     ("g", "git actions"),
+                    ("C", "open remote PR"),
+                    ("W", "worktree columns"),
                     ("0", "focus main"),
                     ("space/enter", "open default tmux"),
                 ],
@@ -3091,25 +3096,25 @@ mod tests {
     }
 
     #[test]
-    fn open_tmux_session_target_opens_home_terminal_from_empty_status() {
+    fn open_tmux_session_target_blocks_status_enter() {
         let mut tui = test_tui();
         tui.focused_panel = PanelFocus::Status;
 
         assert_eq!(
             tui.open_tmux_session_target(),
-            OpenTmuxSessionTarget::HomeTerminal
+            OpenTmuxSessionTarget::Blocked("status has no Enter action")
         );
     }
 
     #[test]
-    fn open_tmux_session_target_opens_home_terminal_from_status_with_auto_run() {
+    fn open_tmux_session_target_blocks_status_enter_with_auto_run() {
         let mut tui = test_tui();
         tui.focused_panel = PanelFocus::Status;
         tui.remember_auto_run(test_auto_run("auto", "/repo-one/feature-one", 20));
 
         assert_eq!(
             tui.open_tmux_session_target(),
-            OpenTmuxSessionTarget::HomeTerminal
+            OpenTmuxSessionTarget::Blocked("status has no Enter action")
         );
     }
 

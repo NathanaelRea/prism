@@ -50,6 +50,31 @@ pub(crate) fn create_worktree_session(
     Ok(())
 }
 
+pub(crate) fn checkout_worktree_session(
+    repo: &Repository,
+    config: &Config,
+    branch: &str,
+) -> Result<(), String> {
+    if hidden_session_exists(repo, branch)? && branch_has_worktree(repo, config, branch)? {
+        clear_hidden_session_marker(repo, branch)?;
+        return Ok(());
+    }
+    let mut command = Command::new(config.tool(&config.worktree_command));
+    command.args(checkout_worktree_args(&repo.root, branch));
+    let command_display = observability::command_display(&command);
+    let output = run_output(&mut command)?;
+    if !output.status.success() {
+        return Err(worktree_command_failure_message(
+            &command_display,
+            &output,
+            repo,
+            config,
+        ));
+    }
+    clear_hidden_session_marker(repo, branch)?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WorktrunkApprovalStatus {
     NotWorktrunk,
@@ -271,6 +296,18 @@ fn create_worktree_args(repo_root: &Path, branch: &str, default_base: Option<&st
     }
     args.push(branch.to_string());
     args
+}
+
+fn checkout_worktree_args(repo_root: &Path, branch: &str) -> Vec<String> {
+    vec![
+        "-C".to_string(),
+        repo_root.display().to_string(),
+        "switch".to_string(),
+        "--no-cd".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+        branch.to_string(),
+    ]
 }
 
 fn worktree_command_failure_message(

@@ -9,8 +9,8 @@ use crate::tui::Tui;
 
 use super::{
     archived_picker_overflow_message, discover_wt_columns, pr_target_choice_list,
-    pr_target_repo_for_choice, run_browser_opener, should_prompt_pr_target_choice,
-    status_label_with_behind,
+    pr_target_repo_for_choice, remote_pr_choice_keys, remote_pr_worktree_branch,
+    run_browser_opener, should_prompt_pr_target_choice, status_label_with_behind,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -108,6 +108,16 @@ fn pr_target_choices_offer_upstream_and_origin() {
     assert_eq!(pr_target_repo_for_choice("x", "me/repo", "org/repo"), None);
     assert!(should_prompt_pr_target_choice("me/repo", "org/repo"));
     assert!(!should_prompt_pr_target_choice("me/repo", "me/repo"));
+}
+
+#[test]
+fn remote_pr_picker_uses_stable_keys_and_branch_names() {
+    let keys = remote_pr_choice_keys();
+
+    assert_eq!(keys.first().map(String::as_str), Some("1"));
+    assert_eq!(keys.get(8).map(String::as_str), Some("9"));
+    assert_eq!(keys.get(9).map(String::as_str), Some("a"));
+    assert_eq!(remote_pr_worktree_branch(42), "pr/42");
 }
 
 #[test]
@@ -440,6 +450,8 @@ exit 0
         started.elapsed()
     );
     assert_eq!(tui.sessions.len(), 1);
+    assert!(tui.sessions[0].hidden);
+    assert!(tui.visible_session_indices().is_empty());
     assert_eq!(tui.delete_sessions_in_flight.len(), 1);
 
     let wait_started = Instant::now();
@@ -455,6 +467,83 @@ exit 0
     let commands = fs::read_to_string(&git_log).unwrap();
     assert!(commands.contains("worktree remove --force"));
     assert!(commands.contains("branch -D feature/delete"));
+
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn failed_async_delete_restores_hidden_worktree() {
+    let temp = unique_temp_dir("prism-delete-restore-test");
+    fs::create_dir_all(&temp).unwrap();
+    let worktree = temp.join("worktree");
+    fs::create_dir_all(&worktree).unwrap();
+    let git = temp.join("git");
+    let tmux = temp.join("tmux");
+    fs::write(
+        &git,
+        format!(
+            r#"#!/bin/sh
+case "$*" in
+  *"worktree remove --force"*)
+    exit 1
+    ;;
+  *"worktree list --porcelain"*)
+    printf 'worktree {}\nHEAD abc\nbranch refs/heads/feature/delete\n\n'
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+            worktree.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &tmux,
+        r#"#!/bin/sh
+case "$1" in
+  list-sessions|kill-session)
+    exit 0
+    ;;
+esac
+exit 0
+"#,
+    )
+    .unwrap();
+    for executable in [&git, &tmux] {
+        let mut permissions = fs::metadata(executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(executable, permissions).unwrap();
+    }
+
+    let mut config = test_config();
+    config
+        .tools
+        .insert("git".to_string(), git.display().to_string());
+    config
+        .tools
+        .insert("tmux".to_string(), tmux.display().to_string());
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(worktree, "feature/delete");
+    let mut tui = Tui::new_single(repo, config, vec![session]);
+
+    tui.start_delete_session_for_test().unwrap();
+
+    assert!(tui.sessions[0].hidden);
+    assert!(tui.visible_session_indices().is_empty());
+
+    let wait_started = Instant::now();
+    while !tui.delete_sessions_in_flight.is_empty()
+        && wait_started.elapsed() < Duration::from_secs(3)
+    {
+        tui.poll_delete_sessions();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(tui.delete_sessions_in_flight.is_empty());
+    assert_eq!(tui.sessions.len(), 1);
+    assert!(!tui.sessions[0].hidden);
+    assert_eq!(tui.visible_session_indices(), vec![0]);
 
     let _ = fs::remove_dir_all(temp);
 }
