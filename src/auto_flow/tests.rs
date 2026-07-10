@@ -852,6 +852,35 @@ fn ci_repair_commit_enters_pending_push_with_guard_data() {
 }
 
 #[test]
+fn completed_review_repair_allows_ci_repair_follow_up() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut persisted = AutoLaunch::new(
+        Path::new("/tmp/repo"),
+        Path::new("/tmp/repo/worktree"),
+        "feat/auto",
+        "Implement auto",
+    )
+    .unwrap()
+    .create_run();
+    persisted.steps.clear();
+    for (sequence, key) in [AutoStepKey::CommitReviewFix, AutoStepKey::FixCi]
+        .into_iter()
+        .enumerate()
+    {
+        let mut step = AutoStepRun::queued(&persisted.run.id, sequence + 1, key, 1, None);
+        step.status = AutoStepStatus::Done;
+        persisted.steps.push(step);
+    }
+    save_auto_run(&conn, &mut persisted).unwrap();
+
+    assert!(ensure_next_repair_follow_up_step(&conn, &mut persisted).unwrap());
+    assert!(persisted.steps.iter().any(|step| {
+        step.step_key == AutoStepKey::VerifyCiFix && step.status == AutoStepStatus::Queued
+    }));
+}
+
+#[test]
 fn schema_migration_archives_old_active_auto_runs_once() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch(
@@ -1150,6 +1179,30 @@ fn stale_reconciliation_marks_active_steps_failed() {
     assert!(output.iter().any(|line| {
         line.kind == AutoOutputKind::Error && line.text.contains("Prism restarted")
     }));
+}
+
+#[test]
+fn stale_reconciliation_preserves_a_paused_run() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted =
+        AutoLaunch::new(&repo, &repo.join("feature"), "feat/auto", "Implement auto")
+            .unwrap()
+            .create_run();
+    persisted.run.status = AutoRunStatus::Paused;
+    persisted.run.pause_requested = true;
+    persisted.steps[0].status = AutoStepStatus::Done;
+    save_auto_run(&conn, &mut persisted).unwrap();
+
+    let changed = reconcile_stale_auto_run(&conn, &mut persisted).unwrap();
+
+    assert!(!changed);
+    let loaded = load_auto_run(&conn, &persisted.run.id)
+        .unwrap()
+        .expect("run");
+    assert_eq!(loaded.run.status, AutoRunStatus::Paused);
+    assert!(loaded.run.pause_requested);
 }
 
 #[test]

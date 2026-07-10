@@ -118,6 +118,7 @@ pub(super) fn pause_before_next_auto_step_with_context(
     persisted.run.pause_requested = true;
     persisted.run.status = AutoRunStatus::Paused;
     persisted.run.updated_unix_ms = unix_ms();
+    save_run_with_conn(conn, &persisted.run)?;
     append_auto_event(
         conn,
         &AutoEvent {
@@ -129,7 +130,7 @@ pub(super) fn pause_before_next_auto_step_with_context(
             data_json: "{}".to_string(),
         },
     )?;
-    save_run_with_conn(conn, &persisted.run)
+    Ok(())
 }
 
 pub(super) fn next_state_machine_step_needed(persisted: &PersistedAutoRun) -> bool {
@@ -357,7 +358,7 @@ fn ensure_next_implementation_step(
     Ok(false)
 }
 
-fn ensure_next_repair_follow_up_step(
+pub(super) fn ensure_next_repair_follow_up_step(
     conn: &rusqlite::Connection,
     persisted: &mut PersistedAutoRun,
 ) -> Result<bool, String> {
@@ -418,12 +419,6 @@ fn ensure_next_repair_follow_up_step(
             save_step_with_conn(conn, step)?;
         }
         return Ok(true);
-    }
-    if matches!(
-        latest_step_status(persisted, &AutoStepKey::CommitReviewFix),
-        Some(AutoStepStatus::Done | AutoStepStatus::Skipped)
-    ) {
-        return Ok(false);
     }
     if latest_step_status(persisted, &AutoStepKey::FixCi) == Some(AutoStepStatus::Done)
         && latest_step_status(persisted, &AutoStepKey::VerifyCiFix) != Some(AutoStepStatus::Queued)

@@ -244,6 +244,7 @@ pub(crate) fn sidebar_width_for(cols: u16, configured_width: Option<u16>) -> u16
     layout::sidebar_width(cols, configured_width)
 }
 
+use auto_dashboard::*;
 use dialog::*;
 use format::*;
 use layout::*;

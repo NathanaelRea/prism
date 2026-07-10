@@ -73,16 +73,28 @@ prism_binary="$repo_root/target/release/prism"
 logs_path="$sandbox_path/logs"
 setup_helper="$script_dir/setup-demo.sh"
 tape_template="$script_dir/tapes/prism-demo.tape"
-host_mise_config="${XDG_CONFIG_HOME:-$HOME/.config}/mise/config.toml"
 host_home="${HOME:-}"
 vhs_browser_binary=""
 vhs_browser_source=""
+vhs_binary="$(command -v vhs || true)"
+opencode_binary=""
+lazygit_binary="$(command -v lazygit || true)"
+git_binary="$(command -v git || true)"
+mise_binary="$(command -v mise || true)"
+node_root=""
+provider_pid=""
+vhs_rod_chromium_revision="1321438"
 
 cleanup() {
   local status=$?
 
   if command -v tmux >/dev/null 2>&1 && [[ -n "${PRISM_DEMO_ROOT:-}" ]]; then
     tmux -S "${PRISM_DEMO_TMUX_SOCKET:-$PRISM_DEMO_ROOT/tmux.sock}" kill-server >/dev/null 2>&1 || true
+  fi
+
+  if [[ -n "$provider_pid" ]]; then
+    kill "$provider_pid" >/dev/null 2>&1 || true
+    wait "$provider_pid" >/dev/null 2>&1 || true
   fi
 
   if [[ "$status" -ne 0 && -n "$sandbox_path" ]]; then
@@ -131,12 +143,89 @@ optional_tool() {
   fi
 }
 
+require_pinned_version() {
+  local tool="$1"
+  local binary="$2"
+  local expected="$3"
+  local actual
+
+  [[ -n "$binary" && -x "$binary" ]] || die "required pinned tool '$tool' was not found in PATH"
+  actual="$("$binary" --version 2>&1)"
+  [[ "$actual" == *"$expected"* ]] || die "incompatible $tool version: expected $expected, got: $actual"
+  printf 'Pinned %s: %s\n' "$tool" "$actual"
+}
+
+resolve_pinned_opencode() {
+  local package="opencode-ai@1.17.18"
+  local binary
+
+  if ! binary="$("$node_root/bin/node" "$node_root/bin/npx" --yes --offline --package "$package" -- which opencode)"; then
+    die "pinned OpenCode package $package is not available in the npm cache"
+  fi
+  [[ -x "$binary" ]] || die "resolved OpenCode binary is missing or not executable: $binary"
+  printf '%s\n' "$binary"
+}
+
+allocate_port() {
+  python3 <<'PY'
+import socket
+
+with socket.socket() as sock:
+    sock.bind(("127.0.0.1", 0))
+    print(sock.getsockname()[1])
+PY
+}
+
+start_mock_provider() {
+  local port="$1"
+  local config="$XDG_CONFIG_HOME/opencode/opencode.json"
+  local attempts=0
+
+  mkdir -p "$(dirname "$config")"
+  cat >"$config" <<EOF
+{
+  "autoupdate": false,
+  "share": "disabled",
+  "shell": "$sandbox_path/bin/opencode-shell",
+  "model": "prism-demo/prism-demo",
+  "small_model": "prism-demo/prism-demo",
+  "enabled_providers": ["prism-demo"],
+  "provider": {
+    "prism-demo": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Prism Demo Provider",
+      "options": {"baseURL": "http://127.0.0.1:$port/v1", "apiKey": "offline-demo"},
+      "models": {"prism-demo": {"name": "Prism Demo Model"}}
+    }
+  },
+  "permission": {"*": "deny", "bash": "allow", "read": "allow", "edit": "allow", "write": "allow"}
+}
+EOF
+  "$script_dir/mock-provider.py" "$port" >"$logs_path/provider.log" 2>&1 &
+  provider_pid=$!
+  while [[ "$attempts" -lt 30 ]]; do
+    if python3 - "$port" <<'PY' >/dev/null 2>&1
+import sys
+import urllib.request
+urllib.request.urlopen(f"http://127.0.0.1:{sys.argv[1]}/v1/models", timeout=0.25).read()
+PY
+    then
+      return
+    fi
+    kill -0 "$provider_pid" >/dev/null 2>&1 || die "offline model provider exited; inspect $logs_path/provider.log"
+    sleep 0.1
+    attempts=$((attempts + 1))
+  done
+  die "offline model provider did not become ready"
+}
+
 run_with_timeout() {
   local seconds="$1"
   shift
 
   python3 - "$seconds" "$@" <<'PY'
 import os
+import ctypes
 import shlex
 import signal
 import subprocess
@@ -145,6 +234,42 @@ import time
 
 seconds = float(sys.argv[1])
 cmd = sys.argv[2:]
+
+if sys.platform.startswith("linux"):
+    try:
+        ctypes.CDLL(None).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
+    except (AttributeError, OSError):
+        pass
+
+
+def descendant_pids():
+    listing = subprocess.check_output(
+        ["ps", "-A", "-o", "pid=,ppid="], text=True
+    )
+    children = {}
+    for line in listing.splitlines():
+        pid, ppid = (int(value) for value in line.split())
+        children.setdefault(ppid, []).append(pid)
+
+    descendants = []
+    pending = [os.getpid()]
+    while pending:
+        parent = pending.pop()
+        for child in children.get(parent, []):
+            descendants.append(child)
+            pending.append(child)
+    return descendants
+
+
+def reap_children():
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
 
 try:
     process = subprocess.Popen(cmd, start_new_session=True)
@@ -163,12 +288,31 @@ except subprocess.TimeoutExpired:
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            sys.exit(124)
+            break
         time.sleep(0.1)
     try:
         os.killpg(process.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
+
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        pass
+
+    # Chromium crash handlers detach into their own sessions. On Linux the
+    # subreaper above keeps them attributable to this supervisor.
+    for _ in range(20):
+        descendants = descendant_pids()
+        if not descendants:
+            break
+        for pid in reversed(descendants):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        time.sleep(0.05)
+        reap_children()
     sys.exit(124)
 PY
 }
@@ -204,31 +348,18 @@ EOF
   fi
 }
 
-find_cached_rod_chrome() {
-  local browser_dir="$host_home/.cache/rod/browser"
-  local candidate
-  local found=""
-
-  [[ -n "$host_home" && -d "$browser_dir" ]] || return 1
-
-  for candidate in "$browser_dir"/chromium-*/chrome; do
-    [[ -x "$candidate" ]] || continue
-    found="$candidate"
-  done
-
-  [[ -n "$found" ]] || return 1
-  printf '%s\n' "$found"
-}
-
 configure_vhs_browser() {
   local browser="${PRISM_DEMO_CHROME_BINARY:-}"
+  local cached_browser="$host_home/.cache/rod/browser/chromium-$vhs_rod_chromium_revision/chrome"
   local source="PRISM_DEMO_CHROME_BINARY"
 
   if [[ -z "$browser" ]]; then
-    if ! browser="$(find_cached_rod_chrome)"; then
-      return 0
+    if [[ -n "$host_home" && -x "$cached_browser" ]]; then
+      browser="$cached_browser"
+      source="VHS go-rod Chromium $vhs_rod_chromium_revision"
+    else
+      die "PRISM_DEMO_CHROME_BINARY is required because the pinned VHS browser is not cached at $cached_browser"
     fi
-    source="cached go-rod Chromium"
   fi
 
   [[ -x "$browser" ]] || die "PRISM_DEMO_CHROME_BINARY is not executable: $browser"
@@ -294,11 +425,11 @@ with socket.socket() as sock:
 PY
 )"
 
-  "$sandbox_path/bin/opencode" serve --hostname 127.0.0.1 --port "$port" >/dev/null 2>&1 &
+  "$sandbox_path/bin/opencode" serve --hostname 127.0.0.1 --port "$port" >"$logs_path/opencode-server.log" 2>&1 &
   pid=$!
   trap 'kill "$pid" >/dev/null 2>&1 || true; wait "$pid" >/dev/null 2>&1 || true; trap - RETURN' RETURN
 
-  for _ in 1 2 3 4 5 6 7 8 9 10; do
+  for _ in $(seq 1 50); do
     if python3 - "$port" <<'PY' >/dev/null 2>&1
 import sys
 import urllib.request
@@ -313,7 +444,11 @@ PY
     sleep 0.1
   done
 
-  [[ "$ready" -eq 1 ]] || return 1
+  if [[ "$ready" -ne 1 ]]; then
+    printf 'OpenCode server log:\n' >&2
+    [[ -f "$logs_path/opencode-server.log" ]] && cat "$logs_path/opencode-server.log" >&2
+    return 1
+  fi
 
   python3 - "$port" "$PRISM_DEMO_REPO" <<'PY'
 import json
@@ -337,7 +472,10 @@ for path in [
     f"/session/{session_id}/todo",
     "/event",
 ]:
-    urllib.request.urlopen(f"{base}{path}", timeout=1).read()
+    response = urllib.request.urlopen(f"{base}{path}", timeout=1)
+    if path != "/event":
+        response.read()
+    response.close()
 PY
 }
 
@@ -350,6 +488,13 @@ require_recording_tool vhs "Install VHS from https://github.com/charmbracelet/vh
 require_recording_tool ttyd "VHS requires ttyd. Install it with your system package manager or from https://github.com/tsl0922/ttyd."
 require_recording_tool ffmpeg "VHS requires ffmpeg. Install it with your system package manager."
 optional_tool gifsicle
+require_pinned_version VHS "$vhs_binary" "v0.11.0"
+require_pinned_version LazyGit "$lazygit_binary" "0.62.1"
+[[ -n "$mise_binary" ]] || die "OpenCode launcher requires mise to locate its pinned Node runtime"
+node_root="$(env MISE_GLOBAL_CONFIG_FILE=/tmp/prism-demo-mise.toml MISE_SHELL= "$mise_binary" where node@latest)"
+[[ -x "$node_root/bin/node" ]] || die "OpenCode Node runtime is missing: $node_root/bin/node"
+opencode_binary="$(resolve_pinned_opencode)"
+require_pinned_version OpenCode "$opencode_binary" "1.17.18"
 
 if [[ "$skip_build" -eq 1 ]]; then
   [[ -x "$prism_binary" ]] || die "--skip-build requested, but Prism binary is missing or not executable: $prism_binary"
@@ -399,12 +544,33 @@ export LINES=46
 export TZ=UTC
 export LC_ALL=C.UTF-8
 export LANG=C.UTF-8
+export PRISM_DEMO_OPENCODE="$opencode_binary"
+export PRISM_DEMO_LAZYGIT="$lazygit_binary"
+export PRISM_DEMO_GIT="$git_binary"
+export PRISM_DEMO_NODE_ROOT="$node_root"
+export PRISM_DEMO_SCENARIO="$sandbox_path/bin/prism-demo-scenario"
+export OPENCODE_CONFIG="$XDG_CONFIG_HOME/opencode/opencode.json"
+export OPENCODE_CONFIG_DIR="$XDG_CONFIG_HOME/opencode"
+export MISE_GLOBAL_CONFIG_FILE="$sandbox_path/mise.toml"
+export MISE_SHELL=""
 
-unset GH_TOKEN GITHUB_TOKEN OPENCODE_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY
+unset GH_TOKEN GITHUB_TOKEN OPENCODE_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY DEEPSEEK_API_KEY
 
-if [[ -f "$host_mise_config" ]]; then
-  export MISE_TRUSTED_CONFIG_PATHS="${MISE_TRUSTED_CONFIG_PATHS:+$MISE_TRUSTED_CONFIG_PATHS:}$host_mise_config"
+cat >"$sandbox_path/bin/opencode-shell" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "-c" ]]; then
+  case "${2:-}" in
+    "prism-demo-scenario write-plan"|"prism-demo-scenario apply-plan"|"prism-demo-scenario repair review"|"prism-demo-scenario repair ci")
+      exec /bin/sh -c "$2"
+      ;;
+  esac
 fi
+printf 'OpenCode demo command is not allowlisted\n' >&2
+exit 126
+EOF
+chmod +x "$sandbox_path/bin/opencode-shell"
 
 case "$HOME:$XDG_CONFIG_HOME:$XDG_CACHE_HOME:$XDG_STATE_HOME:$GIT_CONFIG_GLOBAL" in
   "$sandbox_path"/*:"$sandbox_path"/*:"$sandbox_path"/*:"$sandbox_path"/*:"$sandbox_path"/*)
@@ -422,6 +588,8 @@ printf 'Fake HOME: %s\n' "$HOME"
 printf 'Fake XDG_CONFIG_HOME: %s\n' "$XDG_CONFIG_HOME"
 
 configure_vhs_browser
+provider_port="$(allocate_port)"
+start_mock_provider "$provider_port"
 
 cat >"$sandbox_path/run.env" <<EOF
 PATH=$PATH
@@ -440,6 +608,10 @@ COLORTERM=$COLORTERM
 COLUMNS=$COLUMNS
 LINES=$LINES
 PRISM_DEMO_TMUX_SOCKET=$PRISM_DEMO_TMUX_SOCKET
+PRISM_DEMO_OPENCODE=$PRISM_DEMO_OPENCODE
+PRISM_DEMO_LAZYGIT=$PRISM_DEMO_LAZYGIT
+OPENCODE_CONFIG=$OPENCODE_CONFIG
+PRISM_DEMO_PROVIDER=http://127.0.0.1:$provider_port/v1
 OUTPUT=$output_path
 EOF
 printf 'Debug environment: %s\n' "$sandbox_path/run.env"
@@ -457,18 +629,18 @@ printf 'Running Prism startup smoke check...\n'
 
 printf 'Running screenshot shim smoke checks...\n'
 "$sandbox_path/bin/gh" auth status >/dev/null
-"$sandbox_path/bin/opencode" run --format json --dir "$PRISM_DEMO_REPO" "Smoke test demo plan" >/dev/null
+"$sandbox_path/bin/opencode" run --format json --dir "$PRISM_DEMO_REPO" "Report that the offline demo provider is ready"
 smoke_opencode_server
 "$sandbox_path/bin/wt" -C "$PRISM_DEMO_REPO" list --format=json >/dev/null
 "$sandbox_path/bin/tmux" -V >/dev/null
-printf 'README.md\nplan-demo.md\n' | "$sandbox_path/bin/fzf" >/dev/null
+printf 'README.md\nplan-ci.md\n' | "$sandbox_path/bin/fzf" >/dev/null
 printf 'shim clipboard smoke\n' | "$sandbox_path/bin/wl-copy"
 "$sandbox_path/bin/date" +%H:%M:%S >/dev/null
 smoke_vhs_recorder
 
 assert_no_unsupported_shim_calls
 
-for log in gh opencode wt tmux wl-copy date fzf; do
+for log in gh wt tmux wl-copy date fzf; do
   if [[ ! -s "$logs_path/$log.log" ]]; then
     die "expected shim log was not written: $logs_path/$log.log"
   fi
@@ -488,15 +660,13 @@ mkdir -p "$(dirname "$output_path")"
 rendered_tape="$sandbox_path/prism-demo.tape"
 raw_gif="$sandbox_path/prism-demo.raw.gif"
 optimized_gif="$sandbox_path/prism-demo.optimized.gif"
-frames_output=""
-
-if [[ "$frames" -eq 1 ]]; then
-  frames_output="Output \"$sandbox_path/frames/\""
-fi
+frames_output="Output \"$sandbox_path/frames/\""
+mkdir -p "$sandbox_path/frames"
 
 sed \
   -e "s|__OUTPUT__|$(escape_sed_replacement "$raw_gif")|g" \
   -e "s|__FRAMES_OUTPUT__|$(escape_sed_replacement "$frames_output")|g" \
+  -e "s|__FRAMES_DIR__|$(escape_sed_replacement "$sandbox_path/frames")|g" \
   -e "s|__REPO__|$(escape_sed_replacement "$PRISM_DEMO_REPO")|g" \
   "$tape_template" >"$rendered_tape"
 
@@ -525,6 +695,8 @@ fi
 if [[ ! -s "$raw_gif" ]]; then
   die "recording did not produce a non-empty GIF: $raw_gif"
 fi
+
+"$script_dir/verify-frames.py" "$sandbox_path"
 
 if command -v gifsicle >/dev/null 2>&1; then
   printf 'Optimizing GIF with gifsicle...\n'

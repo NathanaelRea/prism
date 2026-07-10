@@ -15,7 +15,7 @@ mkdir -p "$log_dir"
 
 choice=""
 while IFS= read -r line; do
-  if [[ "$line" == "plan-demo.md" ]]; then
+  if [[ "$line" == "plan-ci.md" ]]; then
     choice="$line"
   elif [[ -z "$choice" && "$line" == *.md ]]; then
     choice="$line"

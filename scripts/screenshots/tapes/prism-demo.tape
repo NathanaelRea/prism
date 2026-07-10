@@ -3,111 +3,201 @@ __FRAMES_OUTPUT__
 
 Set Shell "bash"
 Set Theme "Catppuccin Mocha"
+Set FontFamily "JetBrainsMono Nerd Font"
 Set FontSize 16
 Set Width 1400
 Set Height 920
 Set Framerate 24
 Set CursorBlink false
-Set TypingSpeed 45ms
+Set TypingSpeed 35ms
 
+# Scene 1: create the focused CI worktree from the repository panel.
 Type "./prism --repo ."
 Enter
-Sleep 2s
-
-Type "n"
-Sleep 300ms
+Wait+Screen@30s /no worktrees/
+Sleep 500ms
+Screenshot "__FRAMES_DIR__/01-opening.png"
+Type "2"
+Type "c"
+Wait+Screen /Branch name for prism-shop:/
+Type "feat/ci-plan"
 Enter
+Wait+Screen /Initial prompt/
+Enter
+Wait+Screen@60s /No PR detected/
+
+# Scene 2: ask the real, locally configured OpenCode client to draft the plan.
+Enter
+Wait+Screen@60s /ctrl.p commands/
+Type "Create plan-ci.md that investigates the repository CI/CD actions and proposes implementation steps."
+Enter
+Wait+Screen@60s /requested sandbox action completed successfully/
+Ctrl+B
+Type "d"
+Wait+Screen@30s /Worktrees repo/
+Sleep 500ms
+Screenshot "__FRAMES_DIR__/02-worktree.png"
+
+# Show the generated plan from the worktree's real terminal window.
+Type " "
+Enter
+Sleep 500ms
+Type "cat plan-ci.md"
+Enter
+Wait+Screen@30s /Phase 3: Verify The Change/
 Sleep 1s
+Screenshot "__FRAMES_DIR__/03-plan-drafted.png"
+Ctrl+B
+Type "d"
+Wait+Screen@30s /Worktrees repo/
 
-Type "2"
-Sleep 500ms
-Type "3"
-Sleep 700ms
-Type "j"
-Sleep 500ms
-
+# Scene 3: run the selected plan with Prism's plan mode.
 Type "P"
-Sleep 1200ms
+Wait+Screen@30s /Step name \[phase\]:/
 Enter
-Sleep 400ms
+Wait+Screen /How many total steps \[3\]:/
 Enter
-Sleep 400ms
-Type "2"
-Sleep 400ms
+Wait+Screen /Where to start \[1\]:/
 Enter
-Sleep 600ms
+Wait+Screen /Run phases in parallel/
 Enter
-Sleep 4s
-
-Type "0"
+Wait+Screen@120s /status done/
 Sleep 500ms
-Type "}"
-Sleep 600ms
+Screenshot "__FRAMES_DIR__/04-plan-complete.png"
 
+# Scene 4: open real LazyGit and make the initial local implementation commit.
 Type "3"
-Sleep 500ms
+Type " "
 Type "g"
 Type "g"
-Sleep 400ms
-Type "j"
+Wait+Screen@60s /Files/
+Wait+Screen@30s /Press <enter> to get started/
+Enter
+Type "a"
+Wait+Screen@30s /Staged changes/
+Type "c"
+Wait+Screen /Commit summary/
+Type "Implement checkout CI fixture"
+Enter
+Wait+Screen@60s /Implement checkout CI fixt/
 Sleep 500ms
-Enter
-Sleep 2500ms
-Type "Continue with the checkout guard and keep the smoke test visible."
-Sleep 700ms
-Enter
-Sleep 1200ms
+Screenshot "__FRAMES_DIR__/05-lazygit-commit.png"
 Ctrl+B
-Sleep 250ms
 Type "d"
-Sleep 900ms
+Wait+Screen@30s /No PR detected/
 
-Type "x"
-Sleep 500ms
+# Scene 5: Auto Flow observes requested changes and the failed local CI fixture.
+Type "A"
+Wait+Screen /Implementation source/
+Enter
+Wait+Screen /Initial prompt:/
+Type "Prepare the checkout pull request."
+Enter
+Wait+Screen@60s /auto: 1/
+Type "3"
+Wait+Screen@60s /status paused/
+
+# Resume local verification, the implementation commit boundary, and PR creation.
+Type " "
+Type "p"
+Wait+Screen /Auto Flow Actions/
+Type "u"
+Wait+Screen /Resume Auto Flow/
 Type "y"
-Sleep 1500ms
-
-Type "j"
-Sleep 500ms
-Type "j"
-Sleep 500ms
-Type " "
-Sleep 200ms
-Type "g"
-Sleep 200ms
-Type "f"
-Sleep 1800ms
-
 Enter
-Sleep 2200ms
-Type "Use the copied review-fix context and update the unresolved thread on PR 17."
-Sleep 700ms
-Enter
-Sleep 1000ms
-Ctrl+B
-Sleep 250ms
-Type "d"
-Sleep 800ms
-
-Type "k"
-Sleep 500ms
+Wait+Screen@60s /status paused/
 Type " "
-Sleep 250ms
+Type "p"
+Wait+Screen /Auto Flow Actions/
+Type "u"
+Wait+Screen /Resume Auto Flow/
+Type "y"
+Enter
+Wait+Screen@60s /status paused/
+Type " "
+Type "p"
+Wait+Screen /Auto Flow Actions/
+Type "u"
+Wait+Screen /Resume Auto Flow/
+Type "y"
+Enter
+Wait+Screen@60s /status paused/
+Type "3"
+Wait+Screen@60s /ReviewFeedbackFound/
+Sleep 1s
+Screenshot "__FRAMES_DIR__/06-failed-pr.png"
+
+# Scene 6: managed review repair, guarded push, CI repair, guarded push, merge.
+# Run the queued review repair, verify it, and create its guarded commit.
+Type " "
+Type "p"
+Wait+Screen /Auto Flow Actions/
+Type "u"
+Wait+Screen /Resume Auto Flow/
+Type "y"
+Enter
+Wait+Screen@60s /status paused/
+Type " "
+Type "p"
+Wait+Screen /Auto Flow Actions/
+Type "u"
+Wait+Screen /Resume Auto Flow/
+Type "y"
+Enter
+Wait+Screen@60s /status paused/
+Type " "
+Type "p"
+Wait+Screen /Auto Flow Actions/
+Type "u"
+Wait+Screen /Resume Auto Flow/
+Type "y"
+Enter
+Wait+Screen@60s /PendingPush/
+Type "3"
+Type " "
 Type "g"
-Sleep 250ms
+Type "P"
+Wait+Screen@60s /guarded repair pushed/
+Sleep 1s
+Screenshot "__FRAMES_DIR__/07-review-pushed.png"
+
+Type " "
+Type "g"
+Type "c"
+Wait+Screen /started managed CI repair/
+Wait+Screen@60s /status paused/
+
+# Verify the CI repair and create its guarded commit.
+Type " "
+Type "p"
+Wait+Screen /Auto Flow Actions/
+Type "u"
+Wait+Screen /Resume Auto Flow/
+Type "y"
+Enter
+Wait+Screen@60s /status paused/
+Type " "
+Type "p"
+Wait+Screen /Auto Flow Actions/
+Type "u"
+Wait+Screen /Resume Auto Flow/
+Type "y"
+Enter
+Wait+Screen@60s /PendingPush/
+Type "3"
+Type " "
+Type "g"
+Type "P"
+Wait+Screen@60s /guarded repair pushed/
+Sleep 1s
+Screenshot "__FRAMES_DIR__/08-ci-pushed.png"
+
+Type " "
+Type "g"
 Type "M"
-Sleep 2500ms
-
-Type "g"
-Type "g"
-Sleep 500ms
-Type "j"
-Sleep 500ms
-
-Type "D"
-Sleep 800ms
-Enter
-Sleep 1500ms
-
+Wait+Screen@60s /Delete Session/
 Type "q"
-Sleep 500ms
+Wait+Screen@30s /merge complete/
+Sleep 1s
+Screenshot "__FRAMES_DIR__/09-merged.png"
+Sleep 1s
