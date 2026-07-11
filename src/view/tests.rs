@@ -836,6 +836,29 @@ fn renders_stabilization_pending_push_in_worktree_main_panel() {
 }
 
 #[test]
+fn renders_requested_pr_review_as_pending_when_approval_gate_is_disabled() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Idle);
+    let mut summary = test_pr_summary();
+    summary.requested_reviewers = vec!["review-team".to_string()];
+    session.pr.summary = Some(summary);
+    let sessions = vec![session];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.auto_dashboard = Some(stabilization_dashboard(
+        StabilizationBlocker::ReadyForManualMerge,
+        StabilizationWorkKind::MarkReadyForManualMerge,
+        None,
+    ));
+
+    let buffer = render_to_buffer(&model, 120, 40);
+    let review_row = find_line(&buffer, "code review");
+    let review_status = line_text(&buffer, review_row);
+
+    assert!(review_status.contains("pending"));
+    assert!(!review_status.contains("disabled"));
+}
+
+#[test]
 fn renders_stabilization_ci_failed_in_worktree_main_panel() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
