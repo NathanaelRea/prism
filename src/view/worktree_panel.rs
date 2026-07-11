@@ -4,6 +4,7 @@ use super::*;
 pub(crate) struct StabilizationPanelModel {
     pub icon_style: IconStyle,
     pub pr_number: String,
+    pub pr_merged: bool,
     pub pr_name: String,
     pub blocker: String,
     pub next: String,
@@ -35,10 +36,42 @@ pub(super) fn worktree_detail_lines(model: &crate::view::FrameModel<'_>) -> Vec<
         lines.push(labelled_line("prompt", session.prompt_summary.clone()));
     }
     lines.push(Line::from(""));
+    lines.extend(agent_lines(session));
+    lines.push(Line::from(""));
     lines.extend(stabilization_panel_lines(&stabilization_panel_model(
         model, session,
     )));
+    if let Some(details) = &session.pr.details {
+        lines.extend(pr_comment_lines(details, 5, model.selected_comment));
+    }
     lines
+}
+
+fn agent_lines(session: &Session) -> Vec<Line<'static>> {
+    let (status, tool, message) = session
+        .opencode_status
+        .as_ref()
+        .map(|status| {
+            (
+                status.state.label(),
+                status.active_tool.as_deref(),
+                status.latest_message.as_deref(),
+            )
+        })
+        .unwrap_or((session.agent_state.label(), None, None));
+    let status = match tool.filter(|tool| !tool.trim().is_empty()) {
+        Some(tool) => format!("{status}  {tool}"),
+        None => status.to_string(),
+    };
+    let message = message
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or("No messages");
+
+    vec![
+        heading_line("Agent"),
+        labelled_line("status", status),
+        labelled_line("message", truncate(message, 70)),
+    ]
 }
 
 pub(crate) fn stabilization_panel_model(
@@ -68,6 +101,7 @@ pub(crate) fn stabilization_panel_model(
         return StabilizationPanelModel {
             icon_style: model.config.icon_style,
             pr_number: String::new(),
+            pr_merged: false,
             pr_name: String::new(),
             blocker: String::new(),
             next: String::new(),
@@ -83,6 +117,7 @@ pub(crate) fn stabilization_panel_model(
         pr_number: summary
             .map(|summary| summary.number.to_string())
             .unwrap_or_default(),
+        pr_merged: summary.is_some_and(|summary| summary.merged),
         pr_name: summary
             .map(|summary| summary.title.clone())
             .unwrap_or_default(),
@@ -101,7 +136,7 @@ pub(crate) fn stabilization_panel_model(
 pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<Line<'static>> {
     let mut lines = vec![
         heading_line("PR"),
-        stabilization_value_line("pr #", &model.pr_number, Style::default()),
+        pr_number_line(model),
         stabilization_value_line("name", &model.pr_name, selected_text_style()),
         stabilization_value_line(
             "state",
@@ -127,6 +162,33 @@ pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<
         model.icon_style,
     ));
     lines
+}
+
+fn pr_number_line(model: &StabilizationPanelModel) -> Line<'static> {
+    let Some(number) = model
+        .pr_number
+        .parse::<u64>()
+        .ok()
+        .filter(|_| !model.pr_number.is_empty())
+    else {
+        return stabilization_value_line("pr #", "", Style::default());
+    };
+    let style = Style::default()
+        .fg(if model.pr_merged {
+            Color::Magenta
+        } else {
+            Color::Green
+        })
+        .add_modifier(Modifier::BOLD);
+    let symbol = if model.pr_merged {
+        icon(model.icon_style, "⋈", "")
+    } else {
+        icon(model.icon_style, "⇄", "")
+    };
+    Line::from(vec![
+        Span::styled(format!("{:<16}", "pr #"), muted_style()),
+        Span::styled(format!("{symbol} #{number}"), style),
+    ])
 }
 
 fn stabilization_value_line(label: &'static str, value: &str, style: Style) -> Line<'static> {

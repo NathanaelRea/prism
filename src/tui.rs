@@ -645,6 +645,10 @@ impl Tui {
                 Key::OpenTmuxSession => {
                     self.clear_leader_hint();
                     pending_g = false;
+                    if self.open_selected_comment_dialog(&mut runtime)? {
+                        self.draw(&mut runtime)?;
+                        continue;
+                    }
                     match self.open_tmux_session_target() {
                         OpenTmuxSessionTarget::RepoDefaultAgent(index) => {
                             self.enter_agent_mode_for_index(&mut runtime, index)?
@@ -1405,6 +1409,9 @@ impl Tui {
 
     fn move_down(&mut self) {
         if self.main_focused {
+            if self.move_comment_selection(1) {
+                return;
+            }
             self.main_scroll = self.main_scroll.saturating_add(1);
             self.move_plan_step_selection(1);
             return;
@@ -1418,6 +1425,9 @@ impl Tui {
 
     fn move_up(&mut self) {
         if self.main_focused {
+            if self.move_comment_selection(-1) {
+                return;
+            }
             self.main_scroll = self.main_scroll.saturating_sub(1);
             self.move_plan_step_selection(-1);
             return;
@@ -1783,6 +1793,79 @@ impl Tui {
             session.visibility = visibility;
         }
         Ok(())
+    }
+
+    fn selected_comment_rows(&self) -> Vec<view::PrCommentDisplayRow> {
+        let Some(index) = self.selected_worktree_index() else {
+            return Vec::new();
+        };
+        self.sessions
+            .get(index)
+            .and_then(|session| session.pr.details.as_ref())
+            .map(view::pr_comment_rows)
+            .unwrap_or_default()
+    }
+
+    fn move_comment_selection(&mut self, direction: isize) -> bool {
+        if self.focused_panel != PanelFocus::Worktrees {
+            return false;
+        }
+        let rows = self.selected_comment_rows();
+        if rows.is_empty() {
+            self.selected_comment = 0;
+            return false;
+        }
+        let current = self.selected_comment.min(rows.len().saturating_sub(1));
+        let next = current as isize + direction;
+        self.selected_comment = if next < 0 {
+            0
+        } else {
+            (next as usize).min(rows.len().saturating_sub(1))
+        };
+        true
+    }
+
+    fn open_selected_comment_dialog(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+    ) -> Result<bool, String> {
+        if !self.main_focused || self.focused_panel != PanelFocus::Worktrees {
+            return Ok(false);
+        }
+        let rows = self.selected_comment_rows();
+        let Some(row) = rows.get(self.selected_comment) else {
+            return Ok(false);
+        };
+        let mut lines = vec![
+            view::DialogLine {
+                text: format!("kind: {}", row.kind),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!("author: {}", row.author),
+                attention: false,
+            },
+            view::DialogLine {
+                text: format!("resolved: {}", row.resolved),
+                attention: row.resolved.eq_ignore_ascii_case("no"),
+            },
+        ];
+        if !row.context.trim().is_empty() {
+            lines.push(view::DialogLine {
+                text: format!("context: {}", row.context),
+                attention: false,
+            });
+        }
+        lines.push(view::DialogLine {
+            text: String::new(),
+            attention: false,
+        });
+        lines.push(view::DialogLine {
+            text: row.body.clone(),
+            attention: false,
+        });
+        self.confirm_dialog(runtime, "Comment Details", lines, "Close", "Close")?;
+        Ok(true)
     }
 
     pub(crate) fn selected_worktree_index(&self) -> Option<usize> {

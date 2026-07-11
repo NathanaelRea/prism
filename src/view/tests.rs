@@ -16,6 +16,7 @@ use crate::{
     },
     config::{Checks, Config, EscapeKey, MergeMethod},
     github::{PrCache, PrDetails, PrReviewComment, PrSummary},
+    opencode::{OpencodeState, OpencodeStatus},
     plan_run::{
         PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRun, PlanRunMode, PlanRunStatus,
         PlanStepRun, PlanStepStatus,
@@ -784,26 +785,38 @@ fn renders_auto_dashboard_steps_and_output_cursor() {
 }
 
 #[test]
-fn worktree_main_panel_omits_runtime_metadata_block() {
+fn worktree_main_panel_renders_three_line_agent_section() {
     let config = test_config();
-    let sessions = vec![test_session("feature", AgentState::Running)];
+    let mut session = test_session("feature", AgentState::Running);
+    session.opencode_status = Some(OpencodeStatus {
+        server_url: None,
+        session_id: None,
+        title: None,
+        state: OpencodeState::Busy,
+        latest_message: Some("implementing the panel".to_string()),
+        active_tool: Some("bash".to_string()),
+        todos: Vec::new(),
+        last_updated_unix_ms: None,
+    });
+    let sessions = vec![session];
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    let buffer = render_to_buffer(&model, 120, 30);
-    let main = region_text(&buffer, 56..120, 0..29);
+    let lines = worktree_detail_lines(&model);
+    let agent = lines
+        .iter()
+        .position(|line| line.to_string().contains("Agent"))
+        .unwrap();
 
-    assert!(main.contains("feature"));
-    assert!(main.contains("prompt implement feature"));
-    assert!(!main.contains("status "));
-    assert!(!main.contains("kind "));
-    assert!(!main.contains("adopted "));
-    assert!(!main.contains("opencode "));
-    assert!(!main.contains("server "));
-    assert!(!main.contains("session "));
-    assert!(!main.contains("updated "));
+    assert!(lines[agent + 1].to_string().contains("busy  bash"));
+    assert!(
+        lines[agent + 2]
+            .to_string()
+            .contains("implementing the panel")
+    );
+    assert!(lines[agent + 3].to_string().is_empty());
 }
 
 #[test]
-fn worktree_main_panel_omits_pr_comments_table() {
+fn worktree_main_panel_renders_pr_comments_table() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
     session.pr.summary = Some(test_pr_summary());
@@ -821,8 +834,42 @@ fn worktree_main_panel_omits_pr_comments_table() {
 
     let buffer = render_to_string(&model, 120, 30);
 
-    assert!(!buffer.contains("kind   res author       text"));
-    assert!(!buffer.contains("please fix"));
+    assert!(buffer.contains("kind   res author       text"));
+    assert!(buffer.contains("inline"));
+    assert!(buffer.contains("no"));
+    assert!(buffer.contains("please fix"));
+}
+
+#[test]
+fn worktree_main_panel_styles_open_and_merged_pr_numbers() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Idle);
+    session.pr.summary = Some(test_pr_summary());
+    let sessions = vec![session];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let open = render_to_buffer(&model, 120, 30);
+    let open_row = find_line(&open, "⇄ #42");
+    let open_x = (open.area.x..open.area.x + open.area.width)
+        .find(|x| open[(*x, open_row)].symbol() == "⇄")
+        .unwrap();
+    assert_eq!(open[(open_x, open_row)].style().fg, Some(Color::Green));
+
+    let mut session = test_session("feature", AgentState::Idle);
+    let mut summary = test_pr_summary();
+    summary.merged = true;
+    summary.state = "MERGED".to_string();
+    session.pr.summary = Some(summary);
+    let sessions = vec![session];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let merged = render_to_buffer(&model, 120, 30);
+    let merged_row = find_line(&merged, "⋈ #42");
+    let merged_x = (merged.area.x..merged.area.x + merged.area.width)
+        .find(|x| merged[(*x, merged_row)].symbol() == "⋈")
+        .unwrap();
+    assert_eq!(
+        merged[(merged_x, merged_row)].style().fg,
+        Some(Color::Magenta)
+    );
 }
 
 #[test]
