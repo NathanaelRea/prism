@@ -15,7 +15,7 @@ use crate::{
     auto_flow::{
         AutoImplementationSource, AutoOutputKind, AutoOutputLine, AutoRunMode, AutoRunStatus,
         AutoStepKey, AutoStepRun, AutoStepStatus, PersistedAutoRun,
-        stabilization_model::{PendingPushGuard, StabilizationBlocker, StabilizationWorkKind},
+        stabilization_model::{StabilizationBlocker, StabilizationWorkKind},
     },
     config::{Config, IconStyle},
     github::PrCache,
@@ -42,6 +42,7 @@ pub(crate) struct FrameModel<'a> {
     pub selected_comment: usize,
     pub focus: PanelFocus,
     pub main_focused: bool,
+    pub main_scroll: usize,
     pub repo_main_view: RepoMainView,
     pub worktree_main_view: WorktreeMainView,
     pub worktree_list_mode: WorktreeListMode,
@@ -236,7 +237,6 @@ pub(crate) fn sidebar_width_for(cols: u16, configured_width: Option<u16>) -> u16
     layout::sidebar_width(cols, configured_width)
 }
 
-use auto_dashboard::*;
 use dialog::*;
 use format::*;
 use layout::*;

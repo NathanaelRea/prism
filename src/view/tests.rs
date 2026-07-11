@@ -16,6 +16,7 @@ use crate::{
     },
     config::{Checks, Config, EscapeKey, MergeMethod},
     github::{PrCache, PrDetails, PrReviewComment, PrSummary},
+    opencode::{OpencodeState, OpencodeStatus},
     plan_run::{
         PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRun, PlanRunMode, PlanRunStatus,
         PlanStepRun, PlanStepStatus,
@@ -42,7 +43,7 @@ fn renders_wide_shell_with_sidebar_main_and_footer() {
     assert_region_contains(&buffer, 0..56, 0..30, "[1] Status");
     assert_region_contains(&buffer, 0..56, 0..30, "[2] Repos");
     assert_region_contains(&buffer, 0..56, 0..30, "[3] Worktrees");
-    let row = find_line(&buffer, "●");
+    let (_, row) = sidebar_cell_containing(&buffer, "feature");
     assert_cell_style(
         &buffer,
         0,
@@ -113,7 +114,7 @@ fn renders_selected_sidebar_rows_with_focused_style() {
 
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     let buffer = render_to_buffer(&model, 120, 30);
-    let row = find_line(&buffer, "●");
+    let (_, row) = sidebar_cell_containing(&buffer, "feature");
 
     assert_cell_style(
         &buffer,
@@ -324,7 +325,8 @@ fn worktree_sidebar_keeps_configured_columns_before_prompt_text() {
     let sessions = vec![session];
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     let buffer = render_to_buffer(&model, 160, 30);
-    let row = line_text(&buffer, find_line(&buffer, "●"));
+    let (_, row_y) = sidebar_cell_containing(&buffer, "feature");
+    let row = line_text(&buffer, row_y);
 
     assert!(row.contains("3"), "got {row:?}");
     assert!(row.contains("agent"), "got {row:?}");
@@ -722,7 +724,7 @@ fn renders_plan_dashboard_compact_step_tails() {
     let sessions = vec![test_session("feature", AgentState::Running)];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.plan_dashboard = Some(test_plan_dashboard(false));
-    let buffer = render_to_string(&model, 120, 32);
+    let buffer = render_to_string(&model, 120, 37);
 
     assert!(buffer.contains("Plan Run"));
     assert!(buffer.contains("current"));
@@ -779,37 +781,201 @@ fn renders_auto_dashboard_steps_and_output_cursor() {
     model.auto_dashboard = Some(test_auto_dashboard());
     let buffer = render_to_string(&model, 120, 32);
 
-    assert!(buffer.contains("Auto Flow"));
-    assert!(buffer.contains("task"));
-    assert!(buffer.contains("Checklist"));
-    assert!(buffer.contains("Implement \"implement feature\""));
-    assert!(buffer.contains("Local validation loop"));
-    assert!(buffer.contains("Run local validation"));
-    assert!(buffer.contains("auto output"));
-    assert!(!buffer.contains("Output"));
+    assert!(!buffer.contains("Auto Flow"));
+    assert!(!buffer.contains("auto output"));
 }
 
 #[test]
-fn worktree_main_panel_omits_runtime_metadata_block() {
+fn worktree_main_panel_renders_five_agent_messages_without_indenting_user_message() {
     let config = test_config();
-    let sessions = vec![test_session("feature", AgentState::Running)];
+    let mut session = test_session("feature", AgentState::Running);
+    session.opencode_status = Some(OpencodeStatus {
+        server_url: None,
+        session_id: None,
+        title: None,
+        state: OpencodeState::Busy,
+        latest_message: Some("implementing the panel".to_string()),
+        latest_user_message: Some("please update the panel".to_string()),
+        recent_messages: vec![
+            "third message".to_string(),
+            "second message".to_string(),
+            "first message".to_string(),
+            "older message".to_string(),
+            "oldest message".to_string(),
+        ],
+        active_tool: Some("bash".to_string()),
+        todos: Vec::new(),
+        last_updated_unix_ms: None,
+    });
+    let sessions = vec![session];
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    let buffer = render_to_buffer(&model, 120, 30);
-    let main = region_text(&buffer, 56..120, 0..29);
+    let lines = worktree_detail_lines(&model);
+    let agent = lines
+        .iter()
+        .position(|line| line.to_string().contains("Agent"))
+        .unwrap();
 
-    assert!(main.contains("feature"));
-    assert!(main.contains("prompt implement feature"));
-    assert!(!main.contains("status "));
-    assert!(!main.contains("kind "));
-    assert!(!main.contains("adopted "));
-    assert!(!main.contains("opencode "));
-    assert!(!main.contains("server "));
-    assert!(!main.contains("session "));
-    assert!(!main.contains("updated "));
+    assert!(lines[agent + 1].to_string().contains("● busy  bash"));
+    assert!(lines[agent + 2].to_string().contains("user"));
+    assert!(lines[agent + 2].to_string().starts_with("user please"));
+    assert!(
+        lines[agent + 2]
+            .to_string()
+            .contains("please update the panel")
+    );
+    assert_eq!(lines[agent + 2].spans[1].style.fg, Some(Color::White));
+    assert_eq!(lines[agent + 3].to_string(), "third message");
+    assert_eq!(lines[agent + 4].to_string(), "second message");
+    assert_eq!(lines[agent + 5].to_string(), "first message");
+    assert_eq!(lines[agent + 6].to_string(), "older message");
+    assert_eq!(lines[agent + 7].to_string(), "oldest message");
+    assert!(lines[agent + 8].to_string().is_empty());
 }
 
 #[test]
-fn pr_comments_table_omits_severity_column() {
+fn worktree_main_panel_renders_idle_status_and_reserves_five_message_lines() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let lines = worktree_detail_lines(&model);
+    let agent = lines
+        .iter()
+        .position(|line| line.to_string().contains("Agent"))
+        .unwrap();
+
+    assert!(lines[agent + 1].to_string().contains("○ idle"));
+    assert!(lines[agent + 2].to_string().contains("user"));
+    assert!(lines[agent + 3].to_string().is_empty());
+    assert!(lines[agent + 4].to_string().is_empty());
+    assert!(lines[agent + 5].to_string().is_empty());
+    assert!(lines[agent + 6].to_string().is_empty());
+    assert!(lines[agent + 7].to_string().is_empty());
+}
+
+#[test]
+fn worktree_main_panel_renders_unknown_opencode_status_as_needing_restart() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Running);
+    session.opencode_status = Some(OpencodeStatus {
+        server_url: None,
+        session_id: None,
+        title: None,
+        state: OpencodeState::Unknown,
+        latest_message: None,
+        latest_user_message: None,
+        recent_messages: Vec::new(),
+        active_tool: None,
+        todos: Vec::new(),
+        last_updated_unix_ms: None,
+    });
+    let sessions = vec![session];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let lines = worktree_detail_lines(&model);
+    let agent = lines
+        .iter()
+        .position(|line| line.to_string().contains("Agent"))
+        .unwrap();
+
+    assert!(lines[agent + 1].to_string().contains("↻ needs restart"));
+}
+
+#[test]
+fn worktree_main_panel_renders_unknown_status_with_active_tool_as_running() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Running);
+    session.opencode_status = Some(OpencodeStatus {
+        server_url: None,
+        session_id: None,
+        title: None,
+        state: OpencodeState::Unknown,
+        latest_message: None,
+        latest_user_message: None,
+        recent_messages: Vec::new(),
+        active_tool: Some("bash running".to_string()),
+        todos: Vec::new(),
+        last_updated_unix_ms: None,
+    });
+    let sessions = vec![session];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let lines = worktree_detail_lines(&model);
+    let agent = lines
+        .iter()
+        .position(|line| line.to_string().contains("Agent"))
+        .unwrap();
+
+    assert!(
+        lines[agent + 1]
+            .to_string()
+            .contains("● running  bash running")
+    );
+}
+
+#[test]
+fn worktree_main_panel_renders_idle_status_with_active_tool_as_running() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::ExitedOk);
+    session.opencode_status = Some(OpencodeStatus {
+        server_url: None,
+        session_id: None,
+        title: None,
+        state: OpencodeState::Idle,
+        latest_message: None,
+        latest_user_message: None,
+        recent_messages: Vec::new(),
+        active_tool: Some("task running".to_string()),
+        todos: Vec::new(),
+        last_updated_unix_ms: None,
+    });
+    let sessions = vec![session];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let lines = worktree_detail_lines(&model);
+    let agent = lines
+        .iter()
+        .position(|line| line.to_string().contains("Agent"))
+        .unwrap();
+
+    assert!(
+        lines[agent + 1]
+            .to_string()
+            .contains("● running  task running")
+    );
+}
+
+#[test]
+fn worktree_main_panel_renders_opencode_workflow_states() {
+    let config = test_config();
+    for (state, expected) in [
+        (OpencodeState::Retry, "↻ retrying"),
+        (OpencodeState::Idle, "✓ done"),
+        (OpencodeState::NeedsInput, "! needs input"),
+        (OpencodeState::Error, "✕ failed"),
+    ] {
+        let mut session = test_session("feature", AgentState::Running);
+        session.opencode_status = Some(OpencodeStatus {
+            server_url: None,
+            session_id: None,
+            title: None,
+            state,
+            latest_message: None,
+            latest_user_message: None,
+            recent_messages: Vec::new(),
+            active_tool: None,
+            todos: Vec::new(),
+            last_updated_unix_ms: None,
+        });
+        let sessions = vec![session];
+        let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+        let lines = worktree_detail_lines(&model);
+        let status = lines
+            .iter()
+            .find(|line| line.to_string().starts_with("status "))
+            .unwrap();
+        assert!(status.to_string().contains(expected));
+    }
+}
+
+#[test]
+fn worktree_main_panel_renders_pr_comments_table() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
     session.pr.summary = Some(test_pr_summary());
@@ -828,7 +994,41 @@ fn pr_comments_table_omits_severity_column() {
     let buffer = render_to_string(&model, 120, 30);
 
     assert!(buffer.contains("kind   res author       text"));
-    assert!(!buffer.contains("sev"));
+    assert!(buffer.contains("inline"));
+    assert!(buffer.contains("no"));
+    assert!(buffer.contains("please fix"));
+}
+
+#[test]
+fn worktree_main_panel_styles_open_and_merged_pr_numbers() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Idle);
+    session.pr.summary = Some(test_pr_summary());
+    let sessions = vec![session];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let open = render_to_buffer(&model, 120, 30);
+    let open_row = find_line(&open, "⇄ #42");
+    let open_x = (open.area.x..open.area.x + open.area.width)
+        .find(|x| open[(*x, open_row)].symbol() == "⇄")
+        .unwrap();
+    assert_eq!(open[(open_x, open_row)].style().fg, Some(Color::Green));
+
+    let mut session = test_session("feature", AgentState::Idle);
+    let mut summary = test_pr_summary();
+    summary.merged = true;
+    summary.state = "MERGED".to_string();
+    session.pr.summary = Some(summary);
+    let sessions = vec![session];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let merged = render_to_buffer(&model, 120, 30);
+    let merged_row = find_line(&merged, "⋈ #42");
+    let merged_x = (merged.area.x..merged.area.x + merged.area.width)
+        .find(|x| merged[(*x, merged_row)].symbol() == "⋈")
+        .unwrap();
+    assert_eq!(
+        merged[(merged_x, merged_row)].style().fg,
+        Some(Color::Magenta)
+    );
 }
 
 #[test]
@@ -846,11 +1046,16 @@ fn renders_stabilization_pending_push_in_worktree_main_panel() {
 
     let buffer = render_to_string(&model, 120, 40);
 
-    assert!(buffer.contains("PR Stabilization"));
-    assert!(buffer.contains("code review"));
-    assert!(buffer.contains("merge conflicts"));
-    assert!(buffer.contains("pending push"));
-    assert!(buffer.contains("guard"));
+    assert!(buffer.contains("PR"));
+    assert!(buffer.contains("pr #"));
+    assert!(buffer.contains("42"));
+    assert!(buffer.contains("name"));
+    assert!(buffer.contains("Feature PR"));
+    assert!(buffer.contains("merge"));
+    assert!(buffer.contains("ci"));
+    assert!(buffer.contains("review"));
+    assert!(!buffer.contains("pending push"));
+    assert!(!buffer.contains("guard"));
     assert!(buffer.contains("state"));
     assert!(buffer.contains("PendingPush"));
     assert!(buffer.contains("next"));
@@ -860,7 +1065,7 @@ fn renders_stabilization_pending_push_in_worktree_main_panel() {
 }
 
 #[test]
-fn renders_requested_pr_review_as_pending_when_approval_gate_is_disabled() {
+fn worktree_main_panel_renders_review_gate() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
     let mut summary = test_pr_summary();
@@ -874,12 +1079,10 @@ fn renders_requested_pr_review_as_pending_when_approval_gate_is_disabled() {
         None,
     ));
 
-    let buffer = render_to_buffer(&model, 120, 40);
-    let review_row = find_line(&buffer, "code review");
-    let review_status = line_text(&buffer, review_row);
+    let buffer = render_to_string(&model, 120, 40);
 
-    assert!(review_status.contains("pending"));
-    assert!(!review_status.contains("disabled"));
+    assert!(buffer.contains("review"));
+    assert!(buffer.contains("pending"));
 }
 
 #[test]
@@ -897,8 +1100,6 @@ fn renders_stabilization_ci_failed_in_worktree_main_panel() {
 
     let buffer = render_to_string(&model, 120, 40);
 
-    assert!(buffer.contains("ci"));
-    assert!(buffer.contains("failed"));
     assert!(buffer.contains("state"));
     assert!(buffer.contains("CiFailed"));
     assert!(buffer.contains("next"));
@@ -923,7 +1124,7 @@ fn renders_stabilization_merge_blocked_in_worktree_main_panel() {
 
     let buffer = render_to_string(&model, 120, 40);
 
-    assert!(buffer.contains("merge conflicts"));
+    assert!(buffer.contains("merge"));
     assert!(buffer.contains("blocked"));
     assert!(buffer.contains("state"));
     assert!(buffer.contains("MergeBlocked"));
@@ -978,13 +1179,63 @@ fn renders_stabilization_ready_for_manual_merge_in_worktree_main_panel() {
 
     let buffer = render_to_string(&model, 120, 40);
 
-    assert!(buffer.contains("ci"));
-    assert!(buffer.contains("code review"));
-    assert!(buffer.contains("required"));
     assert!(buffer.contains("state"));
     assert!(buffer.contains("ReadyForManualMerge"));
     assert!(buffer.contains("next"));
     assert!(buffer.contains("MarkReadyForManualMerge"));
+}
+
+#[test]
+fn worktree_main_panel_always_renders_empty_pr_keys() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let buffer = render_to_string(&model, 120, 30);
+
+    assert!(buffer.contains("PR"));
+    for key in [
+        "pr #", "name", "state", "next", "ci", "review", "merge", "policy",
+    ] {
+        assert!(buffer.contains(key), "missing PR key: {key}");
+    }
+    assert!(!buffer.contains("No PR detected"));
+    assert!(!buffer.contains("Description"));
+    assert!(!buffer.contains("Activity"));
+    assert!(!buffer.contains("refreshed"));
+}
+
+#[test]
+fn worktree_main_panel_hides_stabilization_values_without_pr() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.auto_dashboard = Some(stabilization_dashboard(
+        StabilizationBlocker::NeedsPullRequest,
+        StabilizationWorkKind::PushInitialAndOpenPr,
+        Some(test_pending_push_guard()),
+    ));
+    let buffer = render_to_string(&model, 120, 30);
+
+    assert!(!buffer.contains("NeedsPullRequest"));
+    assert!(!buffer.contains("PushInitialAndOpenPr"));
+    assert!(!buffer.contains("review repair"));
+}
+
+#[test]
+fn main_panel_applies_scroll_for_every_focus() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Running)];
+
+    for focus in [PanelFocus::Status, PanelFocus::Repos, PanelFocus::Worktrees] {
+        let mut model = test_model(&config, &sessions, focus, None, None);
+        let unscrolled = render_to_string(&model, 120, 6);
+        model.main_scroll = 2;
+        let scrolled = render_to_string(&model, 120, 6);
+        assert_ne!(
+            unscrolled, scrolled,
+            "main panel did not scroll for {focus:?}"
+        );
+    }
 }
 
 fn render_to_string(model: &FrameModel<'_>, cols: u16, rows: u16) -> String {
@@ -1205,6 +1456,7 @@ fn test_model<'a>(
         selected_comment: 0,
         focus,
         main_focused: false,
+        main_scroll: 0,
         repo_main_view: RepoMainView::Github,
         worktree_main_view: WorktreeMainView::Details,
         worktree_list_mode: WorktreeListMode::Repo,

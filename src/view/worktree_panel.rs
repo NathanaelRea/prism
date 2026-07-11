@@ -3,14 +3,15 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StabilizationPanelModel {
     pub icon_style: IconStyle,
+    pub pr_number: String,
+    pub pr_merged: bool,
+    pub pr_name: String,
     pub blocker: String,
     pub next: String,
-    pub guard: Option<String>,
     pub ci: String,
     pub review: String,
     pub merge: String,
     pub policy: String,
-    pub pending_commit: Option<String>,
 }
 
 pub(super) fn worktree_detail_lines(model: &crate::view::FrameModel<'_>) -> Vec<Line<'static>> {
@@ -34,27 +35,100 @@ pub(super) fn worktree_detail_lines(model: &crate::view::FrameModel<'_>) -> Vec<
         lines.push(Line::from(""));
         lines.push(labelled_line("prompt", session.prompt_summary.clone()));
     }
-    if let Some(stabilization) = stabilization_panel_model(model, session) {
-        lines.push(Line::from(""));
-        lines.extend(stabilization_panel_lines(&stabilization));
-    }
     lines.push(Line::from(""));
-    lines.extend(pr_panel_lines(
-        model.config,
-        Some(session),
-        model.selected_comment,
-    ));
+    lines.extend(agent_lines(session));
+    lines.push(Line::from(""));
+    lines.extend(stabilization_panel_lines(&stabilization_panel_model(
+        model, session,
+    )));
+    if let Some(details) = &session.pr.details {
+        lines.extend(pr_comment_lines(details, 5, model.selected_comment));
+    }
+    lines
+}
+
+fn agent_lines(session: &Session) -> Vec<Line<'static>> {
+    let (state, icon, label, tool, user_message, messages) = session
+        .opencode_status
+        .as_ref()
+        .map(|status| {
+            let tool = status.active_tool.as_deref();
+            let has_active_tool = tool.is_some_and(|tool| !tool.trim().is_empty());
+            let state = if matches!(status.state, OpencodeState::Starting | OpencodeState::Busy)
+                || has_active_tool
+            {
+                AgentState::Running
+            } else {
+                status.state.agent_state()
+            };
+            let icon = if matches!(status.state, OpencodeState::Unknown | OpencodeState::Idle)
+                && state == AgentState::Running
+            {
+                agent_icon(state)
+            } else {
+                opencode_icon(status.state)
+            };
+            (
+                state,
+                icon,
+                match status.state {
+                    OpencodeState::Starting => "starting",
+                    OpencodeState::Busy => "busy",
+                    OpencodeState::Retry => "retrying",
+                    OpencodeState::Idle if state == AgentState::Running => "running",
+                    OpencodeState::Idle => "done",
+                    OpencodeState::NeedsInput => "needs input",
+                    OpencodeState::Error => "failed",
+                    OpencodeState::Unknown if state == AgentState::Running => "running",
+                    OpencodeState::Unknown | OpencodeState::Offline => "needs restart",
+                },
+                tool,
+                status.latest_user_message.as_deref(),
+                status.recent_messages.as_slice(),
+            )
+        })
+        .unwrap_or((
+            session.agent_state,
+            agent_icon(session.agent_state),
+            session.agent_state.label(),
+            None,
+            None,
+            &[],
+        ));
+    let status = match tool.filter(|tool| !tool.trim().is_empty()) {
+        Some(tool) => format!("{label}  {tool}"),
+        None => label.to_string(),
+    };
+    let mut lines = vec![
+        heading_line("Agent"),
+        Line::from(vec![
+            Span::styled("status ", muted_style()),
+            Span::styled(icon, agent_style(state)),
+            Span::raw(format!(" {status}")),
+        ]),
+        Line::from(vec![
+            Span::styled("user ", muted_style()),
+            Span::styled(
+                truncate(user_message.unwrap_or_default(), 74),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+    ];
+    for index in 0..5 {
+        lines.push(Line::from(
+            messages
+                .get(index)
+                .map(|message| truncate(message, 86))
+                .unwrap_or_default(),
+        ));
+    }
     lines
 }
 
 pub(crate) fn stabilization_panel_model(
     model: &crate::view::FrameModel<'_>,
     session: &Session,
-) -> Option<StabilizationPanelModel> {
-    if session.is_default_branch(model.config) || session.is_detached() {
-        return None;
-    }
-
+) -> StabilizationPanelModel {
     let run = model
         .auto_dashboard
         .as_ref()
@@ -67,29 +141,54 @@ pub(crate) fn stabilization_panel_model(
                 .map(|_| StabilizationBlocker::PendingPush)
         })
         .or_else(|| cached_pr_blocker(model.config, session));
-    let blocker = blocker?;
-    let next = run
-        .and_then(|run| run.stabilization_next_work.as_ref())
-        .cloned()
-        .unwrap_or_else(|| cached_next_work(&blocker));
-    let pending_push = run.and_then(|run| run.pending_push.as_ref());
+    let next = blocker.as_ref().map(|blocker| {
+        run.and_then(|run| run.stabilization_next_work.as_ref())
+            .cloned()
+            .unwrap_or_else(|| cached_next_work(blocker))
+    });
+    let summary = session.pr.summary.as_ref();
 
-    Some(StabilizationPanelModel {
+    if summary.is_none() {
+        return StabilizationPanelModel {
+            icon_style: model.config.icon_style,
+            pr_number: String::new(),
+            pr_merged: false,
+            pr_name: String::new(),
+            blocker: String::new(),
+            next: String::new(),
+            ci: String::new(),
+            review: String::new(),
+            merge: String::new(),
+            policy: String::new(),
+        };
+    }
+
+    StabilizationPanelModel {
         icon_style: model.config.icon_style,
-        blocker: blocker_label(&blocker),
-        next: work_label(&next),
-        guard: pending_push.map(guard_label),
-        ci: ci_gate_label(session, &blocker),
+        pr_number: summary
+            .map(|summary| summary.number.to_string())
+            .unwrap_or_default(),
+        pr_merged: summary.is_some_and(|summary| summary.merged),
+        pr_name: summary
+            .map(|summary| summary.title.clone())
+            .unwrap_or_default(),
+        blocker: blocker.as_ref().map(blocker_label).unwrap_or_default(),
+        next: next.as_ref().map(work_label).unwrap_or_default(),
+        ci: blocker
+            .as_ref()
+            .map(|blocker| ci_gate_label(session, blocker))
+            .unwrap_or_default(),
         review: review_gate_label(model.config, session),
         merge: merge_gate_label(session),
-        policy: policy_gate_label(&blocker),
-        pending_commit: pending_push.map(pending_commit_label),
-    })
+        policy: blocker.as_ref().map(policy_gate_label).unwrap_or_default(),
+    }
 }
 
 pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<Line<'static>> {
     let mut lines = vec![
-        heading_line("PR Stabilization"),
+        heading_line("PR"),
+        pr_number_line(model),
+        stabilization_value_line("name", &model.pr_name, selected_text_style()),
         stabilization_value_line(
             "state",
             &model.blocker,
@@ -99,12 +198,12 @@ pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<
     ];
     lines.push(stabilization_gate_line("ci", &model.ci, model.icon_style));
     lines.push(stabilization_gate_line(
-        "code review",
+        "review",
         &model.review,
         model.icon_style,
     ));
     lines.push(stabilization_gate_line(
-        "merge conflicts",
+        "merge",
         &model.merge,
         model.icon_style,
     ));
@@ -113,17 +212,34 @@ pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<
         &model.policy,
         model.icon_style,
     ));
-    if let Some(commit) = &model.pending_commit {
-        lines.push(stabilization_gate_line(
-            "pending push",
-            commit,
-            model.icon_style,
-        ));
-    }
-    if let Some(guard) = &model.guard {
-        lines.push(stabilization_gate_line("guard", guard, model.icon_style));
-    }
     lines
+}
+
+fn pr_number_line(model: &StabilizationPanelModel) -> Line<'static> {
+    let Some(number) = model
+        .pr_number
+        .parse::<u64>()
+        .ok()
+        .filter(|_| !model.pr_number.is_empty())
+    else {
+        return stabilization_value_line("pr #", "", Style::default());
+    };
+    let style = Style::default()
+        .fg(if model.pr_merged {
+            Color::Magenta
+        } else {
+            Color::Green
+        })
+        .add_modifier(Modifier::BOLD);
+    let symbol = if model.pr_merged {
+        icon(model.icon_style, "⋈", "")
+    } else {
+        icon(model.icon_style, "⇄", "")
+    };
+    Line::from(vec![
+        Span::styled(format!("{:<16}", "pr #"), muted_style()),
+        Span::styled(format!("{symbol} #{number}"), style),
+    ])
 }
 
 fn stabilization_value_line(label: &'static str, value: &str, style: Style) -> Line<'static> {
@@ -138,14 +254,9 @@ fn stabilization_gate_line(
     status: &str,
     icon_style: IconStyle,
 ) -> Line<'static> {
-    let pending_detail = matches!(gate, "pending push" | "guard");
-    let style = if pending_detail {
-        attention_style()
-    } else {
-        gate_style(status)
-    };
-    let status_icon = if pending_detail {
-        icon(icon_style, "…", "")
+    let style = gate_style(status);
+    let status_icon = if status.is_empty() {
+        ""
     } else {
         stabilization_status_icon(status, icon_style)
     };
@@ -248,43 +359,6 @@ fn pascal_label(value: &str) -> String {
         .collect::<String>()
 }
 
-fn guard_label(guard: &PendingPushGuard) -> String {
-    let mut parts = vec![format!(
-        "head {}",
-        short_sha(&guard.expected_local_head_sha)
-    )];
-    if let Some(base) = &guard.expected_base_sha {
-        parts.push(format!("base {}", short_sha(base)));
-    }
-    if let Some(remote) = &guard.expected_remote_head_sha {
-        parts.push(format!("remote {}", short_sha(remote)));
-    }
-    if let Some(pr_head) = &guard.expected_pr_head_sha {
-        parts.push(format!("pr {}", short_sha(pr_head)));
-    }
-    parts.join("  ")
-}
-
-fn pending_commit_label(guard: &PendingPushGuard) -> String {
-    format!(
-        "{} {}",
-        short_sha(&guard.commit_sha),
-        repair_kind_label(&guard.repair_kind)
-    )
-}
-
-fn repair_kind_label(kind: &crate::auto_flow::stabilization_model::RepairKind) -> &'static str {
-    match kind {
-        crate::auto_flow::stabilization_model::RepairKind::Review => "review repair",
-        crate::auto_flow::stabilization_model::RepairKind::Ci => "ci repair",
-        crate::auto_flow::stabilization_model::RepairKind::Merge => "merge repair",
-    }
-}
-
-fn short_sha(value: &str) -> String {
-    value.chars().take(7).collect()
-}
-
 fn ci_gate_label(session: &Session, blocker: &StabilizationBlocker) -> String {
     let Some(summary) = &session.pr.summary else {
         return "unknown".to_string();
@@ -350,7 +424,7 @@ fn review_gate_label(config: &crate::config::Config, session: &Session) -> Strin
 
 fn merge_gate_label(session: &Session) -> String {
     let Some(summary) = &session.pr.summary else {
-        return "unknown".to_string();
+        return String::new();
     };
     if merge_blocked(summary) {
         if summary.merge_state_status.trim().is_empty() {

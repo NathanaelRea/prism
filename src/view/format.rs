@@ -36,6 +36,18 @@ pub(super) fn agent_icon(state: AgentState) -> &'static str {
     }
 }
 
+pub(super) fn opencode_icon(state: OpencodeState) -> &'static str {
+    match state {
+        OpencodeState::Starting => "◌",
+        OpencodeState::Busy => "●",
+        OpencodeState::Retry => "↻",
+        OpencodeState::Idle => "✓",
+        OpencodeState::NeedsInput => "!",
+        OpencodeState::Error => "✕",
+        OpencodeState::Unknown | OpencodeState::Offline => "↻",
+    }
+}
+
 pub(super) fn git_status_indicator(status: &str, icon_style: IconStyle) -> String {
     let mut parts = Vec::new();
     if let Some(count) = status_count(status, "dirty") {

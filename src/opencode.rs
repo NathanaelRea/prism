@@ -59,6 +59,7 @@ pub struct OpencodeSession {
     pub directory: Option<String>,
     pub title: Option<String>,
     pub time_updated: Option<String>,
+    pub parent_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +69,7 @@ pub enum OpencodeState {
     Idle,
     Busy,
     Retry,
+    NeedsInput,
     Error,
     Offline,
 }
@@ -80,6 +82,7 @@ impl OpencodeState {
             Self::Idle => "idle",
             Self::Busy => "busy",
             Self::Retry => "retry",
+            Self::NeedsInput => "needs input",
             Self::Error => "error",
             Self::Offline => "offline",
         }
@@ -92,6 +95,7 @@ impl OpencodeState {
             "idle" | "ready" => Some(Self::Idle),
             "busy" | "running" | "working" => Some(Self::Busy),
             "retry" | "retrying" => Some(Self::Retry),
+            "needs input" | "needs-input" | "permission" => Some(Self::NeedsInput),
             "error" | "failed" => Some(Self::Error),
             "offline" | "disconnected" => Some(Self::Offline),
             _ => None,
@@ -100,9 +104,11 @@ impl OpencodeState {
 
     pub fn agent_state(self) -> AgentState {
         match self {
-            Self::Unknown | Self::Starting => AgentState::NeedsRestart,
-            Self::Idle => AgentState::NeedsInput,
+            Self::Unknown => AgentState::NeedsRestart,
+            Self::Starting => AgentState::Running,
+            Self::Idle => AgentState::ExitedOk,
             Self::Busy | Self::Retry => AgentState::Running,
+            Self::NeedsInput => AgentState::NeedsInput,
             Self::Error => AgentState::ExitedError,
             Self::Offline => AgentState::NeedsRestart,
         }
@@ -122,6 +128,8 @@ pub struct OpencodeStatus {
     pub title: Option<String>,
     pub state: OpencodeState,
     pub latest_message: Option<String>,
+    pub latest_user_message: Option<String>,
+    pub recent_messages: Vec<String>,
     pub active_tool: Option<String>,
     pub todos: Vec<OpencodeTodo>,
     pub last_updated_unix_ms: Option<u64>,
@@ -145,6 +153,8 @@ impl OpencodeStatus {
             title: None,
             state: OpencodeState::Offline,
             latest_message: None,
+            latest_user_message: None,
+            recent_messages: Vec::new(),
             active_tool: None,
             todos: Vec::new(),
             last_updated_unix_ms: Some(unix_ms()),
@@ -464,6 +474,8 @@ pub fn poll_status(runtime: &OpencodeRuntime) -> Result<OpencodeStatus, String> 
             title: None,
             state: OpencodeState::Starting,
             latest_message: None,
+            latest_user_message: None,
+            recent_messages: Vec::new(),
             active_tool: None,
             todos: Vec::new(),
             last_updated_unix_ms: Some(unix_ms()),
@@ -481,9 +493,17 @@ pub fn poll_status(runtime: &OpencodeRuntime) -> Result<OpencodeStatus, String> 
         directory: None,
         title: None,
         time_updated: None,
+        parent_id: None,
     });
-    let state = fetch_session_state(&runtime.server_url, session_id).unwrap_or(OpencodeState::Idle);
-    let messages = fetch_message_summary(&runtime.server_url, session_id).unwrap_or_default();
+    let mut state =
+        fetch_session_state(&runtime.server_url, session_id).unwrap_or(OpencodeState::Idle);
+    if fetch_pending_permission(&runtime.server_url, session_id).unwrap_or(false) {
+        state = OpencodeState::NeedsInput;
+    }
+    let mut messages = fetch_message_summary(&runtime.server_url, session_id).unwrap_or_default();
+    if state == OpencodeState::NeedsInput {
+        messages.active_tool = None;
+    }
     let todos = fetch_todos(&runtime.server_url, session_id).unwrap_or_default();
 
     Ok(OpencodeStatus {
@@ -492,6 +512,8 @@ pub fn poll_status(runtime: &OpencodeRuntime) -> Result<OpencodeStatus, String> 
         title: session.title,
         state,
         latest_message: messages.latest_message,
+        latest_user_message: messages.latest_user_message,
+        recent_messages: messages.recent_messages,
         active_tool: messages.active_tool,
         todos,
         last_updated_unix_ms: Some(unix_ms()),
@@ -511,9 +533,16 @@ pub fn poll_session_status(server_url: &str, session_id: &str) -> Result<Opencod
         directory: None,
         title: None,
         time_updated: None,
+        parent_id: None,
     });
-    let state = fetch_session_state(server_url, session_id).unwrap_or(OpencodeState::Idle);
-    let messages = fetch_message_summary(server_url, session_id).unwrap_or_default();
+    let mut state = fetch_session_state(server_url, session_id).unwrap_or(OpencodeState::Idle);
+    if fetch_pending_permission(server_url, session_id).unwrap_or(false) {
+        state = OpencodeState::NeedsInput;
+    }
+    let mut messages = fetch_message_summary(server_url, session_id).unwrap_or_default();
+    if state == OpencodeState::NeedsInput {
+        messages.active_tool = None;
+    }
     let todos = fetch_todos(server_url, session_id).unwrap_or_default();
 
     Ok(OpencodeStatus {
@@ -522,6 +551,8 @@ pub fn poll_session_status(server_url: &str, session_id: &str) -> Result<Opencod
         title: session.title,
         state,
         latest_message: messages.latest_message,
+        latest_user_message: messages.latest_user_message,
+        recent_messages: messages.recent_messages,
         active_tool: messages.active_tool,
         todos,
         last_updated_unix_ms: Some(unix_ms()),
@@ -704,6 +735,11 @@ pub fn parse_event_payload(payload: &str) -> Option<OpencodeEvent> {
     let object = event_body(&value).unwrap_or(&value);
     let session_id = session_id_field(&value).or_else(|| session_id_field(object));
     let state = string_field(object, &["status", "state"])
+        .or_else(|| {
+            object
+                .get("status")
+                .and_then(|status| string_field(status, &["type"]))
+        })
         .or_else(|| string_field(&value, &["status", "state"]))
         .and_then(|value| parse_state_label(&value))
         .or_else(|| event_type_state(&event_type));
@@ -789,6 +825,8 @@ fn submit_prompt_body(session_id: &str) -> String {
 #[derive(Default)]
 struct MessageSummary {
     latest_message: Option<String>,
+    latest_user_message: Option<String>,
+    recent_messages: Vec<String>,
     active_tool: Option<String>,
 }
 
@@ -801,13 +839,29 @@ fn fetch_session_state(server_url: &str, session_id: &str) -> Result<OpencodeSta
             &response.body,
         ));
     }
-    Ok(parse_session_state(&response.body, session_id).unwrap_or(OpencodeState::Unknown))
+    Ok(session_state_from_status_body(&response.body, session_id))
+}
+
+fn session_state_from_status_body(body: &str, session_id: &str) -> OpencodeState {
+    parse_session_state(body, session_id).unwrap_or(OpencodeState::Idle)
+}
+
+fn fetch_pending_permission(server_url: &str, session_id: &str) -> Result<bool, String> {
+    let response = get(server_url, "/permission", API_TIMEOUT)?;
+    if !success_status(response.status_code) {
+        return Err(http_error_message(
+            "read opencode permissions",
+            response.status_code,
+            &response.body,
+        ));
+    }
+    Ok(has_pending_permission(&response.body, session_id))
 }
 
 fn fetch_message_summary(server_url: &str, session_id: &str) -> Result<MessageSummary, String> {
     let response = get(
         server_url,
-        &format!("/session/{}/message?limit=5", url_path_segment(session_id)),
+        &format!("/session/{}/message?limit=10", url_path_segment(session_id)),
         API_TIMEOUT,
     )?;
     if !success_status(response.status_code) {
@@ -1257,11 +1311,24 @@ fn parse_session(body: &str) -> Option<OpencodeSession> {
 
 fn parse_session_object(object: &Value) -> Option<OpencodeSession> {
     let id = string_field(object, &["id", "sessionID"])?;
+    let time_updated =
+        string_field(object, &["timeUpdated", "updatedAt", "updated_at"]).or_else(|| {
+            object
+                .get("time")
+                .and_then(|time| time.get("updated").or_else(|| time.get("updatedAt")))
+                .and_then(|updated| {
+                    updated
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|| updated.as_u64().map(|value| value.to_string()))
+                })
+        });
     Some(OpencodeSession {
         id,
         directory: string_field(object, &["directory", "cwd", "path"]),
         title: string_field(object, &["title"]),
-        time_updated: string_field(object, &["timeUpdated", "updatedAt", "updated_at"]),
+        time_updated,
+        parent_id: string_field(object, &["parentID", "parentId", "parent_id"]),
     })
 }
 
@@ -1295,6 +1362,15 @@ fn parse_session_state(body: &str, session_id: &str) -> Option<OpencodeState> {
         .and_then(|value| parse_state_label(&value))
 }
 
+fn has_pending_permission(body: &str, session_id: &str) -> bool {
+    let Some(value) = parse_json_value(body) else {
+        return false;
+    };
+    collection_items(&value, &["data", "permissions", "items"])
+        .into_iter()
+        .any(|permission| session_id_field(permission).as_deref() == Some(session_id))
+}
+
 fn parse_state_label(value: &str) -> Option<OpencodeState> {
     OpencodeState::parse(value)
 }
@@ -1303,6 +1379,7 @@ fn event_type_state(event_type: &str) -> Option<OpencodeState> {
     match event_type {
         "session.idle" => Some(OpencodeState::Idle),
         "session.error" => Some(OpencodeState::Error),
+        "permission.asked" | "permission.updated" => Some(OpencodeState::NeedsInput),
         _ => None,
     }
 }
@@ -1316,12 +1393,22 @@ fn parse_message_summary(body: &str) -> MessageSummary {
         return MessageSummary::default();
     };
     let mut summary = MessageSummary::default();
-    for object in collection_items(&value, &["data", "messages", "items"]) {
-        if summary.latest_message.is_none()
-            && is_assistant_like(object)
-            && let Some(text) = message_text(object)
+    for object in collection_items(&value, &["data", "messages", "items"])
+        .into_iter()
+        .rev()
+    {
+        if summary.recent_messages.len() < 5
+            && let Some(text) = assistant_message_text(object)
         {
-            summary.latest_message = Some(text);
+            if summary.latest_message.is_none() {
+                summary.latest_message = Some(text.clone());
+            }
+            summary.recent_messages.push(text);
+        }
+        if summary.latest_user_message.is_none()
+            && let Some(text) = role_message_text(object, "user")
+        {
+            summary.latest_user_message = Some(text);
         }
         if summary.active_tool.is_none()
             && is_active_tool(object)
@@ -1329,8 +1416,45 @@ fn parse_message_summary(body: &str) -> MessageSummary {
         {
             summary.active_tool = Some(tool);
         }
+        if let Some(parts) = object.get("parts").and_then(Value::as_array) {
+            for part in parts.iter().rev() {
+                if summary.active_tool.is_none()
+                    && is_active_tool(part)
+                    && let Some(tool) = tool_label(part)
+                {
+                    summary.active_tool = Some(tool);
+                }
+            }
+        }
     }
     summary
+}
+
+fn assistant_message_text(object: &Value) -> Option<String> {
+    if is_assistant_like(object) {
+        return message_text(object);
+    }
+    role_message_text(object, "assistant")
+}
+
+fn role_message_text(object: &Value, role: &str) -> Option<String> {
+    let matches_role =
+        |value: &Value| string_field(value, &["role"]).is_some_and(|value_role| value_role == role);
+    if matches_role(object) {
+        return message_text(object);
+    }
+    if !object.get("info").is_some_and(matches_role) {
+        return None;
+    }
+    let text = object
+        .get("parts")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|part| is_assistant_like(part))
+        .filter_map(message_text)
+        .collect::<Vec<_>>()
+        .join(" ");
+    (!text.is_empty()).then_some(text)
 }
 
 fn is_assistant_like(object: &Value) -> bool {
@@ -1348,7 +1472,7 @@ fn message_text(object: &Value) -> Option<String> {
 fn is_active_tool(object: &Value) -> bool {
     let type_is_tool = string_field(object, &["type", "partType"])
         .is_some_and(|event_type| event_type.contains("tool"));
-    let status_is_active = string_field(object, &["status", "state"])
+    let status_is_active = tool_status(object)
         .map(|status| {
             matches!(
                 status.as_str(),
@@ -1361,10 +1485,19 @@ fn is_active_tool(object: &Value) -> bool {
 
 fn tool_label(object: &Value) -> Option<String> {
     let name = string_field(object, &["tool", "name", "title"])?;
-    let status = string_field(object, &["status", "state"]);
+    let status = tool_status(object);
     Some(match status {
         Some(status) if !status.is_empty() => format!("{name} {status}"),
         _ => name,
+    })
+}
+
+fn tool_status(object: &Value) -> Option<String> {
+    string_field(object, &["status", "state"]).or_else(|| {
+        object
+            .get("state")
+            .filter(|state| state.is_object())
+            .and_then(|state| string_field(state, &["status", "state"]))
     })
 }
 
@@ -1426,7 +1559,9 @@ fn newest_session_for_worktree<'a>(
 ) -> Option<&'a OpencodeSession> {
     sessions
         .iter()
-        .filter(|session| listed_session_matches_worktree(session, worktree_path))
+        .filter(|session| {
+            session.parent_id.is_none() && listed_session_matches_worktree(session, worktree_path)
+        })
         .max_by(|left, right| left.time_updated.cmp(&right.time_updated))
 }
 
@@ -1631,6 +1766,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_sessions_reads_nested_update_time_and_ignores_newer_child_session() {
+        let sessions = parse_sessions(
+            r#"[
+                {"id":"current","directory":"/repo/wt","time":{"updated":200}},
+                {"id":"child","directory":"/repo/wt","parentID":"current","time":{"updated":300}},
+                {"id":"old","directory":"/repo/wt","time":{"updated":100}}
+            ]"#,
+        );
+
+        let selected = newest_session_for_worktree(&sessions, "/repo/wt").unwrap();
+
+        assert_eq!(selected.id, "current");
+        assert_eq!(selected.time_updated.as_deref(), Some("200"));
+    }
+
+    #[test]
     fn parse_session_accepts_session_envelope_and_session_id_field() {
         let session = parse_session(
             r#"{"session":{"sessionID":"ses_1","cwd":"/repo/wt","title":"feature"}}"#,
@@ -1650,18 +1801,21 @@ mod tests {
                 directory: Some("/repo/other".to_string()),
                 title: None,
                 time_updated: Some("2026-01-03T00:00:00Z".to_string()),
+                parent_id: None,
             },
             OpencodeSession {
                 id: "old".to_string(),
                 directory: Some("/repo/wt".to_string()),
                 title: None,
                 time_updated: Some("2026-01-01T00:00:00Z".to_string()),
+                parent_id: None,
             },
             OpencodeSession {
                 id: "new".to_string(),
                 directory: Some("/repo/wt".to_string()),
                 title: None,
                 time_updated: Some("2026-01-02T00:00:00Z".to_string()),
+                parent_id: None,
             },
         ];
 
@@ -1678,18 +1832,21 @@ mod tests {
                 directory: Some("/repo/wt".to_string()),
                 title: None,
                 time_updated: Some("2026-01-01T00:00:00Z".to_string()),
+                parent_id: None,
             },
             OpencodeSession {
                 id: "new_without_directory".to_string(),
                 directory: None,
                 title: None,
                 time_updated: Some("2026-01-03T00:00:00Z".to_string()),
+                parent_id: None,
             },
             OpencodeSession {
                 id: "new_other_worktree".to_string(),
                 directory: Some("/repo/other".to_string()),
                 title: None,
                 time_updated: Some("2026-01-04T00:00:00Z".to_string()),
+                parent_id: None,
             },
         ];
 
@@ -1783,6 +1940,29 @@ mod tests {
         assert_eq!(summary.latest_message.as_deref(), Some("first reply"));
         assert_eq!(summary.active_tool.as_deref(), Some("bash running"));
 
+        assert!(has_pending_permission(
+            r#"[{"id":"per_1","sessionID":"ses_1","permission":"read"}]"#,
+            "ses_1"
+        ));
+        assert!(!has_pending_permission(
+            r#"[{"id":"per_1","sessionID":"ses_other","permission":"read"}]"#,
+            "ses_1"
+        ));
+
+        let summary = parse_message_summary(
+            r#"[
+                {"info":{"role":"user"},"parts":[{"type":"text","text":"question"}]},
+                {"info":{"role":"assistant"},"parts":[
+                    {"type":"text","text":"latest\nreply"},
+                    {"type":"tool","tool":"bash","state":{"status":"completed"}}
+                ]}
+            ]"#,
+        );
+        assert_eq!(summary.latest_message.as_deref(), Some("latest reply"));
+        assert_eq!(summary.latest_user_message.as_deref(), Some("question"));
+        assert_eq!(summary.recent_messages, vec!["latest reply"]);
+        assert_eq!(summary.active_tool, None);
+
         let todos = parse_todos(
             r#"{"todos":[
                 {"content":"write code","status":"in_progress"},
@@ -1795,6 +1975,18 @@ mod tests {
     }
 
     #[test]
+    fn missing_session_status_means_the_session_is_idle() {
+        assert_eq!(
+            session_state_from_status_body(r#"{}"#, "ses_1"),
+            OpencodeState::Idle
+        );
+        assert_eq!(
+            session_state_from_status_body(r#"{"ses_other":{"status":"busy"}}"#, "ses_1"),
+            OpencodeState::Idle
+        );
+    }
+
+    #[test]
     fn parses_opencode_status_sse_event() {
         let event = parse_event_payload(
             r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":"busy","title":"Feature"}}"#,
@@ -1804,6 +1996,24 @@ mod tests {
         assert_eq!(event.session_id.as_deref(), Some("ses_1"));
         assert_eq!(event.state, Some(OpencodeState::Busy));
         assert_eq!(event.title.as_deref(), Some("Feature"));
+
+        let event = parse_event_payload(
+            r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":{"type":"retry","attempt":2}}}"#,
+        )
+        .unwrap();
+        assert_eq!(event.state, Some(OpencodeState::Retry));
+
+        let event = parse_event_payload(
+            r#"{"type":"permission.updated","properties":{"id":"per_1","sessionID":"ses_1","title":"Run command"}}"#,
+        )
+        .unwrap();
+        assert_eq!(event.state, Some(OpencodeState::NeedsInput));
+
+        let event = parse_event_payload(
+            r#"{"type":"permission.asked","properties":{"id":"per_2","sessionID":"ses_1","permission":"read"}}"#,
+        )
+        .unwrap();
+        assert_eq!(event.state, Some(OpencodeState::NeedsInput));
     }
 
     #[test]
@@ -1858,7 +2068,11 @@ mod tests {
     #[test]
     fn opencode_state_maps_to_existing_agent_state() {
         assert_eq!(OpencodeState::Busy.agent_state(), AgentState::Running);
-        assert_eq!(OpencodeState::Idle.agent_state(), AgentState::NeedsInput);
+        assert_eq!(OpencodeState::Idle.agent_state(), AgentState::ExitedOk);
+        assert_eq!(
+            OpencodeState::NeedsInput.agent_state(),
+            AgentState::NeedsInput
+        );
         assert_eq!(
             OpencodeState::Offline.agent_state(),
             AgentState::NeedsRestart
