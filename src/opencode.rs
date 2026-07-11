@@ -258,15 +258,27 @@ pub fn get_session(server_url: &str, session_id: &str) -> Result<Option<Opencode
     }
 }
 
-pub fn create_session(server_url: &str, worktree: &Path) -> Result<OpencodeSession, String> {
+pub fn create_session(
+    server_url: &str,
+    worktree: &Path,
+    title: &str,
+) -> Result<OpencodeSession, String> {
     let directory = worktree.display().to_string();
-    let body = format!(r#"{{"directory":"{}"}}"#, json_escape(&directory));
+    let body = format!(
+        r#"{{"directory":"{}","title":"{}"}}"#,
+        json_escape(&directory),
+        json_escape(title)
+    );
     match post(server_url, "/session", &body, API_TIMEOUT) {
         Ok(response) if response.status_code == 200 || response.status_code == 201 => {
             parse_session(&response.body).ok_or_else(|| "created opencode session had no id".into())
         }
         Ok(response) if response.status_code == 400 || response.status_code == 415 => {
-            let fallback = post(server_url, "/session", "{}", API_TIMEOUT)?;
+            let directory_body = format!(r#"{{"directory":"{}"}}"#, json_escape(&directory));
+            let mut fallback = post(server_url, "/session", &directory_body, API_TIMEOUT)?;
+            if fallback.status_code == 400 || fallback.status_code == 415 {
+                fallback = post(server_url, "/session", "{}", API_TIMEOUT)?;
+            }
             if fallback.status_code != 200 && fallback.status_code != 201 {
                 return Err(format!(
                     "create opencode session failed with HTTP {}",
@@ -846,7 +858,7 @@ fn resolve_session(runtime: &OpencodeRuntime, worktree: &Path) -> Result<Opencod
         return Ok(session);
     }
 
-    create_session(&runtime.server_url, worktree)
+    create_session(&runtime.server_url, worktree, &runtime.branch)
 }
 
 fn newest_listed_session_for_worktree(

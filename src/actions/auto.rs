@@ -44,7 +44,6 @@ impl Tui {
         if let Some(run_id) = self.active_auto_runs.get(&session_path).cloned() {
             self.load_auto_run_snapshot(&context.repo.root, &run_id);
             self.selected_auto_run = Some(run_id);
-            self.focus_status();
             self.show_message("focused Auto Flow run")?;
             return Ok(());
         }
@@ -153,7 +152,6 @@ impl Tui {
         self.remember_auto_run(persisted.clone());
         self.selected_auto_run = Some(run_id);
         self.spawn_auto_run_executor(context.repo, context.config, persisted);
-        self.focus_status();
         self.show_message("started Auto Flow run")?;
         Ok(())
     }
@@ -162,47 +160,49 @@ impl Tui {
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<Option<AutoStartupSource>, String> {
-        loop {
-            let Some(answer) = self.prompt_line_dialog(
-                raw,
-                "Auto Flow",
-                "Implementation source [p]rompt/[e]xisting plan/[d]raft plan: ",
-                "p",
-            )?
-            else {
-                return Ok(None);
-            };
-            match answer.trim().to_ascii_lowercase().as_str() {
-                "" | "p" | "prompt" => return Ok(Some(AutoStartupSource::Prompt)),
-                "e" | "existing" | "existing plan" | "plan" | "file plan" | "plan file" => {
-                    return Ok(Some(AutoStartupSource::ExistingPlan));
-                }
-                "d" | "draft" | "draft plan" => return Ok(Some(AutoStartupSource::DraftPlan)),
-                _ => self.show_message("choose prompt, existing plan, or draft plan")?,
-            }
-        }
+        let answer = self.prompt_choice_dialog(
+            raw,
+            crate::view::ChoiceList {
+                title: "Auto Flow: Implementation Source".to_string(),
+                choices: [("p", "prompt"), ("e", "existing plan"), ("d", "draft plan")]
+                    .into_iter()
+                    .map(|(key, label)| crate::view::KeyChoice {
+                        key: key.to_string(),
+                        label: label.to_string(),
+                    })
+                    .collect(),
+            },
+        )?;
+        Ok(match answer.as_deref() {
+            Some("p") => Some(AutoStartupSource::Prompt),
+            Some("e") => Some(AutoStartupSource::ExistingPlan),
+            Some("d") => Some(AutoStartupSource::DraftPlan),
+            _ => None,
+        })
     }
 
     pub(super) fn prompt_auto_plan_run_mode(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<Option<PlanRunMode>, String> {
-        loop {
-            let Some(answer) = self.prompt_line_dialog(
-                raw,
-                "Auto Flow",
-                "Plan execution [s]equential/[p]arallel: ",
-                "s",
-            )?
-            else {
-                return Ok(None);
-            };
-            match answer.trim().to_ascii_lowercase().as_str() {
-                "" | "s" | "sequential" => return Ok(Some(PlanRunMode::Sequential)),
-                "p" | "parallel" => return Ok(Some(PlanRunMode::Parallel)),
-                _ => self.show_message("choose sequential or parallel plan execution")?,
-            }
-        }
+        let answer = self.prompt_choice_dialog(
+            raw,
+            crate::view::ChoiceList {
+                title: "Auto Flow: Plan Execution".to_string(),
+                choices: [("s", "sequential"), ("p", "parallel")]
+                    .into_iter()
+                    .map(|(key, label)| crate::view::KeyChoice {
+                        key: key.to_string(),
+                        label: label.to_string(),
+                    })
+                    .collect(),
+            },
+        )?;
+        Ok(match answer.as_deref() {
+            Some("s") => Some(PlanRunMode::Sequential),
+            Some("p") => Some(PlanRunMode::Parallel),
+            _ => None,
+        })
     }
 
     pub(super) fn spawn_auto_run_executor(
@@ -247,18 +247,22 @@ impl Tui {
         let Some(dashboard) = self.current_auto_dashboard() else {
             return Ok(false);
         };
-        let answer = self.prompt_line_dialog(
+        let answer = self.prompt_choice_dialog(
             raw,
-            "Abort Auto Flow",
-            "Abort selected step? Use 'all' for the whole run. [y/N/all] ",
-            "",
+            crate::view::ChoiceList {
+                title: "Abort Auto Flow".to_string(),
+                choices: [("s", "selected step"), ("a", "whole run")]
+                    .into_iter()
+                    .map(|(key, label)| crate::view::KeyChoice {
+                        key: key.to_string(),
+                        label: label.to_string(),
+                    })
+                    .collect(),
+            },
         )?;
         let Some(answer) = answer else {
             return Ok(true);
         };
-        if !answer.trim().eq_ignore_ascii_case("all") && !yes(&answer) {
-            return Ok(true);
-        }
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
@@ -266,7 +270,7 @@ impl Tui {
         crate::observability::with_writable_db(&repo, |conn| {
             let mut run = load_auto_run(conn, &run_id)?
                 .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
-            if answer.trim().eq_ignore_ascii_case("all") {
+            if answer == "a" {
                 for step in &mut run.steps {
                     if matches!(
                         step.status,
@@ -353,13 +357,13 @@ impl Tui {
         let Some(selected) = selected else {
             return Ok(true);
         };
-        let answer = self.prompt_line_dialog(
+        let should_retry = self.confirm_action_dialog(
             raw,
             "Retry Auto Flow",
-            "Retry from selected step? [y/N] ",
-            "",
+            "Retry from selected step?",
+            "Retry",
         )?;
-        if !answer.as_deref().map(yes).unwrap_or(false) {
+        if !should_retry {
             return Ok(true);
         }
         let repo = Repository {
@@ -431,13 +435,12 @@ impl Tui {
     ) -> Result<bool, String> {
         let description = next_auto_step_description(run)
             .unwrap_or_else(|| "determine the next Auto Flow step".to_string());
-        let answer = self.prompt_line_dialog(
+        self.confirm_action_dialog(
             raw,
             "Resume Auto Flow",
-            &format!("Next: {description}. Continue? [y/N] "),
-            "",
-        )?;
-        Ok(answer.as_deref().map(yes).unwrap_or(false))
+            &format!("Next: {description}. Continue?"),
+            "Continue",
+        )
     }
 
     pub(crate) fn dismiss_selected_auto_run(&mut self) -> Result<bool, String> {

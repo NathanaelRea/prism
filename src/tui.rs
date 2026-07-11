@@ -28,7 +28,7 @@ use crate::session::{Session, append_runtime_log};
 use crate::terminal::stdin_is_tty;
 use crate::tmux::TmuxWindow;
 use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
-use crate::util::{status_count, yes};
+use crate::util::status_count;
 use crate::view;
 
 pub struct Tui {
@@ -501,7 +501,7 @@ impl Tui {
         self.start_opencode_status_poll(true);
         self.start_opencode_event_listeners();
         self.refresh_plan_runs();
-        self.refresh_auto_runs();
+        self.refresh_auto_runs(true);
         self.draw(&mut runtime)?;
         if self.repos.is_empty() {
             match self.add_repository(&mut runtime) {
@@ -732,7 +732,7 @@ impl Tui {
                     self.start_opencode_status_poll(true);
                     self.start_opencode_event_listeners();
                     self.refresh_plan_runs();
-                    self.refresh_auto_runs();
+                    self.refresh_auto_runs(false);
                     self.poll_pull_requests(true);
                 }
                 Key::VisibilityUp => {
@@ -961,8 +961,12 @@ impl Tui {
         {
             return Ok(true);
         }
-        let answer = self.prompt_line(runtime, "Agents are running. Quit Prism? [y/N] ")?;
-        Ok(yes(&answer))
+        self.confirm_action_dialog(
+            runtime,
+            "Quit Prism",
+            "Agents are running. Quit Prism?",
+            "Quit",
+        )
     }
 
     fn enter_agent_mode(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
@@ -1187,16 +1191,6 @@ impl Tui {
         self.confirm_dialog(runtime, "Delete Session", lines, "Delete", "Cancel")
     }
 
-    pub(crate) fn prompt_line(
-        &mut self,
-        runtime: &mut TerminalRuntime,
-        prompt: &str,
-    ) -> Result<String, String> {
-        Ok(self
-            .prompt_line_dialog(runtime, "Prism", prompt, "")?
-            .unwrap_or_default())
-    }
-
     pub(crate) fn prompt_line_dialog(
         &mut self,
         runtime: &mut TerminalRuntime,
@@ -1352,12 +1346,14 @@ impl Tui {
                 continue;
             }
             match event.code {
-                KeyCode::Enter => {
+                KeyCode::Enter | KeyCode::Char('y' | 'Y') if plain_key(event) => {
                     self.dialog = None;
                     self.draw(runtime)?;
                     return Ok(true);
                 }
-                KeyCode::Esc => {
+                KeyCode::Esc | KeyCode::Char('n' | 'N')
+                    if event.code == KeyCode::Esc || plain_key(event) =>
+                {
                     self.dialog = None;
                     self.draw(runtime)?;
                     return Ok(false);
@@ -1375,6 +1371,25 @@ impl Tui {
                 _ => {}
             }
         }
+    }
+
+    pub(crate) fn confirm_action_dialog(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        title: &str,
+        message: &str,
+        confirm_label: &str,
+    ) -> Result<bool, String> {
+        self.confirm_dialog(
+            runtime,
+            title,
+            vec![view::DialogLine {
+                text: message.to_string(),
+                attention: false,
+            }],
+            confirm_label,
+            "Cancel",
+        )
     }
 
     pub(crate) fn show_message(&mut self, message: &str) -> Result<(), String> {
@@ -2227,10 +2242,10 @@ impl Tui {
     }
 
     fn poll_auto_runs(&mut self) -> bool {
-        self.refresh_auto_runs()
+        self.refresh_auto_runs(false)
     }
 
-    fn refresh_auto_runs(&mut self) -> bool {
+    fn refresh_auto_runs(&mut self, reconcile_stale: bool) -> bool {
         let mut changed = false;
         let repos = self
             .repos
@@ -2240,8 +2255,10 @@ impl Tui {
         for repo in repos {
             let loaded = crate::observability::with_writable_db(&repo, |conn| {
                 let mut runs = load_recent_active_runs_for_repo(conn, &repo.root, 8)?;
-                for run in &mut runs {
-                    let _ = reconcile_stale_auto_run(conn, run);
+                if reconcile_stale {
+                    for run in &mut runs {
+                        let _ = reconcile_stale_auto_run(conn, run);
+                    }
                 }
                 Ok(runs)
             });

@@ -246,9 +246,9 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
             }
             rendered.push(Line::from(""));
             rendered.push(Line::from(vec![
-                Span::styled("Enter ", selected_style(true)),
+                Span::styled("y/Enter ", selected_style(true)),
                 Span::styled(confirm_label.clone(), selected_style(true)),
-                Span::styled("   Esc/q ", muted_style()),
+                Span::styled("   n/Esc/q ", muted_style()),
                 Span::raw(cancel_label.clone()),
             ]));
             rendered

@@ -17,75 +17,73 @@ pub const CONFIG_SCHEMA_URL: &str =
 pub const CONFIG_SCHEMA_JSON: &str = include_str!("../schemas/config.schema.json");
 
 pub fn config_example() -> String {
-    format!(
-        "#:schema {CONFIG_SCHEMA_URL}\n\
-\n\
-# Prism config. Values here may be used in the global user config or a repository config.\n\
-# Global path: ~/.config/prism/config.toml\n\
-# Repository configs override global config for one repository.\n\
-\n\
-# default_agent = \"opencode\"\n\
-# default_base = \"main\"\n\
-# merge_method = \"squash\" # squash, merge, or rebase\n\
-# escape_key = \"esc-esc\" # esc-esc or ctrl-space\n\
-\n\
-# plan_dir = \"plans\"\n\
-# review_packet_dir = \".agent/review\"\n\
-# worktree_command = \"wt\"\n\
-\n\
-# Prism starts local OpenCode servers on deterministic ports in this range.\n\
-# opencode_port_base = 41000\n\
-# opencode_port_span = 1000\n\
-# opencode_shutdown_owned_servers = false\n\
-# opencode_plan_plugin = false\n\
-\n\
-# [layout]\n\
-# sidebar_width = 56\n\
-\n\
-[ui]\n\
-icon_style = \"unicode\" # or \"nerd-font\"\n\
-\n\
-# [worktrees]\n\
-# columns = []\n\
-\n\
-# [tools]\n\
-# opencode = \"opencode\"\n\
-# gh = \"gh\"\n\
-# git = \"git\"\n\
-# tmux = \"tmux\"\n\
-# wt = \"wt\"\n\
-\n\
-# [checks]\n\
-# pre_pr = [\"scripts/full-check.sh\"]\n\
-# pre_push = [\"scripts/full-check.sh\"]\n\
-# review_fix = [\"scripts/full-check.sh\"]\n\
-\n\
-# [auto]\n\
-# merge = false\n\
-# cleanup_after_merge = false\n\
-# require_review_approval = false\n\
-# push_initial = true\n\
-# push_repairs = false\n\
-# review_wait_enabled = true\n\
-# review_reviewer_identities = [\"Copilot\", \"github-copilot\"]\n\
-# review_max_wait_seconds = 300\n\
-# review_poll_interval_seconds = 30\n\
-# review_continue_on_timeout = true\n\
-# ci_wait_enabled = true\n\
-# ci_max_wait_seconds = 1800\n\
-# ci_poll_interval_seconds = 30\n\
-\n\
-# [agents.opencode]\n\
-# command = \"opencode run --format json\"\n\
-# prompt_mode = \"stdin\"\n\
-\n\
-# [prompt_templates]\n\
-# review_fix = \"Here are review comments on PR {{pr_number}}.\\n\\nIf they are applicable, fix them. Otherwise, say why not.\\n\\n---\\n\\n{{comments}}\"\n\
-# ci_failure = \"Here are CI failures on PR {{pr_number}}.\\n\\nFix the failing checks. Use the log tails below as the primary clues.\\n\\nPR: {{url}}\\nBranch: {{branch}}\\nHead SHA: {{head_sha}}\\n\\n---\\n\\n{{failures}}\"\n\
-# repair_commit_review = \"fix: cr\"\n\
-# repair_commit_ci = \"fix: ci\"\n\
-# repair_commit_merge = \"fix: merge\"\n"
-    )
+    format!("#:schema {CONFIG_SCHEMA_URL}\n")
+        + r#"
+# Prism config. Use this file globally or as a repository override.
+default_agent = "opencode"
+default_base = "main"
+merge_method = "squash" # squash, merge, or rebase
+escape_key = "esc-esc" # esc-esc or ctrl-space
+plan_dir = "plans"
+review_packet_dir = ".agent/review"
+worktree_command = "wt"
+opencode_port_base = 41000
+opencode_port_span = 1000
+opencode_shutdown_owned_servers = false
+opencode_plan_plugin = false
+
+[ui]
+icon_style = "unicode" # or "nerd-font"
+
+[worktrees]
+columns = []
+
+[tools]
+opencode = "opencode"
+gh = "gh"
+git = "git"
+tmux = "tmux"
+wt = "wt"
+lazygit = "lazygit"
+fzf = "fzf"
+
+[checks]
+pre_pr = []
+pre_push = []
+review_fix = []
+
+[auto]
+merge = false
+cleanup_after_merge = false
+require_review_approval = false
+push_initial = true
+push_repairs = false
+review_wait_enabled = true
+review_reviewer_identities = ["Copilot", "github-copilot"]
+review_max_wait_seconds = 300
+review_poll_interval_seconds = 30
+review_continue_on_timeout = true
+ci_wait_enabled = true
+ci_max_wait_seconds = 1800
+ci_poll_interval_seconds = 30
+
+[agents.opencode]
+command = "opencode run --format json"
+prompt_mode = "argument"
+
+[prompt_templates]
+auto_create_plan = "Create an implementation plan at `{{plan_path}}`. Do not implement or commit. Include phases, tests, verification, risks, observability, and architecture fit.\n\nTask:\n{{task}}\n\nMode: {{mode}}\nVariant: {{variant}}\nAgent profile: {{agent_profile}}"
+auto_review_plan = "Review `{{plan_path}}` and edit it in place. Do not implement or commit. Check phases, risks, tests, observability, restartability, safety, and architecture fit.\n\nTask:\n{{task}}"
+auto_implement = "Implement this task in the current worktree. Stop after implementation; do not commit, push, create a pull request, or merge.\n\nTask:\n{{task}}"
+auto_fix_local_verify = "Fix the local verification failures, then stop without committing.\n\nOriginal task:\n{{task}}\n\nFailure context:\n{{context}}"
+auto_fix_review = "Resolve the review feedback, then stop without committing.\n\nOriginal task:\n{{task}}\n\nReview context:\n{{context}}"
+auto_fix_ci = "Fix the CI failure, then stop without committing.\n\nOriginal task:\n{{task}}\n\nCI context:\n{{context}}"
+review_fix = "Here are review comments on PR {pr_number}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n{comments}"
+ci_failure = "Here are CI failures on PR {pr_number}.\n\nFix the failing checks. Use the log tails below as the primary clues.\n\nPR: {url}\nBranch: {branch}\nHead SHA: {head_sha}\n\n---\n\n{failures}"
+repair_commit_review = "fix: cr"
+repair_commit_ci = "fix: ci"
+repair_commit_merge = "fix: merge"
+"#
 }
 
 pub fn user_config_template() -> String {
@@ -93,7 +91,9 @@ pub fn user_config_template() -> String {
 }
 
 pub fn repo_config_template(include_worktree_columns: bool) -> String {
-    let mut text = config_example();
+    let mut text = format!(
+        "#:schema {CONFIG_SCHEMA_URL}\n\n# Repository overrides. Unspecified values inherit the global config.\n"
+    );
     if include_worktree_columns {
         text.push_str("\n[worktrees]\ncolumns = []\n");
     }

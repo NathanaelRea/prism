@@ -41,7 +41,7 @@ pub fn execute_auto_initial_step(
 
         if let Some(step_index) = next_queued_agent_step(persisted) {
             if let Err(error) =
-                execute_one_agent_step(conn, persisted, step_index, executor, output)
+                execute_one_agent_step(conn, config, persisted, step_index, executor, output)
             {
                 persisted.run.status = AutoRunStatus::Failed;
                 persisted.run.pause_requested = false;
