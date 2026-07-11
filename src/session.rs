@@ -17,6 +17,12 @@ use crate::process::run_capture;
 use crate::repo::Repository;
 use crate::util::{safe_branch_filename, status_count, truncate};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorktreeInventoryEntry {
+    path: PathBuf,
+    branch: String,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SessionClassification {
     #[default]
@@ -218,14 +224,64 @@ pub(crate) struct WorktreeSessionKey {
 }
 
 pub fn discover_sessions(repo: &Repository, config: &Config) -> Result<Vec<Session>, String> {
+    let inventory = load_worktree_inventory(repo, config)?;
+    let hidden = load_hidden_sessions(repo);
+    let mut sessions = Vec::new();
+
+    for entry in inventory {
+        if entry.path.exists() {
+            let mut session = build_session(repo, entry.path, entry.branch, config);
+            session.hidden = hidden.contains_key(&session.branch);
+            if session.hidden {
+                session.pr = PrCache::default();
+                session.unseen_comments = false;
+                observability::emit(observability::EventInput {
+                    level: LogLevel::Debug,
+                    target: "session",
+                    action: "unfocused_worktree",
+                    operation_id: None,
+                    parent_operation_id: None,
+                    branch: Some(session.branch.clone()),
+                    session: Some(session.path.display().to_string()),
+                    message: format!("worktree is unfocused {}", session.path.display()),
+                    data_json: None,
+                });
+            }
+            sessions.push(session);
+        } else {
+            observability::emit(observability::EventInput {
+                level: LogLevel::Warn,
+                target: "session",
+                action: "skip_missing_worktree",
+                operation_id: None,
+                parent_operation_id: None,
+                branch: Some(entry.branch),
+                session: Some(entry.path.display().to_string()),
+                message: format!("skipping missing worktree {}", entry.path.display()),
+                data_json: None,
+            });
+        }
+    }
+
+    sessions.sort_by(|a, b| session_discovery_order(config, a, b));
+    Ok(sessions)
+}
+
+fn load_worktree_inventory(
+    repo: &Repository,
+    config: &Config,
+) -> Result<Vec<WorktreeInventoryEntry>, String> {
     let output = run_capture(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(&repo.root)
             .args(["worktree", "list", "--porcelain"]),
     )?;
-    let hidden = load_hidden_sessions(repo);
-    let mut sessions = Vec::new();
+    Ok(parse_worktree_inventory(&output))
+}
+
+fn parse_worktree_inventory(output: &str) -> Vec<WorktreeInventoryEntry> {
+    let mut entries = Vec::new();
     let mut current_path: Option<PathBuf> = None;
     let mut current_branch: Option<String> = None;
 
@@ -235,38 +291,7 @@ pub fn discover_sessions(repo: &Repository, config: &Config) -> Result<Vec<Sessi
                 let branch = current_branch
                     .take()
                     .unwrap_or_else(|| "(detached)".to_string());
-                if path.exists() {
-                    let mut session = build_session(repo, path, branch, config);
-                    session.hidden = hidden.contains_key(&session.branch);
-                    if session.hidden {
-                        session.pr = PrCache::default();
-                        session.unseen_comments = false;
-                        observability::emit(observability::EventInput {
-                            level: LogLevel::Debug,
-                            target: "session",
-                            action: "unfocused_worktree",
-                            operation_id: None,
-                            parent_operation_id: None,
-                            branch: Some(session.branch.clone()),
-                            session: Some(session.path.display().to_string()),
-                            message: format!("worktree is unfocused {}", session.path.display()),
-                            data_json: None,
-                        });
-                    }
-                    sessions.push(session);
-                } else {
-                    observability::emit(observability::EventInput {
-                        level: LogLevel::Warn,
-                        target: "session",
-                        action: "skip_missing_worktree",
-                        operation_id: None,
-                        parent_operation_id: None,
-                        branch: Some(branch),
-                        session: Some(path.display().to_string()),
-                        message: format!("skipping missing worktree {}", path.display()),
-                        data_json: None,
-                    });
-                }
+                entries.push(WorktreeInventoryEntry { path, branch });
             }
             continue;
         }
@@ -284,8 +309,60 @@ pub fn discover_sessions(repo: &Repository, config: &Config) -> Result<Vec<Sessi
         }
     }
 
-    sessions.sort_by(|a, b| session_discovery_order(config, a, b));
-    Ok(sessions)
+    entries
+}
+
+pub(crate) fn reconcile_worktree_state(repo: &Repository, config: &Config) -> Result<(), String> {
+    run_capture(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(&repo.root)
+            .args(["worktree", "prune"]),
+    )?;
+    let live = load_worktree_inventory(repo, config)?;
+    let persisted = observability::with_writable_db(repo, |conn| {
+        let mut statement = conn
+            .prepare(
+                "select branch, worktree
+                 from task_metadata
+                 where branch not in (select branch from archived_worktree)",
+            )
+            .map_err(|error| format!("prepare worktree state inventory: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    PathBuf::from(row.get::<_, String>(1)?),
+                ))
+            })
+            .map_err(|error| format!("query worktree state inventory: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read worktree state inventory: {error}"))
+    })?;
+
+    let mut persisted_by_branch = BTreeMap::<String, Vec<PathBuf>>::new();
+    for (branch, path) in persisted {
+        persisted_by_branch.entry(branch).or_default().push(path);
+    }
+    for (branch, paths) in persisted_by_branch {
+        let is_live = live.iter().any(|entry| entry.branch == branch);
+        if !is_live {
+            let path = &paths[0];
+            crate::lifecycle::delete_worktree_session_local_data(repo, path, &branch)?;
+            observability::emit(observability::EventInput {
+                level: LogLevel::Info,
+                target: "session",
+                action: "remove_stale_worktree",
+                operation_id: None,
+                parent_operation_id: None,
+                branch: Some(branch),
+                session: Some(path.display().to_string()),
+                message: format!("removed stale worktree state for {}", path.display()),
+                data_json: None,
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn session_discovery_order(
@@ -824,6 +901,99 @@ exit 0
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].path, repo_path);
         assert_eq!(sessions[0].branch, "main");
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn reconcile_worktree_state_removes_only_stale_persisted_sessions() {
+        let temp = unique_temp_dir("prism-session-reconcile-test");
+        let repo_path = temp.join("repo");
+        let live_path = temp.join("live");
+        let stale_path = temp.join("stale");
+        let archived_path = temp.join("archived");
+        fs::create_dir_all(&repo_path).unwrap();
+        fs::create_dir_all(&live_path).unwrap();
+        let git = temp.join("git");
+        fs::write(
+            &git,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *\"worktree list --porcelain\"*) printf 'worktree {}\\nHEAD abc\\nbranch refs/heads/live\\n\\n' ;;\nesac\nexit 0\n",
+                live_path.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&git, permissions).unwrap();
+        let mut config = test_config();
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        let repo = Repository::with_config_dir_for_test(repo_path, temp.join("config"));
+        observability::with_writable_db(&repo, |conn| {
+            for (branch, path) in [
+                ("live", &live_path),
+                ("stale", &stale_path),
+                ("archived", &archived_path),
+            ] {
+                conn.execute(
+                    "insert into task_metadata (
+                        branch, prompt_summary, initial_prompt, worktree, classification, visibility, updated_unix_ms
+                     ) values (?1, '', '', ?2, 'work', 0, 0)",
+                    params![branch, path.display().to_string()],
+                )
+                .map_err(|error| error.to_string())?;
+            }
+            conn.execute(
+                "insert into archived_worktree (
+                    branch, repo_root, worktree_path, archived_unix_ms, classification
+                 ) values ('archived', ?1, ?2, 0, 'work')",
+                params![repo.root.display().to_string(), archived_path.display().to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+
+        reconcile_worktree_state(&repo, &config).unwrap();
+
+        observability::with_writable_db(&repo, |conn| {
+            let live: i64 = conn
+                .query_row(
+                    "select count(*) from task_metadata where branch = 'live'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let stale: i64 = conn
+                .query_row(
+                    "select count(*) from task_metadata where branch = 'stale'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let archived_task: i64 = conn
+                .query_row(
+                    "select count(*) from task_metadata where branch = 'archived'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let archived_worktree: i64 = conn
+                .query_row(
+                    "select count(*) from archived_worktree where branch = 'archived'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            assert_eq!(live, 1);
+            assert_eq!(stale, 0);
+            assert_eq!(archived_task, 1);
+            assert_eq!(archived_worktree, 1);
+            Ok(())
+        })
+        .unwrap();
 
         let _ = fs::remove_dir_all(temp);
     }

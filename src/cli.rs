@@ -168,6 +168,9 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
         let (entries, selected_repo) = observability::phase("load_workspace", || {
             workspace::ensure_entries_for_tui(repo_arg)
         })?;
+        let (entries, selected_repo) = observability::phase("reconcile_workspace", || {
+            Ok(workspace::remove_missing_entries(entries, selected_repo))
+        })?;
         let mut repos = Vec::new();
         let discovered_entries = workspace::discover_valid_entries(entries);
         let selected_repo = discovered_entries
@@ -199,6 +202,12 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
                 setup::maybe_prompt_startup_setup(&repo.repo, &repo.config)
             })?;
         }
+        observability::phase("reconcile_worktrees", || {
+            for managed in &repos {
+                session::reconcile_worktree_state(&managed.repo, &managed.config)?;
+            }
+            Ok(())
+        })?;
         let sessions =
             observability::phase("discover_sessions", || discover_workspace_sessions(&repos))?;
         let mut tui = observability::phase("initialize_tui", || {
