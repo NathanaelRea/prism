@@ -323,9 +323,9 @@ pub(crate) fn reconcile_worktree_state(repo: &Repository, config: &Config) -> Re
     let persisted = observability::with_writable_db(repo, |conn| {
         let mut statement = conn
             .prepare(
-                "select branch, worktree from task_metadata
-                 union
-                 select branch, worktree_path from archived_worktree",
+                "select branch, worktree
+                 from task_metadata
+                 where branch not in (select branch from archived_worktree)",
             )
             .map_err(|error| format!("prepare worktree state inventory: {error}"))?;
         let rows = statement
@@ -911,6 +911,7 @@ exit 0
         let repo_path = temp.join("repo");
         let live_path = temp.join("live");
         let stale_path = temp.join("stale");
+        let archived_path = temp.join("archived");
         fs::create_dir_all(&repo_path).unwrap();
         fs::create_dir_all(&live_path).unwrap();
         let git = temp.join("git");
@@ -931,7 +932,11 @@ exit 0
             .insert("git".to_string(), git.display().to_string());
         let repo = Repository::with_config_dir_for_test(repo_path, temp.join("config"));
         observability::with_writable_db(&repo, |conn| {
-            for (branch, path) in [("live", &live_path), ("stale", &stale_path)] {
+            for (branch, path) in [
+                ("live", &live_path),
+                ("stale", &stale_path),
+                ("archived", &archived_path),
+            ] {
                 conn.execute(
                     "insert into task_metadata (
                         branch, prompt_summary, initial_prompt, worktree, classification, visibility, updated_unix_ms
@@ -940,6 +945,13 @@ exit 0
                 )
                 .map_err(|error| error.to_string())?;
             }
+            conn.execute(
+                "insert into archived_worktree (
+                    branch, repo_root, worktree_path, archived_unix_ms, classification
+                 ) values ('archived', ?1, ?2, 0, 'work')",
+                params![repo.root.display().to_string(), archived_path.display().to_string()],
+            )
+            .map_err(|error| error.to_string())?;
             Ok(())
         })
         .unwrap();
@@ -961,8 +973,24 @@ exit 0
                     |row| row.get(0),
                 )
                 .map_err(|error| error.to_string())?;
+            let archived_task: i64 = conn
+                .query_row(
+                    "select count(*) from task_metadata where branch = 'archived'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
+            let archived_worktree: i64 = conn
+                .query_row(
+                    "select count(*) from archived_worktree where branch = 'archived'",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|error| error.to_string())?;
             assert_eq!(live, 1);
             assert_eq!(stale, 0);
+            assert_eq!(archived_task, 1);
+            assert_eq!(archived_worktree, 1);
             Ok(())
         })
         .unwrap();
