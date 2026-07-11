@@ -809,6 +809,29 @@ fn worktree_main_panel_omits_runtime_metadata_block() {
 }
 
 #[test]
+fn pr_comments_table_omits_severity_column() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Idle);
+    session.pr.summary = Some(test_pr_summary());
+    session.pr.details = Some(PrDetails {
+        review_comments: vec![PrReviewComment {
+            author: "reviewer".to_string(),
+            body: "please fix".to_string(),
+            resolved: false,
+            ..PrReviewComment::default()
+        }],
+        ..PrDetails::default()
+    });
+    let sessions = vec![session];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+
+    let buffer = render_to_string(&model, 120, 30);
+
+    assert!(buffer.contains("kind   res author       text"));
+    assert!(!buffer.contains("sev"));
+}
+
+#[test]
 fn renders_stabilization_pending_push_in_worktree_main_panel() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
@@ -834,6 +857,29 @@ fn renders_stabilization_pending_push_in_worktree_main_panel() {
     assert!(buffer.contains("PushPendingRepair"));
     assert!(!buffer.contains("state PendingPush"));
     assert!(!buffer.contains("gate"));
+}
+
+#[test]
+fn renders_requested_pr_review_as_pending_when_approval_gate_is_disabled() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Idle);
+    let mut summary = test_pr_summary();
+    summary.requested_reviewers = vec!["review-team".to_string()];
+    session.pr.summary = Some(summary);
+    let sessions = vec![session];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.auto_dashboard = Some(stabilization_dashboard(
+        StabilizationBlocker::ReadyForManualMerge,
+        StabilizationWorkKind::MarkReadyForManualMerge,
+        None,
+    ));
+
+    let buffer = render_to_buffer(&model, 120, 40);
+    let review_row = find_line(&buffer, "code review");
+    let review_status = line_text(&buffer, review_row);
+
+    assert!(review_status.contains("pending"));
+    assert!(!review_status.contains("disabled"));
 }
 
 #[test]

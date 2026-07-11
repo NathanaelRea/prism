@@ -333,10 +333,16 @@ fn review_gate_label(config: &crate::config::Config, session: &Session) -> Strin
         return "feedback".to_string();
     }
     if !config.auto.require_review_approval {
-        return "disabled".to_string();
+        return if summary.requested_reviewers.is_empty() {
+            "disabled".to_string()
+        } else {
+            "pending".to_string()
+        };
     }
     if summary.review_decision.eq_ignore_ascii_case("approved") {
         "approved".to_string()
+    } else if !summary.requested_reviewers.is_empty() {
+        "pending".to_string()
     } else {
         "missing".to_string()
     }
@@ -381,13 +387,9 @@ fn merge_blocked(summary: &crate::github::PrSummary) -> bool {
 fn has_actionable_review_feedback(session: &Session) -> bool {
     session.pr.details.as_ref().is_some_and(|details| {
         details
-            .reviews
+            .review_comments
             .iter()
-            .any(|review| !review.body.trim().is_empty())
-            || details
-                .review_comments
-                .iter()
-                .any(|comment| !comment.resolved && !comment.body.trim().is_empty())
+            .any(|comment| !comment.resolved && !comment.body.trim().is_empty())
     })
 }
 

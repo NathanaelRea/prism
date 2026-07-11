@@ -22,6 +22,20 @@ pub fn append_step_run(
     Ok(id)
 }
 
+pub fn append_step_run_with_work_guard(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+    step_key: AutoStepKey,
+    reason: Option<String>,
+    work_guard: stabilization_model::WorkGuard,
+) -> Result<i64, String> {
+    let id = append_step_run(conn, persisted, step_key, reason)?;
+    let step = persisted.steps.last_mut().expect("appended auto step");
+    step.work_guard = Some(work_guard);
+    save_step_with_conn(conn, step)?;
+    Ok(id)
+}
+
 pub(super) fn next_queued_agent_step(persisted: &PersistedAutoRun) -> Option<usize> {
     persisted.steps.iter().position(|step| {
         step.status == AutoStepStatus::Queued
@@ -345,12 +359,26 @@ fn ensure_next_repair_follow_up_step(
         && latest_step_status(persisted, &AutoStepKey::VerifyReviewFix)
             != Some(AutoStepStatus::Done)
     {
+        let work_guard = persisted
+            .steps
+            .iter()
+            .rev()
+            .find(|step| step.step_key == AutoStepKey::FixReview)
+            .and_then(|step| step.work_guard.clone());
         append_step_run(
             conn,
             persisted,
             AutoStepKey::VerifyReviewFix,
             Some("run review-fix verification before committing".to_string()),
         )?;
+        if let Some(work_guard) = work_guard {
+            let step = persisted
+                .steps
+                .last_mut()
+                .expect("appended review verification step");
+            step.work_guard = Some(work_guard);
+            save_step_with_conn(conn, step)?;
+        }
         return Ok(true);
     }
     if latest_step_status(persisted, &AutoStepKey::VerifyReviewFix) == Some(AutoStepStatus::Done)
@@ -361,12 +389,26 @@ fn ensure_next_repair_follow_up_step(
         && latest_step_status(persisted, &AutoStepKey::CommitReviewFix)
             != Some(AutoStepStatus::Skipped)
     {
+        let work_guard = persisted
+            .steps
+            .iter()
+            .rev()
+            .find(|step| step.step_key == AutoStepKey::VerifyReviewFix)
+            .and_then(|step| step.work_guard.clone());
         append_step_run(
             conn,
             persisted,
             AutoStepKey::CommitReviewFix,
             Some("commit and push verified review fixes".to_string()),
         )?;
+        if let Some(work_guard) = work_guard {
+            let step = persisted
+                .steps
+                .last_mut()
+                .expect("appended review commit step");
+            step.work_guard = Some(work_guard);
+            save_step_with_conn(conn, step)?;
+        }
         return Ok(true);
     }
     if matches!(

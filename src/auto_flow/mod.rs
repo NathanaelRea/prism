@@ -57,7 +57,7 @@ pub use output::{
     append_auto_event, append_output_line, append_output_line_limited, load_output_lines,
 };
 pub use runner::execute_auto_initial_step;
-pub use state_machine::append_step_run;
+pub use state_machine::{append_step_run, append_step_run_with_work_guard};
 pub use storage::{load_auto_run, load_recent_active_runs_for_repo, migrate_schema, save_auto_run};
 
 pub(crate) use support::unix_ms;

@@ -125,7 +125,7 @@ pub(super) fn pr_comment_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(""), heading_line("Comments")];
     lines.push(Line::from(vec![Span::styled(
-        "  kind   sev res author       text",
+        "  kind   res author       text",
         muted_style(),
     )]));
     let rows = pr_comment_rows(details);
@@ -152,7 +152,6 @@ pub(crate) struct PrCommentDisplayRow {
     pub author: String,
     pub context: String,
     pub body: String,
-    pub severity: String,
     pub resolved: String,
 }
 
@@ -164,7 +163,6 @@ pub(crate) fn pr_comment_rows(details: &crate::github::PrDetails) -> Vec<PrComme
             author: display_author(&comment.author),
             context: String::new(),
             body: one_line_comment(&comment.body),
-            severity: comment.severity.clone().unwrap_or_else(|| ".".to_string()),
             resolved: ".".to_string(),
         });
     }
@@ -179,7 +177,6 @@ pub(crate) fn pr_comment_rows(details: &crate::github::PrDetails) -> Vec<PrComme
             author: display_author(&review.author),
             context: review_label(&review.state).to_string(),
             body: one_line_comment(&review.body),
-            severity: review.severity.clone().unwrap_or_else(|| ".".to_string()),
             resolved: ".".to_string(),
         });
     }
@@ -194,7 +191,6 @@ pub(crate) fn pr_comment_rows(details: &crate::github::PrDetails) -> Vec<PrComme
             author: display_author(&comment.author),
             context,
             body: one_line_comment(&comment.body),
-            severity: comment.severity.clone().unwrap_or_else(|| ".".to_string()),
             resolved: if comment.resolved { "yes" } else { "no" }.to_string(),
         });
     }
@@ -206,10 +202,6 @@ pub(super) fn pr_comment_row_line(row: &PrCommentDisplayRow, selected: bool) -> 
     Line::from(vec![
         Span::styled(format!("{marker} "), title_style(selected)),
         Span::styled(format!("{:<6} ", truncate(&row.kind, 6)), muted_style()),
-        Span::styled(
-            format!("{:<3} ", truncate(&row.severity, 3)),
-            severity_style(&row.severity),
-        ),
         Span::styled(
             format!("{:<3} ", truncate(&row.resolved, 3)),
             resolved_style(&row.resolved),
@@ -240,15 +232,6 @@ fn one_line_comment(body: &str) -> String {
         "empty comment".to_string()
     } else {
         text
-    }
-}
-
-fn severity_style(severity: &str) -> Style {
-    match severity.to_ascii_lowercase().as_str() {
-        "high" => error_style(),
-        "medium" => attention_style(),
-        "low" => muted_style(),
-        _ => muted_style(),
     }
 }
 

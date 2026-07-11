@@ -55,6 +55,8 @@ repair_commit_merge = "fix: merge"
 
 The `#:schema` line is an optional TOML comment. Prism ignores it, while Taplo-compatible TOML language servers can use it for completions, descriptions, enum values, and type validation.
 
+The `review_fix` template supports `{inline_comments}`, `{review_bodies}`, and `{pr_comments}` when feedback sources need separate placement. `{comments}` combines all three for compatibility. Copilot's review overview is excluded from review bodies; its unresolved inline comments remain actionable feedback.
+
 Prism treats `main` as the default branch by default. The default branch is not polled or shown as a pull request branch.
 
 Prism uses squash merges for pull requests by default. Set `merge_method` to `merge` or `rebase` if a repository requires a different GitHub merge method.

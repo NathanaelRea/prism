@@ -51,7 +51,6 @@ use crate::plan_run::{
 };
 use crate::process::{command_exists, run_capture};
 use crate::repo::Repository;
-use crate::review::build_review_fix_prompt;
 use crate::session::{
     append_runtime_log, archive_worktree_session, discover_sessions, list_archived_worktrees,
     save_agent_state, unarchive_worktree_session, write_task_metadata,

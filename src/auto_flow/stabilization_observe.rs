@@ -444,7 +444,6 @@ mod tests {
                     author: "alice".to_string(),
                     body: "top level advisory".to_string(),
                     created_at: "2026-07-01T00:00:00Z".to_string(),
-                    ..PrComment::default()
                 }],
                 reviews: vec![PrReview {
                     id: "r1".to_string(),
@@ -452,7 +451,6 @@ mod tests {
                     state: "CHANGES_REQUESTED".to_string(),
                     body: "please adjust".to_string(),
                     submitted_at: "2026-07-01T00:01:00Z".to_string(),
-                    ..PrReview::default()
                 }],
                 review_comments: vec![PrReviewComment {
                     thread_id: "thread-1".to_string(),
@@ -463,7 +461,6 @@ mod tests {
                     body: "inline fix".to_string(),
                     created_at: "2026-07-01T00:02:00Z".to_string(),
                     resolved: false,
-                    ..PrReviewComment::default()
                 }],
                 failing_checks: vec!["lint".to_string()],
                 ci_failures: vec![CiFailure {
@@ -616,7 +613,6 @@ exit 1
                         body: "please fix".to_string(),
                         created_at: "2026-07-01T00:02:00Z".to_string(),
                         resolved: false,
-                        ..PrReviewComment::default()
                     }],
                     ..PrDetails::default()
                 }),

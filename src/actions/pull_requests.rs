@@ -284,13 +284,20 @@ impl Tui {
                 &context.config,
             );
         }
-        let prompt = build_review_fix_prompt(&self.sessions[selected], &context.config)?;
+        let tracked = crate::review::build_tracked_review_fix_prompt(
+            &self.sessions[selected],
+            &context.config,
+        )?;
         self.start_managed_repair(
             selected,
             &context.repo,
             &context.config,
             AutoStepKey::FixReview,
-            prompt,
+            tracked.prompt,
+            Some(crate::auto_flow::stabilization_model::WorkGuard {
+                review_thread_ids: tracked.review_thread_ids,
+                ..Default::default()
+            }),
         )?;
         self.show_message("started managed review repair; commit will wait for guarded push")?;
         Ok(())
@@ -348,6 +355,7 @@ impl Tui {
             &context.config,
             AutoStepKey::FixCi,
             prompt,
+            None,
         )?;
         self.show_message("started managed CI repair; commit will wait for guarded push")?;
         Ok(())
@@ -360,6 +368,7 @@ impl Tui {
         config: &crate::config::Config,
         step_key: AutoStepKey,
         prompt: String,
+        work_guard: Option<crate::auto_flow::stabilization_model::WorkGuard>,
     ) -> Result<(), String> {
         let session_path = self.sessions[selected].path.clone();
         let session_branch = self.sessions[selected].branch.clone();
@@ -406,7 +415,18 @@ impl Tui {
 
         crate::observability::with_writable_db(repo, |conn| {
             save_auto_run(conn, &mut persisted)?;
-            append_step_run(conn, &mut persisted, step_key, Some(prompt))
+            if let Some(work_guard) = work_guard {
+                crate::auto_flow::append_step_run_with_work_guard(
+                    conn,
+                    &mut persisted,
+                    step_key,
+                    Some(prompt),
+                    work_guard,
+                )?;
+            } else {
+                append_step_run(conn, &mut persisted, step_key, Some(prompt))?;
+            }
+            Ok(())
         })?;
         self.remember_auto_run(persisted.clone());
         self.selected_auto_run = Some(persisted.run.id.clone());
