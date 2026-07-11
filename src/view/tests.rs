@@ -845,9 +845,11 @@ fn renders_stabilization_pending_push_in_worktree_main_panel() {
     assert!(buffer.contains("42"));
     assert!(buffer.contains("name"));
     assert!(buffer.contains("Feature PR"));
-    assert!(buffer.contains("merge conflicts"));
-    assert!(buffer.contains("pending push"));
-    assert!(buffer.contains("guard"));
+    assert!(buffer.contains("merge"));
+    assert!(buffer.contains("ci"));
+    assert!(buffer.contains("review"));
+    assert!(!buffer.contains("pending push"));
+    assert!(!buffer.contains("guard"));
     assert!(buffer.contains("state"));
     assert!(buffer.contains("PendingPush"));
     assert!(buffer.contains("next"));
@@ -857,7 +859,7 @@ fn renders_stabilization_pending_push_in_worktree_main_panel() {
 }
 
 #[test]
-fn worktree_main_panel_omits_code_review_gate() {
+fn worktree_main_panel_renders_review_gate() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
     let mut summary = test_pr_summary();
@@ -873,8 +875,8 @@ fn worktree_main_panel_omits_code_review_gate() {
 
     let buffer = render_to_string(&model, 120, 40);
 
-    assert!(!buffer.contains("code review"));
-    assert!(!buffer.contains("review-team"));
+    assert!(buffer.contains("review"));
+    assert!(buffer.contains("pending"));
 }
 
 #[test]
@@ -916,7 +918,7 @@ fn renders_stabilization_merge_blocked_in_worktree_main_panel() {
 
     let buffer = render_to_string(&model, 120, 40);
 
-    assert!(buffer.contains("merge conflicts"));
+    assert!(buffer.contains("merge"));
     assert!(buffer.contains("blocked"));
     assert!(buffer.contains("state"));
     assert!(buffer.contains("MergeBlocked"));
@@ -986,14 +988,7 @@ fn worktree_main_panel_always_renders_empty_pr_keys() {
 
     assert!(buffer.contains("PR"));
     for key in [
-        "pr #",
-        "name",
-        "state",
-        "next",
-        "merge conflicts",
-        "policy",
-        "pending push",
-        "guard",
+        "pr #", "name", "state", "next", "ci", "review", "merge", "policy",
     ] {
         assert!(buffer.contains(key), "missing PR key: {key}");
     }

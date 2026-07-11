@@ -7,10 +7,10 @@ pub(crate) struct StabilizationPanelModel {
     pub pr_name: String,
     pub blocker: String,
     pub next: String,
-    pub guard: Option<String>,
+    pub ci: String,
+    pub review: String,
     pub merge: String,
     pub policy: String,
-    pub pending_commit: Option<String>,
 }
 
 pub(super) fn worktree_detail_lines(model: &crate::view::FrameModel<'_>) -> Vec<Line<'static>> {
@@ -62,7 +62,6 @@ pub(crate) fn stabilization_panel_model(
             .cloned()
             .unwrap_or_else(|| cached_next_work(blocker))
     });
-    let pending_push = run.and_then(|run| run.pending_push.as_ref());
     let summary = session.pr.summary.as_ref();
 
     if summary.is_none() {
@@ -72,10 +71,10 @@ pub(crate) fn stabilization_panel_model(
             pr_name: String::new(),
             blocker: String::new(),
             next: String::new(),
-            guard: None,
+            ci: String::new(),
+            review: String::new(),
             merge: String::new(),
             policy: String::new(),
-            pending_commit: None,
         };
     }
 
@@ -89,10 +88,13 @@ pub(crate) fn stabilization_panel_model(
             .unwrap_or_default(),
         blocker: blocker.as_ref().map(blocker_label).unwrap_or_default(),
         next: next.as_ref().map(work_label).unwrap_or_default(),
-        guard: pending_push.map(guard_label),
+        ci: blocker
+            .as_ref()
+            .map(|blocker| ci_gate_label(session, blocker))
+            .unwrap_or_default(),
+        review: review_gate_label(model.config, session),
         merge: merge_gate_label(session),
         policy: blocker.as_ref().map(policy_gate_label).unwrap_or_default(),
-        pending_commit: pending_push.map(pending_commit_label),
     }
 }
 
@@ -108,24 +110,20 @@ pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<
         ),
         stabilization_value_line("next", &model.next, attention_style()),
     ];
+    lines.push(stabilization_gate_line("ci", &model.ci, model.icon_style));
     lines.push(stabilization_gate_line(
-        "merge conflicts",
+        "review",
+        &model.review,
+        model.icon_style,
+    ));
+    lines.push(stabilization_gate_line(
+        "merge",
         &model.merge,
         model.icon_style,
     ));
     lines.push(stabilization_gate_line(
         "policy",
         &model.policy,
-        model.icon_style,
-    ));
-    lines.push(stabilization_gate_line(
-        "pending push",
-        model.pending_commit.as_deref().unwrap_or_default(),
-        model.icon_style,
-    ));
-    lines.push(stabilization_gate_line(
-        "guard",
-        model.guard.as_deref().unwrap_or_default(),
         model.icon_style,
     ));
     lines
@@ -143,16 +141,9 @@ fn stabilization_gate_line(
     status: &str,
     icon_style: IconStyle,
 ) -> Line<'static> {
-    let pending_detail = matches!(gate, "pending push" | "guard");
-    let style = if pending_detail {
-        attention_style()
-    } else {
-        gate_style(status)
-    };
+    let style = gate_style(status);
     let status_icon = if status.is_empty() {
         ""
-    } else if pending_detail {
-        icon(icon_style, "…", "")
     } else {
         stabilization_status_icon(status, icon_style)
     };
@@ -253,43 +244,6 @@ fn pascal_label(value: &str) -> String {
             }
         })
         .collect::<String>()
-}
-
-fn guard_label(guard: &PendingPushGuard) -> String {
-    let mut parts = vec![format!(
-        "head {}",
-        short_sha(&guard.expected_local_head_sha)
-    )];
-    if let Some(base) = &guard.expected_base_sha {
-        parts.push(format!("base {}", short_sha(base)));
-    }
-    if let Some(remote) = &guard.expected_remote_head_sha {
-        parts.push(format!("remote {}", short_sha(remote)));
-    }
-    if let Some(pr_head) = &guard.expected_pr_head_sha {
-        parts.push(format!("pr {}", short_sha(pr_head)));
-    }
-    parts.join("  ")
-}
-
-fn pending_commit_label(guard: &PendingPushGuard) -> String {
-    format!(
-        "{} {}",
-        short_sha(&guard.commit_sha),
-        repair_kind_label(&guard.repair_kind)
-    )
-}
-
-fn repair_kind_label(kind: &crate::auto_flow::stabilization_model::RepairKind) -> &'static str {
-    match kind {
-        crate::auto_flow::stabilization_model::RepairKind::Review => "review repair",
-        crate::auto_flow::stabilization_model::RepairKind::Ci => "ci repair",
-        crate::auto_flow::stabilization_model::RepairKind::Merge => "merge repair",
-    }
-}
-
-fn short_sha(value: &str) -> String {
-    value.chars().take(7).collect()
 }
 
 fn ci_gate_label(session: &Session, blocker: &StabilizationBlocker) -> String {
