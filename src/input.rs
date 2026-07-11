@@ -55,6 +55,8 @@ impl KeyInput {
             KeyCode::Char('g') if plain_char(event) => Key::G,
             KeyCode::Char('{') if plain_char(event) => Key::PreviousBlock,
             KeyCode::Char('}') if plain_char(event) => Key::NextBlock,
+            KeyCode::Char('[') if plain_char(event) => Key::PreviousView,
+            KeyCode::Char(']') if plain_char(event) => Key::NextView,
             KeyCode::Char('r') if plain_char(event) => Key::Refresh,
             KeyCode::Char('+') if plain_char(event) => Key::VisibilityUp,
             KeyCode::Char('-') if plain_char(event) => Key::VisibilityDown,
@@ -160,6 +162,8 @@ pub enum Key {
     G,
     PreviousBlock,
     NextBlock,
+    PreviousView,
+    NextView,
     Leader,
     LeaderGit,
     OpenTmuxSession,
@@ -228,6 +232,13 @@ mod tests {
         assert_eq!(map(&mut input, key(KeyCode::Char('l'))), Key::Right);
         assert_eq!(map(&mut input, key(KeyCode::Left)), Key::Left);
         assert_eq!(map(&mut input, key(KeyCode::Right)), Key::Right);
+    }
+
+    #[test]
+    fn key_input_maps_brackets_to_view_switching() {
+        let mut input = KeyInput::default();
+        assert_eq!(map(&mut input, key(KeyCode::Char('['))), Key::PreviousView);
+        assert_eq!(map(&mut input, key(KeyCode::Char(']'))), Key::NextView);
     }
 
     #[test]

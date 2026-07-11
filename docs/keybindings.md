@@ -4,7 +4,8 @@ Prism uses a lazygit-style panel model.
 
 - `1` focuses Status.
 - `2` focuses Repos.
-- `3` focuses Worktrees / Sessions. Press `3` again while Worktrees is focused to toggle repo-scoped and all-repos modes.
+- `3` focuses Worktrees / Sessions.
+- `[` switches Worktrees to all-repos mode; `]` switches it to repo-scoped mode.
 - `Tab` cycles focus between panels.
 - `0` focuses the main panel for the selected sidebar context.
 - `h` / `l` or left/right switches horizontal views in the Repos main panel.

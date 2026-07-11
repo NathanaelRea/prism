@@ -196,22 +196,6 @@ pub(crate) enum WorktreeListMode {
     Global,
 }
 
-impl WorktreeListMode {
-    pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Repo => "repo",
-            Self::Global => "all",
-        }
-    }
-
-    fn toggled(self) -> Self {
-        match self {
-            Self::Repo => Self::Global,
-            Self::Global => Self::Repo,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OpenTmuxSessionTarget {
     PlanPhaseAgent,
@@ -637,6 +621,16 @@ impl Tui {
                 }
                 Key::NextBlock => {
                     self.clear_leader_hint();
+                    pending_g = false;
+                }
+                Key::PreviousView => {
+                    self.clear_leader_hint();
+                    self.switch_worktree_list_mode(WorktreeListMode::Global);
+                    pending_g = false;
+                }
+                Key::NextView => {
+                    self.clear_leader_hint();
+                    self.switch_worktree_list_mode(WorktreeListMode::Repo);
                     pending_g = false;
                 }
                 Key::Leader => {
@@ -1484,14 +1478,20 @@ impl Tui {
     }
 
     pub(crate) fn focus_worktrees(&mut self) {
-        let already_focused = self.focused_panel == PanelFocus::Worktrees && !self.main_focused;
-        if already_focused {
-            self.worktree_list_mode = self.worktree_list_mode.toggled();
-            self.persist_worktree_list_mode();
-        }
         self.focused_panel = PanelFocus::Worktrees;
         self.main_focused = false;
         if self.worktree_list_mode == WorktreeListMode::Repo {
+            self.restore_selected_worktree_for_repo();
+        }
+    }
+
+    fn switch_worktree_list_mode(&mut self, mode: WorktreeListMode) {
+        if self.focused_panel != PanelFocus::Worktrees || self.worktree_list_mode == mode {
+            return;
+        }
+        self.worktree_list_mode = mode;
+        self.persist_worktree_list_mode();
+        if mode == WorktreeListMode::Repo {
             self.restore_selected_worktree_for_repo();
         }
     }
@@ -2945,7 +2945,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_worktree_focus_toggles_repo_and_global_modes() {
+    fn repeated_worktree_focus_does_not_change_list_mode() {
         let mut tui = test_tui();
         tui.focus_worktrees();
 
@@ -2954,16 +2954,12 @@ mod tests {
 
         tui.focus_worktrees();
 
-        assert_eq!(tui.worktree_list_mode, WorktreeListMode::Global);
-        assert_eq!(tui.visible_session_indices(), vec![1, 3]);
-
-        tui.focus_worktrees();
-
         assert_eq!(tui.worktree_list_mode, WorktreeListMode::Repo);
+        assert_eq!(tui.visible_session_indices(), vec![1]);
     }
 
     #[test]
-    fn persisted_worktree_list_mode_loads_and_updates_on_toggle() {
+    fn persisted_worktree_list_mode_loads_and_updates_on_switch() {
         let temp = unique_temp_dir("prism-tui-ui-state-test");
         let path = temp.join("ui-state.toml");
         crate::ui_state::save_to_path(&path, WorktreeListMode::Global).unwrap();
@@ -2974,7 +2970,7 @@ mod tests {
         assert_eq!(tui.worktree_list_mode, WorktreeListMode::Global);
 
         tui.focus_worktrees();
-        tui.focus_worktrees();
+        tui.switch_worktree_list_mode(WorktreeListMode::Repo);
 
         assert_eq!(tui.worktree_list_mode, WorktreeListMode::Repo);
         assert_eq!(

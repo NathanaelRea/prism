@@ -283,10 +283,26 @@ pub(super) fn render_worktrees(
     };
     let focused = model.focus == PanelFocus::Worktrees && !model.main_focused;
     let mut title = panel_title("3", "Worktrees", focused);
-    title.push_span(Span::styled(
-        format!(" {}", model.worktree_list_mode.label()),
-        muted_style(),
-    ));
+    title.push_span(Span::raw(" "));
+    for (index, (mode, label)) in [
+        (WorktreeListMode::Global, "all"),
+        (WorktreeListMode::Repo, "repo"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 {
+            title.push_span(Span::styled(" | ", muted_style()));
+        }
+        title.push_span(Span::styled(
+            label,
+            if model.worktree_list_mode == mode {
+                title_style(focused)
+            } else {
+                muted_style()
+            },
+        ));
+    }
     if !model.worktree_filter.is_empty() {
         title.push_span(Span::styled(
             format!(" /{}", model.worktree_filter),
