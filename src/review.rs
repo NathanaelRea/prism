@@ -65,7 +65,13 @@ pub fn build_review_fix_prompt_from_input(
     input: ReviewFixPromptInput<'_>,
     config: &Config,
 ) -> String {
-    let feedback = actionable_review_feedback(input.details, ReviewFeedbackFilter::default());
+    let mut feedback = actionable_review_feedback(input.details, ReviewFeedbackFilter::default());
+    feedback
+        .review_bodies
+        .retain(|review| !is_copilot_reviewer(&review.author));
+    let inline_comments = render_inline_comments(&feedback);
+    let review_bodies = render_review_bodies(&feedback);
+    let pr_comments = render_pr_comments(&feedback);
     let comments = render_review_feedback(&feedback);
 
     render_template(
@@ -78,6 +84,9 @@ pub fn build_review_fix_prompt_from_input(
             ("title", input.summary.title.clone()),
             ("url", input.summary.url.clone()),
             ("comments", comments),
+            ("inline_comments", inline_comments),
+            ("review_bodies", review_bodies),
+            ("pr_comments", pr_comments),
         ],
     )
 }
@@ -164,56 +173,19 @@ pub fn actionable_review_feedback<'a>(
     feedback
 }
 
+fn is_copilot_reviewer(author: &str) -> bool {
+    matches!(
+        author.trim().to_ascii_lowercase().trim_end_matches("[bot]"),
+        "copilot" | "github-copilot" | "copilot-pull-request-reviewer"
+    )
+}
+
 fn render_review_feedback(feedback: &ReviewFeedback<'_>) -> String {
-    let mut comments = String::new();
+    let mut comments = render_inline_comments(feedback);
+    comments.push_str(&render_review_bodies(feedback));
+    comments.push_str(&render_pr_comments(feedback));
 
-    if feedback.is_actionable() {
-        if !feedback.inline_comments.is_empty() {
-            comments.push_str("Inline review comments:\n\n");
-            for comment in &feedback.inline_comments {
-                let line = if comment.line.is_empty() {
-                    String::new()
-                } else {
-                    format!(" line {}", comment.line)
-                };
-                comments.push_str(&format!(
-                    "- {}{} by {}\n\n{}\n\n",
-                    empty_dash(&comment.path),
-                    line,
-                    empty_dash(&comment.author),
-                    comment.body.trim()
-                ));
-            }
-        }
-
-        if !feedback.review_bodies.is_empty() {
-            comments.push_str("Review bodies:\n\n");
-            for review in &feedback.review_bodies {
-                let state = if review.state.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", review.state.trim())
-                };
-                comments.push_str(&format!(
-                    "- Review from {}{}\n\n{}\n\n",
-                    empty_dash(&review.author),
-                    state,
-                    review.body.trim()
-                ));
-            }
-        }
-
-        if !feedback.pr_comments.is_empty() {
-            comments.push_str("PR comments:\n\n");
-            for comment in &feedback.pr_comments {
-                comments.push_str(&format!(
-                    "- Comment from {}\n\n{}\n\n",
-                    empty_dash(&comment.author),
-                    comment.body.trim()
-                ));
-            }
-        }
-
+    if !comments.is_empty() {
         return comments;
     }
 
@@ -246,6 +218,64 @@ fn render_review_feedback(feedback: &ReviewFeedback<'_>) -> String {
             comments.push_str(&format!("- {} empty comment(s)\n", feedback.skipped_empty));
         }
         comments.push('\n');
+    }
+    comments
+}
+
+fn render_inline_comments(feedback: &ReviewFeedback<'_>) -> String {
+    let mut comments = String::new();
+    if !feedback.inline_comments.is_empty() {
+        comments.push_str("Inline review comments:\n\n");
+        for comment in &feedback.inline_comments {
+            let line = if comment.line.is_empty() {
+                String::new()
+            } else {
+                format!(" line {}", comment.line)
+            };
+            comments.push_str(&format!(
+                "- {}{} by {}\n\n{}\n\n",
+                empty_dash(&comment.path),
+                line,
+                empty_dash(&comment.author),
+                comment.body.trim()
+            ));
+        }
+    }
+    comments
+}
+
+fn render_review_bodies(feedback: &ReviewFeedback<'_>) -> String {
+    let mut comments = String::new();
+    if !feedback.review_bodies.is_empty() {
+        comments.push_str("Review bodies:\n\n");
+        for review in &feedback.review_bodies {
+            let state = if review.state.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", review.state.trim())
+            };
+            comments.push_str(&format!(
+                "- Review from {}{}\n\n{}\n\n",
+                empty_dash(&review.author),
+                state,
+                review.body.trim()
+            ));
+        }
+    }
+    comments
+}
+
+fn render_pr_comments(feedback: &ReviewFeedback<'_>) -> String {
+    let mut comments = String::new();
+    if !feedback.pr_comments.is_empty() {
+        comments.push_str("PR comments:\n\n");
+        for comment in &feedback.pr_comments {
+            comments.push_str(&format!(
+                "- Comment from {}\n\n{}\n\n",
+                empty_dash(&comment.author),
+                comment.body.trim()
+            ));
+        }
     }
     comments
 }
@@ -367,6 +397,34 @@ mod tests {
     }
 
     #[test]
+    fn review_fix_prompt_excludes_copilot_review_summary_but_keeps_inline_feedback() {
+        let session = test_session(PrDetails {
+            reviews: vec![PrReview {
+                author: "copilot-pull-request-reviewer".to_string(),
+                state: "COMMENTED".to_string(),
+                body: "Copilot reviewed 2 out of 2 changed files.".to_string(),
+                submitted_at: "2026-06-14T12:09:00Z".to_string(),
+                ..PrReview::default()
+            }],
+            review_comments: vec![PrReviewComment {
+                author: "Copilot".to_string(),
+                path: "src/review.rs".to_string(),
+                line: "42".to_string(),
+                body: "Make the approval setting explicit.".to_string(),
+                created_at: "2026-06-14T12:10:00Z".to_string(),
+                resolved: false,
+                ..PrReviewComment::default()
+            }],
+            ..PrDetails::default()
+        });
+
+        let prompt = build_review_fix_prompt(&session, &test_config()).unwrap();
+
+        assert!(prompt.contains("Make the approval setting explicit."));
+        assert!(!prompt.contains("Copilot reviewed 2 out of 2 changed files."));
+    }
+
+    #[test]
     fn review_fix_prompt_uses_configured_template() {
         let mut config = test_config();
         config.prompt_templates.insert(
@@ -390,6 +448,46 @@ mod tests {
 
         assert!(prompt.starts_with("Fix PR 123 on feature:"));
         assert!(prompt.contains("- src/review.rs line 9 by dana\n\nCan this be a helper?"));
+    }
+
+    #[test]
+    fn review_fix_template_exposes_feedback_sources_separately() {
+        let mut config = test_config();
+        config.prompt_templates.insert(
+            "review_fix".to_string(),
+            "INLINE\n{inline_comments}\nREVIEWS\n{review_bodies}\nPR\n{pr_comments}".to_string(),
+        );
+        let session = test_session(PrDetails {
+            comments: vec![PrComment {
+                author: "alice".to_string(),
+                body: "Top-level context.".to_string(),
+                created_at: "2026-06-14T12:10:00Z".to_string(),
+                ..PrComment::default()
+            }],
+            reviews: vec![PrReview {
+                author: "bob".to_string(),
+                state: "CHANGES_REQUESTED".to_string(),
+                body: "Review-level request.".to_string(),
+                submitted_at: "2026-06-14T12:09:00Z".to_string(),
+                ..PrReview::default()
+            }],
+            review_comments: vec![PrReviewComment {
+                author: "carol".to_string(),
+                path: "src/review.rs".to_string(),
+                line: "42".to_string(),
+                body: "Inline request.".to_string(),
+                created_at: "2026-06-14T12:11:00Z".to_string(),
+                resolved: false,
+                ..PrReviewComment::default()
+            }],
+            ..PrDetails::default()
+        });
+
+        let prompt = build_review_fix_prompt(&session, &config).unwrap();
+
+        assert!(prompt.contains("INLINE\nInline review comments:\n\n"));
+        assert!(prompt.contains("REVIEWS\nReview bodies:\n\n"));
+        assert!(prompt.contains("PR\nPR comments:\n\n"));
     }
 
     #[test]
@@ -458,6 +556,24 @@ mod tests {
         assert_eq!(feedback.skipped_resolved_inline, 1);
         assert_eq!(feedback.skipped_old, 2);
         assert_eq!(feedback.skipped_author, 1);
+    }
+
+    #[test]
+    fn actionable_feedback_keeps_copilot_review_body_for_workflow_state() {
+        let details = PrDetails {
+            reviews: vec![PrReview {
+                author: "copilot-pull-request-reviewer".to_string(),
+                state: "COMMENTED".to_string(),
+                body: "Copilot reviewed 2 out of 2 changed files.".to_string(),
+                submitted_at: "2026-06-14T12:09:00Z".to_string(),
+                ..PrReview::default()
+            }],
+            ..PrDetails::default()
+        };
+
+        let feedback = actionable_review_feedback(&details, ReviewFeedbackFilter::default());
+
+        assert_eq!(feedback.review_bodies.len(), 1);
     }
 
     #[test]
