@@ -63,7 +63,7 @@ use crate::tui::{
     PrPollResult, Tui, WtPollResult,
 };
 
-use crate::util::{status_count, yes};
+use crate::util::status_count;
 
 mod auto;
 mod opencode_actions;

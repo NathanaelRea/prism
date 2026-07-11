@@ -28,7 +28,7 @@ use crate::session::{Session, append_runtime_log};
 use crate::terminal::stdin_is_tty;
 use crate::tmux::TmuxWindow;
 use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
-use crate::util::{status_count, yes};
+use crate::util::status_count;
 use crate::view;
 
 pub struct Tui {
@@ -961,8 +961,12 @@ impl Tui {
         {
             return Ok(true);
         }
-        let answer = self.prompt_line(runtime, "Agents are running. Quit Prism? [y/N] ")?;
-        Ok(yes(&answer))
+        self.confirm_action_dialog(
+            runtime,
+            "Quit Prism",
+            "Agents are running. Quit Prism?",
+            "Quit",
+        )
     }
 
     fn enter_agent_mode(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
@@ -1187,16 +1191,6 @@ impl Tui {
         self.confirm_dialog(runtime, "Delete Session", lines, "Delete", "Cancel")
     }
 
-    pub(crate) fn prompt_line(
-        &mut self,
-        runtime: &mut TerminalRuntime,
-        prompt: &str,
-    ) -> Result<String, String> {
-        Ok(self
-            .prompt_line_dialog(runtime, "Prism", prompt, "")?
-            .unwrap_or_default())
-    }
-
     pub(crate) fn prompt_line_dialog(
         &mut self,
         runtime: &mut TerminalRuntime,
@@ -1352,12 +1346,14 @@ impl Tui {
                 continue;
             }
             match event.code {
-                KeyCode::Enter => {
+                KeyCode::Enter | KeyCode::Char('y') if plain_key(event) => {
                     self.dialog = None;
                     self.draw(runtime)?;
                     return Ok(true);
                 }
-                KeyCode::Esc => {
+                KeyCode::Esc | KeyCode::Char('n')
+                    if event.code == KeyCode::Esc || plain_key(event) =>
+                {
                     self.dialog = None;
                     self.draw(runtime)?;
                     return Ok(false);
@@ -1375,6 +1371,25 @@ impl Tui {
                 _ => {}
             }
         }
+    }
+
+    pub(crate) fn confirm_action_dialog(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        title: &str,
+        message: &str,
+        confirm_label: &str,
+    ) -> Result<bool, String> {
+        self.confirm_dialog(
+            runtime,
+            title,
+            vec![view::DialogLine {
+                text: message.to_string(),
+                attention: false,
+            }],
+            confirm_label,
+            "Cancel",
+        )
     }
 
     pub(crate) fn show_message(&mut self, message: &str) -> Result<(), String> {

@@ -24,12 +24,25 @@ impl Tui {
         let resume_result = raw.resume();
         resume_result?;
         let execution = execution?;
-        let mode =
-            self.prompt_line_dialog(raw, "Plan Run", "Run phases in parallel? [y/N] ", "")?;
-        let mode = if mode.as_deref().map(yes).unwrap_or(false) {
-            PlanRunMode::Parallel
-        } else {
-            PlanRunMode::Sequential
+        let Some(mode) = self.prompt_choice_dialog(
+            raw,
+            crate::view::ChoiceList {
+                title: "Plan Run: Execution".to_string(),
+                choices: [("s", "sequential"), ("p", "parallel")]
+                    .into_iter()
+                    .map(|(key, label)| crate::view::KeyChoice {
+                        key: key.to_string(),
+                        label: label.to_string(),
+                    })
+                    .collect(),
+            },
+        )?
+        else {
+            return Ok(());
+        };
+        let mode = match mode.as_str() {
+            "p" => PlanRunMode::Parallel,
+            _ => PlanRunMode::Sequential,
         };
         let launch = execution.launch(&repo.root, mode)?;
         let mut should_execute = true;
@@ -392,16 +405,23 @@ impl Tui {
         };
         let run_id = dashboard.run.run.id.clone();
         let selected_step = dashboard.run.run.selected_step;
-        let answer = self.prompt_line_dialog(
+        let answer = self.prompt_choice_dialog(
             raw,
-            "Abort Plan",
-            "Abort selected phase? Use 'all' for every running phase. [y/N/all] ",
-            "",
+            crate::view::ChoiceList {
+                title: "Abort Plan".to_string(),
+                choices: [("s", "selected phase"), ("a", "all running phases")]
+                    .into_iter()
+                    .map(|(key, label)| crate::view::KeyChoice {
+                        key: key.to_string(),
+                        label: label.to_string(),
+                    })
+                    .collect(),
+            },
         )?;
         let Some(answer) = answer else {
             return Ok(true);
         };
-        if answer.trim().eq_ignore_ascii_case("all") {
+        if answer == "a" {
             crate::observability::with_writable_db(&repo, |conn| {
                 let mut run = load_plan_run(conn, &run_id)?
                     .ok_or_else(|| format!("plan run not found: {run_id}"))?;
@@ -409,9 +429,6 @@ impl Tui {
             })?;
             self.load_plan_run_snapshot(&repo.root, &run_id);
             self.show_message("abort requested for plan run")?;
-            return Ok(true);
-        }
-        if !yes(&answer) {
             return Ok(true);
         }
         crate::observability::with_writable_db(&repo, |conn| {
@@ -466,13 +483,13 @@ impl Tui {
             return Ok(false);
         };
         let selected_step = dashboard.run.run.selected_step;
-        let answer = self.prompt_line_dialog(
+        let should_retry = self.confirm_action_dialog(
             raw,
             "Retry Plan",
-            &format!("Retry from phase {selected_step}? [y/N] "),
-            "",
+            &format!("Retry from phase {selected_step}?"),
+            "Retry",
         )?;
-        if !answer.as_deref().map(yes).unwrap_or(false) {
+        if !should_retry {
             return Ok(true);
         }
         let repo = Repository {

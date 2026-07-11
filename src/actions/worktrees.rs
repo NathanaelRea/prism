@@ -18,10 +18,6 @@ pub(super) fn archived_picker_overflow_message(
     })
 }
 
-pub(super) fn yes_default(answer: &str) -> bool {
-    !matches!(answer.trim(), "n" | "N" | "no" | "NO")
-}
-
 impl Tui {
     pub(crate) fn refresh_sessions(&mut self) -> Result<(), String> {
         for managed in &mut self.repos {
@@ -141,13 +137,13 @@ impl Tui {
         if behind == 0 {
             return Ok(());
         }
-        let answer = self.prompt_line_dialog(
+        let should_pull = self.confirm_action_dialog(
             raw,
             "Default Branch Behind",
-            &format!("{base} is behind origin/{base} by {behind}. Pull first? [Y/n] "),
-            "",
+            &format!("{base} is behind origin/{base} by {behind}. Pull first?"),
+            "Pull",
         )?;
-        if answer.as_deref().map(yes_default).unwrap_or(false) {
+        if should_pull {
             self.show_loading_dialog(raw, "Pull Default Branch", &format!("Pulling {base}"))?;
             pull_branch(&base_path, &base, &context.config)?;
             self.refresh_sessions()?;

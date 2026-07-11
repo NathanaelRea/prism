@@ -294,13 +294,13 @@ impl Tui {
             self.show_message("selected worktree is not using OpenCode")?;
             return Ok(());
         }
-        let answer = self.prompt_line_dialog(
+        let should_abort = self.confirm_action_dialog(
             raw,
             "Abort OpenCode",
-            &format!("Abort {}? [y/N] ", self.sessions[selected].branch),
-            "",
+            &format!("Abort {}?", self.sessions[selected].branch),
+            "Abort",
         )?;
-        if !answer.as_deref().map(yes).unwrap_or(false) {
+        if !should_abort {
             return Ok(());
         }
         let runtime = opencode::ensure_opencode_session(

@@ -249,18 +249,22 @@ impl Tui {
         let Some(dashboard) = self.current_auto_dashboard() else {
             return Ok(false);
         };
-        let answer = self.prompt_line_dialog(
+        let answer = self.prompt_choice_dialog(
             raw,
-            "Abort Auto Flow",
-            "Abort selected step? Use 'all' for the whole run. [y/N/all] ",
-            "",
+            crate::view::ChoiceList {
+                title: "Abort Auto Flow".to_string(),
+                choices: [("s", "selected step"), ("a", "whole run")]
+                    .into_iter()
+                    .map(|(key, label)| crate::view::KeyChoice {
+                        key: key.to_string(),
+                        label: label.to_string(),
+                    })
+                    .collect(),
+            },
         )?;
         let Some(answer) = answer else {
             return Ok(true);
         };
-        if !answer.trim().eq_ignore_ascii_case("all") && !yes(&answer) {
-            return Ok(true);
-        }
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
@@ -268,7 +272,7 @@ impl Tui {
         crate::observability::with_writable_db(&repo, |conn| {
             let mut run = load_auto_run(conn, &run_id)?
                 .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
-            if answer.trim().eq_ignore_ascii_case("all") {
+            if answer == "a" {
                 for step in &mut run.steps {
                     if matches!(
                         step.status,
@@ -355,13 +359,13 @@ impl Tui {
         let Some(selected) = selected else {
             return Ok(true);
         };
-        let answer = self.prompt_line_dialog(
+        let should_retry = self.confirm_action_dialog(
             raw,
             "Retry Auto Flow",
-            "Retry from selected step? [y/N] ",
-            "",
+            "Retry from selected step?",
+            "Retry",
         )?;
-        if !answer.as_deref().map(yes).unwrap_or(false) {
+        if !should_retry {
             return Ok(true);
         }
         let repo = Repository {
@@ -433,13 +437,12 @@ impl Tui {
     ) -> Result<bool, String> {
         let description = next_auto_step_description(run)
             .unwrap_or_else(|| "determine the next Auto Flow step".to_string());
-        let answer = self.prompt_line_dialog(
+        self.confirm_action_dialog(
             raw,
             "Resume Auto Flow",
-            &format!("Next: {description}. Continue? [y/N] "),
-            "",
-        )?;
-        Ok(answer.as_deref().map(yes).unwrap_or(false))
+            &format!("Next: {description}. Continue?"),
+            "Continue",
+        )
     }
 
     pub(crate) fn dismiss_selected_auto_run(&mut self) -> Result<bool, String> {
