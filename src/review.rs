@@ -11,6 +11,12 @@ pub struct ReviewFixPromptInput<'a> {
     pub details: &'a PrDetails,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrackedReviewFixPrompt {
+    pub prompt: String,
+    pub review_thread_ids: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReviewFeedbackFilter<'a> {
     pub after: Option<&'a str>,
@@ -36,7 +42,15 @@ impl ReviewFeedback<'_> {
     }
 }
 
+#[cfg(test)]
 pub fn build_review_fix_prompt(session: &Session, config: &Config) -> Result<String, String> {
+    build_tracked_review_fix_prompt(session, config).map(|tracked| tracked.prompt)
+}
+
+pub fn build_tracked_review_fix_prompt(
+    session: &Session,
+    config: &Config,
+) -> Result<TrackedReviewFixPrompt, String> {
     if pr_cache_excluded_branch(config, &session.branch) {
         return Err("selected branch is not treated as a PR branch".to_string());
     }
@@ -51,7 +65,7 @@ pub fn build_review_fix_prompt(session: &Session, config: &Config) -> Result<Str
         .as_ref()
         .ok_or_else(|| "PR comments are still loading; refresh and try again".to_string())?;
 
-    Ok(build_review_fix_prompt_from_input(
+    Ok(build_tracked_review_fix_prompt_from_input(
         ReviewFixPromptInput {
             branch: &session.branch,
             summary,
@@ -61,10 +75,10 @@ pub fn build_review_fix_prompt(session: &Session, config: &Config) -> Result<Str
     ))
 }
 
-pub fn build_review_fix_prompt_from_input(
+pub fn build_tracked_review_fix_prompt_from_input(
     input: ReviewFixPromptInput<'_>,
     config: &Config,
-) -> String {
+) -> TrackedReviewFixPrompt {
     let mut feedback = actionable_review_feedback(input.details, ReviewFeedbackFilter::default());
     feedback
         .review_bodies
@@ -74,10 +88,13 @@ pub fn build_review_fix_prompt_from_input(
     let pr_comments = render_pr_comments(&feedback);
     let comments = render_review_feedback(&feedback);
 
-    render_template(
-        config
-            .prompt_template("review_fix")
-            .unwrap_or(DEFAULT_REVIEW_FIX_TEMPLATE),
+    let template = config
+        .prompt_template("review_fix")
+        .unwrap_or(DEFAULT_REVIEW_FIX_TEMPLATE);
+    let includes_inline_comments =
+        template.contains("{comments}") || template.contains("{inline_comments}");
+    let prompt = render_template(
+        template,
         &[
             ("pr_number", input.summary.number.to_string()),
             ("branch", input.branch.to_string()),
@@ -88,7 +105,29 @@ pub fn build_review_fix_prompt_from_input(
             ("review_bodies", review_bodies),
             ("pr_comments", pr_comments),
         ],
-    )
+    );
+    let review_thread_ids = if includes_inline_comments {
+        review_thread_ids(&feedback)
+    } else {
+        Vec::new()
+    };
+    TrackedReviewFixPrompt {
+        prompt,
+        review_thread_ids,
+    }
+}
+
+pub fn review_thread_ids(feedback: &ReviewFeedback<'_>) -> Vec<String> {
+    let mut ids = feedback
+        .inline_comments
+        .iter()
+        .map(|comment| comment.thread_id.trim())
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    ids
 }
 
 pub fn actionable_review_feedback<'a>(

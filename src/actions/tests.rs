@@ -140,7 +140,7 @@ JSON
 ;;
   api\ graphql*)
 cat <<'JSON'
-{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}
+{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"PRRT_fresh","isResolved":false,"comments":{"nodes":[{"id":"PRRC_fresh","path":"src/lib.rs","originalLine":12,"body":"fresh inline comment","createdAt":"2026-06-14T12:01:30Z","author":{"login":"reviewer"}}]}}]}}}}}
 JSON
 ;;
   *)
@@ -227,7 +227,16 @@ esac
     let prompt = persisted.steps[0].reason.as_deref().unwrap();
     assert!(prompt.contains("fresh top-level comment"));
     assert!(prompt.contains("fresh review body"));
+    assert!(prompt.contains("fresh inline comment"));
     assert!(!prompt.contains("stale cached comment"));
+    assert_eq!(
+        persisted.steps[0]
+            .work_guard
+            .as_ref()
+            .unwrap()
+            .review_thread_ids,
+        vec!["PRRT_fresh"]
+    );
     assert_eq!(persisted.run.variant, "repair");
 
     let _ = fs::remove_dir_all(temp);

@@ -387,13 +387,9 @@ fn merge_blocked(summary: &crate::github::PrSummary) -> bool {
 fn has_actionable_review_feedback(session: &Session) -> bool {
     session.pr.details.as_ref().is_some_and(|details| {
         details
-            .reviews
+            .review_comments
             .iter()
-            .any(|review| !review.body.trim().is_empty())
-            || details
-                .review_comments
-                .iter()
-                .any(|comment| !comment.resolved && !comment.body.trim().is_empty())
+            .any(|comment| !comment.resolved && !comment.body.trim().is_empty())
     })
 }
 

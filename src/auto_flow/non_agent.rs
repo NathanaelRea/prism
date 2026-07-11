@@ -573,6 +573,15 @@ pub(super) fn execute_wait_review_step(
             )?;
             if persisted.next_attempt_for(&AutoStepKey::FixReview) <= MAX_REVIEW_FIX_ATTEMPTS {
                 append_step_run(conn, persisted, AutoStepKey::FixReview, Some(prompt))?;
+                let step = persisted
+                    .steps
+                    .last_mut()
+                    .expect("appended review repair step");
+                step.work_guard = Some(stabilization_model::WorkGuard {
+                    review_thread_ids: outcome.review_thread_ids,
+                    ..Default::default()
+                });
+                save_step_with_conn(conn, step)?;
                 return Ok(());
             }
             return Err(format!(
@@ -712,6 +721,28 @@ pub(super) fn execute_commit_review_fix_step(
     }
     if result.committed && config.auto.push_repairs {
         crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
+        let review_thread_ids = persisted.steps[step_index]
+            .work_guard
+            .as_ref()
+            .map(|guard| guard.review_thread_ids.clone())
+            .unwrap_or_default();
+        persisted.run.pending_push = result.commit_sha.clone().map(|commit_sha| {
+            pending_push_guard(
+                stabilization_model::RepairKind::Review,
+                commit_sha.clone(),
+                head_sha.clone().unwrap_or(commit_sha),
+                guard_facts,
+                review_thread_ids.clone(),
+            )
+        });
+        save_run_with_conn(conn, &persisted.run)?;
+        if !review_thread_ids.is_empty() {
+            crate::github::resolve_review_threads(
+                &persisted.run.worktree_path,
+                config,
+                &review_thread_ids,
+            )?;
+        }
         persisted.run.pending_push = None;
     } else if result.committed {
         persisted.run.pending_push = result.commit_sha.clone().map(|commit_sha| {
@@ -1250,6 +1281,7 @@ pub(super) struct ReviewBaseline {
 pub(super) struct ReviewPollOutcome {
     pub(super) summary: String,
     pub(super) fix_prompt: Option<String>,
+    pub(super) review_thread_ids: Vec<String>,
     pub(super) complete: bool,
 }
 
@@ -1486,6 +1518,7 @@ pub(super) fn evaluate_review_feedback(
                 "no automated reviewer feedback or pending configured reviewer found; continuing"
                     .to_string(),
             fix_prompt: None,
+            review_thread_ids: Vec::new(),
             complete: true,
         });
     }
@@ -1493,6 +1526,7 @@ pub(super) fn evaluate_review_feedback(
         return Ok(ReviewPollOutcome {
             summary: "PR details are not available yet; waiting for review feedback".to_string(),
             fix_prompt: None,
+            review_thread_ids: Vec::new(),
             complete: false,
         });
     };
@@ -1515,6 +1549,7 @@ pub(super) fn evaluate_review_feedback(
         return Ok(ReviewPollOutcome {
             summary: format_review_feedback_summary(&feedback),
             fix_prompt: Some(prompt),
+            review_thread_ids: crate::review::review_thread_ids(&feedback),
             complete: false,
         });
     }
@@ -1530,6 +1565,7 @@ pub(super) fn evaluate_review_feedback(
                     + feedback.skipped_author
             ),
             fix_prompt: None,
+            review_thread_ids: Vec::new(),
             complete: true,
         });
     }
@@ -1537,12 +1573,14 @@ pub(super) fn evaluate_review_feedback(
         return Ok(ReviewPollOutcome {
             summary: "review decision is approved; continuing".to_string(),
             fix_prompt: None,
+            review_thread_ids: Vec::new(),
             complete: true,
         });
     }
     Ok(ReviewPollOutcome {
         summary: "no review feedback found yet".to_string(),
         fix_prompt: None,
+        review_thread_ids: Vec::new(),
         complete: false,
     })
 }
