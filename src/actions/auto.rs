@@ -162,47 +162,49 @@ impl Tui {
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<Option<AutoStartupSource>, String> {
-        loop {
-            let Some(answer) = self.prompt_line_dialog(
-                raw,
-                "Auto Flow",
-                "Implementation source [p]rompt/[e]xisting plan/[d]raft plan: ",
-                "p",
-            )?
-            else {
-                return Ok(None);
-            };
-            match answer.trim().to_ascii_lowercase().as_str() {
-                "" | "p" | "prompt" => return Ok(Some(AutoStartupSource::Prompt)),
-                "e" | "existing" | "existing plan" | "plan" | "file plan" | "plan file" => {
-                    return Ok(Some(AutoStartupSource::ExistingPlan));
-                }
-                "d" | "draft" | "draft plan" => return Ok(Some(AutoStartupSource::DraftPlan)),
-                _ => self.show_message("choose prompt, existing plan, or draft plan")?,
-            }
-        }
+        let answer = self.prompt_choice_dialog(
+            raw,
+            crate::view::ChoiceList {
+                title: "Auto Flow: Implementation Source".to_string(),
+                choices: [("p", "prompt"), ("e", "existing plan"), ("d", "draft plan")]
+                    .into_iter()
+                    .map(|(key, label)| crate::view::KeyChoice {
+                        key: key.to_string(),
+                        label: label.to_string(),
+                    })
+                    .collect(),
+            },
+        )?;
+        Ok(match answer.as_deref() {
+            Some("p") => Some(AutoStartupSource::Prompt),
+            Some("e") => Some(AutoStartupSource::ExistingPlan),
+            Some("d") => Some(AutoStartupSource::DraftPlan),
+            _ => None,
+        })
     }
 
     pub(super) fn prompt_auto_plan_run_mode(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<Option<PlanRunMode>, String> {
-        loop {
-            let Some(answer) = self.prompt_line_dialog(
-                raw,
-                "Auto Flow",
-                "Plan execution [s]equential/[p]arallel: ",
-                "s",
-            )?
-            else {
-                return Ok(None);
-            };
-            match answer.trim().to_ascii_lowercase().as_str() {
-                "" | "s" | "sequential" => return Ok(Some(PlanRunMode::Sequential)),
-                "p" | "parallel" => return Ok(Some(PlanRunMode::Parallel)),
-                _ => self.show_message("choose sequential or parallel plan execution")?,
-            }
-        }
+        let answer = self.prompt_choice_dialog(
+            raw,
+            crate::view::ChoiceList {
+                title: "Auto Flow: Plan Execution".to_string(),
+                choices: [("s", "sequential"), ("p", "parallel")]
+                    .into_iter()
+                    .map(|(key, label)| crate::view::KeyChoice {
+                        key: key.to_string(),
+                        label: label.to_string(),
+                    })
+                    .collect(),
+            },
+        )?;
+        Ok(match answer.as_deref() {
+            Some("s") => Some(PlanRunMode::Sequential),
+            Some("p") => Some(PlanRunMode::Parallel),
+            _ => None,
+        })
     }
 
     pub(super) fn spawn_auto_run_executor(
