@@ -17,7 +17,7 @@ pub const CONFIG_SCHEMA_URL: &str =
 pub const CONFIG_SCHEMA_JSON: &str = include_str!("../schemas/config.schema.json");
 
 pub fn config_example() -> String {
-    format!("#:schema {CONFIG_SCHEMA_URL}\n").to_string()
+    format!("#:schema {CONFIG_SCHEMA_URL}\n")
         + r#"
 # Prism config. Use this file globally or as a repository override.
 default_agent = "opencode"
@@ -78,8 +78,8 @@ auto_implement = "Implement this task in the current worktree. Stop after implem
 auto_fix_local_verify = "Fix the local verification failures, then stop without committing.\n\nOriginal task:\n{{task}}\n\nFailure context:\n{{context}}"
 auto_fix_review = "Resolve the review feedback, then stop without committing.\n\nOriginal task:\n{{task}}\n\nReview context:\n{{context}}"
 auto_fix_ci = "Fix the CI failure, then stop without committing.\n\nOriginal task:\n{{task}}\n\nCI context:\n{{context}}"
-review_fix = "Here are review comments on PR {{pr_number}}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n{{comments}}"
-ci_failure = "Here are CI failures on PR {{pr_number}}.\n\nFix the failing checks. Use the log tails below as the primary clues.\n\nPR: {{url}}\nBranch: {{branch}}\nHead SHA: {{head_sha}}\n\n---\n\n{{failures}}"
+review_fix = "Here are review comments on PR {pr_number}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n{comments}"
+ci_failure = "Here are CI failures on PR {pr_number}.\n\nFix the failing checks. Use the log tails below as the primary clues.\n\nPR: {url}\nBranch: {branch}\nHead SHA: {head_sha}\n\n---\n\n{failures}"
 repair_commit_review = "fix: cr"
 repair_commit_ci = "fix: ci"
 repair_commit_merge = "fix: merge"

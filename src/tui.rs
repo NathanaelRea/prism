@@ -1346,12 +1346,12 @@ impl Tui {
                 continue;
             }
             match event.code {
-                KeyCode::Enter | KeyCode::Char('y') if plain_key(event) => {
+                KeyCode::Enter | KeyCode::Char('y' | 'Y') if plain_key(event) => {
                     self.dialog = None;
                     self.draw(runtime)?;
                     return Ok(true);
                 }
-                KeyCode::Esc | KeyCode::Char('n')
+                KeyCode::Esc | KeyCode::Char('n' | 'N')
                     if event.code == KeyCode::Esc || plain_key(event) =>
                 {
                     self.dialog = None;
@@ -2261,7 +2261,7 @@ impl Tui {
                 let mut runs = load_recent_active_runs_for_repo(conn, &repo.root, 8)?;
                 if reconcile_stale {
                     for run in &mut runs {
-                        reconcile_stale_auto_run(conn, run)?;
+                        let _ = reconcile_stale_auto_run(conn, run);
                     }
                 }
                 Ok(runs)
