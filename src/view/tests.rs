@@ -545,6 +545,7 @@ fn renders_configured_sidebar_width() {
     let buffer = render_to_buffer(&model, 120, 30);
 
     assert_region_contains(&buffer, 0..64, 0..30, "[3] Worktrees");
+    assert_region_contains(&buffer, 0..64, 0..30, "all | repo");
     assert_region_contains(&buffer, 64..120, 0..29, "Main");
 }
 
