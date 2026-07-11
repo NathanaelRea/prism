@@ -3,7 +3,7 @@ use super::*;
 pub(super) fn pr_panel_lines(
     config: &crate::config::Config,
     session: Option<&Session>,
-    selected_comment: usize,
+    _selected_comment: usize,
 ) -> Vec<Line<'static>> {
     let Some(session) = session else {
         return vec![Line::from(Span::styled(
@@ -38,7 +38,6 @@ pub(super) fn pr_panel_lines(
             Line::from(Span::styled("P creates one explicitly", attention_style())),
         ];
     };
-    let review = review_decision_for_display(summary, session.pr.details.as_ref());
     let mut lines = vec![
         Line::from(vec![
             Span::styled(
@@ -51,69 +50,12 @@ pub(super) fn pr_panel_lines(
             ),
         ]),
         Line::from(Span::styled(summary.title.clone(), selected_text_style())),
-        Line::from(vec![
-            Span::styled("base ", muted_style()),
-            Span::raw(summary.base_ref.clone()),
-            Span::styled("  head ", muted_style()),
-            Span::raw(summary.head_ref.clone()),
-        ]),
-        Line::from(vec![
-            Span::styled("review ", muted_style()),
-            Span::styled(review_label(&review).to_string(), review_style(&review)),
-            Span::styled("  ci ", muted_style()),
-            Span::styled(
-                ci_icon(config, session, config.icon_style),
-                ci_style(config, session),
-            ),
-            Span::raw(format!(" {}", summary.check_status)),
-        ]),
     ];
     if !summary.requested_reviewers.is_empty() {
         lines.push(labelled_line(
             "awaiting",
             summary.requested_reviewers.join(", "),
         ));
-    }
-    lines.push(Line::from(""));
-    lines.push(heading_line("Description"));
-    lines.extend(description_lines(&summary.body, 4));
-    if let Some(details) = &session.pr.details {
-        lines.push(Line::from(""));
-        lines.push(heading_line("Activity"));
-        lines.push(Line::from(vec![
-            Span::styled("comments ", muted_style()),
-            Span::raw((details.comments.len() + details.review_comments.len()).to_string()),
-            Span::styled("  reviews ", muted_style()),
-            Span::raw(details.reviews.len().to_string()),
-            Span::styled("  files ", muted_style()),
-            Span::raw(details.files.len().to_string()),
-        ]));
-        lines.extend(pr_comment_lines(details, 5, selected_comment));
-        if !details.failing_checks.is_empty() {
-            lines.push(Line::from(Span::styled("Failing checks", error_style())));
-            for check in details.failing_checks.iter().take(3) {
-                lines.push(Line::from(vec![
-                    Span::styled("✕ ", error_style()),
-                    Span::raw(check.clone()),
-                ]));
-            }
-        }
-        if !details.ci_failures.is_empty() {
-            lines.push(labelled_line(
-                "CI failures cached",
-                details.ci_failures.len().to_string(),
-            ));
-        }
-    } else {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("Activity pending", muted_style())));
-    }
-    if let Some(refreshed) = &session.pr.last_refreshed {
-        lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!("refreshed {refreshed}"),
-            muted_style(),
-        )));
     }
     lines
 }

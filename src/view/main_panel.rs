@@ -14,24 +14,24 @@ pub(super) fn render_main(frame: &mut Frame<'_>, area: Rect, model: &crate::view
         PanelFocus::Repos => repo_overview_lines(model, width, content_area),
         PanelFocus::Worktrees => worktree_detail_lines(model),
     };
-    if model.focus == PanelFocus::Worktrees {
-        if let Some(dashboard) = &model.plan_dashboard {
-            lines.push(Line::from(""));
-            lines.extend(plan_dashboard_lines(dashboard, width, content_area));
-        }
-        if let Some(dashboard) = &model.auto_dashboard {
-            lines.push(Line::from(""));
-            lines.extend(auto_dashboard_lines(dashboard, width, content_area));
-        }
-        lines.truncate(content_area);
+    if model.focus == PanelFocus::Worktrees
+        && let Some(dashboard) = &model.plan_dashboard
+    {
+        lines.push(Line::from(""));
+        lines.extend(plan_dashboard_lines(dashboard, width, content_area));
     }
+    let scroll = model
+        .main_scroll
+        .min(lines.len().saturating_sub(content_area))
+        .min(u16::MAX as usize) as u16;
     frame.render_widget(
         Paragraph::new(lines)
             .block(panel_block(
                 Line::from(Span::styled("0 Main", title_style(model.main_focused))),
                 model.main_focused,
             ))
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         area,
     );
 }

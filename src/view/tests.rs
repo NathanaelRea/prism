@@ -779,14 +779,8 @@ fn renders_auto_dashboard_steps_and_output_cursor() {
     model.auto_dashboard = Some(test_auto_dashboard());
     let buffer = render_to_string(&model, 120, 32);
 
-    assert!(buffer.contains("Auto Flow"));
-    assert!(buffer.contains("task"));
-    assert!(buffer.contains("Checklist"));
-    assert!(buffer.contains("Implement \"implement feature\""));
-    assert!(buffer.contains("Local validation loop"));
-    assert!(buffer.contains("Run local validation"));
-    assert!(buffer.contains("auto output"));
-    assert!(!buffer.contains("Output"));
+    assert!(!buffer.contains("Auto Flow"));
+    assert!(!buffer.contains("auto output"));
 }
 
 #[test]
@@ -809,7 +803,7 @@ fn worktree_main_panel_omits_runtime_metadata_block() {
 }
 
 #[test]
-fn pr_comments_table_omits_severity_column() {
+fn worktree_main_panel_omits_pr_comments_table() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
     session.pr.summary = Some(test_pr_summary());
@@ -827,8 +821,8 @@ fn pr_comments_table_omits_severity_column() {
 
     let buffer = render_to_string(&model, 120, 30);
 
-    assert!(buffer.contains("kind   res author       text"));
-    assert!(!buffer.contains("sev"));
+    assert!(!buffer.contains("kind   res author       text"));
+    assert!(!buffer.contains("please fix"));
 }
 
 #[test]
@@ -846,8 +840,11 @@ fn renders_stabilization_pending_push_in_worktree_main_panel() {
 
     let buffer = render_to_string(&model, 120, 40);
 
-    assert!(buffer.contains("PR Stabilization"));
-    assert!(buffer.contains("code review"));
+    assert!(buffer.contains("PR"));
+    assert!(buffer.contains("pr #"));
+    assert!(buffer.contains("42"));
+    assert!(buffer.contains("name"));
+    assert!(buffer.contains("Feature PR"));
     assert!(buffer.contains("merge conflicts"));
     assert!(buffer.contains("pending push"));
     assert!(buffer.contains("guard"));
@@ -860,7 +857,7 @@ fn renders_stabilization_pending_push_in_worktree_main_panel() {
 }
 
 #[test]
-fn renders_requested_pr_review_as_pending_when_approval_gate_is_disabled() {
+fn worktree_main_panel_omits_code_review_gate() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
     let mut summary = test_pr_summary();
@@ -874,12 +871,10 @@ fn renders_requested_pr_review_as_pending_when_approval_gate_is_disabled() {
         None,
     ));
 
-    let buffer = render_to_buffer(&model, 120, 40);
-    let review_row = find_line(&buffer, "code review");
-    let review_status = line_text(&buffer, review_row);
+    let buffer = render_to_string(&model, 120, 40);
 
-    assert!(review_status.contains("pending"));
-    assert!(!review_status.contains("disabled"));
+    assert!(!buffer.contains("code review"));
+    assert!(!buffer.contains("review-team"));
 }
 
 #[test]
@@ -897,8 +892,6 @@ fn renders_stabilization_ci_failed_in_worktree_main_panel() {
 
     let buffer = render_to_string(&model, 120, 40);
 
-    assert!(buffer.contains("ci"));
-    assert!(buffer.contains("failed"));
     assert!(buffer.contains("state"));
     assert!(buffer.contains("CiFailed"));
     assert!(buffer.contains("next"));
@@ -978,13 +971,70 @@ fn renders_stabilization_ready_for_manual_merge_in_worktree_main_panel() {
 
     let buffer = render_to_string(&model, 120, 40);
 
-    assert!(buffer.contains("ci"));
-    assert!(buffer.contains("code review"));
-    assert!(buffer.contains("required"));
     assert!(buffer.contains("state"));
     assert!(buffer.contains("ReadyForManualMerge"));
     assert!(buffer.contains("next"));
     assert!(buffer.contains("MarkReadyForManualMerge"));
+}
+
+#[test]
+fn worktree_main_panel_always_renders_empty_pr_keys() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let buffer = render_to_string(&model, 120, 30);
+
+    assert!(buffer.contains("PR"));
+    for key in [
+        "pr #",
+        "name",
+        "state",
+        "next",
+        "merge conflicts",
+        "policy",
+        "pending push",
+        "guard",
+    ] {
+        assert!(buffer.contains(key), "missing PR key: {key}");
+    }
+    assert!(!buffer.contains("No PR detected"));
+    assert!(!buffer.contains("Description"));
+    assert!(!buffer.contains("Activity"));
+    assert!(!buffer.contains("refreshed"));
+}
+
+#[test]
+fn worktree_main_panel_hides_stabilization_values_without_pr() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.auto_dashboard = Some(stabilization_dashboard(
+        StabilizationBlocker::NeedsPullRequest,
+        StabilizationWorkKind::PushInitialAndOpenPr,
+        Some(test_pending_push_guard()),
+    ));
+    let buffer = render_to_string(&model, 120, 30);
+
+    assert!(!buffer.contains("NeedsPullRequest"));
+    assert!(!buffer.contains("PushInitialAndOpenPr"));
+    assert!(!buffer.contains("review repair"));
+}
+
+#[test]
+fn main_panel_applies_scroll_for_every_focus() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Running)];
+
+    for focus in [PanelFocus::Status, PanelFocus::Repos, PanelFocus::Worktrees] {
+        let mut model = test_model(&config, &sessions, focus, None, None);
+        let unscrolled = render_to_string(&model, 120, 6);
+        model.main_scroll = 2;
+        let scrolled = render_to_string(&model, 120, 6);
+        assert_ne!(
+            unscrolled, scrolled,
+            "main panel did not scroll for {focus:?}"
+        );
+    }
 }
 
 fn render_to_string(model: &FrameModel<'_>, cols: u16, rows: u16) -> String {
@@ -1205,6 +1255,7 @@ fn test_model<'a>(
         selected_comment: 0,
         focus,
         main_focused: false,
+        main_scroll: 0,
         repo_main_view: RepoMainView::Github,
         worktree_main_view: WorktreeMainView::Details,
         worktree_list_mode: WorktreeListMode::Repo,

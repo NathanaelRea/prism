@@ -41,6 +41,7 @@ pub struct Tui {
     pub(crate) selected_repo_root: Option<PathBuf>,
     pub(crate) focused_panel: PanelFocus,
     pub(crate) main_focused: bool,
+    pub(crate) main_scroll: usize,
     pub(crate) repo_main_view: view::RepoMainView,
     pub(crate) worktree_main_view: view::WorktreeMainView,
     pub(crate) worktree_list_mode: WorktreeListMode,
@@ -208,6 +209,7 @@ enum OpenTmuxSessionTarget {
 pub(crate) struct NavigationSnapshot {
     focused_panel: PanelFocus,
     main_focused: bool,
+    main_scroll: usize,
     current_repo_root: Option<PathBuf>,
     selected_worktree_path: Option<PathBuf>,
     selected_comment: usize,
@@ -391,6 +393,7 @@ impl Tui {
             selected_repo_root: None,
             focused_panel: PanelFocus::Repos,
             main_focused: false,
+            main_scroll: 0,
             repo_main_view: view::RepoMainView::Github,
             worktree_main_view: view::WorktreeMainView::Details,
             worktree_list_mode: WorktreeListMode::Repo,
@@ -642,10 +645,6 @@ impl Tui {
                 Key::OpenTmuxSession => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.open_selected_comment_dialog(&mut runtime)? {
-                        self.draw(&mut runtime)?;
-                        continue;
-                    }
                     match self.open_tmux_session_target() {
                         OpenTmuxSessionTarget::RepoDefaultAgent(index) => {
                             self.enter_agent_mode_for_index(&mut runtime, index)?
@@ -1406,9 +1405,7 @@ impl Tui {
 
     fn move_down(&mut self) {
         if self.main_focused {
-            if self.move_comment_selection(1) {
-                return;
-            }
+            self.main_scroll = self.main_scroll.saturating_add(1);
             self.move_plan_step_selection(1);
             return;
         }
@@ -1421,9 +1418,7 @@ impl Tui {
 
     fn move_up(&mut self) {
         if self.main_focused {
-            if self.move_comment_selection(-1) {
-                return;
-            }
+            self.main_scroll = self.main_scroll.saturating_sub(1);
             self.move_plan_step_selection(-1);
             return;
         }
@@ -1465,6 +1460,7 @@ impl Tui {
     }
 
     fn focus_next_panel(&mut self) {
+        self.main_scroll = 0;
         self.focused_panel = match self.focused_panel {
             PanelFocus::Status => PanelFocus::Repos,
             PanelFocus::Repos => PanelFocus::Worktrees,
@@ -1474,6 +1470,7 @@ impl Tui {
     }
 
     fn focus_previous_panel(&mut self) {
+        self.main_scroll = 0;
         self.focused_panel = match self.focused_panel {
             PanelFocus::Status => PanelFocus::Worktrees,
             PanelFocus::Repos => PanelFocus::Status,
@@ -1483,16 +1480,19 @@ impl Tui {
     }
 
     pub(crate) fn focus_status(&mut self) {
+        self.main_scroll = 0;
         self.focused_panel = PanelFocus::Status;
         self.main_focused = false;
     }
 
     fn focus_repos(&mut self) {
+        self.main_scroll = 0;
         self.focused_panel = PanelFocus::Repos;
         self.main_focused = false;
     }
 
     pub(crate) fn focus_worktrees(&mut self) {
+        self.main_scroll = 0;
         self.focused_panel = PanelFocus::Worktrees;
         self.main_focused = false;
         if self.worktree_list_mode == WorktreeListMode::Repo {
@@ -1688,6 +1688,7 @@ impl Tui {
     }
 
     pub(crate) fn select_worktree(&mut self, index: usize) {
+        self.main_scroll = 0;
         let Some(session) = self.sessions.get(index) else {
             return;
         };
@@ -1709,6 +1710,7 @@ impl Tui {
         NavigationSnapshot {
             focused_panel: self.focused_panel,
             main_focused: self.main_focused,
+            main_scroll: self.main_scroll,
             current_repo_root: self
                 .repos
                 .get(self.current_repo)
@@ -1750,6 +1752,7 @@ impl Tui {
         self.selected_comment = snapshot.selected_comment;
         self.focused_panel = snapshot.focused_panel;
         self.main_focused = snapshot.main_focused;
+        self.main_scroll = snapshot.main_scroll;
     }
 
     fn selected_repo_default_session_index(&self) -> Option<usize> {
@@ -1780,79 +1783,6 @@ impl Tui {
             session.visibility = visibility;
         }
         Ok(())
-    }
-
-    fn selected_comment_rows(&self) -> Vec<view::PrCommentDisplayRow> {
-        let Some(index) = self.selected_worktree_index() else {
-            return Vec::new();
-        };
-        self.sessions
-            .get(index)
-            .and_then(|session| session.pr.details.as_ref())
-            .map(view::pr_comment_rows)
-            .unwrap_or_default()
-    }
-
-    fn move_comment_selection(&mut self, direction: isize) -> bool {
-        if self.focused_panel != PanelFocus::Worktrees {
-            return false;
-        }
-        let rows = self.selected_comment_rows();
-        if rows.is_empty() {
-            self.selected_comment = 0;
-            return false;
-        }
-        let current = self.selected_comment.min(rows.len().saturating_sub(1));
-        let next = current as isize + direction;
-        if next < 0 {
-            self.selected_comment = 0;
-        } else {
-            self.selected_comment = (next as usize).min(rows.len().saturating_sub(1));
-        }
-        true
-    }
-
-    fn open_selected_comment_dialog(
-        &mut self,
-        runtime: &mut TerminalRuntime,
-    ) -> Result<bool, String> {
-        if !self.main_focused || self.focused_panel != PanelFocus::Worktrees {
-            return Ok(false);
-        }
-        let rows = self.selected_comment_rows();
-        let Some(row) = rows.get(self.selected_comment) else {
-            return Ok(false);
-        };
-        let mut lines = vec![
-            view::DialogLine {
-                text: format!("kind: {}", row.kind),
-                attention: false,
-            },
-            view::DialogLine {
-                text: format!("author: {}", row.author),
-                attention: false,
-            },
-            view::DialogLine {
-                text: format!("resolved: {}", row.resolved),
-                attention: row.resolved.eq_ignore_ascii_case("no"),
-            },
-        ];
-        if !row.context.trim().is_empty() {
-            lines.push(view::DialogLine {
-                text: format!("context: {}", row.context),
-                attention: false,
-            });
-        }
-        lines.push(view::DialogLine {
-            text: String::new(),
-            attention: false,
-        });
-        lines.push(view::DialogLine {
-            text: row.body.clone(),
-            attention: false,
-        });
-        self.confirm_dialog(runtime, "Comment Details", lines, "Close", "Close")?;
-        Ok(true)
     }
 
     pub(crate) fn selected_worktree_index(&self) -> Option<usize> {
@@ -1930,6 +1860,7 @@ impl Tui {
     }
 
     pub(crate) fn select_repo(&mut self, repo_index: usize) {
+        self.main_scroll = 0;
         self.current_repo = repo_index.min(self.repos.len().saturating_sub(1));
         self.selected_repo_root = self
             .repos
@@ -2590,6 +2521,7 @@ impl Tui {
             selected_comment: self.selected_comment,
             focus: self.focused_panel,
             main_focused: self.main_focused,
+            main_scroll: self.main_scroll,
             repo_main_view: self.repo_main_view,
             worktree_main_view: self.worktree_main_view,
             worktree_list_mode: self.worktree_list_mode,

@@ -3,11 +3,11 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StabilizationPanelModel {
     pub icon_style: IconStyle,
+    pub pr_number: String,
+    pub pr_name: String,
     pub blocker: String,
     pub next: String,
     pub guard: Option<String>,
-    pub ci: String,
-    pub review: String,
     pub merge: String,
     pub policy: String,
     pub pending_commit: Option<String>,
@@ -34,27 +34,17 @@ pub(super) fn worktree_detail_lines(model: &crate::view::FrameModel<'_>) -> Vec<
         lines.push(Line::from(""));
         lines.push(labelled_line("prompt", session.prompt_summary.clone()));
     }
-    if let Some(stabilization) = stabilization_panel_model(model, session) {
-        lines.push(Line::from(""));
-        lines.extend(stabilization_panel_lines(&stabilization));
-    }
     lines.push(Line::from(""));
-    lines.extend(pr_panel_lines(
-        model.config,
-        Some(session),
-        model.selected_comment,
-    ));
+    lines.extend(stabilization_panel_lines(&stabilization_panel_model(
+        model, session,
+    )));
     lines
 }
 
 pub(crate) fn stabilization_panel_model(
     model: &crate::view::FrameModel<'_>,
     session: &Session,
-) -> Option<StabilizationPanelModel> {
-    if session.is_default_branch(model.config) || session.is_detached() {
-        return None;
-    }
-
+) -> StabilizationPanelModel {
     let run = model
         .auto_dashboard
         .as_ref()
@@ -67,29 +57,50 @@ pub(crate) fn stabilization_panel_model(
                 .map(|_| StabilizationBlocker::PendingPush)
         })
         .or_else(|| cached_pr_blocker(model.config, session));
-    let blocker = blocker?;
-    let next = run
-        .and_then(|run| run.stabilization_next_work.as_ref())
-        .cloned()
-        .unwrap_or_else(|| cached_next_work(&blocker));
+    let next = blocker.as_ref().map(|blocker| {
+        run.and_then(|run| run.stabilization_next_work.as_ref())
+            .cloned()
+            .unwrap_or_else(|| cached_next_work(blocker))
+    });
     let pending_push = run.and_then(|run| run.pending_push.as_ref());
+    let summary = session.pr.summary.as_ref();
 
-    Some(StabilizationPanelModel {
+    if summary.is_none() {
+        return StabilizationPanelModel {
+            icon_style: model.config.icon_style,
+            pr_number: String::new(),
+            pr_name: String::new(),
+            blocker: String::new(),
+            next: String::new(),
+            guard: None,
+            merge: String::new(),
+            policy: String::new(),
+            pending_commit: None,
+        };
+    }
+
+    StabilizationPanelModel {
         icon_style: model.config.icon_style,
-        blocker: blocker_label(&blocker),
-        next: work_label(&next),
+        pr_number: summary
+            .map(|summary| summary.number.to_string())
+            .unwrap_or_default(),
+        pr_name: summary
+            .map(|summary| summary.title.clone())
+            .unwrap_or_default(),
+        blocker: blocker.as_ref().map(blocker_label).unwrap_or_default(),
+        next: next.as_ref().map(work_label).unwrap_or_default(),
         guard: pending_push.map(guard_label),
-        ci: ci_gate_label(session, &blocker),
-        review: review_gate_label(model.config, session),
         merge: merge_gate_label(session),
-        policy: policy_gate_label(&blocker),
+        policy: blocker.as_ref().map(policy_gate_label).unwrap_or_default(),
         pending_commit: pending_push.map(pending_commit_label),
-    })
+    }
 }
 
 pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<Line<'static>> {
     let mut lines = vec![
-        heading_line("PR Stabilization"),
+        heading_line("PR"),
+        stabilization_value_line("pr #", &model.pr_number, Style::default()),
+        stabilization_value_line("name", &model.pr_name, selected_text_style()),
         stabilization_value_line(
             "state",
             &model.blocker,
@@ -97,12 +108,6 @@ pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<
         ),
         stabilization_value_line("next", &model.next, attention_style()),
     ];
-    lines.push(stabilization_gate_line("ci", &model.ci, model.icon_style));
-    lines.push(stabilization_gate_line(
-        "code review",
-        &model.review,
-        model.icon_style,
-    ));
     lines.push(stabilization_gate_line(
         "merge conflicts",
         &model.merge,
@@ -113,16 +118,16 @@ pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<
         &model.policy,
         model.icon_style,
     ));
-    if let Some(commit) = &model.pending_commit {
-        lines.push(stabilization_gate_line(
-            "pending push",
-            commit,
-            model.icon_style,
-        ));
-    }
-    if let Some(guard) = &model.guard {
-        lines.push(stabilization_gate_line("guard", guard, model.icon_style));
-    }
+    lines.push(stabilization_gate_line(
+        "pending push",
+        model.pending_commit.as_deref().unwrap_or_default(),
+        model.icon_style,
+    ));
+    lines.push(stabilization_gate_line(
+        "guard",
+        model.guard.as_deref().unwrap_or_default(),
+        model.icon_style,
+    ));
     lines
 }
 
@@ -144,7 +149,9 @@ fn stabilization_gate_line(
     } else {
         gate_style(status)
     };
-    let status_icon = if pending_detail {
+    let status_icon = if status.is_empty() {
+        ""
+    } else if pending_detail {
         icon(icon_style, "…", "")
     } else {
         stabilization_status_icon(status, icon_style)
@@ -350,7 +357,7 @@ fn review_gate_label(config: &crate::config::Config, session: &Session) -> Strin
 
 fn merge_gate_label(session: &Session) -> String {
     let Some(summary) = &session.pr.summary else {
-        return "unknown".to_string();
+        return String::new();
     };
     if merge_blocked(summary) {
         if summary.merge_state_status.trim().is_empty() {
