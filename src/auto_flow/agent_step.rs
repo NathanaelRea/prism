@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) fn execute_one_agent_step(
     conn: &rusqlite::Connection,
+    config: &Config,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
     executor: &AutoExecutorConfig,
@@ -23,7 +24,7 @@ pub(super) fn execute_one_agent_step(
         save_step_with_conn(conn, step)?;
     }
 
-    let prompt = prompt_for_step(&persisted.run, &persisted.steps[step_index]);
+    let prompt = prompt_for_step(config, &persisted.run, &persisted.steps[step_index]);
     let label = persisted.steps[step_index].step_key.as_str().to_string();
     writeln!(
         output,

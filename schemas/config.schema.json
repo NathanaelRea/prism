@@ -196,7 +196,7 @@
         "columns": {
           "type": "array",
           "items": { "type": "string" },
-          "default": ["url"],
+          "default": [],
           "description": "Extra wt list JSON columns shown in the worktree list."
         }
       }

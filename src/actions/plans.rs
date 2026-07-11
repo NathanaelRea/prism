@@ -75,8 +75,6 @@ impl Tui {
         if self.focused_panel == crate::tui::PanelFocus::Worktrees {
             self.worktree_main_view = crate::view::WorktreeMainView::Plan;
             self.main_focused = false;
-        } else {
-            self.focus_status();
         }
         if should_execute {
             self.show_message("started plan run")?;

@@ -501,7 +501,7 @@ impl Tui {
         self.start_opencode_status_poll(true);
         self.start_opencode_event_listeners();
         self.refresh_plan_runs();
-        self.refresh_auto_runs();
+        self.refresh_auto_runs(true);
         self.draw(&mut runtime)?;
         if self.repos.is_empty() {
             match self.add_repository(&mut runtime) {
@@ -732,7 +732,7 @@ impl Tui {
                     self.start_opencode_status_poll(true);
                     self.start_opencode_event_listeners();
                     self.refresh_plan_runs();
-                    self.refresh_auto_runs();
+                    self.refresh_auto_runs(false);
                     self.poll_pull_requests(true);
                 }
                 Key::VisibilityUp => {
@@ -2246,10 +2246,10 @@ impl Tui {
     }
 
     fn poll_auto_runs(&mut self) -> bool {
-        self.refresh_auto_runs()
+        self.refresh_auto_runs(false)
     }
 
-    fn refresh_auto_runs(&mut self) -> bool {
+    fn refresh_auto_runs(&mut self, reconcile_stale: bool) -> bool {
         let mut changed = false;
         let repos = self
             .repos
@@ -2259,8 +2259,10 @@ impl Tui {
         for repo in repos {
             let loaded = crate::observability::with_writable_db(&repo, |conn| {
                 let mut runs = load_recent_active_runs_for_repo(conn, &repo.root, 8)?;
-                for run in &mut runs {
-                    let _ = reconcile_stale_auto_run(conn, run);
+                if reconcile_stale {
+                    for run in &mut runs {
+                        reconcile_stale_auto_run(conn, run)?;
+                    }
                 }
                 Ok(runs)
             });

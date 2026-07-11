@@ -67,11 +67,14 @@ fn plan_first_prompts_create_and_review_plan_file() {
     .unwrap()
     .create_run();
 
+    let config = test_config();
     let create_prompt = prompt_for_step(
+        &config,
         &persisted.run,
         &AutoStepRun::queued(&persisted.run.id, 2, AutoStepKey::CreatePlan, 1, None),
     );
     let review_prompt = prompt_for_step(
+        &config,
         &persisted.run,
         &AutoStepRun::queued(&persisted.run.id, 3, AutoStepKey::ReviewPlan, 1, None),
     );
@@ -81,6 +84,32 @@ fn plan_first_prompts_create_and_review_plan_file() {
     assert!(create_prompt.contains("Agent profile: planner"));
     assert!(review_prompt.contains("missing phases"));
     assert!(review_prompt.contains("Edit the plan in place"));
+}
+
+#[test]
+fn auto_prompt_template_overrides_default_and_renders_context() {
+    let repo = PathBuf::from("/repo/prism");
+    let persisted = AutoLaunch::new(&repo, &repo.join("feature"), "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+    let mut config = test_config();
+    config.prompt_templates.insert(
+        "auto_implement".to_string(),
+        "Task={{task}} Branch={{branch}} Literal={{missing}}".to_string(),
+    );
+    let mut persisted = persisted;
+    persisted.run.initial_prompt = "Keep {{branch}} literal".to_string();
+
+    let prompt = prompt_for_step(
+        &config,
+        &persisted.run,
+        &AutoStepRun::queued(&persisted.run.id, 2, AutoStepKey::Implement, 1, None),
+    );
+
+    assert_eq!(
+        prompt,
+        "Task=Keep {{branch}} literal Branch=feat/auto Literal={{missing}}"
+    );
 }
 
 #[test]
@@ -1208,7 +1237,11 @@ printf '%s\n' '{"type":"tool.execute.after","id":"tool_1","status":"success","ou
         .iter()
         .find(|step| step.step_key == AutoStepKey::LocalVerify)
         .unwrap();
-    assert_eq!(verify.status, AutoStepStatus::Queued);
+    assert_eq!(verify.status, AutoStepStatus::Done);
+    assert!(loaded.steps.iter().any(|step| {
+        step.step_key == AutoStepKey::CommitImpl
+            && matches!(step.status, AutoStepStatus::Done | AutoStepStatus::Skipped)
+    }));
     let lines = load_output_lines(&conn, implement.id.unwrap()).unwrap();
     assert!(
         lines

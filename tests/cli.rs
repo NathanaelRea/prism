@@ -160,7 +160,9 @@ fn config_discovery_commands_print_templates_schema_and_paths() {
     let example_stdout = stdout(&example);
     assert!(example_stdout.contains("#:schema https://raw.githubusercontent.com/"));
     assert!(example_stdout.contains("[ui]"));
-    assert!(example_stdout.contains("# [worktrees]"));
+    assert!(example_stdout.contains("default_agent = \"opencode\""));
+    assert!(example_stdout.contains("[worktrees]"));
+    assert!(example_stdout.contains("auto_implement ="));
 
     let schema = run(["config", "schema"], &repo, &config_home);
     assert!(schema.status.success(), "{}", stderr(&schema));

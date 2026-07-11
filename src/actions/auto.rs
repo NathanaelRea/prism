@@ -44,7 +44,6 @@ impl Tui {
         if let Some(run_id) = self.active_auto_runs.get(&session_path).cloned() {
             self.load_auto_run_snapshot(&context.repo.root, &run_id);
             self.selected_auto_run = Some(run_id);
-            self.focus_status();
             self.show_message("focused Auto Flow run")?;
             return Ok(());
         }
@@ -153,7 +152,6 @@ impl Tui {
         self.remember_auto_run(persisted.clone());
         self.selected_auto_run = Some(run_id);
         self.spawn_auto_run_executor(context.repo, context.config, persisted);
-        self.focus_status();
         self.show_message("started Auto Flow run")?;
         Ok(())
     }

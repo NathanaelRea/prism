@@ -30,7 +30,7 @@ Safety defaults:
 
 - launch is refused on the default branch, detached HEAD, or a dirty worktree
 - every step attempt is persisted before the next external side effect
-- the TUI pauses Auto Flow between steps; resume from Status with `u` after reviewing the dialog that describes the next step
+- implementation continues through local verification and commit, then pauses before push; other agent and approval boundaries still pause for review
 - worktrees with active Auto Flow runs are highlighted in the worktree list so paused/running/failed runs are visible from the sidebar
 - local verification runs `checks.pre_push`, `checks.pre_pr`, and a non-mutating merge-conflict check
 - PR Stabilization handles review feedback, CI failures, pending checks, review approval, repository policy, mergeability, manual readiness, and auto-merge readiness as derived blockers
@@ -57,10 +57,18 @@ ci_max_wait_seconds = 1800
 ci_poll_interval_seconds = 30
 
 [prompt_templates]
+auto_create_plan = "Create an implementation plan at `{{plan_path}}` for: {{task}}"
+auto_review_plan = "Review and edit `{{plan_path}}` for: {{task}}"
+auto_implement = "Implement this task, then stop without committing: {{task}}"
+auto_fix_local_verify = "Fix these local verification failures, then stop without committing: {{context}}"
+auto_fix_review = "Resolve this review feedback, then stop without committing: {{context}}"
+auto_fix_ci = "Fix this CI failure, then stop without committing: {{context}}"
 repair_commit_review = "fix: cr"
 repair_commit_ci = "fix: ci"
 repair_commit_merge = "fix: merge"
 ```
+
+Auto Flow prompt templates support `{{task}}`, `{{plan_path}}`, `{{mode}}`, `{{variant}}`, `{{agent_profile}}`, `{{context}}`, and `{{branch}}` where applicable.
 
 The selected Worktree Session main panel shows the derived PR Stabilization state: blocker, next work, CI/review/merge/policy gates, guard state, and any pending repair commit. The Auto Flow dashboard remains the audit view for persisted step attempts and output.
 
