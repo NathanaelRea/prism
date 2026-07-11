@@ -1818,10 +1818,6 @@ impl Tui {
                 attention: false,
             },
             view::DialogLine {
-                text: format!("severity: {}", row.severity),
-                attention: row.severity.eq_ignore_ascii_case("high"),
-            },
-            view::DialogLine {
                 text: format!("resolved: {}", row.resolved),
                 attention: row.resolved.eq_ignore_ascii_case("no"),
             },
