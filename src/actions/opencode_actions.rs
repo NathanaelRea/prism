@@ -109,6 +109,13 @@ impl Tui {
                         latest_message: current
                             .as_ref()
                             .and_then(|status| status.latest_message.clone()),
+                        latest_user_message: current
+                            .as_ref()
+                            .and_then(|status| status.latest_user_message.clone()),
+                        recent_messages: current
+                            .as_ref()
+                            .map(|status| status.recent_messages.clone())
+                            .unwrap_or_default(),
                         active_tool: current
                             .as_ref()
                             .and_then(|status| status.active_tool.clone()),
@@ -210,6 +217,8 @@ impl Tui {
                         title: None,
                         state: opencode::OpencodeState::Unknown,
                         latest_message: None,
+                        latest_user_message: None,
+                        recent_messages: Vec::new(),
                         active_tool: None,
                         todos: Vec::new(),
                         last_updated_unix_ms: None,
@@ -221,9 +230,19 @@ impl Tui {
                     }
                     if let Some(state) = event.state {
                         status.state = state;
+                        if !matches!(
+                            state,
+                            opencode::OpencodeState::Busy | opencode::OpencodeState::Retry
+                        ) {
+                            status.active_tool = None;
+                        }
                     }
                     if let Some(message) = event.latest_message {
-                        status.latest_message = Some(message);
+                        status.latest_message = Some(message.clone());
+                        if status.recent_messages.first() != Some(&message) {
+                            status.recent_messages.insert(0, message);
+                            status.recent_messages.truncate(5);
+                        }
                     }
                     if let Some(tool) = event.active_tool {
                         status.active_tool = Some(tool);
@@ -325,6 +344,15 @@ impl Tui {
                 .opencode_status
                 .as_ref()
                 .and_then(|status| status.latest_message.clone()),
+            latest_user_message: self.sessions[selected]
+                .opencode_status
+                .as_ref()
+                .and_then(|status| status.latest_user_message.clone()),
+            recent_messages: self.sessions[selected]
+                .opencode_status
+                .as_ref()
+                .map(|status| status.recent_messages.clone())
+                .unwrap_or_default(),
             active_tool: None,
             todos: self.sessions[selected]
                 .opencode_status

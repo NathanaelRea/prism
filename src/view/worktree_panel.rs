@@ -48,30 +48,81 @@ pub(super) fn worktree_detail_lines(model: &crate::view::FrameModel<'_>) -> Vec<
 }
 
 fn agent_lines(session: &Session) -> Vec<Line<'static>> {
-    let (status, tool, message) = session
+    let (state, icon, label, tool, user_message, messages) = session
         .opencode_status
         .as_ref()
         .map(|status| {
+            let tool = status.active_tool.as_deref();
+            let has_active_tool = tool.is_some_and(|tool| !tool.trim().is_empty());
+            let state = if matches!(status.state, OpencodeState::Starting | OpencodeState::Busy)
+                || has_active_tool
+            {
+                AgentState::Running
+            } else {
+                status.state.agent_state()
+            };
+            let icon = if matches!(status.state, OpencodeState::Unknown | OpencodeState::Idle)
+                && state == AgentState::Running
+            {
+                agent_icon(state)
+            } else {
+                opencode_icon(status.state)
+            };
             (
-                status.state.label(),
-                status.active_tool.as_deref(),
-                status.latest_message.as_deref(),
+                state,
+                icon,
+                match status.state {
+                    OpencodeState::Starting => "starting",
+                    OpencodeState::Busy => "busy",
+                    OpencodeState::Retry => "retrying",
+                    OpencodeState::Idle if state == AgentState::Running => "running",
+                    OpencodeState::Idle => "done",
+                    OpencodeState::NeedsInput => "needs input",
+                    OpencodeState::Error => "failed",
+                    OpencodeState::Unknown if state == AgentState::Running => "running",
+                    OpencodeState::Unknown | OpencodeState::Offline => "needs restart",
+                },
+                tool,
+                status.latest_user_message.as_deref(),
+                status.recent_messages.as_slice(),
             )
         })
-        .unwrap_or((session.agent_state.label(), None, None));
+        .unwrap_or((
+            session.agent_state,
+            agent_icon(session.agent_state),
+            session.agent_state.label(),
+            None,
+            None,
+            &[],
+        ));
     let status = match tool.filter(|tool| !tool.trim().is_empty()) {
-        Some(tool) => format!("{status}  {tool}"),
-        None => status.to_string(),
+        Some(tool) => format!("{label}  {tool}"),
+        None => label.to_string(),
     };
-    let message = message
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or("No messages");
-
-    vec![
+    let mut lines = vec![
         heading_line("Agent"),
-        labelled_line("status", status),
-        labelled_line("message", truncate(message, 70)),
-    ]
+        Line::from(vec![
+            Span::styled("status ", muted_style()),
+            Span::styled(icon, agent_style(state)),
+            Span::raw(format!(" {status}")),
+        ]),
+        Line::from(vec![
+            Span::styled("user ", muted_style()),
+            Span::styled(
+                truncate(user_message.unwrap_or_default(), 74),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+    ];
+    for index in 0..5 {
+        lines.push(Line::from(
+            messages
+                .get(index)
+                .map(|message| truncate(message, 86))
+                .unwrap_or_default(),
+        ));
+    }
+    lines
 }
 
 pub(crate) fn stabilization_panel_model(

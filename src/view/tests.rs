@@ -43,7 +43,7 @@ fn renders_wide_shell_with_sidebar_main_and_footer() {
     assert_region_contains(&buffer, 0..56, 0..30, "[1] Status");
     assert_region_contains(&buffer, 0..56, 0..30, "[2] Repos");
     assert_region_contains(&buffer, 0..56, 0..30, "[3] Worktrees");
-    let row = find_line(&buffer, "●");
+    let (_, row) = sidebar_cell_containing(&buffer, "feature");
     assert_cell_style(
         &buffer,
         0,
@@ -114,7 +114,7 @@ fn renders_selected_sidebar_rows_with_focused_style() {
 
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     let buffer = render_to_buffer(&model, 120, 30);
-    let row = find_line(&buffer, "●");
+    let (_, row) = sidebar_cell_containing(&buffer, "feature");
 
     assert_cell_style(
         &buffer,
@@ -325,7 +325,8 @@ fn worktree_sidebar_keeps_configured_columns_before_prompt_text() {
     let sessions = vec![session];
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     let buffer = render_to_buffer(&model, 160, 30);
-    let row = line_text(&buffer, find_line(&buffer, "●"));
+    let (_, row_y) = sidebar_cell_containing(&buffer, "feature");
+    let row = line_text(&buffer, row_y);
 
     assert!(row.contains("3"), "got {row:?}");
     assert!(row.contains("agent"), "got {row:?}");
@@ -723,7 +724,7 @@ fn renders_plan_dashboard_compact_step_tails() {
     let sessions = vec![test_session("feature", AgentState::Running)];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.plan_dashboard = Some(test_plan_dashboard(false));
-    let buffer = render_to_string(&model, 120, 32);
+    let buffer = render_to_string(&model, 120, 37);
 
     assert!(buffer.contains("Plan Run"));
     assert!(buffer.contains("current"));
@@ -785,7 +786,7 @@ fn renders_auto_dashboard_steps_and_output_cursor() {
 }
 
 #[test]
-fn worktree_main_panel_renders_three_line_agent_section() {
+fn worktree_main_panel_renders_five_agent_messages_without_indenting_user_message() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Running);
     session.opencode_status = Some(OpencodeStatus {
@@ -794,6 +795,14 @@ fn worktree_main_panel_renders_three_line_agent_section() {
         title: None,
         state: OpencodeState::Busy,
         latest_message: Some("implementing the panel".to_string()),
+        latest_user_message: Some("please update the panel".to_string()),
+        recent_messages: vec![
+            "third message".to_string(),
+            "second message".to_string(),
+            "first message".to_string(),
+            "older message".to_string(),
+            "oldest message".to_string(),
+        ],
         active_tool: Some("bash".to_string()),
         todos: Vec::new(),
         last_updated_unix_ms: None,
@@ -806,13 +815,163 @@ fn worktree_main_panel_renders_three_line_agent_section() {
         .position(|line| line.to_string().contains("Agent"))
         .unwrap();
 
-    assert!(lines[agent + 1].to_string().contains("busy  bash"));
+    assert!(lines[agent + 1].to_string().contains("● busy  bash"));
+    assert!(lines[agent + 2].to_string().contains("user"));
+    assert!(lines[agent + 2].to_string().starts_with("user please"));
     assert!(
         lines[agent + 2]
             .to_string()
-            .contains("implementing the panel")
+            .contains("please update the panel")
     );
+    assert_eq!(lines[agent + 2].spans[1].style.fg, Some(Color::White));
+    assert_eq!(lines[agent + 3].to_string(), "third message");
+    assert_eq!(lines[agent + 4].to_string(), "second message");
+    assert_eq!(lines[agent + 5].to_string(), "first message");
+    assert_eq!(lines[agent + 6].to_string(), "older message");
+    assert_eq!(lines[agent + 7].to_string(), "oldest message");
+    assert!(lines[agent + 8].to_string().is_empty());
+}
+
+#[test]
+fn worktree_main_panel_renders_idle_status_and_reserves_five_message_lines() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let lines = worktree_detail_lines(&model);
+    let agent = lines
+        .iter()
+        .position(|line| line.to_string().contains("Agent"))
+        .unwrap();
+
+    assert!(lines[agent + 1].to_string().contains("○ idle"));
+    assert!(lines[agent + 2].to_string().contains("user"));
     assert!(lines[agent + 3].to_string().is_empty());
+    assert!(lines[agent + 4].to_string().is_empty());
+    assert!(lines[agent + 5].to_string().is_empty());
+    assert!(lines[agent + 6].to_string().is_empty());
+    assert!(lines[agent + 7].to_string().is_empty());
+}
+
+#[test]
+fn worktree_main_panel_renders_unknown_opencode_status_as_needing_restart() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Running);
+    session.opencode_status = Some(OpencodeStatus {
+        server_url: None,
+        session_id: None,
+        title: None,
+        state: OpencodeState::Unknown,
+        latest_message: None,
+        latest_user_message: None,
+        recent_messages: Vec::new(),
+        active_tool: None,
+        todos: Vec::new(),
+        last_updated_unix_ms: None,
+    });
+    let sessions = vec![session];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let lines = worktree_detail_lines(&model);
+    let agent = lines
+        .iter()
+        .position(|line| line.to_string().contains("Agent"))
+        .unwrap();
+
+    assert!(lines[agent + 1].to_string().contains("↻ needs restart"));
+}
+
+#[test]
+fn worktree_main_panel_renders_unknown_status_with_active_tool_as_running() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Running);
+    session.opencode_status = Some(OpencodeStatus {
+        server_url: None,
+        session_id: None,
+        title: None,
+        state: OpencodeState::Unknown,
+        latest_message: None,
+        latest_user_message: None,
+        recent_messages: Vec::new(),
+        active_tool: Some("bash running".to_string()),
+        todos: Vec::new(),
+        last_updated_unix_ms: None,
+    });
+    let sessions = vec![session];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let lines = worktree_detail_lines(&model);
+    let agent = lines
+        .iter()
+        .position(|line| line.to_string().contains("Agent"))
+        .unwrap();
+
+    assert!(
+        lines[agent + 1]
+            .to_string()
+            .contains("● running  bash running")
+    );
+}
+
+#[test]
+fn worktree_main_panel_renders_idle_status_with_active_tool_as_running() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::ExitedOk);
+    session.opencode_status = Some(OpencodeStatus {
+        server_url: None,
+        session_id: None,
+        title: None,
+        state: OpencodeState::Idle,
+        latest_message: None,
+        latest_user_message: None,
+        recent_messages: Vec::new(),
+        active_tool: Some("task running".to_string()),
+        todos: Vec::new(),
+        last_updated_unix_ms: None,
+    });
+    let sessions = vec![session];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let lines = worktree_detail_lines(&model);
+    let agent = lines
+        .iter()
+        .position(|line| line.to_string().contains("Agent"))
+        .unwrap();
+
+    assert!(
+        lines[agent + 1]
+            .to_string()
+            .contains("● running  task running")
+    );
+}
+
+#[test]
+fn worktree_main_panel_renders_opencode_workflow_states() {
+    let config = test_config();
+    for (state, expected) in [
+        (OpencodeState::Retry, "↻ retrying"),
+        (OpencodeState::Idle, "✓ done"),
+        (OpencodeState::NeedsInput, "! needs input"),
+        (OpencodeState::Error, "✕ failed"),
+    ] {
+        let mut session = test_session("feature", AgentState::Running);
+        session.opencode_status = Some(OpencodeStatus {
+            server_url: None,
+            session_id: None,
+            title: None,
+            state,
+            latest_message: None,
+            latest_user_message: None,
+            recent_messages: Vec::new(),
+            active_tool: None,
+            todos: Vec::new(),
+            last_updated_unix_ms: None,
+        });
+        let sessions = vec![session];
+        let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+        let lines = worktree_detail_lines(&model);
+        let status = lines
+            .iter()
+            .find(|line| line.to_string().starts_with("status "))
+            .unwrap();
+        assert!(status.to_string().contains(expected));
+    }
 }
 
 #[test]

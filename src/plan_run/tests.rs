@@ -603,6 +603,8 @@ fn poll_reconciliation_recovers_latest_status_message_tool_and_todos() {
         title: Some("plan phase 1".to_string()),
         state: OpencodeState::Busy,
         latest_message: Some("recovered message".to_string()),
+        latest_user_message: None,
+        recent_messages: vec!["recovered message".to_string()],
         active_tool: Some("bash running".to_string()),
         todos: vec![crate::opencode::OpencodeTodo {
             text: "finish phase".to_string(),
