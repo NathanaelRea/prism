@@ -106,6 +106,52 @@ pub fn discover_valid_entries(entries: Vec<RepoEntry>) -> Vec<DiscoveredRepoEntr
     discovered
 }
 
+pub fn remove_missing_entries(entries: Vec<RepoEntry>, selected: usize) -> (Vec<RepoEntry>, usize) {
+    let original_len = entries.len();
+    for entry in entries.iter().filter(|entry| !entry.root.exists()) {
+        observability::emit(observability::EventInput {
+            level: LogLevel::Info,
+            target: "workspace",
+            action: "remove_missing_repo",
+            operation_id: None,
+            parent_operation_id: None,
+            branch: None,
+            session: None,
+            message: format!("removing missing repository {}", entry.root.display()),
+            data_json: None,
+        });
+    }
+    let (retained, selected) = retain_existing_entries(entries, selected);
+    if retained.len() != original_len
+        && let Err(error) = save_entries(&retained)
+    {
+        observability::emit(observability::EventInput {
+            level: LogLevel::Warn,
+            target: "workspace",
+            action: "save_reconciled_repos_failed",
+            operation_id: None,
+            parent_operation_id: None,
+            branch: None,
+            session: None,
+            message: error,
+            data_json: None,
+        });
+    }
+    (retained, selected)
+}
+
+fn retain_existing_entries(entries: Vec<RepoEntry>, selected: usize) -> (Vec<RepoEntry>, usize) {
+    let selected_root = entries.get(selected).map(|entry| entry.root.clone());
+    let retained: Vec<_> = entries
+        .into_iter()
+        .filter(|entry| entry.root.exists())
+        .collect();
+    let selected = selected_root
+        .and_then(|root| retained.iter().position(|entry| entry.root == root))
+        .unwrap_or_else(|| selected.min(retained.len().saturating_sub(1)));
+    (retained, selected)
+}
+
 pub fn label_for_root(root: &Path) -> String {
     root.file_name()
         .and_then(|name| name.to_str())
@@ -244,6 +290,35 @@ key = "8"
         assert_eq!(discovered[0].key, Some('1'));
         assert_eq!(discovered[0].source_index, 0);
 
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn removes_missing_entries_and_preserves_selected_repository() {
+        let temp = unique_temp_dir("prism-workspace-cleanup-test");
+        let first = temp.join("first");
+        let selected = temp.join("selected");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&selected).unwrap();
+        let entries = vec![
+            RepoEntry {
+                root: first.clone(),
+                key: Some('1'),
+            },
+            RepoEntry {
+                root: temp.join("missing"),
+                key: Some('2'),
+            },
+            RepoEntry {
+                root: selected.clone(),
+                key: Some('3'),
+            },
+        ];
+
+        let (retained, selected_index) = retain_existing_entries(entries, 2);
+
+        assert_eq!(retained.len(), 2);
+        assert_eq!(selected_index, 1);
         let _ = fs::remove_dir_all(temp);
     }
 
