@@ -107,12 +107,14 @@ pub(super) fn pause_before_next_auto_step_with_context(
     if !has_pending_auto_work(persisted) {
         return Ok(());
     }
-    if next_queued_non_agent_step(persisted).is_some_and(|index| {
-        matches!(
-            persisted.steps[index].step_key,
-            AutoStepKey::LocalVerify | AutoStepKey::CommitImpl
-        )
-    }) {
+    if !config.auto.pause_between_steps
+        || next_queued_non_agent_step(persisted).is_some_and(|index| {
+            matches!(
+                persisted.steps[index].step_key,
+                AutoStepKey::LocalVerify | AutoStepKey::CommitImpl
+            )
+        })
+    {
         return Ok(());
     }
     persisted.run.pause_requested = true;
@@ -176,6 +178,14 @@ pub(super) fn ensure_next_auto_step_with_context(
 ) -> Result<bool, String> {
     if merge_or_manual_merge_complete(persisted) {
         persisted.run.status = AutoRunStatus::Done;
+        if latest_step_status(persisted, &AutoStepKey::Merge) == Some(AutoStepStatus::Done) {
+            persisted.run.stabilization_status =
+                Some(stabilization_model::StabilizationStatus::Done);
+            persisted.run.stabilization_blocker =
+                Some(stabilization_model::StabilizationBlocker::Merged);
+            persisted.run.stabilization_next_work =
+                Some(stabilization_model::StabilizationWorkKind::Done);
+        }
         persisted.run.updated_unix_ms = unix_ms();
         save_run_with_conn(conn, &persisted.run)?;
         return Ok(false);
@@ -223,6 +233,14 @@ fn ensure_next_auto_step_legacy(
 ) -> Result<bool, String> {
     if merge_or_manual_merge_complete(persisted) {
         persisted.run.status = AutoRunStatus::Done;
+        if latest_step_status(persisted, &AutoStepKey::Merge) == Some(AutoStepStatus::Done) {
+            persisted.run.stabilization_status =
+                Some(stabilization_model::StabilizationStatus::Done);
+            persisted.run.stabilization_blocker =
+                Some(stabilization_model::StabilizationBlocker::Merged);
+            persisted.run.stabilization_next_work =
+                Some(stabilization_model::StabilizationWorkKind::Done);
+        }
         persisted.run.updated_unix_ms = unix_ms();
         save_run_with_conn(conn, &persisted.run)?;
         return Ok(false);

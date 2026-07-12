@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
@@ -108,6 +109,8 @@ def repair(kind: str) -> None:
     marker = "reviewed" if kind == "review" else "ciGreen"
     if marker not in text:
         path.write_text(text.replace('ci: "verified"', f'ci: "verified", {marker}: true'), encoding="utf-8")
+    # Keep each blocker visible long enough for the recorder to capture the transition.
+    time.sleep(3)
 
 
 def git_event(event: str, message: str = "") -> None:

@@ -86,7 +86,7 @@ Ctrl+B
 Type "d"
 Wait+Screen@30s /No PR detected/
 
-# Scene 5: Auto Flow observes requested changes and the failed local CI fixture.
+# Scene 5: Auto Flow opens the PR and handles each trusted-repository gate automatically.
 Type "A"
 Wait+Screen /Implementation source/
 Enter
@@ -95,109 +95,20 @@ Type "Prepare the checkout pull request."
 Enter
 Wait+Screen@60s /auto: 1/
 Type "3"
-Wait+Screen@60s /status paused/
-
-# Resume local verification, the implementation commit boundary, and PR creation.
-Type " "
-Type "p"
-Wait+Screen /Auto Flow Actions/
-Type "u"
-Wait+Screen /Resume Auto Flow/
-Type "y"
-Enter
-Wait+Screen@60s /status paused/
-Type " "
-Type "p"
-Wait+Screen /Auto Flow Actions/
-Type "u"
-Wait+Screen /Resume Auto Flow/
-Type "y"
-Enter
-Wait+Screen@60s /status paused/
-Type " "
-Type "p"
-Wait+Screen /Auto Flow Actions/
-Type "u"
-Wait+Screen /Resume Auto Flow/
-Type "y"
-Enter
-Wait+Screen@60s /status paused/
-Type "3"
 Wait+Screen@60s /ReviewFeedbackFound/
-Sleep 1s
+Sleep 500ms
 Screenshot "__FRAMES_DIR__/06-failed-pr.png"
 
-# Scene 6: managed review repair, guarded push, CI repair, guarded push, merge.
-# Run the queued review repair, verify it, and create its guarded commit.
-Type " "
-Type "p"
-Wait+Screen /Auto Flow Actions/
-Type "u"
-Wait+Screen /Resume Auto Flow/
-Type "y"
-Enter
-Wait+Screen@60s /status paused/
-Type " "
-Type "p"
-Wait+Screen /Auto Flow Actions/
-Type "u"
-Wait+Screen /Resume Auto Flow/
-Type "y"
-Enter
-Wait+Screen@60s /status paused/
-Type " "
-Type "p"
-Wait+Screen /Auto Flow Actions/
-Type "u"
-Wait+Screen /Resume Auto Flow/
-Type "y"
-Enter
-Wait+Screen@60s /PendingPush/
-Type "3"
-Type " "
-Type "g"
-Type "P"
-Wait+Screen@60s /guarded repair pushed/
-Sleep 1s
+# Scene 6: review and CI repairs are verified, pushed, and merged without dialogs.
+Wait+Screen@60s /CiFailed/
+Sleep 500ms
 Screenshot "__FRAMES_DIR__/07-review-pushed.png"
 
-Type " "
-Type "g"
-Type "c"
-Wait+Screen /started managed CI repair/
-Wait+Screen@60s /status paused/
-
-# Verify the CI repair and create its guarded commit.
-Type " "
-Type "p"
-Wait+Screen /Auto Flow Actions/
-Type "u"
-Wait+Screen /Resume Auto Flow/
-Type "y"
-Enter
-Wait+Screen@60s /status paused/
-Type " "
-Type "p"
-Wait+Screen /Auto Flow Actions/
-Type "u"
-Wait+Screen /Resume Auto Flow/
-Type "y"
-Enter
-Wait+Screen@60s /PendingPush/
-Type "3"
-Type " "
-Type "g"
-Type "P"
-Wait+Screen@60s /guarded repair pushed/
-Sleep 1s
+Wait+Screen@60s /ReadyToAutoMerge/
+Sleep 500ms
 Screenshot "__FRAMES_DIR__/08-ci-pushed.png"
 
-Type " "
-Type "g"
-Type "M"
-Wait+Screen@60s /Delete Session/
-Type "q"
-Wait+Screen@30s /merge complete/
+Wait+Screen@60s /state[ ]+Merged/
 Sleep 1s
 Screenshot "__FRAMES_DIR__/09-merged.png"
 Sleep 1s

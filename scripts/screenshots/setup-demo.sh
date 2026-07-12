@@ -151,6 +151,14 @@ icon_style = "nerd-font"
 [worktrees]
 columns = ["url", "vars.localdev", "ci"]
 
+[auto]
+pause_between_steps = false
+push_repairs = true
+merge = true
+cleanup_after_merge = false
+review_poll_interval_seconds = 1
+ci_poll_interval_seconds = 1
+
 [tools]
 gh = "$bin_dir/gh"
 tmux = "$bin_dir/tmux"

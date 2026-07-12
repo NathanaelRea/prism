@@ -1309,6 +1309,29 @@ printf '%s\n' '{"type":"tool.execute.after","id":"tool_1","status":"success","ou
 }
 
 #[test]
+fn step_gate_is_skipped_when_pause_between_steps_is_disabled() {
+    let temp = TempDir::new("auto-step-gate-disabled");
+    let repo = Repository::with_config_dir_for_test(
+        temp.path().to_path_buf(),
+        temp.path().join("prism-config"),
+    );
+    let mut config = Config::load(&repo);
+    config.auto.pause_between_steps = false;
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut persisted = AutoLaunch::new(temp.path(), temp.path(), "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+    save_auto_run(&conn, &mut persisted).unwrap();
+
+    pause_before_next_auto_step_with_context(&conn, &repo, &config, &mut persisted).unwrap();
+
+    let loaded = load_auto_run(&conn, &persisted.run.id).unwrap().unwrap();
+    assert_ne!(loaded.run.status, AutoRunStatus::Paused);
+    assert!(!loaded.run.pause_requested);
+}
+
+#[test]
 #[cfg(unix)]
 fn executor_marks_failed_opencode_exit() {
     let temp = TempDir::new("executor-failed");
@@ -1571,6 +1594,42 @@ fn manual_merge_skip_completes_run_without_cleanup() {
             .steps
             .iter()
             .any(|step| step.step_key == AutoStepKey::Cleanup)
+    );
+}
+
+#[test]
+fn auto_merge_completion_records_merged_stabilization_state() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted =
+        AutoLaunch::new(&repo, &repo.join("feature"), "feat/auto", "Implement auto")
+            .unwrap()
+            .create_run();
+    persisted.steps.clear();
+    push_test_step(&mut persisted, 1, AutoStepKey::Merge, AutoStepStatus::Done);
+    push_test_step(
+        &mut persisted,
+        2,
+        AutoStepKey::Cleanup,
+        AutoStepStatus::Skipped,
+    );
+    save_auto_run(&conn, &mut persisted).unwrap();
+
+    assert!(!ensure_next_auto_step(&conn, &mut persisted).unwrap());
+
+    assert_eq!(persisted.run.status, AutoRunStatus::Done);
+    assert_eq!(
+        persisted.run.stabilization_status,
+        Some(stabilization_model::StabilizationStatus::Done)
+    );
+    assert_eq!(
+        persisted.run.stabilization_blocker,
+        Some(stabilization_model::StabilizationBlocker::Merged)
+    );
+    assert_eq!(
+        persisted.run.stabilization_next_work,
+        Some(stabilization_model::StabilizationWorkKind::Done)
     );
 }
 

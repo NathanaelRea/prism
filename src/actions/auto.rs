@@ -206,11 +206,13 @@ impl Tui {
     }
 
     pub(super) fn spawn_auto_run_executor(
-        &self,
+        &mut self,
         repo: crate::repo::Repository,
         config: crate::config::Config,
         mut persisted: crate::auto_flow::PersistedAutoRun,
     ) {
+        self.auto_runs_in_flight.insert(persisted.run.id.clone());
+        let result_tx = self.auto_run_tx.clone();
         thread::spawn(move || {
             let worktree_path = persisted.run.worktree_path.clone();
             let server_url = crate::opencode::ensure_opencode_server(
@@ -237,6 +239,7 @@ impl Tui {
                     &mut io::sink(),
                 )
             });
+            let _ = result_tx.send(persisted);
         });
     }
 

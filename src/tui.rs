@@ -72,6 +72,9 @@ pub struct Tui {
     pub(crate) opencode_sse_servers: BTreeSet<String>,
     pub(crate) plan_run_tx: Sender<PlanRunResult>,
     pub(crate) plan_run_rx: Receiver<PlanRunResult>,
+    pub(crate) auto_run_tx: Sender<PersistedAutoRun>,
+    pub(crate) auto_run_rx: Receiver<PersistedAutoRun>,
+    pub(crate) auto_runs_in_flight: BTreeSet<String>,
     pub(crate) plan_runs: BTreeMap<String, PersistedPlanRun>,
     pub(crate) active_plan_runs: BTreeMap<PathBuf, String>,
     pub(crate) selected_plan_step_by_run: BTreeMap<String, usize>,
@@ -416,6 +419,7 @@ impl Tui {
         let (opencode_poll_tx, opencode_poll_rx) = mpsc::channel();
         let (opencode_event_tx, opencode_event_rx) = mpsc::channel();
         let (plan_run_tx, plan_run_rx) = mpsc::channel();
+        let (auto_run_tx, auto_run_rx) = mpsc::channel();
         let current_repo = current_repo.min(repos.len().saturating_sub(1));
         let fallback_repo = Repository {
             root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -469,6 +473,9 @@ impl Tui {
             opencode_sse_servers: BTreeSet::new(),
             plan_run_tx,
             plan_run_rx,
+            auto_run_tx,
+            auto_run_rx,
+            auto_runs_in_flight: BTreeSet::new(),
             plan_runs: BTreeMap::new(),
             active_plan_runs: BTreeMap::new(),
             selected_plan_step_by_run: BTreeMap::new(),
@@ -2417,7 +2424,12 @@ impl Tui {
     }
 
     fn poll_auto_runs(&mut self) -> bool {
-        self.refresh_auto_runs(false)
+        let mut changed = false;
+        while let Ok(run) = self.auto_run_rx.try_recv() {
+            self.auto_runs_in_flight.remove(&run.run.id);
+            changed |= self.remember_auto_run(run);
+        }
+        self.refresh_auto_runs(false) || changed
     }
 
     fn refresh_auto_runs(&mut self, reconcile_stale: bool) -> bool {
@@ -2427,12 +2439,15 @@ impl Tui {
             .iter()
             .map(|managed| managed.repo.clone())
             .collect::<Vec<_>>();
+        let in_flight = self.auto_runs_in_flight.clone();
         for repo in repos {
             let loaded = crate::observability::with_writable_db(&repo, |conn| {
                 let mut runs = load_recent_active_runs_for_repo(conn, &repo.root, 8)?;
                 if reconcile_stale {
                     for run in &mut runs {
-                        let _ = reconcile_stale_auto_run(conn, run);
+                        if !in_flight.contains(&run.run.id) {
+                            let _ = reconcile_stale_auto_run(conn, run);
+                        }
                     }
                 }
                 Ok(runs)
@@ -3547,6 +3562,20 @@ mod tests {
         tui.remember_plan_run(run);
 
         assert_eq!(tui.selected_plan_step_by_run.get("plan"), Some(&3));
+    }
+
+    #[test]
+    fn auto_worker_completion_replaces_in_flight_snapshot() {
+        let mut tui = Tui::new(Vec::new(), 0, Vec::new());
+        let mut run = test_auto_run("auto", "/repo-one/feature", 2);
+        run.run.status = AutoRunStatus::Done;
+        tui.auto_runs_in_flight.insert(run.run.id.clone());
+        tui.auto_run_tx.send(run.clone()).unwrap();
+
+        assert!(tui.poll_auto_runs());
+
+        assert!(!tui.auto_runs_in_flight.contains(&run.run.id));
+        assert_eq!(tui.auto_runs.get(&run.run.id), Some(&run));
     }
 
     fn test_tui() -> Tui {
