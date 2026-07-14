@@ -77,6 +77,8 @@ mod worktrees;
 mod tests;
 
 #[cfg(test)]
+use plans::plan_run_mode_from_parallel_confirmation;
+#[cfg(test)]
 use polling::{discover_wt_columns, status_label_with_behind};
 #[cfg(test)]
 use pull_requests::{

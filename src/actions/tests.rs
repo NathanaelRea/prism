@@ -4,20 +4,34 @@ use crate::auto_flow::{AutoStepKey, load_auto_run};
 use crate::config::{Checks, Config, EscapeKey, MergeMethod};
 use crate::github::{PrCache, PrComment, PrDetails, PrSummary, pr_summary_or_error};
 use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
+use crate::plan_run::PlanRunMode;
 use crate::repo::Repository;
 use crate::session::Session;
 use crate::tui::{OpencodeEventResult, OpencodePollKey, OpencodePollResult, Tui};
 
 use super::{
-    archived_picker_overflow_message, discover_wt_columns, pr_target_choice_list,
-    pr_target_repo_for_choice, remote_pr_choice_keys, remote_pr_worktree_branch,
-    run_browser_opener, should_prompt_pr_target_choice, status_label_with_behind,
+    archived_picker_overflow_message, discover_wt_columns,
+    plan_run_mode_from_parallel_confirmation, pr_target_choice_list, pr_target_repo_for_choice,
+    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
+    should_prompt_pr_target_choice, status_label_with_behind,
 };
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[test]
+fn standalone_plan_confirmation_defaults_to_sequential() {
+    assert_eq!(
+        plan_run_mode_from_parallel_confirmation(false),
+        PlanRunMode::Sequential
+    );
+    assert_eq!(
+        plan_run_mode_from_parallel_confirmation(true),
+        PlanRunMode::Parallel
+    );
+}
 
 #[test]
 fn browser_opener_invokes_first_available_candidate() {

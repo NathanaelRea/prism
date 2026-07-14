@@ -668,6 +668,19 @@ fn renders_dialog_overlays() {
     );
 
     model.dialog = Some(DialogModel::Confirm {
+        title: "Plan Run: Execution".to_string(),
+        lines: vec![],
+        prompt: "Run steps in parallel?".to_string(),
+        input: String::new(),
+        default: false,
+        invalid: false,
+    });
+    let buffer = render_to_string(&model, 80, 20);
+
+    assert!(buffer.contains("Plan Run: Execution"));
+    assert!(buffer.contains("Run steps in parallel? [y/N]:"));
+
+    model.dialog = Some(DialogModel::Confirm {
         title: "Pull Default Branch".to_string(),
         lines: vec![],
         prompt: "Pull first?".to_string(),
