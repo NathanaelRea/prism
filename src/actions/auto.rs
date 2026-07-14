@@ -362,6 +362,7 @@ impl Tui {
             "Retry Auto Flow",
             "Retry from selected step?",
             "Retry",
+            false,
         )?;
         if !should_retry {
             return Ok(true);
@@ -440,6 +441,7 @@ impl Tui {
             "Resume Auto Flow",
             &format!("Next: {description}. Continue?"),
             "Continue",
+            true,
         )
     }
 

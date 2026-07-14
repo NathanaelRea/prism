@@ -70,6 +70,7 @@ pub(crate) enum DialogModel {
         lines: Vec<DialogLine>,
         confirm_label: String,
         cancel_label: String,
+        default: bool,
     },
     Prompt {
         title: String,

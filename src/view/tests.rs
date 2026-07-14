@@ -640,14 +640,28 @@ fn renders_dialog_overlays() {
         }],
         confirm_label: "Delete".to_string(),
         cancel_label: "Cancel".to_string(),
+        default: false,
     });
     let buffer = render_to_string(&model, 80, 20);
 
     assert!(buffer.contains("Delete Session"));
     assert!(buffer.contains("dirty worktree"));
     assert!(buffer.contains("remove local state"));
-    assert!(buffer.contains("Enter Delete"));
-    assert!(buffer.contains("Esc/q Cancel"));
+    assert!(buffer.contains("[y/N] Delete / Cancel"));
+    assert!(buffer.contains("Enter: Cancel"));
+    assert!(buffer.contains("Esc/q: Cancel"));
+
+    model.dialog = Some(DialogModel::Confirm {
+        title: "Pull Default Branch".to_string(),
+        lines: vec![],
+        confirm_label: "Pull".to_string(),
+        cancel_label: "Cancel".to_string(),
+        default: true,
+    });
+    let buffer = render_to_string(&model, 80, 20);
+
+    assert!(buffer.contains("[Y/n] Pull / Cancel"));
+    assert!(buffer.contains("Enter: Pull"));
 }
 
 #[test]

@@ -231,6 +231,7 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
             lines,
             confirm_label,
             cancel_label,
+            default,
             ..
         } => {
             let mut rendered = Vec::new();
@@ -246,10 +247,23 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
             }
             rendered.push(Line::from(""));
             rendered.push(Line::from(vec![
-                Span::styled("y/Enter ", selected_style(true)),
-                Span::styled(confirm_label.clone(), selected_style(true)),
-                Span::styled("   n/Esc/q ", muted_style()),
-                Span::raw(cancel_label.clone()),
+                Span::styled(
+                    if *default { "[Y/n] " } else { "[y/N] " },
+                    selected_style(true),
+                ),
+                Span::raw(format!("{confirm_label} / {cancel_label}")),
+                Span::styled(
+                    format!(
+                        "   Enter: {}   Esc/q: {}",
+                        if *default {
+                            confirm_label
+                        } else {
+                            cancel_label
+                        },
+                        cancel_label
+                    ),
+                    muted_style(),
+                ),
             ]));
             rendered
         }

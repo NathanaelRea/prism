@@ -361,7 +361,7 @@ impl Tui {
                 attention: false,
             },
         ];
-        if !self.confirm_dialog(raw, "Worktrunk Approvals", lines, "Run", "Skip")? {
+        if !self.confirm_dialog(raw, "Worktrunk Approvals", lines, "Run", "Skip", true)? {
             return Ok(false);
         }
         raw.suspend_for(|| run_worktrunk_approval_prompt(repo, config))?;

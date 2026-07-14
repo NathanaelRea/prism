@@ -361,6 +361,21 @@ fn ctrl_key(event: KeyEvent) -> bool {
     event.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+fn confirmation_result(event: KeyEvent, default: bool) -> Option<bool> {
+    match event.code {
+        KeyCode::Enter if plain_key(event) => Some(default),
+        KeyCode::Char('y' | 'Y') if plain_key(event) => Some(true),
+        KeyCode::Esc | KeyCode::Char('n' | 'N')
+            if event.code == KeyCode::Esc || plain_key(event) =>
+        {
+            Some(false)
+        }
+        KeyCode::Char('q') if plain_key(event) => Some(false),
+        KeyCode::Char('c') if ctrl_key(event) => Some(false),
+        _ => None,
+    }
+}
+
 impl Tui {
     pub fn new(repos: Vec<ManagedRepo>, current_repo: usize, sessions: Vec<Session>) -> Self {
         let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
@@ -969,6 +984,7 @@ impl Tui {
             "Quit Prism",
             "Agents are running. Quit Prism?",
             "Quit",
+            false,
         )
     }
 
@@ -1158,7 +1174,14 @@ impl Tui {
             text: "Archive hides this worktree from normal navigation. Restore with `git worktree list` and remove the archive marker from Prism state if needed.".to_string(),
             attention: false,
         });
-        self.confirm_dialog(runtime, "Archive Session", lines, "Archive", "Cancel")
+        self.confirm_dialog(
+            runtime,
+            "Archive Session",
+            lines,
+            "Archive",
+            "Cancel",
+            false,
+        )
     }
 
     pub(crate) fn confirm_delete_dialog(
@@ -1191,7 +1214,7 @@ impl Tui {
                 });
             }
         }
-        self.confirm_dialog(runtime, "Delete Session", lines, "Delete", "Cancel")
+        self.confirm_dialog(runtime, "Delete Session", lines, "Delete", "Cancel", false)
     }
 
     pub(crate) fn prompt_line_dialog(
@@ -1326,12 +1349,14 @@ impl Tui {
         lines: Vec<view::DialogLine>,
         confirm_label: &str,
         cancel_label: &str,
+        default: bool,
     ) -> Result<bool, String> {
         self.dialog = Some(view::DialogModel::Confirm {
             title: title.to_string(),
             lines: lines.clone(),
             confirm_label: confirm_label.to_string(),
             cancel_label: cancel_label.to_string(),
+            default,
         });
         self.draw(runtime)?;
         loop {
@@ -1348,30 +1373,10 @@ impl Tui {
             if event.kind != KeyEventKind::Press {
                 continue;
             }
-            match event.code {
-                KeyCode::Enter | KeyCode::Char('y' | 'Y') if plain_key(event) => {
-                    self.dialog = None;
-                    self.draw(runtime)?;
-                    return Ok(true);
-                }
-                KeyCode::Esc | KeyCode::Char('n' | 'N')
-                    if event.code == KeyCode::Esc || plain_key(event) =>
-                {
-                    self.dialog = None;
-                    self.draw(runtime)?;
-                    return Ok(false);
-                }
-                KeyCode::Char('q') if plain_key(event) => {
-                    self.dialog = None;
-                    self.draw(runtime)?;
-                    return Ok(false);
-                }
-                KeyCode::Char('c') if ctrl_key(event) => {
-                    self.dialog = None;
-                    self.draw(runtime)?;
-                    return Ok(false);
-                }
-                _ => {}
+            if let Some(result) = confirmation_result(event, default) {
+                self.dialog = None;
+                self.draw(runtime)?;
+                return Ok(result);
             }
         }
     }
@@ -1382,6 +1387,7 @@ impl Tui {
         title: &str,
         message: &str,
         confirm_label: &str,
+        default: bool,
     ) -> Result<bool, String> {
         self.confirm_dialog(
             runtime,
@@ -1392,6 +1398,7 @@ impl Tui {
             }],
             confirm_label,
             "Cancel",
+            default,
         )
     }
 
@@ -1864,7 +1871,7 @@ impl Tui {
             text: row.body.clone(),
             attention: false,
         });
-        self.confirm_dialog(runtime, "Comment Details", lines, "Close", "Close")?;
+        self.confirm_dialog(runtime, "Comment Details", lines, "Close", "Close", true)?;
         Ok(true)
     }
 
@@ -2936,6 +2943,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
     use crate::agent::AgentState;
     use crate::auto_flow::{
         AutoImplementationSource, AutoRun, AutoRunMode, AutoRunStatus, PersistedAutoRun,
@@ -2949,7 +2958,26 @@ mod tests {
     use crate::session::Session;
     use crate::view::{RepoMainView, WorktreeMainView};
 
-    use super::{ManagedRepo, OpenTmuxSessionTarget, PanelFocus, Tui, WorktreeListMode};
+    use super::{
+        ManagedRepo, OpenTmuxSessionTarget, PanelFocus, Tui, WorktreeListMode, confirmation_result,
+    };
+
+    #[test]
+    fn confirmation_enter_uses_the_passed_default() {
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+
+        assert_eq!(confirmation_result(enter, true), Some(true));
+        assert_eq!(confirmation_result(enter, false), Some(false));
+    }
+
+    #[test]
+    fn confirmation_yes_and_no_override_the_default() {
+        let yes = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        let no = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
+
+        assert_eq!(confirmation_result(yes, false), Some(true));
+        assert_eq!(confirmation_result(no, true), Some(false));
+    }
 
     #[test]
     fn tui_defaults_to_repos_panel_focus() {
