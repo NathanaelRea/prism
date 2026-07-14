@@ -191,10 +191,11 @@ pub fn ensure_opencode_server(
         port_status,
     )?;
     let server_url = server_url(port);
+    let mut started_server = None;
     let server_pid = if check_health(&server_url) {
         existing.as_ref().and_then(|runtime| runtime.server_pid)
     } else {
-        let child = Command::new(config.tool("opencode"))
+        let mut child = Command::new(config.tool("opencode"))
             .arg("serve")
             .args(["--hostname", "127.0.0.1"])
             .args(["--port", &port.to_string()])
@@ -205,8 +206,15 @@ pub fn ensure_opencode_server(
             .spawn()
             .map_err(|error| format!("start opencode server: {error}"))?;
         record_owned_server_process(child.id());
-        wait_for_health(&server_url)?;
-        Some(child.id())
+        if let Err(error) = wait_for_health(&server_url) {
+            let _ = child.kill();
+            let _ = child.wait();
+            forget_owned_server_process(child.id());
+            return Err(error);
+        }
+        let pid = child.id();
+        started_server = Some(child);
+        Some(pid)
     };
 
     let runtime = OpencodeRuntime {
@@ -220,7 +228,14 @@ pub fn ensure_opencode_server(
         generation: 0,
         updated_unix_ms: unix_ms(),
     };
-    save_runtime(repo, &runtime)?;
+    if let Err(error) = save_runtime(repo, &runtime) {
+        if let Some(mut child) = started_server {
+            let _ = child.kill();
+            let _ = child.wait();
+            forget_owned_server_process(child.id());
+        }
+        return Err(error);
+    }
     Ok(runtime)
 }
 
@@ -1692,6 +1707,8 @@ mod tests {
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     use super::*;
@@ -2211,6 +2228,91 @@ mod tests {
             parse_localhost_url("http://127.0.0.1:41000").unwrap(),
             ("127.0.0.1".to_string(), 41_000)
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[ignore = "requires PRISM_TEST_OPENCODE pointing to a real OpenCode binary"]
+    fn real_opencode_server_round_trips_prism_session_api() {
+        let opencode = std::env::var("PRISM_TEST_OPENCODE")
+            .expect("set PRISM_TEST_OPENCODE to the real OpenCode binary");
+        let temp = unique_temp_dir("prism-real-opencode-test");
+        let worktree = temp.join("worktree");
+        let config_dir = temp.join("opencode-config");
+        let data_dir = temp.join("data");
+        for path in [&worktree, &config_dir, &data_dir] {
+            fs::create_dir_all(path).unwrap();
+        }
+        let worktree = fs::canonicalize(worktree).unwrap();
+        let repo = Repository::with_config_dir_for_test(worktree.clone(), temp.join("config"));
+        let wrapper = temp.join("opencode-isolated");
+        let mise_data_dir = std::env::var("MISE_DATA_DIR").unwrap_or_else(|_| {
+            PathBuf::from(std::env::var("HOME").unwrap_or_default())
+                .join(".local/share/mise")
+                .display()
+                .to_string()
+        });
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nexport MISE_DATA_DIR={}\nexport OPENCODE_CONFIG_DIR={}\nexport OPENCODE_DISABLE_AUTOUPDATE=true\nexport OPENCODE_DISABLE_DEFAULT_PLUGINS=true\nexport OPENCODE_DISABLE_LSP_DOWNLOAD=true\nexport OPENCODE_DISABLE_MODELS_FETCH=true\nexport XDG_DATA_HOME={}\nexec {} \"$@\"\n",
+                shell_quote_for_test(&mise_data_dir),
+                shell_quote_for_test(&config_dir.display().to_string()),
+                shell_quote_for_test(&data_dir.display().to_string()),
+                shell_quote_for_test(&opencode),
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&wrapper).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&wrapper, permissions).unwrap();
+        let mut config = Config::load(&repo);
+        config.opencode_port_base = 41_000;
+        config.opencode_port_span = 1_000;
+        config
+            .tools
+            .insert("opencode".to_string(), wrapper.display().to_string());
+
+        let runtime = ensure_opencode_server(&repo, &config, "feature/smoke", &worktree).unwrap();
+        let result = (|| -> Result<(), String> {
+            if !check_health(&runtime.server_url) {
+                return Err("OpenCode server did not remain healthy".to_string());
+            }
+            let created = create_session(&runtime.server_url, &worktree, "Prism smoke test")?;
+            let listed = list_sessions(&runtime.server_url)?;
+            if !listed.iter().any(|session| session.id == created.id) {
+                return Err(format!(
+                    "created OpenCode session {} was not listed",
+                    created.id
+                ));
+            }
+            let resolved = ensure_opencode_session(&repo, &config, "feature/smoke", &worktree)?;
+            if resolved.opencode_session_id.as_deref() != Some(created.id.as_str()) {
+                return Err(format!(
+                    "Prism did not select created OpenCode session {} for {}",
+                    created.id,
+                    worktree.display()
+                ));
+            }
+            let fetched = get_session(&runtime.server_url, &created.id)?
+                .ok_or_else(|| format!("created OpenCode session {} was not found", created.id))?;
+            if fetched.id != created.id {
+                return Err(format!(
+                    "fetched OpenCode session {} instead of {}",
+                    fetched.id, created.id
+                ));
+            }
+            Ok(())
+        })();
+        let shutdown = shutdown_owned_server(&runtime);
+        let _ = fs::remove_dir_all(temp);
+
+        result.unwrap();
+        shutdown.unwrap();
+    }
+
+    fn shell_quote_for_test(value: &str) -> String {
+        format!("'{}'", value.replace('\'', "'\"'\"'"))
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

@@ -6,6 +6,16 @@ Run the local CI gate before pushing:
 scripts/full-check.sh
 ```
 
+CI also runs a no-model smoke test against a pinned real OpenCode binary on Linux and macOS. To run it locally with an installed OpenCode:
+
+```sh
+PRISM_TEST_OPENCODE="$(command -v opencode)" \
+  cargo test opencode::tests::real_opencode_server_round_trips_prism_session_api \
+    -- --ignored --exact
+```
+
+The smoke test starts `opencode serve`, waits for its health endpoint, and verifies Prism can create, list, and retrieve a session. It does not submit a prompt or require provider credentials.
+
 To enforce the same gate as a pre-push hook, opt into the versioned hooks:
 
 ```sh

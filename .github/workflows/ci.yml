@@ -19,9 +19,19 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: aarch64-apple-darwin
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install OpenCode
+        run: npm install --global opencode-ai@1.17.20
       - name: Install Linux cross-check dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y clang pkg-config libsqlite3-dev
       - run: scripts/full-check.sh
+      - name: Test real OpenCode integration
+        run: |
+          PRISM_TEST_OPENCODE="$(command -v opencode)" \
+            cargo test opencode::tests::real_opencode_server_round_trips_prism_session_api \
+              -- --ignored --exact
