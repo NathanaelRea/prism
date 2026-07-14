@@ -353,15 +353,17 @@ impl Tui {
                 attention: true,
             },
             crate::view::DialogLine {
-                text: "Run Worktrunk's approval prompt now?".to_string(),
-                attention: false,
-            },
-            crate::view::DialogLine {
                 text: command,
                 attention: false,
             },
         ];
-        if !self.confirm_dialog(raw, "Worktrunk Approvals", lines, "Run", "Skip", true)? {
+        if !self.confirm_dialog(
+            raw,
+            "Worktrunk Approvals",
+            lines,
+            "Run Worktrunk's approval prompt now?",
+            true,
+        )? {
             return Ok(false);
         }
         raw.suspend_for(|| run_worktrunk_approval_prompt(repo, config))?;

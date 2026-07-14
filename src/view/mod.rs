@@ -68,9 +68,14 @@ pub(crate) enum DialogModel {
     Confirm {
         title: String,
         lines: Vec<DialogLine>,
-        confirm_label: String,
-        cancel_label: String,
+        prompt: String,
+        input: String,
         default: bool,
+        invalid: bool,
+    },
+    Notice {
+        title: String,
+        lines: Vec<DialogLine>,
     },
     Prompt {
         title: String,

@@ -361,17 +361,11 @@ fn ctrl_key(event: KeyEvent) -> bool {
     event.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-fn confirmation_result(event: KeyEvent, default: bool) -> Option<bool> {
-    match event.code {
-        KeyCode::Enter if plain_key(event) => Some(default),
-        KeyCode::Char('y' | 'Y') if plain_key(event) => Some(true),
-        KeyCode::Esc | KeyCode::Char('n' | 'N')
-            if event.code == KeyCode::Esc || plain_key(event) =>
-        {
-            Some(false)
-        }
-        KeyCode::Char('q') if plain_key(event) => Some(false),
-        KeyCode::Char('c') if ctrl_key(event) => Some(false),
+fn confirmation_result(input: &str, default: bool) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" => Some(default),
+        "y" => Some(true),
+        "n" => Some(false),
         _ => None,
     }
 }
@@ -983,7 +977,6 @@ impl Tui {
             runtime,
             "Quit Prism",
             "Agents are running. Quit Prism?",
-            "Quit",
             false,
         )
     }
@@ -1178,8 +1171,7 @@ impl Tui {
             runtime,
             "Archive Session",
             lines,
-            "Archive",
-            "Cancel",
+            "Archive this session?",
             false,
         )
     }
@@ -1214,7 +1206,13 @@ impl Tui {
                 });
             }
         }
-        self.confirm_dialog(runtime, "Delete Session", lines, "Delete", "Cancel", false)
+        self.confirm_dialog(
+            runtime,
+            "Delete Session",
+            lines,
+            "Delete this session?",
+            false,
+        )
     }
 
     pub(crate) fn prompt_line_dialog(
@@ -1347,16 +1345,18 @@ impl Tui {
         runtime: &mut TerminalRuntime,
         title: &str,
         lines: Vec<view::DialogLine>,
-        confirm_label: &str,
-        cancel_label: &str,
+        prompt: &str,
         default: bool,
     ) -> Result<bool, String> {
+        let mut input = String::new();
+        let mut invalid = false;
         self.dialog = Some(view::DialogModel::Confirm {
             title: title.to_string(),
             lines: lines.clone(),
-            confirm_label: confirm_label.to_string(),
-            cancel_label: cancel_label.to_string(),
+            prompt: prompt.to_string(),
+            input: input.clone(),
             default,
+            invalid,
         });
         self.draw(runtime)?;
         loop {
@@ -1373,11 +1373,40 @@ impl Tui {
             if event.kind != KeyEventKind::Press {
                 continue;
             }
-            if let Some(result) = confirmation_result(event, default) {
-                self.dialog = None;
-                self.draw(runtime)?;
-                return Ok(result);
+            match event.code {
+                KeyCode::Enter if plain_key(event) => {
+                    if let Some(result) = confirmation_result(&input, default) {
+                        self.dialog = None;
+                        self.draw(runtime)?;
+                        return Ok(result);
+                    }
+                    input.clear();
+                    invalid = true;
+                }
+                KeyCode::Esc | KeyCode::Char('c')
+                    if event.code == KeyCode::Esc || ctrl_key(event) =>
+                {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Ok(default);
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => {
+                    input.push(ch);
+                }
+                _ => {}
             }
+            self.dialog = Some(view::DialogModel::Confirm {
+                title: title.to_string(),
+                lines: lines.clone(),
+                prompt: prompt.to_string(),
+                input: input.clone(),
+                default,
+                invalid,
+            });
+            self.draw(runtime)?;
         }
     }
 
@@ -1386,20 +1415,32 @@ impl Tui {
         runtime: &mut TerminalRuntime,
         title: &str,
         message: &str,
-        confirm_label: &str,
         default: bool,
     ) -> Result<bool, String> {
-        self.confirm_dialog(
-            runtime,
-            title,
-            vec![view::DialogLine {
-                text: message.to_string(),
-                attention: false,
-            }],
-            confirm_label,
-            "Cancel",
-            default,
-        )
+        self.confirm_dialog(runtime, title, vec![], message, default)
+    }
+
+    pub(crate) fn notice_dialog(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        title: &str,
+        lines: Vec<view::DialogLine>,
+    ) -> Result<(), String> {
+        self.dialog = Some(view::DialogModel::Notice {
+            title: title.to_string(),
+            lines,
+        });
+        self.draw(runtime)?;
+        loop {
+            let Some(event) = runtime.poll_event(Duration::from_millis(100))? else {
+                continue;
+            };
+            if matches!(event, RuntimeEvent::Key(event) if event.kind == KeyEventKind::Press) {
+                self.dialog = None;
+                self.draw(runtime)?;
+                return Ok(());
+            }
+        }
     }
 
     pub(crate) fn show_message(&mut self, message: &str) -> Result<(), String> {
@@ -1871,7 +1912,7 @@ impl Tui {
             text: row.body.clone(),
             attention: false,
         });
-        self.confirm_dialog(runtime, "Comment Details", lines, "Close", "Close", true)?;
+        self.notice_dialog(runtime, "Comment Details", lines)?;
         Ok(true)
     }
 
@@ -2943,8 +2984,6 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
     use crate::agent::AgentState;
     use crate::auto_flow::{
         AutoImplementationSource, AutoRun, AutoRunMode, AutoRunStatus, PersistedAutoRun,
@@ -2963,20 +3002,21 @@ mod tests {
     };
 
     #[test]
-    fn confirmation_enter_uses_the_passed_default() {
-        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-
-        assert_eq!(confirmation_result(enter, true), Some(true));
-        assert_eq!(confirmation_result(enter, false), Some(false));
+    fn confirmation_empty_answer_uses_the_passed_default() {
+        assert_eq!(confirmation_result("", true), Some(true));
+        assert_eq!(confirmation_result("", false), Some(false));
     }
 
     #[test]
     fn confirmation_yes_and_no_override_the_default() {
-        let yes = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
-        let no = KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE);
+        assert_eq!(confirmation_result("y", false), Some(true));
+        assert_eq!(confirmation_result("n", true), Some(false));
+    }
 
-        assert_eq!(confirmation_result(yes, false), Some(true));
-        assert_eq!(confirmation_result(no, true), Some(false));
+    #[test]
+    fn confirmation_rejects_unknown_answers() {
+        assert_eq!(confirmation_result("maybe", true), None);
+        assert_eq!(confirmation_result("ny", false), None);
     }
 
     #[test]

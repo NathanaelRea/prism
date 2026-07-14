@@ -638,30 +638,40 @@ fn renders_dialog_overlays() {
             text: "dirty worktree\nremove local state".to_string(),
             attention: true,
         }],
-        confirm_label: "Delete".to_string(),
-        cancel_label: "Cancel".to_string(),
+        prompt: "Delete this session?".to_string(),
+        input: "n".to_string(),
         default: false,
+        invalid: false,
     });
     let buffer = render_to_string(&model, 80, 20);
 
     assert!(buffer.contains("Delete Session"));
     assert!(buffer.contains("dirty worktree"));
     assert!(buffer.contains("remove local state"));
-    assert!(buffer.contains("[y/N] Delete / Cancel"));
-    assert!(buffer.contains("Enter: Cancel"));
-    assert!(buffer.contains("Esc/q: Cancel"));
+    assert!(buffer.contains("Delete this session? [y/N]: n"));
+    let lines = dialog_lines(model.dialog.as_ref().unwrap());
+    assert_eq!(
+        lines.last().unwrap().to_string(),
+        "Delete this session? [y/N]: n"
+    );
 
     model.dialog = Some(DialogModel::Confirm {
         title: "Pull Default Branch".to_string(),
         lines: vec![],
-        confirm_label: "Pull".to_string(),
-        cancel_label: "Cancel".to_string(),
+        prompt: "Pull first?".to_string(),
+        input: String::new(),
         default: true,
+        invalid: true,
     });
     let buffer = render_to_string(&model, 80, 20);
 
-    assert!(buffer.contains("[Y/n] Pull / Cancel"));
-    assert!(buffer.contains("Enter: Pull"));
+    assert!(buffer.contains("Pull first? [Y/n]:"));
+    assert!(buffer.contains("Please enter y or n."));
+
+    let lines = dialog_lines(model.dialog.as_ref().unwrap());
+    assert_eq!(lines[0].to_string(), "Pull first? [Y/n]: ");
+    assert_eq!(lines[1].to_string(), "Please enter y or n.");
+    assert_eq!(lines[1].spans[0].style, attention_style());
 }
 
 #[test]
