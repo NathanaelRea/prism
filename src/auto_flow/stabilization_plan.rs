@@ -646,6 +646,56 @@ mod tests {
         assert_eq!(plan(&approved).kind, StabilizationWorkKind::Merge);
     }
 
+    #[test]
+    #[ignore = "known Phase 1 safety defect"]
+    fn phase_1_draft_pr_cannot_become_manual_or_auto_merge_ready() {
+        for auto_merge in [false, true] {
+            let mut pr = clean_pr();
+            pr.draft = true;
+            let mut snapshot = snapshot(Some(pr));
+            snapshot.goal.auto_merge = auto_merge;
+            snapshot.worktree.local_head_sha = Some("head".to_string());
+            snapshot.worktree.remote_head_sha = Some("head".to_string());
+
+            let work = plan(&snapshot);
+
+            assert!(!matches!(
+                work.blocker,
+                StabilizationBlocker::ReadyForManualMerge | StabilizationBlocker::ReadyToAutoMerge
+            ));
+            assert!(!matches!(
+                work.kind,
+                StabilizationWorkKind::MarkReadyForManualMerge | StabilizationWorkKind::Merge
+            ));
+            assert!(work.reason.to_ascii_lowercase().contains("draft"));
+        }
+    }
+
+    #[test]
+    #[ignore = "known Phase 1 safety defect"]
+    fn phase_1_three_way_local_remote_and_pr_head_divergence_blocks_readiness() {
+        for auto_merge in [false, true] {
+            let mut pr = clean_pr();
+            pr.head_sha = "pr-head".to_string();
+            let mut snapshot = snapshot(Some(pr));
+            snapshot.goal.auto_merge = auto_merge;
+            snapshot.worktree.local_head_sha = Some("local-head".to_string());
+            snapshot.worktree.remote_head_sha = Some("remote-head".to_string());
+
+            let work = plan(&snapshot);
+
+            assert!(!matches!(
+                work.blocker,
+                StabilizationBlocker::ReadyForManualMerge | StabilizationBlocker::ReadyToAutoMerge
+            ));
+            assert!(!matches!(
+                work.kind,
+                StabilizationWorkKind::MarkReadyForManualMerge | StabilizationWorkKind::Merge
+            ));
+            assert!(work.reason.to_ascii_lowercase().contains("head"));
+        }
+    }
+
     fn snapshot(pull_request: Option<PullRequestFacts>) -> StabilizationSnapshot {
         StabilizationSnapshot {
             run: None,

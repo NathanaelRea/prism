@@ -1547,6 +1547,85 @@ fn recent_active_runs_excludes_archived_and_done_runs() {
 }
 
 #[test]
+#[ignore = "known Phase 1 safety defect"]
+fn phase_1_standalone_review_repair_never_queues_implementation_after_fix() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut persisted = standalone_completed_repair(&conn, AutoStepKey::FixReview);
+
+    let repo = Repository::with_config_dir_for_test(
+        PathBuf::from("/repo/prism"),
+        PathBuf::from("/tmp/prism-phase-1-review-repair-config"),
+    );
+    ensure_next_auto_step_with_context(&conn, &repo, &test_config(), &mut persisted).unwrap();
+
+    assert!(
+        !persisted
+            .steps
+            .iter()
+            .any(|step| matches!(step.step_key, AutoStepKey::Implement | AutoStepKey::RunPlan))
+    );
+}
+
+#[test]
+#[ignore = "known Phase 1 safety defect"]
+fn phase_1_standalone_ci_repair_never_queues_implementation_after_fix() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut persisted = standalone_completed_repair(&conn, AutoStepKey::FixCi);
+
+    let repo = Repository::with_config_dir_for_test(
+        PathBuf::from("/repo/prism"),
+        PathBuf::from("/tmp/prism-phase-1-ci-repair-config"),
+    );
+    ensure_next_auto_step_with_context(&conn, &repo, &test_config(), &mut persisted).unwrap();
+
+    assert!(
+        !persisted
+            .steps
+            .iter()
+            .any(|step| matches!(step.step_key, AutoStepKey::Implement | AutoStepKey::RunPlan))
+    );
+}
+
+#[test]
+#[ignore = "known Phase 1 safety defect"]
+fn phase_1_done_run_with_pending_push_is_discoverable_after_restart() {
+    let temp = TempDir::new("phase-1-pending-push-restart");
+    let database = temp.path().join("prism.db");
+    let repo = temp.path().join("repo");
+    let run_id = {
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        migrate_schema(&conn).unwrap();
+        let mut persisted = AutoLaunch::new(&repo, &repo, "feat/auto", "Repair review")
+            .unwrap()
+            .create_run();
+        persisted.run.status = AutoRunStatus::Done;
+        persisted.run.pending_push = Some(stabilization_model::PendingPushGuard {
+            repair_kind: stabilization_model::RepairKind::Review,
+            commit_sha: "repair-sha".to_string(),
+            expected_local_head_sha: "repair-sha".to_string(),
+            expected_remote_head_sha: Some("remote-sha".to_string()),
+            pr_number: Some(42),
+            expected_pr_head_sha: Some("remote-sha".to_string()),
+            expected_base_sha: Some("base-sha".to_string()),
+            guarded_review_thread_ids: vec!["thread-1".to_string()],
+        });
+        save_auto_run(&conn, &mut persisted).unwrap();
+        persisted.run.id
+    };
+
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    migrate_schema(&conn).unwrap();
+    let recent = load_recent_active_runs_for_repo(&conn, &repo, 10).unwrap();
+
+    assert_eq!(recent.len(), 1);
+    assert_eq!(recent[0].run.id, run_id);
+    assert!(recent[0].run.pending_push.is_some());
+    assert_ne!(recent[0].run.status, AutoRunStatus::Done);
+}
+
+#[test]
 #[cfg(unix)]
 fn executor_runs_fake_opencode_pauses_before_next_step_and_persists_events() {
     let temp = TempDir::new("executor-success");
@@ -2034,6 +2113,21 @@ fn push_test_step(
         summary: Some("done".to_string()),
         error: None,
     });
+}
+
+fn standalone_completed_repair(
+    conn: &rusqlite::Connection,
+    repair_step: AutoStepKey,
+) -> PersistedAutoRun {
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted = AutoLaunch::new(&repo, &repo.join("feature"), "feat/auto", "Repair PR")
+        .unwrap()
+        .create_run();
+    persisted.run.variant = "repair".to_string();
+    persisted.steps.clear();
+    push_test_step(&mut persisted, 1, repair_step, AutoStepStatus::Done);
+    save_auto_run(conn, &mut persisted).unwrap();
+    persisted
 }
 
 fn linked_run_plan_auto_run(conn: &rusqlite::Connection, repo: &Path) -> PersistedAutoRun {

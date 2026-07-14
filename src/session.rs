@@ -1177,6 +1177,75 @@ exit 0
     }
 
     #[test]
+    #[ignore = "known Phase 1 safety defect"]
+    fn phase_1_repository_reorder_preserves_transient_facts_when_repo_index_changes() {
+        let config = test_config();
+        let mut previous = test_session("feature", "/repo/feature");
+        previous.repo_index = 0;
+        previous.agent_state = AgentState::Running;
+        previous.opencode_status = Some(OpencodeStatus::offline(
+            Some("http://127.0.0.1:41000".to_string()),
+            Some("session-1".to_string()),
+        ));
+        previous.pr.error = Some("cached PR failure".to_string());
+        previous.pr.details = Some(crate::github::PrDetails::default());
+        previous
+            .wt_columns
+            .insert("ci".to_string(), "passed".to_string());
+        previous.unseen_comments = true;
+
+        let mut fresh = test_session("feature", "/repo/feature");
+        fresh.repo_index = 1;
+        assert_eq!(
+            fresh.identity_key(),
+            previous.identity_key(),
+            "presentation order must not change Worktree Session identity"
+        );
+        fresh.preserve_refresh_state_from(previous, &config);
+
+        assert_eq!(fresh.agent_state, AgentState::Running);
+        assert!(fresh.opencode_status.is_some());
+        assert_eq!(fresh.pr.error.as_deref(), Some("cached PR failure"));
+        assert!(fresh.pr.details.is_some());
+        assert_eq!(
+            fresh.wt_columns.get("ci").map(String::as_str),
+            Some("passed")
+        );
+        assert!(fresh.unseen_comments);
+    }
+
+    #[test]
+    #[ignore = "known Phase 1 safety defect"]
+    fn phase_1_same_path_changed_branch_does_not_inherit_agent_session_or_pr_cache_facts() {
+        let mut previous = test_session("old-feature", "/repo/feature");
+        previous.agent_state = AgentState::Running;
+        previous.opencode_status = Some(OpencodeStatus::offline(
+            Some("http://127.0.0.1:41000".to_string()),
+            Some("old-session".to_string()),
+        ));
+        previous.pr.error = Some("old branch PR failure".to_string());
+        previous.pr.details = Some(crate::github::PrDetails::default());
+        previous
+            .wt_columns
+            .insert("old".to_string(), "branch".to_string());
+        previous.unseen_comments = true;
+
+        let fresh = test_session("new-feature", "/repo/feature");
+        assert_ne!(
+            fresh.identity_key(),
+            previous.identity_key(),
+            "branch continuity must be part of Worktree Session identity"
+        );
+
+        assert_eq!(fresh.agent_state, AgentState::Idle);
+        assert!(fresh.opencode_status.is_none());
+        assert!(fresh.pr.error.is_none());
+        assert!(fresh.pr.details.is_none());
+        assert!(fresh.wt_columns.is_empty());
+        assert!(!fresh.unseen_comments);
+    }
+
+    #[test]
     fn mark_adopted_with_prompt_updates_local_metadata_facts() {
         let mut session = test_session("feature", "/repo/feature");
 

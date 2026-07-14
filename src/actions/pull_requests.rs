@@ -673,6 +673,16 @@ impl Tui {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn finish_guarded_push_for_test(
+        &mut self,
+        repo: &crate::repo::Repository,
+        config: &crate::config::Config,
+        persisted: &mut PersistedAutoRun,
+    ) -> Result<(), String> {
+        self.finish_guarded_push(repo, config, 0, persisted, true)
+    }
+
     fn update_persisted_stabilization(
         &mut self,
         repo: &crate::repo::Repository,

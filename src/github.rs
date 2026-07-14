@@ -2341,6 +2341,104 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "known Phase 1 safety defect"]
+    fn phase_1_failed_forced_summary_keeps_stale_display_but_authoritative_access_errors() {
+        let temp = unique_temp_dir("prism-phase-1-failed-summary-refresh");
+        fs::create_dir_all(&temp).unwrap();
+        let gh = temp.join("gh");
+        write_executable(&gh, "#!/bin/sh\necho 'GitHub unavailable' >&2\nexit 1\n");
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut config = test_config();
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+        let stale_summary = test_summary("feature", "head-a", 2);
+        let stale_details = PrDetails {
+            files: vec!["src/stale.rs".to_string()],
+            ..PrDetails::default()
+        };
+        let mut cache = PrCache {
+            summary: Some(stale_summary.clone()),
+            details: Some(stale_details),
+            signature: Some(stale_summary.signature()),
+            last_refreshed: Some("before failure".to_string()),
+            ..PrCache::default()
+        };
+
+        refresh_pr_cache(&repo, "feature", &mut cache, &temp, &config, true);
+
+        assert_eq!(cache.summary.as_ref(), Some(&stale_summary));
+        assert_eq!(cache.details.as_ref().unwrap().files, vec!["src/stale.rs"]);
+        assert_eq!(cache.last_refreshed.as_deref(), Some("before failure"));
+        assert!(
+            cache
+                .error
+                .as_deref()
+                .is_some_and(|error| !error.is_empty())
+        );
+        assert!(pr_summary_or_error(&cache).is_err());
+
+        let _ = fs::remove_dir_all(repo.prism_dir());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    #[ignore = "known Phase 1 safety defect"]
+    fn phase_1_details_for_head_a_are_rejected_after_same_pr_advances_to_head_b() {
+        let temp = unique_temp_dir("prism-phase-1-stale-head-details");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut cache = PrCache {
+            summary: Some(test_summary("feature", "head-b", 0)),
+            ..PrCache::default()
+        };
+        let poll_result = PrCache {
+            summary: Some(test_summary("feature", "head-a", 0)),
+            details: Some(PrDetails {
+                review_comments: vec![PrReviewComment {
+                    thread_id: "PRRT_from_head_a".to_string(),
+                    body: "stale".to_string(),
+                    ..PrReviewComment::default()
+                }],
+                ..PrDetails::default()
+            }),
+            details_last_polled: Some(Instant::now()),
+            ..PrCache::default()
+        };
+
+        let applied = apply_pr_details_poll_result(&repo, "feature", &mut cache, poll_result);
+
+        assert!(!applied);
+        assert!(cache.details.is_none());
+        assert!(load_pr_details_cache(&repo, "feature").is_none());
+
+        let _ = fs::remove_dir_all(repo.prism_dir());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    #[ignore = "known Phase 1 safety defect"]
+    fn phase_1_malformed_github_summary_output_is_failure_not_authoritative_absence() {
+        let temp = unique_temp_dir("prism-phase-1-malformed-summary");
+        fs::create_dir_all(&temp).unwrap();
+        let gh = temp.join("gh");
+        write_executable(&gh, "#!/bin/sh\nprintf '{not valid json'\n");
+        let mut config = test_config();
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+
+        let result = fetch_pr_summary(&temp, "feature", &config);
+
+        assert!(
+            result.is_err(),
+            "malformed output must not mean no pull request"
+        );
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn pr_cache_round_trips_details() {
         let temp = unique_temp_dir("prism-pr-details-cache-test");
         fs::create_dir_all(&temp).unwrap();
@@ -3094,6 +3192,13 @@ JSON
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    fn write_executable(path: &std::path::Path, contents: &str) {
+        fs::write(path, contents).unwrap();
+        let mut permissions = fs::metadata(path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).unwrap();
     }
 
     fn test_summary(head_ref: &str, head_sha: &str, comment_count: u64) -> PrSummary {

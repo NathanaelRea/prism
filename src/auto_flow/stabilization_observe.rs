@@ -730,6 +730,72 @@ exit 1
         let _ = fs::remove_dir_all(temp);
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "known Phase 1 safety defect"]
+    fn phase_1_mergeability_conflict_check_uses_actual_pr_base() {
+        let temp = unique_temp_dir("prism-stabilization-pr-base-test");
+        fs::create_dir_all(&temp).unwrap();
+        let git = temp.join("git");
+        write_executable(
+            &git,
+            r#"#!/bin/sh
+case "$*" in
+  *"remote get-url origin"*) printf '%s\n' 'git@github.com:owner/repo.git'; exit 0 ;;
+  *"rev-parse HEAD"*) printf '%s\n' 'head123'; exit 0 ;;
+  *"rev-parse --verify refs/remotes/origin/feature"*) printf '%s\n' 'head123'; exit 0 ;;
+  *"rev-parse --verify refs/remotes/origin/release"*) printf '%s\n' 'base123'; exit 0 ;;
+  *"status --short"*) exit 0 ;;
+  *"fetch origin main"*) exit 0 ;;
+  *"fetch origin release"*) exit 0 ;;
+  *"merge-tree --write-tree HEAD origin/main"*) printf '%s\n' 'tree123'; exit 0 ;;
+  *"merge-tree --write-tree HEAD origin/release"*) printf '%s\n' 'conflict' >&2; exit 1 ;;
+esac
+exit 1
+"#,
+        );
+        let mut config = test_config(false);
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        let mut summary = test_summary();
+        summary.base_ref = "release".to_string();
+        let session = Session {
+            repo_index: 0,
+            repo_label: "repo".to_string(),
+            repo_key: None,
+            path: temp.join("worktree"),
+            path_display: temp.join("worktree").display().to_string(),
+            branch: "feature".to_string(),
+            prompt_summary: String::new(),
+            classification: SessionClassification::Work,
+            visibility: 0,
+            adopted: true,
+            hidden: false,
+            status_label: "clean".to_string(),
+            agent_state: AgentState::Idle,
+            opencode_status: None,
+            pr: PrCache {
+                summary: Some(summary),
+                ..PrCache::default()
+            },
+            wt_columns: BTreeMap::new(),
+            unseen_comments: false,
+        };
+
+        let snapshot = build_stabilization_snapshot(&repo, &session, None, &config);
+        let pull_request = snapshot.pull_request.unwrap();
+
+        assert_eq!(pull_request.base_ref, "release");
+        assert!(matches!(
+            pull_request.mergeability,
+            MergeabilityFacts::Blocked { ref reason } if reason.contains("origin/release")
+        ));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
     fn test_summary() -> PrSummary {
         PrSummary {
             number: 123,

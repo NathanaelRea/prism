@@ -1,6 +1,10 @@
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
-use crate::auto_flow::{AutoStepKey, load_auto_run};
+use crate::auto_flow::stabilization_execute::{GuardedPushDecision, decide_guarded_push};
+use crate::auto_flow::stabilization_model::{
+    PendingPushGuard, RepairKind, StabilizationBlocker, StabilizationWorkKind,
+};
+use crate::auto_flow::{AutoLaunch, AutoStepKey, load_auto_run, save_auto_run};
 use crate::config::{Checks, Config, EscapeKey, MergeMethod};
 use crate::github::{PrCache, PrComment, PrDetails, PrSummary, pr_summary_or_error};
 use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
@@ -239,6 +243,234 @@ esac
         vec!["PRRT_fresh"]
     );
     assert_eq!(persisted.run.variant, "repair");
+
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+#[ignore = "known Phase 1 safety defect"]
+fn phase_1_external_guarded_push_satisfaction_resolves_exact_threads_and_replans_from_refreshed_details()
+ {
+    let temp = unique_temp_dir("prism-phase-1-external-guarded-push-test");
+    let repo_root = temp.join("repo");
+    let worktree = repo_root.join("feature");
+    fs::create_dir_all(&worktree).unwrap();
+    let gh_log = temp.join("gh.log");
+    let resolved = temp.join("resolved");
+    let gh = temp.join("gh");
+    let git = temp.join("git");
+
+    fs::write(
+        &gh,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"thread=PRRT_guarded_1"*|*"thread=PRRT_guarded_2"*)
+    touch '{}'
+    echo '{{"data":{{"resolveReviewThread":{{"thread":{{"isResolved":true}}}}}}}}'
+    ;;
+  "pr view feature --json comments,reviews,files,statusCheckRollup")
+    if [ -f '{}' ]; then
+      echo '{{"comments":[],"reviews":[{{"id":"PRR_fresh","author":{{"login":"reviewer"}},"state":"APPROVED","body":"","submittedAt":"2026-07-13T12:01:00Z"}}],"files":[],"statusCheckRollup":{{"contexts":{{"nodes":[]}}}}}}'
+    else
+      echo '{{"comments":[],"reviews":[{{"id":"PRR_stale","author":{{"login":"reviewer"}},"state":"CHANGES_REQUESTED","body":"address guarded feedback","submittedAt":"2026-07-13T12:00:00Z"}}],"files":[],"statusCheckRollup":{{"contexts":{{"nodes":[]}}}}}}'
+    fi
+    ;;
+  api\ graphql*)
+    if [ -f '{}' ]; then
+      echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
+    else
+      echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{{"id":"PRRT_guarded_1","isResolved":false,"comments":{{"nodes":[{{"id":"PRRC_guarded","path":"src/lib.rs","originalLine":12,"body":"address guarded feedback","createdAt":"2026-07-13T12:00:30Z","author":{{"login":"reviewer"}}}}]}}}}]}}}}}}}}'
+    fi
+    ;;
+  *)
+    if [ -f '{}' ]; then decision=APPROVED; else decision=CHANGES_REQUESTED; fi
+    echo "{{\"number\":42,\"title\":\"Guarded repair\",\"body\":\"\",\"url\":\"https://github.com/example/repo/pull/42\",\"state\":\"OPEN\",\"reviewDecision\":\"$decision\",\"reviewRequests\":{{\"nodes\":[]}},\"headRefName\":\"feature\",\"baseRefName\":\"main\",\"headRefOid\":\"repair-sha\",\"updatedAt\":\"2026-07-13T12:02:00Z\",\"comments\":{{\"totalCount\":0}},\"statusCheckRollup\":{{\"contexts\":{{\"nodes\":[]}}}},\"isDraft\":false}}"
+    ;;
+esac
+"#,
+            gh_log.display(),
+            resolved.display(),
+            resolved.display(),
+            resolved.display(),
+            resolved.display(),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &git,
+        r#"#!/bin/sh
+case "$*" in
+  *"remote get-url origin"*) echo "https://github.com/example/repo.git" ;;
+  *"rev-parse HEAD"*) echo "repair-sha" ;;
+  *"rev-parse refs/remotes/origin/feature"*) echo "repair-sha" ;;
+  *"rev-parse refs/remotes/origin/main"*) echo "base-sha" ;;
+  *"status --porcelain"*) exit 0 ;;
+  *"fetch origin"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+    )
+    .unwrap();
+    for executable in [&gh, &git] {
+        let mut permissions = fs::metadata(executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(executable, permissions).unwrap();
+    }
+
+    let mut config = test_config();
+    config.default_base = Some("main".to_string());
+    config
+        .tools
+        .insert("gh".to_string(), gh.display().to_string());
+    config
+        .tools
+        .insert("git".to_string(), git.display().to_string());
+    let repo = Repository::with_config_dir_for_test(repo_root.clone(), temp.join("config"));
+    let mut persisted = AutoLaunch::new(&repo_root, &worktree, "feature", "Guarded repair")
+        .unwrap()
+        .create_run();
+    persisted.run.pr_number = Some(42);
+    persisted.run.pending_push = Some(PendingPushGuard {
+        repair_kind: RepairKind::Review,
+        commit_sha: "repair-sha".to_string(),
+        expected_local_head_sha: "repair-sha".to_string(),
+        expected_remote_head_sha: Some("old-remote-sha".to_string()),
+        pr_number: Some(42),
+        expected_pr_head_sha: Some("old-remote-sha".to_string()),
+        expected_base_sha: Some("base-sha".to_string()),
+        guarded_review_thread_ids: vec!["PRRT_guarded_1".to_string(), "PRRT_guarded_2".to_string()],
+    });
+    crate::observability::with_writable_db(&repo, |conn| save_auto_run(conn, &mut persisted))
+        .unwrap();
+
+    let mut session = test_session(worktree.clone(), "feature");
+    session.pr = PrCache {
+        summary: Some(PrSummary {
+            number: 42,
+            title: "Guarded repair".to_string(),
+            body: String::new(),
+            url: "https://github.com/example/repo/pull/42".to_string(),
+            state: "OPEN".to_string(),
+            review_decision: "CHANGES_REQUESTED".to_string(),
+            requested_reviewers: Vec::new(),
+            head_ref: "feature".to_string(),
+            base_ref: "main".to_string(),
+            head_sha: "repair-sha".to_string(),
+            updated_at: "2026-07-13T12:00:00Z".to_string(),
+            check_status: "passed".to_string(),
+            merge_state_status: "CLEAN".to_string(),
+            comment_count: 1,
+            merged: false,
+            draft: false,
+        }),
+        details: Some(PrDetails {
+            review_comments: vec![crate::github::PrReviewComment {
+                thread_id: "PRRT_guarded_1".to_string(),
+                body: "address guarded feedback".to_string(),
+                resolved: false,
+                ..crate::github::PrReviewComment::default()
+            }],
+            ..PrDetails::default()
+        }),
+        ..PrCache::default()
+    };
+    let mut tui = Tui::new_single(repo.clone(), config.clone(), vec![session]);
+    tui.active_auto_runs
+        .insert(worktree, persisted.run.id.clone());
+
+    let guard = persisted.run.pending_push.as_ref().unwrap();
+    let decision = decide_guarded_push(
+        guard,
+        Some("repair-sha"),
+        Some("repair-sha"),
+        Some("repair-sha"),
+    );
+    assert_eq!(decision, GuardedPushDecision::AlreadySatisfied);
+    if decision == GuardedPushDecision::AlreadySatisfied {
+        tui.finish_guarded_push_for_test(&repo, &config, &mut persisted)
+            .unwrap();
+    }
+
+    let commands = fs::read_to_string(&gh_log).unwrap();
+    assert_eq!(commands.matches("thread=PRRT_guarded_1").count(), 1);
+    assert_eq!(commands.matches("thread=PRRT_guarded_2").count(), 1);
+    assert!(!commands.contains("thread=PRRT_unguarded"));
+    let details = tui.sessions[0].pr.details.as_ref().unwrap();
+    assert!(details.review_comments.is_empty());
+    assert!(
+        details
+            .reviews
+            .iter()
+            .any(|review| review.state == "APPROVED")
+    );
+    let reloaded = crate::observability::with_writable_db(&repo, |conn| {
+        load_auto_run(conn, &persisted.run.id)
+    })
+    .unwrap()
+    .unwrap();
+    assert!(reloaded.run.pending_push.is_none());
+    assert_eq!(
+        reloaded.run.stabilization_blocker,
+        Some(StabilizationBlocker::ReadyForManualMerge)
+    );
+    assert_eq!(
+        reloaded.run.stabilization_next_work,
+        Some(StabilizationWorkKind::MarkReadyForManualMerge)
+    );
+
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+#[ignore = "known Phase 1 safety defect"]
+fn phase_1_failed_details_refresh_does_not_start_repair_from_stale_thread_ids() {
+    let temp = unique_temp_dir("prism-phase-1-stale-review-authorization-test");
+    let worktree = temp.join("worktree");
+    fs::create_dir_all(&worktree).unwrap();
+    let gh = temp.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\necho 'review details unavailable' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&gh).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&gh, permissions).unwrap();
+
+    let mut config = test_config();
+    config
+        .tools
+        .insert("gh".to_string(), gh.display().to_string());
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut session = test_session(worktree, "feature");
+    session.pr = PrCache {
+        summary: Some(phase_1_pr_summary("old-head")),
+        details: Some(PrDetails {
+            review_comments: vec![crate::github::PrReviewComment {
+                thread_id: "PRRT_stale".to_string(),
+                body: "stale review feedback".to_string(),
+                resolved: false,
+                ..crate::github::PrReviewComment::default()
+            }],
+            ..PrDetails::default()
+        }),
+        ..PrCache::default()
+    };
+    let mut tui = Tui::new_single(repo, config, vec![session]);
+    tui.prompt_submissions = Some(Vec::new());
+
+    let result = tui.start_review_fix_for_test();
+
+    assert!(
+        result.is_err(),
+        "forced review repair must report refresh failure"
+    );
+    assert!(
+        tui.active_auto_runs.is_empty(),
+        "stale thread IDs must not authorize repair work"
+    );
 
     let _ = fs::remove_dir_all(temp);
 }
@@ -751,6 +983,115 @@ exit 0
 }
 
 #[test]
+#[ignore = "known Phase 1 safety defect"]
+fn phase_1_branch_delete_failure_reconciles_without_vanished_worktree_path() {
+    let temp = unique_temp_dir("prism-phase-1-delete-reconcile-test");
+    fs::create_dir_all(&temp).unwrap();
+    let worktree = temp.join("worktree");
+    fs::create_dir_all(&worktree).unwrap();
+    let git = temp.join("git");
+    let tmux = temp.join("tmux");
+    fs::write(
+        &git,
+        r#"#!/bin/sh
+case "$*" in
+  *"worktree remove --force"*) exit 0 ;;
+  *"branch -D feature/delete"*) exit 1 ;;
+  *"worktree list --porcelain"*) exit 0 ;;
+esac
+exit 0
+"#,
+    )
+    .unwrap();
+    fs::write(
+        &tmux,
+        r#"#!/bin/sh
+case "$1" in
+  list-sessions|kill-session) exit 0 ;;
+esac
+exit 0
+"#,
+    )
+    .unwrap();
+    for executable in [&git, &tmux] {
+        let mut permissions = fs::metadata(executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(executable, permissions).unwrap();
+    }
+
+    let mut config = test_config();
+    config
+        .tools
+        .insert("git".to_string(), git.display().to_string());
+    config
+        .tools
+        .insert("tmux".to_string(), tmux.display().to_string());
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(worktree.clone(), "feature/delete");
+    let mut tui = Tui::new_single(repo, config, vec![session]);
+
+    tui.start_delete_session_for_test().unwrap();
+    let wait_started = Instant::now();
+    while !tui.delete_sessions_in_flight.is_empty()
+        && wait_started.elapsed() < Duration::from_secs(3)
+    {
+        tui.poll_delete_sessions();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(tui.delete_sessions_in_flight.is_empty());
+    assert!(tui.sessions.iter().all(|session| session.path != worktree));
+    assert!(tui.visible_session_indices().is_empty());
+
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+#[ignore = "known Phase 1 safety defect"]
+fn phase_1_missing_github_remote_clears_live_and_persisted_pr_cache_state() {
+    let temp = unique_temp_dir("prism-phase-1-removed-remote-poll-test");
+    fs::create_dir_all(&temp).unwrap();
+    let git = temp.join("git");
+    fs::write(&git, "#!/bin/sh\necho 'origin is missing' >&2\nexit 2\n").unwrap();
+    let mut permissions = fs::metadata(&git).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&git, permissions).unwrap();
+
+    let mut config = test_config();
+    config
+        .tools
+        .insert("git".to_string(), git.display().to_string());
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let summary = phase_1_pr_summary("old-head");
+    let cache = PrCache {
+        summary: Some(summary),
+        details: Some(PrDetails {
+            files: vec!["src/stale.rs".to_string()],
+            ..PrDetails::default()
+        }),
+        ..PrCache::default()
+    };
+    crate::github::save_pr_cache(&repo, "feature", &cache).unwrap();
+    crate::github::save_pr_details_cache(&repo, "feature", cache.details.as_ref().unwrap())
+        .unwrap();
+    let mut session = test_session(temp.join("worktree"), "feature");
+    session.pr = cache;
+    session.unseen_comments = true;
+    let mut tui = Tui::new_single(repo.clone(), config, vec![session]);
+
+    assert!(tui.poll_pull_requests(true));
+
+    assert!(tui.sessions[0].pr.summary.is_none());
+    assert!(tui.sessions[0].pr.details.is_none());
+    assert!(!tui.sessions[0].unseen_comments);
+    let persisted = crate::github::load_pr_cache(&repo, "feature");
+    assert!(persisted.summary.is_none());
+    assert!(persisted.details.is_none());
+
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
 fn default_branch_does_not_start_pr_polling() {
     let temp = unique_temp_dir("prism-default-branch-pr-poll-test");
     fs::create_dir_all(&temp).unwrap();
@@ -1158,4 +1499,25 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+}
+
+fn phase_1_pr_summary(head_sha: &str) -> PrSummary {
+    PrSummary {
+        number: 42,
+        title: "Phase 1 safety".to_string(),
+        body: String::new(),
+        url: "https://github.com/example/repo/pull/42".to_string(),
+        state: "OPEN".to_string(),
+        review_decision: "CHANGES_REQUESTED".to_string(),
+        requested_reviewers: Vec::new(),
+        head_ref: "feature".to_string(),
+        base_ref: "main".to_string(),
+        head_sha: head_sha.to_string(),
+        updated_at: "2026-07-13T12:00:00Z".to_string(),
+        check_status: "passed".to_string(),
+        merge_state_status: "CLEAN".to_string(),
+        comment_count: 1,
+        merged: false,
+        draft: false,
+    }
 }
