@@ -790,7 +790,7 @@ impl Tui {
         }
         let path_display = self.sessions[selected].path_display.clone();
         let warnings = self.sessions[selected].deletion_warnings();
-        if self.confirm_delete_dialog(raw, &branch, &path_display, &warnings)? {
+        if self.confirm_delete_dialog(raw, &branch, &path_display, &warnings, true)? {
             self.start_delete_worktree_session(context.repo, context.config, path, branch)?;
             self.show_message("merge complete; deleting local session data, worktree, and branch")?;
         } else {

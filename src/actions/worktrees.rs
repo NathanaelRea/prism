@@ -315,7 +315,7 @@ impl Tui {
         let path = self.sessions[selected].path.clone();
         let path_display = self.sessions[selected].path_display.clone();
         let warnings = self.sessions[selected].deletion_warnings();
-        if !self.confirm_delete_dialog(raw, &branch, &path_display, &warnings)? {
+        if !self.confirm_delete_dialog(raw, &branch, &path_display, &warnings, false)? {
             return Ok(());
         }
         self.start_delete_worktree_session(context.repo, context.config, path, branch)?;
