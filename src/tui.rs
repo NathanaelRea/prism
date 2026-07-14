@@ -1223,6 +1223,7 @@ impl Tui {
         branch: &str,
         path: &str,
         warnings: &[String],
+        default: bool,
     ) -> Result<bool, String> {
         let mut lines = vec![
             view::DialogLine {
@@ -1252,7 +1253,7 @@ impl Tui {
             "Delete Session",
             lines,
             "Delete this session?",
-            false,
+            default,
         )
     }
 
