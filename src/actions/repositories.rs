@@ -125,7 +125,16 @@ impl Tui {
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
         ensure_repo_config_file(&context.config.repo_config_path, true)?;
-        let Some(columns) = self.worktree_column_editor(raw, context.repo_index)? else {
+        let (repo_label, configured_columns) = self
+            .repos
+            .get(context.repo_index)
+            .map(|repo| (repo.label.clone(), repo.config.worktree_columns.clone()))
+            .ok_or_else(|| "no selected repository".to_string())?;
+        let items =
+            worktree_column_choices(&configured_columns, &self.sessions, context.repo_index);
+        let Some(columns) =
+            self.ordered_toggle_dialog(raw, &format!("Worktree Columns: {repo_label}"), items)?
+        else {
             return Ok(());
         };
         update_worktree_columns_config(&context.config.repo_config_path, &columns)?;
@@ -137,78 +146,6 @@ impl Tui {
         self.start_wt_column_poll();
         self.show_message("worktree columns updated")?;
         Ok(())
-    }
-
-    pub(crate) fn worktree_column_editor(
-        &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
-        repo_index: usize,
-    ) -> Result<Option<Vec<String>>, String> {
-        let (repo_label, configured_columns) = self
-            .repos
-            .get(repo_index)
-            .map(|repo| (repo.label.clone(), repo.config.worktree_columns.clone()))
-            .ok_or_else(|| "no selected repository".to_string())?;
-        let mut columns = worktree_column_choices(&configured_columns, &self.sessions, repo_index);
-        let mut selected = 0usize;
-        loop {
-            self.dialog = Some(crate::view::DialogModel::WorktreeColumns {
-                title: format!("Worktree Columns: {repo_label}"),
-                columns: columns.clone(),
-                selected,
-            });
-            self.draw(raw)?;
-            let Some(event) = raw.poll_event(std::time::Duration::from_millis(100))? else {
-                continue;
-            };
-            let crate::tui_runtime::RuntimeEvent::Key(event) = event else {
-                continue;
-            };
-            if event.kind != crossterm::event::KeyEventKind::Press {
-                continue;
-            }
-            match event.code {
-                crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::Char('c')
-                    if event.code == crossterm::event::KeyCode::Esc
-                        || event
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                {
-                    self.dialog = None;
-                    self.draw(raw)?;
-                    return Ok(None);
-                }
-                crossterm::event::KeyCode::Enter => {
-                    self.dialog = None;
-                    self.draw(raw)?;
-                    return Ok(Some(
-                        columns
-                            .iter()
-                            .filter(|column| column.enabled)
-                            .map(|column| column.key.clone())
-                            .collect(),
-                    ));
-                }
-                crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-                    selected = selected.saturating_sub(1);
-                }
-                crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-                    selected = selected
-                        .saturating_add(1)
-                        .min(columns.len().saturating_sub(1));
-                }
-                crossterm::event::KeyCode::Char(' ') => {
-                    toggle_worktree_column(&mut columns, &mut selected);
-                }
-                crossterm::event::KeyCode::Char('K') => {
-                    move_enabled_worktree_column(&mut columns, &mut selected, -1);
-                }
-                crossterm::event::KeyCode::Char('J') => {
-                    move_enabled_worktree_column(&mut columns, &mut selected, 1);
-                }
-                _ => {}
-            }
-        }
     }
 
     pub(crate) fn add_repository(
@@ -307,6 +244,62 @@ impl Tui {
         Ok(())
     }
 
+    pub(crate) fn reorder_repositories(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let entries = crate::workspace::load_entries();
+        let items = repository_order_choices(&entries);
+        let Some(order) = self.ordered_toggle_dialog(raw, "Repositories", items)? else {
+            return Ok(());
+        };
+        let updated = repository_entries_for_order(&entries, &order)?;
+        if updated.is_empty() {
+            self.show_message("at least one repository must remain")?;
+            return Ok(());
+        }
+        let retained_roots = updated
+            .iter()
+            .map(|entry| entry.root.as_path())
+            .collect::<BTreeSet<_>>();
+        let removed = entries
+            .iter()
+            .filter(|entry| !retained_roots.contains(entry.root.as_path()))
+            .collect::<Vec<_>>();
+        if !removed.is_empty() {
+            let lines = removed
+                .iter()
+                .map(|entry| crate::view::DialogLine {
+                    text: entry.root.display().to_string(),
+                    attention: true,
+                })
+                .collect();
+            let prompt = if removed.len() == 1 {
+                "Remove this repository from Prism?"
+            } else {
+                "Remove these repositories from Prism?"
+            };
+            if !self.confirm_dialog(raw, "Remove Repositories", lines, prompt, false)? {
+                return Ok(());
+            }
+        }
+
+        let current_root = self
+            .selected_repo_context()
+            .map(|context| context.repo.root);
+        crate::workspace::save_entries(&updated)?;
+        self.reload_repositories(updated)?;
+        let index = current_root
+            .and_then(|root| self.repos.iter().position(|repo| repo.repo.root == root))
+            .unwrap_or_else(|| self.current_repo.min(self.repos.len().saturating_sub(1)));
+        self.select_repo(index);
+        self.start_tmux_agent_warmup();
+        self.start_wt_column_poll();
+        self.start_default_branch_status_poll(true);
+        self.show_message("repositories updated")?;
+        Ok(())
+    }
+
     pub(super) fn offer_worktrunk_approval_if_pending(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
@@ -353,15 +346,17 @@ impl Tui {
                 attention: true,
             },
             crate::view::DialogLine {
-                text: "Run Worktrunk's approval prompt now?".to_string(),
-                attention: false,
-            },
-            crate::view::DialogLine {
                 text: command,
                 attention: false,
             },
         ];
-        if !self.confirm_dialog(raw, "Worktrunk Approvals", lines, "Run", "Skip")? {
+        if !self.confirm_dialog(
+            raw,
+            "Worktrunk Approvals",
+            lines,
+            "Run Worktrunk's approval prompt now?",
+            true,
+        )? {
             return Ok(false);
         }
         raw.suspend_for(|| run_worktrunk_approval_prompt(repo, config))?;
@@ -394,7 +389,7 @@ pub(super) fn worktree_column_choices(
     configured: &[String],
     sessions: &[crate::session::Session],
     repo_index: usize,
-) -> Vec<crate::view::WorktreeColumnChoice> {
+) -> Vec<crate::view::OrderedToggleItem> {
     let configured_set = configured.iter().cloned().collect::<BTreeSet<_>>();
     let mut discovered = sessions
         .iter()
@@ -404,8 +399,9 @@ pub(super) fn worktree_column_choices(
         .collect::<BTreeSet<_>>();
     let mut choices = configured
         .iter()
-        .map(|key| crate::view::WorktreeColumnChoice {
-            key: key.clone(),
+        .map(|key| crate::view::OrderedToggleItem {
+            id: key.clone(),
+            label: key.clone(),
             enabled: true,
         })
         .collect::<Vec<_>>();
@@ -414,49 +410,45 @@ pub(super) fn worktree_column_choices(
             .pop_first()
             .into_iter()
             .chain(std::iter::from_fn(move || discovered.pop_first()))
-            .map(|key| crate::view::WorktreeColumnChoice {
-                key,
+            .map(|key| crate::view::OrderedToggleItem {
+                id: key.clone(),
+                label: key,
                 enabled: false,
             }),
     );
     choices
 }
 
-pub(super) fn toggle_worktree_column(
-    columns: &mut Vec<crate::view::WorktreeColumnChoice>,
-    selected: &mut usize,
-) {
-    if columns.is_empty() || *selected >= columns.len() {
-        return;
-    }
-    let mut column = columns.remove(*selected);
-    column.enabled = !column.enabled;
-    let insert_at = if column.enabled {
-        columns.iter().take_while(|choice| choice.enabled).count()
-    } else {
-        columns.len()
-    };
-    columns.insert(insert_at, column);
-    *selected = insert_at;
+pub(super) fn repository_order_choices(
+    entries: &[crate::workspace::RepoEntry],
+) -> Vec<crate::view::OrderedToggleItem> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| crate::view::OrderedToggleItem {
+            id: index.to_string(),
+            label: crate::workspace::label_for_root(&entry.root),
+            enabled: true,
+        })
+        .collect()
 }
 
-pub(super) fn move_enabled_worktree_column(
-    columns: &mut [crate::view::WorktreeColumnChoice],
-    selected: &mut usize,
-    direction: isize,
-) {
-    if columns.is_empty() || *selected >= columns.len() || !columns[*selected].enabled {
-        return;
-    }
-    let target = if direction < 0 {
-        (0..*selected).rev().find(|index| columns[*index].enabled)
-    } else {
-        (*selected + 1..columns.len()).find(|index| columns[*index].enabled)
-    };
-    if let Some(target) = target {
-        columns.swap(*selected, target);
-        *selected = target;
-    }
+pub(super) fn repository_entries_for_order(
+    entries: &[crate::workspace::RepoEntry],
+    order: &[String],
+) -> Result<Vec<crate::workspace::RepoEntry>, String> {
+    order
+        .iter()
+        .map(|id| {
+            let index = id
+                .parse::<usize>()
+                .map_err(|_| format!("invalid repository order id: {id}"))?;
+            entries
+                .get(index)
+                .cloned()
+                .ok_or_else(|| format!("unknown repository order id: {id}"))
+        })
+        .collect()
 }
 
 pub(super) fn update_worktree_columns_config(
@@ -514,4 +506,59 @@ pub(super) fn set_worktree_columns_text(text: &str, columns_line: &str) -> Strin
     let mut updated = lines.join("\n");
     updated.push('\n');
     updated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repository_order_preserves_keys_and_omits_disabled_entries() {
+        let entries = vec![
+            crate::workspace::RepoEntry {
+                root: PathBuf::from("/repos/one"),
+                key: Some('1'),
+            },
+            crate::workspace::RepoEntry {
+                root: PathBuf::from("/repos/two"),
+                key: Some('2'),
+            },
+            crate::workspace::RepoEntry {
+                root: PathBuf::from("/repos/three"),
+                key: Some('3'),
+            },
+        ];
+
+        let choices = repository_order_choices(&entries);
+        assert_eq!(
+            choices
+                .iter()
+                .map(|choice| (choice.id.as_str(), choice.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("0", "one"), ("1", "two"), ("2", "three")]
+        );
+
+        let reordered =
+            repository_entries_for_order(&entries, &["2".to_string(), "0".to_string()]).unwrap();
+        assert_eq!(reordered, vec![entries[2].clone(), entries[0].clone()]);
+    }
+
+    #[test]
+    fn repository_order_can_retain_entries_that_are_not_discovered() {
+        let entries = vec![
+            crate::workspace::RepoEntry {
+                root: PathBuf::from("/repos/available"),
+                key: Some('1'),
+            },
+            crate::workspace::RepoEntry {
+                root: PathBuf::from("/repos/unavailable"),
+                key: Some('2'),
+            },
+        ];
+
+        let reordered =
+            repository_entries_for_order(&entries, &["1".to_string(), "0".to_string()]).unwrap();
+
+        assert_eq!(reordered, vec![entries[1].clone(), entries[0].clone()]);
+    }
 }

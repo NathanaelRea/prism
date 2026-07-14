@@ -141,7 +141,7 @@ impl Tui {
             raw,
             "Default Branch Behind",
             &format!("{base} is behind origin/{base} by {behind}. Pull first?"),
-            "Pull",
+            true,
         )?;
         if should_pull {
             self.show_loading_dialog(raw, "Pull Default Branch", &format!("Pulling {base}"))?;

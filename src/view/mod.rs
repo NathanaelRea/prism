@@ -68,8 +68,14 @@ pub(crate) enum DialogModel {
     Confirm {
         title: String,
         lines: Vec<DialogLine>,
-        confirm_label: String,
-        cancel_label: String,
+        prompt: String,
+        input: String,
+        default: bool,
+        invalid: bool,
+    },
+    Notice {
+        title: String,
+        lines: Vec<DialogLine>,
     },
     Prompt {
         title: String,
@@ -79,9 +85,9 @@ pub(crate) enum DialogModel {
     Choice {
         choices: ChoiceList,
     },
-    WorktreeColumns {
+    OrderedToggle {
         title: String,
-        columns: Vec<WorktreeColumnChoice>,
+        items: Vec<OrderedToggleItem>,
         selected: usize,
     },
     Progress {
@@ -109,8 +115,9 @@ pub(crate) struct KeyChoice {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct WorktreeColumnChoice {
-    pub key: String,
+pub(crate) struct OrderedToggleItem {
+    pub id: String,
+    pub label: String,
     pub enabled: bool,
 }
 

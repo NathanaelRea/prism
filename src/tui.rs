@@ -361,6 +361,49 @@ fn ctrl_key(event: KeyEvent) -> bool {
     event.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+fn confirmation_result(input: &str, default: bool) -> Option<bool> {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "" => Some(default),
+        "y" => Some(true),
+        "n" => Some(false),
+        _ => None,
+    }
+}
+
+fn toggle_ordered_item(items: &mut Vec<view::OrderedToggleItem>, selected: &mut usize) {
+    if items.is_empty() || *selected >= items.len() {
+        return;
+    }
+    let mut item = items.remove(*selected);
+    item.enabled = !item.enabled;
+    let insert_at = if item.enabled {
+        items.iter().take_while(|item| item.enabled).count()
+    } else {
+        items.len()
+    };
+    items.insert(insert_at, item);
+    *selected = insert_at;
+}
+
+fn move_enabled_ordered_item(
+    items: &mut [view::OrderedToggleItem],
+    selected: &mut usize,
+    direction: isize,
+) {
+    if items.is_empty() || *selected >= items.len() || !items[*selected].enabled {
+        return;
+    }
+    let target = if direction < 0 {
+        (0..*selected).rev().find(|index| items[*index].enabled)
+    } else {
+        (*selected + 1..items.len()).find(|index| items[*index].enabled)
+    };
+    if let Some(target) = target {
+        items.swap(*selected, target);
+        *selected = target;
+    }
+}
+
 impl Tui {
     pub fn new(repos: Vec<ManagedRepo>, current_repo: usize, sessions: Vec<Session>) -> Self {
         let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
@@ -728,15 +771,21 @@ impl Tui {
                 Key::Refresh => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    self.refresh_sessions()?;
-                    self.start_tmux_agent_warmup();
-                    self.start_wt_column_poll();
-                    self.start_default_branch_status_poll(true);
-                    self.start_opencode_status_poll(true);
-                    self.start_opencode_event_listeners();
-                    self.refresh_plan_runs();
-                    self.refresh_auto_runs(false);
-                    self.poll_pull_requests(true);
+                    if self.focused_panel == PanelFocus::Repos && !self.main_focused {
+                        if let Err(error) = self.reorder_repositories(&mut runtime) {
+                            self.show_error("reorder repositories failed", &error)?;
+                        }
+                    } else {
+                        self.refresh_sessions()?;
+                        self.start_tmux_agent_warmup();
+                        self.start_wt_column_poll();
+                        self.start_default_branch_status_poll(true);
+                        self.start_opencode_status_poll(true);
+                        self.start_opencode_event_listeners();
+                        self.refresh_plan_runs();
+                        self.refresh_auto_runs(false);
+                        self.poll_pull_requests(true);
+                    }
                 }
                 Key::VisibilityUp => {
                     self.clear_leader_hint();
@@ -865,7 +914,7 @@ impl Tui {
                     } else if self.focused_panel == PanelFocus::Status {
                         self.show_message("focus worktrees to delete a worktree/session")?;
                     } else if self.focused_panel == PanelFocus::Repos {
-                        self.show_message("repository removal is available from R")?;
+                        self.show_message("repository removal is available from r")?;
                     } else if let Err(error) = self.archive_session(&mut runtime) {
                         self.show_error("archive failed", &error)?;
                     }
@@ -968,7 +1017,7 @@ impl Tui {
             runtime,
             "Quit Prism",
             "Agents are running. Quit Prism?",
-            "Quit",
+            false,
         )
     }
 
@@ -1032,7 +1081,8 @@ impl Tui {
             "P            worktrees: start or focus a plan run dashboard",
             "j/k          main comments: move comment selection; status dashboard: move plan output or phase selection",
             "A            worktrees: start/focus Auto Flow; choose prompt, plan file, or draft plan",
-            "R            edit repositories/order/keys/remove",
+            "r            repos: reorder or remove repositories",
+            "R            edit repositories/order/keys/remove in repos.toml",
             "C            repos: open a worktree for a remote pull request",
             "c            repos: create worktree session in selected repo",
             "+ / -        worktrees: raise/lower visibility sort",
@@ -1047,7 +1097,7 @@ impl Tui {
             "X            permanently delete non-default worktree/session",
             "j/k, up/down move selection",
             "g g / G      top / bottom",
-            "r            refresh",
+            "r            refresh outside the repos sidebar",
             "q, Ctrl-C    quit",
         ];
         let items = items
@@ -1158,7 +1208,13 @@ impl Tui {
             text: "Archive hides this worktree from normal navigation. Restore with `git worktree list` and remove the archive marker from Prism state if needed.".to_string(),
             attention: false,
         });
-        self.confirm_dialog(runtime, "Archive Session", lines, "Archive", "Cancel")
+        self.confirm_dialog(
+            runtime,
+            "Archive Session",
+            lines,
+            "Archive this session?",
+            false,
+        )
     }
 
     pub(crate) fn confirm_delete_dialog(
@@ -1191,7 +1247,13 @@ impl Tui {
                 });
             }
         }
-        self.confirm_dialog(runtime, "Delete Session", lines, "Delete", "Cancel")
+        self.confirm_dialog(
+            runtime,
+            "Delete Session",
+            lines,
+            "Delete this session?",
+            false,
+        )
     }
 
     pub(crate) fn prompt_line_dialog(
@@ -1304,6 +1366,74 @@ impl Tui {
         }
     }
 
+    pub(crate) fn ordered_toggle_dialog(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        title: &str,
+        mut items: Vec<view::OrderedToggleItem>,
+    ) -> Result<Option<Vec<String>>, String> {
+        items.sort_by_key(|item| !item.enabled);
+        let mut selected = 0usize;
+        loop {
+            self.dialog = Some(view::DialogModel::OrderedToggle {
+                title: title.to_string(),
+                items: items.clone(),
+                selected,
+            });
+            self.draw(runtime)?;
+            if self.tick_tui_action_jobs().any() {
+                self.draw(runtime)?;
+            }
+            let Some(event) = runtime.poll_event(Duration::from_millis(100))? else {
+                continue;
+            };
+            let RuntimeEvent::Key(event) = event else {
+                continue;
+            };
+            if event.kind != KeyEventKind::Press {
+                continue;
+            }
+            match event.code {
+                KeyCode::Esc | KeyCode::Char('c')
+                    if event.code == KeyCode::Esc || ctrl_key(event) =>
+                {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Ok(None);
+                }
+                KeyCode::Enter if plain_key(event) => {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Ok(Some(
+                        items
+                            .iter()
+                            .filter(|item| item.enabled)
+                            .map(|item| item.id.clone())
+                            .collect(),
+                    ));
+                }
+                KeyCode::Up | KeyCode::Char('k') if plain_key(event) => {
+                    selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') if plain_key(event) => {
+                    selected = selected
+                        .saturating_add(1)
+                        .min(items.len().saturating_sub(1));
+                }
+                KeyCode::Char(' ') if plain_key(event) => {
+                    toggle_ordered_item(&mut items, &mut selected);
+                }
+                KeyCode::Char('K') if plain_key(event) => {
+                    move_enabled_ordered_item(&mut items, &mut selected, -1);
+                }
+                KeyCode::Char('J') if plain_key(event) => {
+                    move_enabled_ordered_item(&mut items, &mut selected, 1);
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub(crate) fn show_loading_dialog(
         &mut self,
         runtime: &mut TerminalRuntime,
@@ -1324,14 +1454,18 @@ impl Tui {
         runtime: &mut TerminalRuntime,
         title: &str,
         lines: Vec<view::DialogLine>,
-        confirm_label: &str,
-        cancel_label: &str,
+        prompt: &str,
+        default: bool,
     ) -> Result<bool, String> {
+        let mut input = String::new();
+        let mut invalid = false;
         self.dialog = Some(view::DialogModel::Confirm {
             title: title.to_string(),
             lines: lines.clone(),
-            confirm_label: confirm_label.to_string(),
-            cancel_label: cancel_label.to_string(),
+            prompt: prompt.to_string(),
+            input: input.clone(),
+            default,
+            invalid,
         });
         self.draw(runtime)?;
         loop {
@@ -1349,30 +1483,39 @@ impl Tui {
                 continue;
             }
             match event.code {
-                KeyCode::Enter | KeyCode::Char('y' | 'Y') if plain_key(event) => {
-                    self.dialog = None;
-                    self.draw(runtime)?;
-                    return Ok(true);
+                KeyCode::Enter if plain_key(event) => {
+                    if let Some(result) = confirmation_result(&input, default) {
+                        self.dialog = None;
+                        self.draw(runtime)?;
+                        return Ok(result);
+                    }
+                    input.clear();
+                    invalid = true;
                 }
-                KeyCode::Esc | KeyCode::Char('n' | 'N')
-                    if event.code == KeyCode::Esc || plain_key(event) =>
+                KeyCode::Esc | KeyCode::Char('c')
+                    if event.code == KeyCode::Esc || ctrl_key(event) =>
                 {
                     self.dialog = None;
                     self.draw(runtime)?;
-                    return Ok(false);
+                    return Ok(default);
                 }
-                KeyCode::Char('q') if plain_key(event) => {
-                    self.dialog = None;
-                    self.draw(runtime)?;
-                    return Ok(false);
+                KeyCode::Backspace => {
+                    input.pop();
                 }
-                KeyCode::Char('c') if ctrl_key(event) => {
-                    self.dialog = None;
-                    self.draw(runtime)?;
-                    return Ok(false);
+                KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => {
+                    input.push(ch);
                 }
                 _ => {}
             }
+            self.dialog = Some(view::DialogModel::Confirm {
+                title: title.to_string(),
+                lines: lines.clone(),
+                prompt: prompt.to_string(),
+                input: input.clone(),
+                default,
+                invalid,
+            });
+            self.draw(runtime)?;
         }
     }
 
@@ -1381,18 +1524,32 @@ impl Tui {
         runtime: &mut TerminalRuntime,
         title: &str,
         message: &str,
-        confirm_label: &str,
+        default: bool,
     ) -> Result<bool, String> {
-        self.confirm_dialog(
-            runtime,
-            title,
-            vec![view::DialogLine {
-                text: message.to_string(),
-                attention: false,
-            }],
-            confirm_label,
-            "Cancel",
-        )
+        self.confirm_dialog(runtime, title, vec![], message, default)
+    }
+
+    pub(crate) fn notice_dialog(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        title: &str,
+        lines: Vec<view::DialogLine>,
+    ) -> Result<(), String> {
+        self.dialog = Some(view::DialogModel::Notice {
+            title: title.to_string(),
+            lines,
+        });
+        self.draw(runtime)?;
+        loop {
+            let Some(event) = runtime.poll_event(Duration::from_millis(100))? else {
+                continue;
+            };
+            if matches!(event, RuntimeEvent::Key(event) if event.kind == KeyEventKind::Press) {
+                self.dialog = None;
+                self.draw(runtime)?;
+                return Ok(());
+            }
+        }
     }
 
     pub(crate) fn show_message(&mut self, message: &str) -> Result<(), String> {
@@ -1864,7 +2021,7 @@ impl Tui {
             text: row.body.clone(),
             attention: false,
         });
-        self.confirm_dialog(runtime, "Comment Details", lines, "Close", "Close")?;
+        self.notice_dialog(runtime, "Comment Details", lines)?;
         Ok(true)
     }
 
@@ -2947,9 +3104,99 @@ mod tests {
     };
     use crate::repo::Repository;
     use crate::session::Session;
-    use crate::view::{RepoMainView, WorktreeMainView};
+    use crate::view::{OrderedToggleItem, RepoMainView, WorktreeMainView};
 
-    use super::{ManagedRepo, OpenTmuxSessionTarget, PanelFocus, Tui, WorktreeListMode};
+    use super::{
+        ManagedRepo, OpenTmuxSessionTarget, PanelFocus, Tui, WorktreeListMode, confirmation_result,
+        move_enabled_ordered_item, toggle_ordered_item,
+    };
+
+    #[test]
+    fn confirmation_empty_answer_uses_the_passed_default() {
+        assert_eq!(confirmation_result("", true), Some(true));
+        assert_eq!(confirmation_result("", false), Some(false));
+    }
+
+    #[test]
+    fn confirmation_yes_and_no_override_the_default() {
+        assert_eq!(confirmation_result("y", false), Some(true));
+        assert_eq!(confirmation_result("n", true), Some(false));
+    }
+
+    #[test]
+    fn confirmation_rejects_unknown_answers() {
+        assert_eq!(confirmation_result("maybe", true), None);
+        assert_eq!(confirmation_result("ny", false), None);
+    }
+
+    #[test]
+    fn ordered_toggle_groups_enabled_items_before_disabled_items() {
+        let mut items = ordered_toggle_items();
+        let mut selected = 1;
+
+        toggle_ordered_item(&mut items, &mut selected);
+
+        assert_eq!(selected, 2);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.id.as_str(), item.enabled))
+                .collect::<Vec<_>>(),
+            vec![("one", true), ("three", false), ("two", false)]
+        );
+
+        toggle_ordered_item(&mut items, &mut selected);
+
+        assert_eq!(selected, 1);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.id.as_str(), item.enabled))
+                .collect::<Vec<_>>(),
+            vec![("one", true), ("two", true), ("three", false)]
+        );
+    }
+
+    #[test]
+    fn ordered_toggle_moves_only_enabled_items() {
+        let mut items = ordered_toggle_items();
+        let mut selected = 1;
+
+        move_enabled_ordered_item(&mut items, &mut selected, -1);
+
+        assert_eq!(selected, 0);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["two", "one", "three"]
+        );
+
+        selected = 2;
+        move_enabled_ordered_item(&mut items, &mut selected, -1);
+        assert_eq!(selected, 2);
+    }
+
+    fn ordered_toggle_items() -> Vec<OrderedToggleItem> {
+        vec![
+            OrderedToggleItem {
+                id: "one".to_string(),
+                label: "First".to_string(),
+                enabled: true,
+            },
+            OrderedToggleItem {
+                id: "two".to_string(),
+                label: "Second".to_string(),
+                enabled: true,
+            },
+            OrderedToggleItem {
+                id: "three".to_string(),
+                label: "Third".to_string(),
+                enabled: false,
+            },
+        ]
+    }
 
     #[test]
     fn tui_defaults_to_repos_panel_focus() {

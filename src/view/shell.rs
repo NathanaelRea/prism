@@ -52,7 +52,7 @@ const REPOS_FOOTER_ACTIONS: &[(&str, &str)] = &[
     ("Create", "c"),
     ("Unarchive", "U"),
     ("Columns", "C"),
-    ("Manage", "R"),
+    ("Reorder", "r"),
     ("Search", "/"),
     ("Info", "?"),
     ("Quit", "q"),

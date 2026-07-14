@@ -30,7 +30,8 @@ Prism uses a lazygit-style panel model.
 - `s` skips the selected Plan step from the active Plan dashboard.
 - `p` or `Space g p` pulls the selected repository's default branch from the Repos or Worktrees panel.
 - `Space 1` through `Space 9` jump to configured repositories.
-- `R` edits repository order, key bindings, and tracked repositories.
+- `r` opens the repository order dialog from the Repos panel. Use `Space` to mark repositories for removal, `J`/`K` to move them down/up, and `Enter` to save. Removals require a second confirmation.
+- `R` edits repository order, key bindings, and tracked repositories in `repos.toml`.
 - `c` creates a worktree session from the Repos panel.
 - `x` aborts the selected OpenCode session from the Worktrees panel.
 - `x` also aborts the selected Plan phase from the active Plan dashboard, or accepts `all` when prompted to abort all running phases.
@@ -43,7 +44,7 @@ Prism uses a lazygit-style panel model.
 - `D` archives the selected non-default worktree/session, hiding it from normal navigation while leaving files and branch intact.
 - `U` opens a picker of archived worktrees for the selected repository and restores the chosen one.
 - `X` permanently deletes the selected non-default worktree/session after explicit confirmation.
-- `r` refreshes cached repository, worktree, PR, and agent state.
+- `r` refreshes cached repository, worktree, PR, and agent state outside the Repos panel.
 - `q` or `Ctrl-C` quits.
 
 Most repository actions are only active from the Repos panel. Pulling the default branch and editing worktree columns are active from the selected repository context. Worktree actions are only active from the Worktrees panel.

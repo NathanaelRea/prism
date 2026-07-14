@@ -485,7 +485,7 @@ impl Tui {
             raw,
             "Retry Plan",
             &format!("Retry from phase {selected_step}?"),
-            "Retry",
+            false,
         )?;
         if !should_retry {
             return Ok(true);

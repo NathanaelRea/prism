@@ -52,6 +52,14 @@ pub(super) fn render_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &crate::v
     frame.render_widget(paragraph, geometry.popup);
     if let crate::view::DialogModel::Prompt { prompt, input, .. } = dialog {
         set_prompt_cursor(frame, geometry.inner, prompt, input);
+    } else if let crate::view::DialogModel::Confirm {
+        prompt,
+        input,
+        default,
+        ..
+    } = dialog
+    {
+        set_confirmation_cursor(frame, geometry.inner, dialog, prompt, input, *default);
     }
 }
 
@@ -168,8 +176,9 @@ pub(super) fn dialog_title(dialog: &crate::view::DialogModel) -> String {
     match dialog {
         crate::view::DialogModel::Help { .. } => "Keybindings".to_string(),
         crate::view::DialogModel::Confirm { title, .. }
+        | crate::view::DialogModel::Notice { title, .. }
         | crate::view::DialogModel::Prompt { title, .. }
-        | crate::view::DialogModel::WorktreeColumns { title, .. }
+        | crate::view::DialogModel::OrderedToggle { title, .. }
         | crate::view::DialogModel::Choice {
             choices: crate::view::ChoiceList { title, .. },
             ..
@@ -229,8 +238,10 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
         }
         crate::view::DialogModel::Confirm {
             lines,
-            confirm_label,
-            cancel_label,
+            prompt,
+            input,
+            default,
+            invalid,
             ..
         } => {
             let mut rendered = Vec::new();
@@ -244,15 +255,38 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
                     },
                 ));
             }
-            rendered.push(Line::from(""));
+            if !rendered.is_empty() {
+                rendered.push(Line::from(""));
+            }
             rendered.push(Line::from(vec![
-                Span::styled("y/Enter ", selected_style(true)),
-                Span::styled(confirm_label.clone(), selected_style(true)),
-                Span::styled("   n/Esc/q ", muted_style()),
-                Span::raw(cancel_label.clone()),
+                Span::raw(format!("{prompt} ")),
+                Span::styled(
+                    if *default { "[Y/n]: " } else { "[y/N]: " },
+                    selected_style(true),
+                ),
+                Span::raw(input.clone()),
             ]));
+            if *invalid {
+                rendered.push(Line::from(Span::styled(
+                    "Please enter y or n.",
+                    attention_style(),
+                )));
+            }
             rendered
         }
+        crate::view::DialogModel::Notice { lines, .. } => lines
+            .iter()
+            .flat_map(|line| {
+                styled_text_lines(
+                    &line.text,
+                    if line.attention {
+                        attention_style()
+                    } else {
+                        Style::default()
+                    },
+                )
+            })
+            .collect(),
         crate::view::DialogModel::Prompt { prompt, input, .. } => {
             let mut lines = prompt_dialog_lines(prompt, input);
             lines.push(Line::from(""));
@@ -262,9 +296,9 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
             )));
             lines
         }
-        crate::view::DialogModel::WorktreeColumns {
-            columns, selected, ..
-        } => worktree_column_lines(columns, *selected),
+        crate::view::DialogModel::OrderedToggle {
+            items, selected, ..
+        } => ordered_toggle_lines(items, *selected),
         crate::view::DialogModel::Choice { choices, .. } => choice_lines(choices),
         crate::view::DialogModel::Progress { message, .. } => {
             let mut lines = vec![Line::from(Span::styled(
@@ -275,6 +309,37 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
             lines
         }
     }
+}
+
+fn set_confirmation_cursor(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    dialog: &crate::view::DialogModel,
+    prompt: &str,
+    input: &str,
+    default: bool,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let prefix_width = format!("{prompt} {}", if default { "[Y/n]: " } else { "[y/N]: " })
+        .chars()
+        .count() as u16;
+    let input_width = input.chars().count().min(area.width as usize) as u16;
+    let invalid = matches!(
+        dialog,
+        crate::view::DialogModel::Confirm { invalid: true, .. }
+    );
+    let y = dialog_lines(dialog)
+        .len()
+        .saturating_sub(if invalid { 2 } else { 1 }) as u16;
+    frame.set_cursor_position((
+        area.x
+            + prefix_width
+                .saturating_add(input_width)
+                .min(area.width.saturating_sub(1)),
+        area.y + y.min(area.height.saturating_sub(1)),
+    ));
 }
 
 pub(super) fn help_dialog_content_width(
@@ -307,32 +372,32 @@ pub(super) fn choice_lines(choices: &crate::view::ChoiceList) -> Vec<Line<'stati
         .collect::<Vec<_>>()
 }
 
-pub(super) fn worktree_column_lines(
-    columns: &[crate::view::WorktreeColumnChoice],
+pub(super) fn ordered_toggle_lines(
+    items: &[crate::view::OrderedToggleItem],
     selected: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
-        "j/k select  Space enable/disable  J/K move enabled column  Enter save  Esc cancel",
+        "j/k select  Space toggle  J/K move  Enter save  Esc cancel",
         muted_style(),
     ))];
     lines.push(Line::from(""));
-    if columns.is_empty() {
+    if items.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No wt columns found",
+            "No options available",
             muted_style(),
         )));
         return lines;
     }
-    for (index, column) in columns.iter().enumerate() {
+    for (index, item) in items.iter().enumerate() {
         let focused = index == selected;
         lines.push(Line::from(vec![
             Span::styled(if focused { "▶ " } else { "  " }, title_style(focused)),
             Span::styled(
-                if column.enabled { "[x]" } else { "[ ]" },
-                selected_style(column.enabled),
+                if item.enabled { "[x]" } else { "[ ]" },
+                selected_style(item.enabled),
             ),
             Span::raw(" "),
-            Span::styled(column.key.clone(), title_style(focused)),
+            Span::styled(item.label.clone(), title_style(focused)),
         ]));
     }
     lines

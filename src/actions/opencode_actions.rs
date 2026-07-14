@@ -317,7 +317,7 @@ impl Tui {
             raw,
             "Abort OpenCode",
             &format!("Abort {}?", self.sessions[selected].branch),
-            "Abort",
+            false,
         )?;
         if !should_abort {
             return Ok(());

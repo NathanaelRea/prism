@@ -357,12 +357,8 @@ impl Tui {
         let Some(selected) = selected else {
             return Ok(true);
         };
-        let should_retry = self.confirm_action_dialog(
-            raw,
-            "Retry Auto Flow",
-            "Retry from selected step?",
-            "Retry",
-        )?;
+        let should_retry =
+            self.confirm_action_dialog(raw, "Retry Auto Flow", "Retry from selected step?", false)?;
         if !should_retry {
             return Ok(true);
         }
@@ -439,7 +435,7 @@ impl Tui {
             raw,
             "Resume Auto Flow",
             &format!("Next: {description}. Continue?"),
-            "Continue",
+            true,
         )
     }
 
