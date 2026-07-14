@@ -16,11 +16,13 @@ die() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
   --sandbox)
-    sandbox_path="${2:-}"
+    [[ $# -ge 2 ]] || die "--sandbox requires a value"
+    sandbox_path="$2"
     shift 2
     ;;
   --output)
-    output_path="${2:-}"
+    [[ $# -ge 2 ]] || die "--output requires a value"
+    output_path="$2"
     shift 2
     ;;
   --keep)
@@ -39,7 +41,7 @@ done
 [[ -n "$output_path" ]] || die "--output is required"
 
 prism_binary="$repo_root/target/release/prism"
-git_binary="$(command -v git)"
+git_binary="$(command -v git || true)"
 cleanup() {
   local status=$?
   if command -v tmux >/dev/null 2>&1; then

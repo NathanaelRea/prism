@@ -4,9 +4,10 @@ set -euo pipefail
 root="${PRISM_DEMO_ROOT:?PRISM_DEMO_ROOT is required}"
 repo="${PRISM_DEMO_REPO:?PRISM_DEMO_REPO is required}"
 origin="${PRISM_DEMO_ORIGIN:?PRISM_DEMO_ORIGIN is required}"
+config_home="${XDG_CONFIG_HOME:?XDG_CONFIG_HOME is required}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 bin_dir="$root/bin"
-config_dir="$XDG_CONFIG_HOME/prism"
+config_dir="$config_home/prism"
 demo_url="https://github.com/prism-demo/shop.git"
 
 mkdir -p "$bin_dir" "$config_dir" "$root/state" "$root/logs"
@@ -67,6 +68,7 @@ create_repo() {
   local name="$1"
   local path="$root/work/$name"
   git init "$path" >/dev/null
+  git -C "$path" remote add origin "https://github.com/prism-demo/${name}.git"
   printf '# %s\n' "$name" >"$path/README.md"
   git -C "$path" add README.md
   git -C "$path" commit -m "Initial ${name} service" >/dev/null

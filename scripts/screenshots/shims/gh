@@ -12,7 +12,7 @@ fi
 if [[ "${1:-}" == "api" && "${2:-}" == "graphql" ]]; then
   if [[ "$*" == *"pullRequests"* ]]; then
     # Keep refresh in flight while VHS captures the pre-seeded PR cache.
-    sleep 10
+    sleep 60
   fi
   printf '{"data":{"repository":{"defaultBranchRef":{"name":"main"},"branchProtectionRules":{"nodes":[]},"pullRequests":{"nodes":[]}}}}\n'
   exit 0
