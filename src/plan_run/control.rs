@@ -89,17 +89,27 @@ pub fn abort_plan_run(
 ) -> Result<(), String> {
     let mut errors = Vec::new();
     for step in &mut persisted.steps {
-        if matches!(
-            step.status,
-            PlanStepStatus::Starting | PlanStepStatus::Running
-        ) && let Err(error) = abort_plan_step(conn, step)
-        {
-            errors.push(format!("step {}: {error}", step.step));
+        match step.status {
+            PlanStepStatus::Starting | PlanStepStatus::Running => {
+                if let Err(error) = abort_plan_step(conn, step) {
+                    errors.push(format!("step {}: {error}", step.step));
+                }
+            }
+            PlanStepStatus::Queued => {
+                step.status = PlanStepStatus::Aborted;
+                step.finished_unix_ms = Some(unix_ms());
+                step.error = Some("aborted".to_string());
+            }
+            PlanStepStatus::Done
+            | PlanStepStatus::Failed
+            | PlanStepStatus::Aborted
+            | PlanStepStatus::Skipped => {}
         }
     }
     persisted.run.status = persisted.aggregate_status();
+    persisted.run.pause_requested = false;
     persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)?;
+    save_plan_run(conn, persisted)?;
     if errors.is_empty() {
         Ok(())
     } else {

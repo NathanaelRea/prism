@@ -211,8 +211,10 @@ fn plan_approval_pauses_and_resume_queues_run_plan() {
     assert!(persisted.run.pause_requested);
     assert_eq!(persisted.steps[2].status, AutoStepStatus::Done);
 
-    resume_paused_auto_run(&conn, &mut persisted).unwrap();
-    assert!(prepare_auto_run_for_resume(&conn, &mut persisted, 100).unwrap());
+    let outcome =
+        apply_auto_run_control(&conn, &persisted.run.id, AutoRunControlIntent::Resume).unwrap();
+    assert_eq!(outcome.executor, AutoExecutorDecision::Start);
+    persisted = outcome.run;
     assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
     assert!(
         persisted
@@ -531,8 +533,13 @@ fn retry_failed_run_plan_requeues_linked_failed_phase() {
     plan_run.steps[0].status = crate::plan_run::PlanStepStatus::Failed;
     crate::plan_run::save_plan_run(&conn, &plan_run).unwrap();
 
-    retry_failed_auto_step(&conn, &mut persisted).unwrap();
+    let outcome =
+        apply_auto_run_control(&conn, &persisted.run.id, AutoRunControlIntent::RetryFailed)
+            .unwrap();
+    let persisted = outcome.run;
 
+    assert_eq!(outcome.executor, AutoExecutorDecision::Start);
+    assert!(!auto_run_execution_blocked(&persisted));
     assert_eq!(persisted.steps.len(), 1);
     assert_eq!(persisted.steps[0].status, AutoStepStatus::Queued);
     let loaded_plan = load_plan_run(&conn, &plan_run_id).unwrap().unwrap();
@@ -557,8 +564,13 @@ fn retry_failed_run_plan_continues_when_linked_plan_finished() {
     plan_run.steps[0].status = crate::plan_run::PlanStepStatus::Done;
     crate::plan_run::save_plan_run(&conn, &plan_run).unwrap();
 
-    retry_failed_auto_step(&conn, &mut persisted).unwrap();
+    let outcome =
+        apply_auto_run_control(&conn, &persisted.run.id, AutoRunControlIntent::RetryFailed)
+            .unwrap();
+    let mut persisted = outcome.run;
 
+    assert_eq!(outcome.executor, AutoExecutorDecision::Start);
+    assert!(!auto_run_execution_blocked(&persisted));
     assert_eq!(persisted.steps[0].status, AutoStepStatus::Done);
     assert_eq!(persisted.run.status, AutoRunStatus::Done);
     assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
@@ -585,8 +597,17 @@ fn retry_from_run_plan_resets_later_auto_steps() {
     save_auto_run(&conn, &mut persisted).unwrap();
     let selected = persisted.steps[0].id.unwrap();
 
-    retry_auto_from_step(&conn, &mut persisted, selected).unwrap();
+    let outcome = apply_auto_run_control(
+        &conn,
+        &persisted.run.id,
+        AutoRunControlIntent::RetryFromStep {
+            step_run_id: selected,
+        },
+    )
+    .unwrap();
+    let persisted = outcome.run;
 
+    assert_eq!(outcome.executor, AutoExecutorDecision::Start);
     assert_eq!(persisted.steps[0].status, AutoStepStatus::Queued);
     assert_eq!(persisted.steps[1].status, AutoStepStatus::Queued);
 }
@@ -604,6 +625,349 @@ fn pause_auto_run_requests_linked_plan_pause() {
 
     let loaded_plan = load_plan_run(&conn, &plan_run_id).unwrap().unwrap();
     assert!(loaded_plan.run.pause_requested);
+}
+
+#[test]
+fn auto_control_pause_and_resume_returns_authoritative_execution_decision() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted =
+        AutoLaunch::new(&repo, &repo.join("feature"), "feat/auto", "Implement auto")
+            .unwrap()
+            .create_run();
+    save_auto_run(&conn, &mut persisted).unwrap();
+
+    let paused =
+        apply_auto_run_control(&conn, &persisted.run.id, AutoRunControlIntent::Pause).unwrap();
+
+    assert_eq!(paused.effect, AutoRunControlEffect::Paused);
+    assert_eq!(paused.executor, AutoExecutorDecision::DoNotStart);
+    assert_eq!(paused.run.run.status, AutoRunStatus::Paused);
+    assert!(paused.run.run.pause_requested);
+
+    let resumed =
+        apply_auto_run_control(&conn, &persisted.run.id, AutoRunControlIntent::Resume).unwrap();
+
+    assert_eq!(resumed.effect, AutoRunControlEffect::Resumed);
+    assert_eq!(resumed.executor, AutoExecutorDecision::Start);
+    assert_eq!(resumed.run.run.status, AutoRunStatus::Queued);
+    assert!(!resumed.run.run.pause_requested);
+    assert_eq!(
+        load_auto_run(&conn, &persisted.run.id)
+            .unwrap()
+            .unwrap()
+            .run,
+        resumed.run.run
+    );
+}
+
+#[test]
+fn auto_control_resume_reconciles_linked_plan_before_deciding_to_execute() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted = linked_run_plan_auto_run(&conn, &repo);
+    let plan_run_id = persisted.steps[0].plan_run_id.clone().unwrap();
+    let mut plan_run = load_plan_run(&conn, &plan_run_id).unwrap().unwrap();
+    plan_run.run.status = PlanRunStatus::Running;
+    plan_run.steps[0].status = crate::plan_run::PlanStepStatus::Running;
+    crate::plan_run::save_plan_run(&conn, &plan_run).unwrap();
+    persisted.run.pause_requested = true;
+    persisted.run.status = AutoRunStatus::Paused;
+    save_auto_run(&conn, &mut persisted).unwrap();
+
+    let outcome =
+        apply_auto_run_control(&conn, &persisted.run.id, AutoRunControlIntent::Resume).unwrap();
+
+    assert_eq!(outcome.executor, AutoExecutorDecision::Start);
+    assert_eq!(outcome.run.steps[0].status, AutoStepStatus::Queued);
+    let loaded_plan = load_plan_run(&conn, &plan_run_id).unwrap().unwrap();
+    assert_eq!(
+        loaded_plan.steps[0].status,
+        crate::plan_run::PlanStepStatus::Queued
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn auto_control_resume_clears_pause_while_linked_plan_process_is_live() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted = linked_run_plan_auto_run(&conn, &repo);
+    let plan_run_id = persisted.steps[0].plan_run_id.clone().unwrap();
+    let mut plan_run = load_plan_run(&conn, &plan_run_id).unwrap().unwrap();
+    plan_run.run.status = PlanRunStatus::Running;
+    plan_run.run.pause_requested = true;
+    plan_run.steps[0].status = crate::plan_run::PlanStepStatus::Running;
+    plan_run.steps[0].process_id = Some(std::process::id());
+    crate::plan_run::save_plan_run(&conn, &plan_run).unwrap();
+    persisted.run.pause_requested = true;
+    persisted.run.status = AutoRunStatus::Paused;
+    save_auto_run(&conn, &mut persisted).unwrap();
+
+    let outcome =
+        apply_auto_run_control(&conn, &persisted.run.id, AutoRunControlIntent::Resume).unwrap();
+
+    assert_eq!(outcome.executor, AutoExecutorDecision::AlreadyRunning);
+    assert!(!outcome.run.run.pause_requested);
+    assert_eq!(outcome.run.run.status, AutoRunStatus::Running);
+    let loaded_plan = load_plan_run(&conn, &plan_run_id).unwrap().unwrap();
+    assert!(!loaded_plan.run.pause_requested);
+    assert_eq!(loaded_plan.run.status, PlanRunStatus::Running);
+}
+
+#[test]
+fn auto_control_abort_step_persists_run_and_step_together() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted =
+        AutoLaunch::new(&repo, &repo.join("feature"), "feat/auto", "Implement auto")
+            .unwrap()
+            .create_run();
+    save_auto_run(&conn, &mut persisted).unwrap();
+    let step_run_id = persisted.steps[0].id.unwrap();
+
+    let outcome = apply_auto_run_control(
+        &conn,
+        &persisted.run.id,
+        AutoRunControlIntent::AbortStep { step_run_id },
+    )
+    .unwrap();
+
+    assert_eq!(
+        outcome.effect,
+        AutoRunControlEffect::AbortedStep { step_run_id }
+    );
+    assert_eq!(outcome.executor, AutoExecutorDecision::DoNotStart);
+    assert!(outcome.warnings.is_empty());
+    assert_eq!(outcome.run.run.status, AutoRunStatus::Aborted);
+    assert_eq!(outcome.run.steps[0].status, AutoStepStatus::Aborted);
+    assert!(outcome.run.steps[0].finished_unix_ms.is_some());
+    let loaded = load_auto_run(&conn, &persisted.run.id).unwrap().unwrap();
+    assert_eq!(loaded.run.status, AutoRunStatus::Aborted);
+    assert_eq!(loaded.steps[0].status, AutoStepStatus::Aborted);
+}
+
+#[test]
+fn auto_control_abort_run_only_aborts_active_or_pending_steps() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted =
+        AutoLaunch::new(&repo, &repo.join("feature"), "feat/auto", "Implement auto")
+            .unwrap()
+            .create_run();
+    persisted.steps.clear();
+    push_test_step(
+        &mut persisted,
+        1,
+        AutoStepKey::Implement,
+        AutoStepStatus::Done,
+    );
+    push_test_step(
+        &mut persisted,
+        2,
+        AutoStepKey::LocalVerify,
+        AutoStepStatus::Queued,
+    );
+    push_test_step(
+        &mut persisted,
+        3,
+        AutoStepKey::RunPlan,
+        AutoStepStatus::Waiting,
+    );
+    push_test_step(
+        &mut persisted,
+        4,
+        AutoStepKey::FixCi,
+        AutoStepStatus::Running,
+    );
+    persisted.run.status = AutoRunStatus::Running;
+    persisted.run.pause_requested = true;
+    save_auto_run(&conn, &mut persisted).unwrap();
+
+    let outcome =
+        apply_auto_run_control(&conn, &persisted.run.id, AutoRunControlIntent::AbortRun).unwrap();
+
+    assert_eq!(outcome.effect, AutoRunControlEffect::AbortedRun);
+    assert_eq!(outcome.executor, AutoExecutorDecision::DoNotStart);
+    assert_eq!(outcome.run.run.status, AutoRunStatus::Aborted);
+    assert!(!outcome.run.run.pause_requested);
+    assert_eq!(outcome.run.steps[0].status, AutoStepStatus::Done);
+    assert!(
+        outcome.run.steps[1..]
+            .iter()
+            .all(|step| step.status == AutoStepStatus::Aborted)
+    );
+}
+
+#[test]
+fn auto_control_abort_run_stops_linked_plan_execution() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let persisted = linked_run_plan_auto_run(&conn, &repo);
+    let plan_run_id = persisted.steps[0].plan_run_id.clone().unwrap();
+    let mut plan_run = load_plan_run(&conn, &plan_run_id).unwrap().unwrap();
+    plan_run.run.status = PlanRunStatus::Running;
+    plan_run.steps[0].status = crate::plan_run::PlanStepStatus::Running;
+    crate::plan_run::save_plan_run(&conn, &plan_run).unwrap();
+
+    let outcome =
+        apply_auto_run_control(&conn, &persisted.run.id, AutoRunControlIntent::AbortRun).unwrap();
+
+    assert!(outcome.warnings.is_empty());
+    assert_eq!(outcome.run.run.status, AutoRunStatus::Aborted);
+    let loaded_plan = load_plan_run(&conn, &plan_run_id).unwrap().unwrap();
+    assert_eq!(loaded_plan.run.status, PlanRunStatus::Aborted);
+    assert_eq!(
+        loaded_plan.steps[0].status,
+        crate::plan_run::PlanStepStatus::Aborted
+    );
+}
+
+#[test]
+fn auto_control_abort_run_stops_queued_linked_plan() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let persisted = linked_run_plan_auto_run(&conn, &repo);
+    let plan_run_id = persisted.steps[0].plan_run_id.clone().unwrap();
+
+    let outcome =
+        apply_auto_run_control(&conn, &persisted.run.id, AutoRunControlIntent::AbortRun).unwrap();
+
+    assert!(outcome.warnings.is_empty());
+    let loaded_plan = load_plan_run(&conn, &plan_run_id).unwrap().unwrap();
+    assert_eq!(loaded_plan.run.status, PlanRunStatus::Aborted);
+    assert!(
+        loaded_plan
+            .steps
+            .iter()
+            .all(|step| step.status == crate::plan_run::PlanStepStatus::Aborted)
+    );
+}
+
+#[test]
+fn auto_control_rejects_step_from_another_run() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut first = AutoLaunch::new(&repo, &repo.join("first"), "feat/first", "First")
+        .unwrap()
+        .create_run();
+    let mut second = AutoLaunch::new(&repo, &repo.join("second"), "feat/second", "Second")
+        .unwrap()
+        .create_run();
+    save_auto_run(&conn, &mut first).unwrap();
+    save_auto_run(&conn, &mut second).unwrap();
+    let foreign_step_run_id = second.steps[0].id.unwrap();
+
+    let error = apply_auto_run_control(
+        &conn,
+        &first.run.id,
+        AutoRunControlIntent::AbortStep {
+            step_run_id: foreign_step_run_id,
+        },
+    )
+    .expect_err("foreign step should fail");
+
+    assert_eq!(
+        error,
+        format!("auto flow step not found: {foreign_step_run_id}")
+    );
+    let loaded = load_auto_run(&conn, &first.run.id).unwrap().unwrap();
+    assert_eq!(loaded.run.status, AutoRunStatus::Queued);
+    assert_eq!(loaded.steps[0].status, AutoStepStatus::Queued);
+}
+
+#[test]
+#[cfg(unix)]
+fn auto_control_abort_warning_keeps_authoritative_state_persisted() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted =
+        AutoLaunch::new(&repo, &repo.join("feature"), "feat/auto", "Implement auto")
+            .unwrap()
+            .create_run();
+    persisted.run.status = AutoRunStatus::Running;
+    persisted.steps[0].status = AutoStepStatus::Running;
+    persisted.steps[0].process_id = Some(i32::MAX as u32);
+    save_auto_run(&conn, &mut persisted).unwrap();
+    let step_run_id = persisted.steps[0].id.unwrap();
+
+    let outcome = apply_auto_run_control(
+        &conn,
+        &persisted.run.id,
+        AutoRunControlIntent::AbortStep { step_run_id },
+    )
+    .unwrap();
+
+    assert_eq!(outcome.warnings.len(), 1);
+    assert!(outcome.warnings[0].contains("terminate opencode process"));
+    assert_eq!(outcome.run.run.status, AutoRunStatus::Aborted);
+    assert_eq!(outcome.run.steps[0].status, AutoStepStatus::Aborted);
+    let loaded = load_auto_run(&conn, &persisted.run.id).unwrap().unwrap();
+    assert_eq!(loaded.run.status, AutoRunStatus::Aborted);
+    assert_eq!(loaded.steps[0].status, AutoStepStatus::Aborted);
+}
+
+#[test]
+fn stale_executor_snapshot_does_not_overwrite_aborted_run() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let root = PathBuf::from("/repo/prism");
+    let worktree = root.join("feature");
+    let mut persisted = AutoLaunch::new(&root, &worktree, "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+    save_auto_run(&conn, &mut persisted).unwrap();
+    let mut stale_executor_snapshot = persisted.clone();
+    apply_auto_run_control(&conn, &persisted.run.id, AutoRunControlIntent::AbortRun).unwrap();
+    let executor = AutoExecutorConfig::new("unused", None, worktree, "stale executor");
+
+    execute_auto_initial_step(
+        &conn,
+        &Repository { root },
+        &test_config(),
+        &mut stale_executor_snapshot,
+        &executor,
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    assert_eq!(stale_executor_snapshot.run.status, AutoRunStatus::Aborted);
+    let loaded = load_auto_run(&conn, &persisted.run.id).unwrap().unwrap();
+    assert_eq!(loaded.run.status, AutoRunStatus::Aborted);
+    assert_eq!(loaded.steps[0].status, AutoStepStatus::Aborted);
+}
+
+#[test]
+fn auto_control_rejects_unknown_run_without_mutating_other_runs() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted =
+        AutoLaunch::new(&repo, &repo.join("feature"), "feat/auto", "Implement auto")
+            .unwrap()
+            .create_run();
+    save_auto_run(&conn, &mut persisted).unwrap();
+
+    let error = apply_auto_run_control(&conn, "missing", AutoRunControlIntent::AbortRun)
+        .expect_err("missing run should fail");
+
+    assert_eq!(error, "auto flow run not found: missing");
+    let loaded = load_auto_run(&conn, &persisted.run.id).unwrap().unwrap();
+    assert_eq!(loaded.run.status, AutoRunStatus::Queued);
+    assert_eq!(loaded.steps[0].status, AutoStepStatus::Queued);
 }
 
 #[test]
@@ -1107,7 +1471,9 @@ fn pause_resume_fail_and_archive_round_trip() {
         .expect("paused");
     assert_eq!(loaded.run.status, AutoRunStatus::Paused);
 
-    resume_paused_auto_run(&conn, &mut persisted).unwrap();
+    let outcome =
+        apply_auto_run_control(&conn, &persisted.run.id, AutoRunControlIntent::Resume).unwrap();
+    persisted = outcome.run;
     assert_eq!(persisted.run.status, AutoRunStatus::Queued);
 
     fail_auto_run(&conn, &mut persisted, "verification failed").unwrap();
