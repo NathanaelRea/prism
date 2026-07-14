@@ -30,7 +30,7 @@ Safety defaults:
 
 - launch is refused on the default branch, detached HEAD, or a dirty worktree
 - every step attempt is persisted before the next external side effect
-- implementation continues through local verification and commit, then pauses before push; other agent and approval boundaries still pause for review unless `auto.pause_between_steps = false` for a trusted repository
+- implementation continues through local verification and commit, then pauses before push; other agent and approval boundaries still pause for review
 - worktrees with active Auto Flow runs are highlighted in the worktree list so paused/running/failed runs are visible from the sidebar
 - local verification runs `checks.pre_push`, `checks.pre_pr`, and a non-mutating merge-conflict check
 - PR Stabilization handles review feedback, CI failures, pending checks, review approval, repository policy, mergeability, manual readiness, and auto-merge readiness as derived blockers
@@ -42,7 +42,6 @@ Useful per-repository options:
 
 ```toml
 [auto]
-pause_between_steps = true
 merge = false
 cleanup_after_merge = false
 require_review_approval = false

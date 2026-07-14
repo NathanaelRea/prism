@@ -105,11 +105,6 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "pause_between_steps": {
-          "type": "boolean",
-          "default": true,
-          "description": "Whether the TUI pauses for confirmation between Auto Flow steps."
-        },
         "merge": {
           "type": "boolean",
           "default": false,

@@ -107,20 +107,17 @@ pub(super) fn pause_before_next_auto_step_with_context(
     if !has_pending_auto_work(persisted) {
         return Ok(());
     }
-    if !config.auto.pause_between_steps
-        || next_queued_non_agent_step(persisted).is_some_and(|index| {
-            matches!(
-                persisted.steps[index].step_key,
-                AutoStepKey::LocalVerify | AutoStepKey::CommitImpl
-            )
-        })
-    {
+    if next_queued_non_agent_step(persisted).is_some_and(|index| {
+        matches!(
+            persisted.steps[index].step_key,
+            AutoStepKey::LocalVerify | AutoStepKey::CommitImpl
+        )
+    }) {
         return Ok(());
     }
     persisted.run.pause_requested = true;
     persisted.run.status = AutoRunStatus::Paused;
     persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)?;
     append_auto_event(
         conn,
         &AutoEvent {
@@ -132,7 +129,7 @@ pub(super) fn pause_before_next_auto_step_with_context(
             data_json: "{}".to_string(),
         },
     )?;
-    Ok(())
+    save_run_with_conn(conn, &persisted.run)
 }
 
 pub(super) fn next_state_machine_step_needed(persisted: &PersistedAutoRun) -> bool {
@@ -178,14 +175,6 @@ pub(super) fn ensure_next_auto_step_with_context(
 ) -> Result<bool, String> {
     if merge_or_manual_merge_complete(persisted) {
         persisted.run.status = AutoRunStatus::Done;
-        if latest_step_status(persisted, &AutoStepKey::Merge) == Some(AutoStepStatus::Done) {
-            persisted.run.stabilization_status =
-                Some(stabilization_model::StabilizationStatus::Done);
-            persisted.run.stabilization_blocker =
-                Some(stabilization_model::StabilizationBlocker::Merged);
-            persisted.run.stabilization_next_work =
-                Some(stabilization_model::StabilizationWorkKind::Done);
-        }
         persisted.run.updated_unix_ms = unix_ms();
         save_run_with_conn(conn, &persisted.run)?;
         return Ok(false);
@@ -233,14 +222,6 @@ fn ensure_next_auto_step_legacy(
 ) -> Result<bool, String> {
     if merge_or_manual_merge_complete(persisted) {
         persisted.run.status = AutoRunStatus::Done;
-        if latest_step_status(persisted, &AutoStepKey::Merge) == Some(AutoStepStatus::Done) {
-            persisted.run.stabilization_status =
-                Some(stabilization_model::StabilizationStatus::Done);
-            persisted.run.stabilization_blocker =
-                Some(stabilization_model::StabilizationBlocker::Merged);
-            persisted.run.stabilization_next_work =
-                Some(stabilization_model::StabilizationWorkKind::Done);
-        }
         persisted.run.updated_unix_ms = unix_ms();
         save_run_with_conn(conn, &persisted.run)?;
         return Ok(false);
@@ -376,7 +357,7 @@ fn ensure_next_implementation_step(
     Ok(false)
 }
 
-pub(super) fn ensure_next_repair_follow_up_step(
+fn ensure_next_repair_follow_up_step(
     conn: &rusqlite::Connection,
     persisted: &mut PersistedAutoRun,
 ) -> Result<bool, String> {
@@ -437,6 +418,12 @@ pub(super) fn ensure_next_repair_follow_up_step(
             save_step_with_conn(conn, step)?;
         }
         return Ok(true);
+    }
+    if matches!(
+        latest_step_status(persisted, &AutoStepKey::CommitReviewFix),
+        Some(AutoStepStatus::Done | AutoStepStatus::Skipped)
+    ) {
+        return Ok(false);
     }
     if latest_step_status(persisted, &AutoStepKey::FixCi) == Some(AutoStepStatus::Done)
         && latest_step_status(persisted, &AutoStepKey::VerifyCiFix) != Some(AutoStepStatus::Queued)

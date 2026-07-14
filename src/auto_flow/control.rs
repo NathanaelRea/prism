@@ -243,12 +243,10 @@ pub fn reconcile_stale_auto_run(
         }
         changed = true;
     }
-    if changed
-        && matches!(
-            persisted.run.status,
-            AutoRunStatus::Queued | AutoRunStatus::Running | AutoRunStatus::Paused
-        )
-    {
+    if matches!(
+        persisted.run.status,
+        AutoRunStatus::Queued | AutoRunStatus::Running | AutoRunStatus::Paused
+    ) {
         persisted.run.pause_requested = false;
         persisted.run.status = persisted.aggregate_status();
         persisted.run.updated_unix_ms = unix_ms();

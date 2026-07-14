@@ -1,44 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-real_git="${PRISM_DEMO_GIT:?PRISM_DEMO_GIT is required}"
-scenario="${PRISM_DEMO_SCENARIO:?PRISM_DEMO_SCENARIO is required}"
-
-# Preserve the fixture's GitHub identity even though Git rewrites transport to a local bare repo.
-for ((index = 1; index <= $# - 2; index++)); do
-  next=$((index + 1))
-  last=$((index + 2))
-  if [[ "${!index}" == "remote" && "${!next}" == "get-url" && "${!last}" == "origin" ]]; then
-    printf 'https://github.com/prism-demo/shop.git\n'
-    exit 0
-  fi
-done
-
-command=""
-message=""
-for arg in "$@"; do
-  case "$arg" in
-    commit|push)
-      command="$arg"
-      break
-      ;;
-  esac
-done
-if [[ "$command" == "commit" ]]; then
-  for ((index = 1; index <= $#; index++)); do
-    if [[ "${!index}" == "-m" ]]; then
-      next=$((index + 1))
-      message="${!next}"
-      break
-    fi
-  done
+if [[ "$*" == *"remote get-url origin"* ]]; then
+  printf 'https://github.com/prism-demo/shop.git\n'
+  exit 0
 fi
-
-"$real_git" "$@"
-status=$?
-if [[ "$status" -eq 0 && -f "${PRISM_DEMO_ROOT:-}/state/scenario.json" ]]; then
-  case "$command" in
-    commit) "$scenario" git-event commit "$message" ;;
-    push) "$scenario" git-event push ;;
-  esac
-fi
+exec "${PRISM_DEMO_GIT:?PRISM_DEMO_GIT is required}" "$@"

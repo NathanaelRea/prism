@@ -53,7 +53,6 @@ pre_push = []
 review_fix = []
 
 [auto]
-pause_between_steps = true
 merge = false
 cleanup_after_merge = false
 require_review_approval = false
@@ -110,7 +109,6 @@ pub struct Checks {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AutoConfig {
-    pub pause_between_steps: bool,
     pub merge: bool,
     pub cleanup_after_merge: bool,
     pub require_review_approval: bool,
@@ -157,7 +155,6 @@ impl IconStyle {
 impl Default for AutoConfig {
     fn default() -> Self {
         Self {
-            pause_between_steps: true,
             merge: false,
             cleanup_after_merge: false,
             require_review_approval: false,
@@ -296,7 +293,6 @@ struct RawChecks {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawAutoConfig {
-    pause_between_steps: Option<bool>,
     merge: Option<bool>,
     cleanup_after_merge: Option<bool>,
     require_review_approval: Option<bool>,
@@ -447,9 +443,6 @@ impl Config {
             }
         }
         if let Some(auto) = raw.auto {
-            if let Some(enabled) = auto.pause_between_steps {
-                self.auto.pause_between_steps = enabled;
-            }
             if let Some(enabled) = auto.merge {
                 self.auto.merge = enabled;
             }
@@ -632,10 +625,6 @@ pub fn print_config(repo: &Repository, config: &Config) {
             .sidebar_width
             .map(|width| width.to_string())
             .unwrap_or_default()
-    );
-    println!(
-        "auto.pause_between_steps = {}",
-        config.auto.pause_between_steps
     );
     println!("auto.merge = {}", config.auto.merge);
     println!(
@@ -968,7 +957,6 @@ mod tests {
         assert_eq!(config.opencode_port_span, 1_000);
         assert!(!config.opencode_shutdown_owned_servers);
         assert!(!config.opencode_plan_plugin);
-        assert!(config.auto.pause_between_steps);
         assert!(config.is_default_branch("main"));
         assert_eq!(
             config.agent_command("opencode"),
@@ -1074,9 +1062,6 @@ icon_style = "nerd-font"
 [checks]
 pre_pr = ["cargo test", "printf \"done\""] # trailing comment
 
-[auto]
-pause_between_steps = false
-
 [worktrees]
 columns = ["url", "ci.status"]
 
@@ -1103,7 +1088,6 @@ review = "fix\nreview"
         assert!(config.icon_style_configured);
         assert_eq!(config.layout.sidebar_width, Some(64));
         assert_eq!(config.checks.pre_pr, vec!["cargo test", "printf \"done\""]);
-        assert!(!config.auto.pause_between_steps);
         assert_eq!(config.worktree_columns, vec!["url", "ci.status"]);
         assert_eq!(config.tool("gh"), "/opt/tools/gh");
         assert_eq!(config.prompt_template("review"), Some("fix\nreview"));

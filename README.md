@@ -10,9 +10,9 @@
 
 Prism is a meta-harness for managing agents in parallel on separate worktrees with tmux. It integrates with github (or other remote), so your hands don't need to leave the keyboard to view PR/CI status to merge.
 
-## Demo
+## Overview
 
-![Prism demo](docs/prism-demo.gif)
+![Prism dashboard showing parallel worktrees and pull request status](docs/prism.png)
 
 ## What it enables
 
@@ -54,5 +54,4 @@ prism
 - [Keybindings](docs/keybindings.md)
 - [Configuration](docs/config.md)
 - [Auto Flow](docs/auto-flow.md)
-- [Demo GIF notes](docs/prism-demo.md)
 - [Development](docs/development.md)

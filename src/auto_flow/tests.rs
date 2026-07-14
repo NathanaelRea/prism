@@ -852,35 +852,6 @@ fn ci_repair_commit_enters_pending_push_with_guard_data() {
 }
 
 #[test]
-fn completed_review_repair_allows_ci_repair_follow_up() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
-    let mut persisted = AutoLaunch::new(
-        Path::new("/tmp/repo"),
-        Path::new("/tmp/repo/worktree"),
-        "feat/auto",
-        "Implement auto",
-    )
-    .unwrap()
-    .create_run();
-    persisted.steps.clear();
-    for (sequence, key) in [AutoStepKey::CommitReviewFix, AutoStepKey::FixCi]
-        .into_iter()
-        .enumerate()
-    {
-        let mut step = AutoStepRun::queued(&persisted.run.id, sequence + 1, key, 1, None);
-        step.status = AutoStepStatus::Done;
-        persisted.steps.push(step);
-    }
-    save_auto_run(&conn, &mut persisted).unwrap();
-
-    assert!(ensure_next_repair_follow_up_step(&conn, &mut persisted).unwrap());
-    assert!(persisted.steps.iter().any(|step| {
-        step.step_key == AutoStepKey::VerifyCiFix && step.status == AutoStepStatus::Queued
-    }));
-}
-
-#[test]
 fn schema_migration_archives_old_active_auto_runs_once() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch(
@@ -1182,30 +1153,6 @@ fn stale_reconciliation_marks_active_steps_failed() {
 }
 
 #[test]
-fn stale_reconciliation_preserves_a_paused_run() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
-    let repo = PathBuf::from("/repo/prism");
-    let mut persisted =
-        AutoLaunch::new(&repo, &repo.join("feature"), "feat/auto", "Implement auto")
-            .unwrap()
-            .create_run();
-    persisted.run.status = AutoRunStatus::Paused;
-    persisted.run.pause_requested = true;
-    persisted.steps[0].status = AutoStepStatus::Done;
-    save_auto_run(&conn, &mut persisted).unwrap();
-
-    let changed = reconcile_stale_auto_run(&conn, &mut persisted).unwrap();
-
-    assert!(!changed);
-    let loaded = load_auto_run(&conn, &persisted.run.id)
-        .unwrap()
-        .expect("run");
-    assert_eq!(loaded.run.status, AutoRunStatus::Paused);
-    assert!(loaded.run.pause_requested);
-}
-
-#[test]
 fn recent_active_runs_excludes_archived_and_done_runs() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
@@ -1306,29 +1253,6 @@ printf '%s\n' '{"type":"tool.execute.after","id":"tool_1","status":"success","ou
             .iter()
             .any(|line| { line.kind == AutoOutputKind::ToolOutput && line.text == "ok" })
     );
-}
-
-#[test]
-fn step_gate_is_skipped_when_pause_between_steps_is_disabled() {
-    let temp = TempDir::new("auto-step-gate-disabled");
-    let repo = Repository::with_config_dir_for_test(
-        temp.path().to_path_buf(),
-        temp.path().join("prism-config"),
-    );
-    let mut config = Config::load(&repo);
-    config.auto.pause_between_steps = false;
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
-    let mut persisted = AutoLaunch::new(temp.path(), temp.path(), "feat/auto", "Implement auto")
-        .unwrap()
-        .create_run();
-    save_auto_run(&conn, &mut persisted).unwrap();
-
-    pause_before_next_auto_step_with_context(&conn, &repo, &config, &mut persisted).unwrap();
-
-    let loaded = load_auto_run(&conn, &persisted.run.id).unwrap().unwrap();
-    assert_ne!(loaded.run.status, AutoRunStatus::Paused);
-    assert!(!loaded.run.pause_requested);
 }
 
 #[test]
@@ -1594,42 +1518,6 @@ fn manual_merge_skip_completes_run_without_cleanup() {
             .steps
             .iter()
             .any(|step| step.step_key == AutoStepKey::Cleanup)
-    );
-}
-
-#[test]
-fn auto_merge_completion_records_merged_stabilization_state() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
-    let repo = PathBuf::from("/repo/prism");
-    let mut persisted =
-        AutoLaunch::new(&repo, &repo.join("feature"), "feat/auto", "Implement auto")
-            .unwrap()
-            .create_run();
-    persisted.steps.clear();
-    push_test_step(&mut persisted, 1, AutoStepKey::Merge, AutoStepStatus::Done);
-    push_test_step(
-        &mut persisted,
-        2,
-        AutoStepKey::Cleanup,
-        AutoStepStatus::Skipped,
-    );
-    save_auto_run(&conn, &mut persisted).unwrap();
-
-    assert!(!ensure_next_auto_step(&conn, &mut persisted).unwrap());
-
-    assert_eq!(persisted.run.status, AutoRunStatus::Done);
-    assert_eq!(
-        persisted.run.stabilization_status,
-        Some(stabilization_model::StabilizationStatus::Done)
-    );
-    assert_eq!(
-        persisted.run.stabilization_blocker,
-        Some(stabilization_model::StabilizationBlocker::Merged)
-    );
-    assert_eq!(
-        persisted.run.stabilization_next_work,
-        Some(stabilization_model::StabilizationWorkKind::Done)
     );
 }
 

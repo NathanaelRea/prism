@@ -1,158 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-root="${PRISM_DEMO_ROOT:?PRISM_DEMO_ROOT is required}"
-mkdir -p "$root/logs"
-{
-  printf 'tool=gh\ncwd=%s\nargv=' "$PWD"
-  printf '%q ' "$@"
-  printf '\n\n'
-} >>"$root/logs/gh.log"
-
 if [[ "${1:-}" == "--version" ]]; then
-  printf 'gh version 2.99.0-prism-demo\n'
+  printf 'gh version 2.99.0-prism-screenshot\n'
   exit 0
 fi
 if [[ "${1:-}" == "auth" && "${2:-}" == "status" ]]; then
   printf 'github.com\n  Logged in to github.com account prism-demo\n'
   exit 0
 fi
-
-exec python3 - "$@" <<'PY'
-import json
-import os
-import subprocess
-import sys
-import time
-from pathlib import Path
-
-root = Path(os.environ["PRISM_DEMO_ROOT"])
-scenario = root / "bin" / "prism-demo-scenario"
-state_path = root / "state" / "scenario.json"
-args = sys.argv[1:]
-
-def load():
-    with state_path.open(encoding="utf-8") as handle:
-        return json.load(handle)
-
-def save(state):
-    with state_path.open("w", encoding="utf-8") as handle:
-        json.dump(state, handle, indent=2)
-        handle.write("\n")
-
-def phase(state):
-    return state["state"]
-
-def branch(state):
-    return state.get("branch") or subprocess.check_output(["git", "branch", "--show-current"], text=True).strip()
-
-def head(name):
-    try:
-        return subprocess.check_output(["git", "rev-parse", name], text=True, stderr=subprocess.DEVNULL).strip()
-    except subprocess.CalledProcessError:
-        return "0" * 40
-
-def exists(state):
-    return phase(state) in {"pr_open", "review_repaired", "review_pushed", "ci_repaired", "ci_pushed", "merged"}
-
-def checks(state):
-    if phase(state) in {"ci_pushed", "merged"}:
-        return {"contexts": {"nodes": [{"__typename": "CheckRun", "name": "checkout fixture", "status": "COMPLETED", "conclusion": "SUCCESS"}]}}
-    return {"contexts": {"nodes": [{"__typename": "CheckRun", "name": "checkout fixture", "status": "COMPLETED", "conclusion": "FAILURE"}]}}
-
-def pr(state):
-    review_open = phase(state) in {"pr_open", "review_repaired"}
-    merged = phase(state) == "merged"
-    return {
-        "number": 42,
-        "title": "Verify checkout CI fixture",
-        "body": "Offline Prism demo pull request.",
-        "url": "https://github.com/prism-demo/shop/pull/42",
-        "state": "MERGED" if merged else "OPEN",
-        "reviewDecision": "CHANGES_REQUESTED" if review_open else "APPROVED",
-        "reviewRequests": {"nodes": []},
-        "headRefName": branch(state),
-        "baseRefName": "main",
-        "headRefOid": head(f"origin/{branch(state)}"),
-        "updatedAt": "2026-07-09T12:00:00Z",
-        "mergeStateStatus": "CLEAN",
-        "merged": merged,
-        "isDraft": False,
-        "comments": {"totalCount": 1 if review_open else 0},
-        "reviewThreads": {"totalCount": 1 if review_open else 0},
-        "commits": {"nodes": [{"commit": {"statusCheckRollup": checks(state)}}]},
-    }
-
-def thread_nodes(state):
-    if phase(state) not in {"pr_open", "review_repaired"}:
-        return []
-    return [{"id": "PRRT_demo_review", "isResolved": False, "comments": {"nodes": [{"id": "PRRC_demo_review", "author": {"login": "prism-reviewer"}, "path": "src/checkout.js", "line": 2, "originalLine": 2, "body": "Please make the CI intent explicit.", "createdAt": "2026-07-09T12:00:00Z"}]}}]
-
-if args[:2] == ["api", "graphql"]:
-    query = next((item[6:] for item in args if item.startswith("query=")), "")
-    if "resolveReviewThread" in query:
-        print(json.dumps({"data": {"resolveReviewThread": {"thread": {"id": "PRRT_demo_review", "isResolved": True}}}}))
-    elif "branchProtectionRules" in query:
-        print(json.dumps({"data": {"repository": {"defaultBranchRef": {"name": "main"}, "branchProtectionRules": {"nodes": [{"pattern": "main", "requiredApprovingReviewCount": 1, "requiresConversationResolution": True, "requiresStrictStatusChecks": True, "requiredStatusCheckContexts": ["checkout fixture"]}]}}}}))
-    elif "reviewThreads" in query:
-        print(json.dumps({"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": thread_nodes(load())}}}}}))
-    else:
-        state = load()
-        print(json.dumps({"data": {"repository": {"pullRequests": {"nodes": [pr(state)] if exists(state) else []}}}}))
-    raise SystemExit(0)
-
-if args[:2] == ["pr", "create"]:
-    state = load()
-    if phase(state) == "plan_complete":
-        subprocess.run([str(scenario), "transition", "initial_commit"], check=True)
-        state = load()
-    if phase(state) != "initial_commit":
-        print("pull request is not ready", file=sys.stderr)
-        raise SystemExit(1)
-    state["branch"] = branch(state)
-    save(state)
-    subprocess.run([str(scenario), "transition", "pr_open"], check=True)
-    print("https://github.com/prism-demo/shop/pull/42")
-    raise SystemExit(0)
-
-if args[:2] == ["pr", "merge"]:
-    if phase(load()) != "ci_pushed":
-        print("pull request is not mergeable", file=sys.stderr)
-        raise SystemExit(1)
-    time.sleep(3)
-    subprocess.run([str(scenario), "transition", "merged"], check=True)
-    raise SystemExit(0)
-
-if args[:2] == ["pr", "view"]:
-    state = load()
-    if not exists(state):
-        print("no pull requests found", file=sys.stderr)
-        raise SystemExit(1)
-    result = pr(state)
-    result["statusCheckRollup"] = checks(state)
-    fields = args[args.index("--json") + 1] if "--json" in args else ""
-    if "comments" in fields:
-        result["comments"] = [{"author": {"login": "prism-reviewer"}, "body": "Please make the CI intent explicit."}] if thread_nodes(state) else []
-        result["reviews"] = [{"id": "PRR_demo_review", "author": {"login": "github-copilot"}, "state": "CHANGES_REQUESTED", "body": "Please make the CI intent explicit.", "submittedAt": "2026-07-09T12:00:00Z"}] if thread_nodes(state) else []
-        result["files"] = [{"path": "src/checkout.js"}]
-    print(json.dumps(result))
-    raise SystemExit(0)
-
-if args[:2] == ["run", "list"]:
-    state = load()
-    result = []
-    if exists(state) and phase(state) not in {"ci_pushed", "merged"}:
-        result = [{"databaseId": 9001, "workflowName": "Demo CI", "displayTitle": "checkout fixture", "name": "checkout fixture", "conclusion": "FAILURE", "status": "COMPLETED", "headSha": head("HEAD"), "url": "https://github.com/prism-demo/shop/actions/runs/9001"}]
-    print(json.dumps(result))
-    raise SystemExit(0)
-
-if args[:2] == ["run", "view"] and "--log-failed" in args:
-    print("Demo CI / checkout fixture\nerror: expected checkout status ready\nhelp: update the fixture assertion")
-    raise SystemExit(0)
-if args[:1] == ["browse"] or args[:2] == ["repo", "view"]:
-    print("https://github.com/prism-demo/shop")
-    raise SystemExit(0)
-
-print("gh shim: unsupported command: " + " ".join(args), file=sys.stderr)
-raise SystemExit(64)
-PY
+if [[ "${1:-}" == "api" && "${2:-}" == "graphql" ]]; then
+  if [[ "$*" == *"pullRequests"* ]]; then
+    # Keep refresh in flight while VHS captures the pre-seeded PR cache.
+    sleep 10
+  fi
+  printf '{"data":{"repository":{"defaultBranchRef":{"name":"main"},"branchProtectionRules":{"nodes":[]},"pullRequests":{"nodes":[]}}}}\n'
+  exit 0
+fi
+printf 'gh screenshot shim: unsupported command\n' >&2
+exit 64

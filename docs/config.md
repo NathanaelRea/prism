@@ -68,7 +68,6 @@ Prism uses squash merges for pull requests by default. Set `merge_method` to `me
 
 ```toml
 [auto]
-pause_between_steps = true
 merge = false
 cleanup_after_merge = false
 require_review_approval = false
@@ -77,8 +76,6 @@ push_repairs = false
 review_wait_enabled = true
 ci_wait_enabled = true
 ```
-
-`pause_between_steps = true` keeps the default confirmation gate between Auto Flow steps. Set it to `false` for a trusted repository where Auto Flow may continue without opening resume dialogs.
 
 `merge = false` makes successful stabilization stop at `ReadyForManualMerge`. Set it to `true` only when Prism may merge after all required gates pass and repository policy is known.
 

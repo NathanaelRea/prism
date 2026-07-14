@@ -743,14 +743,6 @@ pub(super) fn execute_commit_review_fix_step(
                 &review_thread_ids,
             )?;
         }
-        crate::lifecycle::refresh_branch_pr_cache(
-            repo,
-            config,
-            &persisted.run.branch,
-            &persisted.run.worktree_path,
-            &mut cache,
-            true,
-        );
         persisted.run.pending_push = None;
     } else if result.committed {
         persisted.run.pending_push = result.commit_sha.clone().map(|commit_sha| {
@@ -1013,7 +1005,8 @@ pub(super) fn execute_commit_ci_fix_step(
         persisted.run.review_baseline_json = Some(review_baseline_json(summary));
     }
     if config.auto.push_repairs {
-        push_repair_and_refresh(repo, config, persisted, &mut cache, &[])?;
+        crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
+        persisted.run.pending_push = None;
     } else {
         persisted.run.pending_push = result.commit_sha.clone().map(|commit_sha| {
             pending_push_guard(
@@ -1794,33 +1787,6 @@ fn repair_commit_message(config: &Config, template_name: &str, default: &str) ->
         .filter(|message| !message.is_empty())
         .unwrap_or(default)
         .to_string()
-}
-
-fn push_repair_and_refresh(
-    repo: &Repository,
-    config: &Config,
-    persisted: &mut PersistedAutoRun,
-    cache: &mut crate::github::PrCache,
-    review_thread_ids: &[String],
-) -> Result<(), String> {
-    crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
-    if !review_thread_ids.is_empty() {
-        crate::github::resolve_review_threads(
-            &persisted.run.worktree_path,
-            config,
-            review_thread_ids,
-        )?;
-    }
-    crate::lifecycle::refresh_branch_pr_cache(
-        repo,
-        config,
-        &persisted.run.branch,
-        &persisted.run.worktree_path,
-        cache,
-        true,
-    );
-    persisted.run.pending_push = None;
-    Ok(())
 }
 
 fn repair_commit_summary(config: &Config, label: &str, commit_sha: &str) -> String {
