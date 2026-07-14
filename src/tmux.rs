@@ -74,7 +74,7 @@ pub fn attach_or_create_agent(
     generation: u64,
 ) -> Result<(), String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
-    ensure_tmux_agent_session(repo, config, session, &runtime)?;
+    ensure_tmux_agent_session_for_attach(repo, config, session, &runtime)?;
     match attach_session(config, runtime.name()) {
         Ok(()) => Ok(()),
         Err(_) if matches!(session_exists(config, runtime.name()), Ok(false)) => Ok(()),
@@ -90,7 +90,7 @@ pub fn attach_or_create_window(
     window: TmuxWindow,
 ) -> Result<(), String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
-    ensure_tmux_agent_session(repo, config, session, &runtime)?;
+    ensure_tmux_agent_session_for_attach(repo, config, session, &runtime)?;
     match attach(config, &runtime, window) {
         Ok(()) => Ok(()),
         Err(_) if matches!(session_exists(config, runtime.name()), Ok(false)) => Ok(()),
@@ -124,6 +124,21 @@ pub fn ensure_agent_session(
 ) -> Result<bool, String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
     ensure_tmux_agent_session(repo, config, session, &runtime)
+}
+
+fn ensure_tmux_agent_session_for_attach(
+    repo: &Repository,
+    config: &Config,
+    session: &Session,
+    runtime: &TmuxAgentSession,
+) -> Result<(), String> {
+    if tmux_agent_session_running(config, runtime)
+        && configure_agent_session(config, runtime.name())?
+    {
+        ensure_companion_windows(config, session, runtime)?;
+        return Ok(());
+    }
+    ensure_tmux_agent_session(repo, config, session, runtime).map(|_| ())
 }
 
 fn ensure_tmux_agent_session(
@@ -1704,6 +1719,64 @@ exit 0
             .find(|line| line.starts_with("attach-session -t "))
             .unwrap();
         assert!(!attach.contains(":1"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn attach_existing_agent_does_not_require_opencode_server() {
+        let temp = unique_temp_dir("prism-tmux-existing-agent-attach-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  has-session|set-option|move-window|attach-session)
+    exit 0
+    ;;
+  display-message)
+    echo opencode
+    exit 0
+    ;;
+  list-windows)
+    printf '1\n2\n3\n'
+    exit 0
+    ;;
+  rename-window)
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+                log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+
+        let mut config = test_config();
+        config.default_base = Some("main".to_string());
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        config.tools.insert(
+            "opencode".to_string(),
+            temp.join("opencode").display().to_string(),
+        );
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let session = test_session(temp.join("worktree"), "feature");
+
+        attach_or_create_agent(&repo, &config, &session, 0).unwrap();
+
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(commands.contains("attach-session -t"));
+        assert!(!commands.contains("new-session -d -s"));
 
         let _ = fs::remove_dir_all(temp);
     }
