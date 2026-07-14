@@ -68,18 +68,22 @@ if current:
 
 def columns(branch):
     if branch == "main":
-        return ("shop.local", "ready", {"number": 118, "status": "passed"})
+        return ("localhost:57", "ready", {"number": 118, "status": "passed"})
     if branch == "feat/idea-board":
-        return ("idea.local", "design", {"number": 121, "status": "queued"})
+        return ("localhost:26", "design", {"number": 121, "status": "queued"})
     if branch == "feat/agent-session":
-        return ("agent.local", "dirty", {"number": 122, "status": "running"})
-    if branch == "feat/review-fix":
-        return ("review.local", "fix", {"number": 123, "status": "failed"})
-    if branch == "feat/ci-green":
-        return ("green.local", "ready", {"number": 124, "status": "passed"})
+        return ("localhost:38", "dirty", {"number": 122, "status": "running"})
+    if branch == "fix/review-comments":
+        return ("localhost:72", "fix", {"number": 123, "status": "failed"})
+    if branch == "fix/ci-green":
+        return ("localhost:51", "ready", {"number": 124, "status": "passed"})
+    if branch == "feat/shipping-rates":
+        return ("localhost:89", "ready", {"number": 125, "status": "passed"})
+    if branch == "refactor/wishlist":
+        return ("localhost:64", "new", {"number": 126, "status": "running"})
     if branch == "feat/merged-cleanup":
-        return ("merged.local", "done", {"number": 125, "status": "passed"})
-    return ("demo.local", "new", {"number": 126, "status": "running"})
+        return ("localhost:43", "done", {"number": 127, "status": "passed"})
+    return ("localhost:95", "new", {"number": 128, "status": "running"})
 
 result = []
 for item in items:

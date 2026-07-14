@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$*" == *"remote get-url origin"* ]]; then
+  printf 'https://github.com/prism-demo/shop.git\n'
+  exit 0
+fi
+exec "${PRISM_DEMO_GIT:?PRISM_DEMO_GIT is required}" "$@"

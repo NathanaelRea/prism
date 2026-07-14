@@ -51,7 +51,7 @@ pub(super) fn selected_sidebar_row_style(focused: bool) -> Style {
             .bg(Color::Rgb(0, 64, 64))
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().bg(Color::Rgb(32, 32, 32))
+        Style::default().add_modifier(Modifier::BOLD)
     }
 }
 

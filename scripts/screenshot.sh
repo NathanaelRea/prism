@@ -6,26 +6,22 @@ repo_root="$(cd "$script_dir/.." && pwd)"
 
 keep=0
 skip_build=0
-frames=0
-check=0
-output="docs/prism-demo.gif"
+output="docs/prism.png"
 
 usage() {
   cat <<'EOF'
 Usage: ./scripts/screenshot.sh [options]
 
-Build Prism, run the sandboxed terminal demo, and generate the README GIF.
+Build Prism and capture the deterministic README screenshot.
 
 Options:
-  --keep           Keep the sandbox under target/screenshots/ for debugging.
+  --keep           Keep the temporary sandbox for debugging.
   --skip-build     Reuse an existing target/release/prism binary.
-  --frames         Keep intermediate frames under the run directory.
-  --check          Validate setup without writing docs/prism-demo.gif.
-  --output <path>  Output GIF path. Defaults to docs/prism-demo.gif.
+  --output <path>  Output PNG path. Defaults to docs/prism.png.
   -h, --help       Show this help text.
 
 Default output:
-  docs/prism-demo.gif
+  docs/prism.png
 EOF
 }
 
@@ -43,14 +39,6 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-build)
       skip_build=1
-      shift
-      ;;
-    --frames)
-      frames=1
-      shift
-      ;;
-    --check)
-      check=1
       shift
       ;;
     --output)
@@ -79,15 +67,15 @@ else
   output_path="$repo_root/$output"
 fi
 
-run_id="run-$(date -u +%Y%m%dT%H%M%SZ)-$$"
-sandbox_path="$repo_root/target/screenshots/$run_id"
+sandbox_path="${TMPDIR:-/tmp}/prism"
+[[ ! -e "$sandbox_path" ]] || die "temporary sandbox already exists: $sandbox_path"
 logs_path="$sandbox_path/logs"
 prism_binary="$repo_root/target/release/prism"
 helper="$repo_root/scripts/screenshots/run.sh"
 
 printf 'Sandbox: %s\n' "$sandbox_path"
 printf 'Prism binary: %s\n' "$prism_binary"
-printf 'Output GIF: %s\n' "$output_path"
+printf 'Output PNG: %s\n' "$output_path"
 printf 'Shim logs: %s\n' "$logs_path"
 
 if [[ ! -x "$helper" ]]; then
@@ -95,9 +83,7 @@ if [[ ! -x "$helper" ]]; then
   exit 1
 fi
 
-if [[ "$check" -eq 0 ]]; then
-  mkdir -p "$(dirname "$output_path")"
-fi
+mkdir -p "$(dirname "$output_path")"
 
 args=(
   "--sandbox" "$sandbox_path"
@@ -106,7 +92,4 @@ args=(
 
 [[ "$keep" -eq 1 ]] && args+=("--keep")
 [[ "$skip_build" -eq 1 ]] && args+=("--skip-build")
-[[ "$frames" -eq 1 ]] && args+=("--frames")
-[[ "$check" -eq 1 ]] && args+=("--check")
-
 exec "$helper" "${args[@]}"

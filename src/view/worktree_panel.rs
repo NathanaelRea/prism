@@ -251,7 +251,7 @@ fn pr_number_line(model: &StabilizationPanelModel) -> Line<'static> {
 fn stabilization_value_line(label: &'static str, value: &str, style: Style) -> Line<'static> {
     Line::from(vec![
         Span::styled(format!("{:<16}", label), muted_style()),
-        Span::styled(format!("{:<30}", truncate(value, 30)), style),
+        Span::styled(truncate(value, 30), style),
     ])
 }
 
@@ -270,7 +270,7 @@ fn stabilization_gate_line(
         Span::styled(format!("{:<16}", gate), muted_style()),
         Span::styled(status_icon, style),
         Span::raw(" "),
-        Span::styled(format!("{:<30}", truncate(status, 30)), style),
+        Span::styled(truncate(status, 30), style),
     ])
 }
 
