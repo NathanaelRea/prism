@@ -15,11 +15,23 @@ die() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --sandbox) sandbox_path="${2:-}"; shift 2 ;;
-    --output) output_path="${2:-}"; shift 2 ;;
-    --keep) keep=1; shift ;;
-    --skip-build) skip_build=1; shift ;;
-    *) die "unknown option: $1" ;;
+  --sandbox)
+    sandbox_path="${2:-}"
+    shift 2
+    ;;
+  --output)
+    output_path="${2:-}"
+    shift 2
+    ;;
+  --keep)
+    keep=1
+    shift
+    ;;
+  --skip-build)
+    skip_build=1
+    shift
+    ;;
+  *) die "unknown option: $1" ;;
   esac
 done
 
@@ -108,7 +120,7 @@ with sqlite3.connect(database) as connection:
             ('feat/agent-session', 14, 'Improve product recommendations',
              'https://github.com/prism-demo/shop/pull/14', 'APPROVED',
              'feat/agent-session', 'pending', 0),
-            ('feat/review-fix', 17, 'Tighten review prompt flow',
+            ('feat/review-fix', 17, 'Tighten review prompt',
              'https://github.com/prism-demo/shop/pull/17', 'CHANGES_REQUESTED',
              'feat/review-fix', 'failed', 2),
             ('feat/shipping-rates', 19, 'Add regional shipping rates',
@@ -119,8 +131,10 @@ with sqlite3.connect(database) as connection:
 PY
 
 rendered_tape="$sandbox_path/prism.tape"
+capture_name=".prism-capture.png"
+capture_path="$PRISM_DEMO_REPO/$capture_name"
 sed \
-  -e "s|__OUTPUT__|$output_path|g" \
+  -e "s|__OUTPUT__|$capture_name|g" \
   -e "s|__FRAMES_DIR__|$sandbox_path/frames|g" \
   "$script_dir/prism.tape" >"$rendered_tape"
 
@@ -129,5 +143,6 @@ sed \
   vhs "$rendered_tape"
 )
 
-[[ -s "$output_path" ]] || die "capture did not produce $output_path"
+[[ -s "$capture_path" ]] || die "capture did not produce $capture_path"
+mv "$capture_path" "$output_path"
 printf 'Captured screenshot: %s\n' "$output_path"
