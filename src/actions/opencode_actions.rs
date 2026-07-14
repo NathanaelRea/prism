@@ -174,24 +174,34 @@ impl Tui {
                             .opencode_last_state_event
                             .get(&result.key)
                             .is_some_and(|event_at| *event_at >= result.started_at);
+                        let current = self.sessions[index].opencode_status.as_ref();
                         let preserve_active_from_idle = status.state
                             == opencode::OpencodeState::Idle
-                            && self.sessions[index].opencode_status.as_ref().is_some_and(
-                                |current| {
+                            && (self.sessions[index].agent_state == AgentState::Running
+                                || current.is_some_and(|current| {
                                     !matches!(
                                         current.state,
                                         opencode::OpencodeState::Unknown
                                             | opencode::OpencodeState::Idle
                                             | opencode::OpencodeState::Offline
                                     )
-                                },
-                            );
-                        if (state_event_is_newer || preserve_active_from_idle)
-                            && let Some(current) = self.sessions[index].opencode_status.as_ref()
-                        {
+                                }));
+                        if state_event_is_newer && let Some(current) = current {
+                            status.state = current.state;
+                        } else if preserve_active_from_idle {
                             // Idle sessions are omitted from /session/status, so a stale poll
                             // can race a newer event. Only session.idle may finish active work.
-                            status.state = current.state;
+                            status.state = current
+                                .map(|current| current.state)
+                                .filter(|state| {
+                                    !matches!(
+                                        state,
+                                        opencode::OpencodeState::Unknown
+                                            | opencode::OpencodeState::Idle
+                                            | opencode::OpencodeState::Offline
+                                    )
+                                })
+                                .unwrap_or(opencode::OpencodeState::Busy);
                         }
                         changed |= self.apply_opencode_status(index, status);
                     }
