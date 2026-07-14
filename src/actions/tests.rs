@@ -1072,7 +1072,7 @@ exit 0
     tui.attach_selected_tmux_session().unwrap();
 
     let wait_started = Instant::now();
-    while !tui.tmux_warmups_in_flight.is_empty() && wait_started.elapsed() < Duration::from_secs(3)
+    while !tui.tmux_warmups_in_flight.is_empty() && wait_started.elapsed() < Duration::from_secs(5)
     {
         tui.poll_tmux_agent_warmup();
         std::thread::sleep(Duration::from_millis(20));
