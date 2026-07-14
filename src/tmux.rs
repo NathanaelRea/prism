@@ -13,7 +13,7 @@ use crate::session::Session;
 use crate::util::{safe_branch_filename, stable_hash};
 
 const EXISTING_SESSION_READY_WAIT: Duration = Duration::from_millis(250);
-const CREATED_SESSION_READY_WAIT: Duration = Duration::from_millis(1_200);
+const CREATED_SESSION_READY_WAIT: Duration = Duration::from_secs(2);
 const SESSION_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const AGENT_INPUT_READY_WAIT: Duration = Duration::from_secs(5);
 
@@ -259,9 +259,13 @@ fn tmux_agent_session_running(config: &Config, runtime: &TmuxAgentSession) -> bo
     if !matches!(session_exists(config, runtime.name()), Ok(true)) {
         return false;
     }
-    pane_current_command(config, &runtime.target(TmuxWindow::Agent))
-        .map(|command| pane_command_matches_agent(config, &command))
-        .unwrap_or(false)
+    let target = runtime.target(TmuxWindow::Agent);
+    let Some(current_command) = pane_current_command(config, &target) else {
+        return false;
+    };
+    pane_command_matches_agent(config, &current_command)
+        || pane_start_command(config, &target)
+            .is_some_and(|command| pane_start_command_matches_agent(config, &command))
 }
 
 pub fn kill_agent_session(
@@ -687,6 +691,19 @@ fn pane_current_command(config: &Config, name: &str) -> Option<String> {
     .filter(|output| !output.is_empty())
 }
 
+fn pane_start_command(config: &Config, name: &str) -> Option<String> {
+    run_capture(
+        Command::new(config.tool("tmux"))
+            .env_remove("TMUX")
+            .args(["display-message", "-p", "-t"])
+            .arg(name)
+            .arg("#{pane_start_command}"),
+    )
+    .ok()
+    .map(|output| output.trim().to_string())
+    .filter(|output| !output.is_empty())
+}
+
 fn pane_command_matches_agent(config: &Config, pane_command: &str) -> bool {
     let expected = if config.default_agent == "opencode" {
         config.tool("opencode")
@@ -704,6 +721,22 @@ fn pane_command_matches_agent(config: &Config, pane_command: &str) -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or(&expected);
     pane_command == expected
+        || (config.default_agent == "opencode" && pane_command == format!("{expected}.exe"))
+}
+
+fn pane_start_command_matches_agent(config: &Config, pane_start_command: &str) -> bool {
+    let command = pane_start_command
+        .strip_prefix('"')
+        .and_then(|command| command.strip_suffix('"'))
+        .unwrap_or(pane_start_command);
+    let Some(executable) = split_command_words(command).into_iter().next() else {
+        return false;
+    };
+    let executable = Path::new(&executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&executable);
+    pane_command_matches_agent(config, executable)
 }
 
 fn usable_opencode_runtime(repo: &Repository, session: &Session) -> Option<OpencodeRuntime> {
@@ -764,7 +797,8 @@ mod tests {
     use super::{
         TmuxAgentSession, TmuxWindow, attach_or_create_agent, attach_or_create_plan_mode,
         attach_or_create_window, ensure_agent_session, latest_agent_session_generation,
-        pane_command_matches_agent, paste_agent_prompt, shell_quote,
+        pane_command_matches_agent, pane_start_command_matches_agent, paste_agent_prompt,
+        shell_quote,
     };
 
     #[test]
@@ -1092,8 +1126,14 @@ exit 0
         };
 
         assert!(pane_command_matches_agent(&config, "opencode"));
+        assert!(pane_command_matches_agent(&config, "opencode.exe"));
         assert!(!pane_command_matches_agent(&config, "bash"));
         assert!(!pane_command_matches_agent(&config, "zsh"));
+        assert!(pane_start_command_matches_agent(
+            &config,
+            r#""/usr/local/bin/opencode attach http://127.0.0.1:41000""#
+        ));
+        assert!(!pane_start_command_matches_agent(&config, r#""/bin/bash""#));
     }
 
     #[test]
@@ -1965,7 +2005,9 @@ exit 0
             (200, "{}".to_string())
         } else if request_line.starts_with("GET /session/ses_123 ") {
             (200, session)
-        } else if request_line.starts_with("GET /session ") {
+        } else if request_line.starts_with("GET /session ")
+            || request_line.starts_with("GET /session?")
+        {
             (200, format!(r#"{{"data":[{session}]}}"#))
         } else if request_line.starts_with("POST /tui/append-prompt ") {
             (append_status, "{}".to_string())
