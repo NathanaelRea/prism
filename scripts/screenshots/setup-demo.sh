@@ -56,11 +56,42 @@ create_worktree "feat/review-fix" "$root/worktrees/review-fix" \
 create_worktree "feat/ci-green" "$root/worktrees/ci-green" \
   "Prepare the storefront health check" "health.js" \
   'export const health = () => ({ checkout: "ready" });'
+create_worktree "feat/shipping-rates" "$root/worktrees/shipping-rates" \
+  "Add regional shipping rates" "shipping.js" \
+  'export const shippingRate = region => region === "local" ? 0 : 5;'
+create_worktree "feat/wishlist" "$root/worktrees/wishlist" \
+  "Build the customer wishlist" "wishlist.js" \
+  'export const wishlist = items => [...new Set(items)];'
+
+create_repo() {
+  local name="$1"
+  local path="$root/work/$name"
+  git init "$path" >/dev/null
+  printf '# %s\n' "$name" >"$path/README.md"
+  git -C "$path" add README.md
+  git -C "$path" commit -m "Initial ${name} service" >/dev/null
+}
+
+create_repo "catalog"
+create_repo "payments"
+create_repo "fulfillment"
 
 cat >"$config_dir/repos.toml" <<EOF
 [[repos]]
 path = "$repo"
 key = "1"
+
+[[repos]]
+path = "$root/work/catalog"
+key = "2"
+
+[[repos]]
+path = "$root/work/payments"
+key = "3"
+
+[[repos]]
+path = "$root/work/fulfillment"
+key = "4"
 EOF
 
 cat >"$config_dir/config.toml" <<EOF
@@ -72,13 +103,13 @@ worktree_command = "wt"
 icon_style = "nerd-font"
 
 [layout]
-sidebar_width = 46
+sidebar_width = 50
 
 [auto]
 require_review_approval = true
 
 [worktrees]
-columns = ["url", "ci"]
+columns = ["url"]
 
 [tools]
 gh = "$bin_dir/gh"

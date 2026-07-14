@@ -80,24 +80,41 @@ export LANG=C.UTF-8
 ln -sf "$prism_binary" "$PRISM_DEMO_REPO/prism"
 "$prism_binary" --repo "$PRISM_DEMO_REPO" debug startup >/dev/null
 
-python3 - "$XDG_CONFIG_HOME/prism" <<'PY'
+python3 - "$prism_binary" "$PRISM_DEMO_REPO" <<'PY'
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 
-database = next(Path(sys.argv[1]).glob("repos/*/prism.db"))
+paths = subprocess.check_output(
+    [sys.argv[1], "--repo", sys.argv[2], "debug", "paths"], text=True
+)
+database = Path(next(
+    line.removeprefix("db_path = ")
+    for line in paths.splitlines()
+    if line.startswith("db_path = ")
+))
 with sqlite3.connect(database) as connection:
-    connection.execute(
+    connection.executemany(
         """insert or replace into pr_cache (
              branch, number, title, body, url, state, review_decision,
              requested_reviewers, head_ref, base_ref, head_sha, updated_at,
              check_status, merge_state_status, comment_count, merged, draft,
              last_refreshed, refreshed_unix_ms
-           ) values ('feat/review-fix', 17, 'Tighten review prompt flow', '',
-             'https://github.com/prism-demo/shop/pull/17', 'OPEN',
-             'CHANGES_REQUESTED', '', 'feat/review-fix', 'main', 'demo',
-             '2026-01-15T12:00:00Z', 'failed', 'CLEAN', 2, 0, 0,
-             '2026-01-15T12:00:00Z', 4102444800000)"""
+           ) values (?, ?, ?, '', ?, 'OPEN', ?, '', ?, 'main', 'demo',
+              '2026-01-15T12:00:00Z', ?, 'CLEAN', ?, 0, 0,
+              '2026-01-15T12:00:00Z', 4102444800000)""",
+        [
+            ('feat/agent-session', 14, 'Improve product recommendations',
+             'https://github.com/prism-demo/shop/pull/14', 'APPROVED',
+             'feat/agent-session', 'pending', 0),
+            ('feat/review-fix', 17, 'Tighten review prompt flow',
+             'https://github.com/prism-demo/shop/pull/17', 'CHANGES_REQUESTED',
+             'feat/review-fix', 'failed', 2),
+            ('feat/shipping-rates', 19, 'Add regional shipping rates',
+             'https://github.com/prism-demo/shop/pull/19', 'APPROVED',
+             'feat/shipping-rates', 'success', 0),
+        ],
     )
 PY
 

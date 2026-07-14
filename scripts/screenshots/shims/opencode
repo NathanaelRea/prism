@@ -117,7 +117,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path.startswith("/session/") and path.endswith("/message"):
             self.send_json(200, {"data": [
                 {"role": "assistant", "text": "I mapped the storefront workflow and am applying the demo-safe fix."},
-                {"type": "tool", "name": "bash", "status": "running"},
+                {"type": "tool", "name": "task running"},
             ]})
         elif path.startswith("/session/") and path.endswith("/todo"):
             self.send_json(200, {"todos": [
@@ -126,12 +126,12 @@ class Handler(BaseHTTPRequestHandler):
                 {"content": "Run focused smoke check", "status": "pending"},
             ]})
         elif path == "/session/status":
-            self.send_json(200, {item["id"]: "busy" for item in sessions})
+            self.send_json(200, {item["id"]: "idle" for item in sessions})
         elif path == "/event":
             events = [
-                {"type": "session.status", "properties": {"sessionID": sessions[0]["id"] if sessions else "ses_demo", "status": "busy", "title": "Demo storefront"}},
+                {"type": "session.status", "properties": {"sessionID": sessions[0]["id"] if sessions else "ses_demo", "status": "idle", "title": "Demo storefront"}},
                 {"type": "message.part.updated", "properties": {"sessionID": sessions[0]["id"] if sessions else "ses_demo", "role": "assistant", "text": "Reviewing failing CI and review comments."}},
-                {"type": "tool.updated", "properties": {"sessionID": sessions[0]["id"] if sessions else "ses_demo", "name": "bash", "status": "running"}},
+                {"type": "tool.updated", "properties": {"sessionID": sessions[0]["id"] if sessions else "ses_demo", "name": "task running"}},
             ]
             body = "".join(f"data: {json.dumps(event)}\n\n" for event in events).encode()
             self.send_response(200)
