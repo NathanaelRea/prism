@@ -110,6 +110,7 @@ impl Tui {
                         session_id: Some(session_id.clone()),
                         title: current.as_ref().and_then(|status| status.title.clone()),
                         state: opencode::OpencodeState::Unknown,
+                        detail: current.as_ref().and_then(|status| status.detail.clone()),
                         latest_message: current
                             .as_ref()
                             .and_then(|status| status.latest_message.clone()),
@@ -189,8 +190,8 @@ impl Tui {
                         if state_event_is_newer && let Some(current) = current {
                             status.state = current.state;
                         } else if preserve_active_from_idle {
-                            // Idle sessions are omitted from /session/status, so a stale poll
-                            // can race a newer event. Only session.idle may finish active work.
+                            // Idle sessions are omitted from /session/status. Preserve active
+                            // work until message history reports a completed assistant turn.
                             status.state = current
                                 .map(|current| current.state)
                                 .filter(|state| {
@@ -253,6 +254,7 @@ impl Tui {
                         session_id: Some(session_id.to_string()),
                         title: None,
                         state: opencode::OpencodeState::Unknown,
+                        detail: None,
                         latest_message: None,
                         latest_user_message: None,
                         recent_messages: Vec::new(),
@@ -270,13 +272,22 @@ impl Tui {
                             opencode_poll_key(&self.sessions[index]),
                             std::time::Instant::now(),
                         );
-                        status.state = state;
+                        if state != opencode::OpencodeState::Idle
+                            || status.state != opencode::OpencodeState::Done
+                        {
+                            status.state = state;
+                        }
                         if !matches!(
                             state,
                             opencode::OpencodeState::Busy | opencode::OpencodeState::Retry
                         ) {
                             status.active_tool = None;
                         }
+                    }
+                    if let Some(detail) = event.detail {
+                        status.detail = Some(detail);
+                    } else if event.state == Some(opencode::OpencodeState::Busy) {
+                        status.detail = None;
                     }
                     if let Some(message) = event.latest_message {
                         status.latest_message = Some(message.clone());
@@ -380,7 +391,8 @@ impl Tui {
                 .opencode_status
                 .as_ref()
                 .and_then(|status| status.title.clone()),
-            state: opencode::OpencodeState::Idle,
+            state: opencode::OpencodeState::Done,
+            detail: Some("aborted".to_string()),
             latest_message: self.sessions[selected]
                 .opencode_status
                 .as_ref()

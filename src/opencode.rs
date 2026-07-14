@@ -67,6 +67,7 @@ pub enum OpencodeState {
     Unknown,
     Starting,
     Idle,
+    Done,
     Busy,
     Retry,
     NeedsInput,
@@ -80,6 +81,7 @@ impl OpencodeState {
             Self::Unknown => "unknown",
             Self::Starting => "starting",
             Self::Idle => "idle",
+            Self::Done => "done",
             Self::Busy => "busy",
             Self::Retry => "retry",
             Self::NeedsInput => "needs input",
@@ -93,6 +95,7 @@ impl OpencodeState {
             "unknown" => Some(Self::Unknown),
             "starting" | "loading" => Some(Self::Starting),
             "idle" | "ready" => Some(Self::Idle),
+            "done" | "completed" => Some(Self::Done),
             "busy" | "running" | "working" => Some(Self::Busy),
             "retry" | "retrying" => Some(Self::Retry),
             "needs input" | "needs-input" | "permission" => Some(Self::NeedsInput),
@@ -106,7 +109,8 @@ impl OpencodeState {
         match self {
             Self::Unknown => AgentState::NeedsRestart,
             Self::Starting => AgentState::Running,
-            Self::Idle => AgentState::ExitedOk,
+            Self::Idle => AgentState::Idle,
+            Self::Done => AgentState::ExitedOk,
             Self::Busy | Self::Retry => AgentState::Running,
             Self::NeedsInput => AgentState::NeedsInput,
             Self::Error => AgentState::ExitedError,
@@ -127,6 +131,7 @@ pub struct OpencodeStatus {
     pub session_id: Option<String>,
     pub title: Option<String>,
     pub state: OpencodeState,
+    pub detail: Option<String>,
     pub latest_message: Option<String>,
     pub latest_user_message: Option<String>,
     pub recent_messages: Vec<String>,
@@ -140,6 +145,7 @@ pub struct OpencodeEvent {
     pub session_id: Option<String>,
     pub title: Option<String>,
     pub state: Option<OpencodeState>,
+    pub detail: Option<String>,
     pub latest_message: Option<String>,
     pub active_tool: Option<String>,
     pub todos: Option<Vec<OpencodeTodo>>,
@@ -152,6 +158,7 @@ impl OpencodeStatus {
             session_id,
             title: None,
             state: OpencodeState::Offline,
+            detail: None,
             latest_message: None,
             latest_user_message: None,
             recent_messages: Vec::new(),
@@ -473,6 +480,7 @@ pub fn poll_status(runtime: &OpencodeRuntime) -> Result<OpencodeStatus, String> 
             session_id: None,
             title: None,
             state: OpencodeState::Starting,
+            detail: None,
             latest_message: None,
             latest_user_message: None,
             recent_messages: Vec::new(),
@@ -501,6 +509,11 @@ pub fn poll_status(runtime: &OpencodeRuntime) -> Result<OpencodeStatus, String> 
         state = OpencodeState::NeedsInput;
     }
     let mut messages = fetch_message_summary(&runtime.server_url, session_id).unwrap_or_default();
+    if state == OpencodeState::Idle
+        && let Some(message_state) = messages.latest_turn_state
+    {
+        state = message_state;
+    }
     if state == OpencodeState::NeedsInput {
         messages.active_tool = None;
     }
@@ -511,6 +524,7 @@ pub fn poll_status(runtime: &OpencodeRuntime) -> Result<OpencodeStatus, String> 
         session_id: Some(session_id.to_string()),
         title: session.title,
         state,
+        detail: messages.latest_error,
         latest_message: messages.latest_message,
         latest_user_message: messages.latest_user_message,
         recent_messages: messages.recent_messages,
@@ -540,6 +554,11 @@ pub fn poll_session_status(server_url: &str, session_id: &str) -> Result<Opencod
         state = OpencodeState::NeedsInput;
     }
     let mut messages = fetch_message_summary(server_url, session_id).unwrap_or_default();
+    if state == OpencodeState::Idle
+        && let Some(message_state) = messages.latest_turn_state
+    {
+        state = message_state;
+    }
     if state == OpencodeState::NeedsInput {
         messages.active_tool = None;
     }
@@ -550,6 +569,7 @@ pub fn poll_session_status(server_url: &str, session_id: &str) -> Result<Opencod
         session_id: Some(session_id.to_string()),
         title: session.title,
         state,
+        detail: messages.latest_error,
         latest_message: messages.latest_message,
         latest_user_message: messages.latest_user_message,
         recent_messages: messages.recent_messages,
@@ -733,7 +753,9 @@ pub fn parse_event_payload(payload: &str) -> Option<OpencodeEvent> {
     let value = serde_json::from_str::<Value>(payload).ok()?;
     let event_type = string_field(&value, &["type", "event"]).unwrap_or_default();
     let object = event_body(&value).unwrap_or(&value);
-    let session_id = session_id_field(&value).or_else(|| session_id_field(object));
+    let session_id = session_id_field(&value)
+        .or_else(|| session_id_field(object))
+        .or_else(|| object.get("info").and_then(session_id_field));
     let state = string_field(object, &["status", "state"])
         .or_else(|| {
             object
@@ -742,7 +764,9 @@ pub fn parse_event_payload(payload: &str) -> Option<OpencodeEvent> {
         })
         .or_else(|| string_field(&value, &["status", "state"]))
         .and_then(|value| parse_state_label(&value))
-        .or_else(|| event_type_state(&event_type));
+        .or_else(|| event_type_state(&event_type))
+        .or_else(|| message_turn_state(&event_type, object));
+    let detail = message_error(&event_type, object);
     let todos = if event_type.contains("todo") || object.get("todos").is_some() {
         Some(parse_todos_value(object))
     } else {
@@ -769,6 +793,7 @@ pub fn parse_event_payload(payload: &str) -> Option<OpencodeEvent> {
         session_id,
         title,
         state,
+        detail,
         latest_message,
         active_tool,
         todos,
@@ -776,6 +801,7 @@ pub fn parse_event_payload(payload: &str) -> Option<OpencodeEvent> {
     (event.session_id.is_some()
         || event.title.is_some()
         || event.state.is_some()
+        || event.detail.is_some()
         || event.latest_message.is_some()
         || event.active_tool.is_some()
         || event.todos.is_some())
@@ -828,6 +854,8 @@ struct MessageSummary {
     latest_user_message: Option<String>,
     recent_messages: Vec<String>,
     active_tool: Option<String>,
+    latest_turn_state: Option<OpencodeState>,
+    latest_error: Option<String>,
 }
 
 fn fetch_session_state(server_url: &str, session_id: &str) -> Result<OpencodeState, String> {
@@ -1397,6 +1425,10 @@ fn parse_message_summary(body: &str) -> MessageSummary {
         .into_iter()
         .rev()
     {
+        if summary.latest_turn_state.is_none() {
+            summary.latest_turn_state = stored_message_turn_state(object);
+            summary.latest_error = stored_message_error(object);
+        }
         if summary.recent_messages.len() < 5
             && let Some(text) = assistant_message_text(object)
         {
@@ -1428,6 +1460,56 @@ fn parse_message_summary(body: &str) -> MessageSummary {
         }
     }
     summary
+}
+
+fn stored_message_turn_state(object: &Value) -> Option<OpencodeState> {
+    let info = object.get("info").unwrap_or(object);
+    match string_field(info, &["role"]).as_deref()? {
+        "user" => Some(OpencodeState::Busy),
+        "assistant" => Some(assistant_turn_state(info)),
+        _ => None,
+    }
+}
+
+fn assistant_turn_state(info: &Value) -> OpencodeState {
+    let completed = info
+        .get("time")
+        .and_then(|time| time.get("completed"))
+        .is_some_and(|completed| completed.is_number());
+    let finish = string_field(info, &["finish"]);
+    if completed
+        && !finish
+            .as_deref()
+            .is_some_and(|finish| matches!(finish, "tool-calls" | "unknown"))
+    {
+        OpencodeState::Done
+    } else {
+        OpencodeState::Busy
+    }
+}
+
+fn stored_message_error(object: &Value) -> Option<String> {
+    let info = object.get("info").unwrap_or(object);
+    message_error_value(info)
+}
+
+fn message_turn_state(event_type: &str, object: &Value) -> Option<OpencodeState> {
+    if event_type != "message.updated" {
+        return None;
+    }
+    let info = object.get("info").unwrap_or(object);
+    stored_message_turn_state(info)
+}
+
+fn message_error(event_type: &str, object: &Value) -> Option<String> {
+    (event_type == "message.updated")
+        .then(|| object.get("info").unwrap_or(object))
+        .and_then(message_error_value)
+}
+
+fn message_error_value(info: &Value) -> Option<String> {
+    let error = info.get("error")?;
+    string_field(error, &["name", "message"]).or_else(|| error.as_str().map(str::to_string))
 }
 
 fn assistant_message_text(object: &Value) -> Option<String> {
@@ -1963,6 +2045,28 @@ mod tests {
         assert_eq!(summary.recent_messages, vec!["latest reply"]);
         assert_eq!(summary.active_tool, None);
 
+        let completed = parse_message_summary(
+            r#"[{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"},"parts":[{"type":"text","text":"done"}]}]"#,
+        );
+        assert_eq!(completed.latest_turn_state, Some(OpencodeState::Done));
+        assert_eq!(completed.latest_error, None);
+
+        let aborted = parse_message_summary(
+            r#"[{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":1,"completed":2},"error":{"name":"MessageAbortedError"}},"parts":[]}]"#,
+        );
+        assert_eq!(aborted.latest_turn_state, Some(OpencodeState::Done));
+        assert_eq!(aborted.latest_error.as_deref(), Some("MessageAbortedError"));
+
+        let continuing = parse_message_summary(
+            r#"[{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":1,"completed":2},"finish":"tool-calls"},"parts":[]}]"#,
+        );
+        assert_eq!(continuing.latest_turn_state, Some(OpencodeState::Busy));
+
+        let in_progress = parse_message_summary(
+            r#"[{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":1}},"parts":[]}]"#,
+        );
+        assert_eq!(in_progress.latest_turn_state, Some(OpencodeState::Busy));
+
         let todos = parse_todos(
             r#"{"todos":[
                 {"content":"write code","status":"in_progress"},
@@ -2024,6 +2128,26 @@ mod tests {
         .unwrap();
         assert_eq!(message.latest_message.as_deref(), Some("hello there"));
 
+        let completed = parse_event_payload(
+            r#"{"type":"message.updated","properties":{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(completed.session_id.as_deref(), Some("ses_1"));
+        assert_eq!(completed.state, Some(OpencodeState::Done));
+
+        let aborted = parse_event_payload(
+            r#"{"type":"message.updated","properties":{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":1,"completed":2},"error":{"name":"MessageAbortedError"}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(aborted.state, Some(OpencodeState::Done));
+        assert_eq!(aborted.detail.as_deref(), Some("MessageAbortedError"));
+
+        let tool_calls = parse_event_payload(
+            r#"{"type":"message.updated","properties":{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":1,"completed":2},"finish":"tool-calls"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(tool_calls.state, Some(OpencodeState::Busy));
+
         let tool = parse_event_payload(
             r#"{"type":"tool.updated","properties":{"sessionID":"ses_1","name":"bash","status":"running"}}"#,
         )
@@ -2068,7 +2192,8 @@ mod tests {
     #[test]
     fn opencode_state_maps_to_existing_agent_state() {
         assert_eq!(OpencodeState::Busy.agent_state(), AgentState::Running);
-        assert_eq!(OpencodeState::Idle.agent_state(), AgentState::ExitedOk);
+        assert_eq!(OpencodeState::Idle.agent_state(), AgentState::Idle);
+        assert_eq!(OpencodeState::Done.agent_state(), AgentState::ExitedOk);
         assert_eq!(
             OpencodeState::NeedsInput.agent_state(),
             AgentState::NeedsInput
