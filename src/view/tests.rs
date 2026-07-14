@@ -171,7 +171,10 @@ fn renders_selected_sidebar_rows_with_unfocused_style() {
         &buffer,
         label_x,
         row,
-        Style::default().fg(Color::Reset).bg(Color::Rgb(32, 32, 32)),
+        Style::default()
+            .fg(Color::Reset)
+            .bg(Color::Reset)
+            .add_modifier(Modifier::BOLD),
     );
     assert_cell_style(
         &buffer,
@@ -194,7 +197,10 @@ fn renders_selected_sidebar_rows_with_unfocused_style() {
         &buffer,
         branch_x,
         row,
-        Style::default().fg(Color::Reset).bg(Color::Rgb(32, 32, 32)),
+        Style::default()
+            .fg(Color::Reset)
+            .bg(Color::Reset)
+            .add_modifier(Modifier::BOLD),
     );
     assert_cell_style(
         &buffer,
