@@ -8,10 +8,6 @@ pub(super) fn highlight_color() -> Color {
     Color::Rgb(0, 255, 255)
 }
 
-pub(super) fn selected_color() -> Color {
-    Color::Rgb(0, 160, 160)
-}
-
 pub(super) fn title_style(focused: bool) -> Style {
     let style = highlight_style();
     if focused {
@@ -37,7 +33,7 @@ pub(super) fn error_style() -> Style {
 
 pub(super) fn selected_style(focused: bool) -> Style {
     let style = if focused {
-        Style::default().fg(Color::Black).bg(selected_color())
+        Style::default().fg(Color::Black).bg(highlight_color())
     } else {
         Style::default().bg(Color::Rgb(32, 32, 32))
     };

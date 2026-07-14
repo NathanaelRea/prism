@@ -630,7 +630,13 @@ fn renders_dialog_overlays() {
 
     let lines = dialog_lines(model.dialog.as_ref().unwrap());
     assert_eq!(lines[0].spans[0].content.as_ref(), "[u]");
-    assert_eq!(lines[0].spans[0].style, selected_style(true));
+    assert_eq!(
+        lines[0].spans[0].style,
+        Style::default()
+            .fg(Color::Black)
+            .bg(highlight_color())
+            .add_modifier(Modifier::BOLD)
+    );
 
     model.dialog = Some(DialogModel::Confirm {
         title: "Delete Session".to_string(),
