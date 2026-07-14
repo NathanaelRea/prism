@@ -178,7 +178,7 @@ pub(super) fn dialog_title(dialog: &crate::view::DialogModel) -> String {
         crate::view::DialogModel::Confirm { title, .. }
         | crate::view::DialogModel::Notice { title, .. }
         | crate::view::DialogModel::Prompt { title, .. }
-        | crate::view::DialogModel::WorktreeColumns { title, .. }
+        | crate::view::DialogModel::OrderedToggle { title, .. }
         | crate::view::DialogModel::Choice {
             choices: crate::view::ChoiceList { title, .. },
             ..
@@ -296,9 +296,9 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
             )));
             lines
         }
-        crate::view::DialogModel::WorktreeColumns {
-            columns, selected, ..
-        } => worktree_column_lines(columns, *selected),
+        crate::view::DialogModel::OrderedToggle {
+            items, selected, ..
+        } => ordered_toggle_lines(items, *selected),
         crate::view::DialogModel::Choice { choices, .. } => choice_lines(choices),
         crate::view::DialogModel::Progress { message, .. } => {
             let mut lines = vec![Line::from(Span::styled(
@@ -372,32 +372,32 @@ pub(super) fn choice_lines(choices: &crate::view::ChoiceList) -> Vec<Line<'stati
         .collect::<Vec<_>>()
 }
 
-pub(super) fn worktree_column_lines(
-    columns: &[crate::view::WorktreeColumnChoice],
+pub(super) fn ordered_toggle_lines(
+    items: &[crate::view::OrderedToggleItem],
     selected: usize,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
-        "j/k select  Space enable/disable  J/K move enabled column  Enter save  Esc cancel",
+        "j/k select  Space toggle  J/K move  Enter save  Esc cancel",
         muted_style(),
     ))];
     lines.push(Line::from(""));
-    if columns.is_empty() {
+    if items.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No wt columns found",
+            "No options available",
             muted_style(),
         )));
         return lines;
     }
-    for (index, column) in columns.iter().enumerate() {
+    for (index, item) in items.iter().enumerate() {
         let focused = index == selected;
         lines.push(Line::from(vec![
             Span::styled(if focused { "▶ " } else { "  " }, title_style(focused)),
             Span::styled(
-                if column.enabled { "[x]" } else { "[ ]" },
-                selected_style(column.enabled),
+                if item.enabled { "[x]" } else { "[ ]" },
+                selected_style(item.enabled),
             ),
             Span::raw(" "),
-            Span::styled(column.key.clone(), title_style(focused)),
+            Span::styled(item.label.clone(), title_style(focused)),
         ]));
     }
     lines

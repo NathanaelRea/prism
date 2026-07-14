@@ -672,6 +672,22 @@ fn renders_dialog_overlays() {
     assert_eq!(lines[0].to_string(), "Pull first? [Y/n]: ");
     assert_eq!(lines[1].to_string(), "Please enter y or n.");
     assert_eq!(lines[1].spans[0].style, attention_style());
+
+    model.dialog = Some(DialogModel::OrderedToggle {
+        title: "Visible Fields".to_string(),
+        items: vec![OrderedToggleItem {
+            id: "internal-id".to_string(),
+            label: "Display label".to_string(),
+            enabled: true,
+        }],
+        selected: 0,
+    });
+    let buffer = render_to_string(&model, 80, 20);
+
+    assert!(buffer.contains("Visible Fields"));
+    assert!(buffer.contains("[x]"));
+    assert!(buffer.contains("Display label"));
+    assert!(buffer.contains("J/K move"));
 }
 
 #[test]

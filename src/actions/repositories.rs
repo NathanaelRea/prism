@@ -125,7 +125,16 @@ impl Tui {
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
         ensure_repo_config_file(&context.config.repo_config_path, true)?;
-        let Some(columns) = self.worktree_column_editor(raw, context.repo_index)? else {
+        let (repo_label, configured_columns) = self
+            .repos
+            .get(context.repo_index)
+            .map(|repo| (repo.label.clone(), repo.config.worktree_columns.clone()))
+            .ok_or_else(|| "no selected repository".to_string())?;
+        let items =
+            worktree_column_choices(&configured_columns, &self.sessions, context.repo_index);
+        let Some(columns) =
+            self.ordered_toggle_dialog(raw, &format!("Worktree Columns: {repo_label}"), items)?
+        else {
             return Ok(());
         };
         update_worktree_columns_config(&context.config.repo_config_path, &columns)?;
@@ -137,78 +146,6 @@ impl Tui {
         self.start_wt_column_poll();
         self.show_message("worktree columns updated")?;
         Ok(())
-    }
-
-    pub(crate) fn worktree_column_editor(
-        &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
-        repo_index: usize,
-    ) -> Result<Option<Vec<String>>, String> {
-        let (repo_label, configured_columns) = self
-            .repos
-            .get(repo_index)
-            .map(|repo| (repo.label.clone(), repo.config.worktree_columns.clone()))
-            .ok_or_else(|| "no selected repository".to_string())?;
-        let mut columns = worktree_column_choices(&configured_columns, &self.sessions, repo_index);
-        let mut selected = 0usize;
-        loop {
-            self.dialog = Some(crate::view::DialogModel::WorktreeColumns {
-                title: format!("Worktree Columns: {repo_label}"),
-                columns: columns.clone(),
-                selected,
-            });
-            self.draw(raw)?;
-            let Some(event) = raw.poll_event(std::time::Duration::from_millis(100))? else {
-                continue;
-            };
-            let crate::tui_runtime::RuntimeEvent::Key(event) = event else {
-                continue;
-            };
-            if event.kind != crossterm::event::KeyEventKind::Press {
-                continue;
-            }
-            match event.code {
-                crossterm::event::KeyCode::Esc | crossterm::event::KeyCode::Char('c')
-                    if event.code == crossterm::event::KeyCode::Esc
-                        || event
-                            .modifiers
-                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
-                {
-                    self.dialog = None;
-                    self.draw(raw)?;
-                    return Ok(None);
-                }
-                crossterm::event::KeyCode::Enter => {
-                    self.dialog = None;
-                    self.draw(raw)?;
-                    return Ok(Some(
-                        columns
-                            .iter()
-                            .filter(|column| column.enabled)
-                            .map(|column| column.key.clone())
-                            .collect(),
-                    ));
-                }
-                crossterm::event::KeyCode::Up | crossterm::event::KeyCode::Char('k') => {
-                    selected = selected.saturating_sub(1);
-                }
-                crossterm::event::KeyCode::Down | crossterm::event::KeyCode::Char('j') => {
-                    selected = selected
-                        .saturating_add(1)
-                        .min(columns.len().saturating_sub(1));
-                }
-                crossterm::event::KeyCode::Char(' ') => {
-                    toggle_worktree_column(&mut columns, &mut selected);
-                }
-                crossterm::event::KeyCode::Char('K') => {
-                    move_enabled_worktree_column(&mut columns, &mut selected, -1);
-                }
-                crossterm::event::KeyCode::Char('J') => {
-                    move_enabled_worktree_column(&mut columns, &mut selected, 1);
-                }
-                _ => {}
-            }
-        }
     }
 
     pub(crate) fn add_repository(
@@ -396,7 +333,7 @@ pub(super) fn worktree_column_choices(
     configured: &[String],
     sessions: &[crate::session::Session],
     repo_index: usize,
-) -> Vec<crate::view::WorktreeColumnChoice> {
+) -> Vec<crate::view::OrderedToggleItem> {
     let configured_set = configured.iter().cloned().collect::<BTreeSet<_>>();
     let mut discovered = sessions
         .iter()
@@ -406,8 +343,9 @@ pub(super) fn worktree_column_choices(
         .collect::<BTreeSet<_>>();
     let mut choices = configured
         .iter()
-        .map(|key| crate::view::WorktreeColumnChoice {
-            key: key.clone(),
+        .map(|key| crate::view::OrderedToggleItem {
+            id: key.clone(),
+            label: key.clone(),
             enabled: true,
         })
         .collect::<Vec<_>>();
@@ -416,49 +354,13 @@ pub(super) fn worktree_column_choices(
             .pop_first()
             .into_iter()
             .chain(std::iter::from_fn(move || discovered.pop_first()))
-            .map(|key| crate::view::WorktreeColumnChoice {
-                key,
+            .map(|key| crate::view::OrderedToggleItem {
+                id: key.clone(),
+                label: key,
                 enabled: false,
             }),
     );
     choices
-}
-
-pub(super) fn toggle_worktree_column(
-    columns: &mut Vec<crate::view::WorktreeColumnChoice>,
-    selected: &mut usize,
-) {
-    if columns.is_empty() || *selected >= columns.len() {
-        return;
-    }
-    let mut column = columns.remove(*selected);
-    column.enabled = !column.enabled;
-    let insert_at = if column.enabled {
-        columns.iter().take_while(|choice| choice.enabled).count()
-    } else {
-        columns.len()
-    };
-    columns.insert(insert_at, column);
-    *selected = insert_at;
-}
-
-pub(super) fn move_enabled_worktree_column(
-    columns: &mut [crate::view::WorktreeColumnChoice],
-    selected: &mut usize,
-    direction: isize,
-) {
-    if columns.is_empty() || *selected >= columns.len() || !columns[*selected].enabled {
-        return;
-    }
-    let target = if direction < 0 {
-        (0..*selected).rev().find(|index| columns[*index].enabled)
-    } else {
-        (*selected + 1..columns.len()).find(|index| columns[*index].enabled)
-    };
-    if let Some(target) = target {
-        columns.swap(*selected, target);
-        *selected = target;
-    }
 }
 
 pub(super) fn update_worktree_columns_config(

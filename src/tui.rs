@@ -370,6 +370,40 @@ fn confirmation_result(input: &str, default: bool) -> Option<bool> {
     }
 }
 
+fn toggle_ordered_item(items: &mut Vec<view::OrderedToggleItem>, selected: &mut usize) {
+    if items.is_empty() || *selected >= items.len() {
+        return;
+    }
+    let mut item = items.remove(*selected);
+    item.enabled = !item.enabled;
+    let insert_at = if item.enabled {
+        items.iter().take_while(|item| item.enabled).count()
+    } else {
+        items.len()
+    };
+    items.insert(insert_at, item);
+    *selected = insert_at;
+}
+
+fn move_enabled_ordered_item(
+    items: &mut [view::OrderedToggleItem],
+    selected: &mut usize,
+    direction: isize,
+) {
+    if items.is_empty() || *selected >= items.len() || !items[*selected].enabled {
+        return;
+    }
+    let target = if direction < 0 {
+        (0..*selected).rev().find(|index| items[*index].enabled)
+    } else {
+        (*selected + 1..items.len()).find(|index| items[*index].enabled)
+    };
+    if let Some(target) = target {
+        items.swap(*selected, target);
+        *selected = target;
+    }
+}
+
 impl Tui {
     pub fn new(repos: Vec<ManagedRepo>, current_repo: usize, sessions: Vec<Session>) -> Self {
         let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
@@ -1322,6 +1356,74 @@ impl Tui {
                 choices: choices.clone(),
             });
             self.draw(runtime)?;
+        }
+    }
+
+    pub(crate) fn ordered_toggle_dialog(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        title: &str,
+        mut items: Vec<view::OrderedToggleItem>,
+    ) -> Result<Option<Vec<String>>, String> {
+        items.sort_by_key(|item| !item.enabled);
+        let mut selected = 0usize;
+        loop {
+            self.dialog = Some(view::DialogModel::OrderedToggle {
+                title: title.to_string(),
+                items: items.clone(),
+                selected,
+            });
+            self.draw(runtime)?;
+            if self.tick_tui_action_jobs().any() {
+                self.draw(runtime)?;
+            }
+            let Some(event) = runtime.poll_event(Duration::from_millis(100))? else {
+                continue;
+            };
+            let RuntimeEvent::Key(event) = event else {
+                continue;
+            };
+            if event.kind != KeyEventKind::Press {
+                continue;
+            }
+            match event.code {
+                KeyCode::Esc | KeyCode::Char('c')
+                    if event.code == KeyCode::Esc || ctrl_key(event) =>
+                {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Ok(None);
+                }
+                KeyCode::Enter if plain_key(event) => {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Ok(Some(
+                        items
+                            .iter()
+                            .filter(|item| item.enabled)
+                            .map(|item| item.id.clone())
+                            .collect(),
+                    ));
+                }
+                KeyCode::Up | KeyCode::Char('k') if plain_key(event) => {
+                    selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') if plain_key(event) => {
+                    selected = selected
+                        .saturating_add(1)
+                        .min(items.len().saturating_sub(1));
+                }
+                KeyCode::Char(' ') if plain_key(event) => {
+                    toggle_ordered_item(&mut items, &mut selected);
+                }
+                KeyCode::Char('K') if plain_key(event) => {
+                    move_enabled_ordered_item(&mut items, &mut selected, -1);
+                }
+                KeyCode::Char('J') if plain_key(event) => {
+                    move_enabled_ordered_item(&mut items, &mut selected, 1);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -2995,10 +3097,11 @@ mod tests {
     };
     use crate::repo::Repository;
     use crate::session::Session;
-    use crate::view::{RepoMainView, WorktreeMainView};
+    use crate::view::{OrderedToggleItem, RepoMainView, WorktreeMainView};
 
     use super::{
         ManagedRepo, OpenTmuxSessionTarget, PanelFocus, Tui, WorktreeListMode, confirmation_result,
+        move_enabled_ordered_item, toggle_ordered_item,
     };
 
     #[test]
@@ -3017,6 +3120,75 @@ mod tests {
     fn confirmation_rejects_unknown_answers() {
         assert_eq!(confirmation_result("maybe", true), None);
         assert_eq!(confirmation_result("ny", false), None);
+    }
+
+    #[test]
+    fn ordered_toggle_groups_enabled_items_before_disabled_items() {
+        let mut items = ordered_toggle_items();
+        let mut selected = 1;
+
+        toggle_ordered_item(&mut items, &mut selected);
+
+        assert_eq!(selected, 2);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.id.as_str(), item.enabled))
+                .collect::<Vec<_>>(),
+            vec![("one", true), ("three", false), ("two", false)]
+        );
+
+        toggle_ordered_item(&mut items, &mut selected);
+
+        assert_eq!(selected, 1);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| (item.id.as_str(), item.enabled))
+                .collect::<Vec<_>>(),
+            vec![("one", true), ("two", true), ("three", false)]
+        );
+    }
+
+    #[test]
+    fn ordered_toggle_moves_only_enabled_items() {
+        let mut items = ordered_toggle_items();
+        let mut selected = 1;
+
+        move_enabled_ordered_item(&mut items, &mut selected, -1);
+
+        assert_eq!(selected, 0);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["two", "one", "three"]
+        );
+
+        selected = 2;
+        move_enabled_ordered_item(&mut items, &mut selected, -1);
+        assert_eq!(selected, 2);
+    }
+
+    fn ordered_toggle_items() -> Vec<OrderedToggleItem> {
+        vec![
+            OrderedToggleItem {
+                id: "one".to_string(),
+                label: "First".to_string(),
+                enabled: true,
+            },
+            OrderedToggleItem {
+                id: "two".to_string(),
+                label: "Second".to_string(),
+                enabled: true,
+            },
+            OrderedToggleItem {
+                id: "three".to_string(),
+                label: "Third".to_string(),
+                enabled: false,
+            },
+        ]
     }
 
     #[test]
