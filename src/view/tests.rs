@@ -1244,18 +1244,16 @@ fn renders_stabilization_ready_for_manual_merge_in_worktree_main_panel() {
 }
 
 #[test]
-fn worktree_main_panel_hides_stabilization_rows_without_pr() {
+fn worktree_main_panel_hides_pr_section_without_pr() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Idle)];
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     let buffer = render_to_string(&model, 120, 30);
 
-    assert!(buffer.contains("PR"));
-    for key in ["pr #", "name"] {
-        assert!(buffer.contains(key), "missing PR key: {key}");
-    }
-    for key in ["state", "next", "ci", "review", "merge", "policy"] {
-        assert!(!buffer.contains(key), "unexpected stabilization key: {key}");
+    for key in [
+        "PR", "pr #", "name", "state", "next", "ci", "review", "merge", "policy",
+    ] {
+        assert!(!buffer.contains(key), "unexpected PR key: {key}");
     }
     assert!(!buffer.contains("No PR detected"));
     assert!(!buffer.contains("Description"));
