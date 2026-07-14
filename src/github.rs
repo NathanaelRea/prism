@@ -5,6 +5,7 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::git::current_head_sha;
 use crate::observability;
 use crate::process::{run_capture, run_output_allow_failure};
 use crate::repo::Repository;
@@ -565,12 +566,22 @@ pub(crate) fn load_pr_cache_for_branch(
     repo: &Repository,
     config: &Config,
     branch: &str,
+    path: &std::path::Path,
 ) -> PrCache {
     if pr_cache_excluded_branch(config, branch) {
         let _ = remove_pr_cache(repo, branch);
         return PrCache::default();
     }
-    load_pr_cache(repo, branch)
+    let cache = load_pr_cache(repo, branch);
+    if cache
+        .summary
+        .as_ref()
+        .is_some_and(|summary| !pr_summary_matches_worktree(summary, branch, path, config))
+    {
+        let _ = remove_pr_cache(repo, branch);
+        return PrCache::default();
+    }
+    cache
 }
 
 pub fn refresh_pr_cache(
@@ -728,12 +739,34 @@ pub(crate) fn refresh_pr_summary_index_for_sessions(
         } else {
             summaries
                 .iter()
-                .find(|summary| summary.head_ref == session.branch)
+                .find(|summary| {
+                    pr_summary_matches_worktree(
+                        summary,
+                        &session.branch,
+                        &session.path,
+                        managed.config,
+                    )
+                })
                 .cloned()
         };
         let mutation = apply_pr_summary_refresh(&mut session.pr, summary, refreshed.clone());
         persist_pr_summary_mutation(managed.repo, &session.branch, &session.pr, mutation);
     }
+}
+
+fn pr_summary_matches_worktree(
+    summary: &PrSummary,
+    branch: &str,
+    path: &std::path::Path,
+    config: &Config,
+) -> bool {
+    if summary.head_ref != branch {
+        return false;
+    }
+    if !summary.merged && summary.state.eq_ignore_ascii_case("open") {
+        return true;
+    }
+    current_head_sha(path, config).is_ok_and(|head| head == summary.head_sha)
 }
 
 pub fn pr_details_due(cache: &PrCache) -> bool {
@@ -2658,6 +2691,54 @@ mod tests {
             load_pr_cache(&repo, "feature").summary.as_ref(),
             Some(&summary)
         );
+
+        let _ = fs::remove_dir_all(repo.prism_dir());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn merged_pr_from_previous_branch_generation_is_not_reused() {
+        let temp = unique_temp_dir("prism-reused-branch-pr-test");
+        fs::create_dir_all(&temp).unwrap();
+        let git = temp.join("git");
+        fs::write(&git, "#!/bin/sh\nprintf 'new-head\\n'\n").unwrap();
+        let mut permissions = fs::metadata(&git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&git, permissions).unwrap();
+
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut config = test_config();
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        let mut old_summary = test_summary("feature", "old-head", 0);
+        old_summary.state = "MERGED".to_string();
+        old_summary.merged = true;
+        let mut sessions = vec![test_session("feature", PrCache::default())];
+        sessions[0].path = temp.join("feature");
+        let old_cache = PrCache {
+            summary: Some(old_summary.clone()),
+            ..PrCache::default()
+        };
+        save_pr_cache(&repo, "feature", &old_cache).unwrap();
+
+        let loaded = load_pr_cache_for_branch(&repo, &config, "feature", &sessions[0].path);
+
+        assert!(loaded.summary.is_none());
+
+        refresh_pr_summary_index_for_sessions(
+            &[PrCacheRepository {
+                repo: &repo,
+                config: &config,
+            }],
+            &mut sessions,
+            0,
+            vec![old_summary],
+            Instant::now(),
+        );
+
+        assert!(sessions[0].pr.summary.is_none());
+        assert!(load_pr_cache(&repo, "feature").summary.is_none());
 
         let _ = fs::remove_dir_all(repo.prism_dir());
         let _ = fs::remove_dir_all(temp);

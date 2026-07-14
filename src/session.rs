@@ -407,7 +407,7 @@ fn build_session(repo: &Repository, path: PathBuf, branch: String, config: &Conf
     let status_label = git_status_label(&path, config);
     let path_display = path.display().to_string();
     let agent_state = load_agent_state(repo, &branch).unwrap_or(AgentState::Idle);
-    let pr = load_pr_cache_for_branch(repo, config, &branch);
+    let pr = load_pr_cache_for_branch(repo, config, &branch, &path);
     Session {
         repo_index: 0,
         repo_label: String::new(),
