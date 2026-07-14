@@ -21,6 +21,7 @@ pub enum CommandKind {
     DbHelp,
     Doctor,
     Config(ConfigCommand),
+    Agent(AgentCommand),
     Auto(AutoCommand),
     RunPlan(Option<PathBuf>),
     Debug(DebugCommand),
@@ -33,6 +34,11 @@ pub enum ConfigCommand {
     Example,
     Schema,
     Paths,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AgentCommand {
+    Ensure { branch: String },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -111,6 +117,42 @@ impl Args {
                         "schema" => ConfigCommand::Schema,
                         "paths" => ConfigCommand::Paths,
                         other => return Err(format!("unknown config subcommand: {other}")),
+                    });
+                    break;
+                }
+                "agent" => {
+                    let subcommand = iter
+                        .next()
+                        .ok_or_else(|| "agent requires a subcommand".to_string())?;
+                    let subcommand = subcommand.to_string_lossy();
+                    if subcommand != "ensure" {
+                        return Err(format!("unknown agent subcommand: {subcommand}"));
+                    }
+                    let mut branch = None;
+                    while let Some(flag) = iter.next() {
+                        let flag = flag.to_string_lossy();
+                        match flag.as_ref() {
+                            "--branch" if branch.is_none() => {
+                                let value = iter.next().ok_or_else(|| {
+                                    "agent ensure requires --branch <branch>".to_string()
+                                })?;
+                                let value = value.to_string_lossy().trim().to_string();
+                                if value.is_empty() {
+                                    return Err(
+                                        "agent ensure requires --branch <branch>".to_string()
+                                    );
+                                }
+                                branch = Some(value);
+                            }
+                            "--branch" => {
+                                return Err("agent ensure accepts --branch only once".to_string());
+                            }
+                            other => return Err(format!("unknown agent ensure argument: {other}")),
+                        }
+                    }
+                    command = CommandKind::Agent(AgentCommand::Ensure {
+                        branch: branch
+                            .ok_or_else(|| "agent ensure requires --branch <branch>".to_string())?,
                     });
                     break;
                 }
@@ -196,7 +238,7 @@ impl Args {
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config [show|example|schema|paths]\n  prism [--repo <path>] auto [prompt]\n  prism [--repo <path>] auto run-plan <plan.md>\n  prism [--repo <path>] auto plan [prompt]\n  prism [--repo <path>] auto plan-first [prompt]\n  prism [--repo <path>] auto intensive [prompt]\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] debug --help\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n  prism [--repo <path>] db --help\n\nDebugging:\n  Use `debug paths` to find Prism state, `debug logs` to tail the runtime log,\n  and `db path` or `db <read-only-sql>` to inspect persisted repo state.\n  Use `--print-logs --log-level trace` to print detailed subprocess logs.\n\nAliases:\n  auto plan-first and auto intensive are aliases for auto plan."
+    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config [show|example|schema|paths]\n  prism [--repo <path>] agent ensure --branch <branch>\n  prism [--repo <path>] auto [prompt]\n  prism [--repo <path>] auto run-plan <plan.md>\n  prism [--repo <path>] auto plan [prompt]\n  prism [--repo <path>] auto plan-first [prompt]\n  prism [--repo <path>] auto intensive [prompt]\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup\n  prism [--repo <path>] debug --help\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n  prism [--repo <path>] db --help\n\nDebugging:\n  Use `debug paths` to find Prism state, `debug logs` to tail the runtime log,\n  and `db path` or `db <read-only-sql>` to inspect persisted repo state.\n  Use `--print-logs --log-level trace` to print detailed subprocess logs.\n\nAliases:\n  auto plan-first and auto intensive are aliases for auto plan."
 }
 
 pub fn debug_help_text() -> &'static str {
@@ -265,6 +307,25 @@ mod tests {
         assert!(help.contains("auto run-plan <plan.md>"));
         assert!(help.contains("auto plan-first [prompt]"));
         assert!(help.contains("auto intensive [prompt]"));
+    }
+
+    #[test]
+    fn agent_ensure_requires_and_parses_branch() {
+        assert_eq!(
+            parse(&["agent", "ensure", "--branch", "feature/e2e"]),
+            CommandKind::Agent(AgentCommand::Ensure {
+                branch: "feature/e2e".to_string(),
+            })
+        );
+        assert_eq!(
+            Args::parse([OsString::from("agent"), OsString::from("ensure")]).unwrap_err(),
+            "agent ensure requires --branch <branch>"
+        );
+    }
+
+    #[test]
+    fn help_documents_agent_ensure() {
+        assert!(help_text().contains("agent ensure --branch <branch>"));
     }
 
     #[test]

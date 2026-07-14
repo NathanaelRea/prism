@@ -20,7 +20,7 @@ use crate::repo::Repository;
 use serde_json::Value;
 
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(250);
-const API_TIMEOUT: Duration = Duration::from_secs(2);
+const API_TIMEOUT: Duration = Duration::from_secs(5);
 const SSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SSE_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
@@ -963,8 +963,26 @@ fn newest_listed_session_for_worktree(
     worktree: &Path,
 ) -> Result<Option<OpencodeSession>, String> {
     let worktree_path = worktree.display().to_string();
-    let sessions = list_sessions(&runtime.server_url)?;
+    let sessions = list_sessions_for_worktree(&runtime.server_url, &worktree_path)?;
     Ok(newest_session_for_worktree(&sessions, &worktree_path).cloned())
+}
+
+fn list_sessions_for_worktree(
+    server_url: &str,
+    worktree_path: &str,
+) -> Result<Vec<OpencodeSession>, String> {
+    let path = format!(
+        "/session?directory={}&limit=100",
+        url_path_segment(worktree_path)
+    );
+    let response = get(server_url, &path, API_TIMEOUT)?;
+    if response.status_code != 200 {
+        return Err(format!(
+            "list opencode sessions failed with HTTP {}",
+            response.status_code
+        ));
+    }
+    Ok(parse_sessions(&response.body))
 }
 
 fn save_runtime_session(
@@ -1289,11 +1307,87 @@ fn request(
         ),
     }
     .map_err(|error| format!("write HTTP request: {error}"))?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .map_err(|error| format!("read HTTP response: {error}"))?;
+    let mut response = Vec::new();
+    loop {
+        let mut buffer = [0_u8; 8192];
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                response.extend_from_slice(&buffer[..count]);
+                if http_response_is_complete(&response) {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("read HTTP response: {error}")),
+        }
+    }
+    let response = String::from_utf8_lossy(&response);
     parse_response(&response)
+}
+
+fn http_response_is_complete(response: &[u8]) -> bool {
+    let Some(headers_end) = response
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4)
+    else {
+        return false;
+    };
+    let headers = String::from_utf8_lossy(&response[..headers_end]);
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|status| status.parse::<u16>().ok());
+    if status.is_some_and(|status| status == 204 || status == 304) {
+        return true;
+    }
+    if header_value(&headers, "transfer-encoding")
+        .is_some_and(|value| value.eq_ignore_ascii_case("chunked"))
+    {
+        return decode_chunked_body(&response[headers_end..]).is_some();
+    }
+    let content_length = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    });
+    content_length.is_some_and(|length| response.len() >= headers_end + length)
+}
+
+fn header_value<'a>(headers: &'a str, expected: &str) -> Option<&'a str> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case(expected).then(|| value.trim())
+    })
+}
+
+fn decode_chunked_body(body: &[u8]) -> Option<String> {
+    let mut decoded = Vec::new();
+    let mut position = 0;
+    loop {
+        let line_end = body[position..]
+            .windows(2)
+            .position(|window| window == b"\r\n")?
+            + position;
+        let size_text = std::str::from_utf8(&body[position..line_end]).ok()?;
+        let size = usize::from_str_radix(size_text.split(';').next()?.trim(), 16).ok()?;
+        position = line_end + 2;
+        if size == 0 {
+            let trailers = body.get(position..)?;
+            let complete = trailers.starts_with(b"\r\n")
+                || trailers.windows(4).any(|window| window == b"\r\n\r\n");
+            return complete.then(|| String::from_utf8_lossy(&decoded).to_string());
+        }
+        let chunk_end = position.checked_add(size)?;
+        decoded.extend_from_slice(body.get(position..chunk_end)?);
+        if body.get(chunk_end..chunk_end + 2)? != b"\r\n" {
+            return None;
+        }
+        position = chunk_end + 2;
+    }
 }
 
 pub(crate) fn parse_localhost_url(url: &str) -> Result<(String, u16), String> {
@@ -1329,10 +1423,15 @@ fn parse_response(response: &str) -> Result<HttpResponse, String> {
         .ok_or_else(|| format!("invalid HTTP status line: {status_line}"))?
         .parse::<u16>()
         .map_err(|error| format!("parse HTTP status: {error}"))?;
-    let body = response
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
-        .unwrap_or_default();
+    let (headers, raw_body) = response.split_once("\r\n\r\n").unwrap_or((response, ""));
+    let body = if header_value(headers, "transfer-encoding")
+        .is_some_and(|value| value.eq_ignore_ascii_case("chunked"))
+    {
+        decode_chunked_body(raw_body.as_bytes())
+            .ok_or_else(|| "invalid chunked HTTP response".to_string())?
+    } else {
+        raw_body.to_string()
+    };
     Ok(HttpResponse { status_code, body })
 }
 
@@ -2231,6 +2330,26 @@ mod tests {
     }
 
     #[test]
+    fn http_response_completion_uses_content_length_without_waiting_for_eof() {
+        let complete =
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n[]";
+        let partial = &complete[..complete.len() - 1];
+
+        assert!(!http_response_is_complete(partial));
+        assert!(http_response_is_complete(complete));
+        assert!(http_response_is_complete(
+            b"HTTP/1.1 204 No Content\r\nConnection: keep-alive\r\n\r\n"
+        ));
+        assert!(!http_response_is_complete(b"HTTP/1.1 100 Continue\r\n\r\n"));
+        let chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\n0\r\n\r\n";
+        assert!(http_response_is_complete(chunked.as_bytes()));
+        assert_eq!(parse_response(chunked).unwrap().body, "[]");
+        let chunked_with_trailer = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\n0\r\nChecksum: x\r\n\r\n";
+        assert!(http_response_is_complete(chunked_with_trailer.as_bytes()));
+        assert_eq!(parse_response(chunked_with_trailer).unwrap().body, "[]");
+    }
+
+    #[test]
     #[cfg(unix)]
     #[ignore = "requires PRISM_TEST_OPENCODE pointing to a real OpenCode binary"]
     fn real_opencode_server_round_trips_prism_session_api() {
@@ -2238,16 +2357,18 @@ mod tests {
             .expect("set PRISM_TEST_OPENCODE to the real OpenCode binary");
         let temp = unique_temp_dir("prism-real-opencode-test");
         let worktree = temp.join("worktree");
+        let home = temp.join("home");
         let config_dir = temp.join("opencode-config");
         let data_dir = temp.join("data");
-        for path in [&worktree, &config_dir, &data_dir] {
+        for path in [&worktree, &home, &config_dir, &data_dir] {
             fs::create_dir_all(path).unwrap();
         }
         let worktree = fs::canonicalize(worktree).unwrap();
         let repo = Repository::with_config_dir_for_test(worktree.clone(), temp.join("config"));
         let wrapper = temp.join("opencode-isolated");
+        let real_home = std::env::var("HOME").unwrap_or_default();
         let mise_data_dir = std::env::var("MISE_DATA_DIR").unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            PathBuf::from(&real_home)
                 .join(".local/share/mise")
                 .display()
                 .to_string()
@@ -2255,8 +2376,10 @@ mod tests {
         fs::write(
             &wrapper,
             format!(
-                "#!/bin/sh\nexport MISE_DATA_DIR={}\nexport OPENCODE_CONFIG_DIR={}\nexport OPENCODE_DISABLE_AUTOUPDATE=true\nexport OPENCODE_DISABLE_DEFAULT_PLUGINS=true\nexport OPENCODE_DISABLE_LSP_DOWNLOAD=true\nexport OPENCODE_DISABLE_MODELS_FETCH=true\nexport XDG_DATA_HOME={}\nexec {} \"$@\"\n",
+                "#!/bin/sh\nexport HOME={}\nexport MISE_DATA_DIR={}\nexport npm_config_cache={}\nexport OPENCODE_CONFIG_DIR={}\nexport OPENCODE_DISABLE_AUTOUPDATE=true\nexport OPENCODE_DISABLE_DEFAULT_PLUGINS=true\nexport OPENCODE_DISABLE_LSP_DOWNLOAD=true\nexport OPENCODE_DISABLE_MODELS_FETCH=true\nexport XDG_DATA_HOME={}\nexec {} \"$@\"\n",
+                shell_quote_for_test(&home.display().to_string()),
                 shell_quote_for_test(&mise_data_dir),
+                shell_quote_for_test(&format!("{real_home}/.npm")),
                 shell_quote_for_test(&config_dir.display().to_string()),
                 shell_quote_for_test(&data_dir.display().to_string()),
                 shell_quote_for_test(&opencode),
@@ -2344,7 +2467,9 @@ mod tests {
                 let request = String::from_utf8_lossy(&request);
                 let body = if request.starts_with("GET /session/old ") {
                     r#"{"id":"old","directory":"/repo/wt","timeUpdated":"2026-01-01T00:00:00Z"}"#
-                } else if request.starts_with("GET /session ") {
+                } else if request.starts_with("GET /session ")
+                    || request.starts_with("GET /session?")
+                {
                     r#"[
                         {"id":"old","directory":"/repo/wt","timeUpdated":"2026-01-01T00:00:00Z"},
                         {"id":"new","directory":"/repo/wt","timeUpdated":"2026-01-02T00:00:00Z"}

@@ -16,6 +16,17 @@ PRISM_TEST_OPENCODE="$(command -v opencode)" \
 
 The smoke test starts `opencode serve`, waits for its health endpoint, and verifies Prism can create, list, and retrieve a session. It does not submit a prompt or require provider credentials.
 
+CI also exercises the full headless stack with the real Prism binary, OpenCode, and tmux on an isolated socket. To run it locally:
+
+```sh
+PRISM_TEST_OPENCODE="$(command -v opencode)" \
+PRISM_TEST_TMUX="$(command -v tmux)" \
+  cargo test real_prism_opencode_tmux_stack_ensures_reusable_agent_session \
+    -- --ignored --exact
+```
+
+The full-stack test creates a Git worktree, runs `prism agent ensure`, verifies the OpenCode-backed tmux session, runs ensure again to check reuse, and cleans up the isolated server and socket. It does not invoke a model.
+
 To enforce the same gate as a pre-push hook, opt into the versioned hooks:
 
 ```sh

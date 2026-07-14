@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::agent::AgentState;
 use crate::config::Config;
+use crate::opencode::{OpencodeRuntime, load_runtime};
 use crate::repo::Repository;
 use crate::session::{Session, save_agent_state};
 use crate::tmux;
@@ -52,6 +53,13 @@ pub(crate) struct AgentSessionDelayedWarmup {
 
 pub(crate) struct AgentSessionLifecycleOutcome {
     pub delayed_warmup: Option<AgentSessionDelayedWarmup>,
+}
+
+pub(crate) struct EnsuredAgentSession {
+    pub generation: u64,
+    pub tmux_session: String,
+    pub running: bool,
+    pub opencode_runtime: Option<OpencodeRuntime>,
 }
 
 pub(crate) struct AgentSessionAttachCompletion<'a> {
@@ -187,6 +195,27 @@ pub(crate) fn ensure_session(
     generation: u64,
 ) -> Result<bool, String> {
     tmux::ensure_agent_session(repo, config, session, generation)
+}
+
+pub(crate) fn ensure_latest_session(
+    repo: &Repository,
+    config: &Config,
+    session: &Session,
+) -> Result<EnsuredAgentSession, String> {
+    let generation =
+        tmux::latest_agent_session_generation(repo, config, &session.branch).unwrap_or(0);
+    let running = ensure_session(repo, config, session, generation)?;
+    let tmux_session =
+        tmux::TmuxAgentSession::for_worktree_session(repo, &session.branch, generation)
+            .name()
+            .to_string();
+    let opencode_runtime = load_runtime(repo, &session.branch, &session.path)?;
+    Ok(EnsuredAgentSession {
+        generation,
+        tmux_session,
+        running,
+        opencode_runtime,
+    })
 }
 
 pub(crate) fn attach_session(

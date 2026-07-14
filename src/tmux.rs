@@ -13,7 +13,7 @@ use crate::session::Session;
 use crate::util::{safe_branch_filename, stable_hash};
 
 const EXISTING_SESSION_READY_WAIT: Duration = Duration::from_millis(250);
-const CREATED_SESSION_READY_WAIT: Duration = Duration::from_millis(1_200);
+const CREATED_SESSION_READY_WAIT: Duration = Duration::from_secs(2);
 const SESSION_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const AGENT_INPUT_READY_WAIT: Duration = Duration::from_secs(5);
 
@@ -1965,7 +1965,9 @@ exit 0
             (200, "{}".to_string())
         } else if request_line.starts_with("GET /session/ses_123 ") {
             (200, session)
-        } else if request_line.starts_with("GET /session ") {
+        } else if request_line.starts_with("GET /session ")
+            || request_line.starts_with("GET /session?")
+        {
             (200, format!(r#"{{"data":[{session}]}}"#))
         } else if request_line.starts_with("POST /tui/append-prompt ") {
             (append_status, "{}".to_string())

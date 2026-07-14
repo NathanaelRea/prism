@@ -1,5 +1,6 @@
 use crate::args::{
-    self, Args, AutoCommand, AutoCommandSource, CommandKind, ConfigCommand, DbCommand, DebugCommand,
+    self, AgentCommand, Args, AutoCommand, AutoCommandSource, CommandKind, ConfigCommand,
+    DbCommand, DebugCommand,
 };
 use crate::auto_flow::{
     AutoExecutorConfig, AutoImplementationSource, AutoLaunch, AutoLaunchOptions, AutoRunMode,
@@ -12,7 +13,7 @@ use crate::observability::{self, LogLevel, ObserverOptions};
 use crate::plan_run::PlanRunMode;
 use crate::repo::Repository;
 use crate::tui::ManagedRepo;
-use crate::{config, plan, session, setup, tui, ui_state, workspace};
+use crate::{agent_session, config, plan, session, setup, tui, ui_state, workspace};
 use std::process::{Command as ProcessCommand, Stdio};
 
 pub fn run() -> Result<(), String> {
@@ -51,6 +52,11 @@ pub fn run() -> Result<(), String> {
             let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;
             config::doctor(&repo, &mut config)
         }
+        CommandKind::Agent(command) => {
+            let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;
+            config::ensure_default_agent_noninteractive(&mut config)?;
+            run_agent_command(command, &repo, &config)
+        }
         CommandKind::RunPlan(path) => {
             let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
             plan::run_plan_mode(&repo.root, &config, path.as_deref())
@@ -80,6 +86,65 @@ fn run_config_command(command: ConfigCommand, repo: &Repository, config: &Config
             println!("user_config = {}", config.user_path.display());
             println!("repo_config = {}", config.repo_config_path.display());
             println!("schema_url = {}", config::CONFIG_SCHEMA_URL);
+        }
+    }
+}
+
+fn run_agent_command(
+    command: AgentCommand,
+    repo: &Repository,
+    config: &Config,
+) -> Result<(), String> {
+    match command {
+        AgentCommand::Ensure { branch } => {
+            session::reconcile_worktree_state(repo, config)?;
+            let mut matches = session::discover_sessions(repo, config)?
+                .into_iter()
+                .filter(|session| session.branch == branch);
+            let selected = matches
+                .next()
+                .ok_or_else(|| format!("no worktree session found for branch '{branch}'"))?;
+            if matches.next().is_some() {
+                return Err(format!(
+                    "multiple worktree sessions found for branch '{branch}'"
+                ));
+            }
+            let ensured = agent_session::ensure_latest_session(repo, config, &selected)?;
+            if !ensured.running {
+                return Err(format!(
+                    "agent session for branch '{branch}' did not become ready"
+                ));
+            }
+            let runtime = ensured.opencode_runtime;
+
+            println!("branch = {}", selected.branch);
+            println!("worktree = {}", selected.path.display());
+            println!("generation = {}", ensured.generation);
+            println!("tmux_session = {}", ensured.tmux_session);
+            println!("running = true");
+            println!(
+                "opencode_server_url = {}",
+                runtime
+                    .as_ref()
+                    .map(|runtime| runtime.server_url.as_str())
+                    .unwrap_or("")
+            );
+            println!(
+                "opencode_server_pid = {}",
+                runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.server_pid)
+                    .map(|pid| pid.to_string())
+                    .unwrap_or_default()
+            );
+            println!(
+                "opencode_session_id = {}",
+                runtime
+                    .as_ref()
+                    .and_then(|runtime| runtime.opencode_session_id.as_deref())
+                    .unwrap_or("")
+            );
+            Ok(())
         }
     }
 }
