@@ -12,7 +12,7 @@ Set TypingSpeed 1ms
 Type "./prism --repo ."
 Enter
 Type "3"
-Wait+Screen@30s /feat\/review-fix/
+Wait+Screen@30s /fix\/review-comments/
 Type "j"
 Type "j"
 Sleep 1s

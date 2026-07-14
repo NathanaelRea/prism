@@ -67,7 +67,7 @@ else
   output_path="$repo_root/$output"
 fi
 
-sandbox_path="${TMPDIR:-/tmp}/prism-shot"
+sandbox_path="${TMPDIR:-/tmp}/prism"
 [[ ! -e "$sandbox_path" ]] || die "temporary sandbox already exists: $sandbox_path"
 logs_path="$sandbox_path/logs"
 prism_binary="$repo_root/target/release/prism"

@@ -50,16 +50,16 @@ create_worktree() {
 create_worktree "feat/agent-session" "$root/worktrees/agent-session" \
   "Improve recommendations while checks run" "recommendations.js" \
   'export const recommendations = () => ["Jasmine Tea"];'
-create_worktree "feat/review-fix" "$root/worktrees/review-fix" \
-  "Resolve review feedback on checkout" "review.js" \
+create_worktree "fix/review-comments" "$root/worktrees/review-comments" \
+  "Review the comments on PR 17 and fix if applicable" "review.js" \
   'export const unresolved = comments => comments.filter(comment => !comment.resolved);'
-create_worktree "feat/ci-green" "$root/worktrees/ci-green" \
+create_worktree "fix/ci-green" "$root/worktrees/ci-green" \
   "Prepare the storefront health check" "health.js" \
   'export const health = () => ({ checkout: "ready" });'
 create_worktree "feat/shipping-rates" "$root/worktrees/shipping-rates" \
   "Add regional shipping rates" "shipping.js" \
   'export const shippingRate = region => region === "local" ? 0 : 5;'
-create_worktree "feat/wishlist" "$root/worktrees/wishlist" \
+create_worktree "refactor/wishlist" "$root/worktrees/wishlist" \
   "Build the customer wishlist" "wishlist.js" \
   'export const wishlist = items => [...new Set(items)];'
 
@@ -75,6 +75,24 @@ create_repo() {
 create_repo "catalog"
 create_repo "payments"
 create_repo "fulfillment"
+
+create_repo_worktree() {
+  local repo_name="$1"
+  local branch="$2"
+  local path="$3"
+  local summary="$4"
+  local file="$5"
+  git -C "$root/work/$repo_name" worktree add -b "$branch" "$path" main >/dev/null
+  mkdir -p "$path/.agent/tasks"
+  printf '{ "prompt_summary": "%s" }\n' "$summary" >"$path/.agent/tasks/task.json"
+  printf '// %s\n' "$summary" >"$path/$file"
+}
+
+create_repo_worktree "catalog" "refactor/catalog-index" "$root/worktrees/catalog-index" \
+  "Rebuild the catalog search index" "catalog-index.js"
+create_repo_worktree "payments" "fix/payment-retries" "$root/worktrees/payment-retries" \
+  "Fix duplicate payment retries" "payment-retries.js"
+printf '\nCatalog sync pending.\n' >>"$root/work/catalog/README.md"
 
 cat >"$config_dir/repos.toml" <<EOF
 [[repos]]

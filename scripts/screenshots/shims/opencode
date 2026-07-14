@@ -93,6 +93,16 @@ def write_sessions(sessions):
 def session_payload(session):
     return {"id": session["id"], "directory": session.get("directory"), "title": session.get("title"), "timeUpdated": session.get("timeUpdated")}
 
+def session_status(session):
+    directory = session.get("directory") or ""
+    if directory.endswith("/agent-session") or directory.endswith("/review-comments"):
+        return "busy"
+    if directory.endswith("/ci-green"):
+        return "done"
+    if directory.endswith("/wishlist") or directory.endswith("/catalog-index"):
+        return "needs input"
+    return "idle"
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "PrismDemoOpenCode/0"
 
@@ -116,6 +126,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json(200, {"data": [session_payload(item) for item in sessions]})
         elif path.startswith("/session/") and path.endswith("/message"):
             self.send_json(200, {"data": [
+                {"role": "user", "text": "Review the comments on PR 17 and fix if applicable"},
                 {"role": "assistant", "text": "I mapped the storefront workflow and am applying the demo-safe fix."},
                 {"type": "tool", "name": "task running"},
             ]})
@@ -126,13 +137,16 @@ class Handler(BaseHTTPRequestHandler):
                 {"content": "Run focused smoke check", "status": "pending"},
             ]})
         elif path == "/session/status":
-            self.send_json(200, {item["id"]: "idle" for item in sessions})
+            self.send_json(200, {item["id"]: session_status(item) for item in sessions})
         elif path == "/event":
+            session = sessions[0] if sessions else {"id": "ses_demo", "directory": ""}
+            status = session_status(session)
             events = [
-                {"type": "session.status", "properties": {"sessionID": sessions[0]["id"] if sessions else "ses_demo", "status": "idle", "title": "Demo storefront"}},
-                {"type": "message.part.updated", "properties": {"sessionID": sessions[0]["id"] if sessions else "ses_demo", "role": "assistant", "text": "Reviewing failing CI and review comments."}},
-                {"type": "tool.updated", "properties": {"sessionID": sessions[0]["id"] if sessions else "ses_demo", "name": "task running"}},
+                {"type": "session.status", "properties": {"sessionID": session["id"], "status": status, "title": "Demo storefront"}},
+                {"type": "message.part.updated", "properties": {"sessionID": session["id"], "role": "assistant", "text": "Review the comments on PR 17 and fix if applicable"}},
             ]
+            if status == "busy":
+                events.append({"type": "tool.updated", "properties": {"sessionID": session["id"], "name": "task running"}})
             body = "".join(f"data: {json.dumps(event)}\n\n" for event in events).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")

@@ -92,42 +92,53 @@ export LANG=C.UTF-8
 ln -sf "$prism_binary" "$PRISM_DEMO_REPO/prism"
 "$prism_binary" --repo "$PRISM_DEMO_REPO" debug startup >/dev/null
 
-python3 - "$prism_binary" "$PRISM_DEMO_REPO" <<'PY'
+python3 - "$prism_binary" "$PRISM_DEMO_REPO" "$sandbox_path/work/payments" <<'PY'
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
-paths = subprocess.check_output(
-    [sys.argv[1], "--repo", sys.argv[2], "debug", "paths"], text=True
-)
-database = Path(next(
-    line.removeprefix("db_path = ")
-    for line in paths.splitlines()
-    if line.startswith("db_path = ")
-))
-with sqlite3.connect(database) as connection:
-    connection.executemany(
-        """insert or replace into pr_cache (
-             branch, number, title, body, url, state, review_decision,
-             requested_reviewers, head_ref, base_ref, head_sha, updated_at,
-             check_status, merge_state_status, comment_count, merged, draft,
-             last_refreshed, refreshed_unix_ms
-           ) values (?, ?, ?, '', ?, 'OPEN', ?, '', ?, 'main', 'demo',
-              '2026-01-15T12:00:00Z', ?, 'CLEAN', ?, 0, 0,
-              '2026-01-15T12:00:00Z', 4102444800000)""",
-        [
+def database_for(repo):
+    subprocess.check_call([sys.argv[1], "--repo", repo, "debug", "startup"], stdout=subprocess.DEVNULL)
+    paths = subprocess.check_output(
+        [sys.argv[1], "--repo", repo, "debug", "paths"], text=True
+    )
+    return Path(next(
+        line.removeprefix("db_path = ")
+        for line in paths.splitlines()
+        if line.startswith("db_path = ")
+    ))
+
+def seed_prs(repo, rows):
+    with sqlite3.connect(database_for(repo)) as connection:
+        connection.executemany(
+            """insert or replace into pr_cache (
+                 branch, number, title, body, url, state, review_decision,
+                 requested_reviewers, head_ref, base_ref, head_sha, updated_at,
+                 check_status, merge_state_status, comment_count, merged, draft,
+                 last_refreshed, refreshed_unix_ms
+               ) values (?, ?, ?, '', ?, 'OPEN', ?, '', ?, 'main', 'demo',
+                  '2026-01-15T12:00:00Z', ?, 'CLEAN', ?, 0, 0,
+                  '2026-01-15T12:00:00Z', 4102444800000)""",
+            rows,
+        )
+
+seed_prs(sys.argv[2], [
             ('feat/agent-session', 14, 'Improve product recommendations',
              'https://github.com/prism-demo/shop/pull/14', 'APPROVED',
              'feat/agent-session', 'pending', 0),
-            ('feat/review-fix', 17, 'Tighten review prompt',
+            ('fix/review-comments', 17, 'Tighten review prompt',
              'https://github.com/prism-demo/shop/pull/17', 'CHANGES_REQUESTED',
-             'feat/review-fix', 'failed', 2),
+             'fix/review-comments', 'failed', 2),
             ('feat/shipping-rates', 19, 'Add regional shipping rates',
              'https://github.com/prism-demo/shop/pull/19', 'APPROVED',
              'feat/shipping-rates', 'success', 0),
-        ],
-    )
+])
+seed_prs(sys.argv[3], [
+            ('fix/payment-retries', 23, 'Prevent duplicate payment retries',
+             'https://github.com/prism-demo/payments/pull/23', 'REVIEW_REQUIRED',
+             'fix/payment-retries', 'running', 1),
+])
 PY
 
 rendered_tape="$sandbox_path/prism.tape"
