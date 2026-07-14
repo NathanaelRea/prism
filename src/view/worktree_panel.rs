@@ -189,13 +189,18 @@ pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<
         heading_line("PR"),
         pr_number_line(model),
         stabilization_value_line("name", &model.pr_name, selected_text_style()),
+    ];
+    if model.pr_number.is_empty() {
+        return lines;
+    }
+    lines.extend([
         stabilization_value_line(
             "state",
             &model.blocker,
             stabilization_state_style(&model.blocker),
         ),
         stabilization_value_line("next", &model.next, attention_style()),
-    ];
+    ]);
     lines.push(stabilization_gate_line("ci", &model.ci, model.icon_style));
     lines.push(stabilization_gate_line(
         "review",
