@@ -463,6 +463,7 @@ fn real_prism_opencode_tmux_stack_ensures_reusable_agent_session() {
             worktree.to_str().expect("UTF-8 worktree path"),
         ],
     );
+    let worktree = fs::canonicalize(worktree).expect("canonicalize worktree path");
 
     let real_home = std::env::var("HOME").unwrap_or_default();
     write_executable(
