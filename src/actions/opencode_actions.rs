@@ -65,7 +65,11 @@ impl Tui {
                     let runtime = opencode::refresh_opencode_session(&repo, runtime, &path)?;
                     opencode::poll_status(&runtime)
                 });
-                let _ = tx.send(OpencodePollResult { key, status });
+                let _ = tx.send(OpencodePollResult {
+                    key,
+                    started_at: now,
+                    status,
+                });
             });
         }
     }
@@ -160,12 +164,35 @@ impl Tui {
         while let Ok(result) = self.opencode_poll_rx.try_recv() {
             self.opencode_polls_in_flight.remove(&result.key);
             match result.status {
-                Ok(status) => {
+                Ok(mut status) => {
                     if let Some(index) = self
                         .sessions
                         .iter()
                         .position(|session| opencode_poll_key(session) == result.key)
                     {
+                        let state_event_is_newer = self
+                            .opencode_last_state_event
+                            .get(&result.key)
+                            .is_some_and(|event_at| *event_at >= result.started_at);
+                        let preserve_active_from_idle = status.state
+                            == opencode::OpencodeState::Idle
+                            && self.sessions[index].opencode_status.as_ref().is_some_and(
+                                |current| {
+                                    !matches!(
+                                        current.state,
+                                        opencode::OpencodeState::Unknown
+                                            | opencode::OpencodeState::Idle
+                                            | opencode::OpencodeState::Offline
+                                    )
+                                },
+                            );
+                        if (state_event_is_newer || preserve_active_from_idle)
+                            && let Some(current) = self.sessions[index].opencode_status.as_ref()
+                        {
+                            // Idle sessions are omitted from /session/status, so a stale poll
+                            // can race a newer event. Only session.idle may finish active work.
+                            status.state = current.state;
+                        }
                         changed |= self.apply_opencode_status(index, status);
                     }
                 }
@@ -229,6 +256,10 @@ impl Tui {
                         status.title = Some(title);
                     }
                     if let Some(state) = event.state {
+                        self.opencode_last_state_event.insert(
+                            opencode_poll_key(&self.sessions[index]),
+                            std::time::Instant::now(),
+                        );
                         status.state = state;
                         if !matches!(
                             state,

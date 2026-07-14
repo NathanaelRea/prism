@@ -3,9 +3,10 @@ use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSession
 use crate::auto_flow::{AutoStepKey, load_auto_run};
 use crate::config::{Checks, Config, EscapeKey, MergeMethod};
 use crate::github::{PrCache, PrComment, PrDetails, PrSummary, pr_summary_or_error};
+use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
 use crate::repo::Repository;
 use crate::session::Session;
-use crate::tui::Tui;
+use crate::tui::{OpencodeEventResult, OpencodePollKey, OpencodePollResult, Tui};
 
 use super::{
     archived_picker_overflow_message, discover_wt_columns, pr_target_choice_list,
@@ -350,6 +351,116 @@ fn archived_picker_reports_overflow_instead_of_truncating() {
 
     assert!(message.contains("36 archived worktrees"));
     assert!(message.contains("picker limit 35"));
+}
+
+#[test]
+fn opencode_poll_does_not_mark_busy_session_done_before_idle_event() {
+    let temp = unique_temp_dir("prism-opencode-status-order-test");
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut session = test_session(temp.join("worktree"), "feature");
+    session.agent_state = AgentState::Running;
+    session.opencode_status = Some(test_opencode_status(OpencodeState::Busy));
+    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+
+    tui.opencode_poll_tx
+        .send(OpencodePollResult {
+            key: OpencodePollKey::for_session(&tui.sessions[0]),
+            started_at: Instant::now(),
+            status: Ok(test_opencode_status(OpencodeState::Idle)),
+        })
+        .unwrap();
+
+    tui.poll_opencode_status();
+    assert_eq!(
+        tui.sessions[0].opencode_status.as_ref().unwrap().state,
+        OpencodeState::Busy
+    );
+    assert_eq!(tui.sessions[0].agent_state, AgentState::Running);
+
+    tui.opencode_event_tx
+        .send(OpencodeEventResult {
+            server_url: "http://127.0.0.1:41000".to_string(),
+            event: Ok(parse_event_payload(
+                r#"{"type":"session.idle","properties":{"sessionID":"ses_1"}}"#,
+            )
+            .unwrap()),
+        })
+        .unwrap();
+
+    assert!(tui.poll_opencode_events());
+    assert_eq!(
+        tui.sessions[0].opencode_status.as_ref().unwrap().state,
+        OpencodeState::Idle
+    );
+    assert_eq!(tui.sessions[0].agent_state, AgentState::ExitedOk);
+
+    tui.opencode_event_tx
+        .send(OpencodeEventResult {
+            server_url: "http://127.0.0.1:41000".to_string(),
+            event: Ok(parse_event_payload(
+                r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":"busy"}}"#,
+            )
+            .unwrap()),
+        })
+        .unwrap();
+    assert!(tui.poll_opencode_events());
+
+    let poll_started_at = Instant::now();
+    tui.opencode_poll_tx
+        .send(OpencodePollResult {
+            key: OpencodePollKey::for_session(&tui.sessions[0]),
+            started_at: poll_started_at,
+            status: Ok(test_opencode_status(OpencodeState::Busy)),
+        })
+        .unwrap();
+    tui.opencode_event_tx
+        .send(OpencodeEventResult {
+            server_url: "http://127.0.0.1:41000".to_string(),
+            event: Ok(parse_event_payload(
+                r#"{"type":"session.idle","properties":{"sessionID":"ses_1"}}"#,
+            )
+            .unwrap()),
+        })
+        .unwrap();
+
+    assert!(tui.poll_opencode_events());
+    tui.poll_opencode_status();
+    assert_eq!(
+        tui.sessions[0].opencode_status.as_ref().unwrap().state,
+        OpencodeState::Idle
+    );
+    assert_eq!(tui.sessions[0].agent_state, AgentState::ExitedOk);
+
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn opencode_permission_event_marks_session_as_needing_input() {
+    let temp = unique_temp_dir("prism-opencode-permission-status-test");
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut session = test_session(temp.join("worktree"), "feature");
+    session.agent_state = AgentState::Running;
+    session.opencode_status = Some(test_opencode_status(OpencodeState::Busy));
+    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+
+    tui.opencode_event_tx
+        .send(OpencodeEventResult {
+            server_url: "http://127.0.0.1:41000".to_string(),
+            event: Ok(parse_event_payload(
+                r#"{"type":"permission.asked","properties":{"sessionID":"ses_1","permission":"bash"}}"#,
+            )
+            .unwrap()),
+        })
+        .unwrap();
+
+    assert!(tui.poll_opencode_events());
+    assert_eq!(
+        tui.sessions[0].opencode_status.as_ref().unwrap().state,
+        OpencodeState::NeedsInput
+    );
+    assert_eq!(tui.sessions[0].agent_state, AgentState::NeedsInput);
+
+    let _ = fs::remove_dir_all(temp);
 }
 
 #[test]
@@ -912,6 +1023,21 @@ fn test_session(path: PathBuf, branch: &str) -> Session {
         pr: PrCache::default(),
         wt_columns: BTreeMap::new(),
         unseen_comments: false,
+    }
+}
+
+fn test_opencode_status(state: OpencodeState) -> OpencodeStatus {
+    OpencodeStatus {
+        server_url: Some("http://127.0.0.1:41000".to_string()),
+        session_id: Some("ses_1".to_string()),
+        title: None,
+        state,
+        latest_message: None,
+        latest_user_message: None,
+        recent_messages: Vec::new(),
+        active_tool: None,
+        todos: Vec::new(),
+        last_updated_unix_ms: Some(1),
     }
 }
 
