@@ -704,6 +704,7 @@ fn pane_command_matches_agent(config: &Config, pane_command: &str) -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or(&expected);
     pane_command == expected
+        || (config.default_agent == "opencode" && pane_command == format!("{expected}.exe"))
 }
 
 fn usable_opencode_runtime(repo: &Repository, session: &Session) -> Option<OpencodeRuntime> {
@@ -1092,6 +1093,7 @@ exit 0
         };
 
         assert!(pane_command_matches_agent(&config, "opencode"));
+        assert!(pane_command_matches_agent(&config, "opencode.exe"));
         assert!(!pane_command_matches_agent(&config, "bash"));
         assert!(!pane_command_matches_agent(&config, "zsh"));
     }
