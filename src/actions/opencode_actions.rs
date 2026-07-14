@@ -65,7 +65,11 @@ impl Tui {
                     let runtime = opencode::refresh_opencode_session(&repo, runtime, &path)?;
                     opencode::poll_status(&runtime)
                 });
-                let _ = tx.send(OpencodePollResult { key, status });
+                let _ = tx.send(OpencodePollResult {
+                    key,
+                    started_at: now,
+                    status,
+                });
             });
         }
     }
@@ -106,6 +110,7 @@ impl Tui {
                         session_id: Some(session_id.clone()),
                         title: current.as_ref().and_then(|status| status.title.clone()),
                         state: opencode::OpencodeState::Unknown,
+                        detail: current.as_ref().and_then(|status| status.detail.clone()),
                         latest_message: current
                             .as_ref()
                             .and_then(|status| status.latest_message.clone()),
@@ -160,12 +165,45 @@ impl Tui {
         while let Ok(result) = self.opencode_poll_rx.try_recv() {
             self.opencode_polls_in_flight.remove(&result.key);
             match result.status {
-                Ok(status) => {
+                Ok(mut status) => {
                     if let Some(index) = self
                         .sessions
                         .iter()
                         .position(|session| opencode_poll_key(session) == result.key)
                     {
+                        let state_event_is_newer = self
+                            .opencode_last_state_event
+                            .get(&result.key)
+                            .is_some_and(|event_at| *event_at >= result.started_at);
+                        let current = self.sessions[index].opencode_status.as_ref();
+                        let preserve_active_from_idle = status.state
+                            == opencode::OpencodeState::Idle
+                            && (self.sessions[index].agent_state == AgentState::Running
+                                || current.is_some_and(|current| {
+                                    !matches!(
+                                        current.state,
+                                        opencode::OpencodeState::Unknown
+                                            | opencode::OpencodeState::Idle
+                                            | opencode::OpencodeState::Offline
+                                    )
+                                }));
+                        if state_event_is_newer && let Some(current) = current {
+                            status.state = current.state;
+                        } else if preserve_active_from_idle {
+                            // Idle sessions are omitted from /session/status. Preserve active
+                            // work until message history reports a completed assistant turn.
+                            status.state = current
+                                .map(|current| current.state)
+                                .filter(|state| {
+                                    !matches!(
+                                        state,
+                                        opencode::OpencodeState::Unknown
+                                            | opencode::OpencodeState::Idle
+                                            | opencode::OpencodeState::Offline
+                                    )
+                                })
+                                .unwrap_or(opencode::OpencodeState::Busy);
+                        }
                         changed |= self.apply_opencode_status(index, status);
                     }
                 }
@@ -216,6 +254,7 @@ impl Tui {
                         session_id: Some(session_id.to_string()),
                         title: None,
                         state: opencode::OpencodeState::Unknown,
+                        detail: None,
                         latest_message: None,
                         latest_user_message: None,
                         recent_messages: Vec::new(),
@@ -229,13 +268,26 @@ impl Tui {
                         status.title = Some(title);
                     }
                     if let Some(state) = event.state {
-                        status.state = state;
+                        self.opencode_last_state_event.insert(
+                            opencode_poll_key(&self.sessions[index]),
+                            std::time::Instant::now(),
+                        );
+                        if state != opencode::OpencodeState::Idle
+                            || status.state != opencode::OpencodeState::Done
+                        {
+                            status.state = state;
+                        }
                         if !matches!(
                             state,
                             opencode::OpencodeState::Busy | opencode::OpencodeState::Retry
                         ) {
                             status.active_tool = None;
                         }
+                    }
+                    if let Some(detail) = event.detail {
+                        status.detail = Some(detail);
+                    } else if event.state == Some(opencode::OpencodeState::Busy) {
+                        status.detail = None;
                     }
                     if let Some(message) = event.latest_message {
                         status.latest_message = Some(message.clone());
@@ -339,7 +391,8 @@ impl Tui {
                 .opencode_status
                 .as_ref()
                 .and_then(|status| status.title.clone()),
-            state: opencode::OpencodeState::Idle,
+            state: opencode::OpencodeState::Done,
+            detail: Some("aborted".to_string()),
             latest_message: self.sessions[selected]
                 .opencode_status
                 .as_ref()

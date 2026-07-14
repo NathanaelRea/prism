@@ -282,7 +282,10 @@ pub(super) fn apply_agent_event(
         }
         PlanAgentEvent::StateChanged { state } => {
             step.opencode_state = OpencodeState::parse(&state);
-            if state == OpencodeState::Idle.label() {
+            if matches!(
+                step.opencode_state,
+                Some(OpencodeState::Idle | OpencodeState::Done)
+            ) {
                 step.active_tool = None;
             }
             (PlanOutputKind::Status, format!("status: {state}"), None)

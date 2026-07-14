@@ -218,6 +218,7 @@ impl Tui {
         #[cfg(test)]
         if let Some(submissions) = &mut self.prompt_submissions {
             submissions.push((index, prompt.to_string(), use_.generation));
+            self.mark_opencode_prompt_submitted(index, &config);
             return Ok(());
         }
 
@@ -230,6 +231,29 @@ impl Tui {
             &use_.slot,
             running,
         );
+        self.mark_opencode_prompt_submitted(index, &config);
         Ok(())
+    }
+
+    fn mark_opencode_prompt_submitted(&mut self, index: usize, config: &crate::config::Config) {
+        if config.default_agent != "opencode"
+            || config.is_default_branch(&self.sessions[index].branch)
+        {
+            return;
+        }
+        if let Some(status) = self.sessions[index].opencode_status.as_mut() {
+            status.state = crate::opencode::OpencodeState::Busy;
+            status.detail = None;
+            status.active_tool = None;
+            status.last_updated_unix_ms = Some(super::opencode_actions::current_unix_ms());
+        }
+        self.sessions[index].agent_state = AgentState::Running;
+        if let Some(repo) = self.repos.get(self.sessions[index].repo_index) {
+            let _ = save_agent_state(
+                &repo.repo,
+                &self.sessions[index].branch,
+                AgentState::Running,
+            );
+        }
     }
 }

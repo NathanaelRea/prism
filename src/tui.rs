@@ -66,6 +66,7 @@ pub struct Tui {
     pub(crate) opencode_poll_rx: Receiver<OpencodePollResult>,
     pub(crate) opencode_polls_in_flight: BTreeSet<OpencodePollKey>,
     pub(crate) opencode_last_polled: BTreeMap<OpencodePollKey, Instant>,
+    pub(crate) opencode_last_state_event: BTreeMap<OpencodePollKey, Instant>,
     pub(crate) opencode_event_tx: Sender<OpencodeEventResult>,
     pub(crate) opencode_event_rx: Receiver<OpencodeEventResult>,
     pub(crate) opencode_sse_servers: BTreeSet<String>,
@@ -237,6 +238,7 @@ pub(crate) struct OpencodePollKey {
 
 pub(crate) struct OpencodePollResult {
     pub key: OpencodePollKey,
+    pub started_at: Instant,
     pub status: Result<OpencodeStatus, String>,
 }
 
@@ -461,6 +463,7 @@ impl Tui {
             opencode_poll_rx,
             opencode_polls_in_flight: BTreeSet::new(),
             opencode_last_polled: BTreeMap::new(),
+            opencode_last_state_event: BTreeMap::new(),
             opencode_event_tx,
             opencode_event_rx,
             opencode_sse_servers: BTreeSet::new(),

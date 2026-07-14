@@ -834,6 +834,7 @@ fn worktree_main_panel_renders_five_agent_messages_without_indenting_user_messag
         session_id: None,
         title: None,
         state: OpencodeState::Busy,
+        detail: None,
         latest_message: Some("implementing the panel".to_string()),
         latest_user_message: Some("please update the panel".to_string()),
         recent_messages: vec![
@@ -901,6 +902,7 @@ fn worktree_main_panel_renders_unknown_opencode_status_as_needing_restart() {
         session_id: None,
         title: None,
         state: OpencodeState::Unknown,
+        detail: None,
         latest_message: None,
         latest_user_message: None,
         recent_messages: Vec::new(),
@@ -928,6 +930,7 @@ fn worktree_main_panel_renders_unknown_status_with_active_tool_as_running() {
         session_id: None,
         title: None,
         state: OpencodeState::Unknown,
+        detail: None,
         latest_message: None,
         latest_user_message: None,
         recent_messages: Vec::new(),
@@ -959,6 +962,7 @@ fn worktree_main_panel_renders_idle_status_with_active_tool_as_running() {
         session_id: None,
         title: None,
         state: OpencodeState::Idle,
+        detail: None,
         latest_message: None,
         latest_user_message: None,
         recent_messages: Vec::new(),
@@ -986,7 +990,8 @@ fn worktree_main_panel_renders_opencode_workflow_states() {
     let config = test_config();
     for (state, expected) in [
         (OpencodeState::Retry, "↻ retrying"),
-        (OpencodeState::Idle, "✓ done"),
+        (OpencodeState::Idle, "○ ready"),
+        (OpencodeState::Done, "✓ done"),
         (OpencodeState::NeedsInput, "! needs input"),
         (OpencodeState::Error, "✕ failed"),
     ] {
@@ -996,6 +1001,7 @@ fn worktree_main_panel_renders_opencode_workflow_states() {
             session_id: None,
             title: None,
             state,
+            detail: None,
             latest_message: None,
             latest_user_message: None,
             recent_messages: Vec::new(),
