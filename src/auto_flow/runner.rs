@@ -8,6 +8,12 @@ pub fn execute_auto_initial_step(
     executor: &AutoExecutorConfig,
     output: &mut dyn Write,
 ) -> Result<(), String> {
+    let run_id = persisted.run.id.clone();
+    *persisted = load_auto_run(conn, &run_id)?
+        .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
+    if auto_run_execution_blocked(persisted) {
+        return Ok(());
+    }
     persisted.run.pause_requested = false;
     persisted.run.status = AutoRunStatus::Running;
     persisted.run.updated_unix_ms = unix_ms();
@@ -80,6 +86,16 @@ pub fn execute_auto_initial_step(
         save_run_with_conn(conn, &persisted.run)?;
         return Ok(());
     }
+}
+
+pub(super) fn auto_run_execution_blocked(persisted: &PersistedAutoRun) -> bool {
+    persisted.run.pause_requested
+        || persisted.run.status == AutoRunStatus::Paused
+        || persisted.run.status == AutoRunStatus::Aborted
+        || matches!(
+            persisted.run.status,
+            AutoRunStatus::Done | AutoRunStatus::Failed
+        ) && !has_pending_auto_work(persisted)
 }
 
 pub(super) fn complete_queued_prepare(

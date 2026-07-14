@@ -1,6 +1,197 @@
 use super::*;
 
-pub fn request_auto_run_pause(
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoRunControlIntent {
+    Pause,
+    Resume,
+    RetryFailed,
+    RetryFromStep { step_run_id: i64 },
+    AbortStep { step_run_id: i64 },
+    AbortRun,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoRunControlEffect {
+    PauseRequested,
+    Paused,
+    Resumed,
+    RetriedFailed,
+    RetriedFromStep { step_run_id: i64 },
+    AbortedStep { step_run_id: i64 },
+    AbortedRun,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoExecutorDecision {
+    Start,
+    AlreadyRunning,
+    DoNotStart,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoRunControlOutcome {
+    pub run: PersistedAutoRun,
+    pub effect: AutoRunControlEffect,
+    pub executor: AutoExecutorDecision,
+    pub warnings: Vec<String>,
+}
+
+pub fn apply_auto_run_control(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+    intent: AutoRunControlIntent,
+) -> Result<AutoRunControlOutcome, String> {
+    let mut persisted =
+        load_auto_run(conn, run_id)?.ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
+    let mut warnings = Vec::new();
+    let (effect, executor) = match intent {
+        AutoRunControlIntent::Pause => {
+            request_auto_run_pause(conn, &mut persisted)?;
+            let effect = if persisted.run.status == AutoRunStatus::Paused {
+                AutoRunControlEffect::Paused
+            } else {
+                AutoRunControlEffect::PauseRequested
+            };
+            (effect, AutoExecutorDecision::DoNotStart)
+        }
+        AutoRunControlIntent::Resume => {
+            if !persisted.run.pause_requested && persisted.run.status != AutoRunStatus::Paused {
+                return Err("auto flow run is not paused".to_string());
+            }
+            let should_execute =
+                prepare_auto_run_for_resume(conn, &mut persisted, DEFAULT_OUTPUT_LINES_PER_STEP)?;
+            (
+                AutoRunControlEffect::Resumed,
+                if should_execute {
+                    AutoExecutorDecision::Start
+                } else if persisted.run.status == AutoRunStatus::Running {
+                    AutoExecutorDecision::AlreadyRunning
+                } else {
+                    AutoExecutorDecision::DoNotStart
+                },
+            )
+        }
+        AutoRunControlIntent::RetryFailed => {
+            retry_failed_auto_step(conn, &mut persisted)?;
+            (
+                AutoRunControlEffect::RetriedFailed,
+                AutoExecutorDecision::Start,
+            )
+        }
+        AutoRunControlIntent::RetryFromStep { step_run_id } => {
+            retry_auto_from_step(conn, &mut persisted, step_run_id)?;
+            (
+                AutoRunControlEffect::RetriedFromStep { step_run_id },
+                AutoExecutorDecision::Start,
+            )
+        }
+        AutoRunControlIntent::AbortStep { step_run_id } => {
+            abort_selected_auto_step(conn, &mut persisted, step_run_id, &mut warnings)?;
+            (
+                AutoRunControlEffect::AbortedStep { step_run_id },
+                AutoExecutorDecision::DoNotStart,
+            )
+        }
+        AutoRunControlIntent::AbortRun => {
+            abort_auto_run(conn, &mut persisted, &mut warnings)?;
+            (
+                AutoRunControlEffect::AbortedRun,
+                AutoExecutorDecision::DoNotStart,
+            )
+        }
+    };
+    Ok(AutoRunControlOutcome {
+        run: persisted,
+        effect,
+        executor,
+        warnings,
+    })
+}
+
+fn abort_selected_auto_step(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+    step_run_id: i64,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    let step = persisted
+        .steps
+        .iter_mut()
+        .find(|step| step.id == Some(step_run_id))
+        .ok_or_else(|| format!("auto flow step not found: {step_run_id}"))?;
+    abort_linked_plan_run(conn, step, warnings)?;
+    abort_step_recording_warning(conn, step, warnings);
+    persisted.run.status = persisted.aggregate_status();
+    persisted.run.updated_unix_ms = unix_ms();
+    save_auto_run(conn, persisted)
+}
+
+fn abort_auto_run(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    for step in &mut persisted.steps {
+        if matches!(
+            step.status,
+            AutoStepStatus::Queued
+                | AutoStepStatus::Starting
+                | AutoStepStatus::Running
+                | AutoStepStatus::Waiting
+        ) {
+            abort_linked_plan_run(conn, step, warnings)?;
+            abort_step_recording_warning(conn, step, warnings);
+        }
+    }
+    persisted.run.status = AutoRunStatus::Aborted;
+    persisted.run.pause_requested = false;
+    persisted.run.updated_unix_ms = unix_ms();
+    save_auto_run(conn, persisted)
+}
+
+fn abort_linked_plan_run(
+    conn: &rusqlite::Connection,
+    step: &AutoStepRun,
+    warnings: &mut Vec<String>,
+) -> Result<(), String> {
+    let Some(plan_run_id) = step.plan_run_id.as_deref() else {
+        return Ok(());
+    };
+    let Some(mut plan_run) = load_plan_run(conn, plan_run_id)? else {
+        warnings.push(format!("linked plan run not found: {plan_run_id}"));
+        return Ok(());
+    };
+    if matches!(
+        plan_run.run.status,
+        PlanRunStatus::Done | PlanRunStatus::Failed | PlanRunStatus::Aborted
+    ) {
+        return Ok(());
+    }
+    if let Err(error) = abort_plan_run(conn, &mut plan_run) {
+        warnings.push(format!("linked plan run {plan_run_id}: {error}"));
+    }
+    Ok(())
+}
+
+fn abort_step_recording_warning(
+    conn: &rusqlite::Connection,
+    step: &mut AutoStepRun,
+    warnings: &mut Vec<String>,
+) {
+    if matches!(
+        step.status,
+        AutoStepStatus::Starting | AutoStepStatus::Running
+    ) {
+        if let Err(error) = abort_auto_step(conn, step) {
+            warnings.push(error);
+        }
+    } else {
+        step.status = AutoStepStatus::Aborted;
+        step.finished_unix_ms = Some(unix_ms());
+    }
+}
+
+pub(super) fn request_auto_run_pause(
     conn: &rusqlite::Connection,
     persisted: &mut PersistedAutoRun,
 ) -> Result<(), String> {
@@ -20,19 +211,6 @@ pub fn request_auto_run_pause(
         persisted.run.status = AutoRunStatus::Paused;
     }
     request_active_linked_plan_pause(conn, persisted)?;
-    persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)
-}
-
-pub fn resume_paused_auto_run(
-    conn: &rusqlite::Connection,
-    persisted: &mut PersistedAutoRun,
-) -> Result<(), String> {
-    if !persisted.run.pause_requested && persisted.run.status != AutoRunStatus::Paused {
-        return Err("auto flow run is not paused".to_string());
-    }
-    persisted.run.pause_requested = false;
-    persisted.run.status = persisted.aggregate_status();
     persisted.run.updated_unix_ms = unix_ms();
     save_run_with_conn(conn, &persisted.run)
 }
@@ -60,7 +238,7 @@ pub fn fail_auto_run(
     save_run_with_conn(conn, &persisted.run)
 }
 
-pub fn retry_failed_auto_step(
+pub(super) fn retry_failed_auto_step(
     conn: &rusqlite::Connection,
     persisted: &mut PersistedAutoRun,
 ) -> Result<(), String> {
@@ -117,7 +295,7 @@ pub fn retry_failed_auto_step(
     Ok(())
 }
 
-pub fn retry_auto_from_step(
+pub(super) fn retry_auto_from_step(
     conn: &rusqlite::Connection,
     persisted: &mut PersistedAutoRun,
     selected_step_run_id: i64,
@@ -166,7 +344,7 @@ pub fn archive_auto_run(
     save_run_with_conn(conn, &persisted.run)
 }
 
-pub fn abort_auto_step(conn: &rusqlite::Connection, step: &mut AutoStepRun) -> Result<(), String> {
+fn abort_auto_step(conn: &rusqlite::Connection, step: &mut AutoStepRun) -> Result<(), String> {
     let mut errors = Vec::new();
     if let (Some(server_url), Some(session_id)) = (
         step.opencode_server_url.as_deref(),
@@ -286,6 +464,9 @@ pub(super) fn reconcile_linked_plan_runs(
             }
             continue;
         };
+        if plan_run.run.pause_requested || plan_run.run.status == PlanRunStatus::Paused {
+            resume_paused_plan_run(conn, &mut plan_run)?;
+        }
         let can_resume =
             prepare_plan_run_for_resume(conn, &mut plan_run, max_output_lines_per_step)?;
         let before = persisted.steps[index].status;
@@ -361,9 +542,10 @@ pub fn prepare_auto_run_for_resume(
     persisted: &mut PersistedAutoRun,
     max_output_lines_per_step: usize,
 ) -> Result<bool, String> {
+    let was_paused = persisted.run.pause_requested || persisted.run.status == AutoRunStatus::Paused;
     let linked_changed = reconcile_linked_plan_runs(conn, persisted, max_output_lines_per_step)?;
     let changed = reconcile_stale_auto_run(conn, persisted)? || linked_changed;
-    if matches!(persisted.run.status, AutoRunStatus::Paused) {
+    if was_paused {
         persisted.run.pause_requested = false;
         persisted.run.status = persisted.aggregate_status();
         if matches!(persisted.run.status, AutoRunStatus::Done) {

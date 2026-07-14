@@ -672,6 +672,45 @@ fn abort_plan_step_marks_step_aborted() {
 }
 
 #[test]
+fn abort_plan_run_aborts_queued_steps_and_clears_pause() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted = PlanLaunch::new(
+        &repo,
+        &repo,
+        &repo.join("plan.md"),
+        "phase",
+        1,
+        2,
+        PlanRunMode::Sequential,
+    )
+    .unwrap()
+    .create_run();
+    persisted.run.pause_requested = true;
+    save_plan_run(&conn, &persisted).unwrap();
+
+    abort_plan_run(&conn, &mut persisted).unwrap();
+
+    assert_eq!(persisted.run.status, PlanRunStatus::Aborted);
+    assert!(!persisted.run.pause_requested);
+    assert!(
+        persisted
+            .steps
+            .iter()
+            .all(|step| step.status == PlanStepStatus::Aborted)
+    );
+    let loaded = load_plan_run(&conn, &persisted.run.id).unwrap().unwrap();
+    assert_eq!(loaded.run.status, PlanRunStatus::Aborted);
+    assert!(
+        loaded
+            .steps
+            .iter()
+            .all(|step| step.status == PlanStepStatus::Aborted)
+    );
+}
+
+#[test]
 fn reconcile_marks_running_steps_failed_after_restart() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();

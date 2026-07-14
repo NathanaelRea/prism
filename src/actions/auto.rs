@@ -267,57 +267,29 @@ impl Tui {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
         let run_id = dashboard.run.run.id.clone();
-        crate::observability::with_writable_db(&repo, |conn| {
-            let mut run = load_auto_run(conn, &run_id)?
-                .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
-            if answer == "a" {
-                for step in &mut run.steps {
-                    if matches!(
-                        step.status,
-                        AutoStepStatus::Queued
-                            | AutoStepStatus::Starting
-                            | AutoStepStatus::Running
-                            | AutoStepStatus::Waiting
-                    ) {
-                        if matches!(
-                            step.status,
-                            AutoStepStatus::Starting | AutoStepStatus::Running
-                        ) {
-                            let _ = abort_auto_step(conn, step);
-                        } else {
-                            step.status = AutoStepStatus::Aborted;
-                            step.finished_unix_ms = Some(crate::auto_flow::unix_ms());
-                        }
-                    }
-                }
-                run.run.status = AutoRunStatus::Aborted;
-                run.run.pause_requested = false;
-            } else {
-                let selected = run
-                    .run
-                    .selected_step_run_id
-                    .or_else(|| run.steps.first().and_then(|step| step.id))
-                    .ok_or_else(|| "auto flow run has no selected step".to_string())?;
-                let step = run
-                    .steps
-                    .iter_mut()
-                    .find(|step| step.id == Some(selected))
-                    .ok_or_else(|| format!("auto flow step not found: {selected}"))?;
-                if matches!(
-                    step.status,
-                    AutoStepStatus::Starting | AutoStepStatus::Running
-                ) {
-                    abort_auto_step(conn, step)?;
-                } else {
-                    step.status = AutoStepStatus::Aborted;
-                    step.finished_unix_ms = Some(crate::auto_flow::unix_ms());
-                }
-                run.run.status = run.aggregate_status();
-            }
-            save_auto_run(conn, &mut run)
+        let intent = if answer == "a" {
+            AutoRunControlIntent::AbortRun
+        } else {
+            let step_run_id = dashboard
+                .run
+                .run
+                .selected_step_run_id
+                .or_else(|| dashboard.run.steps.first().and_then(|step| step.id))
+                .ok_or_else(|| "auto flow run has no selected step".to_string())?;
+            AutoRunControlIntent::AbortStep { step_run_id }
+        };
+        let outcome = crate::observability::with_writable_db(&repo, |conn| {
+            apply_auto_run_control(conn, &run_id, intent)
         })?;
-        self.load_auto_run_snapshot(&repo.root, &run_id);
-        self.show_message("abort recorded for Auto Flow")?;
+        self.remember_auto_run(outcome.run);
+        if outcome.warnings.is_empty() {
+            self.show_message("abort recorded for Auto Flow")?;
+        } else {
+            self.show_message(&format!(
+                "abort recorded for Auto Flow with warnings: {}",
+                outcome.warnings.join("; ")
+            ))?;
+        }
         Ok(true)
     }
 
@@ -330,14 +302,14 @@ impl Tui {
         };
         let config = Config::load(&repo);
         let run_id = dashboard.run.run.id.clone();
-        let persisted = crate::observability::with_writable_db(&repo, |conn| {
-            let mut run = load_auto_run(conn, &run_id)?
-                .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
-            retry_auto_failed_step(conn, &mut run)?;
-            Ok(run)
+        let outcome = crate::observability::with_writable_db(&repo, |conn| {
+            apply_auto_run_control(conn, &run_id, AutoRunControlIntent::RetryFailed)
         })?;
+        let persisted = outcome.run;
         self.remember_auto_run(persisted.clone());
-        self.spawn_auto_run_executor(repo, config, persisted);
+        if outcome.executor == AutoExecutorDecision::Start {
+            self.spawn_auto_run_executor(repo, config, persisted);
+        }
         self.show_message("retrying Auto Flow step")?;
         Ok(true)
     }
@@ -367,14 +339,20 @@ impl Tui {
         };
         let config = Config::load(&repo);
         let run_id = dashboard.run.run.id.clone();
-        let persisted = crate::observability::with_writable_db(&repo, |conn| {
-            let mut run = load_auto_run(conn, &run_id)?
-                .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
-            retry_auto_from_step(conn, &mut run, selected)?;
-            Ok(run)
+        let outcome = crate::observability::with_writable_db(&repo, |conn| {
+            apply_auto_run_control(
+                conn,
+                &run_id,
+                AutoRunControlIntent::RetryFromStep {
+                    step_run_id: selected,
+                },
+            )
         })?;
+        let persisted = outcome.run;
         self.remember_auto_run(persisted.clone());
-        self.spawn_auto_run_executor(repo, config, persisted);
+        if outcome.executor == AutoExecutorDecision::Start {
+            self.spawn_auto_run_executor(repo, config, persisted);
+        }
         self.show_message("retrying Auto Flow from selected step")?;
         Ok(true)
     }
@@ -389,37 +367,33 @@ impl Tui {
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
-        let config = Config::load(&repo);
         let run_id = dashboard.run.run.id.clone();
-        let mut should_execute = false;
         let resuming =
             dashboard.run.run.pause_requested || dashboard.run.run.status == AutoRunStatus::Paused;
         if resuming && !self.confirm_resume_auto_step(raw, &dashboard.run)? {
             self.show_message("Auto Flow resume cancelled")?;
             return Ok(true);
         }
-        let persisted = crate::observability::with_writable_db(&repo, |conn| {
-            let mut run = load_auto_run(conn, &run_id)?
-                .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
-            if run.run.pause_requested || run.run.status == AutoRunStatus::Paused {
-                resume_paused_auto_run(conn, &mut run)?;
-                should_execute =
-                    prepare_auto_run_for_resume(conn, &mut run, DEFAULT_OUTPUT_LINES_PER_STEP)?;
-            } else {
-                request_auto_run_pause(conn, &mut run)?;
-            }
-            Ok(run)
-        })?;
-        self.remember_auto_run(persisted.clone());
-        if persisted.run.pause_requested || persisted.run.status == AutoRunStatus::Paused {
-            self.show_message("Auto Flow will pause before the next step")?;
+        let intent = if resuming {
+            AutoRunControlIntent::Resume
         } else {
-            if should_execute {
-                self.spawn_auto_run_executor(repo, config, persisted);
-                self.show_message("resumed Auto Flow run")?;
-            } else {
-                self.show_message("Auto Flow has no queued agent step")?;
-            }
+            AutoRunControlIntent::Pause
+        };
+        let outcome = crate::observability::with_writable_db(&repo, |conn| {
+            apply_auto_run_control(conn, &run_id, intent)
+        })?;
+        let executor = outcome.executor;
+        let persisted = outcome.run;
+        self.remember_auto_run(persisted.clone());
+        if !resuming {
+            self.show_message("Auto Flow will pause before the next step")?;
+        } else if executor == AutoExecutorDecision::Start {
+            self.spawn_auto_run_executor(repo.clone(), Config::load(&repo), persisted);
+            self.show_message("resumed Auto Flow run")?;
+        } else if executor == AutoExecutorDecision::AlreadyRunning {
+            self.show_message("resumed Auto Flow run; work is already running")?;
+        } else {
+            self.show_message("Auto Flow has no queued agent step")?;
         }
         Ok(true)
     }

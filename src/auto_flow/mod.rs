@@ -16,10 +16,10 @@ use crate::observability::{self, LogLevel};
 use crate::plan::PlanExecution;
 use crate::plan_run::{
     DEFAULT_OUTPUT_LINES_PER_STEP, PlanAgentEvent, PlanExecutorConfig, PlanRunMode, PlanRunStatus,
-    execute_plan_parallel, execute_plan_sequential, load_plan_run, prepare_plan_plugin_config,
-    prepare_plan_run_for_resume, request_plan_run_pause,
-    retry_failed_steps as retry_plan_failed_steps, retry_from_step as retry_plan_from_step,
-    save_plan_run,
+    abort_plan_run, execute_plan_parallel, execute_plan_sequential, load_plan_run,
+    prepare_plan_plugin_config, prepare_plan_run_for_resume, request_plan_run_pause,
+    resume_paused_plan_run, retry_failed_steps as retry_plan_failed_steps,
+    retry_from_step as retry_plan_from_step, save_plan_run,
 };
 use crate::repo::Repository;
 use crate::review::{ReviewFeedback, ReviewFeedbackFilter, actionable_review_feedback};
@@ -44,9 +44,9 @@ mod support;
 mod tests;
 
 pub use control::{
-    abort_auto_step, archive_auto_run, fail_auto_run, prepare_auto_run_for_resume,
-    reconcile_stale_auto_run, request_auto_run_pause, resume_paused_auto_run, retry_auto_from_step,
-    retry_failed_auto_step,
+    AutoExecutorDecision, AutoRunControlEffect, AutoRunControlIntent, AutoRunControlOutcome,
+    apply_auto_run_control, archive_auto_run, fail_auto_run, prepare_auto_run_for_resume,
+    reconcile_stale_auto_run,
 };
 pub use model::{
     AutoEvent, AutoExecutorConfig, AutoImplementationSource, AutoLaunch, AutoLaunchOptions,

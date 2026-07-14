@@ -11,11 +11,10 @@ use serde_json::Value;
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{
-    AutoExecutorConfig, AutoImplementationSource, AutoLaunch, AutoLaunchOptions, AutoRunMode,
-    AutoRunStatus, AutoStepKey, AutoStepStatus, PersistedAutoRun, abort_auto_step, append_step_run,
-    archive_auto_run, execute_auto_initial_step, load_auto_run, prepare_auto_run_for_resume,
-    request_auto_run_pause, resume_paused_auto_run, retry_auto_from_step,
-    retry_failed_auto_step as retry_auto_failed_step, save_auto_run,
+    AutoExecutorConfig, AutoExecutorDecision, AutoImplementationSource, AutoLaunch,
+    AutoLaunchOptions, AutoRunControlIntent, AutoRunMode, AutoRunStatus, AutoStepKey,
+    AutoStepStatus, PersistedAutoRun, append_step_run, apply_auto_run_control, archive_auto_run,
+    execute_auto_initial_step, load_auto_run, prepare_auto_run_for_resume, save_auto_run,
     stabilization_execute::{GuardedPushDecision, decide_guarded_push},
     stabilization_observe::build_stabilization_snapshot,
     stabilization_plan::plan as plan_stabilization,
