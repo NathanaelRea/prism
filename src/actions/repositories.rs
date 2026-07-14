@@ -244,6 +244,62 @@ impl Tui {
         Ok(())
     }
 
+    pub(crate) fn reorder_repositories(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let entries = crate::workspace::load_entries();
+        let items = repository_order_choices(&entries);
+        let Some(order) = self.ordered_toggle_dialog(raw, "Repositories", items)? else {
+            return Ok(());
+        };
+        let updated = repository_entries_for_order(&entries, &order)?;
+        if updated.is_empty() {
+            self.show_message("at least one repository must remain")?;
+            return Ok(());
+        }
+        let retained_roots = updated
+            .iter()
+            .map(|entry| entry.root.as_path())
+            .collect::<BTreeSet<_>>();
+        let removed = entries
+            .iter()
+            .filter(|entry| !retained_roots.contains(entry.root.as_path()))
+            .collect::<Vec<_>>();
+        if !removed.is_empty() {
+            let lines = removed
+                .iter()
+                .map(|entry| crate::view::DialogLine {
+                    text: entry.root.display().to_string(),
+                    attention: true,
+                })
+                .collect();
+            let prompt = if removed.len() == 1 {
+                "Remove this repository from Prism?"
+            } else {
+                "Remove these repositories from Prism?"
+            };
+            if !self.confirm_dialog(raw, "Remove Repositories", lines, prompt, false)? {
+                return Ok(());
+            }
+        }
+
+        let current_root = self
+            .selected_repo_context()
+            .map(|context| context.repo.root);
+        crate::workspace::save_entries(&updated)?;
+        self.reload_repositories(updated)?;
+        let index = current_root
+            .and_then(|root| self.repos.iter().position(|repo| repo.repo.root == root))
+            .unwrap_or_else(|| self.current_repo.min(self.repos.len().saturating_sub(1)));
+        self.select_repo(index);
+        self.start_tmux_agent_warmup();
+        self.start_wt_column_poll();
+        self.start_default_branch_status_poll(true);
+        self.show_message("repositories updated")?;
+        Ok(())
+    }
+
     pub(super) fn offer_worktrunk_approval_if_pending(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
@@ -363,6 +419,38 @@ pub(super) fn worktree_column_choices(
     choices
 }
 
+pub(super) fn repository_order_choices(
+    entries: &[crate::workspace::RepoEntry],
+) -> Vec<crate::view::OrderedToggleItem> {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(index, entry)| crate::view::OrderedToggleItem {
+            id: index.to_string(),
+            label: crate::workspace::label_for_root(&entry.root),
+            enabled: true,
+        })
+        .collect()
+}
+
+pub(super) fn repository_entries_for_order(
+    entries: &[crate::workspace::RepoEntry],
+    order: &[String],
+) -> Result<Vec<crate::workspace::RepoEntry>, String> {
+    order
+        .iter()
+        .map(|id| {
+            let index = id
+                .parse::<usize>()
+                .map_err(|_| format!("invalid repository order id: {id}"))?;
+            entries
+                .get(index)
+                .cloned()
+                .ok_or_else(|| format!("unknown repository order id: {id}"))
+        })
+        .collect()
+}
+
 pub(super) fn update_worktree_columns_config(
     path: &Path,
     columns: &[String],
@@ -418,4 +506,59 @@ pub(super) fn set_worktree_columns_text(text: &str, columns_line: &str) -> Strin
     let mut updated = lines.join("\n");
     updated.push('\n');
     updated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repository_order_preserves_keys_and_omits_disabled_entries() {
+        let entries = vec![
+            crate::workspace::RepoEntry {
+                root: PathBuf::from("/repos/one"),
+                key: Some('1'),
+            },
+            crate::workspace::RepoEntry {
+                root: PathBuf::from("/repos/two"),
+                key: Some('2'),
+            },
+            crate::workspace::RepoEntry {
+                root: PathBuf::from("/repos/three"),
+                key: Some('3'),
+            },
+        ];
+
+        let choices = repository_order_choices(&entries);
+        assert_eq!(
+            choices
+                .iter()
+                .map(|choice| (choice.id.as_str(), choice.label.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("0", "one"), ("1", "two"), ("2", "three")]
+        );
+
+        let reordered =
+            repository_entries_for_order(&entries, &["2".to_string(), "0".to_string()]).unwrap();
+        assert_eq!(reordered, vec![entries[2].clone(), entries[0].clone()]);
+    }
+
+    #[test]
+    fn repository_order_can_retain_entries_that_are_not_discovered() {
+        let entries = vec![
+            crate::workspace::RepoEntry {
+                root: PathBuf::from("/repos/available"),
+                key: Some('1'),
+            },
+            crate::workspace::RepoEntry {
+                root: PathBuf::from("/repos/unavailable"),
+                key: Some('2'),
+            },
+        ];
+
+        let reordered =
+            repository_entries_for_order(&entries, &["1".to_string(), "0".to_string()]).unwrap();
+
+        assert_eq!(reordered, vec![entries[1].clone(), entries[0].clone()]);
+    }
 }

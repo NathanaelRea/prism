@@ -771,15 +771,21 @@ impl Tui {
                 Key::Refresh => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    self.refresh_sessions()?;
-                    self.start_tmux_agent_warmup();
-                    self.start_wt_column_poll();
-                    self.start_default_branch_status_poll(true);
-                    self.start_opencode_status_poll(true);
-                    self.start_opencode_event_listeners();
-                    self.refresh_plan_runs();
-                    self.refresh_auto_runs(false);
-                    self.poll_pull_requests(true);
+                    if self.focused_panel == PanelFocus::Repos && !self.main_focused {
+                        if let Err(error) = self.reorder_repositories(&mut runtime) {
+                            self.show_error("reorder repositories failed", &error)?;
+                        }
+                    } else {
+                        self.refresh_sessions()?;
+                        self.start_tmux_agent_warmup();
+                        self.start_wt_column_poll();
+                        self.start_default_branch_status_poll(true);
+                        self.start_opencode_status_poll(true);
+                        self.start_opencode_event_listeners();
+                        self.refresh_plan_runs();
+                        self.refresh_auto_runs(false);
+                        self.poll_pull_requests(true);
+                    }
                 }
                 Key::VisibilityUp => {
                     self.clear_leader_hint();
@@ -908,7 +914,7 @@ impl Tui {
                     } else if self.focused_panel == PanelFocus::Status {
                         self.show_message("focus worktrees to delete a worktree/session")?;
                     } else if self.focused_panel == PanelFocus::Repos {
-                        self.show_message("repository removal is available from R")?;
+                        self.show_message("repository removal is available from r")?;
                     } else if let Err(error) = self.archive_session(&mut runtime) {
                         self.show_error("archive failed", &error)?;
                     }
@@ -1075,7 +1081,8 @@ impl Tui {
             "P            worktrees: start or focus a plan run dashboard",
             "j/k          main comments: move comment selection; status dashboard: move plan output or phase selection",
             "A            worktrees: start/focus Auto Flow; choose prompt, plan file, or draft plan",
-            "R            edit repositories/order/keys/remove",
+            "r            repos: reorder or remove repositories",
+            "R            edit repositories/order/keys/remove in repos.toml",
             "C            repos: open a worktree for a remote pull request",
             "c            repos: create worktree session in selected repo",
             "+ / -        worktrees: raise/lower visibility sort",
@@ -1090,7 +1097,7 @@ impl Tui {
             "X            permanently delete non-default worktree/session",
             "j/k, up/down move selection",
             "g g / G      top / bottom",
-            "r            refresh",
+            "r            refresh outside the repos sidebar",
             "q, Ctrl-C    quit",
         ];
         let items = items
