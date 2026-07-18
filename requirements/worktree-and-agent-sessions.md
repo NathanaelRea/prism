@@ -28,7 +28,7 @@
 - **Default**: Prism allocates OpenCode servers from a deterministic range
   beginning at port 41000 and spanning 1000 ports. Owned servers remain warm
   when Prism exits unless shutdown is enabled.
-- **Invariant**: Active OpenCode-session association is resolved independently
+- **Invariant**: Active OpenCode session association is resolved independently
   per worktree. Creating `/new` or changing activity in one worktree cannot
   retarget prompts or status in another.
 - **Behavior**: The main panel shows the selected worktree's current OpenCode

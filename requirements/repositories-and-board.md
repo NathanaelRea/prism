@@ -28,7 +28,7 @@
 - **Behavior**: From a repository, users can select an open pull request and
   open it as a Worktree Session. Prism reuses an existing matching worktree or
   fetches the pull request into a deterministic local branch, then retains the
-  selected pull-request summary on the focused session.
+  selected pull request summary on the focused session.
 
 ## Navigation
 
@@ -73,7 +73,7 @@
   aligned.
 - **Behavior**: Contextual help for repository and worktree views explains their
   symbols and columns, is scrollable, and does not obscure search results.
-- **Default**: Active-repository pull-request summaries refresh no more often
+- **Default**: Active-repository pull request summaries refresh no more often
   than every 15 seconds, inactive summaries every 60 seconds, selected details
   every 30 seconds, and Default Branch status every 60 seconds. Regaining
   terminal focus requests a refresh, and only one refresh per target is in

@@ -6,7 +6,7 @@
   multiple Git repositories, worktrees, pull requests, and agent-backed sessions
   without requiring the user to leave the keyboard-driven workflow.
 - **Behavior**: Prism supports the lifecycle from planning and implementation
-  through local verification, pull-request stabilization, merge readiness, and
+  through local verification, pull request stabilization, merge readiness, and
   worktree cleanup.
 - **Behavior**: Prism can start from any directory; behavior is based on tracked
   repository roots rather than the process working directory.
@@ -21,7 +21,7 @@
   explicitly creates a repository-owned artifact.
 - **Invariant**: The Default Branch remains a Worktree Session but is not treated
   as a task branch or Agent Session target from the worktree list. It sorts ahead
-  of task worktrees and is not polled for or decorated with pull-request state.
+  of task worktrees and is not polled for or decorated with pull request state.
 - **Invariant**: A logical prompt-starting action creates at most one intended
   OpenCode session and submits its prompt exactly once.
 - **Invariant**: Repository, Worktree Session, Agent Session, Plan run, Auto Flow
