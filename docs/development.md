@@ -14,7 +14,7 @@ PRISM_TEST_OPENCODE="$(command -v opencode)" \
     -- --ignored --exact
 ```
 
-The smoke test starts `opencode serve`, waits for its health endpoint, and verifies Prism can create, list, and retrieve a session. It does not submit a prompt or require provider credentials.
+The smoke test starts `opencode serve`, waits for its health endpoint, and verifies Prism can create, list, retrieve, and persist a prompt in a session. It does not require provider credentials.
 
 CI also exercises the full headless stack with the real Prism binary, OpenCode, and tmux on an isolated socket. To run it locally:
 
