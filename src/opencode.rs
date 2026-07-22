@@ -1124,11 +1124,58 @@ pub(crate) fn remove_runtime_for_worktree_session_with_conn(
     worktree_path: &str,
 ) -> Result<(), String> {
     conn.execute(
-        "delete from opencode_runtime where repo_root = ?1 and (branch = ?2 or worktree_path = ?3)",
+        "delete from opencode_runtime where repo_root = ?1 and branch = ?2 and worktree_path = ?3",
         params![repo_root, branch, worktree_path],
     )
     .map_err(|error| format!("remove opencode runtime: {error}"))?;
     Ok(())
+}
+
+pub(crate) fn reconcile_session_refresh(
+    current: &mut Option<OpencodeStatus>,
+    previous: Option<OpencodeStatus>,
+) {
+    *current = previous;
+}
+
+pub(crate) fn shutdown_worktree_session_runtimes(
+    repo: &Repository,
+    branch: &str,
+    worktree: &Path,
+) -> Result<(), String> {
+    let runtimes = load_runtimes_for_worktree_session(repo, branch, worktree)?;
+    let mut errors = Vec::new();
+    for runtime in runtimes {
+        if runtime.branch != branch || runtime.worktree_path != worktree.display().to_string() {
+            continue;
+        }
+        if let Err(error) = shutdown_stored_server(&runtime) {
+            errors.push(error);
+            continue;
+        }
+        let result = observability::with_writable_db(repo, |conn| {
+            conn.execute(
+                "delete from opencode_runtime
+                 where repo_root = ?1 and branch = ?2 and worktree_path = ?3 and generation = ?4",
+                params![
+                    runtime.repo_root,
+                    runtime.branch,
+                    runtime.worktree_path,
+                    i64::try_from(runtime.generation).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(|error| format!("remove shut down OpenCode runtime: {error}"))?;
+            Ok(())
+        });
+        if let Err(error) = result {
+            errors.push(error);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
 pub fn allocate_port(

@@ -556,6 +556,21 @@ impl PersistedAutoRun {
         aggregate_step_status(self.steps.iter().map(|step| step.status))
     }
 
+    pub fn authoritative_status(&self) -> AutoRunStatus {
+        let aggregate = self.aggregate_status();
+        let stabilization_active = self
+            .run
+            .stabilization_status
+            .is_some_and(stabilization_model::StabilizationStatus::keeps_run_active);
+        if self.run.pending_push.is_some()
+            || (stabilization_active && matches!(aggregate, AutoRunStatus::Done))
+        {
+            AutoRunStatus::Paused
+        } else {
+            aggregate
+        }
+    }
+
     pub fn status_counts(&self) -> AutoStatusCounts {
         AutoStatusCounts::from_steps(&self.steps)
     }

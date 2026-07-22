@@ -44,6 +44,23 @@ pub(crate) fn derive_blockers(snapshot: &StabilizationSnapshot) -> Vec<Stabiliza
     if snapshot.worktree.dirty {
         blockers.push(StabilizationBlocker::DirtyWorktree);
     }
+    if pull_request.observation_error.is_some() {
+        blockers.push(StabilizationBlocker::ObservationFailed);
+    }
+    if pull_request.draft {
+        blockers.push(StabilizationBlocker::DraftPullRequest);
+    }
+    if snapshot
+        .repository
+        .default_base
+        .as_deref()
+        .is_some_and(|base| base != pull_request.base_ref)
+    {
+        blockers.push(StabilizationBlocker::WrongBase);
+    }
+    if heads_diverged(snapshot, pull_request) {
+        blockers.push(StabilizationBlocker::HeadDiverged);
+    }
     if matches!(pull_request.mergeability, MergeabilityFacts::Blocked { .. }) {
         blockers.push(StabilizationBlocker::MergeBlocked);
     } else if matches!(pull_request.mergeability, MergeabilityFacts::Unknown) {
@@ -134,16 +151,20 @@ fn blocker_priority(blocker: &StabilizationBlocker) -> u8 {
         StabilizationBlocker::NeedsPullRequest => 2,
         StabilizationBlocker::PendingPush => 3,
         StabilizationBlocker::DirtyWorktree => 4,
-        StabilizationBlocker::MergeBlocked => 5,
-        StabilizationBlocker::ReviewFeedbackFound => 6,
-        StabilizationBlocker::CiFailed | StabilizationBlocker::CiMissingRequiredChecks => 7,
-        StabilizationBlocker::CiPending => 8,
-        StabilizationBlocker::ReviewApprovalMissing => 9,
-        StabilizationBlocker::PolicyBlocked => 10,
-        StabilizationBlocker::PolicyUnknown => 11,
-        StabilizationBlocker::ReadyToAutoMerge | StabilizationBlocker::ReadyForManualMerge => 12,
-        StabilizationBlocker::Merged => 13,
-        StabilizationBlocker::Escalate => 14,
+        StabilizationBlocker::ObservationFailed => 5,
+        StabilizationBlocker::DraftPullRequest => 6,
+        StabilizationBlocker::WrongBase => 7,
+        StabilizationBlocker::HeadDiverged => 8,
+        StabilizationBlocker::MergeBlocked => 9,
+        StabilizationBlocker::ReviewFeedbackFound => 10,
+        StabilizationBlocker::CiFailed | StabilizationBlocker::CiMissingRequiredChecks => 11,
+        StabilizationBlocker::CiPending => 12,
+        StabilizationBlocker::ReviewApprovalMissing => 13,
+        StabilizationBlocker::PolicyBlocked => 14,
+        StabilizationBlocker::PolicyUnknown => 15,
+        StabilizationBlocker::ReadyToAutoMerge | StabilizationBlocker::ReadyForManualMerge => 16,
+        StabilizationBlocker::Merged => 17,
+        StabilizationBlocker::Escalate => 18,
     }
 }
 
@@ -163,6 +184,10 @@ fn work_kind_for_blocker(blocker: &StabilizationBlocker) -> StabilizationWorkKin
         StabilizationBlocker::Merged => StabilizationWorkKind::Done,
         StabilizationBlocker::NotEligible
         | StabilizationBlocker::DirtyWorktree
+        | StabilizationBlocker::ObservationFailed
+        | StabilizationBlocker::DraftPullRequest
+        | StabilizationBlocker::WrongBase
+        | StabilizationBlocker::HeadDiverged
         | StabilizationBlocker::MergeBlocked
         | StabilizationBlocker::PolicyBlocked
         | StabilizationBlocker::PolicyUnknown
@@ -190,6 +215,30 @@ fn reason_for_blocker(snapshot: &StabilizationSnapshot, blocker: &StabilizationB
         }
         StabilizationBlocker::DirtyWorktree => {
             "local worktree changes must be resolved before interpreting PR gates".to_string()
+        }
+        StabilizationBlocker::ObservationFailed => snapshot
+            .pull_request
+            .as_ref()
+            .and_then(|pr| pr.observation_error.clone())
+            .unwrap_or_else(|| "pull request observation is not trustworthy".to_string()),
+        StabilizationBlocker::DraftPullRequest => {
+            "draft pull request must be marked ready before merge readiness".to_string()
+        }
+        StabilizationBlocker::WrongBase => {
+            let pr_base = snapshot
+                .pull_request
+                .as_ref()
+                .map(|pr| pr.base_ref.as_str())
+                .unwrap_or("unknown");
+            let expected = snapshot
+                .repository
+                .default_base
+                .as_deref()
+                .unwrap_or("unknown");
+            format!("pull request base is {pr_base}, expected {expected}")
+        }
+        StabilizationBlocker::HeadDiverged => {
+            "local, remote, and pull request heads do not agree".to_string()
         }
         StabilizationBlocker::MergeBlocked => snapshot
             .pull_request
@@ -246,6 +295,16 @@ fn reason_for_blocker(snapshot: &StabilizationSnapshot, blocker: &StabilizationB
             }
         }
     }
+}
+
+fn heads_diverged(snapshot: &StabilizationSnapshot, pull_request: &PullRequestFacts) -> bool {
+    let Some(local) = snapshot.worktree.local_head_sha.as_deref() else {
+        return true;
+    };
+    let Some(remote) = snapshot.worktree.remote_head_sha.as_deref() else {
+        return true;
+    };
+    local != remote || remote != pull_request.head_sha
 }
 
 fn required_check_reason(
@@ -647,7 +706,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known Phase 1 safety defect"]
     fn phase_1_draft_pr_cannot_become_manual_or_auto_merge_ready() {
         for auto_merge in [false, true] {
             let mut pr = clean_pr();
@@ -672,7 +730,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "known Phase 1 safety defect"]
     fn phase_1_three_way_local_remote_and_pr_head_divergence_blocks_readiness() {
         for auto_merge in [false, true] {
             let mut pr = clean_pr();
@@ -712,8 +769,8 @@ mod tests {
                 is_default_branch: false,
                 detached: false,
                 dirty: false,
-                local_head_sha: Some("local".to_string()),
-                remote_head_sha: Some("remote".to_string()),
+                local_head_sha: Some("head".to_string()),
+                remote_head_sha: Some("head".to_string()),
             },
             pull_request,
             policy: PolicyFacts::Satisfied,
@@ -750,6 +807,7 @@ mod tests {
             },
             mergeability: MergeabilityFacts::Clean,
             top_level_comment_count: 0,
+            observation_error: None,
         }
     }
 

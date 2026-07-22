@@ -37,6 +37,8 @@ pub struct Tui {
     pub(crate) repos: Vec<ManagedRepo>,
     pub(crate) current_repo: usize,
     pub(crate) sessions: Vec<Session>,
+    pub(crate) session_repository_roots: BTreeMap<usize, PathBuf>,
+    pub(crate) worktree_generations: BTreeMap<(PathBuf, PathBuf, String, String), u64>,
     pub(crate) selected: usize,
     pub(crate) selected_repo_root: Option<PathBuf>,
     pub(crate) focused_panel: PanelFocus,
@@ -141,14 +143,16 @@ impl ManagedRepo {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PrPollKey {
-    pub repo_index: usize,
+    pub repo_root: PathBuf,
     pub branch: String,
     pub path: PathBuf,
+    pub generation: u64,
+    pub incarnation: String,
 }
 
 pub(crate) enum PrPollResult {
     Summary {
-        repo_index: usize,
+        repo_root: PathBuf,
         summaries: Result<Vec<PrSummary>, String>,
         poll_started_at: Instant,
     },
@@ -162,19 +166,28 @@ pub(crate) enum PrPollResult {
 pub(crate) struct DeleteSessionKey {
     pub repo_root: PathBuf,
     pub path: PathBuf,
+    pub branch: String,
+    pub generation: u64,
+    pub incarnation: String,
 }
 
 pub(crate) struct DeleteSessionResult {
     pub key: DeleteSessionKey,
-    pub result: Result<(), String>,
+    pub result: Result<crate::session::DeleteWorktreeOutcome, String>,
 }
 
 impl PrPollKey {
-    pub(crate) fn for_session(session: &Session) -> Self {
+    pub(crate) fn for_repository_session_generation(
+        repo_root: &Path,
+        session: &Session,
+        generation: u64,
+    ) -> Self {
         Self {
-            repo_index: session.repo_index,
+            repo_root: repo_root.to_path_buf(),
             branch: session.branch.clone(),
             path: session.path.clone(),
+            generation,
+            incarnation: session.incarnation.clone(),
         }
     }
 }
@@ -218,12 +231,12 @@ pub(crate) struct NavigationSnapshot {
 }
 
 pub(crate) struct WtPollResult {
-    pub repo_index: usize,
+    pub repo_root: PathBuf,
     pub columns: Result<BTreeMap<PathBuf, BTreeMap<String, String>>, String>,
 }
 
 pub(crate) struct DefaultBranchPollResult {
-    pub repo_index: usize,
+    pub repo_root: PathBuf,
     pub branch: String,
     pub path: PathBuf,
     pub status_label: Result<String, String>,
@@ -231,9 +244,11 @@ pub(crate) struct DefaultBranchPollResult {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct OpencodePollKey {
-    pub repo_index: usize,
+    pub repo_root: PathBuf,
     pub branch: String,
     pub path: PathBuf,
+    pub generation: u64,
+    pub incarnation: String,
 }
 
 pub(crate) struct OpencodePollResult {
@@ -254,11 +269,28 @@ pub(crate) struct PlanRunResult {
 }
 
 impl OpencodePollKey {
+    #[cfg(test)]
     pub(crate) fn for_session(session: &Session) -> Self {
+        let repo_root = session.path.parent().unwrap_or_else(|| Path::new(""));
+        Self::for_repository_session(repo_root, session)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_repository_session(repo_root: &Path, session: &Session) -> Self {
+        Self::for_repository_session_generation(repo_root, session, 0)
+    }
+
+    pub(crate) fn for_repository_session_generation(
+        repo_root: &Path,
+        session: &Session,
+        generation: u64,
+    ) -> Self {
         Self {
-            repo_index: session.repo_index,
+            repo_root: repo_root.to_path_buf(),
             branch: session.branch.clone(),
             path: session.path.clone(),
+            generation,
+            incarnation: session.incarnation.clone(),
         }
     }
 }
@@ -428,12 +460,34 @@ impl Tui {
             .get(current_repo)
             .map(|repo| repo.config.clone())
             .unwrap_or_else(|| Config::load(&fallback_repo));
+        let session_repository_roots = repos
+            .iter()
+            .enumerate()
+            .map(|(index, repo)| (index, repo.repo.root.clone()))
+            .collect();
+        let worktree_generations = sessions
+            .iter()
+            .filter_map(|session| {
+                let repo = repos.get(session.repo_index)?;
+                Some((
+                    (
+                        repo.repo.root.clone(),
+                        session.path.clone(),
+                        session.branch.clone(),
+                        session.incarnation.clone(),
+                    ),
+                    0,
+                ))
+            })
+            .collect();
         let mut tui = Self {
             repo,
             config,
             repos,
             current_repo,
             sessions,
+            session_repository_roots,
+            worktree_generations,
             selected: 0,
             selected_repo_root: None,
             focused_panel: PanelFocus::Repos,
@@ -3075,7 +3129,7 @@ fn worktree_priority_rank(visibility: i16) -> u8 {
 }
 
 fn worktree_updated_label(session: &Session) -> String {
-    if let Some(label) = session.pr.last_refreshed.as_deref() {
+    if let Some(label) = session.pr.last_refreshed() {
         return label.to_string();
     }
     if let Some(summary) = &session.pr.summary {
@@ -3111,8 +3165,8 @@ mod tests {
     use crate::view::{OrderedToggleItem, RepoMainView, WorktreeMainView};
 
     use super::{
-        ManagedRepo, OpenTmuxSessionTarget, PanelFocus, Tui, WorktreeListMode, confirmation_result,
-        move_enabled_ordered_item, toggle_ordered_item,
+        ManagedRepo, OpenTmuxSessionTarget, PanelFocus, PrPollKey, Tui, WorktreeListMode,
+        confirmation_result, move_enabled_ordered_item, toggle_ordered_item,
     };
 
     #[test]
@@ -3668,12 +3722,27 @@ mod tests {
         run
     }
 
+    #[test]
+    fn pr_poll_identity_uses_repository_and_worktree_generation_not_repo_order() {
+        let repo_root = PathBuf::from("/tmp/repo");
+        let mut session = test_session(0, "/tmp/repo", "feature");
+        let first = PrPollKey::for_repository_session_generation(&repo_root, &session, 3);
+
+        session.repo_index = 9;
+        let reordered = PrPollKey::for_repository_session_generation(&repo_root, &session, 3);
+        let recreated = PrPollKey::for_repository_session_generation(&repo_root, &session, 4);
+
+        assert_eq!(first, reordered);
+        assert_ne!(first, recreated);
+    }
+
     fn test_session(repo_index: usize, root: &str, branch: &str) -> Session {
         Session {
             repo_index,
             repo_label: format!("repo-{repo_index}"),
             repo_key: None,
             path: PathBuf::from(format!("{root}/{branch}")),
+            incarnation: String::new(),
             path_display: format!("{root}/{branch}"),
             branch: branch.to_string(),
             prompt_summary: String::new(),

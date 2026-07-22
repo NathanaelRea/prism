@@ -141,7 +141,12 @@ pub(crate) fn stabilization_panel_model(
             run.and_then(|run| run.pending_push.as_ref())
                 .map(|_| StabilizationBlocker::PendingPush)
         })
-        .or_else(|| cached_pr_blocker(model.config, session));
+        .or_else(|| {
+            run.and_then(|run| run.stabilization_status)
+                .is_none()
+                .then(|| cached_pr_blocker(model.config, session))
+                .flatten()
+        });
     let next = blocker.as_ref().map(|blocker| {
         run.and_then(|run| run.stabilization_next_work.as_ref())
             .cloned()
@@ -173,7 +178,14 @@ pub(crate) fn stabilization_panel_model(
         pr_name: summary
             .map(|summary| summary.title.clone())
             .unwrap_or_default(),
-        blocker: blocker.as_ref().map(blocker_label).unwrap_or_default(),
+        blocker: blocker
+            .as_ref()
+            .map(blocker_label)
+            .or_else(|| {
+                run.and_then(|run| run.stabilization_status)
+                    .map(|status| pascal_label(status.as_str()))
+            })
+            .unwrap_or_default(),
         next: next.as_ref().map(work_label).unwrap_or_default(),
         ci: blocker
             .as_ref()

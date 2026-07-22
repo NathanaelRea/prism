@@ -23,23 +23,57 @@ impl Tui {
         for managed in &mut self.repos {
             managed.config = crate::config::Config::load(&managed.repo);
         }
-        let old = std::mem::take(&mut self.sessions);
-        let mut by_path = old
-            .into_iter()
-            .map(|session| (session.identity_key(), session))
-            .collect::<BTreeMap<_, _>>();
-        let mut fresh = Vec::new();
-        for (repo_index, managed) in self.repos.iter().enumerate() {
-            let mut repo_sessions = discover_sessions(&managed.repo, &managed.config)?;
-            for session in &mut repo_sessions {
-                session.apply_repo_identity(repo_index, managed.label.clone(), managed.key);
-                if let Some(previous) = by_path.remove(&session.identity_key()) {
-                    session.preserve_refresh_state_from(previous, &managed.config);
-                }
+        let repositories = self
+            .repos
+            .iter()
+            .enumerate()
+            .map(
+                |(repo_index, managed)| crate::session::WorktreeSessionRepository {
+                    repo_index,
+                    repo: &managed.repo,
+                    config: &managed.config,
+                    label: &managed.label,
+                    key: managed.key,
+                },
+            )
+            .collect::<Vec<_>>();
+        crate::session::refresh_worktree_sessions(
+            &repositories,
+            &self.session_repository_roots,
+            &mut self.sessions,
+        )?;
+        let live = self
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                let repo = self.repos.get(session.repo_index)?;
+                Some((
+                    repo.repo.root.clone(),
+                    session.path.clone(),
+                    session.branch.clone(),
+                    session.incarnation.clone(),
+                ))
+            })
+            .collect::<BTreeSet<_>>();
+        for (identity, generation) in &mut self.worktree_generations {
+            if !live.contains(identity) {
+                *generation = generation.saturating_add(1);
             }
-            fresh.extend(repo_sessions);
         }
-        self.sessions = fresh;
+        for identity in live {
+            self.worktree_generations.entry(identity).or_default();
+        }
+        self.session_repository_roots = self
+            .repos
+            .iter()
+            .enumerate()
+            .map(|(index, repo)| (index, repo.repo.root.clone()))
+            .collect();
+        crate::agent_session::reconcile_worktree_sessions(
+            &self.repos,
+            &self.sessions,
+            &mut self.tmux_generations,
+        );
         self.ensure_navigation_valid();
         Ok(())
     }
@@ -75,18 +109,29 @@ impl Tui {
             "Create Session",
             &format!("Creating worktree for {}", branch.trim()),
         )?;
-        if let Err(error) = create_worktree_session(&context.repo, &context.config, branch.trim()) {
-            if !is_worktrunk_approval_failure(&error)
-                || !self.offer_worktrunk_approval(raw, &context.repo, &context.config)?
-            {
-                return Err(error);
+        let creation = match create_worktree_session(&context.repo, &context.config, branch.trim())
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                if !is_worktrunk_approval_failure(&error)
+                    || !self.offer_worktrunk_approval(raw, &context.repo, &context.config)?
+                {
+                    return Err(error);
+                }
+                self.show_loading_dialog(
+                    raw,
+                    "Create Session",
+                    &format!("Creating worktree for {}", branch.trim()),
+                )?;
+                create_worktree_session(&context.repo, &context.config, branch.trim())?
             }
-            self.show_loading_dialog(
-                raw,
-                "Create Session",
-                &format!("Creating worktree for {}", branch.trim()),
-            )?;
-            create_worktree_session(&context.repo, &context.config, branch.trim())?;
+        };
+        if let CreateWorktreeOutcome::CreatedMetadataFailed { error } = creation {
+            self.refresh_sessions()?;
+            self.show_message(&format!(
+                "worktree created, but restoring Prism metadata failed: {error}"
+            ))?;
+            return Ok(true);
         }
         self.refresh_sessions()?;
         self.start_tmux_agent_warmup();
@@ -105,8 +150,19 @@ impl Tui {
             self.worktree_filter.clear();
         }
         self.select_worktree(index);
-        write_task_metadata(&context.repo, &self.sessions[index], &initial_prompt)?;
-        self.sessions[index].mark_adopted_with_prompt(&initial_prompt);
+        let adoption = crate::session::adopt_worktree_session(
+            &context.repo,
+            &mut self.sessions[index],
+            &initial_prompt,
+        );
+        if let crate::session::AdoptWorktreeOutcome::WorktreeCreatedMetadataFailed { error } =
+            adoption
+        {
+            self.show_message(&format!(
+                "worktree created, but Prism metadata adoption failed: {error}"
+            ))?;
+            return Ok(true);
+        }
         if !initial_prompt.trim().is_empty() {
             self.show_loading_dialog(raw, "Create Session", "Starting agent session")?;
             self.paste_prompt_into_tmux_agent(index, &initial_prompt, false)?;
@@ -332,6 +388,27 @@ impl Tui {
         let key = DeleteSessionKey {
             repo_root: repo.root.clone(),
             path: path.clone(),
+            branch: branch.clone(),
+            incarnation: self
+                .sessions
+                .iter()
+                .find(|session| session.path == path && session.branch == branch)
+                .map(|session| session.incarnation.clone())
+                .unwrap_or_default(),
+            generation: self
+                .worktree_generations
+                .get(&(
+                    repo.root.clone(),
+                    path.clone(),
+                    branch.clone(),
+                    self.sessions
+                        .iter()
+                        .find(|session| session.path == path && session.branch == branch)
+                        .map(|session| session.incarnation.clone())
+                        .unwrap_or_default(),
+                ))
+                .copied()
+                .unwrap_or_default(),
         };
         if !self.delete_sessions_in_flight.insert(key.clone()) {
             self.show_message("delete already in progress")?;
@@ -354,7 +431,13 @@ impl Tui {
         let tx = self.delete_session_tx.clone();
         let branch_for_job = branch.clone();
         thread::spawn(move || {
-            let result = delete_worktree_session(&repo, &config, &path, &branch_for_job);
+            let result = crate::session::delete_worktree_session_if_current(
+                &repo,
+                &config,
+                &path,
+                &branch_for_job,
+                Some(&key.incarnation),
+            );
             let _ = tx.send(DeleteSessionResult { key, result });
         });
         self.show_message(&format!("deleting {branch}..."))
@@ -364,14 +447,31 @@ impl Tui {
         let mut changed = false;
         while let Ok(result) = self.delete_session_rx.try_recv() {
             self.delete_sessions_in_flight.remove(&result.key);
+            let current_generation = self
+                .worktree_generations
+                .get(&(
+                    result.key.repo_root.clone(),
+                    result.key.path.clone(),
+                    result.key.branch.clone(),
+                    result.key.incarnation.clone(),
+                ))
+                .copied()
+                .unwrap_or_default();
+            if current_generation != result.key.generation {
+                continue;
+            }
             changed = true;
             match result.result {
-                Ok(()) => {
+                Ok(DeleteWorktreeOutcome::Deleted) => {
+                    self.sessions.retain(|session| {
+                        session.path != result.key.path || session.branch != result.key.branch
+                    });
                     if self.selected_worktree_by_repo.get(&result.key.repo_root)
                         == Some(&result.key.path)
                     {
                         self.selected_worktree_by_repo.remove(&result.key.repo_root);
                     }
+                    self.ensure_navigation_valid();
                     match self.refresh_sessions() {
                         Ok(()) => {
                             self.start_tmux_agent_warmup();
@@ -386,12 +486,36 @@ impl Tui {
                         }
                     }
                 }
-                Err(error) => {
-                    if let Some(session) = self
-                        .sessions
-                        .iter_mut()
-                        .find(|session| session.path == result.key.path)
+                Ok(DeleteWorktreeOutcome::BranchRetained { error }) => {
+                    self.sessions.retain(|session| {
+                        session.path != result.key.path || session.branch != result.key.branch
+                    });
+                    if self.selected_worktree_by_repo.get(&result.key.repo_root)
+                        == Some(&result.key.path)
                     {
+                        self.selected_worktree_by_repo.remove(&result.key.repo_root);
+                    }
+                    self.ensure_navigation_valid();
+                    let _ = self.refresh_sessions();
+                    let _ = self.show_message(&format!(
+                        "worktree removed, but branch deletion failed: {error}"
+                    ));
+                }
+                Ok(DeleteWorktreeOutcome::DeletedWithWarnings { errors }) => {
+                    self.sessions.retain(|session| {
+                        session.path != result.key.path || session.branch != result.key.branch
+                    });
+                    self.ensure_navigation_valid();
+                    let _ = self.refresh_sessions();
+                    let _ = self.show_message(&format!(
+                        "worktree removed with cleanup warnings: {}",
+                        errors.join("; ")
+                    ));
+                }
+                Err(error) => {
+                    if let Some(session) = self.sessions.iter_mut().find(|session| {
+                        session.path == result.key.path && session.branch == result.key.branch
+                    }) {
                         session.hidden = false;
                     }
                     self.ensure_navigation_valid();

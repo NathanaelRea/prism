@@ -414,6 +414,7 @@ pub(super) fn execute_commit_impl_step(
         max_output_lines_per_step,
     )?;
     finish_non_agent_step(conn, step, status, Some(summary), None)?;
+    persisted.run.status = persisted.authoritative_status();
     persisted.run.updated_unix_ms = unix_ms();
     save_run_with_conn(conn, &persisted.run)
 }
@@ -449,15 +450,15 @@ pub(super) fn execute_push_pr_step(
     crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
 
     let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
-    crate::lifecycle::refresh_branch_pr_cache(
+    let _ = crate::github::refresh_pr_cache(
         repo,
-        config,
         &persisted.run.branch,
-        &persisted.run.worktree_path,
         &mut cache,
+        &persisted.run.worktree_path,
+        config,
         true,
     );
-    if cache.summary.is_none() {
+    if cache.trusted_summary()?.is_none() {
         let body = auto_pr_body(config, &persisted.run);
         crate::lifecycle::create_pull_request(
             repo,
@@ -469,19 +470,18 @@ pub(super) fn execute_push_pr_step(
             &mut cache,
         )?;
     }
-    if cache.summary.is_none() {
-        crate::lifecycle::refresh_branch_pr_cache(
+    if cache.trusted_summary()?.is_none() {
+        crate::github::refresh_pr_cache(
             repo,
-            config,
             &persisted.run.branch,
-            &persisted.run.worktree_path,
             &mut cache,
+            &persisted.run.worktree_path,
+            config,
             true,
-        );
+        )?;
     }
     let summary = cache
-        .summary
-        .as_ref()
+        .trusted_summary()?
         .ok_or_else(|| "push/create PR completed but no PR summary was found".to_string())?;
     persisted.run.pr_number = Some(summary.number);
     persisted.run.pr_url = Some(summary.url.clone());
@@ -543,6 +543,7 @@ pub(super) fn execute_wait_review_step(
     let deadline = unix_ms().saturating_add(config.auto.review_max_wait_seconds * 1000);
     loop {
         let outcome = poll_review_feedback(repo, config, persisted)?;
+        let work = stabilization_execute::observe_plan_and_save(conn, repo, config, persisted)?;
         append_auto_event(
             conn,
             &AutoEvent {
@@ -563,7 +564,12 @@ pub(super) fn execute_wait_review_step(
             max_output_lines_per_step,
         )?;
 
-        if let Some(prompt) = outcome.fix_prompt {
+        let observation_changed = work.kind
+            == stabilization_model::StabilizationWorkKind::FixReview
+            && outcome.fix_prompt.is_none();
+        if work.kind == stabilization_model::StabilizationWorkKind::FixReview
+            && let Some(prompt) = outcome.fix_prompt
+        {
             finish_non_agent_step(
                 conn,
                 &mut persisted.steps[step_index],
@@ -577,10 +583,7 @@ pub(super) fn execute_wait_review_step(
                     .steps
                     .last_mut()
                     .expect("appended review repair step");
-                step.work_guard = Some(stabilization_model::WorkGuard {
-                    review_thread_ids: outcome.review_thread_ids,
-                    ..Default::default()
-                });
+                step.work_guard = Some(work.guard);
                 save_step_with_conn(conn, step)?;
                 return Ok(());
             }
@@ -589,7 +592,12 @@ pub(super) fn execute_wait_review_step(
             ));
         }
 
-        if outcome.complete {
+        if work.kind != stabilization_model::StabilizationWorkKind::WaitForReview
+            && !observation_changed
+        {
+            if work.kind == stabilization_model::StabilizationWorkKind::Escalate {
+                return Err(work.reason);
+            }
             finish_non_agent_step(
                 conn,
                 &mut persisted.steps[step_index],
@@ -701,69 +709,63 @@ pub(super) fn execute_commit_review_fix_step(
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
     let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
-    crate::lifecycle::refresh_branch_pr_cache(
+    let _ = crate::github::refresh_pr_cache(
         repo,
-        config,
         &persisted.run.branch,
-        &persisted.run.worktree_path,
         &mut cache,
+        &persisted.run.worktree_path,
+        config,
         true,
     );
-    let guard_facts = repair_guard_facts(config, persisted, cache.summary.as_ref());
+    let guard_facts = repair_guard_facts(config, persisted, cache.trusted_summary()?);
+    let review_thread_ids = persisted.steps[step_index]
+        .work_guard
+        .as_ref()
+        .map(|guard| guard.review_thread_ids.clone())
+        .unwrap_or_default();
+    let pre_commit_head = crate::git::current_head_sha(&persisted.run.worktree_path, config)?;
+    persist_pending_commit_obligation(
+        conn,
+        persisted,
+        stabilization_model::RepairKind::Review,
+        pre_commit_head,
+        guard_facts.clone(),
+        review_thread_ids,
+    )?;
     let message = repair_commit_message(config, "repair_commit_review", "fix: cr");
     let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
     let head_sha = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
     persisted.run.current_head_sha = head_sha.clone();
-    if let Some(summary) = cache.summary.as_ref() {
+    if let Some(summary) = cache.trusted_summary()? {
         persisted.run.pr_number = Some(summary.number);
         persisted.run.pr_url = Some(summary.url.clone());
         persisted.run.review_baseline_json = Some(review_baseline_json(summary));
     }
-    if result.committed && config.auto.push_repairs {
-        crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
-        let review_thread_ids = persisted.steps[step_index]
-            .work_guard
+    if result.committed {
+        let commit_sha = result
+            .commit_sha
             .as_ref()
-            .map(|guard| guard.review_thread_ids.clone())
-            .unwrap_or_default();
-        persisted.run.pending_push = result.commit_sha.clone().map(|commit_sha| {
-            pending_push_guard(
-                stabilization_model::RepairKind::Review,
-                commit_sha.clone(),
-                head_sha.clone().unwrap_or(commit_sha),
-                guard_facts,
-                review_thread_ids.clone(),
-            )
-        });
+            .ok_or_else(|| "review repair commit did not report its SHA".to_string())?;
+        let guard = persisted
+            .run
+            .pending_push
+            .as_mut()
+            .ok_or_else(|| "review repair commit lost its persisted obligation".to_string())?;
+        guard.commit_sha = commit_sha.clone();
+        guard.expected_local_head_sha = head_sha.clone().unwrap_or_else(|| commit_sha.clone());
         save_run_with_conn(conn, &persisted.run)?;
-        if !review_thread_ids.is_empty() {
-            crate::github::resolve_review_threads(
-                &persisted.run.worktree_path,
+        if config.auto.push_repairs {
+            stabilization_execute::progress_pending_push(
+                conn,
+                repo,
                 config,
-                &review_thread_ids,
+                persisted,
+                &mut cache,
+                || Ok(()),
             )?;
         }
+    } else {
         persisted.run.pending_push = None;
-    } else if result.committed {
-        persisted.run.pending_push = result.commit_sha.clone().map(|commit_sha| {
-            pending_push_guard(
-                stabilization_model::RepairKind::Review,
-                commit_sha.clone(),
-                head_sha.clone().unwrap_or(commit_sha),
-                guard_facts,
-                persisted.steps[step_index]
-                    .work_guard
-                    .as_ref()
-                    .map(|guard| guard.review_thread_ids.clone())
-                    .unwrap_or_default(),
-            )
-        });
-        persisted.run.stabilization_status =
-            Some(stabilization_model::StabilizationStatus::Blocked);
-        persisted.run.stabilization_blocker =
-            Some(stabilization_model::StabilizationBlocker::PendingPush);
-        persisted.run.stabilization_next_work =
-            Some(stabilization_model::StabilizationWorkKind::PushPendingRepair);
     }
 
     let step = &mut persisted.steps[step_index];
@@ -795,6 +797,7 @@ pub(super) fn execute_commit_review_fix_step(
         max_output_lines_per_step,
     )?;
     finish_non_agent_step(conn, step, status, Some(summary), None)?;
+    persisted.run.status = persisted.authoritative_status();
     persisted.run.updated_unix_ms = unix_ms();
     save_run_with_conn(conn, &persisted.run)
 }
@@ -832,6 +835,7 @@ pub(super) fn execute_wait_ci_step(
     let deadline = unix_ms().saturating_add(config.auto.ci_max_wait_seconds * 1000);
     loop {
         let outcome = poll_ci_status(repo, config, persisted)?;
+        let work = stabilization_execute::observe_plan_and_save(conn, repo, config, persisted)?;
         append_auto_event(
             conn,
             &AutoEvent {
@@ -856,18 +860,8 @@ pub(super) fn execute_wait_ci_step(
             max_output_lines_per_step,
         )?;
 
-        match outcome.state {
-            PrCheckState::Success => {
-                finish_non_agent_step(
-                    conn,
-                    &mut persisted.steps[step_index],
-                    AutoStepStatus::Done,
-                    Some(outcome.summary),
-                    None,
-                )?;
-                return Ok(());
-            }
-            PrCheckState::Failed | PrCheckState::Mixed => {
+        match work.kind {
+            stabilization_model::StabilizationWorkKind::FixCi => {
                 finish_non_agent_step(
                     conn,
                     &mut persisted.steps[step_index],
@@ -877,13 +871,27 @@ pub(super) fn execute_wait_ci_step(
                 )?;
                 if persisted.next_attempt_for(&AutoStepKey::FixCi) <= MAX_CI_FIX_ATTEMPTS {
                     append_step_run(conn, persisted, AutoStepKey::FixCi, Some(outcome.prompt))?;
+                    let step = persisted.steps.last_mut().expect("appended CI repair step");
+                    step.work_guard = Some(work.guard);
+                    save_step_with_conn(conn, step)?;
                     return Ok(());
                 }
                 let error =
                     format!("CI remained failing after {MAX_CI_FIX_ATTEMPTS} repair attempts");
                 return Err(error);
             }
-            PrCheckState::Pending | PrCheckState::Unknown => {}
+            stabilization_model::StabilizationWorkKind::WaitForCi => {}
+            stabilization_model::StabilizationWorkKind::Escalate => return Err(work.reason),
+            _ => {
+                finish_non_agent_step(
+                    conn,
+                    &mut persisted.steps[step_index],
+                    AutoStepStatus::Done,
+                    Some(outcome.summary),
+                    None,
+                )?;
+                return Ok(());
+            }
         }
 
         if unix_ms() >= deadline {
@@ -975,18 +983,29 @@ pub(super) fn execute_commit_ci_fix_step(
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
     let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
-    crate::lifecycle::refresh_branch_pr_cache(
+    let _ = crate::github::refresh_pr_cache(
         repo,
-        config,
         &persisted.run.branch,
-        &persisted.run.worktree_path,
         &mut cache,
+        &persisted.run.worktree_path,
+        config,
         true,
     );
-    let guard_facts = repair_guard_facts(config, persisted, cache.summary.as_ref());
+    let guard_facts = repair_guard_facts(config, persisted, cache.trusted_summary()?);
+    let pre_commit_head = crate::git::current_head_sha(&persisted.run.worktree_path, config)?;
+    persist_pending_commit_obligation(
+        conn,
+        persisted,
+        stabilization_model::RepairKind::Ci,
+        pre_commit_head,
+        guard_facts,
+        Vec::new(),
+    )?;
     let message = repair_commit_message(config, "repair_commit_ci", "fix: ci");
     let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
     if !result.committed {
+        persisted.run.pending_push = None;
+        save_run_with_conn(conn, &persisted.run)?;
         let summary = "CI fix produced no commitable changes".to_string();
         finish_non_agent_step(
             conn,
@@ -1004,25 +1023,27 @@ pub(super) fn execute_commit_ci_fix_step(
         persisted.run.pr_url = Some(summary.url.clone());
         persisted.run.review_baseline_json = Some(review_baseline_json(summary));
     }
+    let commit_sha = result
+        .commit_sha
+        .as_ref()
+        .ok_or_else(|| "CI repair commit did not report its SHA".to_string())?;
+    let guard = persisted
+        .run
+        .pending_push
+        .as_mut()
+        .ok_or_else(|| "CI repair commit lost its persisted obligation".to_string())?;
+    guard.commit_sha = commit_sha.clone();
+    guard.expected_local_head_sha = local_head.clone().unwrap_or_else(|| commit_sha.clone());
+    save_run_with_conn(conn, &persisted.run)?;
     if config.auto.push_repairs {
-        crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
-        persisted.run.pending_push = None;
-    } else {
-        persisted.run.pending_push = result.commit_sha.clone().map(|commit_sha| {
-            pending_push_guard(
-                stabilization_model::RepairKind::Ci,
-                commit_sha.clone(),
-                local_head.clone().unwrap_or(commit_sha),
-                guard_facts,
-                Vec::new(),
-            )
-        });
-        persisted.run.stabilization_status =
-            Some(stabilization_model::StabilizationStatus::Blocked);
-        persisted.run.stabilization_blocker =
-            Some(stabilization_model::StabilizationBlocker::PendingPush);
-        persisted.run.stabilization_next_work =
-            Some(stabilization_model::StabilizationWorkKind::PushPendingRepair);
+        stabilization_execute::progress_pending_push(
+            conn,
+            repo,
+            config,
+            persisted,
+            &mut cache,
+            || Ok(()),
+        )?;
     }
 
     let step = &mut persisted.steps[step_index];
@@ -1045,6 +1066,7 @@ pub(super) fn execute_commit_ci_fix_step(
         max_output_lines_per_step,
     )?;
     finish_non_agent_step(conn, step, AutoStepStatus::Done, Some(summary), None)?;
+    persisted.run.status = persisted.authoritative_status();
     persisted.run.updated_unix_ms = unix_ms();
     save_run_with_conn(conn, &persisted.run)
 }
@@ -1082,34 +1104,41 @@ pub(super) fn execute_merge_step(
 
     let verify =
         crate::verify::run_auto_verify(config, &persisted.run.worktree_path, VerifyMode::Normal);
-    let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config)?;
-    let dirty = crate::git::selected_dirty(&persisted.run.worktree_path, config)?;
     let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
-    crate::lifecycle::refresh_branch_pr_cache(
+    crate::github::refresh_pr_cache(
         repo,
-        config,
         &persisted.run.branch,
-        &persisted.run.worktree_path,
         &mut cache,
+        &persisted.run.worktree_path,
+        config,
         true,
-    );
+    )?;
     let summary = cache
-        .summary
-        .as_ref()
+        .trusted_summary()?
+        .cloned()
         .ok_or_else(|| "merge gate could not find pull request summary".to_string())?;
+    cache.trusted_details()?;
     persisted.run.pr_number = Some(summary.number);
     persisted.run.pr_url = Some(summary.url.clone());
     persisted.run.current_head_sha = Some(summary.head_sha.clone());
 
-    let gate = evaluate_merge_gate(
-        config,
-        persisted,
-        summary,
-        cache.details.as_ref(),
-        &local_head,
-        dirty,
-        &verify,
-    );
+    let planned = stabilization_execute::observe_and_plan(repo, config, persisted);
+    let gate = if !verify.passed {
+        MergeGateOutcome {
+            allowed: false,
+            summary: format!("merge blocked:\n- {}", format_verify_result(&verify)),
+        }
+    } else if planned.kind == stabilization_model::StabilizationWorkKind::Merge {
+        MergeGateOutcome {
+            allowed: true,
+            summary: planned.reason,
+        }
+    } else {
+        MergeGateOutcome {
+            allowed: false,
+            summary: format!("merge blocked:\n- {}", planned.reason),
+        }
+    };
     append_system_output(
         conn,
         step_id,
@@ -1152,6 +1181,15 @@ pub(super) fn execute_merge_step(
         )?;
         return Err(error);
     }
+    crate::github::refresh_pr_cache(
+        repo,
+        &persisted.run.branch,
+        &mut cache,
+        &persisted.run.worktree_path,
+        config,
+        true,
+    )?;
+    stabilization_execute::observe_plan_and_save(conn, repo, config, persisted)?;
 
     let done = format!("merged PR #{}", summary.number);
     append_system_output(
@@ -1217,13 +1255,32 @@ pub(super) fn execute_cleanup_step(
         )?;
     }
 
-    crate::lifecycle::delete_worktree_session(
+    let outcome = crate::session::delete_worktree_session(
         repo,
         config,
         &persisted.run.worktree_path,
         &persisted.run.branch,
     )?;
-    let summary = "deleted local session data, worktree, and branch".to_string();
+    let (status, summary, error) = match outcome {
+        crate::session::DeleteWorktreeOutcome::Deleted => (
+            AutoStepStatus::Done,
+            "deleted local session data, worktree, and branch".to_string(),
+            None,
+        ),
+        crate::session::DeleteWorktreeOutcome::BranchRetained { error } => (
+            AutoStepStatus::Failed,
+            format!("worktree removed, but branch was retained: {error}"),
+            Some(error),
+        ),
+        crate::session::DeleteWorktreeOutcome::DeletedWithWarnings { errors } => {
+            let error = errors.join("; ");
+            (
+                AutoStepStatus::Failed,
+                format!("worktree deletion completed with warnings: {error}"),
+                Some(error),
+            )
+        }
+    };
     append_system_output(
         conn,
         step_id,
@@ -1235,12 +1292,17 @@ pub(super) fn execute_cleanup_step(
     finish_non_agent_step(
         conn,
         &mut persisted.steps[step_index],
-        AutoStepStatus::Done,
+        status,
         Some(summary),
-        None,
+        error.clone(),
     )?;
     persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)
+    save_run_with_conn(conn, &persisted.run)?;
+    if let Some(error) = error {
+        Err(error)
+    } else {
+        Ok(())
+    }
 }
 
 pub(super) fn finish_non_agent_step(
@@ -1293,101 +1355,9 @@ pub(super) struct CiPollOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct MergeGateOutcome {
-    pub(super) allowed: bool,
-    pub(super) summary: String,
-}
-
-pub(super) fn evaluate_merge_gate(
-    config: &Config,
-    persisted: &PersistedAutoRun,
-    summary: &PrSummary,
-    details: Option<&PrDetails>,
-    local_head: &str,
-    dirty: bool,
-    verify: &VerifyResult,
-) -> MergeGateOutcome {
-    let mut blockers = Vec::new();
-    if dirty {
-        blockers.push("worktree is dirty".to_string());
-    }
-    if !verify.passed {
-        blockers.push("final local verification failed".to_string());
-    }
-    if summary.draft {
-        blockers.push("PR is draft".to_string());
-    }
-    if summary.check_state() != PrCheckState::Success {
-        blockers.push(format!("CI state is {}", summary.check_state().label()));
-    }
-    if summary.head_sha.trim().is_empty() {
-        blockers.push("PR head SHA is unknown".to_string());
-    } else if summary.head_sha.trim() != local_head.trim() {
-        blockers.push(format!(
-            "PR head {} does not match local head {}",
-            empty_or_unknown(&summary.head_sha),
-            empty_or_unknown(local_head)
-        ));
-    }
-
-    let review_blocker = merge_gate_review_blocker(config, persisted, summary, details);
-    if let Some(blocker) = review_blocker {
-        blockers.push(blocker);
-    }
-
-    if blockers.is_empty() {
-        MergeGateOutcome {
-            allowed: true,
-            summary: format!(
-                "merge gate passed for PR #{} at head {}",
-                summary.number,
-                empty_or_unknown(local_head)
-            ),
-        }
-    } else {
-        MergeGateOutcome {
-            allowed: false,
-            summary: format!("merge blocked:\n- {}", blockers.join("\n- ")),
-        }
-    }
-}
-
-pub(super) fn merge_gate_review_blocker(
-    config: &Config,
-    persisted: &PersistedAutoRun,
-    summary: &PrSummary,
-    details: Option<&PrDetails>,
-) -> Option<String> {
-    if !config.auto.review_wait_enabled {
-        return None;
-    }
-    let details = details?;
-    let baseline = parse_review_baseline(persisted.run.review_baseline_json.as_deref());
-    let after = baseline
-        .as_ref()
-        .filter(|baseline| baseline.head_sha == summary.head_sha)
-        .map(|baseline| baseline.updated_at.as_str());
-    let authors = config
-        .auto
-        .review_reviewer_identities
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
-    let feedback = actionable_review_feedback(
-        details,
-        ReviewFeedbackFilter {
-            after,
-            authors: &authors,
-        },
-    );
-    feedback.is_actionable().then(|| {
-        format!(
-            "actionable review feedback remains: {} inline, {} review body, {} PR comment(s)",
-            feedback.inline_comments.len(),
-            feedback.review_bodies.len(),
-            feedback.pr_comments.len()
-        )
-    })
+struct MergeGateOutcome {
+    allowed: bool,
+    summary: String,
 }
 
 pub(super) fn poll_ci_status(
@@ -1396,17 +1366,16 @@ pub(super) fn poll_ci_status(
     persisted: &mut PersistedAutoRun,
 ) -> Result<CiPollOutcome, String> {
     let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
-    crate::lifecycle::refresh_branch_pr_cache(
+    crate::github::refresh_pr_cache(
         repo,
-        config,
         &persisted.run.branch,
-        &persisted.run.worktree_path,
         &mut cache,
+        &persisted.run.worktree_path,
+        config,
         true,
-    );
+    )?;
     let summary = cache
-        .summary
-        .as_ref()
+        .trusted_summary()?
         .ok_or_else(|| "CI wait could not find pull request summary".to_string())?;
     persisted.run.pr_number = Some(summary.number);
     persisted.run.pr_url = Some(summary.url.clone());
@@ -1415,7 +1384,7 @@ pub(super) fn poll_ci_status(
         config,
         &persisted.run.branch,
         summary,
-        cache.details.as_ref(),
+        cache.trusted_details()?,
     )
 }
 
@@ -1480,17 +1449,16 @@ pub(super) fn poll_review_feedback(
     persisted: &mut PersistedAutoRun,
 ) -> Result<ReviewPollOutcome, String> {
     let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
-    crate::lifecycle::refresh_branch_pr_cache(
+    crate::github::refresh_pr_cache(
         repo,
-        config,
         &persisted.run.branch,
-        &persisted.run.worktree_path,
         &mut cache,
+        &persisted.run.worktree_path,
+        config,
         true,
-    );
+    )?;
     let summary = cache
-        .summary
-        .as_ref()
+        .trusted_summary()?
         .ok_or_else(|| "review wait could not find pull request summary".to_string())?;
     persisted.run.pr_number = Some(summary.number);
     persisted.run.pr_url = Some(summary.url.clone());
@@ -1498,7 +1466,7 @@ pub(super) fn poll_review_feedback(
     if persisted.run.review_baseline_json.is_none() {
         persisted.run.review_baseline_json = Some(review_baseline_json(summary));
     }
-    evaluate_review_feedback(config, persisted, summary, cache.details.as_ref())
+    evaluate_review_feedback(config, persisted, summary, cache.trusted_details()?)
 }
 
 pub(super) fn evaluate_review_feedback(
@@ -1512,16 +1480,6 @@ pub(super) fn evaluate_review_feedback(
         .as_ref()
         .filter(|baseline| baseline.head_sha == summary.head_sha)
         .map(|baseline| baseline.updated_at.as_str());
-    if !has_configured_reviewer_requested(summary, config) {
-        return Ok(ReviewPollOutcome {
-            summary:
-                "no automated reviewer feedback or pending configured reviewer found; continuing"
-                    .to_string(),
-            fix_prompt: None,
-            review_thread_ids: Vec::new(),
-            complete: true,
-        });
-    }
     let Some(details) = details else {
         return Ok(ReviewPollOutcome {
             summary: "PR details are not available yet; waiting for review feedback".to_string(),
@@ -1530,17 +1488,11 @@ pub(super) fn evaluate_review_feedback(
             complete: false,
         });
     };
-    let authors = config
-        .auto
-        .review_reviewer_identities
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>();
     let feedback = actionable_review_feedback(
         details,
         ReviewFeedbackFilter {
             after,
-            authors: &authors,
+            authors: &[],
         },
     );
     if feedback.is_actionable() {
@@ -1551,6 +1503,16 @@ pub(super) fn evaluate_review_feedback(
             fix_prompt: Some(prompt),
             review_thread_ids: crate::review::review_thread_ids(&feedback),
             complete: false,
+        });
+    }
+    if !has_configured_reviewer_requested(summary, config) {
+        return Ok(ReviewPollOutcome {
+            summary:
+                "no automated reviewer feedback or pending configured reviewer found; continuing"
+                    .to_string(),
+            fix_prompt: None,
+            review_thread_ids: Vec::new(),
+            complete: true,
         });
     }
     let total_feedback =
@@ -1755,8 +1717,7 @@ fn repair_guard_facts(
             .or(persisted.run.pr_number),
         pr_head_sha: summary
             .map(|summary| summary.head_sha.clone())
-            .filter(|sha| !sha.trim().is_empty())
-            .or_else(|| persisted.run.current_head_sha.clone()),
+            .filter(|sha| !sha.trim().is_empty()),
         base_sha,
     }
 }
@@ -1778,6 +1739,29 @@ fn pending_push_guard(
         expected_base_sha: facts.base_sha,
         guarded_review_thread_ids,
     }
+}
+
+fn persist_pending_commit_obligation(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+    repair_kind: stabilization_model::RepairKind,
+    pre_commit_head: String,
+    facts: RepairGuardFacts,
+    guarded_review_thread_ids: Vec<String>,
+) -> Result<(), String> {
+    persisted.run.pending_push = Some(pending_push_guard(
+        repair_kind,
+        String::new(),
+        pre_commit_head,
+        facts,
+        guarded_review_thread_ids,
+    ));
+    persisted.run.stabilization_status = Some(stabilization_model::StabilizationStatus::Blocked);
+    persisted.run.stabilization_blocker =
+        Some(stabilization_model::StabilizationBlocker::PendingPush);
+    persisted.run.stabilization_next_work =
+        Some(stabilization_model::StabilizationWorkKind::PushPendingRepair);
+    save_run_with_conn(conn, &persisted.run)
 }
 
 fn repair_commit_message(config: &Config, template_name: &str, default: &str) -> String {

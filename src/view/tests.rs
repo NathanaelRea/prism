@@ -1425,6 +1425,7 @@ fn test_session(branch: &str, agent_state: AgentState) -> Session {
         repo_label: "repo".to_string(),
         repo_key: Some('1'),
         path: PathBuf::from(format!("/repo/{branch}")),
+        incarnation: String::new(),
         path_display: format!("/repo/{branch}"),
         branch: branch.to_string(),
         prompt_summary: "implement feature".to_string(),

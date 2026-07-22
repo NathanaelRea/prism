@@ -179,9 +179,26 @@ pub fn load_auto_run(
     run_id: &str,
 ) -> Result<Option<PersistedAutoRun>, String> {
     let run = load_run_with_conn(conn, run_id)?;
-    let Some(run) = run else {
+    let Some(mut run) = run else {
         return Ok(None);
     };
+    if run.status == AutoRunStatus::Done
+        && (run.pending_push.is_some()
+            || run
+                .stabilization_status
+                .is_some_and(stabilization_model::StabilizationStatus::keeps_run_active))
+    {
+        run.status = AutoRunStatus::Paused;
+        if run.pending_push.is_some() {
+            run.stabilization_status = Some(stabilization_model::StabilizationStatus::Blocked);
+            run.stabilization_blocker =
+                Some(stabilization_model::StabilizationBlocker::PendingPush);
+            run.stabilization_next_work =
+                Some(stabilization_model::StabilizationWorkKind::PushPendingRepair);
+        }
+        run.updated_unix_ms = unix_ms();
+        save_run_with_conn(conn, &run)?;
+    }
     let steps = load_steps_with_conn(conn, run_id)?;
     Ok(Some(PersistedAutoRun { run, steps }))
 }
@@ -197,7 +214,9 @@ pub fn load_recent_active_runs_for_repo(
              from auto_run
              where repo_root = ?1
                and archived_unix_ms is null
-               and status in ('queued', 'running', 'paused', 'failed')
+               and (status in ('queued', 'running', 'paused', 'failed')
+                    or pending_push_json is not null
+                    or stabilization_status in ('observing', 'blocked', 'waiting', 'ready'))
              order by
                case status
                   when 'running' then 0

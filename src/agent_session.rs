@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -14,7 +15,7 @@ const DELAYED_REWARM_AFTER_ATTACH: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct AgentSessionSlot {
-    pub repo_index: usize,
+    pub repo_root: PathBuf,
     pub branch: String,
     pub path: PathBuf,
 }
@@ -63,9 +64,18 @@ pub(crate) struct AgentSessionAttachCompletion<'a> {
 }
 
 impl AgentSessionSlot {
+    #[cfg(test)]
     pub(crate) fn for_session(session: &Session) -> Self {
+        let inferred_root = session
+            .path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(""));
+        Self::for_repository_session(inferred_root, session)
+    }
+
+    pub(crate) fn for_repository_session(repo_root: &std::path::Path, session: &Session) -> Self {
         Self {
-            repo_index: session.repo_index,
+            repo_root: repo_root.to_path_buf(),
             branch: session.branch.clone(),
             path: session.path.clone(),
         }
@@ -83,7 +93,11 @@ pub(crate) fn session_use(
     generations: &mut BTreeMap<AgentSessionSlot, u64>,
     session: &Session,
 ) -> AgentSessionUse {
-    let slot = AgentSessionSlot::for_session(session);
+    let repo_root = repos
+        .get(session.repo_index)
+        .map(|repo| repo.repo.root.as_path())
+        .unwrap_or_else(|| std::path::Path::new(""));
+    let slot = AgentSessionSlot::for_repository_session(repo_root, session);
     let generation = generation_for_slot(repos, generations, &slot);
     let warmup_key = AgentSessionWarmupKey::new(slot.clone(), generation);
     AgentSessionUse {
@@ -132,10 +146,14 @@ pub(crate) fn warmup_job_for_key(
     if in_flight.contains(&key) || !key_is_current(generations, &key) {
         return None;
     }
-    let session = sessions
+    let session = sessions.iter().find(|session| {
+        repos.get(session.repo_index).is_some_and(|repo| {
+            AgentSessionSlot::for_repository_session(&repo.repo.root, session) == key.slot
+        })
+    })?;
+    let repo = repos
         .iter()
-        .find(|session| AgentSessionSlot::for_session(session) == key.slot)?;
-    let repo = repos.get(session.repo_index)?;
+        .find(|repo| repo.repo.root == key.slot.repo_root)?;
     Some(AgentSessionWarmupJob {
         key,
         repo: repo.repo.clone(),
@@ -154,7 +172,8 @@ pub(crate) fn generation_for_slot(
         return generation;
     }
     let generation = repos
-        .get(slot.repo_index)
+        .iter()
+        .find(|repo| repo.repo.root == slot.repo_root)
         .and_then(|repo| {
             tmux::latest_agent_session_generation(&repo.repo, &repo.config, &slot.branch)
         })
@@ -178,6 +197,28 @@ pub(crate) fn key_is_current(
     key: &AgentSessionWarmupKey,
 ) -> bool {
     generations.get(&key.slot).copied().unwrap_or(0) == key.generation
+}
+
+pub(crate) fn reconcile_worktree_sessions(
+    repos: &[ManagedRepo],
+    sessions: &[Session],
+    generations: &mut BTreeMap<AgentSessionSlot, u64>,
+) {
+    let live = sessions
+        .iter()
+        .filter_map(|session| {
+            let repo = repos.get(session.repo_index)?;
+            Some(AgentSessionSlot::for_repository_session(
+                &repo.repo.root,
+                session,
+            ))
+        })
+        .collect::<BTreeSet<_>>();
+    for (slot, generation) in generations.iter_mut() {
+        if !live.contains(slot) {
+            *generation = generation.saturating_add(1);
+        }
+    }
 }
 
 pub(crate) fn ensure_session(
@@ -280,10 +321,11 @@ fn update_observed_state(
     slot: &AgentSessionSlot,
     running: bool,
 ) -> bool {
-    let Some(session) = sessions
-        .iter_mut()
-        .find(|session| AgentSessionSlot::for_session(session) == *slot)
-    else {
+    let Some(session) = sessions.iter_mut().find(|session| {
+        repos.get(session.repo_index).is_some_and(|repo| {
+            AgentSessionSlot::for_repository_session(&repo.repo.root, session) == *slot
+        })
+    }) else {
         return false;
     };
     persist_observed_state(repos, session, running)
@@ -301,7 +343,8 @@ pub(crate) fn apply_warmup_result(
     }
     if let Some(error) = result.error {
         let repo = repos
-            .get(result.key.slot.repo_index)
+            .iter()
+            .find(|repo| repo.repo.root == result.key.slot.repo_root)
             .map(|repo| repo.repo.clone())
             .unwrap_or_else(|| fallback_repo.clone());
         let _ = crate::session::append_runtime_log(
@@ -343,6 +386,38 @@ fn observed_agent_state(current: AgentState, tmux_agent_running: bool) -> Option
     None
 }
 
+pub(crate) fn reconcile_session_refresh(current: &mut AgentState, previous: AgentState) {
+    *current = previous;
+}
+
+pub(crate) fn remove_state_with_conn(
+    conn: &rusqlite::Connection,
+    branch: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "delete from agent_state where branch = ?1",
+        rusqlite::params![branch],
+    )
+    .map_err(|error| format!("remove Agent Session state: {error}"))?;
+    Ok(())
+}
+
+pub(crate) fn remove_owned_state(repo: &Repository, branch: &str) -> Result<(), String> {
+    crate::observability::with_writable_db(repo, |conn| remove_state_with_conn(conn, branch))?;
+    let log = repo
+        .prism_dir()
+        .join("logs")
+        .join(format!("{}.log", crate::util::safe_branch_filename(branch)));
+    if log.exists() {
+        fs::remove_file(log).map_err(|error| format!("remove Agent Session log: {error}"))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn shutdown(repo: &Repository, config: &Config, branch: &str) -> Result<(), String> {
+    tmux::kill_agent_sessions_for_branch(repo, config, branch)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -382,7 +457,7 @@ mod tests {
         let repos = vec![ManagedRepo::new(repo.clone(), config.clone(), None)];
         let mut sessions = vec![test_session("feature")];
         sessions[0].agent_state = AgentState::Running;
-        let slot = AgentSessionSlot::for_session(&sessions[0]);
+        let slot = AgentSessionSlot::for_repository_session(&repo.root, &sessions[0]);
         let mut generations = BTreeMap::from([(slot.clone(), 2)]);
         let completion_use = session_use(&repos, &mut generations, &sessions[0]);
 
@@ -414,7 +489,7 @@ mod tests {
         let config = test_config();
         let repos = vec![ManagedRepo::new(repo, config, None)];
         let sessions = vec![test_session("feature")];
-        let slot = AgentSessionSlot::for_session(&sessions[0]);
+        let slot = AgentSessionSlot::for_repository_session(&repos[0].repo.root, &sessions[0]);
         let generations = BTreeMap::from([(slot.clone(), 1)]);
 
         assert!(
@@ -452,7 +527,7 @@ mod tests {
         let config = test_config();
         let repos = vec![ManagedRepo::new(repo, config, None)];
         let sessions = vec![test_session("feature")];
-        let slot = AgentSessionSlot::for_session(&sessions[0]);
+        let slot = AgentSessionSlot::for_repository_session(&repos[0].repo.root, &sessions[0]);
         let mut generations = BTreeMap::from([(slot.clone(), 4)]);
 
         let jobs = warmup_jobs_for_sessions(&repos, &sessions, &mut generations, &BTreeSet::new());
@@ -462,12 +537,40 @@ mod tests {
         assert_eq!(jobs[0].session.branch, "feature");
     }
 
+    #[test]
+    fn removed_session_invalidates_in_flight_generation_across_repository_reorder() {
+        let first = ManagedRepo::new(
+            Repository {
+                root: PathBuf::from("/tmp/repo-a"),
+            },
+            test_config(),
+            None,
+        );
+        let second = ManagedRepo::new(
+            Repository {
+                root: PathBuf::from("/tmp/repo-b"),
+            },
+            test_config(),
+            None,
+        );
+        let mut session = test_session("feature");
+        session.repo_index = 0;
+        let slot = AgentSessionSlot::for_repository_session(&first.repo.root, &session);
+        let stale = AgentSessionWarmupKey::new(slot.clone(), 2);
+        let mut generations = BTreeMap::from([(slot, 2)]);
+
+        super::reconcile_worktree_sessions(&[second, first], &[], &mut generations);
+
+        assert!(!super::key_is_current(&generations, &stale));
+    }
+
     fn test_session(branch: &str) -> Session {
         Session {
             repo_index: 0,
             repo_label: "repo".to_string(),
             repo_key: None,
             path: PathBuf::from("/tmp/prism-agent-session-test/worktree"),
+            incarnation: String::new(),
             path_display: "worktree".to_string(),
             branch: branch.to_string(),
             prompt_summary: String::new(),

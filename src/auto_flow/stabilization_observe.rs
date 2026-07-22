@@ -6,7 +6,7 @@ use crate::github::{PrCache, PrDetails, PrReview, PrReviewComment, PrSummary, Re
 use crate::repo::Repository;
 use crate::review::{ReviewFeedbackFilter, actionable_review_feedback};
 use crate::session::Session;
-use crate::verify::run_merge_conflict_check;
+use crate::verify::run_merge_conflict_check_against;
 
 use super::stabilization_model::*;
 
@@ -29,15 +29,18 @@ pub(crate) fn build_stabilization_snapshot(
     let policy_cache = github_remote
         .as_deref()
         .and_then(|remote| crate::github::load_repo_policy_cache(repo, remote));
-    let merge_conflict = (!session.is_default_branch(config) && !session.is_detached())
-        .then(|| run_merge_conflict_check(config, &session.path));
+    let merge_conflict = session.pr.summary.as_ref().and_then(|summary| {
+        (!session.is_default_branch(config) && !session.is_detached())
+            .then(|| run_merge_conflict_check_against(config, &session.path, &summary.base_ref))
+    });
 
-    let mut pull_request = pull_request_facts_from_cache(
+    let mut pull_request = pull_request_facts_from_cache_with_baseline(
         &session.pr,
         config,
         base_sha,
         merge_conflict.as_ref(),
         policy_cache.as_ref(),
+        run.and_then(|run| run.review_baseline_json.as_deref()),
     );
     if policy_cache
         .as_ref()
@@ -84,7 +87,15 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
     run: &super::AutoRun,
     config: &Config,
 ) -> StabilizationSnapshot {
-    let cache = crate::github::load_pr_cache(repo, &run.branch);
+    let mut cache = crate::github::load_pr_cache(repo, &run.branch);
+    let _ = crate::github::refresh_pr_cache(
+        repo,
+        &run.branch,
+        &mut cache,
+        &run.worktree_path,
+        config,
+        true,
+    );
     let local_head_sha = git::current_head_sha(&run.worktree_path, config).ok();
     let remote_head_sha = git::remote_branch_head_sha(&run.worktree_path, &run.branch, config)
         .ok()
@@ -101,15 +112,19 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
         .and_then(|remote| crate::github::load_repo_policy_cache(repo, remote));
     let is_default_branch = config.is_default_branch(&run.branch);
     let detached = run.branch == "(detached)";
-    let merge_conflict = (!is_default_branch && !detached)
-        .then(|| run_merge_conflict_check(config, &run.worktree_path));
+    let merge_conflict = cache.summary.as_ref().and_then(|summary| {
+        (!is_default_branch && !detached).then(|| {
+            run_merge_conflict_check_against(config, &run.worktree_path, &summary.base_ref)
+        })
+    });
 
-    let mut pull_request = pull_request_facts_from_cache(
+    let mut pull_request = pull_request_facts_from_cache_with_baseline(
         &cache,
         config,
         base_sha,
         merge_conflict.as_ref(),
         policy_cache.as_ref(),
+        run.review_baseline_json.as_deref(),
     );
     if policy_cache
         .as_ref()
@@ -214,8 +229,37 @@ pub(crate) fn pull_request_facts_from_cache(
     merge_conflict: Option<&crate::verify::VerifyCheckResult>,
     policy: Option<&RepoPolicyCache>,
 ) -> Option<PullRequestFacts> {
+    pull_request_facts_from_cache_with_baseline(
+        cache,
+        config,
+        base_sha,
+        merge_conflict,
+        policy,
+        None,
+    )
+}
+
+fn pull_request_facts_from_cache_with_baseline(
+    cache: &PrCache,
+    config: &Config,
+    base_sha: Option<String>,
+    merge_conflict: Option<&crate::verify::VerifyCheckResult>,
+    policy: Option<&RepoPolicyCache>,
+    review_baseline_json: Option<&str>,
+) -> Option<PullRequestFacts> {
     let summary = cache.summary.as_ref()?;
     let details = cache.details.as_ref();
+    let observation_error = match cache.trusted_summary() {
+        Err(error) => Some(error),
+        Ok(None) => Some("pull request summary is unavailable".to_string()),
+        Ok(Some(_)) => match cache.trusted_details() {
+            Err(error) => Some(error),
+            Ok(None) => Some("pull request details have not been observed".to_string()),
+            Ok(Some(_)) => None,
+        },
+    };
+    let review_after = super::non_agent::parse_review_baseline(review_baseline_json)
+        .map(|baseline| baseline.updated_at);
     Some(PullRequestFacts {
         number: summary.number,
         url: summary.url.clone(),
@@ -226,11 +270,12 @@ pub(crate) fn pull_request_facts_from_cache(
         base_sha,
         updated_at: summary.updated_at.clone(),
         ci: ci_facts(summary, details, policy),
-        review: review_facts(summary, details, config),
+        review: review_facts(summary, details, config, review_after.as_deref()),
         mergeability: mergeability_facts(summary, merge_conflict),
         top_level_comment_count: details
             .map(|details| details.comments.len())
             .unwrap_or(summary.comment_count as usize),
+        observation_error,
     })
 }
 
@@ -313,7 +358,12 @@ fn optional_failures(details: &PrDetails, required: &[CheckFact]) -> Vec<String>
         .collect()
 }
 
-fn review_facts(summary: &PrSummary, details: Option<&PrDetails>, config: &Config) -> ReviewFacts {
+fn review_facts(
+    summary: &PrSummary,
+    details: Option<&PrDetails>,
+    config: &Config,
+    after: Option<&str>,
+) -> ReviewFacts {
     let mut actionable_reviews = Vec::new();
     let mut unresolved_threads = Vec::new();
     let top_level_comments = details.map(|details| details.comments.len()).unwrap_or(0);
@@ -322,11 +372,27 @@ fn review_facts(summary: &PrSummary, details: Option<&PrDetails>, config: &Confi
         let feedback = actionable_review_feedback(
             details,
             ReviewFeedbackFilter {
-                after: None,
+                after,
                 authors: &[],
             },
         );
-        actionable_reviews.extend(feedback.review_bodies.into_iter().map(review_body_item));
+        let mut review_bodies = feedback.review_bodies;
+        review_bodies.retain(|review| {
+            let superseded = details.reviews.iter().any(|candidate| {
+                candidate.author.eq_ignore_ascii_case(&review.author)
+                    && candidate.submitted_at > review.submitted_at
+                    && matches!(
+                        candidate.state.trim().to_ascii_uppercase().as_str(),
+                        "APPROVED" | "DISMISSED" | "CHANGES_REQUESTED"
+                    )
+            });
+            !superseded
+                && !matches!(
+                    review.state.trim().to_ascii_uppercase().as_str(),
+                    "APPROVED" | "DISMISSED"
+                )
+        });
+        actionable_reviews.extend(review_bodies.into_iter().map(review_body_item));
         for comment in feedback.inline_comments {
             let fact = review_thread_fact(comment);
             if !fact.resolved {
@@ -433,6 +499,95 @@ mod tests {
     use crate::session::{Session, SessionClassification};
 
     use super::*;
+
+    #[test]
+    fn old_review_body_is_not_actionable_after_baseline() {
+        let summary = test_summary();
+        let details = PrDetails {
+            reviews: vec![PrReview {
+                id: "review-1".to_string(),
+                author: "reviewer".to_string(),
+                state: "CHANGES_REQUESTED".to_string(),
+                body: "old request".to_string(),
+                submitted_at: "2026-01-01T00:00:00Z".to_string(),
+            }],
+            ..PrDetails::default()
+        };
+        let config = test_config(false);
+
+        let facts = review_facts(
+            &summary,
+            Some(&details),
+            &config,
+            Some("2026-01-01T00:01:00Z"),
+        );
+
+        assert!(facts.actionable_reviews.is_empty());
+    }
+
+    #[test]
+    fn later_approval_addresses_earlier_review_body() {
+        let summary = test_summary();
+        let details = PrDetails {
+            reviews: vec![
+                PrReview {
+                    id: "review-1".to_string(),
+                    author: "reviewer".to_string(),
+                    state: "CHANGES_REQUESTED".to_string(),
+                    body: "please fix".to_string(),
+                    submitted_at: "2026-01-01T00:00:00Z".to_string(),
+                },
+                PrReview {
+                    id: "review-2".to_string(),
+                    author: "reviewer".to_string(),
+                    state: "APPROVED".to_string(),
+                    body: "looks good".to_string(),
+                    submitted_at: "2026-01-01T00:01:00Z".to_string(),
+                },
+            ],
+            ..PrDetails::default()
+        };
+        let config = test_config(false);
+
+        let facts = review_facts(&summary, Some(&details), &config, None);
+
+        assert!(facts.actionable_reviews.is_empty());
+    }
+
+    #[test]
+    fn later_commented_review_does_not_erase_requested_changes() {
+        let summary = test_summary();
+        let details = PrDetails {
+            reviews: vec![
+                PrReview {
+                    id: "review-1".to_string(),
+                    author: "reviewer".to_string(),
+                    state: "CHANGES_REQUESTED".to_string(),
+                    body: "please fix".to_string(),
+                    submitted_at: "2026-01-01T00:00:00Z".to_string(),
+                },
+                PrReview {
+                    id: "review-2".to_string(),
+                    author: "reviewer".to_string(),
+                    state: "COMMENTED".to_string(),
+                    body: "one more note".to_string(),
+                    submitted_at: "2026-01-01T00:01:00Z".to_string(),
+                },
+            ],
+            ..PrDetails::default()
+        };
+        let config = test_config(false);
+
+        let facts = review_facts(&summary, Some(&details), &config, None);
+
+        assert!(facts.actionable_reviews.iter().any(|review| {
+            matches!(
+                review,
+                ActionableReviewItem::ReviewBody { state, body, .. }
+                    if state == "CHANGES_REQUESTED" && body == "please fix"
+            )
+        }));
+    }
 
     #[test]
     fn pull_request_facts_keep_top_level_comments_advisory() {
@@ -591,6 +746,7 @@ exit 1
             repo_label: "repo".to_string(),
             repo_key: None,
             path: worktree.clone(),
+            incarnation: String::new(),
             path_display: worktree.display().to_string(),
             branch: "feature".to_string(),
             prompt_summary: String::new(),
@@ -697,6 +853,7 @@ exit 1
             repo_label: "repo".to_string(),
             repo_key: None,
             path: temp.join("worktree"),
+            incarnation: String::new(),
             path_display: temp.join("worktree").display().to_string(),
             branch: "feature".to_string(),
             prompt_summary: String::new(),
@@ -732,7 +889,6 @@ exit 1
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "known Phase 1 safety defect"]
     fn phase_1_mergeability_conflict_check_uses_actual_pr_base() {
         let temp = unique_temp_dir("prism-stabilization-pr-base-test");
         fs::create_dir_all(&temp).unwrap();
@@ -766,6 +922,7 @@ exit 1
             repo_label: "repo".to_string(),
             repo_key: None,
             path: temp.join("worktree"),
+            incarnation: String::new(),
             path_display: temp.join("worktree").display().to_string(),
             branch: "feature".to_string(),
             prompt_summary: String::new(),

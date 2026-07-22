@@ -1849,6 +1849,7 @@ exit 0
             repo_label: "repo".to_string(),
             repo_key: None,
             path: path.clone(),
+            incarnation: String::new(),
             path_display: path.display().to_string(),
             branch: branch.to_string(),
             prompt_summary: String::new(),

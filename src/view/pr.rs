@@ -18,14 +18,14 @@ pub(super) fn pr_panel_lines(
             Line::from(Span::styled("PR tracking disabled", muted_style())),
         ];
     }
-    if let Some(error) = &session.pr.error {
+    if let Some(error) = session.pr.display_error() {
         return vec![
             Line::from(Span::styled("✕ PR refresh error", error_style())),
-            Line::from(error.clone()),
+            Line::from(error.to_string()),
             Line::from(Span::styled("Press r to retry", attention_style())),
         ];
     }
-    let Some(summary) = &session.pr.summary else {
+    let Some(summary) = session.pr.summary() else {
         let refreshed = session
             .pr
             .last_refreshed
@@ -240,7 +240,7 @@ pub(super) fn description_lines(body: &str, max_lines: usize) -> Vec<Line<'stati
 }
 
 pub(super) fn pr_comment_count_label(cache: &crate::github::PrCache) -> String {
-    if let Some(details) = &cache.details {
+    if let Some(details) = cache.details() {
         let open = details.comments.len()
             + details
                 .review_comments

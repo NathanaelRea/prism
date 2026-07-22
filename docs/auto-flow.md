@@ -79,8 +79,16 @@ Pending push behavior:
 - If the PR branch already contains the guarded commit, Prism marks the push satisfied and replans.
 - If local or remote branch state moved away from the guard, Prism invalidates the pending push and replans instead of pushing blindly.
 - Review repair pushes resolve only the guarded review thread IDs captured when the repair work was planned.
+- The guarded obligation is persisted before either an automatic or user-approved repair push, so a restart cannot lose an in-flight effect.
 
-If Prism exits or the machine restarts, rerun `prism` or `prism auto` for the repository. Active Auto Flow steps are reconciled from the persisted run; stale running attempts are marked failed so they can be retried instead of being silently forgotten.
+PR Cache refresh behavior:
+
+- Cached PR data can remain visible during a transient GitHub or persistence failure, but it is marked stale and cannot authorize repair, readiness, merge, or guarded-thread resolution.
+- Forced actions report the refresh failure instead of treating stale details or malformed GitHub output as authoritative absence.
+- Summary and detail observations are associated with the pull request number and head SHA; details from an earlier head are rejected.
+- PR Stabilization requires trustworthy observations and blocks readiness when local, remote, and pull-request heads diverge.
+
+If Prism exits or the machine restarts, rerun `prism` or `prism auto` for the repository. Active Auto Flow steps are reconciled from the persisted run; stale running attempts are marked failed so they can be retried instead of being silently forgotten. A persisted pending guarded push keeps the run active even if older step aggregation recorded it as done. Prism restores the pending guard, reobserves the branch and PR, and either completes the matching effect or replans without pushing.
 
 Troubleshooting:
 

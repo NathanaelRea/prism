@@ -69,6 +69,7 @@ pub(crate) struct PullRequestFacts {
     pub review: ReviewFacts,
     pub mergeability: MergeabilityFacts,
     pub top_level_comment_count: usize,
+    pub observation_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -186,6 +187,10 @@ pub enum StabilizationBlocker {
     NeedsPullRequest,
     PendingPush,
     DirtyWorktree,
+    ObservationFailed,
+    DraftPullRequest,
+    WrongBase,
+    HeadDiverged,
     MergeBlocked,
     ReviewFeedbackFound,
     ReviewApprovalMissing,
@@ -240,6 +245,13 @@ pub struct WorkGuard {
 }
 
 impl StabilizationStatus {
+    pub(crate) fn keeps_run_active(self) -> bool {
+        matches!(
+            self,
+            Self::Observing | Self::Blocked | Self::Waiting | Self::Ready
+        )
+    }
+
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Observing => "observing",
@@ -272,6 +284,10 @@ impl StabilizationBlocker {
             Self::NeedsPullRequest => "needs_pull_request",
             Self::PendingPush => "pending_push",
             Self::DirtyWorktree => "dirty_worktree",
+            Self::ObservationFailed => "observation_failed",
+            Self::DraftPullRequest => "draft_pull_request",
+            Self::WrongBase => "wrong_base",
+            Self::HeadDiverged => "head_diverged",
             Self::MergeBlocked => "merge_blocked",
             Self::ReviewFeedbackFound => "review_feedback_found",
             Self::ReviewApprovalMissing => "review_approval_missing",
@@ -294,6 +310,10 @@ impl StabilizationBlocker {
             "needs_pull_request" => Ok(Self::NeedsPullRequest),
             "pending_push" => Ok(Self::PendingPush),
             "dirty_worktree" => Ok(Self::DirtyWorktree),
+            "observation_failed" => Ok(Self::ObservationFailed),
+            "draft_pull_request" => Ok(Self::DraftPullRequest),
+            "wrong_base" => Ok(Self::WrongBase),
+            "head_diverged" => Ok(Self::HeadDiverged),
             "merge_blocked" => Ok(Self::MergeBlocked),
             "review_feedback_found" => Ok(Self::ReviewFeedbackFound),
             "review_approval_missing" => Ok(Self::ReviewApprovalMissing),
@@ -356,6 +376,22 @@ impl StabilizationWorkKind {
             "done" => Ok(Self::Done),
             "escalate" => Ok(Self::Escalate),
             _ => Err(format!("unknown stabilization work kind: {value}")),
+        }
+    }
+}
+
+impl StabilizationWorkItem {
+    pub(crate) fn status(&self) -> StabilizationStatus {
+        match self.kind {
+            StabilizationWorkKind::WaitForCi | StabilizationWorkKind::WaitForReview => {
+                StabilizationStatus::Waiting
+            }
+            StabilizationWorkKind::MarkReadyForManualMerge | StabilizationWorkKind::Merge => {
+                StabilizationStatus::Ready
+            }
+            StabilizationWorkKind::Done => StabilizationStatus::Done,
+            StabilizationWorkKind::Escalate => StabilizationStatus::Escalated,
+            _ => StabilizationStatus::Blocked,
         }
     }
 }

@@ -12,8 +12,12 @@ pub(super) fn current_unix_ms() -> u64 {
         .unwrap_or_default()
 }
 
-pub(super) fn opencode_poll_key(session: &crate::session::Session) -> OpencodePollKey {
-    OpencodePollKey::for_session(session)
+pub(super) fn opencode_poll_key(
+    repo_root: &Path,
+    session: &crate::session::Session,
+    generation: u64,
+) -> OpencodePollKey {
+    OpencodePollKey::for_repository_session_generation(repo_root, session, generation)
 }
 
 impl Tui {
@@ -34,7 +38,17 @@ impl Tui {
             {
                 continue;
             }
-            let key = opencode_poll_key(session);
+            let generation = self
+                .worktree_generations
+                .get(&(
+                    managed.repo.root.clone(),
+                    session.path.clone(),
+                    session.branch.clone(),
+                    session.incarnation.clone(),
+                ))
+                .copied()
+                .unwrap_or_default();
+            let key = opencode_poll_key(&managed.repo.root, session, generation);
             if !force && self.opencode_polls_in_flight.contains(&key) {
                 continue;
             }
@@ -166,11 +180,21 @@ impl Tui {
             self.opencode_polls_in_flight.remove(&result.key);
             match result.status {
                 Ok(mut status) => {
-                    if let Some(index) = self
-                        .sessions
-                        .iter()
-                        .position(|session| opencode_poll_key(session) == result.key)
-                    {
+                    if let Some(index) = self.sessions.iter().position(|session| {
+                        self.repos.get(session.repo_index).is_some_and(|repo| {
+                            let generation = self
+                                .worktree_generations
+                                .get(&(
+                                    repo.repo.root.clone(),
+                                    session.path.clone(),
+                                    session.branch.clone(),
+                                    session.incarnation.clone(),
+                                ))
+                                .copied()
+                                .unwrap_or_default();
+                            opencode_poll_key(&repo.repo.root, session, generation) == result.key
+                        })
+                    }) {
                         let state_event_is_newer = self
                             .opencode_last_state_event
                             .get(&result.key)
@@ -211,7 +235,11 @@ impl Tui {
                     if error == "no OpenCode runtime exists yet" {
                         continue;
                     }
-                    if let Some(repo) = self.repos.get(result.key.repo_index) {
+                    if let Some(repo) = self
+                        .repos
+                        .iter()
+                        .find(|repo| repo.repo.root == result.key.repo_root)
+                    {
                         let _ = append_runtime_log(
                             &repo.repo,
                             &format!(
@@ -269,7 +297,22 @@ impl Tui {
                     }
                     if let Some(state) = event.state {
                         self.opencode_last_state_event.insert(
-                            opencode_poll_key(&self.sessions[index]),
+                            opencode_poll_key(
+                                &self.repos[self.sessions[index].repo_index].repo.root,
+                                &self.sessions[index],
+                                self.worktree_generations
+                                    .get(&(
+                                        self.repos[self.sessions[index].repo_index]
+                                            .repo
+                                            .root
+                                            .clone(),
+                                        self.sessions[index].path.clone(),
+                                        self.sessions[index].branch.clone(),
+                                        self.sessions[index].incarnation.clone(),
+                                    ))
+                                    .copied()
+                                    .unwrap_or_default(),
+                            ),
                             std::time::Instant::now(),
                         );
                         if state != opencode::OpencodeState::Idle

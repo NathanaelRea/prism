@@ -3,8 +3,12 @@ use super::*;
 pub(super) const DEFAULT_BRANCH_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(60);
 pub(super) const BACKGROUND_PR_SUMMARY_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
-pub(super) fn pr_poll_key(session: &crate::session::Session) -> PrPollKey {
-    PrPollKey::for_session(session)
+pub(super) fn pr_poll_key(
+    repo_root: &Path,
+    generation: u64,
+    session: &crate::session::Session,
+) -> PrPollKey {
+    PrPollKey::for_repository_session_generation(repo_root, session, generation)
 }
 
 pub(super) fn fetch_wt_columns(
@@ -155,32 +159,50 @@ impl Tui {
             let has_pr_branches = self.sessions.iter().any(|session| {
                 session.repo_index == repo_index
                     && !session.hidden
-                    && pr_cache_pollable(&managed.config, &session.branch, &session.pr)
+                    && pr_cache_pollable_for_session(session, &managed.config, true)
             });
+            let has_sessions = self
+                .sessions
+                .iter()
+                .any(|session| session.repo_index == repo_index);
+            if has_sessions
+                && (force || summaries_due)
+                && !github_remote_configured(&managed.repo.root, &managed.config)
+            {
+                let poll_started_at = std::time::Instant::now();
+                let repo = managed.repo.clone();
+                if let Some(managed) = self.repos.get_mut(repo_index) {
+                    managed.pr_summary_last_polled = Some(poll_started_at);
+                }
+                for session in self
+                    .sessions
+                    .iter_mut()
+                    .filter(|session| session.repo_index == repo_index)
+                {
+                    let before = pr_cache_render_signature(&session.pr);
+                    let had_visible_cache =
+                        before != pr_cache_render_signature(&Default::default());
+                    clear_pr_cache(&repo, &session.branch, &mut session.pr);
+                    if had_visible_cache {
+                        session.unseen_comments = false;
+                        changed = true;
+                    }
+                }
+                continue;
+            }
             if has_pr_branches && (force || summaries_due) && !managed.pr_summary_poll_in_flight {
                 let poll_started_at = std::time::Instant::now();
-                if !github_remote_configured(&managed.repo.root, &managed.config) {
-                    if let Some(managed) = self.repos.get_mut(repo_index) {
-                        managed.pr_summary_last_polled = Some(poll_started_at);
-                    }
-                    for session in self
-                        .sessions
-                        .iter_mut()
-                        .filter(|session| session.repo_index == repo_index)
-                    {
-                        if pr_cache_render_signature(&session.pr)
-                            != pr_cache_render_signature(&Default::default())
-                        {
-                            session.pr = Default::default();
-                            session.unseen_comments = false;
-                            changed = true;
-                        }
-                    }
-                    continue;
-                }
                 let path = managed.repo.root.clone();
+                let repo_root = path.clone();
                 let config = managed.config.clone();
                 let tx = self.pr_poll_tx.clone();
+                for session in self
+                    .sessions
+                    .iter_mut()
+                    .filter(|session| session.repo_index == repo_index && !session.hidden)
+                {
+                    session.pr.begin_summary_poll(poll_started_at);
+                }
                 if let Some(managed) = self.repos.get_mut(repo_index) {
                     managed.pr_summary_last_polled = Some(poll_started_at);
                     managed.pr_summary_poll_in_flight = true;
@@ -193,7 +215,7 @@ impl Tui {
                     );
                     let summaries = fetch_pr_summary_index(&path, &config);
                     let _ = tx.send(PrPollResult::Summary {
-                        repo_index,
+                        repo_root,
                         summaries,
                         poll_started_at,
                     });
@@ -202,26 +224,41 @@ impl Tui {
         }
 
         let selected = self.selected_worktree_index();
-        if let Some(session) = selected.and_then(|index| self.sessions.get_mut(index)) {
+        if let Some(index) = selected {
+            let Some(session) = self.sessions.get(index) else {
+                return changed;
+            };
             let Some(managed) = self.repos.get(session.repo_index) else {
                 return changed;
             };
-            let key = pr_poll_key(session);
+            let identity = (
+                managed.repo.root.clone(),
+                session.path.clone(),
+                session.branch.clone(),
+                session.incarnation.clone(),
+            );
+            let generation = self
+                .worktree_generations
+                .get(&identity)
+                .copied()
+                .unwrap_or_default();
+            let key = pr_poll_key(&managed.repo.root, generation, session);
+            let config = managed.config.clone();
+            let github_remote = github_remote_configured(&session.path, &config);
+            let details_pollable = pr_details_pollable(&config, &session.branch, &session.pr);
+            let session = &mut self.sessions[index];
             if !session.hidden
-                && github_remote_configured(&session.path, &managed.config)
-                && pr_details_pollable(&managed.config, &session.branch, &session.pr)
+                && github_remote
+                && details_pollable
                 && !self.pr_polls_in_flight.contains(&key)
             {
-                let config = managed.config.clone();
                 let branch = session.branch.clone();
                 let path = session.path.clone();
-                let mut cache = session.pr.clone();
+                let mut cache = session.pr.begin_details_poll();
                 let tx = self.pr_poll_tx.clone();
-                session.pr.details_last_polled = Some(std::time::Instant::now());
-                cache.details_last_polled = session.pr.details_last_polled;
                 self.pr_polls_in_flight.insert(key.clone());
                 std::thread::spawn(move || {
-                    refresh_pr_details_cache(&branch, &mut cache, &path, &config);
+                    refresh_pr_details_cache_state(&branch, &mut cache, &path, &config);
                     let _ = tx.send(PrPollResult::Details {
                         key,
                         cache: Box::new(cache),
@@ -238,10 +275,17 @@ impl Tui {
         while let Ok(result) = self.pr_poll_rx.try_recv() {
             match result {
                 PrPollResult::Summary {
-                    repo_index,
+                    repo_root,
                     summaries,
                     poll_started_at,
                 } => {
+                    let Some(repo_index) = self
+                        .repos
+                        .iter()
+                        .position(|managed| managed.repo.root == repo_root)
+                    else {
+                        continue;
+                    };
                     if let Some(repo) = self.repos.get_mut(repo_index) {
                         repo.pr_summary_poll_in_flight = false;
                     }
@@ -274,9 +318,17 @@ impl Tui {
                             );
                         }
                         Err(error) => {
-                            for session in &mut self.sessions {
-                                if session.repo_index == repo_index && !session.hidden {
-                                    session.pr.error = Some(error.clone());
+                            if let Some(repo) = self.repos.get(repo_index) {
+                                for session in &mut self.sessions {
+                                    if session.repo_index == repo_index && !session.hidden {
+                                        record_pr_summary_failure(
+                                            &repo.repo,
+                                            &session.branch,
+                                            &mut session.pr,
+                                            error.clone(),
+                                            poll_started_at,
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -297,18 +349,37 @@ impl Tui {
                 }
                 PrPollResult::Details { key, cache } => {
                     self.pr_polls_in_flight.remove(&key);
-                    let selected_key =
-                        selected.and_then(|index| self.sessions.get(index).map(pr_poll_key));
-                    if let Some(session) = self
-                        .sessions
-                        .iter_mut()
-                        .find(|session| pr_poll_key(session) == key)
-                    {
+                    let key_for_index = |index: usize| {
+                        let session = self.sessions.get(index)?;
+                        let repo = self.repos.get(session.repo_index)?;
+                        let identity = (
+                            repo.repo.root.clone(),
+                            session.path.clone(),
+                            session.branch.clone(),
+                            session.incarnation.clone(),
+                        );
+                        let generation = self
+                            .worktree_generations
+                            .get(&identity)
+                            .copied()
+                            .unwrap_or_default();
+                        Some(pr_poll_key(&repo.repo.root, generation, session))
+                    };
+                    let selected_key = selected.and_then(key_for_index);
+                    let session_index = (0..self.sessions.len())
+                        .find(|index| key_for_index(*index).as_ref() == Some(&key));
+                    if let Some(session_index) = session_index {
+                        let repo = self
+                            .repos
+                            .iter()
+                            .find(|repo| repo.repo.root == key.repo_root)
+                            .map(|repo| repo.repo.clone());
+                        let session = &mut self.sessions[session_index];
                         let before = pr_cache_render_signature(&session.pr);
                         let before_comments = pr_cache_comment_count(&session.pr);
-                        if let Some(repo) = self.repos.get(session.repo_index)
+                        if let Some(repo) = repo
                             && apply_pr_details_poll_result(
-                                &repo.repo,
+                                &repo,
                                 &session.branch,
                                 &mut session.pr,
                                 *cache,
@@ -336,6 +407,7 @@ impl Tui {
                 continue;
             }
             let repo = managed.repo.clone();
+            let repo_root = repo.root.clone();
             let config = managed.config.clone();
             let tx = self.wt_poll_tx.clone();
             if let Some(managed) = self.repos.get_mut(repo_index) {
@@ -343,10 +415,7 @@ impl Tui {
             }
             std::thread::spawn(move || {
                 let columns = fetch_wt_columns(&repo, &config);
-                let _ = tx.send(WtPollResult {
-                    repo_index,
-                    columns,
-                });
+                let _ = tx.send(WtPollResult { repo_root, columns });
             });
         }
     }
@@ -354,13 +423,20 @@ impl Tui {
     pub(crate) fn poll_wt_columns(&mut self) -> bool {
         let mut changed = false;
         while let Ok(result) = self.wt_poll_rx.try_recv() {
-            if let Some(repo) = self.repos.get_mut(result.repo_index) {
+            let Some(repo_index) = self
+                .repos
+                .iter()
+                .position(|managed| managed.repo.root == result.repo_root)
+            else {
+                continue;
+            };
+            if let Some(repo) = self.repos.get_mut(repo_index) {
                 repo.wt_poll_in_flight = false;
             }
             match result.columns {
                 Ok(columns_by_path) => {
                     for session in &mut self.sessions {
-                        if session.repo_index != result.repo_index {
+                        if session.repo_index != repo_index {
                             continue;
                         }
                         let next = columns_by_path
@@ -374,7 +450,7 @@ impl Tui {
                     }
                 }
                 Err(error) => {
-                    if let Some(repo) = self.repos.get(result.repo_index) {
+                    if let Some(repo) = self.repos.get(repo_index) {
                         let _ = append_runtime_log(
                             &repo.repo,
                             &format!("wt column refresh failed: {error}"),
@@ -413,6 +489,7 @@ impl Tui {
                 continue;
             };
             let path = self.default_branch_path_for_repo(repo_index, &branch);
+            let repo_root = managed.repo.root.clone();
             let config = managed.config.clone();
             let tx = self.default_branch_poll_tx.clone();
             if let Some(managed) = self.repos.get_mut(repo_index) {
@@ -422,7 +499,7 @@ impl Tui {
             std::thread::spawn(move || {
                 let status_label = default_branch_status_label(&path, &branch, &config);
                 let _ = tx.send(DefaultBranchPollResult {
-                    repo_index,
+                    repo_root,
                     branch,
                     path,
                     status_label,
@@ -434,13 +511,20 @@ impl Tui {
     pub(crate) fn poll_default_branch_status(&mut self) -> bool {
         let mut changed = false;
         while let Ok(result) = self.default_branch_poll_rx.try_recv() {
-            if let Some(repo) = self.repos.get_mut(result.repo_index) {
+            let Some(repo_index) = self
+                .repos
+                .iter()
+                .position(|managed| managed.repo.root == result.repo_root)
+            else {
+                continue;
+            };
+            if let Some(repo) = self.repos.get_mut(repo_index) {
                 repo.default_branch_poll_in_flight = false;
             }
             match result.status_label {
                 Ok(status_label) => {
                     if let Some(session) = self.sessions.iter_mut().find(|session| {
-                        session.repo_index == result.repo_index
+                        session.repo_index == repo_index
                             && session.branch == result.branch
                             && session.path == result.path
                     }) && session.status_label != status_label
@@ -450,7 +534,7 @@ impl Tui {
                     }
                 }
                 Err(error) => {
-                    if let Some(repo) = self.repos.get(result.repo_index) {
+                    if let Some(repo) = self.repos.get(repo_index) {
                         let _ = append_runtime_log(
                             &repo.repo,
                             &format!("default branch status refresh failed: {error}"),

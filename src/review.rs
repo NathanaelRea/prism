@@ -54,15 +54,11 @@ pub fn build_tracked_review_fix_prompt(
     if pr_cache_excluded_branch(config, &session.branch) {
         return Err("selected branch is not treated as a PR branch".to_string());
     }
-    let summary = session
+    let (summary, details) = session
         .pr
-        .summary
-        .as_ref()
+        .trusted_summary_and_details()?
         .ok_or_else(|| "no pull request found for selected branch".to_string())?;
-    let details = session
-        .pr
-        .details
-        .as_ref()
+    let details = details
         .ok_or_else(|| "PR comments are still loading; refresh and try again".to_string())?;
 
     Ok(build_tracked_review_fix_prompt_from_input(
@@ -436,6 +432,16 @@ mod tests {
     }
 
     #[test]
+    fn review_fix_prompt_rejects_restart_stale_observation() {
+        let mut session = test_session(PrDetails::default());
+        session.pr.mark_preserved_stale();
+
+        let error = build_review_fix_prompt(&session, &test_config()).unwrap_err();
+
+        assert!(error.contains("not been freshly observed"));
+    }
+
+    #[test]
     fn review_fix_prompt_excludes_copilot_review_summary_but_keeps_inline_feedback() {
         let session = test_session(PrDetails {
             reviews: vec![PrReview {
@@ -656,6 +662,7 @@ mod tests {
             repo_label: "repo".to_string(),
             repo_key: None,
             path: PathBuf::from("/repo/worktree"),
+            incarnation: String::new(),
             path_display: "/repo/worktree".to_string(),
             branch: "feature".to_string(),
             prompt_summary: String::new(),
@@ -666,8 +673,8 @@ mod tests {
             status_label: "clean".to_string(),
             agent_state: AgentState::Idle,
             opencode_status: None,
-            pr: PrCache {
-                summary: Some(PrSummary {
+            pr: PrCache::observed(
+                PrSummary {
                     number: 123,
                     title: "Title".to_string(),
                     body: String::new(),
@@ -684,10 +691,9 @@ mod tests {
                     comment_count: 3,
                     merged: false,
                     draft: false,
-                }),
-                details: Some(details),
-                ..PrCache::default()
-            },
+                },
+                Some(details),
+            ),
             wt_columns: BTreeMap::new(),
             unseen_comments: false,
         }

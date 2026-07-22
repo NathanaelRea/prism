@@ -15,15 +15,12 @@ pub fn build_ci_failure_prompt(session: &Session, config: &Config) -> Result<Str
     if pr_cache_excluded_branch(config, &session.branch) {
         return Err("selected branch is not treated as a PR branch".to_string());
     }
-    let summary = session
+    let (summary, details) = session
         .pr
-        .summary
-        .as_ref()
+        .trusted_summary_and_details()?
         .ok_or_else(|| "no pull request found for selected branch".to_string())?;
-    let details =
-        session.pr.details.as_ref().ok_or_else(|| {
-            "CI failure details are still loading; refresh and try again".to_string()
-        })?;
+    let details = details
+        .ok_or_else(|| "CI failure details are still loading; refresh and try again".to_string())?;
 
     Ok(build_ci_failure_prompt_from_input(
         CiFailurePromptInput {
@@ -164,12 +161,23 @@ mod tests {
         assert!(prompt.contains("- lint"));
     }
 
+    #[test]
+    fn ci_failure_prompt_rejects_restart_stale_observation() {
+        let mut session = test_session(PrDetails::default());
+        session.pr.mark_preserved_stale();
+
+        let error = build_ci_failure_prompt(&session, &test_config()).unwrap_err();
+
+        assert!(error.contains("not been freshly observed"));
+    }
+
     fn test_session(details: PrDetails) -> Session {
         Session {
             repo_index: 0,
             repo_label: "repo".to_string(),
             repo_key: None,
             path: PathBuf::from("/repo/worktree"),
+            incarnation: String::new(),
             path_display: "/repo/worktree".to_string(),
             branch: "feature".to_string(),
             prompt_summary: String::new(),
@@ -180,8 +188,8 @@ mod tests {
             status_label: "clean".to_string(),
             agent_state: AgentState::Idle,
             opencode_status: None,
-            pr: PrCache {
-                summary: Some(PrSummary {
+            pr: PrCache::observed(
+                PrSummary {
                     number: 123,
                     title: "Title".to_string(),
                     body: String::new(),
@@ -198,10 +206,9 @@ mod tests {
                     comment_count: 0,
                     merged: false,
                     draft: false,
-                }),
-                details: Some(details),
-                ..PrCache::default()
-            },
+                },
+                Some(details),
+            ),
             wt_columns: BTreeMap::new(),
             unseen_comments: false,
         }

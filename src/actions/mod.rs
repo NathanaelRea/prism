@@ -15,9 +15,6 @@ use crate::auto_flow::{
     AutoLaunchOptions, AutoRunControlIntent, AutoRunMode, AutoRunStatus, AutoStepKey,
     AutoStepStatus, PersistedAutoRun, append_step_run, apply_auto_run_control, archive_auto_run,
     execute_auto_initial_step, load_auto_run, prepare_auto_run_for_resume, save_auto_run,
-    stabilization_execute::{GuardedPushDecision, decide_guarded_push},
-    stabilization_observe::build_stabilization_snapshot,
-    stabilization_plan::plan as plan_stabilization,
 };
 use crate::ci::build_ci_failure_prompt;
 use crate::config::Config;
@@ -26,18 +23,18 @@ use crate::git::{
     selected_dirty,
 };
 use crate::github::{
-    PR_SUMMARY_POLL_INTERVAL, PrCacheRepository, apply_pr_details_poll_result,
+    PR_SUMMARY_POLL_INTERVAL, PrCacheRepository, apply_pr_details_poll_result, clear_pr_cache,
     fetch_pr_summary_index, github_remote_configured, github_remote_repo, pr_cache_comment_count,
-    pr_cache_pollable, pr_cache_render_signature, pr_details_pollable, pr_summary_or_error,
-    refresh_pr_cache, refresh_pr_details_cache, refresh_pr_summary_index_for_sessions,
+    pr_cache_pollable_for_session, pr_cache_render_signature, pr_details_pollable,
+    pr_summary_or_error, record_pr_merged, record_pr_summary, record_pr_summary_failure,
+    refresh_pr_cache, refresh_pr_details_cache_state, refresh_pr_summary_index_for_sessions,
     refresh_repo_policy_cache, wait_for_pr_merged,
 };
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::lifecycle::{
-    WorktrunkApprovalStatus, check_worktrunk_approval_status, checkout_worktree_session,
-    create_pull_request, create_worktree_session, delete_worktree_session,
-    is_worktrunk_approval_failure, merge_pull_request, push_branch, refresh_branch_pr_cache,
-    run_pre_pr_checks, run_pre_push_checks, run_worktrunk_approval_prompt,
+    WorktrunkApprovalStatus, check_worktrunk_approval_status, create_pull_request,
+    is_worktrunk_approval_failure, merge_pull_request, push_branch, run_pre_pr_checks,
+    run_pre_push_checks, run_worktrunk_approval_prompt,
 };
 use crate::opencode::{self, OpencodeStatus, load_runtime};
 use crate::plan::{PlanExecution, infer_total_phases, open_plan_mode, select_plan_path};
@@ -51,8 +48,9 @@ use crate::plan_run::{
 use crate::process::{command_exists, run_capture};
 use crate::repo::Repository;
 use crate::session::{
-    append_runtime_log, archive_worktree_session, discover_sessions, list_archived_worktrees,
-    save_agent_state, unarchive_worktree_session, write_task_metadata,
+    CreateWorktreeOutcome, DeleteWorktreeOutcome, append_runtime_log, archive_worktree_session,
+    checkout_worktree_session, create_worktree_session, list_archived_worktrees, save_agent_state,
+    unarchive_worktree_session,
 };
 use crate::tmux::TmuxWindow;
 use crate::tui::{

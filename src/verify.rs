@@ -83,6 +83,24 @@ pub(crate) fn run_merge_conflict_check(config: &Config, path: &Path) -> VerifyCh
         };
     };
 
+    run_merge_conflict_check_against(config, path, base)
+}
+
+pub(crate) fn run_merge_conflict_check_against(
+    config: &Config,
+    path: &Path,
+    base: &str,
+) -> VerifyCheckResult {
+    let base = base.trim();
+    if base.is_empty() {
+        return VerifyCheckResult {
+            kind: VerifyCheckKind::MergeConflict,
+            label: "merge conflict".to_string(),
+            passed: false,
+            message: "pull request base is empty; merge conflict check cannot run".to_string(),
+        };
+    }
+
     let fetch = run_status(
         Command::new(config.tool("git"))
             .arg("-C")

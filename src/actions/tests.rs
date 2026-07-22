@@ -1,6 +1,6 @@
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
-use crate::auto_flow::stabilization_execute::{GuardedPushDecision, decide_guarded_push};
+use crate::auto_flow::stabilization_execute::{GuardedPushProgress, progress_pending_push};
 use crate::auto_flow::stabilization_model::{
     PendingPushGuard, RepairKind, StabilizationBlocker, StabilizationWorkKind,
 };
@@ -248,7 +248,6 @@ esac
 }
 
 #[test]
-#[ignore = "known Phase 1 safety defect"]
 fn phase_1_external_guarded_push_satisfaction_resolves_exact_threads_and_replans_from_refreshed_details()
  {
     let temp = unique_temp_dir("prism-phase-1-external-guarded-push-test");
@@ -281,12 +280,12 @@ case "$*" in
     if [ -f '{}' ]; then
       echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
     else
-      echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{{"id":"PRRT_guarded_1","isResolved":false,"comments":{{"nodes":[{{"id":"PRRC_guarded","path":"src/lib.rs","originalLine":12,"body":"address guarded feedback","createdAt":"2026-07-13T12:00:30Z","author":{{"login":"reviewer"}}}}]}}}}]}}}}}}}}'
+      echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{{"id":"PRRT_guarded_1","isResolved":false,"comments":{{"nodes":[{{"id":"PRRC_guarded","path":"src/lib.rs","originalLine":12,"body":"address guarded feedback","createdAt":"2026-07-13T12:00:30Z","author":{{"login":"reviewer"}}}}]}}}}]}}}}}}}}}}'
     fi
     ;;
   *)
     if [ -f '{}' ]; then decision=APPROVED; else decision=CHANGES_REQUESTED; fi
-    echo "{{\"number\":42,\"title\":\"Guarded repair\",\"body\":\"\",\"url\":\"https://github.com/example/repo/pull/42\",\"state\":\"OPEN\",\"reviewDecision\":\"$decision\",\"reviewRequests\":{{\"nodes\":[]}},\"headRefName\":\"feature\",\"baseRefName\":\"main\",\"headRefOid\":\"repair-sha\",\"updatedAt\":\"2026-07-13T12:02:00Z\",\"comments\":{{\"totalCount\":0}},\"statusCheckRollup\":{{\"contexts\":{{\"nodes\":[]}}}},\"isDraft\":false}}"
+    echo "{{\"number\":42,\"title\":\"Guarded repair\",\"body\":\"\",\"url\":\"https://github.com/example/repo/pull/42\",\"state\":\"OPEN\",\"reviewDecision\":\"$decision\",\"reviewRequests\":{{\"nodes\":[]}},\"headRefName\":\"feature\",\"baseRefName\":\"main\",\"headRefOid\":\"repair-sha\",\"updatedAt\":\"2026-07-13T12:02:00Z\",\"comments\":{{\"totalCount\":0}},\"statusCheckRollup\":{{\"contexts\":{{\"nodes\":[]}}}},\"mergeStateStatus\":\"CLEAN\",\"isDraft\":false}}"
     ;;
 esac
 "#,
@@ -304,8 +303,8 @@ esac
 case "$*" in
   *"remote get-url origin"*) echo "https://github.com/example/repo.git" ;;
   *"rev-parse HEAD"*) echo "repair-sha" ;;
-  *"rev-parse refs/remotes/origin/feature"*) echo "repair-sha" ;;
-  *"rev-parse refs/remotes/origin/main"*) echo "base-sha" ;;
+  *"refs/remotes/origin/feature"*) echo "repair-sha" ;;
+  *"refs/remotes/origin/main"*) echo "base-sha" ;;
   *"status --porcelain"*) exit 0 ;;
   *"fetch origin"*) exit 0 ;;
   *) exit 0 ;;
@@ -380,18 +379,18 @@ esac
     tui.active_auto_runs
         .insert(worktree, persisted.run.id.clone());
 
-    let guard = persisted.run.pending_push.as_ref().unwrap();
-    let decision = decide_guarded_push(
-        guard,
-        Some("repair-sha"),
-        Some("repair-sha"),
-        Some("repair-sha"),
-    );
-    assert_eq!(decision, GuardedPushDecision::AlreadySatisfied);
-    if decision == GuardedPushDecision::AlreadySatisfied {
-        tui.finish_guarded_push_for_test(&repo, &config, &mut persisted)
-            .unwrap();
-    }
+    let progress = crate::observability::with_writable_db(&repo, |conn| {
+        progress_pending_push(
+            conn,
+            &repo,
+            &config,
+            &mut persisted,
+            &mut tui.sessions[0].pr,
+            || Ok(()),
+        )
+    })
+    .unwrap();
+    assert_eq!(progress, GuardedPushProgress::AlreadySatisfied);
 
     let commands = fs::read_to_string(&gh_log).unwrap();
     assert_eq!(commands.matches("thread=PRRT_guarded_1").count(), 1);
@@ -424,7 +423,6 @@ esac
 }
 
 #[test]
-#[ignore = "known Phase 1 safety defect"]
 fn phase_1_failed_details_refresh_does_not_start_repair_from_stale_thread_ids() {
     let temp = unique_temp_dir("prism-phase-1-stale-review-authorization-test");
     let worktree = temp.join("worktree");
@@ -492,6 +490,12 @@ case "$*" in
 cat <<'JSON'
 {"comments":[],"reviews":[],"files":[],"statusCheckRollup":{"contexts":{"nodes":[{"name":"test","status":"COMPLETED","conclusion":"FAILURE"}]}}}
 JSON
+;;
+  "run list "*)
+printf '[]\n'
+;;
+  api\ graphql*)
+printf '%s\n' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}'
 ;;
   *)
 cat <<'JSON'
@@ -829,6 +833,10 @@ fn delete_session_does_not_block_input_loop() {
             r#"#!/bin/sh
 printf '%s\n' "$*" >> '{}'
 case "$*" in
+  *"rev-parse --verify refs/heads/feature/delete"*)
+    echo branch-oid
+    exit 0
+    ;;
   *"worktree remove --force"*)
     sleep 1
     exit 0
@@ -918,6 +926,10 @@ fn failed_async_delete_restores_hidden_worktree() {
         format!(
             r#"#!/bin/sh
 case "$*" in
+  *"rev-parse --verify refs/heads/feature/delete"*)
+    echo branch-oid
+    exit 0
+    ;;
   *"worktree remove --force"*)
     exit 1
     ;;
@@ -983,7 +995,6 @@ exit 0
 }
 
 #[test]
-#[ignore = "known Phase 1 safety defect"]
 fn phase_1_branch_delete_failure_reconciles_without_vanished_worktree_path() {
     let temp = unique_temp_dir("prism-phase-1-delete-reconcile-test");
     fs::create_dir_all(&temp).unwrap();
@@ -995,6 +1006,7 @@ fn phase_1_branch_delete_failure_reconciles_without_vanished_worktree_path() {
         &git,
         r#"#!/bin/sh
 case "$*" in
+  *"rev-parse --verify refs/heads/feature/delete"*) echo branch-oid; exit 0 ;;
   *"worktree remove --force"*) exit 0 ;;
   *"branch -D feature/delete"*) exit 1 ;;
   *"worktree list --porcelain"*) exit 0 ;;
@@ -1047,7 +1059,6 @@ exit 0
 }
 
 #[test]
-#[ignore = "known Phase 1 safety defect"]
 fn phase_1_missing_github_remote_clears_live_and_persisted_pr_cache_state() {
     let temp = unique_temp_dir("prism-phase-1-removed-remote-poll-test");
     fs::create_dir_all(&temp).unwrap();
@@ -1088,6 +1099,41 @@ fn phase_1_missing_github_remote_clears_live_and_persisted_pr_cache_state() {
     assert!(persisted.summary.is_none());
     assert!(persisted.details.is_none());
 
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn missing_github_remote_clears_hidden_non_pollable_pr_cache_state() {
+    let temp = unique_temp_dir("prism-removed-remote-hidden-cache-test");
+    fs::create_dir_all(&temp).unwrap();
+    let git = temp.join("git");
+    fs::write(&git, "#!/bin/sh\nexit 2\n").unwrap();
+    let mut permissions = fs::metadata(&git).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&git, permissions).unwrap();
+    let mut config = test_config();
+    config
+        .tools
+        .insert("git".to_string(), git.display().to_string());
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let cache = PrCache {
+        summary: Some(phase_1_pr_summary("old-head")),
+        ..PrCache::default()
+    };
+    crate::github::save_pr_cache(&repo, "feature", &cache).unwrap();
+    let mut session = test_session(temp.join("worktree"), "feature");
+    session.hidden = true;
+    session.pr = cache;
+    let mut tui = Tui::new_single(repo.clone(), config, vec![session]);
+
+    assert!(tui.poll_pull_requests(true));
+
+    assert!(tui.sessions[0].pr.summary.is_none());
+    assert!(
+        crate::github::load_pr_cache(&repo, "feature")
+            .summary
+            .is_none()
+    );
     let _ = fs::remove_dir_all(temp);
 }
 
@@ -1433,6 +1479,7 @@ fn test_session(path: PathBuf, branch: &str) -> Session {
         repo_label: "repo".to_string(),
         repo_key: None,
         path: path.clone(),
+        incarnation: String::new(),
         path_display: path.display().to_string(),
         branch: branch.to_string(),
         prompt_summary: String::new(),

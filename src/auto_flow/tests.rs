@@ -260,9 +260,11 @@ fn prompt_implementation_pr_delegates_to_stabilization_ready_state() {
     let origin = temp.path().join("origin.git");
     let work = temp.path().join("work");
     setup_git_worktree(&origin, &work);
+    run_git(&work, &["push", "-u", "origin", "feat/auto"]);
     let head = git_output(&work, &["rev-parse", "HEAD"]);
     let repo = Repository::with_config_dir_for_test(work.clone(), temp.path().join("prism-config"));
-    let config = Config::load(&repo);
+    let mut config = Config::load(&repo);
+    configure_pr_observation(&temp, &mut config, "feat/auto", &head);
     seed_pr_cache(&repo, "feat/auto", &head);
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
@@ -300,7 +302,13 @@ fn prompt_implementation_pr_delegates_to_stabilization_ready_state() {
     persisted.run.current_head_sha = Some(head.clone());
     save_auto_run(&conn, &mut persisted).unwrap();
 
-    assert!(ensure_next_auto_step_with_context(&conn, &repo, &config, &mut persisted).unwrap());
+    assert!(
+        ensure_next_auto_step_with_context(&conn, &repo, &config, &mut persisted).unwrap(),
+        "status={:?} blocker={:?} next={:?}",
+        persisted.run.stabilization_status,
+        persisted.run.stabilization_blocker,
+        persisted.run.stabilization_next_work
+    );
 
     let step = persisted.steps.last().unwrap();
     assert_eq!(step.step_key, AutoStepKey::Merge);
@@ -1097,6 +1105,41 @@ fn schema_round_trips_stabilization_guards_and_planner_state() {
     assert_eq!(loaded.steps[0].blocker, persisted.steps[0].blocker);
 }
 
+#[test]
+fn done_run_with_non_push_stabilization_obligation_is_active_after_restart() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted =
+        AutoLaunch::new(&repo, &repo.join("feature"), "feat/auto", "Implement auto")
+            .unwrap()
+            .create_run();
+    persisted.run.status = AutoRunStatus::Done;
+    persisted.run.stabilization_status = Some(stabilization_model::StabilizationStatus::Waiting);
+    persisted.run.stabilization_blocker =
+        Some(stabilization_model::StabilizationBlocker::CiPending);
+    persisted.run.stabilization_next_work =
+        Some(stabilization_model::StabilizationWorkKind::WaitForCi);
+    persisted.steps[0].status = AutoStepStatus::Done;
+    save_auto_run(&conn, &mut persisted).unwrap();
+
+    let loaded = load_auto_run(&conn, &persisted.run.id)
+        .unwrap()
+        .expect("active run");
+
+    assert_eq!(loaded.run.status, AutoRunStatus::Paused);
+    assert_eq!(
+        loaded.steps, persisted.steps,
+        "attempt audit must be preserved"
+    );
+    assert_eq!(
+        load_recent_active_runs_for_repo(&conn, &repo, 10).unwrap()[0]
+            .run
+            .id,
+        persisted.run.id
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn review_repair_commit_enters_pending_push_with_guard_data() {
@@ -1111,6 +1154,7 @@ fn review_repair_commit_enters_pending_push_with_guard_data() {
 
     fs::write(work.join("tracked.txt"), "review fix\n").unwrap();
     let mut config = test_config();
+    configure_pr_observation(&temp, &mut config, "feat/auto", &remote_head);
     config.prompt_templates.insert(
         "repair_commit_review".to_string(),
         "fix: review template".to_string(),
@@ -1169,6 +1213,7 @@ fn ci_repair_commit_enters_pending_push_with_guard_data() {
 
     fs::write(work.join("ci.txt"), "ci fix\n").unwrap();
     let mut config = test_config();
+    configure_pr_observation(&temp, &mut config, "feat/auto", &remote_head);
     config.prompt_templates.insert(
         "repair_commit_ci".to_string(),
         "fix: ci template".to_string(),
@@ -1547,7 +1592,6 @@ fn recent_active_runs_excludes_archived_and_done_runs() {
 }
 
 #[test]
-#[ignore = "known Phase 1 safety defect"]
 fn phase_1_standalone_review_repair_never_queues_implementation_after_fix() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
@@ -1568,7 +1612,6 @@ fn phase_1_standalone_review_repair_never_queues_implementation_after_fix() {
 }
 
 #[test]
-#[ignore = "known Phase 1 safety defect"]
 fn phase_1_standalone_ci_repair_never_queues_implementation_after_fix() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
@@ -1589,7 +1632,6 @@ fn phase_1_standalone_ci_repair_never_queues_implementation_after_fix() {
 }
 
 #[test]
-#[ignore = "known Phase 1 safety defect"]
 fn phase_1_done_run_with_pending_push_is_discoverable_after_restart() {
     let temp = TempDir::new("phase-1-pending-push-restart");
     let database = temp.path().join("prism.db");
@@ -1632,10 +1674,13 @@ fn executor_runs_fake_opencode_pauses_before_next_step_and_persists_events() {
     let origin = temp.path().join("origin.git");
     let work = temp.path().join("work");
     setup_git_worktree(&origin, &work);
+    run_git(&work, &["push", "-u", "origin", "feat/auto"]);
     let repo = Repository::with_config_dir_for_test(work.clone(), temp.path().join("prism-config"));
     let mut config = Config::load(&repo);
     config.default_base = None;
-    seed_pr_cache(&repo, "feat/auto", "abc123");
+    let head = crate::git::current_head_sha(&work, &config).unwrap();
+    seed_pr_cache(&repo, "feat/auto", &head);
+    configure_pr_observation(&temp, &mut config, "feat/auto", &head);
     let opencode = temp.path().join("opencode");
     write_executable(
         &opencode,
@@ -1966,60 +2011,6 @@ fn manual_merge_skip_completes_run_without_cleanup() {
     );
 }
 
-#[test]
-fn merge_gate_blocks_dirty_draft_failed_ci_stale_head_and_review_feedback() {
-    let temp = TempDir::new("merge-gate-blockers");
-    let repo = Repository {
-        root: temp.path().to_path_buf(),
-    };
-    let config = Config::load(&repo);
-    let mut summary = test_pr_summary("feat/auto", "remote-head", "2026-01-01T00:00:00Z");
-    summary.check_status = "failed".to_string();
-    summary.draft = true;
-    let details = PrDetails {
-        comments: vec![crate::github::PrComment {
-            id: "comment-1".to_string(),
-            author: "github-copilot".to_string(),
-            body: "Please fix this before merging.".to_string(),
-            created_at: "2026-01-01T00:01:00Z".to_string(),
-        }],
-        ..PrDetails::default()
-    };
-    let mut persisted = AutoLaunch::new(temp.path(), temp.path(), "feat/auto", "Implement auto")
-        .unwrap()
-        .create_run();
-    persisted.run.review_baseline_json = Some(
-        serde_json::to_string(&ReviewBaseline {
-            head_sha: "remote-head".to_string(),
-            updated_at: "2026-01-01T00:00:00Z".to_string(),
-        })
-        .unwrap(),
-    );
-    let verify = verify_result(false);
-
-    let outcome = evaluate_merge_gate(
-        &config,
-        &persisted,
-        &summary,
-        Some(&details),
-        "local-head",
-        true,
-        &verify,
-    );
-
-    assert!(!outcome.allowed);
-    assert!(outcome.summary.contains("worktree is dirty"));
-    assert!(outcome.summary.contains("PR is draft"));
-    assert!(outcome.summary.contains("CI state is failed"));
-    assert!(outcome.summary.contains("does not match local head"));
-    assert!(
-        outcome
-            .summary
-            .contains("actionable review feedback remains")
-    );
-    assert!(outcome.summary.contains("final local verification failed"));
-}
-
 #[cfg(unix)]
 #[test]
 fn merge_step_uses_gh_merge_and_waits_for_merged_status() {
@@ -2027,21 +2018,40 @@ fn merge_step_uses_gh_merge_and_waits_for_merged_status() {
     let origin = temp.path().join("origin.git");
     let work = temp.path().join("work");
     setup_git_worktree(&origin, &work);
+    run_git(&work, &["push", "-u", "origin", "feat/auto"]);
     let repo = Repository::with_config_dir_for_test(work.clone(), temp.path().join("prism-config"));
     let mut config = Config::load(&repo);
     config.auto.merge = true;
     config.auto.review_wait_enabled = false;
+    crate::github::save_repo_policy_cache(
+        &repo,
+        &crate::github::RepoPolicyCache {
+            repo_remote: "example/repo".to_string(),
+            refreshed_unix_ms: 1,
+            ..crate::github::RepoPolicyCache::default()
+        },
+    )
+    .unwrap();
     let gh_log = temp.path().join("gh.log");
     let head = crate::git::current_head_sha(&work, &config).unwrap();
     let gh = temp.path().join("gh");
+    let git = temp.path().join("git");
+    write_executable(
+        &git,
+        "#!/bin/sh\nif [ \"$3\" = \"remote\" ] && [ \"$4\" = \"get-url\" ]; then\n  printf 'https://github.com/example/repo.git\\n'\n  exit 0\nfi\nexec git \"$@\"\n",
+    );
     write_executable(
         &gh,
         &format!(
             r#"#!/bin/sh
 printf 'args=%s\n' "$*" >> '{}'
+if [ "$1" = "pr" ] && [ "$2" = "view" ] && [ "$5" = "comments,reviews,files,statusCheckRollup" ]; then
+  printf '%s\n' '{{"comments":[],"reviews":[],"files":[],"statusCheckRollup":{{"contexts":{{"nodes":[]}}}}}}'
+  exit 0
+fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ] && [ "$3" = "feat/auto" ]; then
   cat <<'JSON'
-{{"number":42,"title":"Auto","body":"","url":"https://example.com/pr/42","state":"OPEN","reviewDecision":"APPROVED","reviewRequests":[],"headRefName":"feat/auto","baseRefName":"main","headRefOid":"{}","updatedAt":"2026-01-01T00:00:00Z","statusCheckRollup":{{"contexts":{{"nodes":[{{"__typename":"StatusContext","context":"ci","state":"SUCCESS"}}]}}}},"mergedAt":null,"isDraft":false}}
+{{"number":42,"title":"Auto","body":"","url":"https://example.com/pr/42","state":"OPEN","reviewDecision":"APPROVED","reviewRequests":[],"headRefName":"feat/auto","baseRefName":"main","headRefOid":"{}","updatedAt":"2026-01-01T00:00:00Z","statusCheckRollup":{{"contexts":{{"nodes":[{{"__typename":"StatusContext","context":"ci","state":"SUCCESS"}}]}}}},"mergeStateStatus":"CLEAN","mergedAt":null,"isDraft":false}}
 JSON
   exit 0
 fi
@@ -2050,6 +2060,10 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ] && [ "$3" = "42" ]; then
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
+  printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
   exit 0
 fi
 exit 1
@@ -2061,6 +2075,9 @@ exit 1
     config
         .tools
         .insert("gh".to_string(), gh.display().to_string());
+    config
+        .tools
+        .insert("git".to_string(), git.display().to_string());
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
     let mut persisted = AutoLaunch::new(&work, &work, "feat/auto", "Implement auto")
@@ -2172,18 +2189,6 @@ fn linked_run_plan_auto_run(conn: &rusqlite::Connection, repo: &Path) -> Persist
     persisted
 }
 
-fn verify_result(passed: bool) -> VerifyResult {
-    VerifyResult {
-        passed,
-        checks: vec![crate::verify::VerifyCheckResult {
-            kind: crate::verify::VerifyCheckKind::Configured,
-            label: "test".to_string(),
-            passed,
-            message: "test".to_string(),
-        }],
-    }
-}
-
 fn test_config() -> Config {
     Config {
         default_agent: "opencode".to_string(),
@@ -2242,8 +2247,8 @@ fn setup_git_worktree(origin: &Path, work: &Path) {
 
 #[cfg(unix)]
 fn seed_pr_cache(repo: &Repository, branch: &str, head_sha: &str) {
-    let cache = crate::github::PrCache {
-        summary: Some(crate::github::PrSummary {
+    let cache = crate::github::PrCache::observed(
+        crate::github::PrSummary {
             number: 42,
             title: "Auto".to_string(),
             body: String::new(),
@@ -2260,10 +2265,45 @@ fn seed_pr_cache(repo: &Repository, branch: &str, head_sha: &str) {
             comment_count: 0,
             merged: false,
             draft: false,
-        }),
-        ..crate::github::PrCache::default()
-    };
+        },
+        Some(crate::github::PrDetails::default()),
+    );
     crate::github::save_pr_cache(repo, branch, &cache).unwrap();
+}
+
+#[cfg(unix)]
+fn configure_pr_observation(temp: &TempDir, config: &mut Config, branch: &str, head_sha: &str) {
+    let gh = temp.path().join("gh");
+    let git = temp.path().join("git");
+    write_executable(
+        &git,
+        "#!/bin/sh\nif [ \"$3\" = \"remote\" ] && [ \"$4\" = \"get-url\" ]; then\n  printf 'https://github.com/example/repo.git\\n'\n  exit 0\nfi\nexec git \"$@\"\n",
+    );
+    let script = format!(
+        r#"#!/bin/sh
+case "$*" in
+  "pr view {branch} --json comments,reviews,files,statusCheckRollup")
+    printf '%s\n' '{{"comments":[],"reviews":[],"files":[],"statusCheckRollup":{{"contexts":{{"nodes":[]}}}}}}'
+    ;;
+  api\ graphql*)
+    printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
+    ;;
+  "run list "*)
+    printf '[]\n'
+    ;;
+  *)
+    printf '%s\n' '{{"number":42,"title":"Auto","body":"","url":"https://example.com/pr/42","state":"OPEN","reviewDecision":"","reviewRequests":{{"nodes":[]}},"headRefName":"{branch}","baseRefName":"main","headRefOid":"{head_sha}","updatedAt":"2026-01-01T00:00:00Z","comments":{{"totalCount":0}},"statusCheckRollup":{{"contexts":{{"nodes":[]}}}},"mergeStateStatus":"CLEAN","isDraft":false}}'
+    ;;
+esac
+"#
+    );
+    write_executable(&gh, &script);
+    config
+        .tools
+        .insert("gh".to_string(), gh.display().to_string());
+    config
+        .tools
+        .insert("git".to_string(), git.display().to_string());
 }
 
 fn test_pr_summary(branch: &str, head_sha: &str, updated_at: &str) -> crate::github::PrSummary {
