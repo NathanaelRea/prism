@@ -32,6 +32,10 @@ require_rust_target() {
 export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-always}"
 
+isolated_tmux_dir="$(mktemp -d "${TMPDIR:-/tmp}/prism-full-check-tmux.XXXXXX")"
+trap 'rm -rf "$isolated_tmux_dir"' EXIT
+export TMUX_TMPDIR="$isolated_tmux_dir"
+
 run cargo fmt --check
 run cargo test
 run cargo clippy --all-targets -- -D warnings

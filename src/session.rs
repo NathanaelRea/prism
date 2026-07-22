@@ -1366,10 +1366,15 @@ exit 0
         let mut permissions = fs::metadata(&git).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&git, permissions).unwrap();
+        let tmux = temp.join("tmux");
+        write_executable(&tmux, "#!/bin/sh\nexit 0\n");
         let mut config = test_config();
         config
             .tools
             .insert("git".to_string(), git.display().to_string());
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
         let repo = Repository::with_config_dir_for_test(repo_path, temp.join("config"));
         observability::with_writable_db(&repo, |conn| {
             for (branch, path) in [
