@@ -296,18 +296,14 @@ pub fn create_session(
     title: &str,
 ) -> Result<OpencodeSession, String> {
     let directory = worktree.display().to_string();
-    let body = format!(
-        r#"{{"directory":"{}","title":"{}"}}"#,
-        json_escape(&directory),
-        json_escape(title)
-    );
-    match post(server_url, "/session", &body, API_TIMEOUT) {
+    let path = format!("/session?directory={}", url_path_segment(&directory));
+    let body = format!(r#"{{"title":"{}"}}"#, json_escape(title));
+    match post(server_url, &path, &body, API_TIMEOUT) {
         Ok(response) if response.status_code == 200 || response.status_code == 201 => {
             parse_session(&response.body).ok_or_else(|| "created opencode session had no id".into())
         }
         Ok(response) if response.status_code == 400 || response.status_code == 415 => {
-            let directory_body = format!(r#"{{"directory":"{}"}}"#, json_escape(&directory));
-            let mut fallback = post(server_url, "/session", &directory_body, API_TIMEOUT)?;
+            let mut fallback = post(server_url, &path, "{}", API_TIMEOUT)?;
             if fallback.status_code == 400 || fallback.status_code == 415 {
                 fallback = post(server_url, "/session", "{}", API_TIMEOUT)?;
             }
@@ -328,8 +324,22 @@ pub fn create_session(
 }
 
 pub fn submit_prompt(server_url: &str, session_id: &str, prompt: &str) -> Result<(), String> {
-    append_prompt(server_url, session_id, prompt)?;
-    submit_appended_prompt(server_url, session_id)
+    let body = prompt_async_body(prompt);
+    let response = post(
+        server_url,
+        &format!("/session/{}/prompt_async", url_path_segment(session_id)),
+        &body,
+        API_TIMEOUT,
+    )?;
+    if success_status(response.status_code) {
+        Ok(())
+    } else {
+        Err(http_error_message(
+            "submit opencode prompt",
+            response.status_code,
+            &response.body,
+        ))
+    }
 }
 
 pub fn abort_session(server_url: &str, session_id: &str) -> Result<(), String> {
@@ -823,44 +833,11 @@ pub fn parse_event_payload(payload: &str) -> Option<OpencodeEvent> {
     .then_some(event)
 }
 
-fn append_prompt(server_url: &str, session_id: &str, prompt: &str) -> Result<(), String> {
-    let body = append_prompt_body(session_id, prompt);
-    let response = post(server_url, "/tui/append-prompt", &body, API_TIMEOUT)?;
-    if success_status(response.status_code) {
-        Ok(())
-    } else {
-        Err(http_error_message(
-            "append opencode prompt",
-            response.status_code,
-            &response.body,
-        ))
-    }
-}
-
-fn submit_appended_prompt(server_url: &str, session_id: &str) -> Result<(), String> {
-    let body = submit_prompt_body(session_id);
-    let response = post(server_url, "/tui/submit-prompt", &body, API_TIMEOUT)?;
-    if success_status(response.status_code) {
-        Ok(())
-    } else {
-        Err(http_error_message(
-            "submit opencode prompt",
-            response.status_code,
-            &response.body,
-        ))
-    }
-}
-
-fn append_prompt_body(session_id: &str, prompt: &str) -> String {
+fn prompt_async_body(prompt: &str) -> String {
     format!(
-        r#"{{"sessionID":"{}","text":"{}"}}"#,
-        json_escape(session_id),
+        r#"{{"parts":[{{"type":"text","text":"{}"}}]}}"#,
         json_escape(prompt)
     )
-}
-
-fn submit_prompt_body(session_id: &str) -> String {
-    format!(r#"{{"sessionID":"{}"}}"#, json_escape(session_id))
 }
 
 #[derive(Default)]
@@ -2108,15 +2085,59 @@ mod tests {
     }
 
     #[test]
-    fn prompt_submission_bodies_include_session_and_escape_text() {
-        assert_eq!(
-            append_prompt_body(
-                "ses_123",
-                "  hello world\n\"quotes\" and $PATH && true\n--leading-dash"
-            ),
-            r#"{"sessionID":"ses_123","text":"  hello world\n\"quotes\" and $PATH && true\n--leading-dash"}"#
+    fn create_session_routes_request_to_worktree_directory() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(&mut stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).unwrap();
+            let mut content_length = 0;
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    request.push_str(&line);
+                    break;
+                }
+                if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    content_length = value.trim().parse().unwrap();
+                }
+                request.push_str(&line);
+            }
+            let mut request_body = vec![0; content_length];
+            reader.read_exact(&mut request_body).unwrap();
+            request.push_str(&String::from_utf8_lossy(&request_body));
+            drop(reader);
+            let body = r#"{"id":"ses_1","directory":"/repo/work tree","title":"feature"}"#;
+            let response = format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            request
+        });
+
+        let created = create_session(&server_url, Path::new("/repo/work tree"), "feature").unwrap();
+        let request = server.join().unwrap();
+
+        assert_eq!(created.id, "ses_1");
+        assert!(
+            request.starts_with("POST /session?directory=%2Frepo%2Fwork%20tree HTTP/1.1"),
+            "{request}"
         );
-        assert_eq!(submit_prompt_body("ses_123"), r#"{"sessionID":"ses_123"}"#);
+        assert!(request.contains(r#"{"title":"feature"}"#));
+        assert!(!request.contains(r#""directory""#));
+    }
+
+    #[test]
+    fn async_prompt_body_escapes_text() {
+        assert_eq!(
+            prompt_async_body("  hello world\n\"quotes\" and $PATH && true\n--leading-dash"),
+            r#"{"parts":[{"type":"text","text":"  hello world\n\"quotes\" and $PATH && true\n--leading-dash"}]}"#
+        );
     }
 
     #[test]
@@ -2424,6 +2445,20 @@ mod tests {
                     "fetched OpenCode session {} instead of {}",
                     fetched.id, created.id
                 ));
+            }
+            let prompt = "Prism persisted prompt smoke test";
+            submit_prompt(&runtime.server_url, &created.id, prompt)?;
+            let mut persisted = false;
+            for _ in 0..20 {
+                let summary = fetch_message_summary(&runtime.server_url, &created.id)?;
+                if summary.latest_user_message.as_deref() == Some(prompt) {
+                    persisted = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if !persisted {
+                return Err("submitted OpenCode prompt was not persisted".to_string());
             }
             Ok(())
         })();
