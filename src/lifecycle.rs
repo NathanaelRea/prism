@@ -477,14 +477,14 @@ mod tests {
         is_worktrunk_approval_failure, move_branch_to_worktree_args, remove_worktree,
         switch_checkout_args,
     };
-    use crate::config::{Checks, Config, EscapeKey, MergeMethod};
+    use crate::config::Config;
     use crate::observability;
     use crate::repo::Repository;
+    use crate::test_support::write_executable;
     use rusqlite::params;
-    use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1419,31 +1419,7 @@ exit 0
     }
 
     fn test_config() -> Config {
-        Config {
-            default_agent: "ask".to_string(),
-            default_base: None,
-            plan_dir: "plans".to_string(),
-            review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
-            opencode_port_base: 41_000,
-            opencode_port_span: 1_000,
-            opencode_shutdown_owned_servers: false,
-            opencode_plan_plugin: false,
-            escape_key: EscapeKey::EscEsc,
-            merge_method: MergeMethod::Squash,
-            icon_style: crate::config::IconStyle::Unicode,
-            icon_style_configured: false,
-            auto: crate::config::AutoConfig::default(),
-            layout: crate::config::LayoutConfig::default(),
-            checks: Checks::default(),
-            worktree_columns: Vec::new(),
-            tools: BTreeMap::new(),
-            agent_commands: BTreeMap::new(),
-            agent_prompt_modes: BTreeMap::new(),
-            prompt_templates: BTreeMap::new(),
-            user_path: PathBuf::from("/tmp/prism-user-config.toml"),
-            repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
-        }
+        crate::test_support::test_config()
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -1452,15 +1428,6 @@ exit 0
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{id}"))
-    }
-
-    fn write_executable(path: &Path, text: &str) {
-        let staging = path.with_extension("staging");
-        fs::write(&staging, text).unwrap();
-        let mut permissions = fs::metadata(&staging).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&staging, permissions).unwrap();
-        fs::rename(staging, path).unwrap();
     }
 
     fn count_rows(repo: &Repository, table: &str, branch: &str) -> i64 {

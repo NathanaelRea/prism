@@ -1215,8 +1215,8 @@ fn unix_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::PromptMode;
-    use crate::config::{Checks, EscapeKey, MergeMethod};
+    use crate::config::Config;
+    use crate::test_support::write_executable;
 
     use std::collections::BTreeMap;
     use std::fs;
@@ -1366,15 +1366,11 @@ exit 0
         let mut permissions = fs::metadata(&git).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&git, permissions).unwrap();
-        let tmux = temp.join("tmux");
-        write_executable(&tmux, "#!/bin/sh\nexit 0\n");
         let mut config = test_config();
         config
             .tools
             .insert("git".to_string(), git.display().to_string());
-        config
-            .tools
-            .insert("tmux".to_string(), tmux.display().to_string());
+        crate::test_support::install_tool(&mut config, &temp, "tmux", "#!/bin/sh\nexit 0\n");
         let repo = Repository::with_config_dir_for_test(repo_path, temp.join("config"));
         observability::with_writable_db(&repo, |conn| {
             for (branch, path) in [
@@ -2484,31 +2480,7 @@ exit 0
     }
 
     fn test_config() -> Config {
-        Config {
-            default_agent: "ask".to_string(),
-            default_base: None,
-            plan_dir: "plans".to_string(),
-            review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
-            opencode_port_base: 41_000,
-            opencode_port_span: 1_000,
-            opencode_shutdown_owned_servers: false,
-            opencode_plan_plugin: false,
-            escape_key: EscapeKey::EscEsc,
-            merge_method: MergeMethod::Squash,
-            icon_style: crate::config::IconStyle::Unicode,
-            icon_style_configured: false,
-            auto: crate::config::AutoConfig::default(),
-            layout: crate::config::LayoutConfig::default(),
-            checks: Checks::default(),
-            worktree_columns: Vec::new(),
-            tools: BTreeMap::new(),
-            agent_commands: BTreeMap::new(),
-            agent_prompt_modes: BTreeMap::<String, PromptMode>::new(),
-            prompt_templates: BTreeMap::new(),
-            user_path: PathBuf::from("/tmp/prism-test-user-config.toml"),
-            repo_config_path: PathBuf::from("/tmp/prism-test-repo-config.toml"),
-        }
+        crate::test_support::test_config()
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -2535,12 +2507,5 @@ exit 0
             |row| row.get::<_, i64>(0),
         )
         .map_err(|error| error.to_string())
-    }
-
-    fn write_executable(path: &Path, text: &str) {
-        fs::write(path, text).unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
     }
 }

@@ -1,9 +1,9 @@
 use super::*;
-use std::collections::BTreeMap;
 use std::fs;
 use std::process::Command;
 
-use crate::config::{Checks, Config, EscapeKey, MergeMethod};
+use crate::config::Config;
+use crate::test_support::write_executable;
 
 struct TempDir {
     path: PathBuf,
@@ -1756,10 +1756,12 @@ fn restart_after_unrelated_commit_does_not_adopt_it_as_the_repair_commit() {
     let mut reopened = load_auto_run(&conn, &run_id).unwrap().unwrap();
     let mut cache = crate::github::load_pr_cache(&repo, "feat/auto");
 
+    let mut config = test_config();
+    crate::test_support::use_real_tool(&mut config, "git");
     let progress = stabilization_execute::progress_pending_push(
         &conn,
         &repo,
-        &test_config(),
+        &config,
         &mut reopened,
         &mut cache,
         || panic!("a precommit placeholder must never authorize a push"),
@@ -2468,31 +2470,9 @@ fn linked_run_plan_auto_run(conn: &rusqlite::Connection, repo: &Path) -> Persist
 }
 
 fn test_config() -> Config {
-    Config {
-        default_agent: "opencode".to_string(),
-        default_base: None,
-        plan_dir: "plans".to_string(),
-        review_packet_dir: ".agent/review".to_string(),
-        worktree_command: "wt".to_string(),
-        opencode_port_base: 41_000,
-        opencode_port_span: 1_000,
-        opencode_shutdown_owned_servers: false,
-        opencode_plan_plugin: false,
-        escape_key: EscapeKey::EscEsc,
-        merge_method: MergeMethod::Squash,
-        icon_style: crate::config::IconStyle::Unicode,
-        icon_style_configured: false,
-        auto: crate::config::AutoConfig::default(),
-        layout: crate::config::LayoutConfig::default(),
-        checks: Checks::default(),
-        worktree_columns: Vec::new(),
-        tools: BTreeMap::new(),
-        agent_commands: BTreeMap::new(),
-        agent_prompt_modes: BTreeMap::new(),
-        prompt_templates: BTreeMap::new(),
-        user_path: PathBuf::from("/tmp/prism-user-config.toml"),
-        repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
-    }
+    let mut config = crate::test_support::test_config();
+    config.default_agent = "opencode".to_string();
+    config
 }
 
 fn ensure_next_test_step(
@@ -2504,16 +2484,6 @@ fn ensure_next_test_step(
         PathBuf::from("/tmp/prism-auto-flow-test-config"),
     );
     ensure_next_auto_step_with_context(conn, &repo, &test_config(), persisted)
-}
-
-#[cfg(unix)]
-fn write_executable(path: &Path, text: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::write(path, text).unwrap();
-    let mut permissions = fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(path, permissions).unwrap();
 }
 
 #[cfg(unix)]

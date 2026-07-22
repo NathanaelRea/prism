@@ -1215,11 +1215,9 @@ mod tests {
             StabilizationGoal, StabilizationSnapshot, WorktreeFacts,
         },
     };
-    use crate::config::{Checks, Config, EscapeKey, MergeMethod};
+    use crate::config::Config;
     use crate::github::{CiFailure, PrCheckState};
-    use std::collections::BTreeMap;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1841,42 +1839,14 @@ mod tests {
         ));
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("gh.log");
-        let gh = temp.join("gh");
-        fs::write(
-            &gh,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&gh).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&gh, permissions).unwrap();
-        let mut tools = BTreeMap::new();
-        tools.insert("gh".to_string(), gh.display().to_string());
-        let config = Config {
-            default_agent: "ask".to_string(),
-            default_base: Some("main".to_string()),
-            plan_dir: "plans".to_string(),
-            review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
-            opencode_port_base: 41_000,
-            opencode_port_span: 1_000,
-            opencode_shutdown_owned_servers: false,
-            opencode_plan_plugin: false,
-            escape_key: EscapeKey::EscEsc,
-            merge_method: MergeMethod::Squash,
-            icon_style: crate::config::IconStyle::Unicode,
-            icon_style_configured: false,
-            auto: crate::config::AutoConfig::default(),
-            layout: crate::config::LayoutConfig::default(),
-            checks: Checks::default(),
-            worktree_columns: Vec::new(),
-            tools,
-            agent_commands: BTreeMap::new(),
-            agent_prompt_modes: BTreeMap::new(),
-            prompt_templates: BTreeMap::new(),
-            user_path: temp.join("user.toml"),
-            repo_config_path: temp.join("repo.toml"),
-        };
+        let mut config = crate::test_support::test_config();
+        config.default_base = Some("main".to_string());
+        crate::test_support::install_tool(
+            &mut config,
+            &temp,
+            "gh",
+            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        );
         (temp, config, log)
     }
 

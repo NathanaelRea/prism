@@ -519,18 +519,18 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::agent::{AgentState, PromptMode};
-    use crate::config::{AutoConfig, Checks, Config, EscapeKey, MergeMethod};
+    use crate::agent::AgentState;
+    use crate::config::{AutoConfig, Config};
     use crate::github::{
         CiFailure, PrCache, PrCheckContext, PrCheckState, PrComment, PrDetails, PrReview,
         PrReviewComment, PrSummary, RepoPolicyCache, save_repo_policy_cache,
     };
     use crate::repo::Repository;
     use crate::session::{Session, SessionClassification};
+    use crate::test_support::write_executable;
 
     use super::*;
 
@@ -1117,43 +1117,14 @@ exit 1
     }
 
     fn test_config(require_review_approval: bool) -> Config {
-        let auto = AutoConfig {
+        let mut config = crate::test_support::test_config();
+        config.default_agent = "opencode".to_string();
+        config.default_base = Some("main".to_string());
+        config.auto = AutoConfig {
             require_review_approval,
             ..AutoConfig::default()
         };
-        Config {
-            default_agent: "opencode".to_string(),
-            default_base: Some("main".to_string()),
-            plan_dir: "plans".to_string(),
-            review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
-            opencode_port_base: 41_000,
-            opencode_port_span: 1_000,
-            opencode_shutdown_owned_servers: false,
-            opencode_plan_plugin: false,
-            escape_key: EscapeKey::EscEsc,
-            merge_method: MergeMethod::Squash,
-            icon_style: crate::config::IconStyle::Unicode,
-            icon_style_configured: false,
-            auto,
-            layout: crate::config::LayoutConfig::default(),
-            checks: Checks::default(),
-            worktree_columns: Vec::new(),
-            tools: BTreeMap::new(),
-            agent_commands: BTreeMap::new(),
-            agent_prompt_modes: BTreeMap::<String, PromptMode>::new(),
-            prompt_templates: BTreeMap::new(),
-            user_path: PathBuf::from("/tmp/user.toml"),
-            repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
-        }
-    }
-
-    #[cfg(unix)]
-    fn write_executable(path: &std::path::Path, text: &str) {
-        fs::write(path, text).unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
+        config
     }
 
     #[cfg(unix)]

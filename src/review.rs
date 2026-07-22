@@ -367,7 +367,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::agent::AgentState;
-    use crate::config::{Checks, Config, EscapeKey};
+    use crate::config::Config;
     use crate::github::{PrCache, PrComment, PrDetails, PrReview, PrReviewComment, PrSummary};
 
     use super::*;
@@ -729,30 +729,9 @@ mod tests {
     }
 
     fn test_config() -> Config {
-        Config {
-            default_agent: "opencode".to_string(),
-            default_base: Some("main".to_string()),
-            plan_dir: "plans".to_string(),
-            review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
-            opencode_port_base: 41_000,
-            opencode_port_span: 1_000,
-            opencode_shutdown_owned_servers: false,
-            opencode_plan_plugin: false,
-            escape_key: EscapeKey::EscEsc,
-            merge_method: crate::config::MergeMethod::Squash,
-            icon_style: crate::config::IconStyle::Unicode,
-            icon_style_configured: false,
-            auto: crate::config::AutoConfig::default(),
-            layout: crate::config::LayoutConfig::default(),
-            checks: Checks::default(),
-            worktree_columns: Vec::new(),
-            tools: BTreeMap::new(),
-            agent_commands: BTreeMap::new(),
-            agent_prompt_modes: BTreeMap::new(),
-            prompt_templates: BTreeMap::new(),
-            user_path: PathBuf::from("/tmp/user.toml"),
-            repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
-        }
+        let mut config = crate::test_support::test_config();
+        config.default_agent = "opencode".to_string();
+        config.default_base = Some("main".to_string());
+        config
     }
 }

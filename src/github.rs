@@ -3163,7 +3163,8 @@ fn unix_seconds() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Checks, Config, EscapeKey};
+    use crate::config::Config;
+    use crate::test_support::write_executable;
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -4671,31 +4672,7 @@ JSON
     }
 
     fn test_config() -> Config {
-        Config {
-            default_agent: "ask".to_string(),
-            default_base: None,
-            plan_dir: "plans".to_string(),
-            review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
-            opencode_port_base: 41_000,
-            opencode_port_span: 1_000,
-            opencode_shutdown_owned_servers: false,
-            opencode_plan_plugin: false,
-            escape_key: EscapeKey::EscEsc,
-            merge_method: crate::config::MergeMethod::Squash,
-            icon_style: crate::config::IconStyle::Unicode,
-            icon_style_configured: false,
-            auto: crate::config::AutoConfig::default(),
-            layout: crate::config::LayoutConfig::default(),
-            checks: Checks::default(),
-            worktree_columns: Vec::new(),
-            tools: BTreeMap::new(),
-            agent_commands: BTreeMap::new(),
-            agent_prompt_modes: BTreeMap::new(),
-            prompt_templates: BTreeMap::new(),
-            user_path: PathBuf::from("/tmp/prism-user-config.toml"),
-            repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
-        }
+        crate::test_support::test_config()
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -4704,13 +4681,6 @@ JSON
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
-    }
-
-    fn write_executable(path: &std::path::Path, contents: &str) {
-        fs::write(path, contents).unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
     }
 
     fn test_summary(head_ref: &str, head_sha: &str, comment_count: u64) -> PrSummary {

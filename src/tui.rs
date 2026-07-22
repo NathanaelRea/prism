@@ -3147,7 +3147,7 @@ mod tests {
     use crate::auto_flow::{
         AutoImplementationSource, AutoRun, AutoRunMode, AutoRunStatus, PersistedAutoRun,
     };
-    use crate::config::{Checks, Config, EscapeKey, MergeMethod};
+    use crate::config::Config;
     use crate::github::PrCache;
     use crate::plan_run::{
         PersistedPlanRun, PlanRun, PlanRunMode, PlanRunStatus, PlanStepRun, PlanStepStatus,
@@ -3753,31 +3753,10 @@ mod tests {
     }
 
     fn test_config() -> Config {
-        Config {
-            default_agent: "opencode".to_string(),
-            default_base: Some("main".to_string()),
-            plan_dir: "plans".to_string(),
-            review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
-            opencode_port_base: 41_000,
-            opencode_port_span: 1_000,
-            opencode_shutdown_owned_servers: false,
-            opencode_plan_plugin: false,
-            escape_key: EscapeKey::EscEsc,
-            merge_method: MergeMethod::Squash,
-            icon_style: crate::config::IconStyle::Unicode,
-            icon_style_configured: false,
-            auto: crate::config::AutoConfig::default(),
-            layout: crate::config::LayoutConfig::default(),
-            checks: Checks::default(),
-            worktree_columns: Vec::new(),
-            tools: BTreeMap::new(),
-            agent_commands: BTreeMap::new(),
-            agent_prompt_modes: BTreeMap::new(),
-            prompt_templates: BTreeMap::new(),
-            user_path: PathBuf::from("/tmp/prism-user.toml"),
-            repo_config_path: PathBuf::from("/tmp/prism-repo.toml"),
-        }
+        let mut config = crate::test_support::test_config();
+        config.default_agent = "opencode".to_string();
+        config.default_base = Some("main".to_string());
+        config
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
