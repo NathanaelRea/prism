@@ -121,7 +121,7 @@ fn abort_selected_auto_step(
         .ok_or_else(|| format!("auto flow step not found: {step_run_id}"))?;
     abort_linked_plan_run(conn, step, warnings)?;
     abort_step_recording_warning(conn, step, warnings);
-    persisted.run.status = persisted.aggregate_status();
+    persisted.run.status = persisted.authoritative_status();
     persisted.run.updated_unix_ms = unix_ms();
     save_auto_run(conn, persisted)
 }
@@ -284,7 +284,7 @@ pub(super) fn retry_failed_auto_step(
             save_step_with_conn(conn, &mut persisted.steps[failed_index])?;
         }
         persisted.run.pause_requested = false;
-        persisted.run.status = persisted.aggregate_status();
+        persisted.run.status = persisted.authoritative_status();
         persisted.run.updated_unix_ms = unix_ms();
         save_run_with_conn(conn, &persisted.run)?;
         return Ok(());
@@ -323,7 +323,7 @@ pub(super) fn retry_auto_from_step(
     }
     persisted.run.selected_step_run_id = persisted.steps[selected_index].id;
     persisted.run.pause_requested = false;
-    persisted.run.status = persisted.aggregate_status();
+    persisted.run.status = persisted.authoritative_status();
     persisted.run.updated_unix_ms = unix_ms();
     save_run_with_conn(conn, &persisted.run)
 }
@@ -426,7 +426,7 @@ pub fn reconcile_stale_auto_run(
         AutoRunStatus::Queued | AutoRunStatus::Running | AutoRunStatus::Paused
     ) {
         persisted.run.pause_requested = false;
-        persisted.run.status = persisted.aggregate_status();
+        persisted.run.status = persisted.authoritative_status();
         persisted.run.updated_unix_ms = unix_ms();
         save_run_with_conn(conn, &persisted.run)?;
         changed = true;
@@ -530,7 +530,7 @@ pub(super) fn reconcile_linked_plan_runs(
         changed |= persisted.steps[index].status != before;
     }
     if changed {
-        persisted.run.status = persisted.aggregate_status();
+        persisted.run.status = persisted.authoritative_status();
         persisted.run.updated_unix_ms = unix_ms();
         save_run_with_conn(conn, &persisted.run)?;
     }
@@ -547,7 +547,7 @@ pub fn prepare_auto_run_for_resume(
     let changed = reconcile_stale_auto_run(conn, persisted)? || linked_changed;
     if was_paused {
         persisted.run.pause_requested = false;
-        persisted.run.status = persisted.aggregate_status();
+        persisted.run.status = persisted.authoritative_status();
         if matches!(persisted.run.status, AutoRunStatus::Done) {
             persisted.run.status = AutoRunStatus::Paused;
         }

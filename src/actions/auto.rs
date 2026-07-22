@@ -41,6 +41,7 @@ impl Tui {
         };
         let session_path = self.sessions[context.session_index].path.clone();
         let session_branch = self.sessions[context.session_index].branch.clone();
+        let session_incarnation = self.sessions[context.session_index].incarnation.clone();
         if let Some(run_id) = self.active_auto_runs.get(&session_path).cloned() {
             self.load_auto_run_snapshot(&context.repo.root, &run_id);
             self.selected_auto_run = Some(run_id);
@@ -143,7 +144,8 @@ impl Tui {
                 agent_profile: None,
                 initial_prompt: prompt,
             },
-        )?;
+        )?
+        .with_worktree_incarnation(session_incarnation);
         let mut persisted = launch.create_run();
         crate::observability::with_writable_db(&context.repo, |conn| {
             save_auto_run(conn, &mut persisted)

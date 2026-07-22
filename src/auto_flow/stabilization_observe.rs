@@ -4,9 +4,9 @@ use crate::config::Config;
 use crate::git;
 use crate::github::{PrCache, PrDetails, PrReview, PrReviewComment, PrSummary, RepoPolicyCache};
 use crate::repo::Repository;
-use crate::review::{ReviewFeedbackFilter, actionable_review_feedback};
+use crate::review::{ReviewFeedback, ReviewFeedbackFilter, actionable_review_feedback};
 use crate::session::Session;
-use crate::verify::run_merge_conflict_check;
+use crate::verify::run_merge_conflict_check_against;
 
 use super::stabilization_model::*;
 
@@ -20,7 +20,7 @@ pub(crate) fn build_stabilization_snapshot(
     let remote_head_sha = git::remote_branch_head_sha(&session.path, &session.branch, config)
         .ok()
         .flatten();
-    let base_sha = session.pr.summary.as_ref().and_then(|summary| {
+    let base_sha = session.pr.summary().and_then(|summary| {
         git::remote_branch_head_sha(&session.path, &summary.base_ref, config)
             .ok()
             .flatten()
@@ -29,15 +29,18 @@ pub(crate) fn build_stabilization_snapshot(
     let policy_cache = github_remote
         .as_deref()
         .and_then(|remote| crate::github::load_repo_policy_cache(repo, remote));
-    let merge_conflict = (!session.is_default_branch(config) && !session.is_detached())
-        .then(|| run_merge_conflict_check(config, &session.path));
+    let merge_conflict = session.pr.summary().and_then(|summary| {
+        (!session.is_default_branch(config) && !session.is_detached())
+            .then(|| run_merge_conflict_check_against(config, &session.path, &summary.base_ref))
+    });
 
-    let mut pull_request = pull_request_facts_from_cache(
+    let mut pull_request = pull_request_facts_from_cache_with_baseline(
         &session.pr,
         config,
         base_sha,
         merge_conflict.as_ref(),
         policy_cache.as_ref(),
+        run.and_then(|run| run.review_baseline_json.as_deref()),
     );
     if policy_cache
         .as_ref()
@@ -47,12 +50,18 @@ pub(crate) fn build_stabilization_snapshot(
         pull_request.review.approval_required = true;
     }
     let policy = policy_facts_from_cache(policy_cache.as_ref(), pull_request.as_ref());
+    let default_base = policy_cache
+        .as_ref()
+        .and_then(|policy| policy.default_branch.clone())
+        .or_else(|| config.default_base.clone());
+    let is_default_branch = session.is_default_branch(config)
+        || default_base.as_deref() == Some(session.branch.as_str());
 
     StabilizationSnapshot {
         run: run.map(AutoRunRef::from),
         repository: RepositoryFacts {
             root: repo.root.clone(),
-            default_base: config.default_base.clone(),
+            default_base,
             github_remote,
             policy_refreshed_unix_ms: policy_cache.as_ref().map(|policy| policy.refreshed_unix_ms),
             policy_error: policy_cache
@@ -62,7 +71,7 @@ pub(crate) fn build_stabilization_snapshot(
         worktree: WorktreeFacts {
             path: session.path.clone(),
             branch: session.branch.clone(),
-            is_default_branch: session.is_default_branch(config),
+            is_default_branch,
             detached: session.is_detached(),
             dirty: git::selected_dirty(&session.path, config)
                 .unwrap_or_else(|_| status_label_dirty(&session.status_label)),
@@ -84,12 +93,25 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
     run: &super::AutoRun,
     config: &Config,
 ) -> StabilizationSnapshot {
-    let cache = crate::github::load_pr_cache(repo, &run.branch);
+    let policy_refresh_error = if config.auto.merge {
+        crate::github::refresh_repo_policy_cache(repo, &run.worktree_path, config).err()
+    } else {
+        None
+    };
+    let mut cache = crate::github::load_pr_cache(repo, &run.branch);
+    let _ = crate::github::refresh_pr_cache(
+        repo,
+        &run.branch,
+        &mut cache,
+        &run.worktree_path,
+        config,
+        true,
+    );
     let local_head_sha = git::current_head_sha(&run.worktree_path, config).ok();
     let remote_head_sha = git::remote_branch_head_sha(&run.worktree_path, &run.branch, config)
         .ok()
         .flatten();
-    let base_sha = cache.summary.as_ref().and_then(|summary| {
+    let base_sha = cache.summary().and_then(|summary| {
         git::remote_branch_head_sha(&run.worktree_path, &summary.base_ref, config)
             .ok()
             .flatten()
@@ -99,17 +121,25 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
     let policy_cache = github_remote
         .as_deref()
         .and_then(|remote| crate::github::load_repo_policy_cache(repo, remote));
-    let is_default_branch = config.is_default_branch(&run.branch);
+    let is_default_branch = config.is_default_branch(&run.branch)
+        || policy_cache
+            .as_ref()
+            .and_then(|policy| policy.default_branch.as_deref())
+            == Some(run.branch.as_str());
     let detached = run.branch == "(detached)";
-    let merge_conflict = (!is_default_branch && !detached)
-        .then(|| run_merge_conflict_check(config, &run.worktree_path));
+    let merge_conflict = cache.summary().and_then(|summary| {
+        (!is_default_branch && !detached).then(|| {
+            run_merge_conflict_check_against(config, &run.worktree_path, &summary.base_ref)
+        })
+    });
 
-    let mut pull_request = pull_request_facts_from_cache(
+    let mut pull_request = pull_request_facts_from_cache_with_baseline(
         &cache,
         config,
         base_sha,
         merge_conflict.as_ref(),
         policy_cache.as_ref(),
+        run.review_baseline_json.as_deref(),
     );
     if policy_cache
         .as_ref()
@@ -118,18 +148,29 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
     {
         pull_request.review.approval_required = true;
     }
-    let policy = policy_facts_from_cache(policy_cache.as_ref(), pull_request.as_ref());
+    let policy = policy_refresh_error.as_ref().map_or_else(
+        || policy_facts_from_cache(policy_cache.as_ref(), pull_request.as_ref()),
+        |error| PolicyFacts::Unknown {
+            reason: Some(error.clone()),
+        },
+    );
+    let default_base = policy_cache
+        .as_ref()
+        .and_then(|policy| policy.default_branch.clone())
+        .or_else(|| config.default_base.clone());
 
     StabilizationSnapshot {
         run: Some(AutoRunRef::from(run)),
         repository: RepositoryFacts {
             root: repo.root.clone(),
-            default_base: config.default_base.clone(),
+            default_base,
             github_remote,
             policy_refreshed_unix_ms: policy_cache.as_ref().map(|policy| policy.refreshed_unix_ms),
-            policy_error: policy_cache
-                .as_ref()
-                .and_then(|policy| policy.error.clone()),
+            policy_error: policy_refresh_error.or_else(|| {
+                policy_cache
+                    .as_ref()
+                    .and_then(|policy| policy.error.clone())
+            }),
         },
         worktree: WorktreeFacts {
             path: run.worktree_path.clone(),
@@ -214,8 +255,35 @@ pub(crate) fn pull_request_facts_from_cache(
     merge_conflict: Option<&crate::verify::VerifyCheckResult>,
     policy: Option<&RepoPolicyCache>,
 ) -> Option<PullRequestFacts> {
-    let summary = cache.summary.as_ref()?;
-    let details = cache.details.as_ref();
+    pull_request_facts_from_cache_with_baseline(
+        cache,
+        config,
+        base_sha,
+        merge_conflict,
+        policy,
+        None,
+    )
+}
+
+fn pull_request_facts_from_cache_with_baseline(
+    cache: &PrCache,
+    config: &Config,
+    base_sha: Option<String>,
+    merge_conflict: Option<&crate::verify::VerifyCheckResult>,
+    policy: Option<&RepoPolicyCache>,
+    review_baseline_json: Option<&str>,
+) -> Option<PullRequestFacts> {
+    let summary = cache.summary()?;
+    let details = cache.details();
+    let observation_error = match cache.trusted_summary() {
+        Err(error) => Some(error),
+        Ok(None) => Some("pull request summary is unavailable".to_string()),
+        Ok(Some(_)) => match cache.trusted_details() {
+            Err(error) => Some(error),
+            Ok(None) => Some("pull request details have not been observed".to_string()),
+            Ok(Some(_)) => None,
+        },
+    };
     Some(PullRequestFacts {
         number: summary.number,
         url: summary.url.clone(),
@@ -226,11 +294,12 @@ pub(crate) fn pull_request_facts_from_cache(
         base_sha,
         updated_at: summary.updated_at.clone(),
         ci: ci_facts(summary, details, policy),
-        review: review_facts(summary, details, config),
+        review: review_facts(summary, details, config, review_baseline_json),
         mergeability: mergeability_facts(summary, merge_conflict),
         top_level_comment_count: details
             .map(|details| details.comments.len())
             .unwrap_or(summary.comment_count as usize),
+        observation_error,
     })
 }
 
@@ -313,20 +382,35 @@ fn optional_failures(details: &PrDetails, required: &[CheckFact]) -> Vec<String>
         .collect()
 }
 
-fn review_facts(summary: &PrSummary, details: Option<&PrDetails>, config: &Config) -> ReviewFacts {
+fn review_facts(
+    summary: &PrSummary,
+    details: Option<&PrDetails>,
+    config: &Config,
+    review_baseline_json: Option<&str>,
+) -> ReviewFacts {
     let mut actionable_reviews = Vec::new();
     let mut unresolved_threads = Vec::new();
     let top_level_comments = details.map(|details| details.comments.len()).unwrap_or(0);
 
     if let Some(details) = details {
-        let feedback = actionable_review_feedback(
-            details,
-            ReviewFeedbackFilter {
-                after: None,
-                authors: &[],
-            },
-        );
-        actionable_reviews.extend(feedback.review_bodies.into_iter().map(review_body_item));
+        let feedback = stabilization_review_feedback(details, review_baseline_json);
+        let mut review_bodies = feedback.review_bodies;
+        review_bodies.retain(|review| {
+            let superseded = details.reviews.iter().any(|candidate| {
+                candidate.author.eq_ignore_ascii_case(&review.author)
+                    && candidate.submitted_at > review.submitted_at
+                    && matches!(
+                        candidate.state.trim().to_ascii_uppercase().as_str(),
+                        "APPROVED" | "DISMISSED" | "CHANGES_REQUESTED"
+                    )
+            });
+            !superseded
+                && !matches!(
+                    review.state.trim().to_ascii_uppercase().as_str(),
+                    "APPROVED" | "DISMISSED"
+                )
+        });
+        actionable_reviews.extend(review_bodies.into_iter().map(review_body_item));
         for comment in feedback.inline_comments {
             let fact = review_thread_fact(comment);
             if !fact.resolved {
@@ -343,6 +427,22 @@ fn review_facts(summary: &PrSummary, details: Option<&PrDetails>, config: &Confi
         unresolved_threads,
         top_level_comments,
     }
+}
+
+pub(crate) fn stabilization_review_feedback<'a>(
+    details: &'a PrDetails,
+    review_baseline_json: Option<&str>,
+) -> ReviewFeedback<'a> {
+    let baseline = super::non_agent::parse_review_baseline(review_baseline_json);
+    actionable_review_feedback(
+        details,
+        ReviewFeedbackFilter {
+            after: baseline
+                .as_ref()
+                .map(|baseline| baseline.updated_at.as_str()),
+            authors: &[],
+        },
+    )
 }
 
 fn review_body_item(review: &PrReview) -> ActionableReviewItem {
@@ -419,26 +519,164 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use crate::agent::{AgentState, PromptMode};
-    use crate::config::{AutoConfig, Checks, Config, EscapeKey, MergeMethod};
+    use crate::agent::AgentState;
+    use crate::config::{AutoConfig, Config};
     use crate::github::{
         CiFailure, PrCache, PrCheckContext, PrCheckState, PrComment, PrDetails, PrReview,
         PrReviewComment, PrSummary, RepoPolicyCache, save_repo_policy_cache,
     };
     use crate::repo::Repository;
     use crate::session::{Session, SessionClassification};
+    use crate::test_support::write_executable;
 
     use super::*;
 
     #[test]
+    fn old_review_body_is_not_actionable_after_baseline() {
+        let summary = test_summary();
+        let details = PrDetails {
+            reviews: vec![PrReview {
+                id: "review-1".to_string(),
+                author: "reviewer".to_string(),
+                state: "CHANGES_REQUESTED".to_string(),
+                body: "old request".to_string(),
+                submitted_at: "2026-01-01T00:00:00Z".to_string(),
+            }],
+            ..PrDetails::default()
+        };
+        let config = test_config(false);
+
+        let facts = review_facts(
+            &summary,
+            Some(&details),
+            &config,
+            Some(r#"{"head_sha":"head","updated_at":"2026-01-01T00:01:00Z"}"#),
+        );
+
+        assert!(facts.actionable_reviews.is_empty());
+    }
+
+    #[test]
+    fn review_guard_population_excludes_old_non_actionable_unresolved_threads() {
+        let summary = test_summary();
+        let details = PrDetails {
+            review_comments: vec![
+                PrReviewComment {
+                    thread_id: "thread-old".to_string(),
+                    id: "old".to_string(),
+                    author: "reviewer".to_string(),
+                    path: "src/lib.rs".to_string(),
+                    line: "1".to_string(),
+                    body: "old unresolved feedback".to_string(),
+                    created_at: "2026-01-01T00:00:00Z".to_string(),
+                    resolved: false,
+                },
+                PrReviewComment {
+                    thread_id: "thread-new".to_string(),
+                    id: "new".to_string(),
+                    author: "reviewer".to_string(),
+                    path: "src/lib.rs".to_string(),
+                    line: "2".to_string(),
+                    body: "new actionable feedback".to_string(),
+                    created_at: "2026-01-01T00:02:00Z".to_string(),
+                    resolved: false,
+                },
+            ],
+            ..PrDetails::default()
+        };
+        let config = test_config(false);
+
+        let facts = review_facts(
+            &summary,
+            Some(&details),
+            &config,
+            Some(r#"{"head_sha":"head","updated_at":"2026-01-01T00:01:00Z"}"#),
+        );
+
+        assert_eq!(facts.unresolved_threads.len(), 1);
+        assert_eq!(facts.unresolved_threads[0].thread_id, "thread-new");
+        let feedback = stabilization_review_feedback(
+            &details,
+            Some(r#"{"head_sha":"head","updated_at":"2026-01-01T00:01:00Z"}"#),
+        );
+        assert_eq!(
+            crate::review::review_thread_ids(&feedback),
+            vec!["thread-new".to_string()]
+        );
+    }
+
+    #[test]
+    fn later_approval_addresses_earlier_review_body() {
+        let summary = test_summary();
+        let details = PrDetails {
+            reviews: vec![
+                PrReview {
+                    id: "review-1".to_string(),
+                    author: "reviewer".to_string(),
+                    state: "CHANGES_REQUESTED".to_string(),
+                    body: "please fix".to_string(),
+                    submitted_at: "2026-01-01T00:00:00Z".to_string(),
+                },
+                PrReview {
+                    id: "review-2".to_string(),
+                    author: "reviewer".to_string(),
+                    state: "APPROVED".to_string(),
+                    body: "looks good".to_string(),
+                    submitted_at: "2026-01-01T00:01:00Z".to_string(),
+                },
+            ],
+            ..PrDetails::default()
+        };
+        let config = test_config(false);
+
+        let facts = review_facts(&summary, Some(&details), &config, None);
+
+        assert!(facts.actionable_reviews.is_empty());
+    }
+
+    #[test]
+    fn later_commented_review_does_not_erase_requested_changes() {
+        let summary = test_summary();
+        let details = PrDetails {
+            reviews: vec![
+                PrReview {
+                    id: "review-1".to_string(),
+                    author: "reviewer".to_string(),
+                    state: "CHANGES_REQUESTED".to_string(),
+                    body: "please fix".to_string(),
+                    submitted_at: "2026-01-01T00:00:00Z".to_string(),
+                },
+                PrReview {
+                    id: "review-2".to_string(),
+                    author: "reviewer".to_string(),
+                    state: "COMMENTED".to_string(),
+                    body: "one more note".to_string(),
+                    submitted_at: "2026-01-01T00:01:00Z".to_string(),
+                },
+            ],
+            ..PrDetails::default()
+        };
+        let config = test_config(false);
+
+        let facts = review_facts(&summary, Some(&details), &config, None);
+
+        assert!(facts.actionable_reviews.iter().any(|review| {
+            matches!(
+                review,
+                ActionableReviewItem::ReviewBody { state, body, .. }
+                    if state == "CHANGES_REQUESTED" && body == "please fix"
+            )
+        }));
+    }
+
+    #[test]
     fn pull_request_facts_keep_top_level_comments_advisory() {
-        let cache = PrCache {
-            summary: Some(test_summary()),
-            details: Some(PrDetails {
+        let cache = PrCache::observed(
+            test_summary(),
+            Some(PrDetails {
                 comments: vec![PrComment {
                     id: "c1".to_string(),
                     author: "alice".to_string(),
@@ -474,8 +712,7 @@ mod tests {
                 files: Vec::new(),
                 check_contexts: Vec::new(),
             }),
-            ..PrCache::default()
-        };
+        );
 
         let facts = pull_request_facts_from_cache(
             &cache,
@@ -500,10 +737,7 @@ mod tests {
 
     #[test]
     fn pull_request_facts_apply_configured_review_approval_requirement() {
-        let cache = PrCache {
-            summary: Some(test_summary()),
-            ..PrCache::default()
-        };
+        let cache = PrCache::observed(test_summary(), None);
 
         let facts =
             pull_request_facts_from_cache(&cache, &test_config(true), None, None, None).unwrap();
@@ -515,12 +749,12 @@ mod tests {
 
     #[test]
     fn pull_request_facts_use_policy_required_checks_and_optional_failures() {
-        let cache = PrCache {
-            summary: Some(PrSummary {
+        let cache = PrCache::observed(
+            PrSummary {
                 check_status: "failed".to_string(),
                 ..test_summary()
-            }),
-            details: Some(PrDetails {
+            },
+            Some(PrDetails {
                 failing_checks: vec!["docs".to_string()],
                 check_contexts: vec![
                     PrCheckContext {
@@ -534,8 +768,7 @@ mod tests {
                 ],
                 ..PrDetails::default()
             }),
-            ..PrCache::default()
-        };
+        );
         let policy = RepoPolicyCache {
             required_checks: vec!["ci".to_string(), "lint".to_string(), "missing".to_string()],
             ..RepoPolicyCache::default()
@@ -567,8 +800,8 @@ mod tests {
 case "$*" in
   *"remote get-url origin"*) printf '%s\n' 'git@github.com:owner/repo.git'; exit 0 ;;
   *"rev-parse HEAD"*) printf '%s\n' 'local123'; exit 0 ;;
-  *"rev-parse --verify refs/remotes/origin/feature"*) printf '%s\n' 'remote123'; exit 0 ;;
-  *"rev-parse --verify refs/remotes/origin/main"*) printf '%s\n' 'base123'; exit 0 ;;
+  *"rev-parse --verify --quiet refs/remotes/origin/feature"*) printf '%s\n' 'remote123'; exit 0 ;;
+  *"rev-parse --verify --quiet refs/remotes/origin/main"*) printf '%s\n' 'base123'; exit 0 ;;
   *"status --short"*) exit 0 ;;
   *"fetch origin main"*) exit 0 ;;
   *"merge-tree --write-tree HEAD origin/main"*) printf '%s\n' 'tree123'; exit 0 ;;
@@ -591,6 +824,7 @@ exit 1
             repo_label: "repo".to_string(),
             repo_key: None,
             path: worktree.clone(),
+            incarnation: String::new(),
             path_display: worktree.display().to_string(),
             branch: "feature".to_string(),
             prompt_summary: String::new(),
@@ -601,9 +835,9 @@ exit 1
             status_label: "clean".to_string(),
             agent_state: AgentState::Idle,
             opencode_status: None,
-            pr: PrCache {
-                summary: Some(test_summary()),
-                details: Some(PrDetails {
+            pr: PrCache::observed(
+                test_summary(),
+                Some(PrDetails {
                     review_comments: vec![PrReviewComment {
                         thread_id: "thread-1".to_string(),
                         id: "comment-1".to_string(),
@@ -616,8 +850,7 @@ exit 1
                     }],
                     ..PrDetails::default()
                 }),
-                ..PrCache::default()
-            },
+            ),
             wt_columns: BTreeMap::new(),
             unseen_comments: false,
         };
@@ -667,8 +900,8 @@ exit 1
 case "$*" in
   *"remote get-url origin"*) printf '%s\n' 'git@github.com:owner/repo.git'; exit 0 ;;
   *"rev-parse HEAD"*) printf '%s\n' 'local123'; exit 0 ;;
-  *"rev-parse --verify refs/remotes/origin/feature"*) printf '%s\n' 'remote123'; exit 0 ;;
-  *"rev-parse --verify refs/remotes/origin/main"*) printf '%s\n' 'base123'; exit 0 ;;
+  *"rev-parse --verify --quiet refs/remotes/origin/feature"*) printf '%s\n' 'remote123'; exit 0 ;;
+  *"rev-parse --verify --quiet refs/remotes/origin/main"*) printf '%s\n' 'base123'; exit 0 ;;
   *"status --short"*) exit 0 ;;
   *"fetch origin main"*) exit 0 ;;
   *"merge-tree --write-tree HEAD origin/main"*) printf '%s\n' 'tree123'; exit 0 ;;
@@ -677,6 +910,7 @@ exit 1
 "#,
         );
         let mut config = test_config(false);
+        config.default_base = Some("configured-but-stale".to_string());
         config
             .tools
             .insert("git".to_string(), git.display().to_string());
@@ -697,6 +931,7 @@ exit 1
             repo_label: "repo".to_string(),
             repo_key: None,
             path: temp.join("worktree"),
+            incarnation: String::new(),
             path_display: temp.join("worktree").display().to_string(),
             branch: "feature".to_string(),
             prompt_summary: String::new(),
@@ -707,10 +942,7 @@ exit 1
             status_label: "clean".to_string(),
             agent_state: AgentState::Idle,
             opencode_status: None,
-            pr: PrCache {
-                summary: Some(test_summary()),
-                ..PrCache::default()
-            },
+            pr: PrCache::observed(test_summary(), None),
             wt_columns: BTreeMap::new(),
             unseen_comments: false,
         };
@@ -718,6 +950,7 @@ exit 1
         let snapshot = build_stabilization_snapshot(&repo, &session, None, &config);
 
         assert_eq!(snapshot.repository.policy_refreshed_unix_ms, Some(123));
+        assert_eq!(snapshot.repository.default_base.as_deref(), Some("main"));
         assert_eq!(snapshot.repository.policy_error, None);
         assert_eq!(
             snapshot.policy,
@@ -726,6 +959,138 @@ exit 1
             }
         );
         assert!(snapshot.pull_request.unwrap().review.approval_required);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn headless_policy_refresh_failure_does_not_reuse_satisfied_cache() {
+        let temp = unique_temp_dir("prism-headless-policy-refresh-failure-test");
+        fs::create_dir_all(&temp).unwrap();
+        let git = temp.join("git");
+        write_executable(
+            &git,
+            "#!/bin/sh\ncase \"$*\" in\n  *\"remote get-url origin\"*) printf '%s\\n' 'git@github.com:owner/repo.git'; exit 0 ;;\nesac\nexit 1\n",
+        );
+        let gh = temp.join("gh");
+        write_executable(
+            &gh,
+            "#!/bin/sh\nif [ \"$1\" = api ] && [ \"$2\" = graphql ]; then\n  printf '%s\\n' '{\"data\":{\"repository\":{\"defaultBranchRef\":{\"name\":\"main\"},\"branchProtectionRules\":{\"nodes\":[]}}}}'\n  exit 0\nfi\nexit 1\n",
+        );
+        let mut config = test_config(true);
+        config.auto.merge = true;
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        save_repo_policy_cache(
+            &repo,
+            &RepoPolicyCache {
+                repo_remote: "owner/repo".to_string(),
+                default_branch: Some("main".to_string()),
+                refreshed_unix_ms: 123,
+                ..RepoPolicyCache::default()
+            },
+        )
+        .unwrap();
+        crate::observability::with_writable_db(&repo, |conn| {
+            conn.execute_batch(
+                "create trigger reject_policy_refresh before update on repo_policy_cache
+                 begin select raise(abort, 'policy refresh rejected'); end;",
+            )
+            .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        let run = super::super::AutoLaunch::new(
+            &repo.root,
+            &temp.join("worktree"),
+            "feature",
+            "Implement",
+        )
+        .unwrap()
+        .create_run()
+        .run;
+
+        let snapshot = build_auto_run_stabilization_snapshot(&repo, &run, &config);
+
+        assert!(matches!(
+            snapshot.policy,
+            PolicyFacts::Unknown { ref reason }
+                if reason.as_deref().is_some_and(|reason| reason.contains("policy refresh rejected"))
+        ));
+        assert!(
+            snapshot
+                .repository
+                .policy_error
+                .as_deref()
+                .is_some_and(|error| error.contains("policy refresh rejected"))
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn phase_1_mergeability_conflict_check_uses_actual_pr_base() {
+        let temp = unique_temp_dir("prism-stabilization-pr-base-test");
+        fs::create_dir_all(&temp).unwrap();
+        let git = temp.join("git");
+        write_executable(
+            &git,
+            r#"#!/bin/sh
+case "$*" in
+  *"remote get-url origin"*) printf '%s\n' 'git@github.com:owner/repo.git'; exit 0 ;;
+  *"rev-parse HEAD"*) printf '%s\n' 'head123'; exit 0 ;;
+  *"rev-parse --verify --quiet refs/remotes/origin/feature"*) printf '%s\n' 'head123'; exit 0 ;;
+  *"rev-parse --verify --quiet refs/remotes/origin/release"*) printf '%s\n' 'base123'; exit 0 ;;
+  *"status --short"*) exit 0 ;;
+  *"fetch origin main"*) exit 0 ;;
+  *"fetch origin release"*) exit 0 ;;
+  *"merge-tree --write-tree HEAD origin/main"*) printf '%s\n' 'tree123'; exit 0 ;;
+  *"merge-tree --write-tree HEAD origin/release"*) printf '%s\n' 'conflict' >&2; exit 1 ;;
+esac
+exit 1
+"#,
+        );
+        let mut config = test_config(false);
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        let mut summary = test_summary();
+        summary.base_ref = "release".to_string();
+        let session = Session {
+            repo_index: 0,
+            repo_label: "repo".to_string(),
+            repo_key: None,
+            path: temp.join("worktree"),
+            incarnation: String::new(),
+            path_display: temp.join("worktree").display().to_string(),
+            branch: "feature".to_string(),
+            prompt_summary: String::new(),
+            classification: SessionClassification::Work,
+            visibility: 0,
+            adopted: true,
+            hidden: false,
+            status_label: "clean".to_string(),
+            agent_state: AgentState::Idle,
+            opencode_status: None,
+            pr: PrCache::observed(summary, None),
+            wt_columns: BTreeMap::new(),
+            unseen_comments: false,
+        };
+
+        let snapshot = build_stabilization_snapshot(&repo, &session, None, &config);
+        let pull_request = snapshot.pull_request.unwrap();
+
+        assert_eq!(pull_request.base_ref, "release");
+        assert!(matches!(
+            pull_request.mergeability,
+            MergeabilityFacts::Blocked { ref reason } if reason.contains("origin/release")
+        ));
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -752,43 +1117,14 @@ exit 1
     }
 
     fn test_config(require_review_approval: bool) -> Config {
-        let auto = AutoConfig {
+        let mut config = crate::test_support::test_config();
+        config.default_agent = "opencode".to_string();
+        config.default_base = Some("main".to_string());
+        config.auto = AutoConfig {
             require_review_approval,
             ..AutoConfig::default()
         };
-        Config {
-            default_agent: "opencode".to_string(),
-            default_base: Some("main".to_string()),
-            plan_dir: "plans".to_string(),
-            review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
-            opencode_port_base: 41_000,
-            opencode_port_span: 1_000,
-            opencode_shutdown_owned_servers: false,
-            opencode_plan_plugin: false,
-            escape_key: EscapeKey::EscEsc,
-            merge_method: MergeMethod::Squash,
-            icon_style: crate::config::IconStyle::Unicode,
-            icon_style_configured: false,
-            auto,
-            layout: crate::config::LayoutConfig::default(),
-            checks: Checks::default(),
-            worktree_columns: Vec::new(),
-            tools: BTreeMap::new(),
-            agent_commands: BTreeMap::new(),
-            agent_prompt_modes: BTreeMap::<String, PromptMode>::new(),
-            prompt_templates: BTreeMap::new(),
-            user_path: PathBuf::from("/tmp/user.toml"),
-            repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
-        }
-    }
-
-    #[cfg(unix)]
-    fn write_executable(path: &std::path::Path, text: &str) {
-        fs::write(path, text).unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
+        config
     }
 
     #[cfg(unix)]

@@ -2,7 +2,7 @@
 
 Auto Flow automates one clean, non-default Worktree Session through implementation, local verification, commit, and pull request creation. After a PR exists, Auto Flow delegates gate decisions to PR Stabilization.
 
-PR Stabilization observes local Git state, cached GitHub pull request state, repository policy, and Auto Flow configuration. It derives the current blocker and chooses one safe next work item instead of following a fixed review-to-CI checklist.
+PR Stabilization observes local Git state, cached GitHub pull request state, repository policy, and Auto Flow configuration. It is authoritative for post-PR liveness, derives one status and blocker, and chooses one safe next work item instead of following a fixed review-to-CI checklist.
 
 Start or focus it from the TUI with `A` on a selected non-default worktree. New runs ask how to source implementation work:
 
@@ -35,6 +35,7 @@ Safety defaults:
 - local verification runs `checks.pre_push`, `checks.pre_pr`, and a non-mutating merge-conflict check
 - PR Stabilization handles review feedback, CI failures, pending checks, review approval, repository policy, mergeability, manual readiness, and auto-merge readiness as derived blockers
 - managed review and CI repairs verify locally, create a repair commit, and enter guarded pending-push by default
+- review bodies and unresolved inline review threads can authorize review repair; top-level PR comments remain advisory
 - pending repair commits are not pushed automatically unless `auto.push_repairs = true`; inspect the commit diff and use `Space g P` to push through the guard
 - `auto.merge = false` and `auto.cleanup_after_merge = false` by default
 
@@ -79,8 +80,16 @@ Pending push behavior:
 - If the PR branch already contains the guarded commit, Prism marks the push satisfied and replans.
 - If local or remote branch state moved away from the guard, Prism invalidates the pending push and replans instead of pushing blindly.
 - Review repair pushes resolve only the guarded review thread IDs captured when the repair work was planned.
+- The guarded obligation is persisted before either an automatic or user-approved repair push, so a restart cannot lose an in-flight effect.
 
-If Prism exits or the machine restarts, rerun `prism` or `prism auto` for the repository. Active Auto Flow steps are reconciled from the persisted run; stale running attempts are marked failed so they can be retried instead of being silently forgotten.
+PR Cache refresh behavior:
+
+- Cached PR data can remain visible during a transient GitHub or persistence failure, but it is marked stale and cannot authorize repair, readiness, merge, or guarded-thread resolution.
+- Forced actions report the refresh failure instead of treating stale details or malformed GitHub output as authoritative absence.
+- Summary and detail observations are associated with the pull request number and head SHA; details from an earlier head are rejected.
+- PR Stabilization requires trustworthy observations and blocks readiness when local, remote, and pull-request heads diverge.
+
+If Prism exits or the machine restarts, rerun `prism` or `prism auto` for the repository. Active Auto Flow steps are reconciled from the persisted run; stale running attempts are marked failed so they can be retried instead of being silently forgotten. A persisted pending guarded push keeps the run active even if older step aggregation recorded it as done. Prism restores the pending guard, reobserves the branch and PR, and either completes the matching effect or replans without pushing.
 
 Troubleshooting:
 

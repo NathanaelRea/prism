@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::github::{PrDetails, PrSummary, pr_cache_excluded_branch};
+use crate::github::{PrDetails, PrSummary, trusted_pr_for_session};
 use crate::session::Session;
 use crate::util::empty_dash;
 
@@ -51,19 +51,18 @@ pub fn build_tracked_review_fix_prompt(
     session: &Session,
     config: &Config,
 ) -> Result<TrackedReviewFixPrompt, String> {
-    if pr_cache_excluded_branch(config, &session.branch) {
-        return Err("selected branch is not treated as a PR branch".to_string());
-    }
-    let summary = session
-        .pr
-        .summary
-        .as_ref()
+    let (summary, details) = trusted_pr_for_session(session, config)?
         .ok_or_else(|| "no pull request found for selected branch".to_string())?;
-    let details = session
-        .pr
-        .details
-        .as_ref()
+    let details = details
         .ok_or_else(|| "PR comments are still loading; refresh and try again".to_string())?;
+    let mut feedback = actionable_review_feedback(details, ReviewFeedbackFilter::default());
+    feedback.pr_comments.clear();
+    feedback
+        .review_bodies
+        .retain(|review| !is_copilot_reviewer(&review.author));
+    if !feedback.is_actionable() {
+        return Err("no actionable GitHub review feedback was found".to_string());
+    }
 
     Ok(build_tracked_review_fix_prompt_from_input(
         ReviewFixPromptInput {
@@ -80,6 +79,8 @@ pub fn build_tracked_review_fix_prompt_from_input(
     config: &Config,
 ) -> TrackedReviewFixPrompt {
     let mut feedback = actionable_review_feedback(input.details, ReviewFeedbackFilter::default());
+    // Top-level PR comments are advisory; managed review repair follows review mechanisms only.
+    feedback.pr_comments.clear();
     feedback
         .review_bodies
         .retain(|review| !is_copilot_reviewer(&review.author));
@@ -118,10 +119,18 @@ pub fn build_tracked_review_fix_prompt_from_input(
 }
 
 pub fn review_thread_ids(feedback: &ReviewFeedback<'_>) -> Vec<String> {
-    let mut ids = feedback
-        .inline_comments
-        .iter()
-        .map(|comment| comment.thread_id.trim())
+    canonical_review_thread_ids(
+        feedback
+            .inline_comments
+            .iter()
+            .map(|comment| comment.thread_id.as_str()),
+    )
+}
+
+pub fn canonical_review_thread_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut ids = ids
+        .into_iter()
+        .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
@@ -358,7 +367,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::agent::AgentState;
-    use crate::config::{Checks, Config, EscapeKey};
+    use crate::config::Config;
     use crate::github::{PrCache, PrComment, PrDetails, PrReview, PrReviewComment, PrSummary};
 
     use super::*;
@@ -416,8 +425,8 @@ mod tests {
         assert!(prompt.contains(
             "- Review from bob (CHANGES_REQUESTED)\n\nThis should mention the fallback behavior."
         ));
-        assert!(prompt.contains("PR comments:"));
-        assert!(prompt.contains("- Comment from alice\n\nPlease simplify this branch."));
+        assert!(!prompt.contains("PR comments:"));
+        assert!(!prompt.contains("Please simplify this branch."));
         assert!(prompt.contains("\n\n---\n\n"));
         assert!(prompt.contains("Can this be a helper?"));
         assert!(!prompt.contains("This resolved comment should stay out."));
@@ -433,6 +442,16 @@ mod tests {
         assert!(!prompt.contains("2026-06-14"));
         assert!(!prompt.contains("Make the requested changes"));
         assert!(!prompt.contains("cargo test"));
+    }
+
+    #[test]
+    fn review_fix_prompt_rejects_restart_stale_observation() {
+        let mut session = test_session(PrDetails::default());
+        session.pr.mark_preserved_stale();
+
+        let error = build_review_fix_prompt(&session, &test_config()).unwrap_err();
+
+        assert!(error.contains("not been freshly observed"));
     }
 
     #[test]
@@ -526,7 +545,8 @@ mod tests {
 
         assert!(prompt.contains("INLINE\nInline review comments:\n\n"));
         assert!(prompt.contains("REVIEWS\nReview bodies:\n\n"));
-        assert!(prompt.contains("PR\nPR comments:\n\n"));
+        assert!(prompt.contains("PR\n"));
+        assert!(!prompt.contains("Top-level context."));
     }
 
     #[test]
@@ -616,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn review_fix_prompt_explains_skipped_feedback() {
+    fn review_fix_prompt_rejects_resolved_feedback() {
         let session = test_session(PrDetails {
             review_comments: vec![PrReviewComment {
                 author: "dana".to_string(),
@@ -630,11 +650,26 @@ mod tests {
             ..PrDetails::default()
         });
 
-        let prompt = build_review_fix_prompt(&session, &test_config()).unwrap();
+        let error = build_review_fix_prompt(&session, &test_config()).unwrap_err();
 
-        assert!(prompt.contains("No actionable PR review feedback was found."));
-        assert!(prompt.contains("Skipped feedback:"));
-        assert!(prompt.contains("- 1 resolved inline comment(s)"));
+        assert_eq!(error, "no actionable GitHub review feedback was found");
+    }
+
+    #[test]
+    fn top_level_comment_alone_does_not_authorize_review_repair() {
+        let session = test_session(PrDetails {
+            comments: vec![PrComment {
+                author: "alice".to_string(),
+                body: "advisory context".to_string(),
+                created_at: "2026-06-14T12:10:00Z".to_string(),
+                ..PrComment::default()
+            }],
+            ..PrDetails::default()
+        });
+
+        let error = build_review_fix_prompt(&session, &test_config()).unwrap_err();
+
+        assert_eq!(error, "no actionable GitHub review feedback was found");
     }
 
     #[test]
@@ -656,6 +691,7 @@ mod tests {
             repo_label: "repo".to_string(),
             repo_key: None,
             path: PathBuf::from("/repo/worktree"),
+            incarnation: String::new(),
             path_display: "/repo/worktree".to_string(),
             branch: "feature".to_string(),
             prompt_summary: String::new(),
@@ -666,8 +702,8 @@ mod tests {
             status_label: "clean".to_string(),
             agent_state: AgentState::Idle,
             opencode_status: None,
-            pr: PrCache {
-                summary: Some(PrSummary {
+            pr: PrCache::observed(
+                PrSummary {
                     number: 123,
                     title: "Title".to_string(),
                     body: String::new(),
@@ -684,40 +720,18 @@ mod tests {
                     comment_count: 3,
                     merged: false,
                     draft: false,
-                }),
-                details: Some(details),
-                ..PrCache::default()
-            },
+                },
+                Some(details),
+            ),
             wt_columns: BTreeMap::new(),
             unseen_comments: false,
         }
     }
 
     fn test_config() -> Config {
-        Config {
-            default_agent: "opencode".to_string(),
-            default_base: Some("main".to_string()),
-            plan_dir: "plans".to_string(),
-            review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
-            opencode_port_base: 41_000,
-            opencode_port_span: 1_000,
-            opencode_shutdown_owned_servers: false,
-            opencode_plan_plugin: false,
-            escape_key: EscapeKey::EscEsc,
-            merge_method: crate::config::MergeMethod::Squash,
-            icon_style: crate::config::IconStyle::Unicode,
-            icon_style_configured: false,
-            auto: crate::config::AutoConfig::default(),
-            layout: crate::config::LayoutConfig::default(),
-            checks: Checks::default(),
-            worktree_columns: Vec::new(),
-            tools: BTreeMap::new(),
-            agent_commands: BTreeMap::new(),
-            agent_prompt_modes: BTreeMap::new(),
-            prompt_templates: BTreeMap::new(),
-            user_path: PathBuf::from("/tmp/user.toml"),
-            repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
-        }
+        let mut config = crate::test_support::test_config();
+        config.default_agent = "opencode".to_string();
+        config.default_base = Some("main".to_string());
+        config
     }
 }

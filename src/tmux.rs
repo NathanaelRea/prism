@@ -795,7 +795,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use crate::agent::AgentState;
-    use crate::config::{Checks, Config, EscapeKey};
+    use crate::config::Config;
     use crate::github::PrCache;
     use crate::opencode::{OpencodeRuntime, save_runtime, server_url};
     use crate::repo::Repository;
@@ -917,34 +917,12 @@ exit 1
 
     #[test]
     fn rejects_prompt_placeholder_for_interactive_tmux_command() {
-        let config = Config {
-            default_agent: "custom".to_string(),
-            default_base: None,
-            plan_dir: "plans".to_string(),
-            review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
-            opencode_port_base: 41_000,
-            opencode_port_span: 1_000,
-            opencode_shutdown_owned_servers: false,
-            opencode_plan_plugin: false,
-            escape_key: EscapeKey::EscEsc,
-            merge_method: crate::config::MergeMethod::Squash,
-            icon_style: crate::config::IconStyle::Unicode,
-            icon_style_configured: false,
-            auto: crate::config::AutoConfig::default(),
-            layout: crate::config::LayoutConfig::default(),
-            checks: Checks::default(),
-            worktree_columns: Vec::new(),
-            tools: BTreeMap::new(),
-            agent_commands: BTreeMap::from([(
-                "custom".to_string(),
-                "custom-agent --prompt {prompt}".to_string(),
-            )]),
-            agent_prompt_modes: BTreeMap::new(),
-            prompt_templates: BTreeMap::new(),
-            user_path: PathBuf::from("/tmp/user.toml"),
-            repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
-        };
+        let mut config = crate::test_support::test_config();
+        config.default_agent = "custom".to_string();
+        config.agent_commands.insert(
+            "custom".to_string(),
+            "custom-agent --prompt {prompt}".to_string(),
+        );
 
         let repo = Repository {
             root: PathBuf::from("/repo"),
@@ -1106,31 +1084,11 @@ exit 0
 
     #[test]
     fn pane_command_only_counts_the_configured_agent_as_running() {
-        let config = Config {
-            default_agent: "opencode".to_string(),
-            default_base: None,
-            plan_dir: "plans".to_string(),
-            review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
-            opencode_port_base: 41_000,
-            opencode_port_span: 1_000,
-            opencode_shutdown_owned_servers: false,
-            opencode_plan_plugin: false,
-            escape_key: EscapeKey::EscEsc,
-            merge_method: crate::config::MergeMethod::Squash,
-            icon_style: crate::config::IconStyle::Unicode,
-            icon_style_configured: false,
-            auto: crate::config::AutoConfig::default(),
-            layout: crate::config::LayoutConfig::default(),
-            checks: Checks::default(),
-            worktree_columns: Vec::new(),
-            tools: BTreeMap::new(),
-            agent_commands: BTreeMap::new(),
-            agent_prompt_modes: BTreeMap::new(),
-            prompt_templates: BTreeMap::new(),
-            user_path: PathBuf::from("/tmp/user.toml"),
-            repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
-        };
+        let mut config = crate::test_support::test_config();
+        config.default_agent = "opencode".to_string();
+        config
+            .tools
+            .insert("opencode".to_string(), "opencode".to_string());
 
         assert!(pane_command_matches_agent(&config, "opencode"));
         assert!(pane_command_matches_agent(&config, "opencode.exe"));
@@ -1896,6 +1854,7 @@ exit 0
             repo_label: "repo".to_string(),
             repo_key: None,
             path: path.clone(),
+            incarnation: String::new(),
             path_display: path.display().to_string(),
             branch: branch.to_string(),
             prompt_summary: String::new(),
@@ -1913,31 +1872,10 @@ exit 0
     }
 
     fn test_config() -> Config {
-        Config {
-            default_agent: "opencode".to_string(),
-            default_base: Some("feature".to_string()),
-            plan_dir: "plans".to_string(),
-            review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
-            opencode_port_base: 41_000,
-            opencode_port_span: 1_000,
-            opencode_shutdown_owned_servers: false,
-            opencode_plan_plugin: false,
-            escape_key: EscapeKey::EscEsc,
-            merge_method: crate::config::MergeMethod::Squash,
-            icon_style: crate::config::IconStyle::Unicode,
-            icon_style_configured: false,
-            auto: crate::config::AutoConfig::default(),
-            layout: crate::config::LayoutConfig::default(),
-            checks: Checks::default(),
-            worktree_columns: Vec::new(),
-            tools: BTreeMap::new(),
-            agent_commands: BTreeMap::new(),
-            agent_prompt_modes: BTreeMap::new(),
-            prompt_templates: BTreeMap::new(),
-            user_path: PathBuf::from("/tmp/user.toml"),
-            repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
-        }
+        let mut config = crate::test_support::test_config();
+        config.default_agent = "opencode".to_string();
+        config.default_base = Some("feature".to_string());
+        config
     }
 
     fn start_fake_opencode_server(

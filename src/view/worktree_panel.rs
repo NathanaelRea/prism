@@ -41,7 +41,7 @@ pub(super) fn worktree_detail_lines(model: &crate::view::FrameModel<'_>) -> Vec<
     lines.extend(stabilization_panel_lines(&stabilization_panel_model(
         model, session,
     )));
-    if let Some(details) = &session.pr.details {
+    if let Some(details) = session.pr.details() {
         lines.extend(pr_comment_lines(details, 5, model.selected_comment));
     }
     lines
@@ -134,20 +134,19 @@ pub(crate) fn stabilization_panel_model(
         .auto_dashboard
         .as_ref()
         .map(|dashboard| &dashboard.run.run);
-    let blocker = run
-        .and_then(|run| run.stabilization_blocker.as_ref())
-        .cloned()
-        .or_else(|| {
-            run.and_then(|run| run.pending_push.as_ref())
-                .map(|_| StabilizationBlocker::PendingPush)
+    let cached_state = run
+        .is_none()
+        .then(|| {
+            crate::auto_flow::stabilization_plan::conservative_cached_state(model.config, session)
         })
-        .or_else(|| cached_pr_blocker(model.config, session));
-    let next = blocker.as_ref().map(|blocker| {
-        run.and_then(|run| run.stabilization_next_work.as_ref())
-            .cloned()
-            .unwrap_or_else(|| cached_next_work(blocker))
-    });
-    let summary = session.pr.summary.as_ref();
+        .flatten();
+    let blocker = run
+        .and_then(|run| run.stabilization_blocker.clone())
+        .or_else(|| cached_state.as_ref().map(|state| state.blocker.clone()));
+    let next = run
+        .and_then(|run| run.stabilization_next_work.clone())
+        .or_else(|| cached_state.as_ref().map(|state| state.next_work.clone()));
+    let summary = session.pr.summary();
 
     if summary.is_none() {
         return StabilizationPanelModel {
@@ -173,7 +172,14 @@ pub(crate) fn stabilization_panel_model(
         pr_name: summary
             .map(|summary| summary.title.clone())
             .unwrap_or_default(),
-        blocker: blocker.as_ref().map(blocker_label).unwrap_or_default(),
+        blocker: blocker
+            .as_ref()
+            .map(blocker_label)
+            .or_else(|| {
+                run.and_then(|run| run.stabilization_status)
+                    .map(|status| pascal_label(status.as_str()))
+            })
+            .unwrap_or_default(),
         next: next.as_ref().map(work_label).unwrap_or_default(),
         ci: blocker
             .as_ref()
@@ -298,52 +304,6 @@ fn stabilization_status_icon(status: &str, icon_style: IconStyle) -> &'static st
     }
 }
 
-fn cached_pr_blocker(
-    config: &crate::config::Config,
-    session: &Session,
-) -> Option<StabilizationBlocker> {
-    let summary = session.pr.summary.as_ref()?;
-    if summary.merged || summary.state.eq_ignore_ascii_case("merged") {
-        return Some(StabilizationBlocker::Merged);
-    }
-    if merge_blocked(summary) {
-        return Some(StabilizationBlocker::MergeBlocked);
-    }
-    if has_actionable_review_feedback(session) {
-        return Some(StabilizationBlocker::ReviewFeedbackFound);
-    }
-    match summary.check_state() {
-        crate::github::PrCheckState::Failed | crate::github::PrCheckState::Mixed => {
-            return Some(StabilizationBlocker::CiFailed);
-        }
-        crate::github::PrCheckState::Pending => return Some(StabilizationBlocker::CiPending),
-        crate::github::PrCheckState::Success | crate::github::PrCheckState::Unknown => {}
-    }
-    if config.auto.merge {
-        Some(StabilizationBlocker::PolicyUnknown)
-    } else {
-        Some(StabilizationBlocker::ReadyForManualMerge)
-    }
-}
-
-fn cached_next_work(blocker: &StabilizationBlocker) -> StabilizationWorkKind {
-    match blocker {
-        StabilizationBlocker::PendingPush => StabilizationWorkKind::PushPendingRepair,
-        StabilizationBlocker::ReviewFeedbackFound => StabilizationWorkKind::FixReview,
-        StabilizationBlocker::CiFailed | StabilizationBlocker::CiMissingRequiredChecks => {
-            StabilizationWorkKind::FixCi
-        }
-        StabilizationBlocker::CiPending => StabilizationWorkKind::WaitForCi,
-        StabilizationBlocker::ReviewApprovalMissing => StabilizationWorkKind::WaitForReview,
-        StabilizationBlocker::ReadyForManualMerge => StabilizationWorkKind::MarkReadyForManualMerge,
-        StabilizationBlocker::ReadyToAutoMerge => StabilizationWorkKind::Merge,
-        StabilizationBlocker::Merged => StabilizationWorkKind::Done,
-        StabilizationBlocker::NeedsPullRequest => StabilizationWorkKind::PushInitialAndOpenPr,
-        StabilizationBlocker::NeedsImplementation => StabilizationWorkKind::RunImplementation,
-        _ => StabilizationWorkKind::Escalate,
-    }
-}
-
 fn blocker_label(blocker: &StabilizationBlocker) -> String {
     pascal_label(blocker.as_str())
 }
@@ -367,13 +327,12 @@ fn pascal_label(value: &str) -> String {
 }
 
 fn ci_gate_label(session: &Session, blocker: &StabilizationBlocker) -> String {
-    let Some(summary) = &session.pr.summary else {
+    let Some(summary) = session.pr.summary() else {
         return "unknown".to_string();
     };
     let optional_failure_count = session
         .pr
-        .details
-        .as_ref()
+        .details()
         .map(|details| details.failing_checks.len())
         .unwrap_or(0);
     if optional_failure_count > 0 && ci_blockers_ruled_out(blocker) {
@@ -386,7 +345,7 @@ fn ci_gate_label(session: &Session, blocker: &StabilizationBlocker) -> String {
         return "required missing".to_string();
     }
     let mut label = summary.check_state().label().to_string();
-    if let Some(details) = &session.pr.details
+    if let Some(details) = session.pr.details()
         && !details.failing_checks.is_empty()
     {
         label = format!("{label} ({} failing)", details.failing_checks.len());
@@ -407,7 +366,7 @@ fn ci_blockers_ruled_out(blocker: &StabilizationBlocker) -> bool {
 }
 
 fn review_gate_label(config: &crate::config::Config, session: &Session) -> String {
-    let Some(summary) = &session.pr.summary else {
+    let Some(summary) = session.pr.summary() else {
         return "unknown".to_string();
     };
     if has_actionable_review_feedback(session) {
@@ -430,7 +389,7 @@ fn review_gate_label(config: &crate::config::Config, session: &Session) -> Strin
 }
 
 fn merge_gate_label(session: &Session) -> String {
-    let Some(summary) = &session.pr.summary else {
+    let Some(summary) = session.pr.summary() else {
         return String::new();
     };
     if merge_blocked(summary) {
@@ -466,7 +425,7 @@ fn merge_blocked(summary: &crate::github::PrSummary) -> bool {
 }
 
 fn has_actionable_review_feedback(session: &Session) -> bool {
-    session.pr.details.as_ref().is_some_and(|details| {
+    session.pr.details().is_some_and(|details| {
         details
             .review_comments
             .iter()

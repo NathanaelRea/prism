@@ -85,13 +85,12 @@ pub(super) fn repo_github_summary(
         if session.is_default_branch(config) {
             continue;
         }
-        match &session.pr.summary {
+        match session.pr.summary() {
             Some(pr) => {
                 if !pr.merged && pr.state == "OPEN" {
                     summary.open_prs += 1;
                 }
-                if review_decision_for_display(pr, session.pr.details.as_ref()) == "REVIEW_REQUIRED"
-                {
+                if review_decision_for_display(pr, session.pr.details()) == "REVIEW_REQUIRED" {
                     summary.review_needed += 1;
                 }
                 if pr.check_status == "failed" {
@@ -162,8 +161,7 @@ pub(super) fn repo_work_item_line(
     let kind = repo_work_kind_label(config, session);
     let label = session
         .pr
-        .summary
-        .as_ref()
+        .summary()
         .map(|summary| format!("{} - {}", session.branch, summary.title))
         .unwrap_or_else(|| session.branch.clone());
     Line::from(vec![
@@ -305,7 +303,7 @@ pub(super) fn kanban_card_spans(
     selected: bool,
 ) -> Vec<Span<'static>> {
     let mut suffix = git_status_indicator(&session.status_label, config.icon_style);
-    if let Some(summary) = &session.pr.summary {
+    if let Some(summary) = session.pr.summary() {
         if !suffix.is_empty() {
             suffix.push(' ');
         }
@@ -333,15 +331,10 @@ pub(super) fn kanban_lane(config: &crate::config::Config, session: &Session) -> 
     if session.is_default_branch(config) {
         return None;
     }
-    if session
-        .pr
-        .summary
-        .as_ref()
-        .is_some_and(|summary| summary.merged)
-    {
+    if session.pr.summary().is_some_and(|summary| summary.merged) {
         return Some(KanbanLane::Merged);
     }
-    if session.pr.summary.is_some() {
+    if session.pr.has_summary() {
         return Some(KanbanLane::PrCi);
     }
     if status_count(&session.status_label, "dirty").is_some()
@@ -362,7 +355,7 @@ pub(super) fn kanban_lane(config: &crate::config::Config, session: &Session) -> 
 pub(super) fn repo_work_kind_label(config: &crate::config::Config, session: &Session) -> String {
     if session.is_default_branch(config) {
         "default".to_string()
-    } else if let Some(summary) = &session.pr.summary {
+    } else if let Some(summary) = session.pr.summary() {
         format!("#{}", summary.number)
     } else {
         "local".to_string()
@@ -373,14 +366,10 @@ pub(super) fn repo_work_detail_label(config: &crate::config::Config, session: &S
     let mut parts = Vec::new();
     if session.is_default_branch(config) {
         parts.push("tracking off".to_string());
-    } else if let Some(summary) = &session.pr.summary {
+    } else if let Some(summary) = session.pr.summary() {
         parts.push(pr_state_label(summary).to_string());
         parts.push(
-            review_label(&review_decision_for_display(
-                summary,
-                session.pr.details.as_ref(),
-            ))
-            .to_string(),
+            review_label(&review_decision_for_display(summary, session.pr.details())).to_string(),
         );
         parts.push(format!(
             "ci {} {}",

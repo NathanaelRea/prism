@@ -9,6 +9,7 @@ pub struct AutoRun {
     pub id: String,
     pub repo_root: String,
     pub worktree_path: PathBuf,
+    pub worktree_incarnation: Option<String>,
     pub branch: String,
     pub mode: AutoRunMode,
     pub implementation_source: AutoImplementationSource,
@@ -81,6 +82,7 @@ pub struct AutoEvent {
 pub struct AutoLaunch {
     pub repo_root: String,
     pub worktree_path: PathBuf,
+    worktree_incarnation: Option<String>,
     pub branch: String,
     pub mode: AutoRunMode,
     pub implementation_source: AutoImplementationSource,
@@ -432,6 +434,9 @@ impl AutoLaunch {
         Ok(Self {
             repo_root: repo_root.display().to_string(),
             worktree_path: worktree_path.to_path_buf(),
+            worktree_incarnation: nonempty_incarnation(crate::session::worktree_incarnation(
+                worktree_path,
+            )),
             branch,
             mode,
             implementation_source,
@@ -444,6 +449,11 @@ impl AutoLaunch {
         })
     }
 
+    pub(crate) fn with_worktree_incarnation(mut self, incarnation: String) -> Self {
+        self.worktree_incarnation = nonempty_incarnation(incarnation);
+        self
+    }
+
     pub fn create_run(&self) -> PersistedAutoRun {
         let now = unix_ms();
         let id = self.default_run_id(now);
@@ -451,6 +461,7 @@ impl AutoLaunch {
             id: id.clone(),
             repo_root: self.repo_root.clone(),
             worktree_path: self.worktree_path.clone(),
+            worktree_incarnation: self.worktree_incarnation.clone(),
             branch: self.branch.clone(),
             mode: self.mode,
             implementation_source: self.implementation_source,
@@ -493,6 +504,10 @@ impl AutoLaunch {
                 ^ stable_string_hash(&self.initial_prompt)
         )
     }
+}
+
+fn nonempty_incarnation(incarnation: String) -> Option<String> {
+    (!incarnation.is_empty()).then_some(incarnation)
 }
 
 impl AutoStepRun {
@@ -554,6 +569,21 @@ impl AutoExecutorConfig {
 impl PersistedAutoRun {
     pub fn aggregate_status(&self) -> AutoRunStatus {
         aggregate_step_status(self.steps.iter().map(|step| step.status))
+    }
+
+    pub fn authoritative_status(&self) -> AutoRunStatus {
+        let aggregate = self.aggregate_status();
+        let stabilization_active = self
+            .run
+            .stabilization_status
+            .is_some_and(stabilization_model::StabilizationStatus::keeps_run_active);
+        if self.run.pending_push.is_some()
+            || (stabilization_active && matches!(aggregate, AutoRunStatus::Done))
+        {
+            AutoRunStatus::Paused
+        } else {
+            aggregate
+        }
     }
 
     pub fn status_counts(&self) -> AutoStatusCounts {

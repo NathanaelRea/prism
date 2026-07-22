@@ -45,6 +45,19 @@ pub fn execute_auto_initial_step(
             return Ok(());
         }
 
+        if persisted.run.pending_push.is_some() && config.auto.push_repairs {
+            let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
+            stabilization_execute::progress_pending_push(
+                conn,
+                repo,
+                config,
+                persisted,
+                &mut cache,
+                || Ok(()),
+            )?;
+            continue;
+        }
+
         if let Some(step_index) = next_queued_agent_step(persisted) {
             if let Err(error) =
                 execute_one_agent_step(conn, config, persisted, step_index, executor, output)
@@ -78,7 +91,7 @@ pub fn execute_auto_initial_step(
         }
 
         persisted.run.pause_requested = false;
-        persisted.run.status = persisted.aggregate_status();
+        persisted.run.status = persisted.authoritative_status();
         if matches!(persisted.run.status, AutoRunStatus::Queued) {
             persisted.run.status = AutoRunStatus::Paused;
         }
@@ -122,7 +135,7 @@ pub(super) fn complete_queued_prepare(
             max_output_lines_per_step,
         )?;
     }
-    persisted.run.status = persisted.aggregate_status();
+    persisted.run.status = persisted.authoritative_status();
     persisted.run.updated_unix_ms = unix_ms();
     save_run_with_conn(conn, &persisted.run)
 }

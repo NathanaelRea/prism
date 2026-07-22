@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::github::{PrDetails, PrSummary, pr_cache_excluded_branch};
+use crate::github::{PrDetails, PrSummary, trusted_pr_for_session};
 use crate::session::Session;
 use crate::util::empty_dash;
 
@@ -12,18 +12,10 @@ pub struct CiFailurePromptInput<'a> {
 }
 
 pub fn build_ci_failure_prompt(session: &Session, config: &Config) -> Result<String, String> {
-    if pr_cache_excluded_branch(config, &session.branch) {
-        return Err("selected branch is not treated as a PR branch".to_string());
-    }
-    let summary = session
-        .pr
-        .summary
-        .as_ref()
+    let (summary, details) = trusted_pr_for_session(session, config)?
         .ok_or_else(|| "no pull request found for selected branch".to_string())?;
-    let details =
-        session.pr.details.as_ref().ok_or_else(|| {
-            "CI failure details are still loading; refresh and try again".to_string()
-        })?;
+    let details = details
+        .ok_or_else(|| "CI failure details are still loading; refresh and try again".to_string())?;
 
     Ok(build_ci_failure_prompt_from_input(
         CiFailurePromptInput {
@@ -114,7 +106,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::agent::AgentState;
-    use crate::config::{Checks, Config, EscapeKey};
+    use crate::config::Config;
     use crate::github::{CiFailure, PrCache, PrDetails, PrSummary};
 
     use super::*;
@@ -164,12 +156,23 @@ mod tests {
         assert!(prompt.contains("- lint"));
     }
 
+    #[test]
+    fn ci_failure_prompt_rejects_restart_stale_observation() {
+        let mut session = test_session(PrDetails::default());
+        session.pr.mark_preserved_stale();
+
+        let error = build_ci_failure_prompt(&session, &test_config()).unwrap_err();
+
+        assert!(error.contains("not been freshly observed"));
+    }
+
     fn test_session(details: PrDetails) -> Session {
         Session {
             repo_index: 0,
             repo_label: "repo".to_string(),
             repo_key: None,
             path: PathBuf::from("/repo/worktree"),
+            incarnation: String::new(),
             path_display: "/repo/worktree".to_string(),
             branch: "feature".to_string(),
             prompt_summary: String::new(),
@@ -180,8 +183,8 @@ mod tests {
             status_label: "clean".to_string(),
             agent_state: AgentState::Idle,
             opencode_status: None,
-            pr: PrCache {
-                summary: Some(PrSummary {
+            pr: PrCache::observed(
+                PrSummary {
                     number: 123,
                     title: "Title".to_string(),
                     body: String::new(),
@@ -198,40 +201,18 @@ mod tests {
                     comment_count: 0,
                     merged: false,
                     draft: false,
-                }),
-                details: Some(details),
-                ..PrCache::default()
-            },
+                },
+                Some(details),
+            ),
             wt_columns: BTreeMap::new(),
             unseen_comments: false,
         }
     }
 
     fn test_config() -> Config {
-        Config {
-            default_base: Some("main".to_string()),
-            default_agent: "opencode".to_string(),
-            plan_dir: "plans".to_string(),
-            review_packet_dir: ".agent/review".to_string(),
-            worktree_command: "wt".to_string(),
-            opencode_port_base: 41_000,
-            opencode_port_span: 1_000,
-            opencode_shutdown_owned_servers: false,
-            opencode_plan_plugin: false,
-            agent_prompt_modes: BTreeMap::new(),
-            prompt_templates: BTreeMap::new(),
-            tools: BTreeMap::new(),
-            agent_commands: BTreeMap::new(),
-            checks: Checks::default(),
-            merge_method: crate::config::MergeMethod::Squash,
-            icon_style: crate::config::IconStyle::Unicode,
-            icon_style_configured: false,
-            auto: crate::config::AutoConfig::default(),
-            layout: crate::config::LayoutConfig::default(),
-            worktree_columns: Vec::new(),
-            user_path: PathBuf::from("/repo/.config/prism/config.toml"),
-            repo_config_path: PathBuf::from("/repo/.prism/config.toml"),
-            escape_key: EscapeKey::EscEsc,
-        }
+        let mut config = crate::test_support::test_config();
+        config.default_agent = "opencode".to_string();
+        config.default_base = Some("main".to_string());
+        config
     }
 }

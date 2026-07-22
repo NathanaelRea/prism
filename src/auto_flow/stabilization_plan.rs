@@ -44,6 +44,23 @@ pub(crate) fn derive_blockers(snapshot: &StabilizationSnapshot) -> Vec<Stabiliza
     if snapshot.worktree.dirty {
         blockers.push(StabilizationBlocker::DirtyWorktree);
     }
+    if pull_request.observation_error.is_some() {
+        blockers.push(StabilizationBlocker::ObservationFailed);
+    }
+    if pull_request.draft {
+        blockers.push(StabilizationBlocker::DraftPullRequest);
+    }
+    if snapshot
+        .repository
+        .default_base
+        .as_deref()
+        .is_some_and(|base| base != pull_request.base_ref)
+    {
+        blockers.push(StabilizationBlocker::WrongBase);
+    }
+    if heads_diverged(snapshot, pull_request) {
+        blockers.push(StabilizationBlocker::HeadDiverged);
+    }
     if matches!(pull_request.mergeability, MergeabilityFacts::Blocked { .. }) {
         blockers.push(StabilizationBlocker::MergeBlocked);
     } else if matches!(pull_request.mergeability, MergeabilityFacts::Unknown) {
@@ -103,12 +120,93 @@ pub(crate) fn plan(snapshot: &StabilizationSnapshot) -> StabilizationWorkItem {
         .first()
         .cloned()
         .unwrap_or(StabilizationBlocker::Escalate);
+    work_item_for_blocker(snapshot, blocker)
+}
+
+pub(crate) fn manual_merge_authorization(
+    snapshot: &StabilizationSnapshot,
+) -> Result<StabilizationWorkItem, StabilizationState> {
+    let work = plan(snapshot);
+    if work.kind != StabilizationWorkKind::MarkReadyForManualMerge {
+        return Err(work.state());
+    }
+    if matches!(snapshot.policy, PolicyFacts::Unknown { .. }) {
+        return Err(work_item_for_blocker(snapshot, StabilizationBlocker::PolicyUnknown).state());
+    }
+    Ok(work)
+}
+
+fn work_item_for_blocker(
+    snapshot: &StabilizationSnapshot,
+    blocker: StabilizationBlocker,
+) -> StabilizationWorkItem {
     StabilizationWorkItem {
         kind: work_kind_for_blocker(&blocker),
         reason: reason_for_blocker(snapshot, &blocker),
         guard: work_guard(snapshot),
         blocker,
     }
+}
+
+pub(crate) fn state(snapshot: &StabilizationSnapshot) -> StabilizationState {
+    plan(snapshot).state()
+}
+
+pub(crate) fn conservative_cached_state(
+    config: &crate::config::Config,
+    session: &crate::session::Session,
+) -> Option<StabilizationState> {
+    session.pr.summary()?;
+    let pull_request = super::stabilization_observe::pull_request_facts_from_cache(
+        &session.pr,
+        config,
+        None,
+        None,
+        None,
+    );
+    let snapshot = StabilizationSnapshot {
+        run: None,
+        repository: RepositoryFacts {
+            root: session.path.clone(),
+            default_base: config.default_base.clone(),
+            github_remote: None,
+            policy_refreshed_unix_ms: None,
+            policy_error: None,
+        },
+        worktree: WorktreeFacts {
+            path: session.path.clone(),
+            branch: session.branch.clone(),
+            is_default_branch: session.is_default_branch(config),
+            detached: session.is_detached(),
+            dirty: cached_status_is_dirty(&session.status_label),
+            // Rendering cannot observe immutable Git identities. Unknown heads are
+            // intentionally conservative and therefore cannot claim readiness.
+            local_head_sha: None,
+            remote_head_sha: None,
+        },
+        pull_request,
+        policy: if config.auto.merge {
+            PolicyFacts::Unknown {
+                reason: Some("repository policy is unavailable in the cached view".to_string()),
+            }
+        } else {
+            PolicyFacts::Satisfied
+        },
+        goal: StabilizationGoal {
+            auto_merge: config.auto.merge,
+            cleanup_after_merge: config.auto.cleanup_after_merge,
+        },
+        pending_push: None,
+    };
+    Some(state(&snapshot))
+}
+
+fn cached_status_is_dirty(status_label: &str) -> bool {
+    status_label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|parts| parts[0] == "dirty" && parts[1].parse::<usize>().unwrap_or(0) > 0)
 }
 
 fn required_ci_blocker(required: &[CheckFact]) -> Option<StabilizationBlocker> {
@@ -134,16 +232,20 @@ fn blocker_priority(blocker: &StabilizationBlocker) -> u8 {
         StabilizationBlocker::NeedsPullRequest => 2,
         StabilizationBlocker::PendingPush => 3,
         StabilizationBlocker::DirtyWorktree => 4,
-        StabilizationBlocker::MergeBlocked => 5,
-        StabilizationBlocker::ReviewFeedbackFound => 6,
-        StabilizationBlocker::CiFailed | StabilizationBlocker::CiMissingRequiredChecks => 7,
-        StabilizationBlocker::CiPending => 8,
-        StabilizationBlocker::ReviewApprovalMissing => 9,
-        StabilizationBlocker::PolicyBlocked => 10,
-        StabilizationBlocker::PolicyUnknown => 11,
-        StabilizationBlocker::ReadyToAutoMerge | StabilizationBlocker::ReadyForManualMerge => 12,
-        StabilizationBlocker::Merged => 13,
-        StabilizationBlocker::Escalate => 14,
+        StabilizationBlocker::ObservationFailed => 5,
+        StabilizationBlocker::DraftPullRequest => 6,
+        StabilizationBlocker::WrongBase => 7,
+        StabilizationBlocker::HeadDiverged => 8,
+        StabilizationBlocker::MergeBlocked => 9,
+        StabilizationBlocker::ReviewFeedbackFound => 10,
+        StabilizationBlocker::CiFailed | StabilizationBlocker::CiMissingRequiredChecks => 11,
+        StabilizationBlocker::CiPending => 12,
+        StabilizationBlocker::ReviewApprovalMissing => 13,
+        StabilizationBlocker::PolicyBlocked => 14,
+        StabilizationBlocker::PolicyUnknown => 15,
+        StabilizationBlocker::ReadyToAutoMerge | StabilizationBlocker::ReadyForManualMerge => 16,
+        StabilizationBlocker::Merged => 17,
+        StabilizationBlocker::Escalate => 18,
     }
 }
 
@@ -163,6 +265,10 @@ fn work_kind_for_blocker(blocker: &StabilizationBlocker) -> StabilizationWorkKin
         StabilizationBlocker::Merged => StabilizationWorkKind::Done,
         StabilizationBlocker::NotEligible
         | StabilizationBlocker::DirtyWorktree
+        | StabilizationBlocker::ObservationFailed
+        | StabilizationBlocker::DraftPullRequest
+        | StabilizationBlocker::WrongBase
+        | StabilizationBlocker::HeadDiverged
         | StabilizationBlocker::MergeBlocked
         | StabilizationBlocker::PolicyBlocked
         | StabilizationBlocker::PolicyUnknown
@@ -190,6 +296,30 @@ fn reason_for_blocker(snapshot: &StabilizationSnapshot, blocker: &StabilizationB
         }
         StabilizationBlocker::DirtyWorktree => {
             "local worktree changes must be resolved before interpreting PR gates".to_string()
+        }
+        StabilizationBlocker::ObservationFailed => snapshot
+            .pull_request
+            .as_ref()
+            .and_then(|pr| pr.observation_error.clone())
+            .unwrap_or_else(|| "pull request observation is not trustworthy".to_string()),
+        StabilizationBlocker::DraftPullRequest => {
+            "draft pull request must be marked ready before merge readiness".to_string()
+        }
+        StabilizationBlocker::WrongBase => {
+            let pr_base = snapshot
+                .pull_request
+                .as_ref()
+                .map(|pr| pr.base_ref.as_str())
+                .unwrap_or("unknown");
+            let expected = snapshot
+                .repository
+                .default_base
+                .as_deref()
+                .unwrap_or("unknown");
+            format!("pull request base is {pr_base}, expected {expected}")
+        }
+        StabilizationBlocker::HeadDiverged => {
+            "local, remote, and pull request heads do not agree".to_string()
         }
         StabilizationBlocker::MergeBlocked => snapshot
             .pull_request
@@ -225,7 +355,7 @@ fn reason_for_blocker(snapshot: &StabilizationSnapshot, blocker: &StabilizationB
         ),
         StabilizationBlocker::PolicyBlocked => "repository policy blocks readiness".to_string(),
         StabilizationBlocker::PolicyUnknown => {
-            "repository policy is unknown, so auto-merge is blocked".to_string()
+            "repository policy is unknown, so merge authorization is blocked".to_string()
         }
         StabilizationBlocker::ReadyForManualMerge => {
             "all known gates pass; auto-merge is disabled".to_string()
@@ -246,6 +376,16 @@ fn reason_for_blocker(snapshot: &StabilizationSnapshot, blocker: &StabilizationB
             }
         }
     }
+}
+
+fn heads_diverged(snapshot: &StabilizationSnapshot, pull_request: &PullRequestFacts) -> bool {
+    let Some(local) = snapshot.worktree.local_head_sha.as_deref() else {
+        return true;
+    };
+    let Some(remote) = snapshot.worktree.remote_head_sha.as_deref() else {
+        return true;
+    };
+    local != remote || remote != pull_request.head_sha
 }
 
 fn required_check_reason(
@@ -289,12 +429,13 @@ fn work_guard(snapshot: &StabilizationSnapshot) -> WorkGuard {
             .pull_request
             .as_ref()
             .map(|pull_request| {
-                pull_request
-                    .review
-                    .unresolved_threads
-                    .iter()
-                    .map(|thread| thread.thread_id.clone())
-                    .collect()
+                crate::review::canonical_review_thread_ids(
+                    pull_request
+                        .review
+                        .unresolved_threads
+                        .iter()
+                        .map(|thread| thread.thread_id.as_str()),
+                )
             })
             .unwrap_or_default(),
     }
@@ -302,9 +443,12 @@ fn work_guard(snapshot: &StabilizationSnapshot) -> WorkGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
-    use crate::github::{CiFailure, PrCheckState};
+    use crate::agent::AgentState;
+    use crate::github::{CiFailure, PrCache, PrCheckState, PrDetails, PrSummary};
+    use crate::session::{Session, SessionClassification};
 
     use super::*;
 
@@ -366,6 +510,51 @@ mod tests {
 
         assert_eq!(blockers[0], StabilizationBlocker::PendingPush);
         assert_eq!(work.kind, StabilizationWorkKind::PushPendingRepair);
+    }
+
+    #[test]
+    fn observation_failure_precedes_wrong_base_and_remote_gate_failures() {
+        let mut pr = clean_pr();
+        pr.observation_error = Some("details refresh failed".to_string());
+        pr.base_ref = "release".to_string();
+        pr.ci.aggregate = PrCheckState::Failed;
+        pr.review.unresolved_threads.push(review_thread("thread-1"));
+        let snapshot = snapshot(Some(pr));
+
+        let state = state(&snapshot);
+
+        assert_eq!(state.blocker, StabilizationBlocker::ObservationFailed);
+        assert_eq!(state.status, StabilizationStatus::Escalated);
+        assert_eq!(state.next_work, StabilizationWorkKind::Escalate);
+    }
+
+    #[test]
+    fn wrong_base_precedes_head_review_and_ci_failures() {
+        let mut pr = clean_pr();
+        pr.base_ref = "release".to_string();
+        pr.ci.aggregate = PrCheckState::Failed;
+        pr.review.unresolved_threads.push(review_thread("thread-1"));
+        let mut snapshot = snapshot(Some(pr));
+        snapshot.worktree.local_head_sha = Some("local".to_string());
+
+        let state = state(&snapshot);
+
+        assert_eq!(state.blocker, StabilizationBlocker::WrongBase);
+        assert_eq!(state.status, StabilizationStatus::Escalated);
+        assert_eq!(state.next_work, StabilizationWorkKind::Escalate);
+    }
+
+    #[test]
+    fn interface_derives_waiting_status_with_blocker_and_next_work() {
+        let mut pr = clean_pr();
+        pr.ci.aggregate = PrCheckState::Pending;
+
+        let state = state(&snapshot(Some(pr)));
+
+        assert_eq!(state.status, StabilizationStatus::Waiting);
+        assert_eq!(state.blocker, StabilizationBlocker::CiPending);
+        assert_eq!(state.next_work, StabilizationWorkKind::WaitForCi);
+        assert!(!state.reason.is_empty());
     }
 
     #[test]
@@ -580,6 +769,57 @@ mod tests {
     }
 
     #[test]
+    fn manual_merge_authorization_requires_observed_policy() {
+        let mut snapshot = snapshot(Some(clean_pr()));
+        snapshot.policy = PolicyFacts::Unknown {
+            reason: Some("not fetched".to_string()),
+        };
+
+        let denied = manual_merge_authorization(&snapshot).unwrap_err();
+
+        assert_eq!(denied.blocker, StabilizationBlocker::PolicyUnknown);
+        assert!(!snapshot.goal.auto_merge);
+    }
+
+    #[test]
+    fn conservative_cached_projection_reports_observed_dirty_status() {
+        let config = cached_test_config();
+        let mut session = cached_test_session();
+        session.status_label = "dirty 2 ahead 1".to_string();
+
+        let state = conservative_cached_state(&config, &session).unwrap();
+
+        assert_eq!(state.blocker, StabilizationBlocker::DirtyWorktree);
+        assert_ne!(state.blocker, StabilizationBlocker::ReadyForManualMerge);
+    }
+
+    #[test]
+    fn conservative_cached_projection_treats_divergent_or_unknown_heads_as_blocked() {
+        let config = cached_test_config();
+        for status in ["ahead 1", "clean"] {
+            let mut session = cached_test_session();
+            session.status_label = status.to_string();
+
+            let state = conservative_cached_state(&config, &session).unwrap();
+
+            assert_eq!(state.blocker, StabilizationBlocker::HeadDiverged);
+            assert_ne!(state.blocker, StabilizationBlocker::ReadyForManualMerge);
+        }
+    }
+
+    #[test]
+    fn conservative_cached_projection_preserves_stale_observation_failure() {
+        let config = cached_test_config();
+        let mut session = cached_test_session();
+        session.pr.mark_preserved_stale();
+
+        let state = conservative_cached_state(&config, &session).unwrap();
+
+        assert_eq!(state.blocker, StabilizationBlocker::ObservationFailed);
+        assert_ne!(state.blocker, StabilizationBlocker::ReadyForManualMerge);
+    }
+
+    #[test]
     fn policy_blocked_blocks_readiness() {
         let mut snapshot = snapshot(Some(clean_pr()));
         snapshot.policy = PolicyFacts::Blocked {
@@ -646,6 +886,54 @@ mod tests {
         assert_eq!(plan(&approved).kind, StabilizationWorkKind::Merge);
     }
 
+    #[test]
+    fn phase_1_draft_pr_cannot_become_manual_or_auto_merge_ready() {
+        for auto_merge in [false, true] {
+            let mut pr = clean_pr();
+            pr.draft = true;
+            let mut snapshot = snapshot(Some(pr));
+            snapshot.goal.auto_merge = auto_merge;
+            snapshot.worktree.local_head_sha = Some("head".to_string());
+            snapshot.worktree.remote_head_sha = Some("head".to_string());
+
+            let work = plan(&snapshot);
+
+            assert!(!matches!(
+                work.blocker,
+                StabilizationBlocker::ReadyForManualMerge | StabilizationBlocker::ReadyToAutoMerge
+            ));
+            assert!(!matches!(
+                work.kind,
+                StabilizationWorkKind::MarkReadyForManualMerge | StabilizationWorkKind::Merge
+            ));
+            assert!(work.reason.to_ascii_lowercase().contains("draft"));
+        }
+    }
+
+    #[test]
+    fn phase_1_three_way_local_remote_and_pr_head_divergence_blocks_readiness() {
+        for auto_merge in [false, true] {
+            let mut pr = clean_pr();
+            pr.head_sha = "pr-head".to_string();
+            let mut snapshot = snapshot(Some(pr));
+            snapshot.goal.auto_merge = auto_merge;
+            snapshot.worktree.local_head_sha = Some("local-head".to_string());
+            snapshot.worktree.remote_head_sha = Some("remote-head".to_string());
+
+            let work = plan(&snapshot);
+
+            assert!(!matches!(
+                work.blocker,
+                StabilizationBlocker::ReadyForManualMerge | StabilizationBlocker::ReadyToAutoMerge
+            ));
+            assert!(!matches!(
+                work.kind,
+                StabilizationWorkKind::MarkReadyForManualMerge | StabilizationWorkKind::Merge
+            ));
+            assert!(work.reason.to_ascii_lowercase().contains("head"));
+        }
+    }
+
     fn snapshot(pull_request: Option<PullRequestFacts>) -> StabilizationSnapshot {
         StabilizationSnapshot {
             run: None,
@@ -662,8 +950,8 @@ mod tests {
                 is_default_branch: false,
                 detached: false,
                 dirty: false,
-                local_head_sha: Some("local".to_string()),
-                remote_head_sha: Some("remote".to_string()),
+                local_head_sha: Some("head".to_string()),
+                remote_head_sha: Some("head".to_string()),
             },
             pull_request,
             policy: PolicyFacts::Satisfied,
@@ -700,6 +988,7 @@ mod tests {
             },
             mergeability: MergeabilityFacts::Clean,
             top_level_comment_count: 0,
+            observation_error: None,
         }
     }
 
@@ -714,5 +1003,54 @@ mod tests {
             resolved: false,
             created_at: "now".to_string(),
         }
+    }
+
+    fn cached_test_session() -> Session {
+        Session {
+            repo_index: 0,
+            repo_label: "repo".to_string(),
+            repo_key: None,
+            path: PathBuf::from("/repo/feature"),
+            incarnation: String::new(),
+            path_display: "/repo/feature".to_string(),
+            branch: "feature".to_string(),
+            prompt_summary: String::new(),
+            classification: SessionClassification::Work,
+            visibility: 0,
+            adopted: false,
+            hidden: false,
+            status_label: "clean".to_string(),
+            agent_state: AgentState::Idle,
+            opencode_status: None,
+            pr: PrCache::observed(
+                PrSummary {
+                    number: 42,
+                    title: "Ready".to_string(),
+                    body: String::new(),
+                    url: "https://example.test/pr/42".to_string(),
+                    state: "OPEN".to_string(),
+                    review_decision: "APPROVED".to_string(),
+                    requested_reviewers: Vec::new(),
+                    head_ref: "feature".to_string(),
+                    base_ref: "main".to_string(),
+                    head_sha: "head".to_string(),
+                    updated_at: "now".to_string(),
+                    check_status: "passed".to_string(),
+                    merge_state_status: "CLEAN".to_string(),
+                    comment_count: 0,
+                    merged: false,
+                    draft: false,
+                },
+                Some(PrDetails::default()),
+            ),
+            wt_columns: BTreeMap::new(),
+            unseen_comments: false,
+        }
+    }
+
+    fn cached_test_config() -> crate::config::Config {
+        let mut config = crate::test_support::test_config();
+        config.default_base = Some("main".to_string());
+        config
     }
 }

@@ -21,6 +21,8 @@ mod review;
 mod session;
 mod setup;
 mod terminal;
+#[cfg(test)]
+mod test_support;
 mod tmux;
 mod tui;
 mod tui_runtime;
