@@ -840,20 +840,16 @@ mod tests {
         fs::create_dir_all(&worktree).unwrap();
         let log = temp.join("gh.log");
         let gh = temp.join("gh");
-        fs::write(
+        write_executable(
             &gh,
-            format!(
+            &format!(
                 r#"#!/bin/sh
 printf 'pwd=%s\nargs=%s\n' "$PWD" "$*" > '{}'
 exit 0
 "#,
                 log.display()
             ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&gh).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&gh, permissions).unwrap();
+        );
 
         let mut config = test_config();
         config
@@ -1341,10 +1337,12 @@ exit 0
     }
 
     fn write_executable(path: &Path, text: &str) {
-        fs::write(path, text).unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
+        let staging = path.with_extension("staging");
+        fs::write(&staging, text).unwrap();
+        let mut permissions = fs::metadata(&staging).unwrap().permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
+        fs::set_permissions(&staging, permissions).unwrap();
+        fs::rename(staging, path).unwrap();
     }
 
     fn count_rows(repo: &Repository, table: &str, branch: &str) -> i64 {
