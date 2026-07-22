@@ -1455,10 +1455,12 @@ exit 0
     }
 
     fn write_executable(path: &Path, text: &str) {
-        fs::write(path, text).unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
+        let staging = path.with_extension("staging");
+        fs::write(&staging, text).unwrap();
+        let mut permissions = fs::metadata(&staging).unwrap().permissions();
         permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).unwrap();
+        fs::set_permissions(&staging, permissions).unwrap();
+        fs::rename(staging, path).unwrap();
     }
 
     fn count_rows(repo: &Repository, table: &str, branch: &str) -> i64 {

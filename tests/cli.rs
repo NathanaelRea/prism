@@ -428,6 +428,270 @@ fn config_outside_git_repo_fails_with_stderr() {
     assert!(stderr(&output).contains("prism:"));
 }
 
+#[test]
+#[cfg(unix)]
+#[ignore = "requires PRISM_TEST_OPENCODE and PRISM_TEST_TMUX real binaries"]
+fn real_prism_opencode_tmux_stack_ensures_reusable_agent_session() {
+    let opencode = std::env::var("PRISM_TEST_OPENCODE")
+        .expect("set PRISM_TEST_OPENCODE to a real OpenCode binary");
+    let tmux = std::env::var("PRISM_TEST_TMUX").expect("set PRISM_TEST_TMUX to a real tmux binary");
+    let temp = TempDir::new("real-agent-stack");
+    let repo = temp.path().join("repo");
+    let worktree = temp.path().join("feature");
+    let config_home = temp.path().join("xdg");
+    let bin = temp.path().join("bin");
+    let opencode_home = temp.path().join("opencode-home");
+    let opencode_data = temp.path().join("opencode-data");
+    let opencode_config = temp.path().join("opencode-config");
+    let tmux_socket = format!("prism-e2e-{}", std::process::id());
+    for path in [&bin, &opencode_home, &opencode_data, &opencode_config] {
+        fs::create_dir_all(path).expect("create E2E directory");
+    }
+    init_repo(&repo);
+    run_git(&repo, &["config", "user.email", "prism@example.com"]);
+    run_git(&repo, &["config", "user.name", "Prism E2E"]);
+    fs::write(repo.join("README.md"), "Prism E2E\n").expect("write initial file");
+    run_git(&repo, &["add", "README.md"]);
+    run_git(&repo, &["commit", "-m", "initial"]);
+    run_git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/e2e",
+            worktree.to_str().expect("UTF-8 worktree path"),
+        ],
+    );
+    let worktree = fs::canonicalize(worktree).expect("canonicalize worktree path");
+
+    let real_home = std::env::var("HOME").unwrap_or_default();
+    write_executable(
+        &bin.join("opencode"),
+        &format!(
+            "#!/bin/sh\nexport HOME={}\nexport MISE_DATA_DIR={}\nexport npm_config_cache={}\nexport OPENCODE_CONFIG_DIR={}\nexport OPENCODE_DISABLE_AUTOUPDATE=true\nexport OPENCODE_DISABLE_DEFAULT_PLUGINS=true\nexport OPENCODE_DISABLE_LSP_DOWNLOAD=true\nexport OPENCODE_DISABLE_MODELS_FETCH=true\nexport XDG_DATA_HOME={}\nexec {} \"$@\"\n",
+            shell_quote(&opencode_home.display().to_string()),
+            shell_quote(&format!("{real_home}/.local/share/mise")),
+            shell_quote(&format!("{real_home}/.npm")),
+            shell_quote(&opencode_config.display().to_string()),
+            shell_quote(&opencode_data.display().to_string()),
+            shell_quote(&opencode),
+        ),
+    );
+    write_executable(
+        &bin.join("tmux"),
+        &format!(
+            "#!/bin/sh\nexec {} -L {} \"$@\"\n",
+            shell_quote(&tmux),
+            shell_quote(&tmux_socket),
+        ),
+    );
+    let prism_config_dir = config_home.join("prism");
+    fs::create_dir_all(&prism_config_dir).expect("create Prism config directory");
+    fs::write(
+        prism_config_dir.join("config.toml"),
+        format!(
+            "default_agent = \"opencode\"\ndefault_base = \"main\"\nopencode_port_base = 43000\nopencode_port_span = 1000\n\n[tools]\nopencode = \"{}\"\ntmux = \"{}\"\n",
+            toml_escape(&bin.join("opencode").display().to_string()),
+            toml_escape(&bin.join("tmux").display().to_string()),
+        ),
+    )
+    .expect("write Prism config");
+    let cleanup = FullStackCleanup {
+        tmux: bin.join("tmux"),
+        repo: repo.clone(),
+        config_home: config_home.clone(),
+    };
+
+    let first = run_agent_ensure(&repo, &config_home);
+    assert!(first.status.success(), "{}", stderr(&first));
+    assert!(stderr(&first).is_empty(), "{}", stderr(&first));
+    let first_stdout = stdout(&first);
+    assert!(first_stdout.contains("branch = feature/e2e"));
+    assert!(first_stdout.contains(&format!("worktree = {}", worktree.display())));
+    assert!(first_stdout.contains("running = true"));
+    let tmux_session = output_value(&first_stdout, "tmux_session");
+    let opencode_session = output_value(&first_stdout, "opencode_session_id");
+    let opencode_server_pid = output_value(&first_stdout, "opencode_server_pid");
+    assert!(!opencode_session.is_empty());
+    assert!(!opencode_server_pid.is_empty());
+
+    let sessions =
+        run_output(Command::new(&cleanup.tmux).args(["list-sessions", "-F", "#{session_name}"]));
+    assert!(sessions.lines().any(|name| name == tmux_session));
+    let windows = run_output(Command::new(&cleanup.tmux).args([
+        "list-windows",
+        "-t",
+        tmux_session,
+        "-F",
+        "#{window_index}:#{window_name}",
+    ]));
+    assert!(windows.lines().any(|window| window == "1:opencode"));
+    let first_pane_pid = run_output(Command::new(&cleanup.tmux).args([
+        "display-message",
+        "-p",
+        "-t",
+        &format!("{tmux_session}:1"),
+        "#{pane_pid}",
+    ]));
+
+    let second = run_agent_ensure(&repo, &config_home);
+    assert!(second.status.success(), "{}", stderr(&second));
+    let second_stdout = stdout(&second);
+    assert_eq!(output_value(&second_stdout, "tmux_session"), tmux_session);
+    assert_eq!(
+        output_value(&second_stdout, "opencode_session_id"),
+        opencode_session
+    );
+    assert_eq!(
+        output_value(&second_stdout, "opencode_server_pid"),
+        opencode_server_pid
+    );
+    let second_pane_pid = run_output(Command::new(&cleanup.tmux).args([
+        "display-message",
+        "-p",
+        "-t",
+        &format!("{tmux_session}:1"),
+        "#{pane_pid}",
+    ]));
+    assert_eq!(second_pane_pid, first_pane_pid);
+
+    let db_path = run(["db", "path"], &repo, &config_home);
+    assert!(db_path.status.success(), "{}", stderr(&db_path));
+    let conn = rusqlite::Connection::open(stdout(&db_path).trim()).expect("open Prism database");
+    let server_pid = conn
+        .query_row(
+            "select server_pid from opencode_runtime where branch = 'feature/e2e'",
+            [],
+            |row| row.get::<_, Option<u32>>(0),
+        )
+        .expect("read OpenCode server PID");
+    assert!(server_pid.is_some());
+}
+
+#[cfg(unix)]
+struct FullStackCleanup {
+    tmux: PathBuf,
+    repo: PathBuf,
+    config_home: PathBuf,
+}
+
+#[cfg(unix)]
+impl Drop for FullStackCleanup {
+    fn drop(&mut self) {
+        let _ = Command::new(&self.tmux).arg("kill-server").status();
+        let db_path = run(["db", "path"], &self.repo, &self.config_home);
+        if db_path.status.success()
+            && let Ok(conn) = rusqlite::Connection::open(stdout(&db_path).trim())
+            && let Ok(mut statement) = conn.prepare(
+                "select server_pid, server_port from opencode_runtime where server_pid is not null",
+            )
+            && let Ok(processes) =
+                statement.query_map([], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u16>(1)?)))
+        {
+            for (pid, port) in processes.flatten() {
+                terminate_test_opencode(pid, port);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+fn terminate_test_opencode(pid: u32, port: u16) {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output();
+    let Ok(output) = output else {
+        return;
+    };
+    let command = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success()
+        || !command.contains("opencode")
+        || !command.contains("serve")
+        || !command.contains(&format!("--port {port}"))
+    {
+        return;
+    }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    for _ in 0..20 {
+        if unsafe { libc::kill(pid as i32, 0) } != 0 {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    unsafe {
+        libc::kill(pid as i32, libc::SIGKILL);
+    }
+}
+
+#[cfg(unix)]
+fn run_agent_ensure(repo: &Path, config_home: &Path) -> Output {
+    prism()
+        .args(["--repo", repo.to_str().expect("UTF-8 repo path")])
+        .args(["agent", "ensure", "--branch", "feature/e2e"])
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("HOME", config_home)
+        .output()
+        .expect("run prism agent ensure")
+}
+
+#[cfg(unix)]
+fn output_value<'a>(output: &'a str, key: &str) -> &'a str {
+    output
+        .lines()
+        .find_map(|line| line.strip_prefix(&format!("{key} = ")))
+        .unwrap_or_else(|| panic!("missing {key} in output: {output}"))
+}
+
+#[cfg(unix)]
+fn run_git(cwd: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .expect("run git");
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+fn run_output(command: &mut Command) -> String {
+    let output = command.output().expect("run command");
+    assert!(
+        output.status.success(),
+        "command failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+#[cfg(unix)]
+fn write_executable(path: &Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::write(path, contents).expect("write executable");
+    let mut permissions = fs::metadata(path)
+        .expect("executable metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("chmod executable");
+}
+
+#[cfg(unix)]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn toml_escape(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
 #[cfg(unix)]
 fn install_shim(bin: &Path, name: &str) {
     use std::os::unix::fs::PermissionsExt;

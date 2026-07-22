@@ -35,9 +35,14 @@ The default branch worktree is still a session, but Prism treats it specially:
 it sorts first and does not show pull request cache data for that branch.
 Non-default worktree sessions usually represent active task branches.
 
+Each Worktree Session has a persistent identity independent of its branch name
+and path. Branch names and paths may be reused after deletion, but the new
+worktree is a new session and cannot inherit the old session's active state.
+
 Prism may attach metadata to a session, including prompt summary, agent state,
-logs, hidden markers, and pull request cache data. That metadata is keyed by
-repository and branch.
+logs, hidden markers, pull request cache data, and workflow history. Deleting a
+session retires it from active use while retaining historical Plan and Auto Flow
+runs under that session identity.
 
 The Worktree Session module owns session identity, default-branch
 classification, branch metadata facts, background-safe snapshots, and deletion

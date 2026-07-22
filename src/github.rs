@@ -3290,23 +3290,33 @@ mod tests {
     }
 
     #[test]
-    fn github_pr_command_arguments_stay_in_the_github_adapter() {
+    fn create_pr_uses_fill_with_explicit_empty_body_and_default_base_when_configured() {
         assert_eq!(
             create_pr_args(Some("main"), "", None),
             vec!["pr", "create", "--fill", "--body", "", "--base", "main"]
         );
         assert_eq!(
-            create_pr_args(None, "manual", Some("owner/repo")),
+            create_pr_args(None, "manual description", None),
+            vec!["pr", "create", "--fill", "--body", "manual description"]
+        );
+        assert_eq!(
+            create_pr_args(Some("main"), "manual description", Some("owner/repo")),
             vec![
                 "pr",
                 "create",
                 "--fill",
                 "--body",
-                "manual",
+                "manual description",
                 "--repo",
-                "owner/repo"
+                "owner/repo",
+                "--base",
+                "main"
             ]
         );
+    }
+
+    #[test]
+    fn merge_pr_args_use_configured_method() {
         assert_eq!(
             merge_pr_args("42", MergeMethod::Squash, "abc123"),
             vec![
@@ -3318,10 +3328,68 @@ mod tests {
                 "abc123"
             ]
         );
-        assert!(
-            !merge_pr_args("42", MergeMethod::Merge, "abc123")
-                .contains(&"--delete-branch".to_string())
+        assert_eq!(
+            merge_pr_args("42", MergeMethod::Merge, "abc123"),
+            vec![
+                "pr",
+                "merge",
+                "42",
+                "--merge",
+                "--match-head-commit",
+                "abc123"
+            ]
         );
+        assert_eq!(
+            merge_pr_args("42", MergeMethod::Rebase, "abc123"),
+            vec![
+                "pr",
+                "merge",
+                "42",
+                "--rebase",
+                "--match-head-commit",
+                "abc123"
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_pull_request_does_not_delegate_branch_deletion_to_gh() {
+        let temp = unique_temp_dir("prism-merge-no-delete-branch-test");
+        let worktree = temp.join("worktree");
+        fs::create_dir_all(&worktree).unwrap();
+        let log = temp.join("gh.log");
+        let gh = temp.join("gh");
+        write_executable(
+            &gh,
+            &format!(
+                r#"#!/bin/sh
+printf 'pwd=%s\nargs=%s\n' "$PWD" "$*" > '{}'
+exit 0
+"#,
+                log.display()
+            ),
+        );
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+
+        merge_pull_request(&config, &worktree, 42, "abc123").unwrap();
+
+        let commands = fs::read_to_string(&log).unwrap();
+        let actual_pwd = commands
+            .lines()
+            .find_map(|line| line.strip_prefix("pwd="))
+            .expect("gh shim should record its working directory");
+        assert_eq!(
+            PathBuf::from(actual_pwd).canonicalize().unwrap(),
+            worktree.canonicalize().unwrap()
+        );
+        assert!(commands.contains("args=pr merge 42 --squash --match-head-commit abc123"));
+        assert!(!commands.contains("--delete-branch"));
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]

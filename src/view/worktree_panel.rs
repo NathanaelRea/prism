@@ -192,14 +192,15 @@ pub(crate) fn stabilization_panel_model(
 }
 
 pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<Line<'static>> {
+    if model.pr_number.is_empty() {
+        return Vec::new();
+    }
+
     let mut lines = vec![
         heading_line("PR"),
         pr_number_line(model),
         stabilization_value_line("name", &model.pr_name, selected_text_style()),
     ];
-    if model.pr_number.is_empty() {
-        return lines;
-    }
     lines.extend([
         stabilization_value_line(
             "state",

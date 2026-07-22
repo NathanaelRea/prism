@@ -49,6 +49,12 @@ Normal runtime requirements:
 prism
 ```
 
+To prepare a worktree's OpenCode-backed tmux session without entering the TUI:
+
+```sh
+prism agent ensure --branch feature/my-change
+```
+
 ## Learn More
 
 - [Keybindings](docs/keybindings.md)

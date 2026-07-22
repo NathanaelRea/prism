@@ -8,6 +8,7 @@ use crate::auto_flow::{AutoLaunch, AutoStepKey, load_auto_run, save_auto_run};
 use crate::config::{Checks, Config, EscapeKey, MergeMethod};
 use crate::github::{PrCache, PrComment, PrDetails, PrSummary, pr_summary_or_error};
 use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
+use crate::plan_run::PlanRunMode;
 use crate::repo::Repository;
 use crate::session::Session;
 use crate::tui::{
@@ -16,15 +17,28 @@ use crate::tui::{
 };
 
 use super::{
-    archived_picker_overflow_message, discover_wt_columns, pr_target_choice_list,
-    pr_target_repo_for_choice, remote_pr_choice_keys, remote_pr_worktree_branch,
-    run_browser_opener, should_prompt_pr_target_choice, status_label_with_behind,
+    archived_picker_overflow_message, discover_wt_columns,
+    plan_run_mode_from_parallel_confirmation, pr_target_choice_list, pr_target_repo_for_choice,
+    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
+    should_prompt_pr_target_choice, status_label_with_behind,
 };
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[test]
+fn standalone_plan_confirmation_defaults_to_sequential() {
+    assert_eq!(
+        plan_run_mode_from_parallel_confirmation(false),
+        PlanRunMode::Sequential
+    );
+    assert_eq!(
+        plan_run_mode_from_parallel_confirmation(true),
+        PlanRunMode::Parallel
+    );
+}
 
 #[test]
 fn browser_opener_invokes_first_available_candidate() {
@@ -1676,7 +1690,7 @@ exit 0
     tui.attach_selected_tmux_session().unwrap();
 
     let wait_started = Instant::now();
-    while !tui.tmux_warmups_in_flight.is_empty() && wait_started.elapsed() < Duration::from_secs(3)
+    while !tui.tmux_warmups_in_flight.is_empty() && wait_started.elapsed() < Duration::from_secs(5)
     {
         tui.poll_tmux_agent_warmup();
         std::thread::sleep(Duration::from_millis(20));

@@ -1,5 +1,13 @@
 use super::*;
 
+pub(super) fn plan_run_mode_from_parallel_confirmation(parallel: bool) -> PlanRunMode {
+    if parallel {
+        PlanRunMode::Parallel
+    } else {
+        PlanRunMode::Sequential
+    }
+}
+
 impl Tui {
     pub(crate) fn start_selected_worktree_plan_run(
         &mut self,
@@ -24,26 +32,13 @@ impl Tui {
         let resume_result = raw.resume();
         resume_result?;
         let execution = execution?;
-        let Some(mode) = self.prompt_choice_dialog(
+        let parallel = self.confirm_action_dialog(
             raw,
-            crate::view::ChoiceList {
-                title: "Plan Run: Execution".to_string(),
-                choices: [("s", "sequential"), ("p", "parallel")]
-                    .into_iter()
-                    .map(|(key, label)| crate::view::KeyChoice {
-                        key: key.to_string(),
-                        label: label.to_string(),
-                    })
-                    .collect(),
-            },
-        )?
-        else {
-            return Ok(());
-        };
-        let mode = match mode.as_str() {
-            "p" => PlanRunMode::Parallel,
-            _ => PlanRunMode::Sequential,
-        };
+            "Plan Run: Execution",
+            "Run steps in parallel?",
+            false,
+        )?;
+        let mode = plan_run_mode_from_parallel_confirmation(parallel);
         let launch = execution.launch(&repo.root, mode)?;
         let mut should_execute = true;
         let persisted = crate::observability::with_writable_db(&repo, |conn| {
