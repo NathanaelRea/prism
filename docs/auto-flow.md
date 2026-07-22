@@ -2,7 +2,7 @@
 
 Auto Flow automates one clean, non-default Worktree Session through implementation, local verification, commit, and pull request creation. After a PR exists, Auto Flow delegates gate decisions to PR Stabilization.
 
-PR Stabilization observes local Git state, cached GitHub pull request state, repository policy, and Auto Flow configuration. It derives the current blocker and chooses one safe next work item instead of following a fixed review-to-CI checklist.
+PR Stabilization observes local Git state, cached GitHub pull request state, repository policy, and Auto Flow configuration. It is authoritative for post-PR liveness, derives one status and blocker, and chooses one safe next work item instead of following a fixed review-to-CI checklist.
 
 Start or focus it from the TUI with `A` on a selected non-default worktree. New runs ask how to source implementation work:
 
@@ -35,6 +35,7 @@ Safety defaults:
 - local verification runs `checks.pre_push`, `checks.pre_pr`, and a non-mutating merge-conflict check
 - PR Stabilization handles review feedback, CI failures, pending checks, review approval, repository policy, mergeability, manual readiness, and auto-merge readiness as derived blockers
 - managed review and CI repairs verify locally, create a repair commit, and enter guarded pending-push by default
+- review bodies and unresolved inline review threads can authorize review repair; top-level PR comments remain advisory
 - pending repair commits are not pushed automatically unless `auto.push_repairs = true`; inspect the commit diff and use `Space g P` to push through the guard
 - `auto.merge = false` and `auto.cleanup_after_merge = false` by default
 

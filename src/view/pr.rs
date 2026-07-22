@@ -26,11 +26,7 @@ pub(super) fn pr_panel_lines(
         ];
     }
     let Some(summary) = session.pr.summary() else {
-        let refreshed = session
-            .pr
-            .last_refreshed
-            .as_deref()
-            .unwrap_or("not refreshed");
+        let refreshed = session.pr.last_refreshed().unwrap_or("not refreshed");
         return vec![
             Line::from(Span::styled("○ No PR detected", muted_style())),
             labelled_line("branch", session.branch.clone()),
@@ -255,8 +251,7 @@ pub(super) fn pr_comment_count_label(cache: &crate::github::PrCache) -> String {
         return format!("#{open}✓{resolved}");
     }
     cache
-        .summary
-        .as_ref()
+        .summary()
         .map(|summary| format!("#{}", summary.comment_count))
         .unwrap_or_else(|| "#?".to_string())
 }
@@ -356,8 +351,7 @@ pub(super) fn ci_icon(
     }
     match session
         .pr
-        .summary
-        .as_ref()
+        .summary()
         .map(|summary| summary.check_status.as_str())
     {
         Some("passed") => icon(icon_style, "✓", ""),
@@ -425,8 +419,7 @@ pub(super) fn ci_style(config: &crate::config::Config, session: &Session) -> Sty
     }
     match session
         .pr
-        .summary
-        .as_ref()
+        .summary()
         .map(|summary| summary.check_status.as_str())
     {
         Some("passed") => Style::default().fg(Color::Green),

@@ -359,11 +359,17 @@ pub(crate) fn remote_branch_head_sha(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(path)
-            .args(["rev-parse", "--verify"])
+            .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/remotes/origin/{branch}")),
     )?;
     if !output.status.success() {
-        return Ok(None);
+        return match output.status.code() {
+            Some(1) => Ok(None),
+            _ => Err(format!(
+                "inspect remote branch {branch}: {}",
+                output.stderr.trim()
+            )),
+        };
     }
     let sha = output.stdout.trim();
     if sha.is_empty() {

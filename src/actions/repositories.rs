@@ -309,8 +309,10 @@ impl Tui {
         let status = match check_worktrunk_approval_status(repo, config) {
             Ok(status) => status,
             Err(error) => {
-                let _ =
-                    append_runtime_log(repo, &format!("Worktrunk approval check skipped: {error}"));
+                let _ = append_runtime_message(
+                    repo,
+                    &format!("Worktrunk approval check skipped: {error}"),
+                );
                 return Ok(());
             }
         };
@@ -367,11 +369,20 @@ impl Tui {
         &mut self,
         entries: Vec<crate::workspace::RepoEntry>,
     ) -> Result<(), String> {
+        let identities = self
+            .repos
+            .iter()
+            .map(|managed| (managed.repo.root.clone(), managed.identity.clone()))
+            .collect::<BTreeMap<_, _>>();
         let mut repos = Vec::new();
         for entry in crate::workspace::discover_valid_entries(entries) {
             let repo = entry.repo;
             let config = crate::config::Config::load(&repo);
-            repos.push(ManagedRepo::new(repo, config, entry.key));
+            let mut managed = ManagedRepo::new(repo, config, entry.key);
+            if let Some(identity) = identities.get(&managed.repo.root) {
+                managed.identity = identity.clone();
+            }
+            repos.push(managed);
         }
         self.repos = repos;
         self.current_repo = self.current_repo.min(self.repos.len().saturating_sub(1));

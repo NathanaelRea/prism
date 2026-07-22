@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::github::{PrDetails, PrSummary, pr_cache_excluded_branch};
+use crate::github::{PrDetails, PrSummary, trusted_pr_for_session};
 use crate::session::Session;
 use crate::util::empty_dash;
 
@@ -12,12 +12,7 @@ pub struct CiFailurePromptInput<'a> {
 }
 
 pub fn build_ci_failure_prompt(session: &Session, config: &Config) -> Result<String, String> {
-    if pr_cache_excluded_branch(config, &session.branch) {
-        return Err("selected branch is not treated as a PR branch".to_string());
-    }
-    let (summary, details) = session
-        .pr
-        .trusted_summary_and_details()?
+    let (summary, details) = trusted_pr_for_session(session, config)?
         .ok_or_else(|| "no pull request found for selected branch".to_string())?;
     let details = details
         .ok_or_else(|| "CI failure details are still loading; refresh and try again".to_string())?;

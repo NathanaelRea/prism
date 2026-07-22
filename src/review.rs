@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::github::{PrDetails, PrSummary, pr_cache_excluded_branch};
+use crate::github::{PrDetails, PrSummary, trusted_pr_for_session};
 use crate::session::Session;
 use crate::util::empty_dash;
 
@@ -51,15 +51,18 @@ pub fn build_tracked_review_fix_prompt(
     session: &Session,
     config: &Config,
 ) -> Result<TrackedReviewFixPrompt, String> {
-    if pr_cache_excluded_branch(config, &session.branch) {
-        return Err("selected branch is not treated as a PR branch".to_string());
-    }
-    let (summary, details) = session
-        .pr
-        .trusted_summary_and_details()?
+    let (summary, details) = trusted_pr_for_session(session, config)?
         .ok_or_else(|| "no pull request found for selected branch".to_string())?;
     let details = details
         .ok_or_else(|| "PR comments are still loading; refresh and try again".to_string())?;
+    let mut feedback = actionable_review_feedback(details, ReviewFeedbackFilter::default());
+    feedback.pr_comments.clear();
+    feedback
+        .review_bodies
+        .retain(|review| !is_copilot_reviewer(&review.author));
+    if !feedback.is_actionable() {
+        return Err("no actionable GitHub review feedback was found".to_string());
+    }
 
     Ok(build_tracked_review_fix_prompt_from_input(
         ReviewFixPromptInput {
@@ -76,6 +79,8 @@ pub fn build_tracked_review_fix_prompt_from_input(
     config: &Config,
 ) -> TrackedReviewFixPrompt {
     let mut feedback = actionable_review_feedback(input.details, ReviewFeedbackFilter::default());
+    // Top-level PR comments are advisory; managed review repair follows review mechanisms only.
+    feedback.pr_comments.clear();
     feedback
         .review_bodies
         .retain(|review| !is_copilot_reviewer(&review.author));
@@ -114,10 +119,18 @@ pub fn build_tracked_review_fix_prompt_from_input(
 }
 
 pub fn review_thread_ids(feedback: &ReviewFeedback<'_>) -> Vec<String> {
-    let mut ids = feedback
-        .inline_comments
-        .iter()
-        .map(|comment| comment.thread_id.trim())
+    canonical_review_thread_ids(
+        feedback
+            .inline_comments
+            .iter()
+            .map(|comment| comment.thread_id.as_str()),
+    )
+}
+
+pub fn canonical_review_thread_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut ids = ids
+        .into_iter()
+        .map(str::trim)
         .filter(|id| !id.is_empty())
         .map(str::to_string)
         .collect::<Vec<_>>();
@@ -412,8 +425,8 @@ mod tests {
         assert!(prompt.contains(
             "- Review from bob (CHANGES_REQUESTED)\n\nThis should mention the fallback behavior."
         ));
-        assert!(prompt.contains("PR comments:"));
-        assert!(prompt.contains("- Comment from alice\n\nPlease simplify this branch."));
+        assert!(!prompt.contains("PR comments:"));
+        assert!(!prompt.contains("Please simplify this branch."));
         assert!(prompt.contains("\n\n---\n\n"));
         assert!(prompt.contains("Can this be a helper?"));
         assert!(!prompt.contains("This resolved comment should stay out."));
@@ -532,7 +545,8 @@ mod tests {
 
         assert!(prompt.contains("INLINE\nInline review comments:\n\n"));
         assert!(prompt.contains("REVIEWS\nReview bodies:\n\n"));
-        assert!(prompt.contains("PR\nPR comments:\n\n"));
+        assert!(prompt.contains("PR\n"));
+        assert!(!prompt.contains("Top-level context."));
     }
 
     #[test]
@@ -622,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn review_fix_prompt_explains_skipped_feedback() {
+    fn review_fix_prompt_rejects_resolved_feedback() {
         let session = test_session(PrDetails {
             review_comments: vec![PrReviewComment {
                 author: "dana".to_string(),
@@ -636,11 +650,26 @@ mod tests {
             ..PrDetails::default()
         });
 
-        let prompt = build_review_fix_prompt(&session, &test_config()).unwrap();
+        let error = build_review_fix_prompt(&session, &test_config()).unwrap_err();
 
-        assert!(prompt.contains("No actionable PR review feedback was found."));
-        assert!(prompt.contains("Skipped feedback:"));
-        assert!(prompt.contains("- 1 resolved inline comment(s)"));
+        assert_eq!(error, "no actionable GitHub review feedback was found");
+    }
+
+    #[test]
+    fn top_level_comment_alone_does_not_authorize_review_repair() {
+        let session = test_session(PrDetails {
+            comments: vec![PrComment {
+                author: "alice".to_string(),
+                body: "advisory context".to_string(),
+                created_at: "2026-06-14T12:10:00Z".to_string(),
+                ..PrComment::default()
+            }],
+            ..PrDetails::default()
+        });
+
+        let error = build_review_fix_prompt(&session, &test_config()).unwrap_err();
+
+        assert_eq!(error, "no actionable GitHub review feedback was found");
     }
 
     #[test]

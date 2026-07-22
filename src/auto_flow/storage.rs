@@ -7,6 +7,7 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
           id text primary key,
           repo_root text not null,
           worktree_path text not null,
+          worktree_incarnation text,
           branch text not null,
           mode text not null,
           implementation_source text not null default 'prompt',
@@ -101,6 +102,13 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
         conn.execute("alter table auto_run add column pr_url text", [])
             .map_err(|error| format!("migrate auto_run pr_url column: {error}"))?;
     }
+    if !table_has_column(conn, "auto_run", "worktree_incarnation")? {
+        conn.execute(
+            "alter table auto_run add column worktree_incarnation text",
+            [],
+        )
+        .map_err(|error| format!("migrate auto_run worktree_incarnation column: {error}"))?;
+    }
     if !table_has_column(conn, "auto_run", "implementation_source")? {
         conn.execute(
             "alter table auto_run add column implementation_source text not null default 'prompt'",
@@ -147,7 +155,7 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
     }
     reset_incompatible_active_runs(conn)?;
     conn.execute(
-        "insert into auto_schema_version (id, version) values (1, 4)
+        "insert into auto_schema_version (id, version) values (1, 5)
          on conflict(id) do update set version = excluded.version",
         [],
     )
@@ -162,16 +170,23 @@ pub fn save_auto_run(
     let tx = conn
         .unchecked_transaction()
         .map_err(|error| format!("begin auto run transaction: {error}"))?;
-    let mut run_without_selection = persisted.run.clone();
-    run_without_selection.selected_step_run_id = None;
-    save_run_with_conn(&tx, &run_without_selection)?;
-    for step in &mut persisted.steps {
-        save_step_with_conn(&tx, step)?;
-    }
-    save_run_with_conn(&tx, &persisted.run)?;
+    save_persisted_auto_run_with_conn(&tx, persisted)?;
     tx.commit()
         .map_err(|error| format!("commit auto run transaction: {error}"))?;
     Ok(())
+}
+
+pub(super) fn save_persisted_auto_run_with_conn(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+) -> Result<(), String> {
+    let mut run_without_selection = persisted.run.clone();
+    run_without_selection.selected_step_run_id = None;
+    save_run_with_conn(conn, &run_without_selection)?;
+    for step in &mut persisted.steps {
+        save_step_with_conn(conn, step)?;
+    }
+    save_run_with_conn(conn, &persisted.run)
 }
 
 pub fn load_auto_run(
@@ -245,15 +260,16 @@ pub fn load_recent_active_runs_for_repo(
 pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &AutoRun) -> Result<(), String> {
     conn.execute(
         "insert into auto_run (
-           id, repo_root, worktree_path, branch, mode, implementation_source, plan_path,
+           id, repo_root, worktree_path, worktree_incarnation, branch, mode, implementation_source, plan_path,
            plan_run_mode, variant, agent_profile, prompt_summary, initial_prompt, status, pause_requested,
            selected_step_run_id, pr_number, pr_url, current_head_sha, review_baseline_json,
            stabilization_status, stabilization_blocker, stabilization_next_work, pending_push_json,
            created_unix_ms, updated_unix_ms, archived_unix_ms
-         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26)
+         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
          on conflict(id) do update set
            repo_root = excluded.repo_root,
            worktree_path = excluded.worktree_path,
+           worktree_incarnation = excluded.worktree_incarnation,
            branch = excluded.branch,
            mode = excluded.mode,
            implementation_source = excluded.implementation_source,
@@ -280,6 +296,7 @@ pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &AutoRun) -> 
             run.id.as_str(),
             run.repo_root.as_str(),
             run.worktree_path.display().to_string(),
+            run.worktree_incarnation.as_deref(),
             run.branch.as_str(),
             run.mode.as_str(),
             run.implementation_source.as_str(),
@@ -402,7 +419,7 @@ pub(super) fn load_run_with_conn(
     run_id: &str,
 ) -> Result<Option<AutoRun>, String> {
     conn.query_row(
-        "select id, repo_root, worktree_path, branch, mode, implementation_source, plan_path,
+        "select id, repo_root, worktree_path, worktree_incarnation, branch, mode, implementation_source, plan_path,
                 plan_run_mode, variant, agent_profile, prompt_summary, initial_prompt, status, pause_requested,
                  selected_step_run_id, pr_number, pr_url, current_head_sha, review_baseline_json,
                  stabilization_status, stabilization_blocker, stabilization_next_work, pending_push_json,
@@ -411,41 +428,42 @@ pub(super) fn load_run_with_conn(
          where id = ?1",
         params![run_id],
         |row| {
-            let mode: String = row.get(4)?;
-            let implementation_source: String = row.get(5)?;
-            let plan_run_mode: String = row.get(7)?;
-            let status: String = row.get(12)?;
+            let mode: String = row.get(5)?;
+            let implementation_source: String = row.get(6)?;
+            let plan_run_mode: String = row.get(8)?;
+            let status: String = row.get(13)?;
             Ok(AutoRun {
                 id: row.get(0)?,
                 repo_root: row.get(1)?,
                 worktree_path: PathBuf::from(row.get::<_, String>(2)?),
-                branch: row.get(3)?,
+                worktree_incarnation: row.get(3)?,
+                branch: row.get(4)?,
                 mode: AutoRunMode::parse(&mode).map_err(from_string_error)?,
                 implementation_source: AutoImplementationSource::parse(&implementation_source)
                     .map_err(from_string_error)?,
-                plan_path: row.get::<_, Option<String>>(6)?.map(PathBuf::from),
+                plan_path: row.get::<_, Option<String>>(7)?.map(PathBuf::from),
                 plan_run_mode: parse_plan_run_mode(&plan_run_mode).map_err(from_string_error)?,
-                variant: row.get(8)?,
-                agent_profile: row.get(9)?,
-                prompt_summary: row.get(10)?,
-                initial_prompt: row.get(11)?,
+                variant: row.get(9)?,
+                agent_profile: row.get(10)?,
+                prompt_summary: row.get(11)?,
+                initial_prompt: row.get(12)?,
                 status: AutoRunStatus::parse(&status).map_err(from_string_error)?,
-                pause_requested: row.get::<_, i64>(13)? != 0,
-                selected_step_run_id: row.get(14)?,
+                pause_requested: row.get::<_, i64>(14)? != 0,
+                selected_step_run_id: row.get(15)?,
                 pr_number: row
-                    .get::<_, Option<i64>>(15)?
+                    .get::<_, Option<i64>>(16)?
                     .map(|value| value.max(0) as u64),
-                pr_url: row.get(16)?,
-                current_head_sha: row.get(17)?,
-                review_baseline_json: row.get(18)?,
-                stabilization_status: optional_stabilization_status(row.get(19)?)?,
-                stabilization_blocker: optional_stabilization_blocker(row.get(20)?)?,
-                stabilization_next_work: optional_stabilization_work_kind(row.get(21)?)?,
-                pending_push: optional_json_value(row.get::<_, Option<String>>(22)?)?,
-                created_unix_ms: i64_to_u64(row.get(23)?, 23),
-                updated_unix_ms: i64_to_u64(row.get(24)?, 24),
+                pr_url: row.get(17)?,
+                current_head_sha: row.get(18)?,
+                review_baseline_json: row.get(19)?,
+                stabilization_status: optional_stabilization_status(row.get(20)?)?,
+                stabilization_blocker: optional_stabilization_blocker(row.get(21)?)?,
+                stabilization_next_work: optional_stabilization_work_kind(row.get(22)?)?,
+                pending_push: optional_json_value(row.get::<_, Option<String>>(23)?)?,
+                created_unix_ms: i64_to_u64(row.get(24)?, 24),
+                updated_unix_ms: i64_to_u64(row.get(25)?, 25),
                 archived_unix_ms: row
-                    .get::<_, Option<i64>>(25)?
+                    .get::<_, Option<i64>>(26)?
                     .map(|value| value.max(0) as u64),
             })
         },

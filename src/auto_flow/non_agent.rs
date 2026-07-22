@@ -460,7 +460,7 @@ pub(super) fn execute_push_pr_step(
     );
     if cache.trusted_summary()?.is_none() {
         let body = auto_pr_body(config, &persisted.run);
-        crate::lifecycle::create_pull_request(
+        crate::github::create_pull_request(
             repo,
             config,
             &persisted.run.branch,
@@ -564,47 +564,15 @@ pub(super) fn execute_wait_review_step(
             max_output_lines_per_step,
         )?;
 
-        let observation_changed = work.kind
-            == stabilization_model::StabilizationWorkKind::FixReview
-            && outcome.fix_prompt.is_none();
-        if work.kind == stabilization_model::StabilizationWorkKind::FixReview
-            && let Some(prompt) = outcome.fix_prompt
+        if stabilization_execute::advance_review_wait(
+            conn,
+            persisted,
+            step_index,
+            work,
+            outcome.summary,
+            outcome.fix_prompt,
+        )? != stabilization_execute::WaitProgress::KeepWaiting
         {
-            finish_non_agent_step(
-                conn,
-                &mut persisted.steps[step_index],
-                AutoStepStatus::Done,
-                Some(outcome.summary),
-                None,
-            )?;
-            if persisted.next_attempt_for(&AutoStepKey::FixReview) <= MAX_REVIEW_FIX_ATTEMPTS {
-                append_step_run(conn, persisted, AutoStepKey::FixReview, Some(prompt))?;
-                let step = persisted
-                    .steps
-                    .last_mut()
-                    .expect("appended review repair step");
-                step.work_guard = Some(work.guard);
-                save_step_with_conn(conn, step)?;
-                return Ok(());
-            }
-            return Err(format!(
-                "review feedback remained after {MAX_REVIEW_FIX_ATTEMPTS} repair attempts"
-            ));
-        }
-
-        if work.kind != stabilization_model::StabilizationWorkKind::WaitForReview
-            && !observation_changed
-        {
-            if work.kind == stabilization_model::StabilizationWorkKind::Escalate {
-                return Err(work.reason);
-            }
-            finish_non_agent_step(
-                conn,
-                &mut persisted.steps[step_index],
-                AutoStepStatus::Skipped,
-                Some(outcome.summary),
-                None,
-            )?;
             return Ok(());
         }
 
@@ -709,97 +677,75 @@ pub(super) fn execute_commit_review_fix_step(
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
     let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
-    let _ = crate::github::refresh_pr_cache(
+    crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
+    crate::github::refresh_pr_cache(
         repo,
         &persisted.run.branch,
         &mut cache,
         &persisted.run.worktree_path,
         config,
         true,
-    );
-    let guard_facts = repair_guard_facts(config, persisted, cache.trusted_summary()?);
-    let review_thread_ids = persisted.steps[step_index]
-        .work_guard
-        .as_ref()
-        .map(|guard| guard.review_thread_ids.clone())
-        .unwrap_or_default();
-    let pre_commit_head = crate::git::current_head_sha(&persisted.run.worktree_path, config)?;
-    persist_pending_commit_obligation(
-        conn,
-        persisted,
-        stabilization_model::RepairKind::Review,
-        pre_commit_head,
-        guard_facts.clone(),
-        review_thread_ids,
     )?;
-    let message = repair_commit_message(config, "repair_commit_review", "fix: cr");
-    let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
-    let head_sha = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
-    persisted.run.current_head_sha = head_sha.clone();
-    if let Some(summary) = cache.trusted_summary()? {
-        persisted.run.pr_number = Some(summary.number);
-        persisted.run.pr_url = Some(summary.url.clone());
-        persisted.run.review_baseline_json = Some(review_baseline_json(summary));
-    }
-    if result.committed {
-        let commit_sha = result
-            .commit_sha
-            .as_ref()
-            .ok_or_else(|| "review repair commit did not report its SHA".to_string())?;
-        let guard = persisted
-            .run
-            .pending_push
-            .as_mut()
-            .ok_or_else(|| "review repair commit lost its persisted obligation".to_string())?;
-        guard.commit_sha = commit_sha.clone();
-        guard.expected_local_head_sha = head_sha.clone().unwrap_or_else(|| commit_sha.clone());
-        save_run_with_conn(conn, &persisted.run)?;
-        if config.auto.push_repairs {
-            stabilization_execute::progress_pending_push(
-                conn,
-                repo,
-                config,
-                persisted,
-                &mut cache,
-                || Ok(()),
-            )?;
-        }
-    } else {
-        persisted.run.pending_push = None;
-    }
-
-    let step = &mut persisted.steps[step_index];
-    step.commit_sha = result.commit_sha.clone();
-    step.head_sha = persisted.run.current_head_sha.clone();
-    let status = if result.committed {
-        AutoStepStatus::Done
-    } else {
-        AutoStepStatus::Skipped
-    };
-    let summary = if result.committed {
-        repair_commit_summary(
+    let current_guard = current_work_guard(config, persisted, &cache)?;
+    let pr_number = cache.trusted_summary()?.map(|summary| summary.number);
+    if let stabilization_execute::RepairCommitGate::Invalidated { summary } =
+        stabilization_execute::validate_and_begin_repair_commit(
+            conn,
+            repo,
             config,
-            "review",
-            result.commit_sha.as_deref().unwrap_or("unknown"),
-        )
-    } else {
-        result.message
-    };
-    let step_id = step
+            persisted,
+            step_index,
+            stabilization_model::RepairKind::Review,
+            stabilization_execute::RepairCommitObservation {
+                guard: current_guard,
+                pr_number,
+            },
+        )?
+    {
+        let step_id = persisted.steps[step_index]
+            .id
+            .ok_or_else(|| "repair commit step must be saved before output".to_string())?;
+        append_system_output(
+            conn,
+            step_id,
+            AutoOutputKind::Status,
+            &summary,
+            None,
+            max_output_lines_per_step,
+        )?;
+        return Ok(());
+    }
+    let message = stabilization_execute::repair_commit_message(
+        config,
+        &stabilization_model::RepairKind::Review,
+    );
+    let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
+    let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
+    let pr_summary = cache.trusted_summary()?.cloned();
+    let outcome = stabilization_execute::complete_repair_commit(
+        conn,
+        repo,
+        config,
+        persisted,
+        step_index,
+        stabilization_model::RepairKind::Review,
+        result,
+        local_head,
+        pr_summary,
+        &mut cache,
+    )?;
+    let step_id = persisted.steps[step_index]
         .id
         .ok_or_else(|| "auto review commit step must be saved before output".to_string())?;
     append_system_output(
         conn,
         step_id,
         AutoOutputKind::Status,
-        &summary,
+        &outcome.summary,
         None,
         max_output_lines_per_step,
     )?;
-    finish_non_agent_step(conn, step, status, Some(summary), None)?;
-    persisted.run.status = persisted.authoritative_status();
-    persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)
+    Ok(())
 }
 
 pub(super) fn execute_wait_ci_step(
@@ -860,38 +806,16 @@ pub(super) fn execute_wait_ci_step(
             max_output_lines_per_step,
         )?;
 
-        match work.kind {
-            stabilization_model::StabilizationWorkKind::FixCi => {
-                finish_non_agent_step(
-                    conn,
-                    &mut persisted.steps[step_index],
-                    AutoStepStatus::Done,
-                    Some(outcome.summary.clone()),
-                    None,
-                )?;
-                if persisted.next_attempt_for(&AutoStepKey::FixCi) <= MAX_CI_FIX_ATTEMPTS {
-                    append_step_run(conn, persisted, AutoStepKey::FixCi, Some(outcome.prompt))?;
-                    let step = persisted.steps.last_mut().expect("appended CI repair step");
-                    step.work_guard = Some(work.guard);
-                    save_step_with_conn(conn, step)?;
-                    return Ok(());
-                }
-                let error =
-                    format!("CI remained failing after {MAX_CI_FIX_ATTEMPTS} repair attempts");
-                return Err(error);
-            }
-            stabilization_model::StabilizationWorkKind::WaitForCi => {}
-            stabilization_model::StabilizationWorkKind::Escalate => return Err(work.reason),
-            _ => {
-                finish_non_agent_step(
-                    conn,
-                    &mut persisted.steps[step_index],
-                    AutoStepStatus::Done,
-                    Some(outcome.summary),
-                    None,
-                )?;
-                return Ok(());
-            }
+        if stabilization_execute::advance_ci_wait(
+            conn,
+            persisted,
+            step_index,
+            work,
+            outcome.summary,
+            outcome.prompt,
+        )? != stabilization_execute::WaitProgress::KeepWaiting
+        {
+            return Ok(());
         }
 
         if unix_ms() >= deadline {
@@ -983,92 +907,73 @@ pub(super) fn execute_commit_ci_fix_step(
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
     let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
-    let _ = crate::github::refresh_pr_cache(
+    crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
+    crate::github::refresh_pr_cache(
         repo,
         &persisted.run.branch,
         &mut cache,
         &persisted.run.worktree_path,
         config,
         true,
-    );
-    let guard_facts = repair_guard_facts(config, persisted, cache.trusted_summary()?);
-    let pre_commit_head = crate::git::current_head_sha(&persisted.run.worktree_path, config)?;
-    persist_pending_commit_obligation(
-        conn,
-        persisted,
-        stabilization_model::RepairKind::Ci,
-        pre_commit_head,
-        guard_facts,
-        Vec::new(),
     )?;
-    let message = repair_commit_message(config, "repair_commit_ci", "fix: ci");
-    let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
-    if !result.committed {
-        persisted.run.pending_push = None;
-        save_run_with_conn(conn, &persisted.run)?;
-        let summary = "CI fix produced no commitable changes".to_string();
-        finish_non_agent_step(
-            conn,
-            &mut persisted.steps[step_index],
-            AutoStepStatus::Failed,
-            Some(summary.clone()),
-            Some(summary.clone()),
-        )?;
-        return Err(summary);
-    }
-    let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
-    persisted.run.current_head_sha = local_head.clone();
-    if let Some(summary) = cache.summary.as_ref() {
-        persisted.run.pr_number = Some(summary.number);
-        persisted.run.pr_url = Some(summary.url.clone());
-        persisted.run.review_baseline_json = Some(review_baseline_json(summary));
-    }
-    let commit_sha = result
-        .commit_sha
-        .as_ref()
-        .ok_or_else(|| "CI repair commit did not report its SHA".to_string())?;
-    let guard = persisted
-        .run
-        .pending_push
-        .as_mut()
-        .ok_or_else(|| "CI repair commit lost its persisted obligation".to_string())?;
-    guard.commit_sha = commit_sha.clone();
-    guard.expected_local_head_sha = local_head.clone().unwrap_or_else(|| commit_sha.clone());
-    save_run_with_conn(conn, &persisted.run)?;
-    if config.auto.push_repairs {
-        stabilization_execute::progress_pending_push(
+    let current_guard = current_work_guard(config, persisted, &cache)?;
+    let pr_number = cache.trusted_summary()?.map(|summary| summary.number);
+    if let stabilization_execute::RepairCommitGate::Invalidated { summary } =
+        stabilization_execute::validate_and_begin_repair_commit(
             conn,
             repo,
             config,
             persisted,
-            &mut cache,
-            || Ok(()),
+            step_index,
+            stabilization_model::RepairKind::Ci,
+            stabilization_execute::RepairCommitObservation {
+                guard: current_guard,
+                pr_number,
+            },
+        )?
+    {
+        let step_id = persisted.steps[step_index]
+            .id
+            .ok_or_else(|| "repair commit step must be saved before output".to_string())?;
+        append_system_output(
+            conn,
+            step_id,
+            AutoOutputKind::Status,
+            &summary,
+            None,
+            max_output_lines_per_step,
         )?;
+        return Ok(());
     }
-
-    let step = &mut persisted.steps[step_index];
-    step.commit_sha = result.commit_sha.clone();
-    step.head_sha = persisted.run.current_head_sha.clone();
-    let summary = repair_commit_summary(
+    let message =
+        stabilization_execute::repair_commit_message(config, &stabilization_model::RepairKind::Ci);
+    let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
+    let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
+    let pr_summary = cache.trusted_summary()?.cloned();
+    let outcome = stabilization_execute::complete_repair_commit(
+        conn,
+        repo,
         config,
-        "CI",
-        result.commit_sha.as_deref().unwrap_or("unknown"),
-    );
-    let step_id = step
+        persisted,
+        step_index,
+        stabilization_model::RepairKind::Ci,
+        result,
+        local_head,
+        pr_summary,
+        &mut cache,
+    )?;
+    let step_id = persisted.steps[step_index]
         .id
         .ok_or_else(|| "auto CI commit step must be saved before output".to_string())?;
     append_system_output(
         conn,
         step_id,
         AutoOutputKind::Status,
-        &summary,
+        &outcome.summary,
         None,
         max_output_lines_per_step,
     )?;
-    finish_non_agent_step(conn, step, AutoStepStatus::Done, Some(summary), None)?;
-    persisted.run.status = persisted.authoritative_status();
-    persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)
+    Ok(())
 }
 
 pub(super) fn execute_merge_step(
@@ -1104,54 +1009,44 @@ pub(super) fn execute_merge_step(
 
     let verify =
         crate::verify::run_auto_verify(config, &persisted.run.worktree_path, VerifyMode::Normal);
-    let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
-    crate::github::refresh_pr_cache(
-        repo,
-        &persisted.run.branch,
-        &mut cache,
-        &persisted.run.worktree_path,
-        config,
-        true,
-    )?;
-    let summary = cache
-        .trusted_summary()?
-        .cloned()
-        .ok_or_else(|| "merge gate could not find pull request summary".to_string())?;
-    cache.trusted_details()?;
-    persisted.run.pr_number = Some(summary.number);
-    persisted.run.pr_url = Some(summary.url.clone());
-    persisted.run.current_head_sha = Some(summary.head_sha.clone());
-
-    let planned = stabilization_execute::observe_and_plan(repo, config, persisted);
+    crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
+    let snapshot =
+        stabilization_observe::build_auto_run_stabilization_snapshot(repo, &persisted.run, config);
+    let expected_guard = persisted.steps[step_index]
+        .work_guard
+        .as_ref()
+        .ok_or_else(|| "auto merge step is missing its stabilization work guard".to_string())?;
+    let authorization = stabilization_execute::authorize_auto_merge(
+        &snapshot,
+        persisted.run.pr_number,
+        expected_guard,
+    );
     let gate = if !verify.passed {
         MergeGateOutcome {
             allowed: false,
             summary: format!("merge blocked:\n- {}", format_verify_result(&verify)),
         }
-    } else if planned.kind == stabilization_model::StabilizationWorkKind::Merge {
-        MergeGateOutcome {
-            allowed: true,
-            summary: planned.reason,
-        }
     } else {
-        MergeGateOutcome {
-            allowed: false,
-            summary: format!("merge blocked:\n- {}", planned.reason),
+        match &authorization {
+            stabilization_execute::MergeAuthorization::Authorized(_) => MergeGateOutcome {
+                allowed: true,
+                summary: "fresh stabilization observation authorized auto-merge".to_string(),
+            },
+            stabilization_execute::MergeAuthorization::Blocked(state) => MergeGateOutcome {
+                allowed: false,
+                summary: format!("merge blocked:\n- {}", state.reason),
+            },
         }
     };
-    append_system_output(
-        conn,
-        step_id,
-        if gate.allowed {
-            AutoOutputKind::Status
-        } else {
-            AutoOutputKind::Error
-        },
-        &gate.summary,
-        None,
-        max_output_lines_per_step,
-    )?;
     if !gate.allowed {
+        append_system_output(
+            conn,
+            step_id,
+            AutoOutputKind::Error,
+            &gate.summary,
+            None,
+            max_output_lines_per_step,
+        )?;
         finish_non_agent_step(
             conn,
             &mut persisted.steps[step_index],
@@ -1162,15 +1057,28 @@ pub(super) fn execute_merge_step(
         return Err(gate.summary);
     }
 
-    if !summary.merged {
-        crate::lifecycle::merge_pull_request(config, &persisted.run.worktree_path, summary.number)?;
-    }
+    let execution = stabilization_execute::execute_merge_authorization(
+        config,
+        &persisted.run.worktree_path,
+        authorization,
+    )?;
+    let stabilization_execute::ManualMergeExecution::Merged { pr_number } = execution else {
+        unreachable!("the final gate only passes an authorized merge")
+    };
+    append_system_output(
+        conn,
+        step_id,
+        AutoOutputKind::Status,
+        &gate.summary,
+        None,
+        max_output_lines_per_step,
+    )?;
     let merged =
-        crate::github::wait_for_pr_merged(&persisted.run.worktree_path, summary.number, config)?;
+        crate::github::wait_for_pr_merged(&persisted.run.worktree_path, pr_number, config)?;
     if !merged {
         let error = format!(
             "PR #{} merge command completed, but GitHub has not marked it merged yet",
-            summary.number
+            pr_number
         );
         finish_non_agent_step(
             conn,
@@ -1181,6 +1089,7 @@ pub(super) fn execute_merge_step(
         )?;
         return Err(error);
     }
+    let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
     crate::github::refresh_pr_cache(
         repo,
         &persisted.run.branch,
@@ -1191,7 +1100,7 @@ pub(super) fn execute_merge_step(
     )?;
     stabilization_execute::observe_plan_and_save(conn, repo, config, persisted)?;
 
-    let done = format!("merged PR #{}", summary.number);
+    let done = format!("merged PR #{pr_number}");
     append_system_output(
         conn,
         step_id,
@@ -1255,11 +1164,21 @@ pub(super) fn execute_cleanup_step(
         )?;
     }
 
-    let outcome = crate::session::delete_worktree_session(
+    let expected_incarnation = persisted
+        .run
+        .worktree_incarnation
+        .as_deref()
+        .filter(|incarnation| !incarnation.is_empty())
+        .ok_or_else(|| {
+            "auto cleanup retained the worktree because this run has no persisted worktree incarnation"
+                .to_string()
+        })?;
+    let outcome = crate::session::delete_worktree_session_if_current(
         repo,
         config,
         &persisted.run.worktree_path,
         &persisted.run.branch,
+        Some(expected_incarnation),
     )?;
     let (status, summary, error) = match outcome {
         crate::session::DeleteWorktreeOutcome::Deleted => (
@@ -1685,100 +1604,47 @@ pub(super) fn implementation_commit_message(run: &AutoRun) -> String {
     }
 }
 
-#[derive(Clone)]
-struct RepairGuardFacts {
-    remote_head_sha: Option<String>,
-    pr_number: Option<u64>,
-    pr_head_sha: Option<String>,
-    base_sha: Option<String>,
-}
-
-fn repair_guard_facts(
+fn current_work_guard(
     config: &Config,
     persisted: &PersistedAutoRun,
-    summary: Option<&PrSummary>,
-) -> RepairGuardFacts {
+    cache: &crate::github::PrCache,
+) -> Result<stabilization_model::WorkGuard, String> {
+    let summary = cache.trusted_summary()?;
     let remote_head_sha = crate::git::remote_branch_head_sha(
         &persisted.run.worktree_path,
         &persisted.run.branch,
         config,
-    )
-    .ok()
-    .flatten();
-    let base_sha = summary.and_then(|summary| {
-        crate::git::remote_branch_head_sha(&persisted.run.worktree_path, &summary.base_ref, config)
-            .ok()
-            .flatten()
-    });
-    RepairGuardFacts {
+    )?;
+    let base_sha = match summary {
+        Some(summary) => crate::git::remote_branch_head_sha(
+            &persisted.run.worktree_path,
+            &summary.base_ref,
+            config,
+        )?,
+        None => None,
+    };
+    let review_thread_ids = cache
+        .trusted_details()?
+        .map(|details| {
+            let feedback = stabilization_observe::stabilization_review_feedback(
+                details,
+                persisted.run.review_baseline_json.as_deref(),
+            );
+            crate::review::review_thread_ids(&feedback)
+        })
+        .unwrap_or_default();
+    Ok(stabilization_model::WorkGuard {
+        local_head_sha: Some(crate::git::current_head_sha(
+            &persisted.run.worktree_path,
+            config,
+        )?),
         remote_head_sha,
-        pr_number: summary
-            .map(|summary| summary.number)
-            .or(persisted.run.pr_number),
         pr_head_sha: summary
             .map(|summary| summary.head_sha.clone())
             .filter(|sha| !sha.trim().is_empty()),
         base_sha,
-    }
-}
-
-fn pending_push_guard(
-    repair_kind: stabilization_model::RepairKind,
-    commit_sha: String,
-    expected_local_head_sha: String,
-    facts: RepairGuardFacts,
-    guarded_review_thread_ids: Vec<String>,
-) -> stabilization_model::PendingPushGuard {
-    stabilization_model::PendingPushGuard {
-        repair_kind,
-        commit_sha,
-        expected_local_head_sha,
-        expected_remote_head_sha: facts.remote_head_sha,
-        pr_number: facts.pr_number,
-        expected_pr_head_sha: facts.pr_head_sha,
-        expected_base_sha: facts.base_sha,
-        guarded_review_thread_ids,
-    }
-}
-
-fn persist_pending_commit_obligation(
-    conn: &rusqlite::Connection,
-    persisted: &mut PersistedAutoRun,
-    repair_kind: stabilization_model::RepairKind,
-    pre_commit_head: String,
-    facts: RepairGuardFacts,
-    guarded_review_thread_ids: Vec<String>,
-) -> Result<(), String> {
-    persisted.run.pending_push = Some(pending_push_guard(
-        repair_kind,
-        String::new(),
-        pre_commit_head,
-        facts,
-        guarded_review_thread_ids,
-    ));
-    persisted.run.stabilization_status = Some(stabilization_model::StabilizationStatus::Blocked);
-    persisted.run.stabilization_blocker =
-        Some(stabilization_model::StabilizationBlocker::PendingPush);
-    persisted.run.stabilization_next_work =
-        Some(stabilization_model::StabilizationWorkKind::PushPendingRepair);
-    save_run_with_conn(conn, &persisted.run)
-}
-
-fn repair_commit_message(config: &Config, template_name: &str, default: &str) -> String {
-    config
-        .prompt_template(template_name)
-        .map(str::trim)
-        .filter(|message| !message.is_empty())
-        .unwrap_or(default)
-        .to_string()
-}
-
-fn repair_commit_summary(config: &Config, label: &str, commit_sha: &str) -> String {
-    if config.auto.push_repairs {
-        format!("committed {label} fixes as {commit_sha} and pushed")
-    } else {
-        format!("committed {label} fixes as {commit_sha}; pending guarded push")
-    }
+        review_thread_ids,
+    })
 }
 
 pub(super) fn auto_pr_body(config: &Config, run: &AutoRun) -> String {

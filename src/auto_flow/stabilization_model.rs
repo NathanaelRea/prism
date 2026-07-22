@@ -16,6 +16,14 @@ pub enum StabilizationStatus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StabilizationState {
+    pub status: StabilizationStatus,
+    pub blocker: StabilizationBlocker,
+    pub next_work: StabilizationWorkKind,
+    pub reason: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StabilizationSnapshot {
     pub run: Option<AutoRunRef>,
     pub repository: RepositoryFacts,
@@ -381,7 +389,7 @@ impl StabilizationWorkKind {
 }
 
 impl StabilizationWorkItem {
-    pub(crate) fn status(&self) -> StabilizationStatus {
+    fn status(&self) -> StabilizationStatus {
         match self.kind {
             StabilizationWorkKind::WaitForCi | StabilizationWorkKind::WaitForReview => {
                 StabilizationStatus::Waiting
@@ -392,6 +400,15 @@ impl StabilizationWorkItem {
             StabilizationWorkKind::Done => StabilizationStatus::Done,
             StabilizationWorkKind::Escalate => StabilizationStatus::Escalated,
             _ => StabilizationStatus::Blocked,
+        }
+    }
+
+    pub(crate) fn state(&self) -> StabilizationState {
+        StabilizationState {
+            status: self.status(),
+            blocker: self.blocker.clone(),
+            next_work: self.kind.clone(),
+            reason: self.reason.clone(),
         }
     }
 }

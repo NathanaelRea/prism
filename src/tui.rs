@@ -24,7 +24,7 @@ use crate::plan_run::{
     load_recent_plan_runs_for_repo, reconcile_stale_plan_run,
 };
 use crate::repo::Repository;
-use crate::session::{Session, append_runtime_log};
+use crate::session::{Session, WorktreeRepositoryKey, WorktreeSessionKey};
 use crate::terminal::stdin_is_tty;
 use crate::tmux::TmuxWindow;
 use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
@@ -37,8 +37,8 @@ pub struct Tui {
     pub(crate) repos: Vec<ManagedRepo>,
     pub(crate) current_repo: usize,
     pub(crate) sessions: Vec<Session>,
-    pub(crate) session_repository_roots: BTreeMap<usize, PathBuf>,
-    pub(crate) worktree_generations: BTreeMap<(PathBuf, PathBuf, String, String), u64>,
+    pub(crate) session_repository_identities: BTreeMap<usize, WorktreeRepositoryKey>,
+    pub(crate) worktree_generations: BTreeMap<WorktreeSessionKey, u64>,
     pub(crate) selected: usize,
     pub(crate) selected_repo_root: Option<PathBuf>,
     pub(crate) focused_panel: PanelFocus,
@@ -103,6 +103,7 @@ pub(crate) struct ManagedRepo {
     pub config: Config,
     pub label: String,
     pub key: Option<char>,
+    pub identity: WorktreeRepositoryKey,
     pub pr_summary_poll_in_flight: bool,
     pub pr_summary_last_polled: Option<std::time::Instant>,
     pub wt_poll_in_flight: bool,
@@ -128,6 +129,7 @@ impl ManagedRepo {
     pub(crate) fn new(repo: Repository, config: Config, key: Option<char>) -> Self {
         let label = crate::workspace::label_for_root(&repo.root);
         Self {
+            identity: WorktreeRepositoryKey::new(repo.root.clone()),
             repo,
             config,
             label,
@@ -143,7 +145,7 @@ impl ManagedRepo {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PrPollKey {
-    pub repo_root: PathBuf,
+    pub repository: WorktreeRepositoryKey,
     pub branch: String,
     pub path: PathBuf,
     pub generation: u64,
@@ -152,7 +154,8 @@ pub(crate) struct PrPollKey {
 
 pub(crate) enum PrPollResult {
     Summary {
-        repo_root: PathBuf,
+        repository: WorktreeRepositoryKey,
+        sessions: Vec<WorktreeSessionKey>,
         summaries: Result<Vec<PrSummary>, String>,
         poll_started_at: Instant,
     },
@@ -164,7 +167,7 @@ pub(crate) enum PrPollResult {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct DeleteSessionKey {
-    pub repo_root: PathBuf,
+    pub repository: WorktreeRepositoryKey,
     pub path: PathBuf,
     pub branch: String,
     pub generation: u64,
@@ -178,12 +181,12 @@ pub(crate) struct DeleteSessionResult {
 
 impl PrPollKey {
     pub(crate) fn for_repository_session_generation(
-        repo_root: &Path,
+        repository: &WorktreeRepositoryKey,
         session: &Session,
         generation: u64,
     ) -> Self {
         Self {
-            repo_root: repo_root.to_path_buf(),
+            repository: repository.clone(),
             branch: session.branch.clone(),
             path: session.path.clone(),
             generation,
@@ -231,20 +234,18 @@ pub(crate) struct NavigationSnapshot {
 }
 
 pub(crate) struct WtPollResult {
-    pub repo_root: PathBuf,
-    pub columns: Result<BTreeMap<PathBuf, BTreeMap<String, String>>, String>,
+    pub repository: WorktreeRepositoryKey,
+    pub columns: Result<BTreeMap<WorktreeSessionKey, BTreeMap<String, String>>, String>,
 }
 
 pub(crate) struct DefaultBranchPollResult {
-    pub repo_root: PathBuf,
-    pub branch: String,
-    pub path: PathBuf,
+    pub key: WorktreeSessionKey,
     pub status_label: Result<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct OpencodePollKey {
-    pub repo_root: PathBuf,
+    pub repository: WorktreeRepositoryKey,
     pub branch: String,
     pub path: PathBuf,
     pub generation: u64,
@@ -258,6 +259,7 @@ pub(crate) struct OpencodePollResult {
 }
 
 pub(crate) struct OpencodeEventResult {
+    pub key: WorktreeSessionKey,
     pub server_url: String,
     pub event: Result<OpencodeEvent, String>,
 }
@@ -270,23 +272,20 @@ pub(crate) struct PlanRunResult {
 
 impl OpencodePollKey {
     #[cfg(test)]
-    pub(crate) fn for_session(session: &Session) -> Self {
-        let repo_root = session.path.parent().unwrap_or_else(|| Path::new(""));
-        Self::for_repository_session(repo_root, session)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_repository_session(repo_root: &Path, session: &Session) -> Self {
-        Self::for_repository_session_generation(repo_root, session, 0)
+    pub(crate) fn for_repository_session(
+        repository: &WorktreeRepositoryKey,
+        session: &Session,
+    ) -> Self {
+        Self::for_repository_session_generation(repository, session, 0)
     }
 
     pub(crate) fn for_repository_session_generation(
-        repo_root: &Path,
+        repository: &WorktreeRepositoryKey,
         session: &Session,
         generation: u64,
     ) -> Self {
         Self {
-            repo_root: repo_root.to_path_buf(),
+            repository: repository.clone(),
             branch: session.branch.clone(),
             path: session.path.clone(),
             generation,
@@ -460,24 +459,16 @@ impl Tui {
             .get(current_repo)
             .map(|repo| repo.config.clone())
             .unwrap_or_else(|| Config::load(&fallback_repo));
-        let session_repository_roots = repos
+        let session_repository_identities = repos
             .iter()
             .enumerate()
-            .map(|(index, repo)| (index, repo.repo.root.clone()))
+            .map(|(index, repo)| (index, repo.identity.clone()))
             .collect();
         let worktree_generations = sessions
             .iter()
             .filter_map(|session| {
                 let repo = repos.get(session.repo_index)?;
-                Some((
-                    (
-                        repo.repo.root.clone(),
-                        session.path.clone(),
-                        session.branch.clone(),
-                        session.incarnation.clone(),
-                    ),
-                    0,
-                ))
+                Some((session.identity_key(&repo.identity), 0))
             })
             .collect();
         let mut tui = Self {
@@ -486,7 +477,7 @@ impl Tui {
             repos,
             current_repo,
             sessions,
-            session_repository_roots,
+            session_repository_identities,
             worktree_generations,
             selected: 0,
             selected_repo_root: None,
@@ -1613,7 +1604,7 @@ impl Tui {
     pub(crate) fn show_message(&mut self, message: &str) -> Result<(), String> {
         self.status_message = Some(message.to_string());
         self.status_message_until = Some(Instant::now() + STATUS_MESSAGE_DURATION);
-        let _ = append_runtime_log(&self.repo, message);
+        let _ = crate::observability::append_runtime_message(&self.repo, message);
         Ok(())
     }
 
@@ -1741,7 +1732,10 @@ impl Tui {
             return;
         };
         if let Err(error) = crate::ui_state::save_to_path(path, self.worktree_list_mode) {
-            let _ = append_runtime_log(&self.repo, &format!("UI state save failed: {error}"));
+            let _ = crate::observability::append_runtime_message(
+                &self.repo,
+                &format!("UI state save failed: {error}"),
+            );
         }
     }
 
@@ -2016,7 +2010,7 @@ impl Tui {
         };
         self.sessions
             .get(index)
-            .and_then(|session| session.pr.details.as_ref())
+            .and_then(|session| session.pr.details())
             .map(view::pr_comment_rows)
             .unwrap_or_default()
     }
@@ -2860,13 +2854,12 @@ impl Tui {
             {
                 attention += 1;
             }
-            if session.pr.summary.is_some() {
+            if session.pr.has_summary() {
                 prs += 1;
             }
             match session
                 .pr
-                .summary
-                .as_ref()
+                .summary()
                 .map(|summary| summary.check_status.as_str())
             {
                 Some("failed") => ci_failed += 1,
@@ -2951,13 +2944,12 @@ impl Tui {
             {
                 attention += 1;
             }
-            if session.pr.summary.is_some() {
+            if session.pr.has_summary() {
                 prs += 1;
             }
             match session
                 .pr
-                .summary
-                .as_ref()
+                .summary()
                 .map(|summary| summary.check_status.as_str())
             {
                 Some("failed") => ci_failed += 1,
@@ -3132,7 +3124,7 @@ fn worktree_updated_label(session: &Session) -> String {
     if let Some(label) = session.pr.last_refreshed() {
         return label.to_string();
     }
-    if let Some(summary) = &session.pr.summary {
+    if let Some(summary) = session.pr.summary() {
         return summary.updated_at.chars().take(10).collect();
     }
     "-".to_string()
@@ -3161,7 +3153,7 @@ mod tests {
         PersistedPlanRun, PlanRun, PlanRunMode, PlanRunStatus, PlanStepRun, PlanStepStatus,
     };
     use crate::repo::Repository;
-    use crate::session::Session;
+    use crate::session::{Session, WorktreeRepositoryKey};
     use crate::view::{OrderedToggleItem, RepoMainView, WorktreeMainView};
 
     use super::{
@@ -3635,6 +3627,7 @@ mod tests {
                 id: id.to_string(),
                 repo_root: "/repo-one".to_string(),
                 worktree_path: PathBuf::from(worktree_path),
+                worktree_incarnation: None,
                 branch: "feature".to_string(),
                 mode: AutoRunMode::Standard,
                 implementation_source: AutoImplementationSource::Prompt,
@@ -3724,13 +3717,13 @@ mod tests {
 
     #[test]
     fn pr_poll_identity_uses_repository_and_worktree_generation_not_repo_order() {
-        let repo_root = PathBuf::from("/tmp/repo");
+        let repository = WorktreeRepositoryKey::new(PathBuf::from("/tmp/repo"));
         let mut session = test_session(0, "/tmp/repo", "feature");
-        let first = PrPollKey::for_repository_session_generation(&repo_root, &session, 3);
+        let first = PrPollKey::for_repository_session_generation(&repository, &session, 3);
 
         session.repo_index = 9;
-        let reordered = PrPollKey::for_repository_session_generation(&repo_root, &session, 3);
-        let recreated = PrPollKey::for_repository_session_generation(&repo_root, &session, 4);
+        let reordered = PrPollKey::for_repository_session_generation(&repository, &session, 3);
+        let recreated = PrPollKey::for_repository_session_generation(&repository, &session, 4);
 
         assert_eq!(first, reordered);
         assert_ne!(first, recreated);

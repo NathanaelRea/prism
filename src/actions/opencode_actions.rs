@@ -13,11 +13,11 @@ pub(super) fn current_unix_ms() -> u64 {
 }
 
 pub(super) fn opencode_poll_key(
-    repo_root: &Path,
+    repository: &crate::session::WorktreeRepositoryKey,
     session: &crate::session::Session,
     generation: u64,
 ) -> OpencodePollKey {
-    OpencodePollKey::for_repository_session_generation(repo_root, session, generation)
+    OpencodePollKey::for_repository_session_generation(repository, session, generation)
 }
 
 impl Tui {
@@ -40,15 +40,10 @@ impl Tui {
             }
             let generation = self
                 .worktree_generations
-                .get(&(
-                    managed.repo.root.clone(),
-                    session.path.clone(),
-                    session.branch.clone(),
-                    session.incarnation.clone(),
-                ))
+                .get(&session.identity_key(&managed.identity))
                 .copied()
                 .unwrap_or_default();
-            let key = opencode_poll_key(&managed.repo.root, session, generation);
+            let key = opencode_poll_key(&managed.identity, session, generation);
             if !force && self.opencode_polls_in_flight.contains(&key) {
                 continue;
             }
@@ -108,6 +103,7 @@ impl Tui {
             let Some(session_id) = runtime.opencode_session_id.clone() else {
                 continue;
             };
+            let key = session.identity_key(&managed.identity);
             if let Some(session) = self.sessions.get_mut(session_index) {
                 let current = session.opencode_status.clone();
                 if current
@@ -156,6 +152,7 @@ impl Tui {
                 loop {
                     let result = opencode::listen_events(&server_url, |event| {
                         tx.send(OpencodeEventResult {
+                            key: key.clone(),
                             server_url: server_url.clone(),
                             event: Ok(event),
                         })
@@ -163,6 +160,7 @@ impl Tui {
                     });
                     if let Err(error) = result {
                         let _ = tx.send(OpencodeEventResult {
+                            key: key.clone(),
                             server_url: server_url.clone(),
                             event: Err(error),
                         });
@@ -184,15 +182,10 @@ impl Tui {
                         self.repos.get(session.repo_index).is_some_and(|repo| {
                             let generation = self
                                 .worktree_generations
-                                .get(&(
-                                    repo.repo.root.clone(),
-                                    session.path.clone(),
-                                    session.branch.clone(),
-                                    session.incarnation.clone(),
-                                ))
+                                .get(&session.identity_key(&repo.identity))
                                 .copied()
                                 .unwrap_or_default();
-                            opencode_poll_key(&repo.repo.root, session, generation) == result.key
+                            opencode_poll_key(&repo.identity, session, generation) == result.key
                         })
                     }) {
                         let state_event_is_newer = self
@@ -238,9 +231,9 @@ impl Tui {
                     if let Some(repo) = self
                         .repos
                         .iter()
-                        .find(|repo| repo.repo.root == result.key.repo_root)
+                        .find(|repo| repo.identity == result.key.repository)
                     {
-                        let _ = append_runtime_log(
+                        let _ = append_runtime_message(
                             &repo.repo,
                             &format!(
                                 "opencode status refresh failed for {}: {error}",
@@ -263,7 +256,9 @@ impl Tui {
                         continue;
                     };
                     let Some(index) = self.sessions.iter().position(|session| {
-                        session
+                        self.repos.get(session.repo_index).is_some_and(|managed| {
+                            session.identity_key(&managed.identity) == result.key
+                        }) && session
                             .opencode_status
                             .as_ref()
                             .and_then(|status| status.server_url.as_deref())
@@ -298,17 +293,11 @@ impl Tui {
                     if let Some(state) = event.state {
                         self.opencode_last_state_event.insert(
                             opencode_poll_key(
-                                &self.repos[self.sessions[index].repo_index].repo.root,
+                                &self.repos[self.sessions[index].repo_index].identity,
                                 &self.sessions[index],
                                 self.worktree_generations
-                                    .get(&(
-                                        self.repos[self.sessions[index].repo_index]
-                                            .repo
-                                            .root
-                                            .clone(),
-                                        self.sessions[index].path.clone(),
-                                        self.sessions[index].branch.clone(),
-                                        self.sessions[index].incarnation.clone(),
+                                    .get(&self.sessions[index].identity_key(
+                                        &self.repos[self.sessions[index].repo_index].identity,
                                     ))
                                     .copied()
                                     .unwrap_or_default(),
@@ -350,7 +339,9 @@ impl Tui {
                 }
                 Err(error) => {
                     if let Some(repo) = self.sessions.iter().find_map(|session| {
-                        (session
+                        (self.repos.get(session.repo_index).is_some_and(|managed| {
+                            session.identity_key(&managed.identity) == result.key
+                        }) && session
                             .opencode_status
                             .as_ref()
                             .and_then(|status| status.server_url.as_deref())
@@ -358,7 +349,7 @@ impl Tui {
                         .then(|| self.repos.get(session.repo_index))
                         .flatten()
                     }) {
-                        let _ = append_runtime_log(
+                        let _ = append_runtime_message(
                             &repo.repo,
                             &format!(
                                 "opencode event stream disconnected for {}: {error}",
@@ -490,7 +481,7 @@ impl Tui {
                 continue;
             }
             if let Err(error) = opencode::shutdown_owned_server(&runtime) {
-                let _ = append_runtime_log(
+                let _ = append_runtime_message(
                     &managed.repo,
                     &format!("opencode server shutdown failed for pid {pid}: {error}"),
                 );

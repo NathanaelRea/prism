@@ -48,6 +48,47 @@ fn launch_creates_persistable_auto_run() {
 }
 
 #[test]
+fn worktree_incarnation_round_trips_and_legacy_rows_remain_unknown() {
+    let temp = TempDir::new("worktree-incarnation");
+    let worktree = temp.path().join("feature");
+    fs::create_dir_all(&worktree).unwrap();
+    fs::write(
+        worktree.join(".git"),
+        "gitdir: /repo/.git/worktrees/feature\n",
+    )
+    .unwrap();
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut persisted = AutoLaunch::new(temp.path(), &worktree, "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+    let incarnation = persisted
+        .run
+        .worktree_incarnation
+        .clone()
+        .expect("new run incarnation");
+
+    save_auto_run(&conn, &mut persisted).unwrap();
+    let loaded = load_auto_run(&conn, &persisted.run.id)
+        .unwrap()
+        .expect("saved run");
+
+    assert_eq!(
+        loaded.run.worktree_incarnation.as_deref(),
+        Some(incarnation.as_str())
+    );
+    conn.execute(
+        "update auto_run set worktree_incarnation = null where id = ?1",
+        params![persisted.run.id],
+    )
+    .unwrap();
+    let legacy = load_auto_run(&conn, &persisted.run.id)
+        .unwrap()
+        .expect("legacy run");
+    assert_eq!(legacy.run.worktree_incarnation, None);
+}
+
+#[test]
 fn plan_first_prompts_create_and_review_plan_file() {
     let repo = PathBuf::from("/repo/prism");
     let persisted = AutoLaunch::with_options(
@@ -113,55 +154,6 @@ fn auto_prompt_template_overrides_default_and_renders_context() {
 }
 
 #[test]
-fn plan_first_queues_prelude_before_run_plan() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
-    let repo = PathBuf::from("/repo/prism");
-    let mut persisted = AutoLaunch::with_options(
-        &repo,
-        &repo.join("feature"),
-        AutoLaunchOptions {
-            branch: "feat/auto".to_string(),
-            mode: AutoRunMode::PlanFirst,
-            implementation_source: AutoImplementationSource::DraftPlan,
-            plan_path: Some(repo.join("feature/plan.md")),
-            plan_run_mode: PlanRunMode::Sequential,
-            variant: "intensive".to_string(),
-            agent_profile: None,
-            initial_prompt: "Implement auto".to_string(),
-        },
-    )
-    .unwrap()
-    .create_run();
-    persisted.steps[0].status = AutoStepStatus::Done;
-    save_auto_run(&conn, &mut persisted).unwrap();
-
-    assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
-    assert_eq!(persisted.steps[1].step_key, AutoStepKey::CreatePlan);
-    persisted.steps[1].status = AutoStepStatus::Done;
-    save_auto_run(&conn, &mut persisted).unwrap();
-
-    assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
-    assert_eq!(persisted.steps[2].step_key, AutoStepKey::ReviewPlan);
-    persisted.steps[2].status = AutoStepStatus::Done;
-    save_auto_run(&conn, &mut persisted).unwrap();
-
-    assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
-    assert_eq!(persisted.steps[3].step_key, AutoStepKey::ApprovePlan);
-    assert!(
-        !persisted
-            .steps
-            .iter()
-            .any(|step| step.step_key == AutoStepKey::Implement)
-    );
-    persisted.steps[3].status = AutoStepStatus::Done;
-    save_auto_run(&conn, &mut persisted).unwrap();
-
-    assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
-    assert_eq!(persisted.steps[4].step_key, AutoStepKey::RunPlan);
-}
-
-#[test]
 fn plan_approval_pauses_and_resume_queues_run_plan() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
@@ -215,7 +207,7 @@ fn plan_approval_pauses_and_resume_queues_run_plan() {
         apply_auto_run_control(&conn, &persisted.run.id, AutoRunControlIntent::Resume).unwrap();
     assert_eq!(outcome.executor, AutoExecutorDecision::Start);
     persisted = outcome.run;
-    assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
+    assert!(ensure_next_test_step(&conn, &mut persisted).unwrap());
     assert!(
         persisted
             .steps
@@ -248,7 +240,7 @@ fn existing_plan_queues_run_plan() {
     persisted.steps[0].status = AutoStepStatus::Done;
     save_auto_run(&conn, &mut persisted).unwrap();
 
-    assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
+    assert!(ensure_next_test_step(&conn, &mut persisted).unwrap());
 
     assert_eq!(persisted.steps[1].step_key, AutoStepKey::RunPlan);
 }
@@ -403,7 +395,7 @@ printf '%s\n' '{{"type":"message","text":"phase done"}}'
     let command = fs::read_to_string(opencode_log).unwrap();
     assert!(command.contains("--attach http://127.0.0.1:41234"));
 
-    assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
+    assert!(ensure_next_test_step(&conn, &mut persisted).unwrap());
     assert!(
         persisted
             .steps
@@ -522,7 +514,7 @@ fn resume_marks_run_plan_done_when_linked_plan_finished() {
     assert!(prepare_auto_run_for_resume(&conn, &mut persisted, 100).unwrap());
 
     assert_eq!(persisted.steps[0].status, AutoStepStatus::Done);
-    assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
+    assert!(ensure_next_test_step(&conn, &mut persisted).unwrap());
     assert_eq!(persisted.steps[1].step_key, AutoStepKey::LocalVerify);
 }
 
@@ -581,7 +573,7 @@ fn retry_failed_run_plan_continues_when_linked_plan_finished() {
     assert!(!auto_run_execution_blocked(&persisted));
     assert_eq!(persisted.steps[0].status, AutoStepStatus::Done);
     assert_eq!(persisted.run.status, AutoRunStatus::Done);
-    assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
+    assert!(ensure_next_test_step(&conn, &mut persisted).unwrap());
     assert_eq!(persisted.steps[1].step_key, AutoStepKey::LocalVerify);
 }
 
@@ -1172,8 +1164,11 @@ fn review_repair_commit_enters_pending_push_with_guard_data() {
         Some("commit review repair".to_string()),
     ));
     persisted.steps[0].work_guard = Some(stabilization_model::WorkGuard {
-        review_thread_ids: vec!["thread-1".to_string()],
-        ..stabilization_model::WorkGuard::default()
+        local_head_sha: Some(remote_head.clone()),
+        remote_head_sha: None,
+        pr_head_sha: Some(remote_head.clone()),
+        base_sha: Some(remote_head.clone()),
+        review_thread_ids: Vec::new(),
     });
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
@@ -1191,10 +1186,57 @@ fn review_repair_commit_enters_pending_push_with_guard_data() {
         guard.expected_pr_head_sha.as_deref(),
         Some(remote_head.as_str())
     );
-    assert_eq!(guard.guarded_review_thread_ids, vec!["thread-1"]);
+    assert!(guard.guarded_review_thread_ids.is_empty());
     assert_eq!(
         git_output(&work, &["log", "-1", "--pretty=%s"]),
         "fix: review template"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn invalidated_repair_guard_replans_without_creating_a_commit() {
+    let temp = TempDir::new("invalidated-review-repair-guard");
+    let origin = temp.path().join("origin.git");
+    let work = temp.path().join("work");
+    setup_git_worktree(&origin, &work);
+    let repo = Repository::with_config_dir_for_test(work.clone(), temp.path().join("config"));
+    let original_head = git_output(&work, &["rev-parse", "HEAD"]);
+    seed_pr_cache(&repo, "feat/auto", &original_head);
+    fs::write(work.join("tracked.txt"), "stale review fix\n").unwrap();
+    let mut config = test_config();
+    configure_pr_observation(&temp, &mut config, "feat/auto", &original_head);
+    let mut persisted = AutoLaunch::new(&repo.root, &work, "feat/auto", "Repair")
+        .unwrap()
+        .create_run();
+    persisted.run.pr_number = Some(42);
+    persisted.steps.clear();
+    persisted.steps.push(AutoStepRun::queued(
+        &persisted.run.id,
+        1,
+        AutoStepKey::CommitReviewFix,
+        1,
+        Some("commit stale repair".to_string()),
+    ));
+    persisted.steps[0].work_guard = Some(stabilization_model::WorkGuard {
+        local_head_sha: Some(original_head.clone()),
+        remote_head_sha: None,
+        pr_head_sha: Some("superseded-head".to_string()),
+        base_sha: Some(original_head.clone()),
+        review_thread_ids: Vec::new(),
+    });
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    save_auto_run(&conn, &mut persisted).unwrap();
+
+    execute_commit_review_fix_step(&conn, &repo, &config, &mut persisted, 0, 100).unwrap();
+
+    assert_eq!(git_output(&work, &["rev-parse", "HEAD"]), original_head);
+    assert_eq!(persisted.steps[0].status, AutoStepStatus::Skipped);
+    assert!(persisted.run.pending_push.is_none());
+    assert!(
+        !git_output(&work, &["status", "--porcelain"]).is_empty(),
+        "the stale repair remains uncommitted for the replanned work"
     );
 }
 
@@ -1230,6 +1272,13 @@ fn ci_repair_commit_enters_pending_push_with_guard_data() {
         1,
         Some("commit CI repair".to_string()),
     ));
+    persisted.steps[0].work_guard = Some(stabilization_model::WorkGuard {
+        local_head_sha: Some(remote_head.clone()),
+        remote_head_sha: Some(remote_head.clone()),
+        pr_head_sha: Some(remote_head.clone()),
+        base_sha: Some(remote_head.clone()),
+        review_thread_ids: Vec::new(),
+    });
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
     save_auto_run(&conn, &mut persisted).unwrap();
@@ -1324,6 +1373,7 @@ fn schema_migration_archives_old_active_auto_runs_once() {
     let loaded = load_auto_run(&conn, "old").unwrap().expect("run");
 
     assert_eq!(loaded.run.status, AutoRunStatus::Aborted);
+    assert_eq!(loaded.run.worktree_incarnation, None);
     assert!(loaded.run.archived_unix_ms.is_some());
     assert_eq!(loaded.steps[0].status, AutoStepStatus::Aborted);
     assert!(
@@ -1669,6 +1719,156 @@ fn phase_1_done_run_with_pending_push_is_discoverable_after_restart() {
 
 #[test]
 #[cfg(unix)]
+fn restart_after_unrelated_commit_does_not_adopt_it_as_the_repair_commit() {
+    let temp = TempDir::new("precommit-obligation-restart");
+    let origin = temp.path().join("origin.git");
+    let work = temp.path().join("work");
+    setup_git_worktree(&origin, &work);
+    let repo = Repository::with_config_dir_for_test(work.clone(), temp.path().join("config"));
+    let head = git_output(&work, &["rev-parse", "HEAD"]);
+    seed_pr_cache(&repo, "feat/auto", &head);
+    let database = temp.path().join("auto.db");
+    let run_id = {
+        let conn = rusqlite::Connection::open(&database).unwrap();
+        migrate_schema(&conn).unwrap();
+        let mut persisted = AutoLaunch::new(&repo.root, &work, "feat/auto", "Repair")
+            .unwrap()
+            .create_run();
+        persisted.run.pending_push = Some(stabilization_model::PendingPushGuard {
+            repair_kind: stabilization_model::RepairKind::Review,
+            commit_sha: String::new(),
+            expected_local_head_sha: head.clone(),
+            expected_remote_head_sha: None,
+            pr_number: Some(42),
+            expected_pr_head_sha: Some(head.clone()),
+            expected_base_sha: Some(head.clone()),
+            guarded_review_thread_ids: vec!["thread-1".to_string()],
+        });
+        save_auto_run(&conn, &mut persisted).unwrap();
+        persisted.run.id
+    };
+    fs::write(work.join("unrelated.txt"), "user work\n").unwrap();
+    run_git(&work, &["add", "unrelated.txt"]);
+    run_git(&work, &["commit", "-m", "unrelated user commit"]);
+    let unrelated_head = git_output(&work, &["rev-parse", "HEAD"]);
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut reopened = load_auto_run(&conn, &run_id).unwrap().unwrap();
+    let mut cache = crate::github::load_pr_cache(&repo, "feat/auto");
+
+    let progress = stabilization_execute::progress_pending_push(
+        &conn,
+        &repo,
+        &test_config(),
+        &mut reopened,
+        &mut cache,
+        || panic!("a precommit placeholder must never authorize a push"),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        progress,
+        stabilization_execute::GuardedPushProgress::Invalidated { .. }
+    ));
+    assert!(reopened.run.pending_push.is_none());
+    assert!(
+        load_auto_run(&conn, &run_id)
+            .unwrap()
+            .unwrap()
+            .run
+            .pending_push
+            .is_none()
+    );
+    assert_eq!(git_output(&work, &["rev-parse", "HEAD"]), unrelated_head);
+}
+
+#[test]
+#[cfg(unix)]
+fn transient_base_lookup_failure_retains_pending_push_for_retry() {
+    let temp = TempDir::new("pending-push-base-retry");
+    let origin = temp.path().join("origin.git");
+    let work = temp.path().join("work");
+    setup_git_worktree(&origin, &work);
+    run_git(&work, &["push", "-u", "origin", "feat/auto"]);
+    let remote_head = git_output(&work, &["rev-parse", "origin/feat/auto"]);
+    fs::write(work.join("repair.txt"), "repair\n").unwrap();
+    run_git(&work, &["add", "repair.txt"]);
+    run_git(&work, &["commit", "-m", "repair"]);
+    let repair_head = git_output(&work, &["rev-parse", "HEAD"]);
+    let repo = Repository::with_config_dir_for_test(work.clone(), temp.path().join("config"));
+    seed_pr_cache(&repo, "feat/auto", &remote_head);
+    let mut config = test_config();
+    configure_pr_observation(&temp, &mut config, "feat/auto", &remote_head);
+    let marker = temp.path().join("base-lookup-failed");
+    let git = temp.path().join("git");
+    write_executable(
+        &git,
+        &format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --verify --quiet refs/remotes/origin/main\"*)\n    if [ ! -e '{}' ]; then touch '{}'; printf 'transient lookup failure\\n' >&2; exit 128; fi\n    ;;\nesac\nif [ \"$3\" = \"remote\" ] && [ \"$4\" = \"get-url\" ]; then printf 'https://github.com/example/repo.git\\n'; exit 0; fi\nexec git \"$@\"\n",
+            marker.display(),
+            marker.display()
+        ),
+    );
+    let mut persisted = AutoLaunch::new(&repo.root, &work, "feat/auto", "Repair")
+        .unwrap()
+        .create_run();
+    persisted.run.pending_push = Some(stabilization_model::PendingPushGuard {
+        repair_kind: stabilization_model::RepairKind::Ci,
+        commit_sha: repair_head.clone(),
+        expected_local_head_sha: repair_head,
+        expected_remote_head_sha: Some(remote_head.clone()),
+        pr_number: Some(42),
+        expected_pr_head_sha: Some(remote_head.clone()),
+        expected_base_sha: Some(remote_head),
+        guarded_review_thread_ids: Vec::new(),
+    });
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    save_auto_run(&conn, &mut persisted).unwrap();
+    let mut cache = crate::github::load_pr_cache(&repo, "feat/auto");
+
+    let first_error = stabilization_execute::progress_pending_push(
+        &conn,
+        &repo,
+        &config,
+        &mut persisted,
+        &mut cache,
+        || panic!("lookup failure must stop before push"),
+    )
+    .unwrap_err();
+
+    assert!(first_error.contains("transient lookup failure"));
+    assert!(persisted.run.pending_push.is_some());
+    assert!(
+        load_auto_run(&conn, &persisted.run.id)
+            .unwrap()
+            .unwrap()
+            .run
+            .pending_push
+            .is_some()
+    );
+
+    let retried_push = std::cell::Cell::new(false);
+    let retry_error = stabilization_execute::progress_pending_push(
+        &conn,
+        &repo,
+        &config,
+        &mut persisted,
+        &mut cache,
+        || {
+            retried_push.set(true);
+            Err("stop test before push".to_string())
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(retry_error, "stop test before push");
+    assert!(retried_push.get());
+    assert!(persisted.run.pending_push.is_some());
+}
+
+#[test]
+#[cfg(unix)]
 fn executor_runs_fake_opencode_pauses_before_next_step_and_persists_events() {
     let temp = TempDir::new("executor-success");
     let origin = temp.path().join("origin.git");
@@ -1970,7 +2170,7 @@ fn merge_success_queues_cleanup_separately() {
     push_test_step(&mut persisted, 2, AutoStepKey::Merge, AutoStepStatus::Done);
     save_auto_run(&conn, &mut persisted).unwrap();
 
-    assert!(ensure_next_auto_step(&conn, &mut persisted).unwrap());
+    assert!(ensure_next_test_step(&conn, &mut persisted).unwrap());
 
     assert!(
         persisted
@@ -2000,7 +2200,7 @@ fn manual_merge_skip_completes_run_without_cleanup() {
     );
     save_auto_run(&conn, &mut persisted).unwrap();
 
-    assert!(!ensure_next_auto_step(&conn, &mut persisted).unwrap());
+    assert!(!ensure_next_test_step(&conn, &mut persisted).unwrap());
 
     assert_eq!(persisted.run.status, AutoRunStatus::Done);
     assert!(
@@ -2013,7 +2213,7 @@ fn manual_merge_skip_completes_run_without_cleanup() {
 
 #[cfg(unix)]
 #[test]
-fn merge_step_uses_gh_merge_and_waits_for_merged_status() {
+fn headless_merge_step_refreshes_policy_before_merging() {
     let temp = TempDir::new("merge-step-success");
     let origin = temp.path().join("origin.git");
     let work = temp.path().join("work");
@@ -2023,15 +2223,6 @@ fn merge_step_uses_gh_merge_and_waits_for_merged_status() {
     let mut config = Config::load(&repo);
     config.auto.merge = true;
     config.auto.review_wait_enabled = false;
-    crate::github::save_repo_policy_cache(
-        &repo,
-        &crate::github::RepoPolicyCache {
-            repo_remote: "example/repo".to_string(),
-            refreshed_unix_ms: 1,
-            ..crate::github::RepoPolicyCache::default()
-        },
-    )
-    .unwrap();
     let gh_log = temp.path().join("gh.log");
     let head = crate::git::current_head_sha(&work, &config).unwrap();
     let gh = temp.path().join("gh");
@@ -2044,7 +2235,11 @@ fn merge_step_uses_gh_merge_and_waits_for_merged_status() {
         &gh,
         &format!(
             r#"#!/bin/sh
-printf 'args=%s\n' "$*" >> '{}'
+ printf 'args=%s\n' "$*" >> '{}'
+if [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'branchProtectionRules'; then
+  printf '%s\n' '{{"data":{{"repository":{{"defaultBranchRef":{{"name":"main"}},"branchProtectionRules":{{"nodes":[]}}}}}}}}'
+  exit 0
+fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ] && [ "$5" = "comments,reviews,files,statusCheckRollup" ]; then
   printf '%s\n' '{{"comments":[],"reviews":[],"files":[],"statusCheckRollup":{{"contexts":{{"nodes":[]}}}}}}'
   exit 0
@@ -2091,6 +2286,14 @@ exit 1
         1,
         Some("merge".to_string()),
     ));
+    persisted.run.pr_number = Some(42);
+    persisted.steps[0].work_guard = Some(stabilization_model::WorkGuard {
+        local_head_sha: Some(head.clone()),
+        remote_head_sha: Some(head.clone()),
+        pr_head_sha: Some(head.clone()),
+        base_sha: Some(head.clone()),
+        review_thread_ids: Vec::new(),
+    });
     save_auto_run(&conn, &mut persisted).unwrap();
     start_non_agent_step(&conn, &mut persisted, 0).unwrap();
 
@@ -2099,8 +2302,83 @@ exit 1
     let loaded = load_auto_run(&conn, &persisted.run.id).unwrap().unwrap();
     assert_eq!(loaded.steps[0].status, AutoStepStatus::Done);
     let commands = fs::read_to_string(gh_log).unwrap();
-    assert!(commands.contains("args=pr merge 42 --squash"));
+    assert!(commands.contains("branchProtectionRules"));
+    assert!(commands.contains(&format!(
+        "args=pr merge 42 --squash --match-head-commit {head}"
+    )));
     assert!(commands.contains("args=pr view 42 --json state,mergedAt"));
+}
+
+#[test]
+fn cleanup_after_restart_rejects_legacy_run_without_incarnation() {
+    let temp = TempDir::new("cleanup-legacy-incarnation");
+    let repo = Repository::with_config_dir_for_test(
+        temp.path().join("repo"),
+        temp.path().join("prism-config"),
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut persisted = AutoLaunch::new(&repo.root, &repo.root, "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+    persisted.run.worktree_incarnation = None;
+    persisted.steps.clear();
+    persisted.steps.push(AutoStepRun::queued(
+        &persisted.run.id,
+        1,
+        AutoStepKey::Cleanup,
+        1,
+        Some("cleanup".to_string()),
+    ));
+    save_auto_run(&conn, &mut persisted).unwrap();
+    start_non_agent_step(&conn, &mut persisted, 0).unwrap();
+    let mut config = test_config();
+    config.auto.cleanup_after_merge = true;
+
+    let error = execute_cleanup_step(&conn, &repo, &config, &mut persisted, 0, 100)
+        .expect_err("legacy cleanup must fail closed");
+
+    assert!(error.contains("no persisted worktree incarnation"));
+}
+
+#[test]
+fn cleanup_after_restart_rejects_replaced_worktree_incarnation() {
+    let temp = TempDir::new("cleanup-replaced-incarnation");
+    let worktree = temp.path().join("worktree");
+    fs::create_dir_all(&worktree).unwrap();
+    fs::write(worktree.join(".git"), "old git link\n").unwrap();
+    let repo = Repository::with_config_dir_for_test(
+        temp.path().join("repo"),
+        temp.path().join("prism-config"),
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut persisted = AutoLaunch::new(&repo.root, &worktree, "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+    persisted.steps.clear();
+    persisted.steps.push(AutoStepRun::queued(
+        &persisted.run.id,
+        1,
+        AutoStepKey::Cleanup,
+        1,
+        Some("cleanup".to_string()),
+    ));
+    save_auto_run(&conn, &mut persisted).unwrap();
+    let mut restarted = load_auto_run(&conn, &persisted.run.id)
+        .unwrap()
+        .expect("restarted run");
+    start_non_agent_step(&conn, &mut restarted, 0).unwrap();
+    fs::remove_file(worktree.join(".git")).unwrap();
+    fs::write(worktree.join(".git"), "replacement git link\n").unwrap();
+    let mut config = test_config();
+    config.auto.cleanup_after_merge = true;
+
+    let error = execute_cleanup_step(&conn, &repo, &config, &mut restarted, 0, 100)
+        .expect_err("replacement cleanup must fail closed");
+
+    assert!(error.contains("was replaced"));
+    assert!(worktree.join(".git").exists());
 }
 
 fn push_test_step(
@@ -2215,6 +2493,17 @@ fn test_config() -> Config {
         user_path: PathBuf::from("/tmp/prism-user-config.toml"),
         repo_config_path: PathBuf::from("/tmp/prism-repo-config.toml"),
     }
+}
+
+fn ensure_next_test_step(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+) -> Result<bool, String> {
+    let repo = Repository::with_config_dir_for_test(
+        PathBuf::from(&persisted.run.repo_root),
+        PathBuf::from("/tmp/prism-auto-flow-test-config"),
+    );
+    ensure_next_auto_step_with_context(conn, &repo, &test_config(), persisted)
 }
 
 #[cfg(unix)]

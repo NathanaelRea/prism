@@ -259,7 +259,7 @@ pub(super) fn render_worktrees(
                         muted_style(),
                     )
                 }));
-                if worktree.pr.summary.is_none() && !worktree.prompt_summary.is_empty() {
+                if !worktree.pr.has_summary() && !worktree.prompt_summary.is_empty() {
                     spans.push(Span::styled(
                         format!("  {}", worktree.prompt_summary),
                         muted_style(),
@@ -509,10 +509,10 @@ pub(super) fn worktree_pr_column(
     if matches!(worktree.kind, crate::view::WorktreeKind::DefaultBranch) {
         return (" ", muted_style());
     }
-    if worktree.pr.error.is_some() {
+    if worktree.pr.display_error().is_some() {
         return (icon(icon_style, "!", ""), error_style());
     }
-    let Some(summary) = &worktree.pr.summary else {
+    let Some(summary) = worktree.pr.summary() else {
         return ("○", muted_style());
     };
     (pr_state_icon(summary, icon_style), pr_style(summary))
@@ -553,7 +553,7 @@ pub(super) fn worktree_ci_column(
     if matches!(worktree.kind, crate::view::WorktreeKind::DefaultBranch) {
         return (" ", muted_style());
     }
-    let Some(summary) = &worktree.pr.summary else {
+    let Some(summary) = worktree.pr.summary() else {
         return ("·", muted_style());
     };
     (
@@ -566,7 +566,7 @@ pub(super) fn worktree_comments_column(worktree: &crate::view::WorktreeRow) -> (
     if matches!(worktree.kind, crate::view::WorktreeKind::DefaultBranch) {
         return (" ".to_string(), muted_style());
     }
-    let label = if let Some(details) = &worktree.pr.details {
+    let label = if let Some(details) = worktree.pr.details() {
         let unresolved = details.comments.len()
             + details
                 .review_comments
@@ -583,7 +583,7 @@ pub(super) fn worktree_comments_column(worktree: &crate::view::WorktreeRow) -> (
         } else {
             format!("{unresolved}/{resolved}")
         }
-    } else if let Some(summary) = &worktree.pr.summary {
+    } else if let Some(summary) = worktree.pr.summary() {
         if summary.comment_count == 0 {
             "·".to_string()
         } else {
@@ -592,7 +592,7 @@ pub(super) fn worktree_comments_column(worktree: &crate::view::WorktreeRow) -> (
     } else {
         "·".to_string()
     };
-    let has_unresolved = worktree.pr.details.as_ref().is_some_and(|details| {
+    let has_unresolved = worktree.pr.details().is_some_and(|details| {
         !details.comments.is_empty()
             || details
                 .review_comments
@@ -613,7 +613,7 @@ pub(super) fn worktree_error_column(worktree: &crate::view::WorktreeRow) -> (&'s
     if matches!(worktree.kind, crate::view::WorktreeKind::DefaultBranch) {
         return (" ", muted_style());
     }
-    if worktree.pr.error.is_some() || worktree.agent_state == AgentState::ExitedError {
+    if worktree.pr.display_error().is_some() || worktree.agent_state == AgentState::ExitedError {
         ("!", error_style())
     } else if matches!(
         worktree.agent_state,

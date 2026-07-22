@@ -272,22 +272,24 @@ fn renders_worktree_sidebar_metadata() {
     config.worktree_columns = vec!["todo".to_string(), "owner".to_string()];
     let mut session = test_session("feature", AgentState::Running);
     session.status_label = "dirty 2 ahead 1".to_string();
-    session.pr.summary = Some(test_pr_summary());
-    session.pr.details = Some(PrDetails {
-        review_comments: vec![
-            PrReviewComment {
-                resolved: false,
-                body: "please fix".to_string(),
-                ..PrReviewComment::default()
-            },
-            PrReviewComment {
-                resolved: true,
-                body: "already handled".to_string(),
-                ..PrReviewComment::default()
-            },
-        ],
-        ..PrDetails::default()
-    });
+    session.pr = PrCache::observed(
+        test_pr_summary(),
+        Some(PrDetails {
+            review_comments: vec![
+                PrReviewComment {
+                    resolved: false,
+                    body: "please fix".to_string(),
+                    ..PrReviewComment::default()
+                },
+                PrReviewComment {
+                    resolved: true,
+                    body: "already handled".to_string(),
+                    ..PrReviewComment::default()
+                },
+            ],
+            ..PrDetails::default()
+        }),
+    );
     session
         .wt_columns
         .insert("todo".to_string(), "3".to_string());
@@ -411,7 +413,7 @@ fn renders_nerd_font_worktree_icons_when_configured() {
     session.status_label = "dirty 2".to_string();
     let mut summary = test_pr_summary();
     summary.check_status = "passed".to_string();
-    session.pr.summary = Some(summary);
+    session.pr = PrCache::observed(summary, None);
     let sessions = vec![session];
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     let buffer = render_to_string(&model, 160, 30);
@@ -1036,16 +1038,18 @@ fn worktree_main_panel_renders_opencode_workflow_states() {
 fn worktree_main_panel_renders_pr_comments_table() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
-    session.pr.summary = Some(test_pr_summary());
-    session.pr.details = Some(PrDetails {
-        review_comments: vec![PrReviewComment {
-            author: "reviewer".to_string(),
-            body: "please fix".to_string(),
-            resolved: false,
-            ..PrReviewComment::default()
-        }],
-        ..PrDetails::default()
-    });
+    session.pr = PrCache::observed(
+        test_pr_summary(),
+        Some(PrDetails {
+            review_comments: vec![PrReviewComment {
+                author: "reviewer".to_string(),
+                body: "please fix".to_string(),
+                resolved: false,
+                ..PrReviewComment::default()
+            }],
+            ..PrDetails::default()
+        }),
+    );
     let sessions = vec![session];
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
 
@@ -1061,7 +1065,7 @@ fn worktree_main_panel_renders_pr_comments_table() {
 fn worktree_main_panel_styles_open_and_merged_pr_numbers() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
-    session.pr.summary = Some(test_pr_summary());
+    session.pr = PrCache::observed(test_pr_summary(), None);
     let sessions = vec![session];
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     let open = render_to_buffer(&model, 120, 30);
@@ -1075,7 +1079,7 @@ fn worktree_main_panel_styles_open_and_merged_pr_numbers() {
     let mut summary = test_pr_summary();
     summary.merged = true;
     summary.state = "MERGED".to_string();
-    session.pr.summary = Some(summary);
+    session.pr = PrCache::observed(summary, None);
     let sessions = vec![session];
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     let merged = render_to_buffer(&model, 120, 30);
@@ -1093,7 +1097,7 @@ fn worktree_main_panel_styles_open_and_merged_pr_numbers() {
 fn renders_stabilization_pending_push_in_worktree_main_panel() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
-    session.pr.summary = Some(test_pr_summary());
+    session.pr = PrCache::observed(test_pr_summary(), None);
     let sessions = vec![session];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.auto_dashboard = Some(stabilization_dashboard(
@@ -1128,7 +1132,7 @@ fn worktree_main_panel_renders_review_gate() {
     let mut session = test_session("feature", AgentState::Idle);
     let mut summary = test_pr_summary();
     summary.requested_reviewers = vec!["review-team".to_string()];
-    session.pr.summary = Some(summary);
+    session.pr = PrCache::observed(summary, None);
     let sessions = vec![session];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.auto_dashboard = Some(stabilization_dashboard(
@@ -1147,7 +1151,7 @@ fn worktree_main_panel_renders_review_gate() {
 fn renders_stabilization_ci_failed_in_worktree_main_panel() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
-    session.pr.summary = Some(test_pr_summary());
+    session.pr = PrCache::observed(test_pr_summary(), None);
     let sessions = vec![session];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.auto_dashboard = Some(stabilization_dashboard(
@@ -1171,7 +1175,7 @@ fn renders_stabilization_merge_blocked_in_worktree_main_panel() {
     let mut summary = test_pr_summary();
     summary.check_status = "passed".to_string();
     summary.merge_state_status = "DIRTY".to_string();
-    session.pr.summary = Some(summary);
+    session.pr = PrCache::observed(summary, None);
     let sessions = vec![session];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.auto_dashboard = Some(stabilization_dashboard(
@@ -1196,7 +1200,7 @@ fn renders_stabilization_policy_unknown_in_worktree_main_panel() {
     let mut session = test_session("feature", AgentState::Idle);
     let mut summary = test_pr_summary();
     summary.check_status = "passed".to_string();
-    session.pr.summary = Some(summary);
+    session.pr = PrCache::observed(summary, None);
     let sessions = vec![session];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.auto_dashboard = Some(stabilization_dashboard(
@@ -1222,11 +1226,13 @@ fn renders_stabilization_ready_for_manual_merge_in_worktree_main_panel() {
     let mut summary = test_pr_summary();
     summary.check_status = "failed".to_string();
     summary.review_decision = "APPROVED".to_string();
-    session.pr.summary = Some(summary);
-    session.pr.details = Some(PrDetails {
-        failing_checks: vec!["docs".to_string()],
-        ..PrDetails::default()
-    });
+    session.pr = PrCache::observed(
+        summary,
+        Some(PrDetails {
+            failing_checks: vec!["docs".to_string()],
+            ..PrDetails::default()
+        }),
+    );
     let sessions = vec![session];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.auto_dashboard = Some(stabilization_dashboard(
@@ -1648,6 +1654,7 @@ fn test_auto_dashboard() -> AutoDashboard {
                 id: "auto-run".to_string(),
                 repo_root: "/repo".to_string(),
                 worktree_path: PathBuf::from("/repo/feature"),
+                worktree_incarnation: None,
                 branch: "feature".to_string(),
                 mode: AutoRunMode::Standard,
                 implementation_source: AutoImplementationSource::Prompt,

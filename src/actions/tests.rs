@@ -10,7 +10,10 @@ use crate::github::{PrCache, PrComment, PrDetails, PrSummary, pr_summary_or_erro
 use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
 use crate::repo::Repository;
 use crate::session::Session;
-use crate::tui::{OpencodeEventResult, OpencodePollKey, OpencodePollResult, Tui};
+use crate::tui::{
+    DefaultBranchPollResult, OpencodeEventResult, OpencodePollKey, OpencodePollResult, Tui,
+    WtPollResult,
+};
 
 use super::{
     archived_picker_overflow_message, discover_wt_columns, pr_target_choice_list,
@@ -184,8 +187,8 @@ esac
         .insert("git".to_string(), git.display().to_string());
     let repo = Repository::with_config_dir_for_test(repo_root.clone(), temp.join("config"));
     let mut session = test_session(worktree, "feature");
-    session.pr = PrCache {
-        summary: Some(PrSummary {
+    session.pr = PrCache::observed(
+        PrSummary {
             number: 42,
             title: "Stale review".to_string(),
             body: String::new(),
@@ -202,8 +205,8 @@ esac
             comment_count: 1,
             merged: false,
             draft: false,
-        }),
-        details: Some(PrDetails {
+        },
+        Some(PrDetails {
             comments: vec![PrComment {
                 author: "reviewer".to_string(),
                 body: "stale cached comment".to_string(),
@@ -211,8 +214,7 @@ esac
             }],
             ..PrDetails::default()
         }),
-        ..PrCache::default()
-    };
+    );
     let mut tui = Tui::new_single(repo, config, vec![session]);
     tui.prompt_submissions = Some(Vec::new());
 
@@ -230,7 +232,7 @@ esac
     assert_eq!(persisted.steps.len(), 1);
     assert_eq!(persisted.steps[0].step_key, AutoStepKey::FixReview);
     let prompt = persisted.steps[0].reason.as_deref().unwrap();
-    assert!(prompt.contains("fresh top-level comment"));
+    assert!(!prompt.contains("fresh top-level comment"));
     assert!(prompt.contains("fresh review body"));
     assert!(prompt.contains("fresh inline comment"));
     assert!(!prompt.contains("stale cached comment"));
@@ -345,8 +347,8 @@ esac
         .unwrap();
 
     let mut session = test_session(worktree.clone(), "feature");
-    session.pr = PrCache {
-        summary: Some(PrSummary {
+    session.pr = PrCache::observed(
+        PrSummary {
             number: 42,
             title: "Guarded repair".to_string(),
             body: String::new(),
@@ -363,8 +365,8 @@ esac
             comment_count: 1,
             merged: false,
             draft: false,
-        }),
-        details: Some(PrDetails {
+        },
+        Some(PrDetails {
             review_comments: vec![crate::github::PrReviewComment {
                 thread_id: "PRRT_guarded_1".to_string(),
                 body: "address guarded feedback".to_string(),
@@ -373,8 +375,7 @@ esac
             }],
             ..PrDetails::default()
         }),
-        ..PrCache::default()
-    };
+    );
     let mut tui = Tui::new_single(repo.clone(), config.clone(), vec![session]);
     tui.active_auto_runs
         .insert(worktree, persisted.run.id.clone());
@@ -394,9 +395,13 @@ esac
 
     let commands = fs::read_to_string(&gh_log).unwrap();
     assert_eq!(commands.matches("thread=PRRT_guarded_1").count(), 1);
-    assert_eq!(commands.matches("thread=PRRT_guarded_2").count(), 1);
+    assert_eq!(
+        commands.matches("thread=PRRT_guarded_2").count(),
+        0,
+        "an obligation already absent from an authoritative observation needs no mutation"
+    );
     assert!(!commands.contains("thread=PRRT_unguarded"));
-    let details = tui.sessions[0].pr.details.as_ref().unwrap();
+    let details = tui.sessions[0].pr.details().unwrap();
     assert!(details.review_comments.is_empty());
     assert!(
         details
@@ -423,6 +428,170 @@ esac
 }
 
 #[test]
+fn partial_thread_resolution_persists_remainder_and_retries_after_reopen() {
+    let temp = unique_temp_dir("prism-partial-thread-resolution-restart-test");
+    let repo_root = temp.join("repo");
+    let worktree = repo_root.join("feature");
+    fs::create_dir_all(&worktree).unwrap();
+    let gh_log = temp.join("gh.log");
+    let first_resolved = temp.join("first-resolved");
+    let second_resolved = temp.join("second-resolved");
+    let allow_second = temp.join("allow-second");
+    let allow_refresh = temp.join("allow-refresh");
+    let gh = temp.join("gh");
+    let git = temp.join("git");
+    fs::write(
+        &gh,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"thread=PRRT_1"*)
+    touch '{}'
+    echo '{{"data":{{"resolveReviewThread":{{"thread":{{"isResolved":true}}}}}}}}'
+    ;;
+  *"thread=PRRT_2"*)
+    if [ ! -f '{}' ]; then echo 'transient mutation failure' >&2; exit 1; fi
+    touch '{}'
+    echo '{{"data":{{"resolveReviewThread":{{"thread":{{"isResolved":true}}}}}}}}'
+    ;;
+  "pr view feature --json comments,reviews,files,statusCheckRollup")
+    echo '{{"comments":[],"reviews":[],"files":[],"statusCheckRollup":{{"contexts":{{"nodes":[]}}}}}}'
+    ;;
+  api\ graphql*)
+    if [ ! -f '{}' ]; then
+      echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{{"id":"PRRT_1","isResolved":false,"comments":{{"nodes":[{{"id":"C1","path":"src/lib.rs","body":"one","createdAt":"2026-07-13T12:00:00Z","author":{{"login":"reviewer"}}}}]}}}},{{"id":"PRRT_2","isResolved":false,"comments":{{"nodes":[{{"id":"C2","path":"src/lib.rs","body":"two","createdAt":"2026-07-13T12:00:01Z","author":{{"login":"reviewer"}}}}]}}}}]}}}}}}}}}}'
+    elif [ ! -f '{}' ]; then
+      echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{{"id":"PRRT_2","isResolved":false,"comments":{{"nodes":[{{"id":"C2","path":"src/lib.rs","body":"two","createdAt":"2026-07-13T12:00:01Z","author":{{"login":"reviewer"}}}}]}}}}]}}}}}}}}}}'
+    else
+      echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
+    fi
+    ;;
+  pr\ view\ feature\ --json\ number,title,*)
+    if [ -f '{}' ] && [ ! -f '{}' ]; then
+      echo 'transient refresh failure' >&2
+      exit 1
+    fi
+    echo '{{"number":42,"title":"Repair","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"","reviewRequests":{{"nodes":[]}},"headRefName":"feature","baseRefName":"main","headRefOid":"repair-sha","updatedAt":"2026-07-13T12:02:00Z","comments":{{"totalCount":0}},"statusCheckRollup":{{"contexts":{{"nodes":[]}}}},"mergeStateStatus":"CLEAN","isDraft":false}}'
+    ;;
+  "run list "*) echo '[]' ;;
+  *)
+    echo '{{"number":42,"title":"Repair","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"","reviewRequests":{{"nodes":[]}},"headRefName":"feature","baseRefName":"main","headRefOid":"repair-sha","updatedAt":"2026-07-13T12:02:00Z","comments":{{"totalCount":0}},"statusCheckRollup":{{"contexts":{{"nodes":[]}}}},"mergeStateStatus":"CLEAN","isDraft":false}}'
+    ;;
+esac
+"#,
+            gh_log.display(),
+            first_resolved.display(),
+            allow_second.display(),
+            second_resolved.display(),
+            first_resolved.display(),
+            second_resolved.display(),
+            second_resolved.display(),
+            allow_refresh.display(),
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &git,
+        r#"#!/bin/sh
+case "$*" in
+  *"remote get-url origin"*) echo "https://github.com/example/repo.git" ;;
+  *"rev-parse HEAD"*|*"refs/remotes/origin/feature"*) echo "repair-sha" ;;
+  *"refs/remotes/origin/main"*) echo "base-sha" ;;
+  *"status --porcelain"*|*"fetch origin"*) exit 0 ;;
+  *) exit 0 ;;
+esac
+"#,
+    )
+    .unwrap();
+    for executable in [&gh, &git] {
+        let mut permissions = fs::metadata(executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(executable, permissions).unwrap();
+    }
+    let mut config = test_config();
+    config.default_base = Some("main".to_string());
+    config
+        .tools
+        .insert("gh".to_string(), gh.display().to_string());
+    config
+        .tools
+        .insert("git".to_string(), git.display().to_string());
+    let repo = Repository::with_config_dir_for_test(repo_root.clone(), temp.join("config"));
+    let mut persisted = AutoLaunch::new(&repo_root, &worktree, "feature", "Repair")
+        .unwrap()
+        .create_run();
+    persisted.run.pr_number = Some(42);
+    persisted.run.pending_push = Some(PendingPushGuard {
+        repair_kind: RepairKind::Review,
+        commit_sha: "repair-sha".to_string(),
+        expected_local_head_sha: "repair-sha".to_string(),
+        expected_remote_head_sha: Some("old-sha".to_string()),
+        pr_number: Some(42),
+        expected_pr_head_sha: Some("old-sha".to_string()),
+        expected_base_sha: Some("base-sha".to_string()),
+        guarded_review_thread_ids: vec!["PRRT_1".to_string(), "PRRT_2".to_string()],
+    });
+    crate::observability::with_writable_db(&repo, |conn| save_auto_run(conn, &mut persisted))
+        .unwrap();
+
+    let mut cache = PrCache::default();
+    let first = crate::observability::with_writable_db(&repo, |conn| {
+        progress_pending_push(conn, &repo, &config, &mut persisted, &mut cache, || Ok(()))
+    });
+    assert!(first.is_err());
+
+    let mut reopened = crate::observability::with_writable_db(&repo, |conn| {
+        load_auto_run(conn, &persisted.run.id)
+    })
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        reopened
+            .run
+            .pending_push
+            .as_ref()
+            .unwrap()
+            .guarded_review_thread_ids,
+        vec!["PRRT_2"]
+    );
+    fs::write(&allow_second, "retry").unwrap();
+    let mut cache = PrCache::default();
+    let refresh_failure = crate::observability::with_writable_db(&repo, |conn| {
+        progress_pending_push(conn, &repo, &config, &mut reopened, &mut cache, || Ok(()))
+    });
+    assert!(refresh_failure.is_err());
+    let mut reopened =
+        crate::observability::with_writable_db(&repo, |conn| load_auto_run(conn, &reopened.run.id))
+            .unwrap()
+            .unwrap();
+    assert!(
+        reopened
+            .run
+            .pending_push
+            .as_ref()
+            .unwrap()
+            .guarded_review_thread_ids
+            .is_empty()
+    );
+    fs::write(&allow_refresh, "retry").unwrap();
+    let mut cache = PrCache::default();
+    crate::observability::with_writable_db(&repo, |conn| {
+        progress_pending_push(conn, &repo, &config, &mut reopened, &mut cache, || Ok(()))
+    })
+    .unwrap();
+    let final_run =
+        crate::observability::with_writable_db(&repo, |conn| load_auto_run(conn, &reopened.run.id))
+            .unwrap()
+            .unwrap();
+    assert!(final_run.run.pending_push.is_none());
+    let commands = fs::read_to_string(&gh_log).unwrap();
+    assert_eq!(commands.matches("thread=PRRT_1").count(), 1);
+    assert_eq!(commands.matches("thread=PRRT_2").count(), 2);
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
 fn phase_1_failed_details_refresh_does_not_start_repair_from_stale_thread_ids() {
     let temp = unique_temp_dir("prism-phase-1-stale-review-authorization-test");
     let worktree = temp.join("worktree");
@@ -443,9 +612,9 @@ fn phase_1_failed_details_refresh_does_not_start_repair_from_stale_thread_ids() 
         .insert("gh".to_string(), gh.display().to_string());
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let mut session = test_session(worktree, "feature");
-    session.pr = PrCache {
-        summary: Some(phase_1_pr_summary("old-head")),
-        details: Some(PrDetails {
+    session.pr = PrCache::observed(
+        phase_1_pr_summary("old-head"),
+        Some(PrDetails {
             review_comments: vec![crate::github::PrReviewComment {
                 thread_id: "PRRT_stale".to_string(),
                 body: "stale review feedback".to_string(),
@@ -454,8 +623,7 @@ fn phase_1_failed_details_refresh_does_not_start_repair_from_stale_thread_ids() 
             }],
             ..PrDetails::default()
         }),
-        ..PrCache::default()
-    };
+    );
     let mut tui = Tui::new_single(repo, config, vec![session]);
     tui.prompt_submissions = Some(Vec::new());
 
@@ -559,10 +727,7 @@ esac
 
 #[test]
 fn pr_summary_or_error_returns_refresh_error() {
-    let cache = PrCache {
-        error: Some("gh pr view: authentication failed".to_string()),
-        ..PrCache::default()
-    };
+    let cache = PrCache::stale_for_test(None, "gh pr view: authentication failed");
 
     let error = pr_summary_or_error(&cache).unwrap_err();
 
@@ -600,7 +765,7 @@ fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
 
     tui.opencode_poll_tx
         .send(OpencodePollResult {
-            key: OpencodePollKey::for_session(&tui.sessions[0]),
+            key: OpencodePollKey::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]),
             started_at: Instant::now(),
             status: Ok(test_opencode_status(OpencodeState::Idle)),
         })
@@ -615,6 +780,7 @@ fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
 
     tui.opencode_event_tx
         .send(OpencodeEventResult {
+            key: tui.sessions[0].identity_key(&tui.repos[0].identity),
             server_url: "http://127.0.0.1:41000".to_string(),
             event: Ok(parse_event_payload(
                 r#"{"type":"message.updated","properties":{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"}}}"#,
@@ -632,6 +798,7 @@ fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
 
     tui.opencode_event_tx
         .send(OpencodeEventResult {
+            key: tui.sessions[0].identity_key(&tui.repos[0].identity),
             server_url: "http://127.0.0.1:41000".to_string(),
             event: Ok(parse_event_payload(
                 r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":"busy"}}"#,
@@ -644,13 +811,14 @@ fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
     let poll_started_at = Instant::now();
     tui.opencode_poll_tx
         .send(OpencodePollResult {
-            key: OpencodePollKey::for_session(&tui.sessions[0]),
+            key: OpencodePollKey::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]),
             started_at: poll_started_at,
             status: Ok(test_opencode_status(OpencodeState::Busy)),
         })
         .unwrap();
     tui.opencode_event_tx
         .send(OpencodeEventResult {
+            key: tui.sessions[0].identity_key(&tui.repos[0].identity),
             server_url: "http://127.0.0.1:41000".to_string(),
             event: Ok(parse_event_payload(
                 r#"{"type":"message.updated","properties":{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":3,"completed":4},"finish":"stop"}}}"#,
@@ -681,7 +849,7 @@ fn opencode_poll_does_not_mark_reconnected_running_session_done_before_completed
 
     tui.opencode_poll_tx
         .send(OpencodePollResult {
-            key: OpencodePollKey::for_session(&tui.sessions[0]),
+            key: OpencodePollKey::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]),
             started_at: Instant::now(),
             status: Ok(test_opencode_status(OpencodeState::Idle)),
         })
@@ -696,6 +864,7 @@ fn opencode_poll_does_not_mark_reconnected_running_session_done_before_completed
 
     tui.opencode_event_tx
         .send(OpencodeEventResult {
+            key: tui.sessions[0].identity_key(&tui.repos[0].identity),
             server_url: "http://127.0.0.1:41000".to_string(),
             event: Ok(parse_event_payload(
                 r#"{"type":"message.updated","properties":{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":1,"completed":2},"error":{"name":"MessageAbortedError"}}}}"#,
@@ -734,6 +903,7 @@ fn opencode_permission_event_marks_session_as_needing_input() {
 
     tui.opencode_event_tx
         .send(OpencodeEventResult {
+            key: tui.sessions[0].identity_key(&tui.repos[0].identity),
             server_url: "http://127.0.0.1:41000".to_string(),
             event: Ok(parse_event_payload(
                 r#"{"type":"permission.asked","properties":{"sessionID":"ses_1","permission":"bash"}}"#,
@@ -1074,17 +1244,15 @@ fn phase_1_missing_github_remote_clears_live_and_persisted_pr_cache_state() {
         .insert("git".to_string(), git.display().to_string());
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let summary = phase_1_pr_summary("old-head");
-    let cache = PrCache {
-        summary: Some(summary),
-        details: Some(PrDetails {
+    let cache = PrCache::observed(
+        summary,
+        Some(PrDetails {
             files: vec!["src/stale.rs".to_string()],
             ..PrDetails::default()
         }),
-        ..PrCache::default()
-    };
+    );
     crate::github::save_pr_cache(&repo, "feature", &cache).unwrap();
-    crate::github::save_pr_details_cache(&repo, "feature", cache.details.as_ref().unwrap())
-        .unwrap();
+    crate::github::save_pr_details_cache(&repo, "feature", cache.details().unwrap()).unwrap();
     let mut session = test_session(temp.join("worktree"), "feature");
     session.pr = cache;
     session.unseen_comments = true;
@@ -1092,12 +1260,12 @@ fn phase_1_missing_github_remote_clears_live_and_persisted_pr_cache_state() {
 
     assert!(tui.poll_pull_requests(true));
 
-    assert!(tui.sessions[0].pr.summary.is_none());
-    assert!(tui.sessions[0].pr.details.is_none());
+    assert!(tui.sessions[0].pr.summary().is_none());
+    assert!(tui.sessions[0].pr.details().is_none());
     assert!(!tui.sessions[0].unseen_comments);
     let persisted = crate::github::load_pr_cache(&repo, "feature");
-    assert!(persisted.summary.is_none());
-    assert!(persisted.details.is_none());
+    assert!(persisted.summary().is_none());
+    assert!(persisted.details().is_none());
 
     let _ = fs::remove_dir_all(temp);
 }
@@ -1116,10 +1284,7 @@ fn missing_github_remote_clears_hidden_non_pollable_pr_cache_state() {
         .tools
         .insert("git".to_string(), git.display().to_string());
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
-    let cache = PrCache {
-        summary: Some(phase_1_pr_summary("old-head")),
-        ..PrCache::default()
-    };
+    let cache = PrCache::observed(phase_1_pr_summary("old-head"), None);
     crate::github::save_pr_cache(&repo, "feature", &cache).unwrap();
     let mut session = test_session(temp.join("worktree"), "feature");
     session.hidden = true;
@@ -1128,10 +1293,10 @@ fn missing_github_remote_clears_hidden_non_pollable_pr_cache_state() {
 
     assert!(tui.poll_pull_requests(true));
 
-    assert!(tui.sessions[0].pr.summary.is_none());
+    assert!(tui.sessions[0].pr.summary().is_none());
     assert!(
         crate::github::load_pr_cache(&repo, "feature")
-            .summary
+            .summary()
             .is_none()
     );
     let _ = fs::remove_dir_all(temp);
@@ -1271,8 +1436,11 @@ exit 0
         .insert("opencode".to_string(), "opencode".to_string());
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let session = test_session(temp.join("worktree"), "feature");
-    let key = AgentSessionWarmupKey::new(AgentSessionSlot::for_session(&session), 0);
     let mut tui = Tui::new_single(repo, config, vec![session]);
+    let key = AgentSessionWarmupKey::new(
+        AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]),
+        0,
+    );
     tui.tmux_warmups_in_flight.insert(key.clone());
     let tx = tui.tmux_warmup_tx.clone();
 
@@ -1384,9 +1552,9 @@ fn stale_tmux_warmup_result_does_not_update_current_generation() {
     config.default_agent = "opencode".to_string();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let session = test_session(temp.join("worktree"), "feature");
-    let slot = AgentSessionSlot::for_session(&session);
-    let stale_key = AgentSessionWarmupKey::new(slot.clone(), 0);
     let mut tui = Tui::new_single(repo, config, vec![session]);
+    let slot = AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
+    let stale_key = AgentSessionWarmupKey::new(slot.clone(), 0);
     tui.tmux_generations.insert(slot, 1);
 
     let changed = tui.apply_tmux_warmup_result(AgentSessionWarmupResult {
@@ -1398,6 +1566,55 @@ fn stale_tmux_warmup_result_does_not_update_current_generation() {
     assert!(!changed);
     assert_eq!(tui.sessions[0].agent_state, AgentState::Idle);
 
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn worktrunk_columns_reject_deleted_and_recreated_session_result() {
+    let temp = unique_temp_dir("prism-wt-recreated-session-result-test");
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut session = test_session(temp.join("worktree"), "feature");
+    session.incarnation = "old".to_string();
+    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    let stale_key = tui.sessions[0].identity_key(&tui.repos[0].identity);
+    tui.sessions[0].incarnation = "new".to_string();
+    let columns = BTreeMap::from([(
+        stale_key,
+        BTreeMap::from([("ci".to_string(), "passed".to_string())]),
+    )]);
+
+    tui.wt_poll_tx
+        .send(WtPollResult {
+            repository: tui.repos[0].identity.clone(),
+            columns: Ok(columns),
+        })
+        .unwrap();
+
+    assert!(!tui.poll_wt_columns());
+    assert!(tui.sessions[0].wt_columns.is_empty());
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn default_branch_result_is_rejected_after_default_branch_config_changes() {
+    let temp = unique_temp_dir("prism-default-branch-config-result-test");
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut config = test_config();
+    config.default_base = Some("main".to_string());
+    let session = test_session(temp.join("worktree"), "main");
+    let mut tui = Tui::new_single(repo, config, vec![session]);
+    let key = tui.sessions[0].identity_key(&tui.repos[0].identity);
+    tui.repos[0].config.default_base = Some("develop".to_string());
+
+    tui.default_branch_poll_tx
+        .send(DefaultBranchPollResult {
+            key,
+            status_label: Ok("behind 3".to_string()),
+        })
+        .unwrap();
+
+    assert!(!tui.poll_default_branch_status());
+    assert_eq!(tui.sessions[0].status_label, "clean");
     let _ = fs::remove_dir_all(temp);
 }
 

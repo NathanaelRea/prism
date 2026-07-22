@@ -209,11 +209,7 @@ impl Tui {
         if let Some(index) = self.sessions.iter().position(|session| {
             !session.hidden
                 && session.repo_index == repo_index
-                && session
-                    .pr
-                    .summary
-                    .as_ref()
-                    .is_some_and(|cached| cached.number == summary.number)
+                && session.pr.is_for_pr(summary.number)
         }) {
             self.select_worktree(index);
             self.focus_worktrees();
@@ -290,10 +286,6 @@ impl Tui {
             return Ok(());
         };
         let selected = context.session_index;
-        if self.sessions[selected].is_default_branch(&context.config) {
-            self.show_message("default branch has no PR review comments")?;
-            return Ok(());
-        }
         {
             let session = &mut self.sessions[selected];
             refresh_pr_cache(
@@ -305,21 +297,12 @@ impl Tui {
                 true,
             )?;
         }
-        let tracked = crate::review::build_tracked_review_fix_prompt(
+        let repair = crate::auto_flow::stabilization_execute::prepare_standalone_repair(
             &self.sessions[selected],
             &context.config,
+            crate::auto_flow::stabilization_model::RepairKind::Review,
         )?;
-        self.start_managed_repair(
-            selected,
-            &context.repo,
-            &context.config,
-            AutoStepKey::FixReview,
-            tracked.prompt,
-            Some(crate::auto_flow::stabilization_model::WorkGuard {
-                review_thread_ids: tracked.review_thread_ids,
-                ..Default::default()
-            }),
-        )?;
+        self.start_managed_repair(selected, &context.repo, &context.config, repair)?;
         self.show_message("started managed review repair; commit will wait for guarded push")?;
         Ok(())
     }
@@ -333,12 +316,7 @@ impl Tui {
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
-        let Some(context) = self.selected_worktree_context() else {
-            return Ok(());
-        };
-        let selected = context.session_index;
-        if self.sessions[selected].is_default_branch(&context.config) {
-            self.show_message("default branch has no PR CI failures")?;
+        if self.selected_worktree_context().is_none() {
             return Ok(());
         }
         self.show_loading_dialog(
@@ -354,10 +332,6 @@ impl Tui {
             return Ok(());
         };
         let selected = context.session_index;
-        if self.sessions[selected].is_default_branch(&context.config) {
-            self.show_message("default branch has no PR CI failures")?;
-            return Ok(());
-        }
         {
             let session = &mut self.sessions[selected];
             refresh_pr_cache(
@@ -369,15 +343,12 @@ impl Tui {
                 true,
             )?;
         }
-        let prompt = build_ci_failure_prompt(&self.sessions[selected], &context.config)?;
-        self.start_managed_repair(
-            selected,
-            &context.repo,
+        let repair = crate::auto_flow::stabilization_execute::prepare_standalone_repair(
+            &self.sessions[selected],
             &context.config,
-            AutoStepKey::FixCi,
-            prompt,
-            None,
+            crate::auto_flow::stabilization_model::RepairKind::Ci,
         )?;
+        self.start_managed_repair(selected, &context.repo, &context.config, repair)?;
         self.show_message("started managed CI repair; commit will wait for guarded push")?;
         Ok(())
     }
@@ -387,9 +358,7 @@ impl Tui {
         selected: usize,
         repo: &crate::repo::Repository,
         config: &crate::config::Config,
-        step_key: AutoStepKey,
-        prompt: String,
-        work_guard: Option<crate::auto_flow::stabilization_model::WorkGuard>,
+        repair: crate::auto_flow::stabilization_execute::StandaloneRepair,
     ) -> Result<(), String> {
         let session_path = self.sessions[selected].path.clone();
         let session_branch = self.sessions[selected].branch.clone();
@@ -422,31 +391,22 @@ impl Tui {
             run.steps.clear();
             run.run.pr_number = self.sessions[selected]
                 .pr
-                .summary
-                .as_ref()
+                .summary()
                 .map(|summary| summary.number);
             run.run.pr_url = self.sessions[selected]
                 .pr
-                .summary
-                .as_ref()
+                .summary()
                 .map(|summary| summary.url.clone());
             run.run.current_head_sha = crate::git::current_head_sha(&session_path, config).ok();
             run
         };
 
         crate::observability::with_writable_db(repo, |conn| {
-            save_auto_run(conn, &mut persisted)?;
-            if let Some(work_guard) = work_guard {
-                crate::auto_flow::append_step_run_with_work_guard(
-                    conn,
-                    &mut persisted,
-                    step_key,
-                    Some(prompt),
-                    work_guard,
-                )?;
-            } else {
-                append_step_run(conn, &mut persisted, step_key, Some(prompt))?;
-            }
+            crate::auto_flow::stabilization_execute::queue_standalone_repair(
+                conn,
+                &mut persisted,
+                repair,
+            )?;
             Ok(())
         })?;
         self.remember_auto_run(persisted.clone());
@@ -480,7 +440,7 @@ impl Tui {
             self.show_message("cannot open a PR for a detached worktree")?;
             return Ok(());
         }
-        if self.sessions[selected].pr.summary.is_none() {
+        if !self.sessions[selected].pr.has_summary() {
             self.show_loading_dialog(raw, "Open Pull Request", "Refreshing pull request")?;
             let session = &mut self.sessions[selected];
             refresh_pr_cache(
@@ -543,9 +503,7 @@ impl Tui {
                 true,
             )?;
         }
-        if self.sessions[selected].pr.summary.is_none()
-            && !self.sessions[selected].is_default_branch(&context.config)
-        {
+        if !self.sessions[selected].pr.has_summary() {
             run_pre_pr_checks(&context.config, &path)?;
             let target_repo =
                 if let Ok(upstream) = github_remote_repo(&path, &context.config, "upstream") {
@@ -654,42 +612,62 @@ impl Tui {
         }
         let path = self.sessions[selected].path.clone();
         let branch = self.sessions[selected].branch.clone();
-        {
-            let session = &mut self.sessions[selected];
-            refresh_pr_cache(
+        let initial_authorization =
+            crate::auto_flow::stabilization_execute::observe_manual_merge_authorization(
                 &context.repo,
-                &session.branch,
-                &mut session.pr,
-                &session.path,
                 &context.config,
-                false,
-            )?;
-        }
-        let Some(summary) = pr_summary_or_error(&self.sessions[selected].pr)? else {
-            self.show_message("no pull request found for selected branch")?;
-            return Ok(());
+                &mut self.sessions[selected],
+            );
+        let initially_observed_pr_number = match &initial_authorization {
+            crate::auto_flow::stabilization_execute::MergeAuthorization::Authorized(token) => {
+                token.pr_number()
+            }
+            crate::auto_flow::stabilization_execute::MergeAuthorization::Blocked(state) => {
+                if state.blocker
+                    == crate::auto_flow::stabilization_model::StabilizationBlocker::Merged
+                {
+                    self.show_message("pull request is already merged")?;
+                } else if state.blocker
+                    == crate::auto_flow::stabilization_model::StabilizationBlocker::NeedsPullRequest
+                {
+                    self.show_message("no pull request found for selected branch")?;
+                } else {
+                    self.show_message(&format!("merge blocked: {}", state.reason))?;
+                }
+                return Ok(());
+            }
         };
-        if summary.merged {
-            self.show_message("pull request is already merged")?;
-            return Ok(());
-        }
-        if selected_dirty(&path, &context.config)? {
-            self.show_message("working tree is dirty; commit or stash before merging")?;
-            return Ok(());
-        }
         run_pre_push_checks(&context.config, &path)?;
         self.show_loading_dialog(
             raw,
             "Merge Pull Request",
-            &format!("Merging PR #{}", summary.number),
+            &format!("Reobserving and merging PR #{initially_observed_pr_number}"),
         )?;
-        merge_pull_request(&context.config, &path, summary.number)?;
+        let execution =
+            crate::auto_flow::stabilization_execute::reobserve_and_execute_manual_merge(
+                &context.repo,
+                &context.config,
+                &mut self.sessions[selected],
+                initial_authorization,
+            )?;
+        let pr_number = match execution {
+            crate::auto_flow::stabilization_execute::ManualMergeExecution::Merged { pr_number } => {
+                pr_number
+            }
+            crate::auto_flow::stabilization_execute::ManualMergeExecution::Blocked(state) => {
+                self.show_message(&format!(
+                    "merge blocked after pre-push checks: {}",
+                    state.reason
+                ))?;
+                return Ok(());
+            }
+        };
         self.show_loading_dialog(
             raw,
             "Merge Pull Request",
-            &format!("Verifying PR #{} is merged", summary.number),
+            &format!("Verifying PR #{pr_number} is merged"),
         )?;
-        let merged = match wait_for_pr_merged(&path, summary.number, &context.config) {
+        let merged = match wait_for_pr_merged(&path, pr_number, &context.config) {
             Ok(merged) => merged,
             Err(error) => {
                 self.refresh_sessions()?;
