@@ -145,6 +145,7 @@ impl Tui {
                 initial_prompt: prompt,
             },
         )?
+        .with_harness(context.config.default_harness.clone())
         .with_worktree_incarnation(session_incarnation);
         let mut persisted = launch.create_run();
         crate::observability::with_writable_db(&context.repo, |conn| {
@@ -215,16 +216,32 @@ impl Tui {
     ) {
         thread::spawn(move || {
             let worktree_path = persisted.run.worktree_path.clone();
-            let server_url = crate::opencode::ensure_opencode_server(
-                &repo,
-                &config,
-                &persisted.run.branch,
-                &worktree_path,
-            )
-            .ok()
-            .map(|runtime| runtime.server_url);
-            let executor = AutoExecutorConfig::new(
-                config.tool("opencode"),
+            let Ok(harness_config) = config.harness_config(&persisted.run.harness_id) else {
+                let error = format!(
+                    "auto run harness '{}' is no longer configured",
+                    persisted.run.harness_id
+                );
+                let _ = crate::observability::with_writable_db(&repo, |conn| {
+                    crate::auto_flow::fail_auto_run(conn, &mut persisted, error)
+                });
+                return;
+            };
+            let server_url = (harness_config.adapter == "opencode")
+                .then(|| {
+                    crate::opencode::ensure_opencode_server_with_program(
+                        &repo,
+                        &config,
+                        &persisted.run.branch,
+                        &worktree_path,
+                        &harness_config.interactive_command[0],
+                    )
+                    .ok()
+                })
+                .flatten()
+                .map(|runtime| runtime.server_url);
+            let executor = AutoExecutorConfig::for_harness(
+                persisted.run.harness_id.clone(),
+                harness_config,
                 server_url,
                 worktree_path,
                 format!("Auto Flow {}", persisted.run.prompt_summary),

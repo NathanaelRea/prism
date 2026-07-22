@@ -20,12 +20,12 @@
 - **Constraint**: Normal Prism operation does not require the external `sqlite3`
   executable. Build-time and runtime prerequisites are documented separately.
 - **Customization**: Users can override executable paths for Git, GitHub CLI,
-  tmux, Worktrunk, lazygit, fzf, and OpenCode.
+  tmux, Worktrunk, lazygit, fzf, and configured harnesses.
 - **Behavior**: Startup validates tools required for the selected mode and names
   missing tools and relevant configuration locations. Optional tools are checked
   only when their actions require them.
 - **Behavior**: `prism doctor` reports tool availability and versions, GitHub
-  authentication, configured checks, agent availability, and discovered
+  authentication, configured checks, selected harness capabilities, and discovered
   worktrees.
 
 ## Verification Commands

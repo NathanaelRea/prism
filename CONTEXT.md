@@ -93,18 +93,18 @@ signature, default-branch, or optional-detail rules.
 ### Plan Mode
 
 Plan mode is Prism's workflow for executing Markdown implementation plans as
-numbered steps through OpenCode. The user selects or passes a plan file, Prism
+numbered steps through a recorded harness adapter. The user selects or passes a plan file, Prism
 infers phase count from headings like `Phase 1`, and then builds each step as a
 task such as `Implement plan-better.md phase 6`.
 
 Plan runs are modeled as persistent Prism state: a `PlanRun` owns the selected
 repository or worktree scope, plan file, mode, and aggregate status, while
-`PlanStepRun` records track per-phase prompts, OpenCode session/process
+`PlanStepRun` records track per-phase prompts, neutral session/process
 metadata, latest message/tool/todo state, and bounded output lines. Prism stores
 that state in its own SQLite database under the user's Prism config directory,
 not in the project repository.
 
-Plan phases use OpenCode's `medium` agent variant by default. The selected
+OpenCode Plan phases use its `medium` agent variant by default. The selected
 variant is persisted on each `PlanStepRun` and shown in the plan dashboard so
 historical phase output remains explainable.
 

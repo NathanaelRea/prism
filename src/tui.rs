@@ -3624,6 +3624,7 @@ mod tests {
     fn test_auto_run(id: &str, worktree_path: &str, updated_unix_ms: u64) -> PersistedAutoRun {
         PersistedAutoRun {
             run: AutoRun {
+                harness_id: "opencode".to_string(),
                 id: id.to_string(),
                 repo_root: "/repo-one".to_string(),
                 worktree_path: PathBuf::from(worktree_path),
@@ -3659,6 +3660,7 @@ mod tests {
     fn test_plan_run(id: &str, scope_path: &str) -> PersistedPlanRun {
         PersistedPlanRun {
             run: PlanRun {
+                harness_id: "opencode".to_string(),
                 id: id.to_string(),
                 repo_root: "/repo-one".to_string(),
                 scope_path: PathBuf::from(scope_path),

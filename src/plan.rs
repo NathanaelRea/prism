@@ -211,29 +211,38 @@ pub fn run_plan_mode(cwd: &Path, config: &Config, path: Option<&Path>) -> Result
         execution.start,
         execution.total,
         PlanRunMode::Sequential,
-    )?;
-    let server_url = match crate::opencode::ensure_opencode_server(
-        &repo,
-        config,
-        "plan",
-        &execution.cwd,
-    ) {
-        Ok(runtime) => Some(runtime.server_url),
-        Err(error) => {
-            eprintln!(
-                "warning: could not start OpenCode server for attach; falling back to direct opencode run: {error}"
-            );
-            None
+    )?
+    .with_harness(config.default_harness.clone());
+    let selected_harness = config.harness_config(&config.default_harness)?;
+    let server_url = if selected_harness.adapter == "opencode" {
+        match crate::opencode::ensure_opencode_server_with_program(
+            &repo,
+            config,
+            "plan",
+            &execution.cwd,
+            &selected_harness.interactive_command[0],
+        ) {
+            Ok(runtime) => Some(runtime.server_url),
+            Err(error) => {
+                eprintln!(
+                    "warning: could not start OpenCode server for attach; falling back to direct opencode run: {error}"
+                );
+                None
+            }
         }
+    } else {
+        None
     };
 
-    let mut executor = PlanExecutorConfig::new(
-        config.tool("opencode"),
+    let mut executor = PlanExecutorConfig::for_harness(
+        config.default_harness.clone(),
+        selected_harness.clone(),
         server_url,
         execution.cwd.clone(),
         execution.plan_file.clone(),
     );
-    if config.opencode_plan_plugin
+    if selected_harness.adapter == "opencode"
+        && config.opencode_plan_plugin
         && let Ok(plugin) = prepare_plan_plugin_config(&repo.prism_dir())
     {
         executor = executor.with_plugin_config(plugin);

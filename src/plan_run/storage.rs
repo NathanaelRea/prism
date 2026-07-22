@@ -5,6 +5,7 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
         "
         create table if not exists plan_run (
           id text primary key,
+          harness_id text not null default 'opencode',
           repo_root text not null,
           scope_path text not null,
           plan_path text not null,
@@ -65,6 +66,12 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
         ",
     )
     .map_err(|error| format!("create plan run schema: {error}"))?;
+    add_column_if_missing(
+        conn,
+        "plan_run",
+        "harness_id",
+        "alter table plan_run add column harness_id text not null default 'opencode'",
+    )?;
     add_column_if_missing(
         conn,
         "plan_run",
@@ -169,8 +176,9 @@ pub fn load_resumable_plan_run(
                and plan_path = ?3
                and step_name = ?4
                and start_step = ?5
-               and total_steps = ?6
-               and mode = ?7
+                and total_steps = ?6
+                and mode = ?7
+                and harness_id = ?8
                and archived_unix_ms is null
                and status in ('queued', 'running', 'paused')
              order by updated_unix_ms desc
@@ -183,6 +191,7 @@ pub fn load_resumable_plan_run(
                 usize_to_i64(launch.start_step),
                 usize_to_i64(launch.total_steps),
                 launch.mode.as_str(),
+                launch.harness_id.as_str(),
             ],
             |row| row.get::<_, String>(0),
         )
@@ -201,12 +210,13 @@ pub fn save_plan_step(conn: &rusqlite::Connection, step: &PlanStepRun) -> Result
 pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &PlanRun) -> Result<(), String> {
     conn.execute(
         "insert into plan_run (
-           id, repo_root, scope_path, plan_path, plan_display, step_name, start_step,
+           id, harness_id, repo_root, scope_path, plan_path, plan_display, step_name, start_step,
            total_steps, mode, status, pause_requested, selected_step, created_unix_ms,
            updated_unix_ms, archived_unix_ms
-         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
          on conflict(id) do update set
-           repo_root = excluded.repo_root,
+            repo_root = excluded.repo_root,
+            harness_id = excluded.harness_id,
            scope_path = excluded.scope_path,
            plan_path = excluded.plan_path,
            plan_display = excluded.plan_display,
@@ -221,6 +231,7 @@ pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &PlanRun) -> 
            archived_unix_ms = excluded.archived_unix_ms",
         params![
             run.id.as_str(),
+            run.harness_id.as_str(),
             run.repo_root.as_str(),
             run.scope_path.display().to_string(),
             run.plan_path.display().to_string(),
@@ -309,32 +320,33 @@ pub(super) fn load_run_with_conn(
     run_id: &str,
 ) -> Result<Option<PlanRun>, String> {
     conn.query_row(
-        "select id, repo_root, scope_path, plan_path, plan_display, step_name,
+        "select id, harness_id, repo_root, scope_path, plan_path, plan_display, step_name,
                 start_step, total_steps, mode, status, pause_requested, selected_step,
                 created_unix_ms, updated_unix_ms, archived_unix_ms
          from plan_run
          where id = ?1",
         params![run_id],
         |row| {
-            let mode: String = row.get(8)?;
-            let status: String = row.get(9)?;
+            let mode: String = row.get(9)?;
+            let status: String = row.get(10)?;
             Ok(PlanRun {
                 id: row.get(0)?,
-                repo_root: row.get(1)?,
-                scope_path: PathBuf::from(row.get::<_, String>(2)?),
-                plan_path: PathBuf::from(row.get::<_, String>(3)?),
-                plan_display: row.get(4)?,
-                step_name: row.get(5)?,
-                start_step: i64_to_usize(row.get(6)?, 6),
-                total_steps: i64_to_usize(row.get(7)?, 7),
+                harness_id: row.get(1)?,
+                repo_root: row.get(2)?,
+                scope_path: PathBuf::from(row.get::<_, String>(3)?),
+                plan_path: PathBuf::from(row.get::<_, String>(4)?),
+                plan_display: row.get(5)?,
+                step_name: row.get(6)?,
+                start_step: i64_to_usize(row.get(7)?, 7),
+                total_steps: i64_to_usize(row.get(8)?, 8),
                 mode: PlanRunMode::parse(&mode).map_err(from_string_error)?,
                 status: PlanRunStatus::parse(&status).map_err(from_string_error)?,
-                pause_requested: row.get::<_, i64>(10)? != 0,
-                selected_step: i64_to_usize(row.get(11)?, 11),
-                created_unix_ms: i64_to_u64(row.get(12)?, 12),
-                updated_unix_ms: i64_to_u64(row.get(13)?, 13),
+                pause_requested: row.get::<_, i64>(11)? != 0,
+                selected_step: i64_to_usize(row.get(12)?, 12),
+                created_unix_ms: i64_to_u64(row.get(13)?, 13),
+                updated_unix_ms: i64_to_u64(row.get(14)?, 14),
                 archived_unix_ms: row
-                    .get::<_, Option<i64>>(14)?
+                    .get::<_, Option<i64>>(15)?
                     .map(|value| value.max(0) as u64),
             })
         },

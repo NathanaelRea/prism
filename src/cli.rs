@@ -326,7 +326,8 @@ fn run_auto_command(
         return Err("Auto Flow requires a clean worktree at launch".to_string());
     }
     let launch_options = auto_launch_options_for_command(repo, branch, command)?;
-    let launch = AutoLaunch::with_options(&repo.root, &repo.root, launch_options)?;
+    let launch = AutoLaunch::with_options(&repo.root, &repo.root, launch_options)?
+        .with_harness(config.default_harness.clone());
     let mut persisted = launch.create_run();
     observability::with_writable_db(repo, |conn| save_auto_run(conn, &mut persisted))?;
     run_auto_executor(repo, config, &mut persisted)?;
@@ -439,15 +440,29 @@ fn run_auto_executor(
     config: &Config,
     persisted: &mut crate::auto_flow::PersistedAutoRun,
 ) -> Result<(), String> {
-    let runtime = crate::opencode::ensure_opencode_server(
-        repo,
-        config,
-        &persisted.run.branch,
-        &persisted.run.worktree_path,
-    )
-    .ok();
-    let executor = AutoExecutorConfig::new(
-        config.tool("opencode"),
+    let harness_config = config
+        .harness_config(&persisted.run.harness_id)
+        .map_err(|_| {
+            format!(
+                "auto run harness '{}' is no longer configured",
+                persisted.run.harness_id
+            )
+        })?;
+    let runtime = (harness_config.adapter == "opencode")
+        .then(|| {
+            crate::opencode::ensure_opencode_server_with_program(
+                repo,
+                config,
+                &persisted.run.branch,
+                &persisted.run.worktree_path,
+                &harness_config.interactive_command[0],
+            )
+            .ok()
+        })
+        .flatten();
+    let executor = AutoExecutorConfig::for_harness(
+        persisted.run.harness_id.clone(),
+        harness_config,
         runtime.map(|runtime| runtime.server_url),
         persisted.run.worktree_path.clone(),
         format!("Auto Flow {}", persisted.run.prompt_summary),

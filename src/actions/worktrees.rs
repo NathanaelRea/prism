@@ -161,8 +161,9 @@ impl Tui {
         }
         if !initial_prompt.trim().is_empty() {
             self.show_loading_dialog(raw, "Create Session", "Starting agent session")?;
-            self.paste_prompt_into_tmux_agent(index, &initial_prompt, false)?;
-            self.show_message("pasted initial prompt into agent session")?;
+            let start_new_process = !context.config.selected_adapter_is("opencode");
+            self.paste_prompt_into_tmux_agent(index, &initial_prompt, start_new_process)?;
+            self.show_message("submitted initial prompt to agent session")?;
         }
         Ok(true)
     }

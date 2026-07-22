@@ -386,7 +386,8 @@ impl Tui {
                     agent_profile: None,
                     initial_prompt,
                 },
-            )?;
+            )?
+            .with_harness(config.default_harness.clone());
             let mut run = launch.create_run();
             run.steps.clear();
             run.run.pr_number = self.sessions[selected]

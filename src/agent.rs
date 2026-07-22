@@ -1,5 +1,5 @@
 use crate::config::{AGENT_CANDIDATES, Config};
-use crate::process::{command_exists, split_command_words};
+use crate::process::command_exists;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptMode {
@@ -43,13 +43,6 @@ pub fn detected_agents(config: &Config) -> Vec<String> {
         .filter(|agent| command_exists(&config.tool(agent)))
         .map(|agent| (*agent).to_string())
         .collect()
-}
-
-pub fn agent_command_exists(config: &Config, agent: &str) -> bool {
-    split_command_words(&config.agent_command(agent))
-        .first()
-        .map(|command| command_exists(command))
-        .unwrap_or(false)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

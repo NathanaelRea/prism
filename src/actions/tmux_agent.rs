@@ -236,7 +236,7 @@ impl Tui {
     }
 
     fn mark_opencode_prompt_submitted(&mut self, index: usize, config: &crate::config::Config) {
-        if config.default_agent != "opencode"
+        if !config.selected_adapter_is("opencode")
             || config.is_default_branch(&self.sessions[index].branch)
         {
             return;

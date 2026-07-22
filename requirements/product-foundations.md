@@ -23,7 +23,7 @@
   as a task branch or Agent Session target from the worktree list. It sorts ahead
   of task worktrees and is not polled for or decorated with pull request state.
 - **Invariant**: A logical prompt-starting action creates at most one intended
-  OpenCode session and submits its prompt exactly once.
+  harness session and submits its prompt exactly once through an adapter-supported transport.
 - **Invariant**: Repository, Worktree Session, Agent Session, Plan run, Auto Flow
   run, and PR cache identities remain isolated. Branch names and paths may be
   reused, but state from an old or concurrent identity must not appear on another
@@ -48,7 +48,7 @@
   it could otherwise disturb layout.
 - **Quality**: Error states distinguish integration or refresh failures from
   legitimate absence, such as a branch having no pull request.
-- **Quality**: Critical Prism/tmux/OpenCode launch and prompt-delivery paths have
+- **Quality**: Critical Prism/tmux/harness launch and prompt-delivery paths have
   deterministic integration coverage on supported platforms. Tests and demos
   must not read, mutate, or delete the user's real Prism state.
 - **Quality**: Every status has a non-color cue, every action is keyboard
@@ -76,11 +76,10 @@
   worktree.
 - **Constraint**: Worktrunk provides worktree creation and its configured project
   hooks; Prism must not depend on changing the caller's shell directory.
-- **Constraint**: OpenCode activity and completion are obtained from OpenCode's
-  native session data, not by scraping rendered terminal lines.
-- **Constraint**: OpenCode is the only supported observable agent backend.
-  Configuring an unsupported default backend fails clearly rather than silently
-  losing session status, messages, or completion data.
+- **Constraint**: Harness activity and completion are obtained from supported
+  adapter data, not by scraping rendered terminal lines.
+- **Constraint**: Generic harnesses expose process liveness and bounded headless
+  text only. Rich state is shown only when the selected adapter supports it.
 - **Constraint**: External runtime tools remain explicit prerequisites or
   configured paths; Prism does not silently download them.
 - **Constraint**: Dependencies remain conservative and purpose-driven. Structured

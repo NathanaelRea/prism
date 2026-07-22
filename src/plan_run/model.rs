@@ -5,6 +5,7 @@ pub const DEFAULT_OUTPUT_LINES_PER_STEP: usize = 2_000;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanRun {
     pub id: String,
+    pub harness_id: String,
     pub repo_root: String,
     pub scope_path: PathBuf,
     pub plan_path: PathBuf,

@@ -39,7 +39,9 @@ impl Tui {
             false,
         )?;
         let mode = plan_run_mode_from_parallel_confirmation(parallel);
-        let launch = execution.launch(&repo.root, mode)?;
+        let launch = execution
+            .launch(&repo.root, mode)?
+            .with_harness(config.default_harness.clone());
         let mut should_execute = true;
         let persisted = crate::observability::with_writable_db(&repo, |conn| {
             if let Some(mut persisted) = load_resumable_plan_run(conn, &launch)? {
@@ -91,17 +93,42 @@ impl Tui {
             let mode = persisted.run.mode;
             let scope_path = persisted.run.scope_path.clone();
             let title_prefix = persisted.run.plan_display.clone();
-            let server_url =
-                crate::opencode::ensure_opencode_server(&repo, &config, "plan", &scope_path)
+            let harness_config = match config.harness_config(&persisted.run.harness_id) {
+                Ok(harness) => harness,
+                Err(_) => {
+                    let _ = tx.send(PlanRunResult {
+                        repo_root: repo.root,
+                        run_id,
+                        result: Err(format!(
+                            "plan run harness '{}' is no longer configured",
+                            persisted.run.harness_id
+                        )),
+                    });
+                    return;
+                }
+            };
+            let server_url = (harness_config.adapter == "opencode")
+                .then(|| {
+                    crate::opencode::ensure_opencode_server_with_program(
+                        &repo,
+                        &config,
+                        "plan",
+                        &scope_path,
+                        &harness_config.interactive_command[0],
+                    )
                     .ok()
-                    .map(|runtime| runtime.server_url);
-            let mut executor = PlanExecutorConfig::new(
-                config.tool("opencode"),
+                })
+                .flatten()
+                .map(|runtime| runtime.server_url);
+            let mut executor = PlanExecutorConfig::for_harness(
+                persisted.run.harness_id.clone(),
+                harness_config.clone(),
                 server_url,
                 scope_path.clone(),
                 title_prefix,
             );
-            if config.opencode_plan_plugin
+            if harness_config.adapter == "opencode"
+                && config.opencode_plan_plugin
                 && let Ok(plugin) = prepare_plan_plugin_config(&repo.prism_dir())
             {
                 executor = executor.with_plugin_config(plugin);
@@ -162,7 +189,7 @@ impl Tui {
             return Ok(true);
         };
         let config = managed.config.clone();
-        if config.default_agent != "opencode" {
+        if !config.selected_adapter_is("opencode") {
             self.show_message("selected worktree is not using OpenCode")?;
             return Ok(false);
         }

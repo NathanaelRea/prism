@@ -6,11 +6,10 @@
   "type": "object",
   "additionalProperties": false,
   "properties": {
-    "default_agent": {
+    "default_harness": {
       "type": "string",
-      "enum": ["opencode", "ask"],
       "default": "opencode",
-      "description": "Default agent backend. Use ask to prompt for a detected backend on first interactive startup."
+      "description": "Global harness ID selected from the harnesses table."
     },
     "default_base": {
       "type": "string",
@@ -206,20 +205,47 @@
       "additionalProperties": { "type": "string" },
       "description": "Command overrides for external tools."
     },
-    "agents": {
+    "harnesses": {
       "type": "object",
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
+        "required": ["adapter"],
         "properties": {
-          "command": {
+          "adapter": {
             "type": "string",
-            "description": "Command used to run this agent."
+            "enum": ["opencode", "generic"]
           },
-          "prompt_mode": {
+          "program": {
             "type": "string",
-            "enum": ["interactive", "stdin", "argument", "temp-file"],
-            "description": "How Prism passes prompts to this agent command."
+            "description": "OpenCode executable or wrapper. Prism owns protocol arguments."
+          },
+          "interactive_command": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" }
+          },
+          "interactive_prompt_transport": {
+            "type": "string",
+            "enum": ["argument", "temp-file"]
+          },
+          "headless_command": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" }
+          },
+          "headless_prompt_transport": {
+            "type": "string",
+            "enum": ["argument", "stdin", "temp-file"]
+          },
+          "output_format": {
+            "type": "string",
+            "enum": ["text"],
+            "default": "text"
+          },
+          "environment": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
           }
         }
       }

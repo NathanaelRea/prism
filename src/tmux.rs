@@ -156,6 +156,7 @@ fn ensure_tmux_agent_session(
                 session,
                 runtime_session,
                 runtime.as_ref(),
+                None,
             )?;
             configure_agent_session(config, runtime_session.name())?;
             ensure_companion_windows(config, session, runtime_session)?;
@@ -171,7 +172,14 @@ fn ensure_tmux_agent_session(
         }
         kill_session(config, runtime_session.name())?;
     }
-    create_detached_agent_session(repo, config, session, runtime_session, runtime.as_ref())?;
+    create_detached_agent_session(
+        repo,
+        config,
+        session,
+        runtime_session,
+        runtime.as_ref(),
+        None,
+    )?;
     configure_agent_session(config, runtime_session.name())?;
     ensure_companion_windows(config, session, runtime_session)?;
     Ok(wait_for_agent_session_running(
@@ -189,7 +197,7 @@ pub fn paste_agent_prompt(
     prompt: &str,
 ) -> Result<(), String> {
     let runtime_session = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
-    if config.default_agent == "opencode" && !config.is_default_branch(&session.branch) {
+    if selected_adapter_is(config, "opencode") && !config.is_default_branch(&session.branch) {
         let runtime = ensure_opencode_session(repo, config, &session.branch, &session.path)
             .map_err(|error| format!("prepare opencode runtime for prompt: {error}"))?;
         let session_id = runtime
@@ -214,10 +222,39 @@ pub fn paste_agent_prompt(
             }
         }
     }
-    if !ensure_agent_session(repo, config, session, generation)? {
-        return Err("agent session did not become ready".to_string());
+    if uses_legacy_agent_override(config)
+        || (selected_adapter_is(config, "opencode") && config.is_default_branch(&session.branch))
+    {
+        if !ensure_agent_session(repo, config, session, generation)? {
+            return Err("agent session did not become ready".to_string());
+        }
+        return paste_prompt_into_tmux(config, &runtime_session, prompt);
     }
-    paste_prompt_into_tmux(config, &runtime_session, prompt)
+    if tmux_agent_session_running(config, &runtime_session) {
+        return Err(format!(
+            "harness '{}' does not support submitting a prompt to an existing interactive session",
+            config.default_harness
+        ));
+    }
+    let runtime = opencode_runtime_for_session(repo, config, session)?;
+    if session_exists(config, runtime_session.name())? {
+        kill_session(config, runtime_session.name())?;
+    }
+    create_detached_agent_session(
+        repo,
+        config,
+        session,
+        &runtime_session,
+        runtime.as_ref(),
+        Some(prompt),
+    )?;
+    configure_agent_session(config, runtime_session.name())?;
+    ensure_companion_windows(config, session, &runtime_session)?;
+    if wait_for_agent_session_running(config, &runtime_session, CREATED_SESSION_READY_WAIT) {
+        Ok(())
+    } else {
+        Err("agent session did not become ready".to_string())
+    }
 }
 
 fn paste_prompt_into_tmux(
@@ -364,8 +401,9 @@ fn create_detached_agent_session(
     session: &Session,
     runtime_session: &TmuxAgentSession,
     runtime: Option<&OpencodeRuntime>,
+    prompt: Option<&str>,
 ) -> Result<(), String> {
-    let command = agent_shell_command(repo, config, session, runtime)?;
+    let command = agent_shell_command(repo, config, session, runtime, prompt)?;
     run_tmux_status(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
@@ -623,8 +661,10 @@ fn agent_shell_command(
     config: &Config,
     session: &Session,
     runtime: Option<&OpencodeRuntime>,
+    prompt: Option<&str>,
 ) -> Result<String, String> {
-    let argv = interactive_agent_argv(repo, config, session, runtime);
+    let invocation = interactive_agent_invocation(repo, config, session, runtime, prompt)?;
+    let argv = invocation.argv;
     if argv.is_empty() {
         return Err(format!(
             "agent '{}' has an empty command",
@@ -637,39 +677,70 @@ fn agent_shell_command(
             config.default_agent
         ));
     }
-    Ok(argv
+    let command = argv
         .iter()
         .map(|arg| shell_quote(arg))
         .collect::<Vec<_>>()
-        .join(" "))
+        .join(" ");
+    let command = if invocation.environment.is_empty() {
+        command
+    } else {
+        let assignments = invocation
+            .environment
+            .iter()
+            .map(|(key, value)| format!("{}={}", key, shell_quote(value)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("env {assignments} {command}")
+    };
+    if let Some(path) = invocation.prompt_file {
+        Ok(format!(
+            "{command}; prism_status=$?; rm -f {}; exit $prism_status",
+            shell_quote(&path.display().to_string())
+        ))
+    } else {
+        Ok(command)
+    }
 }
 
-fn interactive_agent_argv(
+fn interactive_agent_invocation(
     repo: &Repository,
     config: &Config,
     session: &Session,
     runtime: Option<&OpencodeRuntime>,
-) -> Vec<String> {
-    if config.default_agent == "opencode" {
-        if let Some(runtime) = runtime
-            .cloned()
-            .or_else(|| usable_opencode_runtime(repo, session))
-            && let Some(session_id) = runtime.opencode_session_id
-        {
-            return vec![
-                config.tool("opencode"),
-                "attach".to_string(),
-                runtime.server_url,
-                "--dir".to_string(),
-                session.path.display().to_string(),
-                "--session".to_string(),
-                session_id,
-            ];
+    prompt: Option<&str>,
+) -> Result<crate::harness::Invocation, String> {
+    if uses_legacy_agent_override(config) {
+        let argv = split_command_words(&config.agent_command(&config.default_agent));
+        if argv.iter().any(|arg| arg.contains("{prompt")) {
+            return Err(format!(
+                "agent '{}' command contains a prompt placeholder; configure an interactive command for tmux attach",
+                config.default_agent
+            ));
         }
-        vec![config.tool("opencode")]
-    } else {
-        split_command_words(&config.agent_command(&config.default_agent))
+        return Ok(crate::harness::Invocation {
+            argv,
+            environment: std::collections::BTreeMap::new(),
+            stdin: None,
+            prompt_file: None,
+            structured_events: false,
+            attach: false,
+        });
     }
+    let runtime = runtime.cloned().or_else(|| {
+        selected_adapter_is(config, "opencode")
+            .then(|| usable_opencode_runtime(repo, session))
+            .flatten()
+    });
+    let harness_config = config.harness_config(&config.default_harness)?;
+    crate::harness::Harness::new(&config.default_harness, &harness_config).interactive_argv(
+        prompt,
+        runtime.as_ref().map(|runtime| runtime.server_url.as_str()),
+        runtime
+            .as_ref()
+            .and_then(|runtime| runtime.opencode_session_id.as_deref()),
+        &session.path,
+    )
 }
 
 fn opencode_runtime_for_session(
@@ -677,7 +748,7 @@ fn opencode_runtime_for_session(
     config: &Config,
     session: &Session,
 ) -> Result<Option<OpencodeRuntime>, String> {
-    if config.default_agent != "opencode" || config.is_default_branch(&session.branch) {
+    if !selected_adapter_is(config, "opencode") || config.is_default_branch(&session.branch) {
         return Ok(None);
     }
     ensure_opencode_session(repo, config, &session.branch, &session.path)
@@ -712,23 +783,35 @@ fn pane_start_command(config: &Config, name: &str) -> Option<String> {
 }
 
 fn pane_command_matches_agent(config: &Config, pane_command: &str) -> bool {
-    let expected = if config.default_agent == "opencode" {
-        config.tool("opencode")
-    } else {
-        let Some(expected) = split_command_words(&config.agent_command(&config.default_agent))
-            .first()
-            .cloned()
-        else {
-            return false;
-        };
-        expected
+    let Some(expected) = config
+        .harnesses
+        .get(&config.default_harness)
+        .and_then(|harness| harness.interactive_command.first())
+        .cloned()
+    else {
+        return false;
     };
     let expected = Path::new(&expected)
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(&expected);
     pane_command == expected
-        || (config.default_agent == "opencode" && pane_command == format!("{expected}.exe"))
+        || (selected_adapter_is(config, "opencode") && pane_command == format!("{expected}.exe"))
+}
+
+fn selected_adapter_is(config: &Config, adapter: &str) -> bool {
+    if uses_legacy_agent_override(config) {
+        return false;
+    }
+    config
+        .harnesses
+        .get(&config.default_harness)
+        .is_some_and(|harness| harness.adapter == adapter)
+}
+
+fn uses_legacy_agent_override(config: &Config) -> bool {
+    config.default_agent != config.default_harness
+        && config.agent_commands.contains_key(&config.default_agent)
 }
 
 fn pane_start_command_matches_agent(config: &Config, pane_start_command: &str) -> bool {
@@ -929,7 +1012,7 @@ exit 1
         };
         let session = test_session(unique_temp_dir("prism-tmux-placeholder-test"), "feature");
 
-        let error = super::agent_shell_command(&repo, &config, &session, None).unwrap_err();
+        let error = super::agent_shell_command(&repo, &config, &session, None, None).unwrap_err();
 
         assert!(error.contains("prompt placeholder"));
     }

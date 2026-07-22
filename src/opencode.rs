@@ -175,6 +175,16 @@ pub fn ensure_opencode_server(
     branch: &str,
     worktree: &Path,
 ) -> Result<OpencodeRuntime, String> {
+    ensure_opencode_server_with_program(repo, config, branch, worktree, &config.tool("opencode"))
+}
+
+pub fn ensure_opencode_server_with_program(
+    repo: &Repository,
+    config: &Config,
+    branch: &str,
+    worktree: &Path,
+    program: &str,
+) -> Result<OpencodeRuntime, String> {
     let existing = load_runtime(repo, branch, worktree)?;
     if let Some(runtime) = existing.as_ref()
         && check_health(&runtime.server_url)
@@ -195,7 +205,7 @@ pub fn ensure_opencode_server(
     let server_pid = if check_health(&server_url) {
         existing.as_ref().and_then(|runtime| runtime.server_pid)
     } else {
-        let mut child = Command::new(config.tool("opencode"))
+        let mut child = Command::new(program)
             .arg("serve")
             .args(["--hostname", "127.0.0.1"])
             .args(["--port", &port.to_string()])

@@ -7,6 +7,7 @@ pub(super) const MAX_CI_FIX_ATTEMPTS: usize = 3;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AutoRun {
     pub id: String,
+    pub harness_id: String,
     pub repo_root: String,
     pub worktree_path: PathBuf,
     pub worktree_incarnation: Option<String>,
@@ -92,6 +93,7 @@ pub struct AutoLaunch {
     pub agent_profile: Option<String>,
     pub prompt_summary: String,
     pub initial_prompt: String,
+    harness_id: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -114,6 +116,8 @@ pub struct PersistedAutoRun {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AutoExecutorConfig {
+    pub harness_id: String,
+    pub harness_config: crate::harness::HarnessConfig,
     pub opencode_program: String,
     pub server_url: Option<String>,
     pub worktree_path: PathBuf,
@@ -446,7 +450,13 @@ impl AutoLaunch {
             agent_profile,
             prompt_summary: summarize_prompt(&initial_prompt),
             initial_prompt,
+            harness_id: "opencode".to_string(),
         })
+    }
+
+    pub fn with_harness(mut self, harness_id: impl Into<String>) -> Self {
+        self.harness_id = harness_id.into();
+        self
     }
 
     pub(crate) fn with_worktree_incarnation(mut self, incarnation: String) -> Self {
@@ -459,6 +469,7 @@ impl AutoLaunch {
         let id = self.default_run_id(now);
         let run = AutoRun {
             id: id.clone(),
+            harness_id: self.harness_id.clone(),
             repo_root: self.repo_root.clone(),
             worktree_path: self.worktree_path.clone(),
             worktree_incarnation: self.worktree_incarnation.clone(),
@@ -556,8 +567,34 @@ impl AutoExecutorConfig {
         worktree_path: impl Into<PathBuf>,
         title_prefix: impl Into<String>,
     ) -> Self {
+        let opencode_program = opencode_program.into();
         Self {
-            opencode_program: opencode_program.into(),
+            harness_id: "opencode".to_string(),
+            harness_config: crate::harness::HarnessConfig::opencode(opencode_program.clone()),
+            opencode_program,
+            server_url,
+            worktree_path: worktree_path.into(),
+            title_prefix: title_prefix.into(),
+            max_output_lines_per_step: DEFAULT_OUTPUT_LINES_PER_STEP,
+        }
+    }
+
+    pub fn for_harness(
+        harness_id: impl Into<String>,
+        harness_config: crate::harness::HarnessConfig,
+        server_url: Option<String>,
+        worktree_path: impl Into<PathBuf>,
+        title_prefix: impl Into<String>,
+    ) -> Self {
+        let opencode_program = harness_config
+            .interactive_command
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        Self {
+            harness_id: harness_id.into(),
+            harness_config,
+            opencode_program,
             server_url,
             worktree_path: worktree_path.into(),
             title_prefix: title_prefix.into(),

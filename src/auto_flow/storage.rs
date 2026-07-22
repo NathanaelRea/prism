@@ -5,6 +5,7 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
         "
         create table if not exists auto_run (
           id text primary key,
+          harness_id text not null default 'opencode',
           repo_root text not null,
           worktree_path text not null,
           worktree_incarnation text,
@@ -101,6 +102,13 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
     if !table_has_column(conn, "auto_run", "pr_url")? {
         conn.execute("alter table auto_run add column pr_url text", [])
             .map_err(|error| format!("migrate auto_run pr_url column: {error}"))?;
+    }
+    if !table_has_column(conn, "auto_run", "harness_id")? {
+        conn.execute(
+            "alter table auto_run add column harness_id text not null default 'opencode'",
+            [],
+        )
+        .map_err(|error| format!("migrate auto_run harness_id column: {error}"))?;
     }
     if !table_has_column(conn, "auto_run", "worktree_incarnation")? {
         conn.execute(
@@ -260,14 +268,15 @@ pub fn load_recent_active_runs_for_repo(
 pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &AutoRun) -> Result<(), String> {
     conn.execute(
         "insert into auto_run (
-           id, repo_root, worktree_path, worktree_incarnation, branch, mode, implementation_source, plan_path,
+           id, harness_id, repo_root, worktree_path, worktree_incarnation, branch, mode, implementation_source, plan_path,
            plan_run_mode, variant, agent_profile, prompt_summary, initial_prompt, status, pause_requested,
            selected_step_run_id, pr_number, pr_url, current_head_sha, review_baseline_json,
            stabilization_status, stabilization_blocker, stabilization_next_work, pending_push_json,
-           created_unix_ms, updated_unix_ms, archived_unix_ms
-         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)
+            created_unix_ms, updated_unix_ms, archived_unix_ms
+          ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
          on conflict(id) do update set
-           repo_root = excluded.repo_root,
+            repo_root = excluded.repo_root,
+            harness_id = excluded.harness_id,
            worktree_path = excluded.worktree_path,
            worktree_incarnation = excluded.worktree_incarnation,
            branch = excluded.branch,
@@ -294,6 +303,7 @@ pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &AutoRun) -> 
             archived_unix_ms = excluded.archived_unix_ms",
         params![
             run.id.as_str(),
+            run.harness_id.as_str(),
             run.repo_root.as_str(),
             run.worktree_path.display().to_string(),
             run.worktree_incarnation.as_deref(),
@@ -419,7 +429,7 @@ pub(super) fn load_run_with_conn(
     run_id: &str,
 ) -> Result<Option<AutoRun>, String> {
     conn.query_row(
-        "select id, repo_root, worktree_path, worktree_incarnation, branch, mode, implementation_source, plan_path,
+        "select id, harness_id, repo_root, worktree_path, worktree_incarnation, branch, mode, implementation_source, plan_path,
                 plan_run_mode, variant, agent_profile, prompt_summary, initial_prompt, status, pause_requested,
                  selected_step_run_id, pr_number, pr_url, current_head_sha, review_baseline_json,
                  stabilization_status, stabilization_blocker, stabilization_next_work, pending_push_json,
@@ -428,42 +438,43 @@ pub(super) fn load_run_with_conn(
          where id = ?1",
         params![run_id],
         |row| {
-            let mode: String = row.get(5)?;
-            let implementation_source: String = row.get(6)?;
-            let plan_run_mode: String = row.get(8)?;
-            let status: String = row.get(13)?;
+            let mode: String = row.get(6)?;
+            let implementation_source: String = row.get(7)?;
+            let plan_run_mode: String = row.get(9)?;
+            let status: String = row.get(14)?;
             Ok(AutoRun {
                 id: row.get(0)?,
-                repo_root: row.get(1)?,
-                worktree_path: PathBuf::from(row.get::<_, String>(2)?),
-                worktree_incarnation: row.get(3)?,
-                branch: row.get(4)?,
+                harness_id: row.get(1)?,
+                repo_root: row.get(2)?,
+                worktree_path: PathBuf::from(row.get::<_, String>(3)?),
+                worktree_incarnation: row.get(4)?,
+                branch: row.get(5)?,
                 mode: AutoRunMode::parse(&mode).map_err(from_string_error)?,
                 implementation_source: AutoImplementationSource::parse(&implementation_source)
                     .map_err(from_string_error)?,
-                plan_path: row.get::<_, Option<String>>(7)?.map(PathBuf::from),
+                plan_path: row.get::<_, Option<String>>(8)?.map(PathBuf::from),
                 plan_run_mode: parse_plan_run_mode(&plan_run_mode).map_err(from_string_error)?,
-                variant: row.get(9)?,
-                agent_profile: row.get(10)?,
-                prompt_summary: row.get(11)?,
-                initial_prompt: row.get(12)?,
+                variant: row.get(10)?,
+                agent_profile: row.get(11)?,
+                prompt_summary: row.get(12)?,
+                initial_prompt: row.get(13)?,
                 status: AutoRunStatus::parse(&status).map_err(from_string_error)?,
-                pause_requested: row.get::<_, i64>(14)? != 0,
-                selected_step_run_id: row.get(15)?,
+                pause_requested: row.get::<_, i64>(15)? != 0,
+                selected_step_run_id: row.get(16)?,
                 pr_number: row
-                    .get::<_, Option<i64>>(16)?
+                    .get::<_, Option<i64>>(17)?
                     .map(|value| value.max(0) as u64),
-                pr_url: row.get(17)?,
-                current_head_sha: row.get(18)?,
-                review_baseline_json: row.get(19)?,
-                stabilization_status: optional_stabilization_status(row.get(20)?)?,
-                stabilization_blocker: optional_stabilization_blocker(row.get(21)?)?,
-                stabilization_next_work: optional_stabilization_work_kind(row.get(22)?)?,
-                pending_push: optional_json_value(row.get::<_, Option<String>>(23)?)?,
-                created_unix_ms: i64_to_u64(row.get(24)?, 24),
-                updated_unix_ms: i64_to_u64(row.get(25)?, 25),
+                pr_url: row.get(18)?,
+                current_head_sha: row.get(19)?,
+                review_baseline_json: row.get(20)?,
+                stabilization_status: optional_stabilization_status(row.get(21)?)?,
+                stabilization_blocker: optional_stabilization_blocker(row.get(22)?)?,
+                stabilization_next_work: optional_stabilization_work_kind(row.get(23)?)?,
+                pending_push: optional_json_value(row.get::<_, Option<String>>(24)?)?,
+                created_unix_ms: i64_to_u64(row.get(25)?, 25),
+                updated_unix_ms: i64_to_u64(row.get(26)?, 26),
                 archived_unix_ms: row
-                    .get::<_, Option<i64>>(26)?
+                    .get::<_, Option<i64>>(27)?
                     .map(|value| value.max(0) as u64),
             })
         },

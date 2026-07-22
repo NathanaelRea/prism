@@ -33,10 +33,11 @@ pub(super) fn execute_one_agent_step(
     )
     .map_err(|error| format!("write auto output: {error}"))?;
 
-    let mut command = opencode_run_command(executor, &persisted.steps[step_index], &prompt, true);
-    let spawn_result = spawn_opencode(&mut command);
+    let (mut command, mut invocation) =
+        harness_run_command(executor, &persisted.steps[step_index], &prompt, true)?;
+    let spawn_result = spawn_harness(&mut command, &invocation);
     let (mut child, used_attach) = match spawn_result {
-        Ok(child) => (child, true),
+        Ok(child) => (child, invocation.attach),
         Err(error) if executor.server_url.is_some() => {
             if let Some(step_id) = persisted.steps[step_index].id {
                 append_system_output(
@@ -48,10 +49,14 @@ pub(super) fn execute_one_agent_step(
                     executor.max_output_lines_per_step,
                 )?;
             }
-            let mut fallback =
-                opencode_run_command(executor, &persisted.steps[step_index], &prompt, false);
-            match spawn_opencode(&mut fallback) {
-                Ok(child) => (child, false),
+            invocation.cleanup();
+            let (mut fallback, fallback_invocation) =
+                harness_run_command(executor, &persisted.steps[step_index], &prompt, false)?;
+            match spawn_harness(&mut fallback, &fallback_invocation) {
+                Ok(child) => {
+                    invocation = fallback_invocation;
+                    (child, false)
+                }
                 Err(error) => {
                     mark_spawn_failure(
                         conn,
@@ -64,6 +69,7 @@ pub(super) fn execute_one_agent_step(
             }
         }
         Err(error) => {
+            invocation.cleanup();
             mark_spawn_failure(
                 conn,
                 &mut persisted.steps[step_index],
@@ -86,8 +92,11 @@ pub(super) fn execute_one_agent_step(
         &mut persisted.steps[step_index],
         &mut child,
         executor.max_output_lines_per_step,
+        invocation.structured_events,
         output,
-    )?;
+    );
+    invocation.cleanup();
+    let exit_code = exit_code?;
     finish_step_after_exit(
         conn,
         &mut persisted.steps[step_index],
@@ -107,91 +116,55 @@ pub(super) fn execute_one_agent_step(
     }
 }
 
-pub(super) fn opencode_run_command(
+fn harness_run_command(
     executor: &AutoExecutorConfig,
     step: &AutoStepRun,
     prompt: &str,
     attach: bool,
-) -> Command {
-    let mut command = Command::new(&executor.opencode_program);
-    command.arg("run");
-    if attach && let Some(server_url) = executor.server_url.as_deref() {
-        command.arg("--attach").arg(server_url);
-    }
-    command
-        .arg("--format")
-        .arg("json")
-        .arg("--dir")
-        .arg(&executor.worktree_path)
-        .arg("--title")
-        .arg(format!(
+) -> Result<(Command, crate::harness::Invocation), String> {
+    let invocation = crate::harness::Harness::new(&executor.harness_id, &executor.harness_config)
+        .headless(
+        prompt,
+        &executor.worktree_path,
+        &format!(
             "{} {} attempt {}",
             executor.title_prefix,
             step.step_key.as_str(),
             step.attempt
-        ))
-        .arg(prompt)
-        .current_dir(&executor.worktree_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    command
+        ),
+        executor.server_url.as_deref(),
+        None,
+        attach,
+    )?;
+    let command = invocation.command(&executor.worktree_path)?;
+    Ok((command, invocation))
 }
 
-pub(super) fn spawn_opencode(command: &mut Command) -> Result<Child, String> {
-    observability::emit(observability::EventInput {
-        level: LogLevel::Info,
-        target: "auto_flow",
-        action: "external_command",
-        operation_id: None,
-        parent_operation_id: None,
-        branch: None,
-        session: None,
-        message: "spawning Auto Flow command".to_string(),
-        data_json: Some(observability::command_data_json(
-            command,
-            false,
-            None,
-            Some("spawn"),
-            None,
-        )),
-    });
-    match command.spawn() {
-        Ok(child) => {
-            observability::emit(observability::EventInput {
-                level: LogLevel::Info,
-                target: "auto_flow",
-                action: "external_command",
-                operation_id: None,
-                parent_operation_id: None,
-                branch: None,
-                session: None,
-                message: "Auto Flow command spawned".to_string(),
-                data_json: Some(format!("{{\"pid\":{}}}", child.id())),
+fn spawn_harness(
+    command: &mut Command,
+    invocation: &crate::harness::Invocation,
+) -> Result<Child, String> {
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("harness '{}': {error}", invocation.argv[0]))?;
+    if let Some(input) = invocation.stdin.as_deref() {
+        use std::io::Write as _;
+        let result = child
+            .stdin
+            .take()
+            .ok_or_else(|| "open harness stdin".to_string())
+            .and_then(|mut stdin| {
+                stdin
+                    .write_all(input.as_bytes())
+                    .map_err(|error| format!("write harness prompt to stdin: {error}"))
             });
-            Ok(child)
-        }
-        Err(error) => {
-            observability::emit(observability::EventInput {
-                level: LogLevel::Warn,
-                target: "auto_flow",
-                action: "external_command",
-                operation_id: None,
-                parent_operation_id: None,
-                branch: None,
-                session: None,
-                message: format!("Auto Flow command spawn failed: {error}"),
-                data_json: Some(observability::command_data_json(
-                    command,
-                    false,
-                    None,
-                    Some("spawn_failed"),
-                    Some(&error.to_string()),
-                )),
-            });
-            Err(format!("opencode: {error}"))
+        if let Err(error) = result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
         }
     }
+    Ok(child)
 }
 
 pub(super) fn mark_spawn_failure(
@@ -239,6 +212,7 @@ pub(super) fn collect_child_output(
     step: &mut AutoStepRun,
     child: &mut Child,
     max_output_lines_per_step: usize,
+    structured_events: bool,
     output: &mut dyn Write,
 ) -> Result<i32, String> {
     let stdout = child
@@ -257,7 +231,15 @@ pub(super) fn collect_child_output(
     while readers_open > 0 {
         match rx.recv() {
             Ok(Ok(ChildLine::Line { stream, text })) => {
-                ingest_child_line(conn, step, stream, &text, max_output_lines_per_step, output)?;
+                ingest_child_line(
+                    conn,
+                    step,
+                    stream,
+                    &text,
+                    max_output_lines_per_step,
+                    structured_events,
+                    output,
+                )?;
             }
             Ok(Ok(ChildLine::End)) => readers_open -= 1,
             Ok(Err(error)) => return Err(error),
@@ -313,6 +295,7 @@ pub(super) fn ingest_child_line(
     stream: StreamKind,
     raw: &str,
     max_output_lines_per_step: usize,
+    structured_events: bool,
     output: &mut dyn Write,
 ) -> Result<(), String> {
     if stream == StreamKind::Stderr {
@@ -331,6 +314,24 @@ pub(super) fn ingest_child_line(
         save_step_with_conn(conn, step)?;
         writeln!(output, "[stderr] {raw}")
             .map_err(|error| format!("write auto output: {error}"))?;
+        return Ok(());
+    }
+
+    if !structured_events {
+        let step_id = step
+            .id
+            .ok_or_else(|| "auto step must be saved before output".to_string())?;
+        append_system_output(
+            conn,
+            step_id,
+            AutoOutputKind::Assistant,
+            raw,
+            None,
+            max_output_lines_per_step,
+        )?;
+        step.summary = Some(raw.to_string());
+        save_step_with_conn(conn, step)?;
+        writeln!(output, "{raw}").map_err(|error| format!("write auto output: {error}"))?;
         return Ok(());
     }
 

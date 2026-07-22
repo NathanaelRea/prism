@@ -2,6 +2,8 @@ use super::*;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanExecutorConfig {
+    pub harness_id: String,
+    pub harness_config: crate::harness::HarnessConfig,
     pub opencode_program: String,
     pub server_url: Option<String>,
     pub scope_path: PathBuf,
@@ -28,8 +30,37 @@ impl PlanExecutorConfig {
         scope_path: impl Into<PathBuf>,
         title_prefix: impl Into<String>,
     ) -> Self {
+        let opencode_program = opencode_program.into();
         Self {
-            opencode_program: opencode_program.into(),
+            harness_id: "opencode".to_string(),
+            harness_config: crate::harness::HarnessConfig::opencode(opencode_program.clone()),
+            opencode_program,
+            server_url,
+            scope_path: scope_path.into(),
+            title_prefix: title_prefix.into(),
+            max_output_lines_per_step: DEFAULT_OUTPUT_LINES_PER_STEP,
+            plugin_config_dir: None,
+            plugin_event_log_path: None,
+            agent_variant: Some(DEFAULT_PLAN_AGENT_VARIANT.to_string()),
+        }
+    }
+
+    pub fn for_harness(
+        harness_id: impl Into<String>,
+        harness_config: crate::harness::HarnessConfig,
+        server_url: Option<String>,
+        scope_path: impl Into<PathBuf>,
+        title_prefix: impl Into<String>,
+    ) -> Self {
+        let opencode_program = harness_config
+            .interactive_command
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        Self {
+            harness_id: harness_id.into(),
+            harness_config,
+            opencode_program,
             server_url,
             scope_path: scope_path.into(),
             title_prefix: title_prefix.into(),

@@ -1535,6 +1535,7 @@ fn test_plan_dashboard(expanded: bool) -> PlanDashboard {
     PlanDashboard {
         run: PersistedPlanRun {
             run: PlanRun {
+                harness_id: "opencode".to_string(),
                 id: "plan-run".to_string(),
                 repo_root: "/repo".to_string(),
                 scope_path: PathBuf::from("/repo"),
@@ -1641,6 +1642,7 @@ fn test_auto_dashboard() -> AutoDashboard {
     AutoDashboard {
         run: PersistedAutoRun {
             run: AutoRun {
+                harness_id: "opencode".to_string(),
                 id: "auto-run".to_string(),
                 repo_root: "/repo".to_string(),
                 worktree_path: PathBuf::from("/repo/feature"),

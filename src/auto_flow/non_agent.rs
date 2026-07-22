@@ -176,7 +176,9 @@ pub(super) fn execute_run_plan_step(
         Some(plan_path.as_path()),
     )?;
     let mode = persisted.run.plan_run_mode;
-    let launch = execution.launch(Path::new(&persisted.run.repo_root), mode)?;
+    let launch = execution
+        .launch(Path::new(&persisted.run.repo_root), mode)?
+        .with_harness(persisted.run.harness_id.clone());
     let mut plan_run = if let Some(plan_run_id) = persisted.steps[step_index].plan_run_id.as_deref()
     {
         load_plan_run(conn, plan_run_id)?.ok_or_else(|| {
@@ -200,14 +202,24 @@ pub(super) fn execute_run_plan_step(
         max_output_lines_per_step,
     )?;
 
-    let mut plan_executor = PlanExecutorConfig::new(
-        config.tool("opencode"),
+    let harness_config = config
+        .harness_config(&persisted.run.harness_id)
+        .map_err(|_| {
+            format!(
+                "auto run harness '{}' is no longer configured",
+                persisted.run.harness_id
+            )
+        })?;
+    let mut plan_executor = PlanExecutorConfig::for_harness(
+        persisted.run.harness_id.clone(),
+        harness_config.clone(),
         server_url,
         persisted.run.worktree_path.clone(),
         plan_run.run.plan_display.clone(),
     );
     plan_executor.max_output_lines_per_step = max_output_lines_per_step;
-    if config.opencode_plan_plugin
+    if harness_config.adapter == "opencode"
+        && config.opencode_plan_plugin
         && let Ok(plugin) = prepare_plan_plugin_config(&repo.prism_dir())
     {
         plan_executor = plan_executor.with_plugin_config(plugin);

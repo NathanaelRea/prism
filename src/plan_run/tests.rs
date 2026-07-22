@@ -53,6 +53,69 @@ fn opencode_run_command_passes_prompt_as_single_raw_argument() {
 }
 
 #[test]
+#[cfg(unix)]
+fn generic_stdin_harness_executes_plan_step_as_bounded_plain_text() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let scope = std::env::temp_dir().join(format!(
+        "prism-generic-plan-{}-{}",
+        std::process::id(),
+        unix_ms()
+    ));
+    fs::create_dir_all(&scope).unwrap();
+    let launch = PlanLaunch::new(
+        &scope,
+        &scope,
+        &scope.join("plan.md"),
+        "phase",
+        1,
+        1,
+        PlanRunMode::Sequential,
+    )
+    .unwrap()
+    .with_harness("generic-test");
+    let mut persisted = launch.create_run();
+    save_plan_run(&conn, &persisted).unwrap();
+    let harness_config = crate::harness::HarnessConfig {
+        adapter: "generic".to_string(),
+        interactive_command: vec!["/bin/sh".to_string()],
+        interactive_prompt_transport: None,
+        headless_command: Some(vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "IFS= read -r prompt; printf 'plain:%s\\n' \"$prompt\"".to_string(),
+        ]),
+        headless_prompt_transport: Some(crate::harness::PromptTransport::Stdin),
+        output_format: crate::harness::OutputFormat::Text,
+        environment: BTreeMap::new(),
+    };
+    let mut executor = PlanExecutorConfig::for_harness(
+        "generic-test",
+        harness_config,
+        None,
+        &scope,
+        "generic plan",
+    );
+    executor.max_output_lines_per_step = 10;
+    let mut output = Vec::new();
+
+    execute_plan_sequential(&conn, &mut persisted, &executor, &mut output).unwrap();
+
+    assert_eq!(persisted.run.harness_id, "generic-test");
+    assert_eq!(persisted.steps[0].status, PlanStepStatus::Done);
+    assert_eq!(
+        persisted.steps[0].latest_message.as_deref(),
+        Some("plain:Implement plan.md phase 1")
+    );
+    assert!(
+        String::from_utf8(output)
+            .unwrap()
+            .contains("plain:Implement plan.md phase 1")
+    );
+    let _ = fs::remove_dir_all(scope);
+}
+
+#[test]
 fn aggregate_status_prioritizes_failure_and_running_state() {
     assert_eq!(
         aggregate_step_status([

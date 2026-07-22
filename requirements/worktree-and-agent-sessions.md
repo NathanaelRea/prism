@@ -13,7 +13,7 @@
   approval both when adding the repository and when a later creation attempt
   reveals new or changed commands.
 - **Behavior**: A non-empty initial prompt is submitted to the interactive
-  OpenCode session that the user will attach to. An empty prompt opens the
+  harness session only when its adapter has a reliable transport. An empty prompt opens the
   session without synthesizing or submitting text.
 - **Behavior**: Successful creation attaches to the resulting tmux session so
   the user can inspect or edit the agent interaction immediately.
@@ -23,12 +23,12 @@
 - **Behavior**: Enter on a Worktree Session attaches to its persistent tmux Agent
   Session. Prism reuses a healthy matching session and replaces a stale or
   incompatible runtime when necessary.
-- **Invariant**: Prism associates one local OpenCode server runtime with each
-  active Worktree Session and never shuts down a server it does not own.
+- **Invariant**: Prism associates adapter runtime identity with each active
+  Worktree Session. OpenCode servers are never shut down unless Prism owns them.
 - **Default**: Prism allocates OpenCode servers from a deterministic range
   beginning at port 41000 and spanning 1000 ports. Owned servers remain warm
   when Prism exits unless shutdown is enabled.
-- **Invariant**: Active OpenCode session association is resolved independently
+- **Invariant**: Active harness session association is resolved independently
   per worktree. Creating `/new` or changing activity in one worktree cannot
   retarget prompts or status in another.
 - **Behavior**: The main panel shows the selected worktree's current OpenCode

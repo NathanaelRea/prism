@@ -8,6 +8,7 @@ pub mod cli;
 mod config;
 mod git;
 mod github;
+mod harness;
 mod input;
 mod json;
 mod lifecycle;

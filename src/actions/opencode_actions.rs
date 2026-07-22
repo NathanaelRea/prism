@@ -33,7 +33,7 @@ impl Tui {
             let Some(managed) = self.repos.get(session.repo_index) else {
                 continue;
             };
-            if managed.config.default_agent != "opencode"
+            if !managed.config.selected_adapter_is("opencode")
                 || !session.is_task_branch(&managed.config)
             {
                 continue;
@@ -91,7 +91,7 @@ impl Tui {
             let Some(managed) = self.repos.get(session.repo_index) else {
                 continue;
             };
-            if managed.config.default_agent != "opencode"
+            if !managed.config.selected_adapter_is("opencode")
                 || !session.is_task_branch(&managed.config)
             {
                 continue;
@@ -395,7 +395,7 @@ impl Tui {
             self.show_message("default branch does not have an OpenCode session")?;
             return Ok(());
         }
-        if context.config.default_agent != "opencode" {
+        if !context.config.selected_adapter_is("opencode") {
             self.show_message("selected worktree is not using OpenCode")?;
             return Ok(());
         }
@@ -466,7 +466,7 @@ impl Tui {
                 continue;
             };
             if !managed.config.opencode_shutdown_owned_servers
-                || managed.config.default_agent != "opencode"
+                || !managed.config.selected_adapter_is("opencode")
             {
                 continue;
             }
