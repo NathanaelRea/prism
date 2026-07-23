@@ -2,7 +2,8 @@ use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::stabilization_execute::{GuardedPushProgress, progress_pending_push};
 use crate::auto_flow::stabilization_model::{
-    PendingPushGuard, RepairKind, StabilizationBlocker, StabilizationWorkKind,
+    PendingPushGuard, RepairKind, StabilizationBlocker, StabilizationState, StabilizationStatus,
+    StabilizationWorkKind,
 };
 use crate::auto_flow::{AutoLaunch, AutoStepKey, load_auto_run, save_auto_run};
 use crate::config::Config;
@@ -18,9 +19,10 @@ use crate::tui::{
 
 use super::{
     apply_bulk_review_resolution, archived_picker_overflow_message, discover_wt_columns,
-    plan_run_mode_from_parallel_confirmation, pr_target_choice_list, pr_target_repo_for_choice,
-    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
-    should_prompt_pr_target_choice, status_label_with_behind,
+    merge_authorization_needs_review_resolution, plan_run_mode_from_parallel_confirmation,
+    pr_target_choice_list, pr_target_repo_for_choice, remote_pr_choice_keys,
+    remote_pr_worktree_branch, run_browser_opener, should_prompt_pr_target_choice,
+    status_label_with_behind,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -79,6 +81,19 @@ fn confirmed_bulk_review_resolution_resolves_each_thread_once() {
 
     assert_eq!(count, 2);
     assert_eq!(resolved.into_inner(), vec!["thread-1", "thread-2"]);
+}
+
+#[test]
+fn review_feedback_merge_blocker_offers_thread_resolution() {
+    let authorization =
+        crate::auto_flow::stabilization_execute::MergeAuthorization::Blocked(StabilizationState {
+            status: StabilizationStatus::Blocked,
+            blocker: StabilizationBlocker::ReviewFeedbackFound,
+            next_work: StabilizationWorkKind::FixReview,
+            reason: "actionable review feedback is present".to_string(),
+        });
+
+    assert!(merge_authorization_needs_review_resolution(&authorization));
 }
 
 #[test]

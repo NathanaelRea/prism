@@ -45,6 +45,14 @@ impl Tui {
         if let Some(run_id) = self.active_auto_runs.get(&session_path).cloned() {
             self.load_auto_run_snapshot(&context.repo.root, &run_id);
             self.selected_auto_run = Some(run_id);
+            if self.resolve_blocking_review_threads(
+                raw,
+                context.session_index,
+                &context.repo,
+                &context.config,
+            )? {
+                return Ok(());
+            }
             self.show_message("focused Auto Flow run")?;
             return Ok(());
         }

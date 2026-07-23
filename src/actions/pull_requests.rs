@@ -17,6 +17,17 @@ pub(super) fn apply_bulk_review_resolution(
     Ok(thread_ids.len())
 }
 
+pub(super) fn merge_authorization_needs_review_resolution(
+    authorization: &crate::auto_flow::stabilization_execute::MergeAuthorization,
+) -> bool {
+    matches!(
+        authorization,
+        crate::auto_flow::stabilization_execute::MergeAuthorization::Blocked(state)
+            if state.blocker
+                == crate::auto_flow::stabilization_model::StabilizationBlocker::ReviewFeedbackFound
+    )
+}
+
 pub(super) fn pr_target_choice_list(origin: &str, upstream: &str) -> crate::view::ChoiceList {
     crate::view::ChoiceList {
         title: "Create Pull Request Target".to_string(),
@@ -606,7 +617,7 @@ impl Tui {
         Ok(true)
     }
 
-    fn resolve_blocking_review_threads(
+    pub(super) fn resolve_blocking_review_threads(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
         selected: usize,
@@ -734,12 +745,27 @@ impl Tui {
         }
         let path = self.sessions[selected].path.clone();
         let branch = self.sessions[selected].branch.clone();
-        let initial_authorization =
+        let mut initial_authorization =
             crate::auto_flow::stabilization_execute::observe_manual_merge_authorization(
                 &context.repo,
                 &context.config,
                 &mut self.sessions[selected],
             );
+        if merge_authorization_needs_review_resolution(&initial_authorization)
+            && self.resolve_observed_review_threads(
+                raw,
+                selected,
+                &context.repo,
+                &context.config,
+            )?
+        {
+            initial_authorization =
+                crate::auto_flow::stabilization_execute::observe_manual_merge_authorization(
+                    &context.repo,
+                    &context.config,
+                    &mut self.sessions[selected],
+                );
+        }
         let initially_observed_pr_number = match &initial_authorization {
             crate::auto_flow::stabilization_execute::MergeAuthorization::Authorized(token) => {
                 token.pr_number()
@@ -816,5 +842,55 @@ impl Tui {
             self.show_message("merge complete")?;
         }
         Ok(())
+    }
+
+    fn resolve_observed_review_threads(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+        selected: usize,
+        repo: &crate::repo::Repository,
+        config: &crate::config::Config,
+    ) -> Result<bool, String> {
+        let feedback = crate::auto_flow::stabilization_observe::stabilization_review_feedback(
+            self.sessions[selected]
+                .pr
+                .trusted_details()?
+                .ok_or_else(|| "pull request review details are unavailable".to_string())?,
+            None,
+        );
+        let thread_ids = crate::review::review_thread_ids(&feedback);
+        if thread_ids.is_empty() {
+            return Ok(false);
+        }
+        let count = thread_ids.len();
+        if !self.confirm_action_dialog(
+            raw,
+            "Resolve Review Conversations",
+            &format!("Mark all {count} unresolved review conversation(s) as resolved?"),
+            false,
+        )? {
+            self.show_message("merge blocked: review conversations left unresolved")?;
+            return Ok(false);
+        }
+
+        self.show_loading_dialog(
+            raw,
+            "Resolve Review Conversations",
+            "Resolving review conversations",
+        )?;
+        let path = self.sessions[selected].path.clone();
+        apply_bulk_review_resolution(true, &thread_ids, |thread_id| {
+            crate::github::resolve_review_thread(&path, config, thread_id)
+        })?;
+        let session = &mut self.sessions[selected];
+        refresh_pr_cache(
+            repo,
+            &session.branch,
+            &mut session.pr,
+            &session.path,
+            config,
+            true,
+        )?;
+        Ok(true)
     }
 }

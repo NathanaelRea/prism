@@ -19,12 +19,12 @@ Prism uses a lazygit-style panel model.
 - `Space g g` opens tmux window 2: lazygit.
 - `Space g o` opens the selected pull request in a browser.
 - `Space g P` pushes a guarded pending PR Stabilization repair commit and continues stabilization. If actionable review conversations block a run without a pending push, Prism offers to mark all freshly observed conversations resolved before reobserving; the confirmation defaults to No.
-- `Space g M` merges the selected pull request.
+- `Space g M` merges the selected pull request. If fresh merge authorization is blocked by unresolved actionable review conversations, Prism offers to mark all of them resolved and retries authorization; the confirmation defaults to No.
 - `Space g c` starts or appends a managed PR Stabilization CI repair for the selected worktree.
 - `Space g f` starts or appends a managed PR Stabilization review repair for the selected worktree.
 - Unavailable `Space g` actions are shown in dark gray and ignored. PR actions require a known pull request; repair actions also require a headless-capable harness.
 - `P` opens plan mode from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through the selected harness. Active plan runs render automatically in the Worktrees main panel for the selected worktree.
-- `A` starts or focuses Auto Flow for the selected non-default worktree.
+- `A` starts or focuses Auto Flow for the selected non-default worktree. Focusing a run blocked by actionable inline review feedback refreshes GitHub and offers to mark all unresolved conversations resolved; the confirmation defaults to No.
 - `u` pauses/resumes the selected Auto Flow or plan run from Status or the Worktrees main panel; paused Auto Flow resumes only after a dialog describes the next step.
 - `f` retries failed Auto Flow or Plan steps from the active dashboard.
 - `B` retries Auto Flow or Plan execution from the selected step.
