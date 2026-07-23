@@ -379,7 +379,12 @@ pub fn command_version(command: &str) -> Option<String> {
 }
 
 pub fn split_command_words(command: &str) -> Vec<String> {
-    parse_command_words(command).unwrap_or_default()
+    parse_command_words(command).unwrap_or_else(|_| {
+        command
+            .split_whitespace()
+            .map(ToString::to_string)
+            .collect()
+    })
 }
 
 pub fn parse_command_words(command: &str) -> Result<Vec<String>, String> {
@@ -472,6 +477,14 @@ mod tests {
         assert_eq!(
             words,
             vec!["my-agent", "--mode", "two words", "three words"]
+        );
+    }
+
+    #[test]
+    fn split_command_words_falls_back_for_incomplete_input() {
+        assert_eq!(
+            split_command_words("my-agent --mode 'incomplete"),
+            ["my-agent", "--mode", "'incomplete"]
         );
     }
 
