@@ -2,7 +2,7 @@ use std::io::{self, BufRead, Write};
 
 use crate::config::{Config, IconStyle};
 use crate::git::{RepositoryCheckout, inspect_repository_checkout, worktree_dirty};
-use crate::harness::BUILTIN_HARNESS_IDS;
+use crate::harness::{BUILTIN_HARNESS_IDS, harness_label};
 use crate::lifecycle::move_current_branch_to_worktree;
 use crate::process::command_exists;
 use crate::repo::Repository;
@@ -99,11 +99,12 @@ fn available_builtin_harnesses(config: &Config) -> Vec<String> {
     BUILTIN_HARNESS_IDS
         .into_iter()
         .filter(|id| {
-            config
-                .harness_config(id)
-                .ok()
-                .and_then(|harness| harness.interactive_command.into_iter().next())
-                .is_some_and(|program| command_exists(&program))
+            config.harness_config(id).is_ok_and(|harness| {
+                harness
+                    .interactive_command
+                    .first()
+                    .is_some_and(|program| command_exists(program))
+            })
         })
         .map(str::to_string)
         .collect()
@@ -156,16 +157,6 @@ fn prompt_harness_setup(
     };
     config.save_user_default_harness(selected)?;
     Ok(selected.clone())
-}
-
-fn harness_label(id: &str) -> &str {
-    match id {
-        "opencode" => "OpenCode",
-        "codex" => "Codex",
-        "claude" => "Claude Code",
-        "pi" => "Pi",
-        _ => id,
-    }
 }
 
 pub(crate) fn inspect_startup_setup(
