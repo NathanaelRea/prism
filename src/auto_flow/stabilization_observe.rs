@@ -396,6 +396,9 @@ fn review_facts(
         let feedback = stabilization_review_feedback(details, review_baseline_json);
         let mut review_bodies = feedback.review_bodies;
         review_bodies.retain(|review| {
+            if crate::review::is_copilot_reviewer(&review.author) {
+                return false;
+            }
             let superseded = details.reviews.iter().any(|candidate| {
                 candidate.author.eq_ignore_ascii_case(&review.author)
                     && candidate.submitted_at > review.submitted_at
@@ -557,6 +560,26 @@ mod tests {
         );
 
         assert!(facts.actionable_reviews.is_empty());
+    }
+
+    #[test]
+    fn copilot_review_overview_does_not_block_stabilization() {
+        let summary = test_summary();
+        let details = PrDetails {
+            reviews: vec![PrReview {
+                id: "review-1".to_string(),
+                author: "copilot-pull-request-reviewer".to_string(),
+                state: "COMMENTED".to_string(),
+                body: "## Pull request overview\n\nCopilot reviewed 2 out of 2 files.".to_string(),
+                submitted_at: "2026-01-01T00:00:00Z".to_string(),
+            }],
+            ..PrDetails::default()
+        };
+
+        let facts = review_facts(&summary, Some(&details), &test_config(false), None);
+
+        assert!(facts.actionable_reviews.is_empty());
+        assert!(facts.unresolved_threads.is_empty());
     }
 
     #[test]
