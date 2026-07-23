@@ -12,7 +12,7 @@ Prism uses a lazygit-style panel model.
 - `j` / `k` or up/down moves within the focused row panel.
 - `g g` jumps to the top of the focused list.
 - `G` jumps to the bottom of the focused list.
-- `Enter` and `Space Space` share the same go-deeper behavior from Repos and Worktrees: Repos opens the selected repository's default tmux session, and Worktrees opens the selected agent session when valid. Status has no `Enter` action. From a focused Worktrees plan dashboard, `Enter` switches the worktree OpenCode runtime to the selected phase session and opens tmux.
+- `Enter` and `Space Space` share the same go-deeper behavior from Repos and Worktrees: Repos opens the selected repository's default tmux session, and Worktrees opens the selected agent session when valid. Status has no `Enter` action. From a focused Worktrees plan dashboard, `Enter` resumes the selected phase's recorded agent session in tmux when supported.
 - Default branch worktrees are not agent targets; `Enter` and `Space Space` show the same blocked message there.
 - `Space Enter` opens tmux window 3: terminal.
 - `Ctrl-/` also opens tmux window 3 where the terminal reports that key combination distinctly; use `Space Enter` as the reliable alternative.
@@ -22,7 +22,7 @@ Prism uses a lazygit-style panel model.
 - `Space g M` merges the selected pull request.
 - `Space g c` starts or appends a managed PR Stabilization CI repair for the selected worktree.
 - `Space g f` starts or appends a managed PR Stabilization review repair for the selected worktree.
-- `P` opens plan mode from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through `opencode run`. Active plan runs render automatically in the Worktrees main panel for the selected worktree.
+- `P` opens plan mode from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through the selected harness. Active plan runs render automatically in the Worktrees main panel for the selected worktree.
 - `A` starts or focuses Auto Flow for the selected non-default worktree.
 - `u` pauses/resumes the selected Auto Flow or plan run from Status or the Worktrees main panel; paused Auto Flow resumes only after a dialog describes the next step.
 - `f` retries failed Auto Flow or Plan steps from the active dashboard.
@@ -33,7 +33,8 @@ Prism uses a lazygit-style panel model.
 - `r` opens the repository order dialog from the Repos panel. Use `Space` to mark repositories for removal, `J`/`K` to move them down/up, and `Enter` to save. Removals require a second confirmation.
 - `R` edits repository order, key bindings, and tracked repositories in `repos.toml`.
 - `c` creates a worktree session from the Repos panel.
-- `x` aborts the selected OpenCode session from the Worktrees panel.
+- `x` aborts the selected agent session from the Worktrees panel when its adapter supports native session cancellation.
+- `M` migrates the selected Worktree Session to the current global harness, including a worktree previously pinned with `Keep`.
 - `x` also aborts the selected Plan phase from the active Plan dashboard, or accepts `all` when prompted to abort all running phases.
 - `e` edits the selected Prism repository config and reloads after save.
 - `E` edits the Prism user config and reloads after save.

@@ -15,10 +15,10 @@
   return the main panel to normal worktree content.
 - **Behavior**: Standalone Plan Mode remains available separately from Auto Flow.
   Its dashboard supports pause/resume, retry, skip, abort, and entering the
-  selected phase's OpenCode session.
+   selected phase's interactive session when its adapter supports persistent sessions and interactive resume.
 - **Behavior**: Starting a Plan asks `Run steps in parallel? [y/N]:`.
 - **Default**: Plan steps run sequentially unless the user opts into parallel
-  execution. OpenCode's `medium` agent variant is used for OpenCode unless another variant is
+   execution. OpenCode's `medium` agent variant is used for OpenCode unless another variant is
   selected.
 - **Behavior**: Opting into parallel execution declares that the selected plan
   was authored with independent, parallel-safe phases. Prism does not infer or

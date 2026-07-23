@@ -44,6 +44,10 @@ logs, hidden markers, pull request cache data, and workflow history. Deleting a
 session retires it from active use while retaining historical Plan and Auto Flow
 runs under that session identity.
 
+Each Worktree Session records the Harness used by its tmux Agent Session. A
+global Harness change does not silently reinterpret an existing worktree;
+users migrate, defer, or pin that association when opening it.
+
 The Worktree Session module owns session identity, default-branch
 classification, branch metadata facts, background-safe snapshots, and deletion
 warnings. It may carry Agent Session and PR Cache facts for callers, but it

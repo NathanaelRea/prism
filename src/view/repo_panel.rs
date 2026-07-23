@@ -386,7 +386,10 @@ pub(super) fn repo_work_detail_label(config: &crate::config::Config, session: &S
     }
     if matches!(
         session.agent_state,
-        AgentState::Running | AgentState::NeedsInput | AgentState::NeedsRestart
+        AgentState::Attached
+            | AgentState::Running
+            | AgentState::NeedsInput
+            | AgentState::NeedsRestart
     ) {
         parts.push(format!("agent {}", agent_icon(session.agent_state)));
     }

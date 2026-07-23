@@ -1,0 +1,2 @@
+{"type":"thread.started","thread_id":"codex-fixture"}
+{"type":"item.completed","item":{"type":"agent_message","text":"Codex fixture complete"}}

@@ -6,6 +6,7 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
         create table if not exists auto_run (
           id text primary key,
           harness_id text not null default 'opencode',
+          adapter_id text not null default 'opencode',
           repo_root text not null,
           worktree_path text not null,
           worktree_incarnation text,
@@ -48,6 +49,12 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
           opencode_server_url text,
           opencode_session_id text,
           process_id integer,
+          execution_state text,
+          execution_process_id integer,
+          execution_process_start_time_ticks integer,
+          session_endpoint text,
+          session_id text,
+          session_adapter_id text,
           plan_run_id text,
           commit_sha text,
           head_sha text,
@@ -110,6 +117,13 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
         )
         .map_err(|error| format!("migrate auto_run harness_id column: {error}"))?;
     }
+    if !table_has_column(conn, "auto_run", "adapter_id")? {
+        conn.execute(
+            "alter table auto_run add column adapter_id text not null default 'opencode'",
+            [],
+        )
+        .map_err(|error| format!("migrate auto_run adapter_id column: {error}"))?;
+    }
     if !table_has_column(conn, "auto_run", "worktree_incarnation")? {
         conn.execute(
             "alter table auto_run add column worktree_incarnation text",
@@ -148,6 +162,30 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
         conn.execute("alter table auto_step_run add column plan_run_id text", [])
             .map_err(|error| format!("migrate auto_step_run plan_run_id column: {error}"))?;
     }
+    for (column, definition, legacy) in [
+        ("execution_process_id", "integer", Some("process_id")),
+        ("execution_process_start_time_ticks", "integer", None),
+        ("session_endpoint", "text", Some("opencode_server_url")),
+        ("session_id", "text", Some("opencode_session_id")),
+        (
+            "session_adapter_id",
+            "text",
+            Some("case when opencode_session_id is not null then 'opencode' end"),
+        ),
+        ("execution_state", "text", None),
+    ] {
+        if !table_has_column(conn, "auto_step_run", column)? {
+            conn.execute(
+                &format!("alter table auto_step_run add column {column} {definition}"),
+                [],
+            )
+            .map_err(|error| format!("migrate auto_step_run {column}: {error}"))?;
+            if let Some(legacy) = legacy {
+                conn.execute(&format!("update auto_step_run set {column} = {legacy}"), [])
+                    .map_err(|error| format!("backfill auto_step_run {column}: {error}"))?;
+            }
+        }
+    }
     for (table, column) in [
         ("auto_run", "stabilization_status"),
         ("auto_run", "stabilization_blocker"),
@@ -163,7 +201,7 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
     }
     reset_incompatible_active_runs(conn)?;
     conn.execute(
-        "insert into auto_schema_version (id, version) values (1, 5)
+        "insert into auto_schema_version (id, version) values (1, 6)
          on conflict(id) do update set version = excluded.version",
         [],
     )
@@ -272,11 +310,12 @@ pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &AutoRun) -> 
            plan_run_mode, variant, agent_profile, prompt_summary, initial_prompt, status, pause_requested,
            selected_step_run_id, pr_number, pr_url, current_head_sha, review_baseline_json,
            stabilization_status, stabilization_blocker, stabilization_next_work, pending_push_json,
-            created_unix_ms, updated_unix_ms, archived_unix_ms
-          ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)
+             created_unix_ms, updated_unix_ms, archived_unix_ms, adapter_id
+           ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
          on conflict(id) do update set
             repo_root = excluded.repo_root,
             harness_id = excluded.harness_id,
+            adapter_id = excluded.adapter_id,
            worktree_path = excluded.worktree_path,
            worktree_incarnation = excluded.worktree_incarnation,
            branch = excluded.branch,
@@ -300,7 +339,8 @@ pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &AutoRun) -> 
             stabilization_next_work = excluded.stabilization_next_work,
             pending_push_json = excluded.pending_push_json,
             updated_unix_ms = excluded.updated_unix_ms,
-            archived_unix_ms = excluded.archived_unix_ms",
+             archived_unix_ms = excluded.archived_unix_ms
+           where auto_run.status != 'aborted' or excluded.status = 'queued'",
         params![
             run.id.as_str(),
             run.harness_id.as_str(),
@@ -330,6 +370,7 @@ pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &AutoRun) -> 
             u64_to_i64(run.created_unix_ms),
             u64_to_i64(run.updated_unix_ms),
             run.archived_unix_ms.map(u64_to_i64),
+            run.adapter_id.as_str(),
         ],
     )
     .map_err(|error| format!("write auto run: {error}"))?;
@@ -352,17 +393,20 @@ pub(super) fn save_step_with_conn(
                  attempt = ?6,
                  started_unix_ms = ?7,
                  finished_unix_ms = ?8,
-                  opencode_server_url = ?9,
-                  opencode_session_id = ?10,
-                  process_id = ?11,
-                  plan_run_id = ?12,
-                  commit_sha = ?13,
-                  head_sha = ?14,
-                  work_guard_json = ?15,
-                  blocker = ?16,
-                  summary = ?17,
-                  error = ?18
-             where id = ?19",
+                  execution_state = ?9,
+                  session_endpoint = ?10,
+                  session_id = ?11,
+                  execution_process_id = ?12,
+                  plan_run_id = ?13,
+                  commit_sha = ?14,
+                  head_sha = ?15,
+                  work_guard_json = ?16,
+                  blocker = ?17,
+                  summary = ?18,
+                   error = ?19,
+                   session_adapter_id = ?20,
+                   execution_process_start_time_ticks = ?21
+               where id = ?22 and (status != 'aborted' or ?5 = 'queued')",
             params![
                 step.run_id.as_str(),
                 usize_to_i64(step.sequence),
@@ -372,9 +416,10 @@ pub(super) fn save_step_with_conn(
                 usize_to_i64(step.attempt),
                 step.started_unix_ms.map(u64_to_i64),
                 step.finished_unix_ms.map(u64_to_i64),
-                step.opencode_server_url.as_deref(),
-                step.opencode_session_id.as_deref(),
-                step.process_id.map(i64::from),
+                step.execution.state.as_deref(),
+                step.session.endpoint.as_deref(),
+                step.session.id.as_deref(),
+                step.execution.process_id.map(i64::from),
                 step.plan_run_id.as_deref(),
                 step.commit_sha.as_deref(),
                 step.head_sha.as_deref(),
@@ -382,6 +427,8 @@ pub(super) fn save_step_with_conn(
                 step.blocker.as_ref().map(|blocker| blocker.as_str()),
                 step.summary.as_deref(),
                 step.error.as_deref(),
+                step.session.adapter_id.as_deref(),
+                step.execution.process_start_time_ticks.map(u64_to_i64),
                 id,
             ],
         )
@@ -392,9 +439,10 @@ pub(super) fn save_step_with_conn(
         conn.execute(
             "insert into auto_step_run (
                run_id, sequence, step_key, reason, status, attempt, started_unix_ms,
-               finished_unix_ms, opencode_server_url, opencode_session_id, process_id,
-                plan_run_id, commit_sha, head_sha, work_guard_json, blocker, summary, error
-              ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+               finished_unix_ms, execution_state, session_endpoint, session_id, execution_process_id,
+                 plan_run_id, commit_sha, head_sha, work_guard_json, blocker, summary, error,
+                  session_adapter_id, execution_process_start_time_ticks
+                ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 step.run_id.as_str(),
                 usize_to_i64(step.sequence),
@@ -404,9 +452,10 @@ pub(super) fn save_step_with_conn(
                 usize_to_i64(step.attempt),
                 step.started_unix_ms.map(u64_to_i64),
                 step.finished_unix_ms.map(u64_to_i64),
-                step.opencode_server_url.as_deref(),
-                step.opencode_session_id.as_deref(),
-                step.process_id.map(i64::from),
+                step.execution.state.as_deref(),
+                step.session.endpoint.as_deref(),
+                step.session.id.as_deref(),
+                step.execution.process_id.map(i64::from),
                 step.plan_run_id.as_deref(),
                 step.commit_sha.as_deref(),
                 step.head_sha.as_deref(),
@@ -414,6 +463,8 @@ pub(super) fn save_step_with_conn(
                 step.blocker.as_ref().map(|blocker| blocker.as_str()),
                 step.summary.as_deref(),
                 step.error.as_deref(),
+                step.session.adapter_id.as_deref(),
+                step.execution.process_start_time_ticks.map(u64_to_i64),
             ],
         )
         .map_err(|error| format!("write auto step run: {error}"))?;
@@ -433,7 +484,7 @@ pub(super) fn load_run_with_conn(
                 plan_run_mode, variant, agent_profile, prompt_summary, initial_prompt, status, pause_requested,
                  selected_step_run_id, pr_number, pr_url, current_head_sha, review_baseline_json,
                  stabilization_status, stabilization_blocker, stabilization_next_work, pending_push_json,
-                 created_unix_ms, updated_unix_ms, archived_unix_ms
+                  created_unix_ms, updated_unix_ms, archived_unix_ms, adapter_id
          from auto_run
          where id = ?1",
         params![run_id],
@@ -445,6 +496,7 @@ pub(super) fn load_run_with_conn(
             Ok(AutoRun {
                 id: row.get(0)?,
                 harness_id: row.get(1)?,
+                adapter_id: row.get(28)?,
                 repo_root: row.get(2)?,
                 worktree_path: PathBuf::from(row.get::<_, String>(3)?),
                 worktree_incarnation: row.get(4)?,
@@ -490,8 +542,9 @@ pub(super) fn load_steps_with_conn(
     let mut statement = conn
         .prepare(
             "select id, run_id, sequence, step_key, reason, status, attempt, started_unix_ms,
-                    finished_unix_ms, opencode_server_url, opencode_session_id, process_id,
-                    plan_run_id, commit_sha, head_sha, work_guard_json, blocker, summary, error
+                    finished_unix_ms, execution_state, session_endpoint, session_id, execution_process_id,
+                    plan_run_id, commit_sha, head_sha, work_guard_json, blocker, summary, error,
+                    session_adapter_id, execution_process_start_time_ticks
              from auto_step_run
              where run_id = ?1
              order by sequence",
@@ -515,18 +568,27 @@ pub(super) fn load_steps_with_conn(
                 finished_unix_ms: row
                     .get::<_, Option<i64>>(8)?
                     .map(|value| value.max(0) as u64),
-                opencode_server_url: row.get(9)?,
-                opencode_session_id: row.get(10)?,
-                process_id: row
-                    .get::<_, Option<i64>>(11)?
-                    .map(|value| value.max(0) as u32),
-                plan_run_id: row.get(12)?,
-                commit_sha: row.get(13)?,
-                head_sha: row.get(14)?,
-                work_guard: optional_json_value(row.get::<_, Option<String>>(15)?)?,
-                blocker: optional_stabilization_blocker(row.get(16)?)?,
-                summary: row.get(17)?,
-                error: row.get(18)?,
+                execution: crate::harness::ExecutionRef {
+                    state: row.get(9)?,
+                    process_id: row
+                        .get::<_, Option<i64>>(12)?
+                        .map(|value| value.max(0) as u32),
+                    process_start_time_ticks: row
+                        .get::<_, Option<i64>>(21)?
+                        .map(|value| value.max(0) as u64),
+                },
+                session: crate::harness::SessionRef {
+                    adapter_id: row.get(20)?,
+                    endpoint: row.get(10)?,
+                    id: row.get(11)?,
+                },
+                plan_run_id: row.get(13)?,
+                commit_sha: row.get(14)?,
+                head_sha: row.get(15)?,
+                work_guard: optional_json_value(row.get::<_, Option<String>>(16)?)?,
+                blocker: optional_stabilization_blocker(row.get(17)?)?,
+                summary: row.get(18)?,
+                error: row.get(19)?,
             })
         })
         .map_err(|error| format!("load auto steps: {error}"))?;

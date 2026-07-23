@@ -98,7 +98,7 @@ pub(super) fn agent_style(state: AgentState) -> Style {
         AgentState::NeedsInput | AgentState::NeedsRestart => attention_style(),
         AgentState::ExitedOk => muted_style(),
         AgentState::ExitedError => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        AgentState::Idle => muted_style(),
+        AgentState::Idle | AgentState::Attached => muted_style(),
     }
 }
 

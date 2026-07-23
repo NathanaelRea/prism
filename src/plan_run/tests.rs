@@ -73,12 +73,13 @@ fn generic_stdin_harness_executes_plan_step_as_bounded_plain_text() {
         PlanRunMode::Sequential,
     )
     .unwrap()
-    .with_harness("generic-test");
+    .with_harness("generic-test", "generic");
     let mut persisted = launch.create_run();
     save_plan_run(&conn, &persisted).unwrap();
     let harness_config = crate::harness::HarnessConfig {
         adapter: "generic".to_string(),
         interactive_command: vec!["/bin/sh".to_string()],
+        arguments: Vec::new(),
         interactive_prompt_transport: None,
         headless_command: Some(vec![
             "/bin/sh".to_string(),
@@ -113,6 +114,115 @@ fn generic_stdin_harness_executes_plan_step_as_bounded_plain_text() {
             .contains("plain:Implement plan.md phase 1")
     );
     let _ = fs::remove_dir_all(scope);
+}
+
+#[test]
+fn unsupported_generic_headless_plan_fails_the_step_instead_of_leaving_it_starting() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let scope = PathBuf::from("/repo/prism");
+    let mut persisted = PlanLaunch::new(
+        &scope,
+        &scope,
+        &scope.join("plan.md"),
+        "phase",
+        1,
+        1,
+        PlanRunMode::Sequential,
+    )
+    .unwrap()
+    .with_harness("interactive-only", "generic")
+    .create_run();
+    save_plan_run(&conn, &persisted).unwrap();
+    let executor = PlanExecutorConfig::for_harness(
+        "interactive-only",
+        crate::harness::HarnessConfig {
+            adapter: "generic".to_string(),
+            interactive_command: vec!["agent".to_string()],
+            arguments: Vec::new(),
+            interactive_prompt_transport: None,
+            headless_command: None,
+            headless_prompt_transport: None,
+            output_format: crate::harness::OutputFormat::Text,
+            environment: std::collections::BTreeMap::new(),
+        },
+        None,
+        scope,
+        "plan.md",
+    );
+
+    execute_plan_sequential(&conn, &mut persisted, &executor, &mut Vec::new()).unwrap_err();
+
+    let loaded = load_plan_run(&conn, &persisted.run.id).unwrap().unwrap();
+    assert_eq!(loaded.steps[0].status, PlanStepStatus::Failed);
+    assert!(
+        loaded.steps[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("does not support managed headless execution")
+    );
+}
+
+#[test]
+fn legacy_plan_execution_fields_backfill_to_neutral_references_once() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "
+        create table plan_run (
+          id text primary key, repo_root text not null, scope_path text not null,
+          plan_path text not null, plan_display text not null, step_name text not null,
+          start_step integer not null, total_steps integer not null, mode text not null,
+          status text not null, selected_step integer not null,
+          created_unix_ms integer not null, updated_unix_ms integer not null
+        );
+        create table plan_step_run (
+          run_id text not null, step integer not null, prompt text not null, status text not null,
+          opencode_state text, opencode_server_url text, opencode_session_id text,
+          process_id integer, started_unix_ms integer, finished_unix_ms integer,
+          exit_code integer, latest_message text, active_tool text,
+          todos_json text not null default '[]', summary text, error text,
+          primary key (run_id, step)
+        );
+        insert into plan_run (
+          id, repo_root, scope_path, plan_path, plan_display, step_name,
+          start_step, total_steps, mode, status, selected_step, created_unix_ms, updated_unix_ms
+        ) values ('legacy', '/repo', '/repo', '/repo/plan.md', 'plan.md', 'phase',
+          1, 1, 'sequential', 'paused', 1, 1, 1);
+        insert into plan_step_run (
+          run_id, step, prompt, status, opencode_state, opencode_server_url,
+          opencode_session_id, process_id
+        ) values ('legacy', 1, 'work', 'running', 'busy',
+          'http://127.0.0.1:41000', 'ses_legacy', 1234);
+        ",
+    )
+    .unwrap();
+
+    migrate_schema(&conn).unwrap();
+    let loaded = load_plan_run(&conn, "legacy").unwrap().unwrap();
+    assert_eq!(loaded.run.harness_id, "opencode");
+    assert_eq!(loaded.run.adapter_id, "opencode");
+    assert_eq!(loaded.steps[0].execution.state.as_deref(), Some("busy"));
+    assert_eq!(loaded.steps[0].execution.process_id, Some(1234));
+    assert_eq!(
+        loaded.steps[0].session.endpoint.as_deref(),
+        Some("http://127.0.0.1:41000")
+    );
+    assert_eq!(loaded.steps[0].session.id.as_deref(), Some("ses_legacy"));
+    assert_eq!(
+        loaded.steps[0].session.adapter_id.as_deref(),
+        Some("opencode")
+    );
+
+    conn.execute(
+        "update plan_step_run set session_id = null, execution_process_id = null where run_id = 'legacy'",
+        [],
+    )
+    .unwrap();
+    migrate_schema(&conn).unwrap();
+    let loaded = load_plan_run(&conn, "legacy").unwrap().unwrap();
+    assert_eq!(loaded.steps[0].session.id, None);
+    assert_eq!(loaded.steps[0].execution.process_id, None);
 }
 
 #[test]
@@ -321,13 +431,10 @@ echo '{"type":"todo.updated","todos":[{"title":"write tests","status":"done"}]}'
             .all(|step| step.status == PlanStepStatus::Done)
     );
     assert_eq!(
-        loaded.steps[0].opencode_server_url.as_deref(),
+        loaded.steps[0].session.endpoint.as_deref(),
         Some("http://127.0.0.1:41234")
     );
-    assert_eq!(
-        loaded.steps[0].opencode_session_id.as_deref(),
-        Some("ses_test")
-    );
+    assert_eq!(loaded.steps[0].session.id.as_deref(), Some("ses_test"));
     assert_eq!(loaded.steps[0].latest_message.as_deref(), Some("working"));
     assert_eq!(
         loaded.steps[0].todos,
@@ -543,6 +650,172 @@ fn parses_known_plan_agent_events_without_panics() {
 }
 
 #[test]
+fn normalizes_named_adapter_session_and_result_events() {
+    for (line, expected_session) in [
+        (
+            r#"{"type":"thread.started","thread_id":"codex-1"}"#,
+            "codex-1",
+        ),
+        (
+            r#"{"type":"result","session_id":"claude-1","result":"done"}"#,
+            "claude-1",
+        ),
+        (r#"{"type":"session","id":"pi-1"}"#, "pi-1"),
+    ] {
+        let events = parse_plan_agent_events(line);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PlanAgentEvent::SessionIdentified { session_id, .. } if session_id == expected_session
+        )));
+    }
+    let events =
+        parse_plan_agent_events(r#"{"type":"result","session_id":"claude-1","result":"done"}"#);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        PlanAgentEvent::AssistantText { text } if text == "done"
+    )));
+}
+
+#[test]
+fn recorded_named_adapter_fixtures_normalize_without_malformed_output() {
+    for (fixture, expected_message) in [
+        (
+            include_str!("../../tests/fixtures/harness/codex.jsonl"),
+            "Codex fixture complete",
+        ),
+        (
+            include_str!("../../tests/fixtures/harness/claude.jsonl"),
+            "Claude fixture complete",
+        ),
+        (
+            include_str!("../../tests/fixtures/harness/pi.jsonl"),
+            "Pi fixture complete",
+        ),
+    ] {
+        let events = fixture
+            .lines()
+            .flat_map(parse_plan_agent_events)
+            .collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, PlanAgentEvent::SessionIdentified { .. }))
+        );
+        assert!(!events.is_empty());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            PlanAgentEvent::AssistantText { text } if text == expected_message
+        )));
+    }
+}
+
+#[test]
+fn malformed_structured_output_is_a_protocol_error_and_unknown_json_is_retained() {
+    assert_eq!(
+        parse_plan_agent_events("not json"),
+        vec![PlanAgentEvent::Error {
+            message: "malformed structured harness output".to_string(),
+        }]
+    );
+    assert!(matches!(
+        parse_plan_agent_events(r#"{"type":"future.adapter.event","value":42}"#).as_slice(),
+        [PlanAgentEvent::Raw { event_type, .. }] if event_type == "future.adapter.event"
+    ));
+}
+
+#[test]
+fn successful_plan_step_clears_benign_stderr_but_preserves_abort() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted = PlanLaunch::new(
+        &repo,
+        &repo,
+        &repo.join("plan.md"),
+        "phase",
+        1,
+        1,
+        PlanRunMode::Sequential,
+    )
+    .unwrap()
+    .create_run();
+    persisted.steps[0].status = PlanStepStatus::Running;
+    save_plan_run(&conn, &persisted).unwrap();
+
+    executor::ingest_child_line(
+        &conn,
+        &mut persisted.steps[0],
+        executor::StreamKind::Stderr,
+        "warning on stderr",
+        DEFAULT_OUTPUT_LINES_PER_STEP,
+        false,
+        &mut Vec::new(),
+    )
+    .unwrap();
+    assert_eq!(persisted.steps[0].error, None);
+    executor::finish_step_after_exit(&conn, &mut persisted.steps[0], 0, false, "test").unwrap();
+    assert_eq!(persisted.steps[0].status, PlanStepStatus::Done);
+    assert_eq!(persisted.steps[0].error, None);
+
+    persisted.steps[0].status = PlanStepStatus::Running;
+    save_step_with_conn(&conn, &persisted.steps[0]).unwrap();
+    let mut stale = persisted.steps[0].clone();
+    abort_plan_step(&conn, &mut persisted.steps[0]).unwrap();
+    executor::finish_step_after_exit(&conn, &mut stale, 143, false, "test").unwrap();
+    assert_eq!(stale.status, PlanStepStatus::Aborted);
+    assert_eq!(
+        load_plan_run(&conn, &persisted.run.id)
+            .unwrap()
+            .unwrap()
+            .steps[0]
+            .status,
+        PlanStepStatus::Aborted
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn abort_during_start_prevents_spawned_plan_process_from_becoming_running() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted = PlanLaunch::new(
+        &repo,
+        &repo,
+        &repo.join("plan.md"),
+        "phase",
+        1,
+        1,
+        PlanRunMode::Sequential,
+    )
+    .unwrap()
+    .create_run();
+    persisted.steps[0].status = PlanStepStatus::Starting;
+    save_plan_run(&conn, &persisted).unwrap();
+    let invocation = crate::harness::Invocation {
+        argv: vec!["sleep".to_string(), "30".to_string()],
+        environment: std::collections::BTreeMap::new(),
+        stdin: None,
+        prompt_file: None,
+        structured_events: false,
+        attach: false,
+    };
+    let mut child = invocation.spawn(Path::new("/tmp")).unwrap();
+
+    abort_plan_step(&conn, &mut persisted.steps[0]).unwrap();
+    assert!(!executor::claim_spawned_process(&conn, &mut persisted.steps[0], &mut child).unwrap());
+
+    assert_eq!(
+        load_plan_run(&conn, &persisted.run.id)
+            .unwrap()
+            .unwrap()
+            .steps[0]
+            .status,
+        PlanStepStatus::Aborted
+    );
+}
+
+#[test]
 fn sse_payload_ingestion_updates_matching_step_and_ignores_other_sessions() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
@@ -558,7 +831,7 @@ fn sse_payload_ingestion_updates_matching_step_and_ignores_other_sessions() {
     )
     .unwrap()
     .create_run();
-    persisted.steps[0].opencode_session_id = Some("ses_plan".to_string());
+    persisted.steps[0].session.id = Some("ses_plan".to_string());
     save_plan_run(&conn, &persisted).unwrap();
 
     let matched = ingest_plan_sse_payload(
@@ -629,10 +902,7 @@ fn sse_payload_ingestion_tracks_session_and_raw_relevant_unknown_events() {
 
     assert!(matched);
     assert!(!malformed);
-    assert_eq!(
-        persisted.steps[0].opencode_session_id.as_deref(),
-        Some("ses_new")
-    );
+    assert_eq!(persisted.steps[0].session.id.as_deref(), Some("ses_new"));
     assert_eq!(persisted.steps[0].active_tool, None);
     let output = load_output_lines(&conn, &persisted.run.id, 1).unwrap();
     assert!(output.iter().any(
@@ -656,8 +926,8 @@ fn poll_reconciliation_recovers_latest_status_message_tool_and_todos() {
     )
     .unwrap()
     .create_run();
-    persisted.steps[0].opencode_server_url = Some("http://127.0.0.1:41234".to_string());
-    persisted.steps[0].opencode_session_id = Some("ses_plan".to_string());
+    persisted.steps[0].session.endpoint = Some("http://127.0.0.1:41234".to_string());
+    persisted.steps[0].session.id = Some("ses_plan".to_string());
     save_plan_run(&conn, &persisted).unwrap();
 
     let status = OpencodeStatus {
@@ -792,7 +1062,7 @@ fn reconcile_marks_running_steps_failed_after_restart() {
     .create_run();
     persisted.run.status = PlanRunStatus::Running;
     persisted.steps[0].status = PlanStepStatus::Running;
-    persisted.steps[0].process_id = None;
+    persisted.steps[0].execution.process_id = None;
     save_plan_run(&conn, &persisted).unwrap();
 
     let changed =
@@ -839,9 +1109,9 @@ fn reconcile_keeps_running_step_with_live_process() {
     persisted.run.selected_step = 1;
     persisted.run.updated_unix_ms = 123;
     persisted.steps[0].status = PlanStepStatus::Running;
-    persisted.steps[0].process_id = Some(std::process::id());
-    persisted.steps[0].opencode_server_url = Some("http://127.0.0.1:41234".to_string());
-    persisted.steps[0].opencode_session_id = Some("ses_live".to_string());
+    persisted.steps[0].execution.process_id = Some(std::process::id());
+    persisted.steps[0].session.endpoint = Some("http://127.0.0.1:41234".to_string());
+    persisted.steps[0].session.id = Some("ses_live".to_string());
     persisted.steps[0].started_unix_ms = Some(111);
     save_plan_run(&conn, &persisted).unwrap();
 
@@ -859,17 +1129,17 @@ fn reconcile_keeps_running_step_with_live_process() {
     assert_eq!(loaded.run.selected_step, 1);
     assert_eq!(loaded.run.updated_unix_ms, 123);
     assert_eq!(loaded.steps[0].status, PlanStepStatus::Running);
-    assert_eq!(loaded.steps[0].process_id, Some(std::process::id()));
+    assert_eq!(
+        loaded.steps[0].execution.process_id,
+        Some(std::process::id())
+    );
     assert_eq!(loaded.steps[0].started_unix_ms, Some(111));
     assert_eq!(loaded.steps[0].finished_unix_ms, None);
     assert_eq!(
-        loaded.steps[0].opencode_server_url.as_deref(),
+        loaded.steps[0].session.endpoint.as_deref(),
         Some("http://127.0.0.1:41234")
     );
-    assert_eq!(
-        loaded.steps[0].opencode_session_id.as_deref(),
-        Some("ses_live")
-    );
+    assert_eq!(loaded.steps[0].session.id.as_deref(), Some("ses_live"));
     let output = load_output_lines(&conn, &persisted.run.id, 1).unwrap();
     assert_eq!(
         output
@@ -986,7 +1256,7 @@ fn resumable_run_requeues_interrupted_steps_and_preserves_done_steps() {
     persisted.run.status = PlanRunStatus::Running;
     persisted.steps[0].status = PlanStepStatus::Done;
     persisted.steps[1].status = PlanStepStatus::Running;
-    persisted.steps[1].process_id = None;
+    persisted.steps[1].execution.process_id = None;
     save_plan_run(&conn, &persisted).unwrap();
 
     let mut resumed = load_resumable_plan_run(&conn, &launch)

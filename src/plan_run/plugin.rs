@@ -4,7 +4,6 @@ use super::*;
 pub struct PlanExecutorConfig {
     pub harness_id: String,
     pub harness_config: crate::harness::HarnessConfig,
-    pub opencode_program: String,
     pub server_url: Option<String>,
     pub scope_path: PathBuf,
     pub title_prefix: String,
@@ -34,7 +33,6 @@ impl PlanExecutorConfig {
         Self {
             harness_id: "opencode".to_string(),
             harness_config: crate::harness::HarnessConfig::opencode(opencode_program.clone()),
-            opencode_program,
             server_url,
             scope_path: scope_path.into(),
             title_prefix: title_prefix.into(),
@@ -52,15 +50,9 @@ impl PlanExecutorConfig {
         scope_path: impl Into<PathBuf>,
         title_prefix: impl Into<String>,
     ) -> Self {
-        let opencode_program = harness_config
-            .interactive_command
-            .first()
-            .cloned()
-            .unwrap_or_default();
         Self {
             harness_id: harness_id.into(),
             harness_config,
-            opencode_program,
             server_url,
             scope_path: scope_path.into(),
             title_prefix: title_prefix.into(),

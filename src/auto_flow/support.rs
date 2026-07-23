@@ -35,7 +35,7 @@ pub(super) fn emit_auto_step_log(step: &AutoStepRun) {
         operation_id: None,
         parent_operation_id: None,
         branch: None,
-        session: step.opencode_session_id.clone(),
+        session: step.session.id.clone(),
         message: format!(
             "Auto Flow step {} attempt {} is {}",
             step.step_key.as_str(),
@@ -52,7 +52,8 @@ pub(super) fn emit_auto_step_log(step: &AutoStepRun) {
             json_string(step.step_key.as_str()),
             step.attempt,
             json_string(step.status.as_str()),
-            step.process_id
+            step.execution
+                .process_id
                 .map(|pid| pid.to_string())
                 .unwrap_or_else(|| "null".to_string()),
             step.commit_sha

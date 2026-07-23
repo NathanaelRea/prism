@@ -9,7 +9,7 @@
     "default_harness": {
       "type": "string",
       "default": "opencode",
-      "description": "Global harness ID selected from the harnesses table."
+      "description": "Global harness ID. OpenCode, Codex, Claude, and Pi have built-in definitions; other IDs must be defined in the harnesses table."
     },
     "default_base": {
       "type": "string",
@@ -210,15 +210,20 @@
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["adapter"],
         "properties": {
           "adapter": {
             "type": "string",
-            "enum": ["opencode", "generic"]
+            "enum": ["opencode", "codex", "claude", "pi", "generic"],
+            "default": "generic"
           },
           "program": {
             "type": "string",
-            "description": "OpenCode executable or wrapper. Prism owns protocol arguments."
+            "description": "Built-in adapter executable or wrapper. Prism owns protocol arguments."
+          },
+          "arguments": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Adapter-approved arguments placed before Prism-owned protocol arguments."
           },
           "interactive_command": {
             "type": "array",

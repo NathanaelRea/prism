@@ -6,6 +6,7 @@ pub const DEFAULT_OUTPUT_LINES_PER_STEP: usize = 2_000;
 pub struct PlanRun {
     pub id: String,
     pub harness_id: String,
+    pub adapter_id: String,
     pub repo_root: String,
     pub scope_path: PathBuf,
     pub plan_path: PathBuf,
@@ -28,11 +29,9 @@ pub struct PlanStepRun {
     pub step: usize,
     pub prompt: String,
     pub status: PlanStepStatus,
-    pub opencode_state: Option<OpencodeState>,
-    pub opencode_server_url: Option<String>,
-    pub opencode_session_id: Option<String>,
+    pub execution: crate::harness::ExecutionRef,
+    pub session: crate::harness::SessionRef,
     pub agent_variant: Option<String>,
-    pub process_id: Option<u32>,
     pub started_unix_ms: Option<u64>,
     pub finished_unix_ms: Option<u64>,
     pub exit_code: Option<i32>,
@@ -43,11 +42,7 @@ pub struct PlanStepRun {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PlanTodo {
-    pub title: String,
-    pub status: String,
-}
+pub type PlanTodo = crate::harness::AgentTodo;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanOutputLine {
@@ -135,46 +130,7 @@ pub struct PlanStatusCounts {
     pub skipped: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum PlanAgentEvent {
-    SessionIdentified {
-        session_id: String,
-        title: Option<String>,
-    },
-    StateChanged {
-        state: String,
-    },
-    AssistantText {
-        text: String,
-    },
-    ToolStarted {
-        id: Option<String>,
-        name: String,
-        args_summary: Option<String>,
-    },
-    ToolOutput {
-        id: Option<String>,
-        text: String,
-    },
-    ToolFinished {
-        id: Option<String>,
-        status: String,
-    },
-    TodoUpdated {
-        todos: Vec<PlanTodo>,
-    },
-    DiffUpdated {
-        summary: String,
-        patch: Option<String>,
-    },
-    Error {
-        message: String,
-    },
-    Raw {
-        event_type: String,
-        json: String,
-    },
-}
+pub type PlanAgentEvent = crate::harness::AgentEvent;
 
 impl PlanRunMode {
     pub(super) fn as_str(self) -> &'static str {
@@ -278,15 +234,6 @@ impl PlanOutputKind {
     }
 }
 
-impl PlanTodo {
-    pub fn new(title: impl Into<String>, status: impl Into<String>) -> Self {
-        Self {
-            title: title.into(),
-            status: status.into(),
-        }
-    }
-}
-
 impl PlanStepRun {
     pub fn queued(run_id: &str, step: usize, prompt: String) -> Self {
         Self {
@@ -294,11 +241,9 @@ impl PlanStepRun {
             step,
             prompt,
             status: PlanStepStatus::Queued,
-            opencode_state: None,
-            opencode_server_url: None,
-            opencode_session_id: None,
+            execution: crate::harness::ExecutionRef::default(),
+            session: crate::harness::SessionRef::default(),
             agent_variant: None,
-            process_id: None,
             started_unix_ms: None,
             finished_unix_ms: None,
             exit_code: None,

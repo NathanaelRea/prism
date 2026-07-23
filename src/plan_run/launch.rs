@@ -3,6 +3,7 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanLaunch {
     pub harness_id: String,
+    pub adapter_id: String,
     pub repo_root: String,
     pub scope_path: PathBuf,
     pub plan_path: PathBuf,
@@ -34,6 +35,7 @@ impl PlanLaunch {
         }
         Ok(Self {
             harness_id: "opencode".to_string(),
+            adapter_id: "opencode".to_string(),
             repo_root: repo_root.display().to_string(),
             scope_path: scope_path.to_path_buf(),
             plan_path: plan_path.to_path_buf(),
@@ -45,8 +47,13 @@ impl PlanLaunch {
         })
     }
 
-    pub fn with_harness(mut self, harness_id: impl Into<String>) -> Self {
+    pub fn with_harness(
+        mut self,
+        harness_id: impl Into<String>,
+        adapter_id: impl Into<String>,
+    ) -> Self {
         self.harness_id = harness_id.into();
+        self.adapter_id = adapter_id.into();
         self
     }
 
@@ -56,6 +63,7 @@ impl PlanLaunch {
         let run = PlanRun {
             id: id.clone(),
             harness_id: self.harness_id.clone(),
+            adapter_id: self.adapter_id.clone(),
             repo_root: self.repo_root.clone(),
             scope_path: self.scope_path.clone(),
             plan_path: self.plan_path.clone(),

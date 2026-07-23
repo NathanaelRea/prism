@@ -130,21 +130,19 @@ pub(super) fn plan_run_row(run: &crate::view::PlanRunSummary) -> Line<'static> {
 
 pub(super) fn plan_opencode_status_lines(step: &PlanStepRun) -> Vec<Line<'static>> {
     let state = step
-        .opencode_state
-        .map(OpencodeState::label)
+        .execution
+        .state
+        .as_deref()
         .unwrap_or_else(|| plan_step_status_label(step.status));
     let server = step
-        .opencode_server_url
+        .session
+        .endpoint
         .as_deref()
         .map(short_server)
         .unwrap_or("none");
-    let session = step
-        .opencode_session_id
-        .as_deref()
-        .map(short_id)
-        .unwrap_or("none");
+    let session = step.session.id.as_deref().map(short_id).unwrap_or("none");
     let mut lines = vec![Line::from(vec![
-        Span::styled("opencode ", muted_style()),
+        Span::styled("harness ", muted_style()),
         Span::raw(state.to_string()),
         Span::styled("  server ", muted_style()),
         Span::raw(server.to_string()),

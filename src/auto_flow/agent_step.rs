@@ -13,9 +13,10 @@ pub(super) fn execute_one_agent_step(
         step.status = AutoStepStatus::Starting;
         step.started_unix_ms = Some(unix_ms());
         step.finished_unix_ms = None;
-        step.opencode_server_url = executor.server_url.clone();
-        step.opencode_session_id = None;
-        step.process_id = None;
+        step.session.endpoint = executor.server_url.clone();
+        step.session.adapter_id = Some(executor.harness_config.adapter.clone());
+        step.session.id = None;
+        step.execution = crate::harness::ExecutionRef::default();
         step.error = None;
         persisted.run.selected_step_run_id = step.id;
         persisted.run.status = AutoRunStatus::Running;
@@ -34,7 +35,18 @@ pub(super) fn execute_one_agent_step(
     .map_err(|error| format!("write auto output: {error}"))?;
 
     let (mut command, mut invocation) =
-        harness_run_command(executor, &persisted.steps[step_index], &prompt, true)?;
+        match harness_run_command(executor, &persisted.steps[step_index], &prompt, true) {
+            Ok(command) => command,
+            Err(error) => {
+                mark_spawn_failure(
+                    conn,
+                    &mut persisted.steps[step_index],
+                    &error,
+                    executor.max_output_lines_per_step,
+                )?;
+                return Err(error);
+            }
+        };
     let spawn_result = spawn_harness(&mut command, &invocation);
     let (mut child, used_attach) = match spawn_result {
         Ok(child) => (child, invocation.attach),
@@ -82,9 +94,13 @@ pub(super) fn execute_one_agent_step(
 
     {
         let step = &mut persisted.steps[step_index];
-        step.status = AutoStepStatus::Running;
-        step.process_id = Some(child.id());
-        save_step_with_conn(conn, step)?;
+        if !claim_spawned_process(conn, step, &mut child)? {
+            invocation.cleanup();
+            return Err(format!(
+                "auto flow step {} was aborted while starting",
+                step.step_key.as_str()
+            ));
+        }
     }
 
     let exit_code = collect_child_output(
@@ -102,8 +118,15 @@ pub(super) fn execute_one_agent_step(
         &mut persisted.steps[step_index],
         exit_code,
         used_attach,
+        &executor.harness_id,
     )?;
-    if exit_code == 0 {
+    if persisted.steps[step_index].status == AutoStepStatus::Aborted {
+        Err(format!(
+            "auto flow step {} attempt {} was aborted",
+            persisted.steps[step_index].step_key.as_str(),
+            persisted.steps[step_index].attempt
+        ))
+    } else if exit_code == 0 && persisted.steps[step_index].status == AutoStepStatus::Done {
         Ok(())
     } else {
         let step = &persisted.steps[step_index];
@@ -111,7 +134,7 @@ pub(super) fn execute_one_agent_step(
             "auto flow step {} attempt {} failed: {}",
             step.step_key.as_str(),
             step.attempt,
-            step.error.as_deref().unwrap_or("opencode run failed")
+            step.error.as_deref().unwrap_or("harness run failed")
         ))
     }
 }
@@ -144,27 +167,11 @@ fn spawn_harness(
     command: &mut Command,
     invocation: &crate::harness::Invocation,
 ) -> Result<Child, String> {
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("harness '{}': {error}", invocation.argv[0]))?;
-    if let Some(input) = invocation.stdin.as_deref() {
-        use std::io::Write as _;
-        let result = child
-            .stdin
-            .take()
-            .ok_or_else(|| "open harness stdin".to_string())
-            .and_then(|mut stdin| {
-                stdin
-                    .write_all(input.as_bytes())
-                    .map_err(|error| format!("write harness prompt to stdin: {error}"))
-            });
-        if let Err(error) = result {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-    }
-    Ok(child)
+    let cwd = command
+        .get_current_dir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    invocation.spawn(&cwd)
 }
 
 pub(super) fn mark_spawn_failure(
@@ -192,19 +199,92 @@ pub(super) fn finish_step_after_exit(
     step: &mut AutoStepRun,
     exit_code: i32,
     used_attach: bool,
+    harness_id: &str,
 ) -> Result<(), String> {
-    step.process_id = None;
+    step.execution.process_id = None;
+    step.execution.process_start_time_ticks = None;
     step.finished_unix_ms = Some(unix_ms());
-    if exit_code == 0 {
+    if exit_code == 0 && step.error.is_none() {
         step.status = AutoStepStatus::Done;
         step.error = None;
     } else {
         step.status = AutoStepStatus::Failed;
-        let attach_note = if used_attach { " with --attach" } else { "" };
-        step.error = Some(format!("opencode run{attach_note} exited with {exit_code}"));
+        if step.error.is_none() {
+            let attach_note = if used_attach { " while attached" } else { "" };
+            step.error = Some(format!(
+                "harness '{harness_id}'{attach_note} exited with {exit_code}"
+            ));
+        }
     }
-    save_step_with_conn(conn, step)?;
+    let step_id = step
+        .id
+        .ok_or_else(|| "auto step must be saved before completion".to_string())?;
+    let changed = conn
+        .execute(
+            "update auto_step_run
+             set status = ?1, execution_process_id = null,
+                 execution_process_start_time_ticks = null, finished_unix_ms = ?2, error = ?3
+             where id = ?4 and status != 'aborted'",
+            params![
+                step.status.as_str(),
+                step.finished_unix_ms.map(u64_to_i64),
+                step.error,
+                step_id,
+            ],
+        )
+        .map_err(|error| format!("finish auto step: {error}"))?;
+    if changed == 0 {
+        let status = conn
+            .query_row(
+                "select status from auto_step_run where id = ?1",
+                params![step_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| format!("reload auto step status: {error}"))?;
+        step.status = AutoStepStatus::parse(&status)?;
+        step.execution.process_id = None;
+        step.execution.process_start_time_ticks = None;
+        if step.status == AutoStepStatus::Aborted {
+            step.error = Some("aborted".to_string());
+        }
+    }
     Ok(())
+}
+
+pub(super) fn claim_spawned_process(
+    conn: &rusqlite::Connection,
+    step: &mut AutoStepRun,
+    child: &mut Child,
+) -> Result<bool, String> {
+    let step_id = step
+        .id
+        .ok_or_else(|| "auto step must be saved before process spawn".to_string())?;
+    let process_id = child.id();
+    let start_time_ticks = crate::harness::process_start_time_ticks(process_id);
+    let changed = conn
+        .execute(
+            "update auto_step_run
+             set status = 'running', execution_process_id = ?1,
+                 execution_process_start_time_ticks = ?2
+             where id = ?3 and status = 'starting'",
+            params![
+                i64::from(process_id),
+                start_time_ticks.map(u64_to_i64),
+                step_id,
+            ],
+        )
+        .map_err(|error| format!("claim auto harness process: {error}"))?;
+    if changed == 0 {
+        let _ = crate::harness::terminate_process(process_id, start_time_ticks);
+        let _ = child.wait();
+        step.status = AutoStepStatus::Aborted;
+        step.execution = crate::harness::ExecutionRef::default();
+        return Ok(false);
+    }
+    step.status = AutoStepStatus::Running;
+    step.execution.process_id = Some(process_id);
+    step.execution.process_start_time_ticks = start_time_ticks;
+    Ok(true)
 }
 
 pub(super) fn collect_child_output(
@@ -218,11 +298,11 @@ pub(super) fn collect_child_output(
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "open opencode stdout".to_string())?;
+        .ok_or_else(|| "open harness stdout".to_string())?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| "open opencode stderr".to_string())?;
+        .ok_or_else(|| "open harness stderr".to_string())?;
     let (tx, rx) = mpsc::channel::<Result<ChildLine, String>>();
     spawn_reader_thread(StreamKind::Stdout, stdout, tx.clone());
     spawn_reader_thread(StreamKind::Stderr, stderr, tx);
@@ -249,7 +329,7 @@ pub(super) fn collect_child_output(
 
     let status = child
         .wait()
-        .map_err(|error| format!("wait for opencode: {error}"))?;
+        .map_err(|error| format!("wait for harness: {error}"))?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -271,19 +351,11 @@ pub(super) fn spawn_reader_thread(
     tx: mpsc::Sender<Result<ChildLine, String>>,
 ) {
     thread::spawn(move || {
-        let reader = BufReader::new(reader);
-        for line in reader.lines() {
-            match line {
-                Ok(text) => {
-                    if tx.send(Ok(ChildLine::Line { stream, text })).is_err() {
-                        return;
-                    }
-                }
-                Err(error) => {
-                    let _ = tx.send(Err(format!("read opencode output: {error}")));
-                    return;
-                }
-            }
+        let result = crate::harness::read_bounded_lines(reader, |text| {
+            tx.send(Ok(ChildLine::Line { stream, text })).is_ok()
+        });
+        if let Err(error) = result {
+            let _ = tx.send(Err(error));
         }
         let _ = tx.send(Ok(ChildLine::End));
     });
@@ -310,8 +382,6 @@ pub(super) fn ingest_child_line(
             None,
             max_output_lines_per_step,
         )?;
-        step.error = Some(raw.to_string());
-        save_step_with_conn(conn, step)?;
         writeln!(output, "[stderr] {raw}")
             .map_err(|error| format!("write auto output: {error}"))?;
         return Ok(());
@@ -371,7 +441,7 @@ pub(super) fn apply_agent_event(
 ) -> (AutoOutputKind, String, Option<String>) {
     match event {
         PlanAgentEvent::SessionIdentified { session_id, title } => {
-            step.opencode_session_id = Some(session_id.clone());
+            step.session.id = Some(session_id.clone());
             let title = title
                 .map(|title| format!(" title: {title}"))
                 .unwrap_or_default();

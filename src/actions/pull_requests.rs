@@ -387,7 +387,10 @@ impl Tui {
                     initial_prompt,
                 },
             )?
-            .with_harness(config.default_harness.clone());
+            .with_harness(
+                config.default_harness.clone(),
+                config.harness_adapter(&config.default_harness)?,
+            );
             let mut run = launch.create_run();
             run.steps.clear();
             run.run.pr_number = self.sessions[selected]

@@ -199,6 +199,16 @@ pub fn infer_total_phases(path: &Path) -> Result<usize, String> {
 }
 
 pub fn run_plan_mode(cwd: &Path, config: &Config, path: Option<&Path>) -> Result<(), String> {
+    let selected_harness = config.harness_config(&config.default_harness)?;
+    if !crate::harness::Harness::new(&config.default_harness, &selected_harness)
+        .describe()
+        .headless
+    {
+        return Err(format!(
+            "harness '{}' does not support managed Plan execution; configure headless_command and headless_prompt_transport",
+            config.default_harness
+        ));
+    }
     let execution = PlanExecution::prepare(cwd, config, path)?;
     let repo = Repository {
         root: execution.cwd.clone(),
@@ -212,26 +222,21 @@ pub fn run_plan_mode(cwd: &Path, config: &Config, path: Option<&Path>) -> Result
         execution.total,
         PlanRunMode::Sequential,
     )?
-    .with_harness(config.default_harness.clone());
-    let selected_harness = config.harness_config(&config.default_harness)?;
-    let server_url = if selected_harness.adapter == "opencode" {
-        match crate::opencode::ensure_opencode_server_with_program(
-            &repo,
-            config,
-            "plan",
-            &execution.cwd,
-            &selected_harness.interactive_command[0],
-        ) {
-            Ok(runtime) => Some(runtime.server_url),
+    .with_harness(
+        config.default_harness.clone(),
+        selected_harness.adapter.clone(),
+    );
+    let server_url = {
+        let harness = crate::harness::Harness::new(&config.default_harness, &selected_harness);
+        match harness.prepare_server(&repo, config, "plan", &execution.cwd) {
+            Ok(runtime) => runtime.map(|runtime| runtime.server_url),
             Err(error) => {
                 eprintln!(
-                    "warning: could not start OpenCode server for attach; falling back to direct opencode run: {error}"
+                    "warning: could not prepare harness server for attach; falling back to a direct harness run: {error}"
                 );
                 None
             }
         }
-    } else {
-        None
     };
 
     let mut executor = PlanExecutorConfig::for_harness(

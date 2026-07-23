@@ -1550,7 +1550,7 @@ exit 1
         .unwrap();
 
     assert_eq!(fs::read_to_string(&prompt_file).unwrap(), "build the thing");
-    assert_eq!(tui.sessions[0].agent_state, AgentState::NeedsInput);
+    assert_eq!(tui.sessions[0].agent_state, AgentState::Attached);
     let commands = fs::read_to_string(&log).unwrap();
     assert!(commands.contains("load-buffer -b"));
     assert!(commands.contains("paste-buffer -d -b"));

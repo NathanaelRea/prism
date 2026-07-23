@@ -48,6 +48,12 @@ impl Tui {
             self.show_message("focused Auto Flow run")?;
             return Ok(());
         }
+        if !context.config.selected_harness()?.describe().headless {
+            return Err(format!(
+                "harness '{}' does not support managed Auto Flow execution; configure headless_command and headless_prompt_transport",
+                context.config.default_harness
+            ));
+        }
         let is_detached = session_branch == "(detached)";
         if context.config.is_default_branch(&session_branch) || is_detached {
             return if is_detached {
@@ -145,7 +151,12 @@ impl Tui {
                 initial_prompt: prompt,
             },
         )?
-        .with_harness(context.config.default_harness.clone())
+        .with_harness(
+            context.config.default_harness.clone(),
+            context
+                .config
+                .harness_adapter(&context.config.default_harness)?,
+        )
         .with_worktree_incarnation(session_incarnation);
         let mut persisted = launch.create_run();
         crate::observability::with_writable_db(&context.repo, |conn| {
@@ -226,19 +237,22 @@ impl Tui {
                 });
                 return;
             };
-            let server_url = (harness_config.adapter == "opencode")
-                .then(|| {
-                    crate::opencode::ensure_opencode_server_with_program(
-                        &repo,
-                        &config,
-                        &persisted.run.branch,
-                        &worktree_path,
-                        &harness_config.interactive_command[0],
-                    )
+            if harness_config.adapter != persisted.run.adapter_id {
+                let error = format!(
+                    "auto run harness '{}' was recorded with adapter '{}', but it is now configured as '{}'",
+                    persisted.run.harness_id, persisted.run.adapter_id, harness_config.adapter
+                );
+                let _ = crate::observability::with_writable_db(&repo, |conn| {
+                    crate::auto_flow::fail_auto_run(conn, &mut persisted, error)
+                });
+                return;
+            }
+            let server_url =
+                crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
+                    .prepare_server(&repo, &config, &persisted.run.branch, &worktree_path)
                     .ok()
-                })
-                .flatten()
-                .map(|runtime| runtime.server_url);
+                    .flatten()
+                    .map(|runtime| runtime.server_url);
             let executor = AutoExecutorConfig::for_harness(
                 persisted.run.harness_id.clone(),
                 harness_config,

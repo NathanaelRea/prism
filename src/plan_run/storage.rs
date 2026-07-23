@@ -6,6 +6,7 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
         create table if not exists plan_run (
           id text primary key,
           harness_id text not null default 'opencode',
+          adapter_id text not null default 'opencode',
           repo_root text not null,
           scope_path text not null,
           plan_path text not null,
@@ -30,6 +31,12 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
           opencode_state text,
           opencode_server_url text,
           opencode_session_id text,
+          execution_state text,
+          execution_process_id integer,
+          execution_process_start_time_ticks integer,
+          session_endpoint text,
+          session_id text,
+          session_adapter_id text,
           agent_variant text,
           process_id integer,
           started_unix_ms integer,
@@ -75,6 +82,12 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
     add_column_if_missing(
         conn,
         "plan_run",
+        "adapter_id",
+        "alter table plan_run add column adapter_id text not null default 'opencode'",
+    )?;
+    add_column_if_missing(
+        conn,
+        "plan_run",
         "archived_unix_ms",
         "alter table plan_run add column archived_unix_ms integer",
     )?;
@@ -96,6 +109,28 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
         "agent_variant",
         "alter table plan_step_run add column agent_variant text",
     )?;
+    for (column, definition, legacy) in [
+        ("execution_state", "text", "opencode_state"),
+        ("execution_process_id", "integer", "process_id"),
+        ("execution_process_start_time_ticks", "integer", "null"),
+        ("session_endpoint", "text", "opencode_server_url"),
+        ("session_id", "text", "opencode_session_id"),
+        (
+            "session_adapter_id",
+            "text",
+            "case when opencode_session_id is not null then 'opencode' end",
+        ),
+    ] {
+        if !table_has_column(conn, "plan_step_run", column)? {
+            conn.execute(
+                &format!("alter table plan_step_run add column {column} {definition}"),
+                [],
+            )
+            .map_err(|error| format!("migrate plan_step_run.{column}: {error}"))?;
+            conn.execute(&format!("update plan_step_run set {column} = {legacy}"), [])
+                .map_err(|error| format!("backfill plan_step_run.{column}: {error}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -178,7 +213,8 @@ pub fn load_resumable_plan_run(
                and start_step = ?5
                 and total_steps = ?6
                 and mode = ?7
-                and harness_id = ?8
+                 and harness_id = ?8
+                 and adapter_id = ?9
                and archived_unix_ms is null
                and status in ('queued', 'running', 'paused')
              order by updated_unix_ms desc
@@ -192,6 +228,7 @@ pub fn load_resumable_plan_run(
                 usize_to_i64(launch.total_steps),
                 launch.mode.as_str(),
                 launch.harness_id.as_str(),
+                launch.adapter_id.as_str(),
             ],
             |row| row.get::<_, String>(0),
         )
@@ -212,11 +249,12 @@ pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &PlanRun) -> 
         "insert into plan_run (
            id, harness_id, repo_root, scope_path, plan_path, plan_display, step_name, start_step,
            total_steps, mode, status, pause_requested, selected_step, created_unix_ms,
-           updated_unix_ms, archived_unix_ms
-         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+           updated_unix_ms, archived_unix_ms, adapter_id
+         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
          on conflict(id) do update set
             repo_root = excluded.repo_root,
             harness_id = excluded.harness_id,
+            adapter_id = excluded.adapter_id,
            scope_path = excluded.scope_path,
            plan_path = excluded.plan_path,
            plan_display = excluded.plan_display,
@@ -228,7 +266,8 @@ pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &PlanRun) -> 
            pause_requested = excluded.pause_requested,
            selected_step = excluded.selected_step,
            updated_unix_ms = excluded.updated_unix_ms,
-           archived_unix_ms = excluded.archived_unix_ms",
+           archived_unix_ms = excluded.archived_unix_ms
+         where plan_run.status != 'aborted' or excluded.status = 'queued'",
         params![
             run.id.as_str(),
             run.harness_id.as_str(),
@@ -246,6 +285,7 @@ pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &PlanRun) -> 
             u64_to_i64(run.created_unix_ms),
             u64_to_i64(run.updated_unix_ms),
             run.archived_unix_ms.map(u64_to_i64),
+            run.adapter_id.as_str(),
         ],
     )
     .map_err(|error| format!("write plan run: {error}"))?;
@@ -271,18 +311,18 @@ pub(super) fn save_step_with_conn(
     .map_err(|error| format!("serialize plan todos: {error}"))?;
     conn.execute(
         "insert into plan_step_run (
-           run_id, step, prompt, status, opencode_state, opencode_server_url, opencode_session_id,
-           agent_variant, process_id, started_unix_ms, finished_unix_ms, exit_code, latest_message,
-           active_tool, todos_json, summary, error
-          ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+           run_id, step, prompt, status, execution_state, session_endpoint, session_id,
+           agent_variant, execution_process_id, started_unix_ms, finished_unix_ms, exit_code, latest_message,
+            active_tool, todos_json, summary, error, session_adapter_id, execution_process_start_time_ticks
+          ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
           on conflict(run_id, step) do update set
             prompt = excluded.prompt,
             status = excluded.status,
-             opencode_state = excluded.opencode_state,
-             opencode_server_url = excluded.opencode_server_url,
-             opencode_session_id = excluded.opencode_session_id,
+             execution_state = excluded.execution_state,
+             session_endpoint = excluded.session_endpoint,
+             session_id = excluded.session_id,
              agent_variant = excluded.agent_variant,
-             process_id = excluded.process_id,
+             execution_process_id = excluded.execution_process_id,
              started_unix_ms = excluded.started_unix_ms,
              finished_unix_ms = excluded.finished_unix_ms,
              exit_code = excluded.exit_code,
@@ -290,17 +330,20 @@ pub(super) fn save_step_with_conn(
              active_tool = excluded.active_tool,
              todos_json = excluded.todos_json,
              summary = excluded.summary,
-             error = excluded.error",
+              error = excluded.error,
+               session_adapter_id = excluded.session_adapter_id,
+               execution_process_start_time_ticks = excluded.execution_process_start_time_ticks
+           where plan_step_run.status != 'aborted' or excluded.status = 'queued'",
         params![
             step.run_id.as_str(),
             usize_to_i64(step.step),
             step.prompt.as_str(),
             step.status.as_str(),
-            step.opencode_state.map(OpencodeState::label),
-            step.opencode_server_url.as_deref(),
-            step.opencode_session_id.as_deref(),
+            step.execution.state.as_deref(),
+            step.session.endpoint.as_deref(),
+            step.session.id.as_deref(),
             step.agent_variant.as_deref(),
-            step.process_id.map(i64::from),
+            step.execution.process_id.map(i64::from),
             step.started_unix_ms.map(u64_to_i64),
             step.finished_unix_ms.map(u64_to_i64),
             step.exit_code,
@@ -309,6 +352,8 @@ pub(super) fn save_step_with_conn(
             todos_json,
             step.summary.as_deref(),
             step.error.as_deref(),
+            step.session.adapter_id.as_deref(),
+            step.execution.process_start_time_ticks.map(u64_to_i64),
         ],
     )
     .map_err(|error| format!("write plan step run: {error}"))?;
@@ -322,7 +367,7 @@ pub(super) fn load_run_with_conn(
     conn.query_row(
         "select id, harness_id, repo_root, scope_path, plan_path, plan_display, step_name,
                 start_step, total_steps, mode, status, pause_requested, selected_step,
-                created_unix_ms, updated_unix_ms, archived_unix_ms
+                 created_unix_ms, updated_unix_ms, archived_unix_ms, adapter_id
          from plan_run
          where id = ?1",
         params![run_id],
@@ -332,6 +377,7 @@ pub(super) fn load_run_with_conn(
             Ok(PlanRun {
                 id: row.get(0)?,
                 harness_id: row.get(1)?,
+                adapter_id: row.get(16)?,
                 repo_root: row.get(2)?,
                 scope_path: PathBuf::from(row.get::<_, String>(3)?),
                 plan_path: PathBuf::from(row.get::<_, String>(4)?),
@@ -361,9 +407,10 @@ pub(super) fn load_steps_with_conn(
 ) -> Result<Vec<PlanStepRun>, String> {
     let mut statement = conn
         .prepare(
-            "select run_id, step, prompt, status, opencode_state, opencode_server_url, opencode_session_id,
-                agent_variant, process_id, started_unix_ms, finished_unix_ms, exit_code,
-                    latest_message, active_tool, todos_json, summary, error
+            "select run_id, step, prompt, status, execution_state, session_endpoint, session_id,
+                agent_variant, execution_process_id, started_unix_ms, finished_unix_ms, exit_code,
+                    latest_message, active_tool, todos_json, summary, error, session_adapter_id,
+                    execution_process_start_time_ticks
              from plan_step_run
              where run_id = ?1
              order by step",
@@ -372,20 +419,28 @@ pub(super) fn load_steps_with_conn(
     let rows = statement
         .query_map(params![run_id], |row| {
             let status: String = row.get(3)?;
-            let opencode_state: Option<String> = row.get(4)?;
+            let execution_state: Option<String> = row.get(4)?;
             let todos_json: String = row.get(14)?;
             Ok(PlanStepRun {
                 run_id: row.get(0)?,
                 step: i64_to_usize(row.get(1)?, 1),
                 prompt: row.get(2)?,
                 status: PlanStepStatus::parse(&status).map_err(from_string_error)?,
-                opencode_state: opencode_state.as_deref().and_then(OpencodeState::parse),
-                opencode_server_url: row.get(5)?,
-                opencode_session_id: row.get(6)?,
+                execution: crate::harness::ExecutionRef {
+                    state: execution_state,
+                    process_id: row
+                        .get::<_, Option<i64>>(8)?
+                        .map(|value| value.max(0) as u32),
+                    process_start_time_ticks: row
+                        .get::<_, Option<i64>>(18)?
+                        .map(|value| value.max(0) as u64),
+                },
+                session: crate::harness::SessionRef {
+                    adapter_id: row.get(17)?,
+                    endpoint: row.get(5)?,
+                    id: row.get(6)?,
+                },
                 agent_variant: row.get(7)?,
-                process_id: row
-                    .get::<_, Option<i64>>(8)?
-                    .map(|value| value.max(0) as u32),
                 started_unix_ms: row
                     .get::<_, Option<i64>>(9)?
                     .map(|value| value.max(0) as u64),
@@ -444,6 +499,22 @@ pub(super) fn add_column_if_missing(
             .map_err(|error| format!("migrate {table}.{column}: {error}"))?;
     }
     Ok(())
+}
+
+fn table_has_column(
+    conn: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+) -> Result<bool, String> {
+    let mut statement = conn
+        .prepare(&format!("pragma table_info({table})"))
+        .map_err(|error| format!("inspect {table} schema: {error}"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("read {table} schema: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("read {table} schema column: {error}"))?;
+    Ok(columns.iter().any(|name| name == column))
 }
 
 pub(super) fn i64_to_usize(value: i64, index: usize) -> usize {

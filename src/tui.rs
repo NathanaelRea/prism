@@ -928,11 +928,18 @@ impl Tui {
                         }
                     }
                 }
+                Key::MigrateHarness => {
+                    if self.focused_panel != PanelFocus::Worktrees {
+                        self.show_message("focus worktrees to migrate an agent harness")?;
+                    } else if let Some(index) = self.selected_worktree_index() {
+                        self.migrate_worktree_harness(index)?;
+                    }
+                }
                 Key::AbortOpencode => {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message("focus worktrees to abort an OpenCode session")?;
+                        self.show_message("focus worktrees to abort an agent session")?;
                     } else if let Err(error) = self.abort_selected_opencode_session(&mut runtime) {
                         self.show_error("abort failed", &error)?;
                     }
@@ -1054,11 +1061,12 @@ impl Tui {
             self.show_message("delete in progress; wait for it to finish before quitting")?;
             return Ok(false);
         }
-        if !self
-            .sessions
-            .iter()
-            .any(|session| session.agent_state == AgentState::Running)
-        {
+        if !self.sessions.iter().any(|session| {
+            matches!(
+                session.agent_state,
+                AgentState::Attached | AgentState::Running
+            )
+        }) {
             return Ok(true);
         }
         self.confirm_action_dialog(
@@ -1084,6 +1092,7 @@ impl Tui {
         runtime: &mut TerminalRuntime,
         index: usize,
     ) -> Result<(), String> {
+        self.prepare_worktree_harness_for_open(runtime, index)?;
         let navigation = self.navigation_snapshot();
         runtime.suspend()?;
         let result = self.attach_tmux_session_for_index(index);
@@ -1095,6 +1104,112 @@ impl Tui {
         if let Err(error) = result {
             self.show_error("tmux session failed", &error)?;
         }
+        Ok(())
+    }
+
+    fn prepare_worktree_harness_for_open(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        index: usize,
+    ) -> Result<(), String> {
+        let Some(session) = self
+            .sessions
+            .get(index)
+            .map(Session::background_job_snapshot)
+        else {
+            return Ok(());
+        };
+        let Some(managed) = self.repos.get(session.repo_index) else {
+            return Ok(());
+        };
+        let repo = managed.repo.clone();
+        let target = managed.config.default_harness.clone();
+        let association = crate::session::worktree_harness(&repo, &session)?;
+        if association.harness_id == target || association.keep {
+            return Ok(());
+        }
+        let choices = view::ChoiceList {
+            title: "Worktree Harness Changed".to_string(),
+            choices: vec![
+                view::KeyChoice {
+                    key: "m".to_string(),
+                    label: format!("Migrate to {target}"),
+                },
+                view::KeyChoice {
+                    key: "l".to_string(),
+                    label: format!("Later; open {} and ask next time", association.harness_id),
+                },
+                view::KeyChoice {
+                    key: "k".to_string(),
+                    label: format!("Keep {}; stop asking", association.harness_id),
+                },
+            ],
+        };
+        match self.prompt_choice_dialog(runtime, choices)?.as_deref() {
+            Some("m") => {
+                let use_ = crate::agent_session::session_use(
+                    &self.repos,
+                    &mut self.tmux_generations,
+                    &session,
+                );
+                self.finish_tmux_warmup_for_key(&use_.warmup_key);
+                if let Some(managed) = self.repos.get(session.repo_index) {
+                    crate::agent_session::retire_generation(
+                        &repo,
+                        &managed.config,
+                        &session.branch,
+                        use_.generation,
+                    );
+                }
+                crate::session::set_worktree_harness(&repo, &session, &target, false)?;
+                crate::agent_session::rotate_generation(
+                    &self.repos,
+                    &mut self.tmux_generations,
+                    use_.slot,
+                );
+            }
+            Some("k") => crate::session::set_worktree_harness(
+                &repo,
+                &session,
+                &association.harness_id,
+                true,
+            )?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn migrate_worktree_harness(&mut self, index: usize) -> Result<(), String> {
+        let Some(session) = self
+            .sessions
+            .get(index)
+            .map(Session::background_job_snapshot)
+        else {
+            return Ok(());
+        };
+        let Some(managed) = self.repos.get(session.repo_index) else {
+            return Ok(());
+        };
+        let repo = managed.repo.clone();
+        let target = managed.config.default_harness.clone();
+        let repository_config = managed.config.clone();
+        let association = crate::session::worktree_harness(&repo, &session)?;
+        if association.harness_id == target && !association.keep {
+            self.show_message(&format!("worktree already uses harness '{target}'"))?;
+            return Ok(());
+        }
+        let use_ =
+            crate::agent_session::session_use(&self.repos, &mut self.tmux_generations, &session);
+        self.finish_tmux_warmup_for_key(&use_.warmup_key);
+        crate::agent_session::retire_generation(
+            &repo,
+            &repository_config,
+            &session.branch,
+            use_.generation,
+        );
+        crate::session::set_worktree_harness(&repo, &session, &target, false)?;
+        crate::agent_session::rotate_generation(&self.repos, &mut self.tmux_generations, use_.slot);
+        self.show_message(&format!("migrated worktree to harness '{target}'"))?;
         Ok(())
     }
 
@@ -1134,7 +1249,8 @@ impl Tui {
             "C            repos: open a worktree for a remote pull request",
             "c            repos: create worktree session in selected repo",
             "+ / -        worktrees: raise/lower visibility sort",
-            "x            worktrees: abort selected OpenCode session",
+            "x            worktrees: abort selected agent session when supported",
+            "M            worktrees: migrate selected worktree to the default harness",
             "e            edit selected repository config, then reload",
             "E            edit user config, then reload",
             "W            repos: edit visible worktree columns in repo config",
@@ -2844,7 +2960,10 @@ impl Tui {
             if status_count(&session.status_label, "dirty").is_some() {
                 dirty += 1;
             }
-            if session.agent_state == AgentState::Running {
+            if matches!(
+                session.agent_state,
+                AgentState::Attached | AgentState::Running
+            ) {
                 running += 1;
             }
             if matches!(
@@ -2934,7 +3053,10 @@ impl Tui {
             if status_count(&session.status_label, "dirty").is_some() {
                 dirty += 1;
             }
-            if session.agent_state == AgentState::Running {
+            if matches!(
+                session.agent_state,
+                AgentState::Attached | AgentState::Running
+            ) {
                 running += 1;
             }
             if matches!(
@@ -3625,6 +3747,7 @@ mod tests {
         PersistedAutoRun {
             run: AutoRun {
                 harness_id: "opencode".to_string(),
+                adapter_id: "opencode".to_string(),
                 id: id.to_string(),
                 repo_root: "/repo-one".to_string(),
                 worktree_path: PathBuf::from(worktree_path),
@@ -3661,6 +3784,7 @@ mod tests {
         PersistedPlanRun {
             run: PlanRun {
                 harness_id: "opencode".to_string(),
+                adapter_id: "opencode".to_string(),
                 id: id.to_string(),
                 repo_root: "/repo-one".to_string(),
                 scope_path: PathBuf::from(scope_path),
@@ -3699,10 +3823,8 @@ mod tests {
                 } else {
                     PlanStepStatus::Queued
                 },
-                opencode_state: None,
-                opencode_server_url: None,
-                opencode_session_id: None,
-                process_id: None,
+                execution: crate::harness::ExecutionRef::default(),
+                session: crate::harness::SessionRef::default(),
                 agent_variant: None,
                 started_unix_ms: (step == selected_step).then_some(step as u64),
                 finished_unix_ms: None,

@@ -703,7 +703,7 @@ fn auto_control_resume_clears_pause_while_linked_plan_process_is_live() {
     plan_run.run.status = PlanRunStatus::Running;
     plan_run.run.pause_requested = true;
     plan_run.steps[0].status = crate::plan_run::PlanStepStatus::Running;
-    plan_run.steps[0].process_id = Some(std::process::id());
+    plan_run.steps[0].execution.process_id = Some(std::process::id());
     crate::plan_run::save_plan_run(&conn, &plan_run).unwrap();
     persisted.run.pause_requested = true;
     persisted.run.status = AutoRunStatus::Paused;
@@ -900,7 +900,7 @@ fn auto_control_abort_warning_keeps_authoritative_state_persisted() {
             .create_run();
     persisted.run.status = AutoRunStatus::Running;
     persisted.steps[0].status = AutoStepStatus::Running;
-    persisted.steps[0].process_id = Some(i32::MAX as u32);
+    persisted.steps[0].execution.process_id = Some(i32::MAX as u32);
     save_auto_run(&conn, &mut persisted).unwrap();
     let step_run_id = persisted.steps[0].id.unwrap();
 
@@ -912,7 +912,7 @@ fn auto_control_abort_warning_keeps_authoritative_state_persisted() {
     .unwrap();
 
     assert_eq!(outcome.warnings.len(), 1);
-    assert!(outcome.warnings[0].contains("terminate opencode process"));
+    assert!(outcome.warnings[0].contains("terminate harness process"));
     assert_eq!(outcome.run.run.status, AutoRunStatus::Aborted);
     assert_eq!(outcome.run.steps[0].status, AutoStepStatus::Aborted);
     let loaded = load_auto_run(&conn, &persisted.run.id).unwrap().unwrap();
@@ -948,6 +948,68 @@ fn stale_executor_snapshot_does_not_overwrite_aborted_run() {
     let loaded = load_auto_run(&conn, &persisted.run.id).unwrap().unwrap();
     assert_eq!(loaded.run.status, AutoRunStatus::Aborted);
     assert_eq!(loaded.steps[0].status, AutoStepStatus::Aborted);
+}
+
+#[test]
+fn completed_agent_process_does_not_overwrite_concurrent_abort() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let root = PathBuf::from("/repo/prism");
+    let mut persisted = AutoLaunch::new(&root, &root.join("feature"), "feat/auto", "Implement")
+        .unwrap()
+        .create_run();
+    persisted.steps[0].status = AutoStepStatus::Running;
+    save_auto_run(&conn, &mut persisted).unwrap();
+    let mut stale = persisted.steps[0].clone();
+    control::abort_auto_step(&conn, &mut persisted.steps[0]).unwrap();
+
+    agent_step::finish_step_after_exit(&conn, &mut stale, 143, false, "test").unwrap();
+
+    assert_eq!(stale.status, AutoStepStatus::Aborted);
+    assert_eq!(
+        load_auto_run(&conn, &persisted.run.id)
+            .unwrap()
+            .unwrap()
+            .steps[0]
+            .status,
+        AutoStepStatus::Aborted
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn abort_during_start_prevents_spawned_auto_process_from_becoming_running() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let root = PathBuf::from("/repo/prism");
+    let mut persisted = AutoLaunch::new(&root, &root.join("feature"), "feat/auto", "Implement")
+        .unwrap()
+        .create_run();
+    persisted.steps[0].status = AutoStepStatus::Starting;
+    save_auto_run(&conn, &mut persisted).unwrap();
+    let invocation = crate::harness::Invocation {
+        argv: vec!["sleep".to_string(), "30".to_string()],
+        environment: std::collections::BTreeMap::new(),
+        stdin: None,
+        prompt_file: None,
+        structured_events: false,
+        attach: false,
+    };
+    let mut child = invocation.spawn(Path::new("/tmp")).unwrap();
+
+    control::abort_auto_step(&conn, &mut persisted.steps[0]).unwrap();
+    assert!(
+        !agent_step::claim_spawned_process(&conn, &mut persisted.steps[0], &mut child).unwrap()
+    );
+
+    assert_eq!(
+        load_auto_run(&conn, &persisted.run.id)
+            .unwrap()
+            .unwrap()
+            .steps[0]
+            .status,
+        AutoStepStatus::Aborted
+    );
 }
 
 #[test]
@@ -1363,8 +1425,11 @@ fn schema_migration_archives_old_active_auto_runs_once() {
           variant, prompt_summary, initial_prompt, status, created_unix_ms, updated_unix_ms
         ) values ('old', '/repo', '/repo/feature', 'feature', 'standard', 'prompt', 'sequential',
           'default', 'old', 'old', 'running', 1, 1);
-        insert into auto_step_run (run_id, sequence, step_key, status, attempt)
-        values ('old', 1, 'wait_ci', 'running', 1);
+        insert into auto_step_run (
+          run_id, sequence, step_key, status, attempt,
+          opencode_server_url, opencode_session_id, process_id
+        ) values ('old', 1, 'wait_ci', 'running', 1,
+          'http://127.0.0.1:41000', 'ses_old', 1234);
         ",
     )
     .unwrap();
@@ -1376,6 +1441,16 @@ fn schema_migration_archives_old_active_auto_runs_once() {
     assert_eq!(loaded.run.worktree_incarnation, None);
     assert!(loaded.run.archived_unix_ms.is_some());
     assert_eq!(loaded.steps[0].status, AutoStepStatus::Aborted);
+    assert_eq!(
+        loaded.steps[0].session.endpoint.as_deref(),
+        Some("http://127.0.0.1:41000")
+    );
+    assert_eq!(loaded.steps[0].session.id.as_deref(), Some("ses_old"));
+    assert_eq!(
+        loaded.steps[0].session.adapter_id.as_deref(),
+        Some("opencode")
+    );
+    assert_eq!(loaded.steps[0].execution.process_id, Some(1234));
     assert!(
         loaded.steps[0]
             .error
@@ -1922,7 +1997,7 @@ printf '%s\n' '{"type":"tool.execute.after","id":"tool_1","status":"success","ou
         .find(|step| step.step_key == AutoStepKey::Implement)
         .unwrap();
     assert_eq!(implement.status, AutoStepStatus::Done);
-    assert_eq!(implement.opencode_session_id.as_deref(), Some("ses_auto"));
+    assert_eq!(implement.session.id.as_deref(), Some("ses_auto"));
     assert_eq!(implement.summary.as_deref(), Some("working on it"));
     let verify = loaded
         .steps
@@ -2001,6 +2076,116 @@ exit 7
     );
     let lines = load_output_lines(&conn, implement.id.unwrap()).unwrap();
     assert!(lines.iter().any(|line| line.text == "boom"));
+}
+
+#[test]
+#[cfg(unix)]
+fn generic_headless_harness_executes_auto_flow_with_plain_text() {
+    let temp = TempDir::new("executor-generic");
+    let repo = Repository {
+        root: temp.path().to_path_buf(),
+    };
+    let config = Config::load(&repo);
+    let agent = temp.path().join("generic-agent");
+    write_executable(
+        &agent,
+        r#"#!/bin/sh
+printf 'generic:%s\n' "$1"
+"#,
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut persisted = AutoLaunch::new(temp.path(), temp.path(), "feat/auto", "Implement auto")
+        .unwrap()
+        .with_harness("generic-test", "generic")
+        .create_run();
+    persisted.steps[0].step_key = AutoStepKey::Implement;
+    save_auto_run(&conn, &mut persisted).unwrap();
+    let harness_config = crate::harness::HarnessConfig {
+        adapter: "generic".to_string(),
+        interactive_command: vec![agent.display().to_string()],
+        arguments: Vec::new(),
+        interactive_prompt_transport: None,
+        headless_command: Some(vec![agent.display().to_string(), "{prompt}".to_string()]),
+        headless_prompt_transport: Some(crate::harness::PromptTransport::Argument),
+        output_format: crate::harness::OutputFormat::Text,
+        environment: std::collections::BTreeMap::new(),
+    };
+    let executor =
+        AutoExecutorConfig::for_harness("generic-test", harness_config, None, temp.path(), "Auto");
+
+    execute_one_agent_step(
+        &conn,
+        &config,
+        &mut persisted,
+        0,
+        &executor,
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    let loaded = load_auto_run(&conn, &persisted.run.id).unwrap().unwrap();
+    let implement = loaded
+        .steps
+        .iter()
+        .find(|step| step.step_key == AutoStepKey::Implement)
+        .unwrap();
+    assert_eq!(implement.status, AutoStepStatus::Done);
+    let output = load_output_lines(&conn, implement.id.unwrap()).unwrap();
+    assert!(output.iter().any(|line| line.text.starts_with("generic:")));
+}
+
+#[test]
+fn unsupported_generic_headless_auto_step_fails_instead_of_remaining_starting() {
+    let temp = TempDir::new("executor-interactive-only");
+    let repo = Repository {
+        root: temp.path().to_path_buf(),
+    };
+    let config = Config::load(&repo);
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut persisted = AutoLaunch::new(temp.path(), temp.path(), "feat/auto", "Implement auto")
+        .unwrap()
+        .with_harness("interactive-only", "generic")
+        .create_run();
+    persisted.steps[0].step_key = AutoStepKey::Implement;
+    save_auto_run(&conn, &mut persisted).unwrap();
+    let executor = AutoExecutorConfig::for_harness(
+        "interactive-only",
+        crate::harness::HarnessConfig {
+            adapter: "generic".to_string(),
+            interactive_command: vec!["agent".to_string()],
+            arguments: Vec::new(),
+            interactive_prompt_transport: None,
+            headless_command: None,
+            headless_prompt_transport: None,
+            output_format: crate::harness::OutputFormat::Text,
+            environment: std::collections::BTreeMap::new(),
+        },
+        None,
+        temp.path(),
+        "Auto",
+    );
+
+    execute_one_agent_step(
+        &conn,
+        &config,
+        &mut persisted,
+        0,
+        &executor,
+        &mut Vec::new(),
+    )
+    .unwrap_err();
+
+    let loaded = load_auto_run(&conn, &persisted.run.id).unwrap().unwrap();
+    assert_eq!(loaded.steps[0].status, AutoStepStatus::Failed);
+    assert!(
+        loaded.steps[0]
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("does not support managed headless execution")
+    );
 }
 
 #[test]
@@ -2399,9 +2584,8 @@ fn push_test_step(
         attempt: 1,
         started_unix_ms: None,
         finished_unix_ms: None,
-        opencode_server_url: None,
-        opencode_session_id: None,
-        process_id: None,
+        execution: crate::harness::ExecutionRef::default(),
+        session: crate::harness::SessionRef::default(),
         plan_run_id: None,
         commit_sha: None,
         head_sha: None,

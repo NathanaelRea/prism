@@ -178,7 +178,10 @@ pub(super) fn execute_run_plan_step(
     let mode = persisted.run.plan_run_mode;
     let launch = execution
         .launch(Path::new(&persisted.run.repo_root), mode)?
-        .with_harness(persisted.run.harness_id.clone());
+        .with_harness(
+            persisted.run.harness_id.clone(),
+            persisted.run.adapter_id.clone(),
+        );
     let mut plan_run = if let Some(plan_run_id) = persisted.steps[step_index].plan_run_id.as_deref()
     {
         load_plan_run(conn, plan_run_id)?.ok_or_else(|| {
@@ -1258,7 +1261,7 @@ pub(super) fn set_auto_step_waiting(
 ) -> Result<(), String> {
     step.status = AutoStepStatus::Waiting;
     step.finished_unix_ms = None;
-    step.process_id = None;
+    step.execution.process_id = None;
     step.summary = Some(summary);
     step.error = None;
     save_step_with_conn(conn, step).map(|_| ())

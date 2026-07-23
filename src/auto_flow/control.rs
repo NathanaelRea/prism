@@ -344,22 +344,25 @@ pub fn archive_auto_run(
     save_run_with_conn(conn, &persisted.run)
 }
 
-fn abort_auto_step(conn: &rusqlite::Connection, step: &mut AutoStepRun) -> Result<(), String> {
+pub(super) fn abort_auto_step(
+    conn: &rusqlite::Connection,
+    step: &mut AutoStepRun,
+) -> Result<(), String> {
     let mut errors = Vec::new();
-    if let (Some(server_url), Some(session_id)) = (
-        step.opencode_server_url.as_deref(),
-        step.opencode_session_id.as_deref(),
-    ) && let Err(error) = crate::opencode::abort_session(server_url, session_id)
+    if step.session.id.is_some()
+        && let Err(error) = crate::harness::cancel_native_session(&step.session)
     {
         errors.push(error);
     }
-    if let Some(process_id) = step.process_id
-        && let Err(error) = terminate_process(process_id)
+    if let Some(process_id) = step.execution.process_id
+        && let Err(error) =
+            crate::harness::terminate_process(process_id, step.execution.process_start_time_ticks)
     {
         errors.push(error);
     }
     step.status = AutoStepStatus::Aborted;
-    step.process_id = None;
+    step.execution.process_id = None;
+    step.execution.process_start_time_ticks = None;
     step.finished_unix_ms = Some(unix_ms());
     step.error = if errors.is_empty() {
         Some("aborted".to_string())
@@ -389,7 +392,7 @@ pub fn reconcile_stale_auto_run(
         if step.step_key == AutoStepKey::RunPlan && step.plan_run_id.is_some() {
             continue;
         }
-        let message = match step.process_id {
+        let message = match step.execution.process_id {
             Some(process_id) => format!(
                 "Prism restarted while auto flow step {} attempt {} was active in process {process_id}; the attempt was marked failed for retry.",
                 step.step_key.as_str(),
@@ -402,7 +405,7 @@ pub fn reconcile_stale_auto_run(
             ),
         };
         step.status = AutoStepStatus::Failed;
-        step.process_id = None;
+        step.execution.process_id = None;
         step.finished_unix_ms = Some(unix_ms());
         step.error = Some(message.clone());
         save_step_with_conn(conn, step)?;
@@ -598,8 +601,8 @@ pub(super) fn reset_auto_step_for_retry(step: &mut AutoStepRun) {
     step.status = AutoStepStatus::Queued;
     step.started_unix_ms = None;
     step.finished_unix_ms = None;
-    step.opencode_session_id = None;
-    step.process_id = None;
+    step.session = crate::harness::SessionRef::default();
+    step.execution = crate::harness::ExecutionRef::default();
     step.commit_sha = None;
     step.head_sha = None;
     step.summary = None;
@@ -673,32 +676,4 @@ pub(super) fn reload_pause_request(
         return Ok(true);
     }
     Ok(false)
-}
-
-#[cfg(unix)]
-pub(super) fn terminate_process(process_id: u32) -> Result<(), String> {
-    let result = unsafe { libc::kill(process_id as libc::pid_t, libc::SIGTERM) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "terminate opencode process {process_id}: {}",
-            std::io::Error::last_os_error()
-        ))
-    }
-}
-
-#[cfg(not(unix))]
-pub(super) fn terminate_process(process_id: u32) -> Result<(), String> {
-    Command::new("taskkill")
-        .args(["/PID", &process_id.to_string(), "/T", "/F"])
-        .status()
-        .map_err(|error| format!("terminate opencode process {process_id}: {error}"))
-        .and_then(|status| {
-            if status.success() {
-                Ok(())
-            } else {
-                Err(format!("terminate opencode process {process_id}: {status}"))
-            }
-        })
 }

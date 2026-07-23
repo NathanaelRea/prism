@@ -48,6 +48,7 @@ pub fn detected_agents(config: &Config) -> Vec<String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentState {
     Idle,
+    Attached,
     Running,
     ExitedOk,
     ExitedError,
@@ -59,6 +60,7 @@ impl AgentState {
     pub fn label(self) -> &'static str {
         match self {
             Self::Idle => "idle",
+            Self::Attached => "process running",
             Self::Running => "running",
             Self::ExitedOk => "done",
             Self::ExitedError => "failed",
@@ -70,6 +72,7 @@ impl AgentState {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "idle" => Some(Self::Idle),
+            "process running" | "attached" => Some(Self::Attached),
             "running" => Some(Self::Running),
             "done" => Some(Self::ExitedOk),
             "failed" => Some(Self::ExitedError),
@@ -93,6 +96,7 @@ mod tests {
     fn agent_state_labels_parse_back_to_same_state() {
         for state in [
             AgentState::Idle,
+            AgentState::Attached,
             AgentState::Running,
             AgentState::ExitedOk,
             AgentState::ExitedError,

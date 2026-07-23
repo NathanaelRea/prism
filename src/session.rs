@@ -198,7 +198,7 @@ impl Session {
         if self.is_detached() {
             warnings.push("detached worktree: no local branch will be deleted".to_string());
         }
-        if self.agent_state == AgentState::Running {
+        if matches!(self.agent_state, AgentState::Attached | AgentState::Running) {
             warnings.push("agent is still running".to_string());
         }
         if let Some(summary) = self.pr.summary()
@@ -226,7 +226,7 @@ impl Session {
         if self.is_detached() {
             warnings.push("detached worktree: no local branch is associated".to_string());
         }
-        if self.agent_state == AgentState::Running {
+        if matches!(self.agent_state, AgentState::Attached | AgentState::Running) {
             warnings.push("agent is still running".to_string());
         }
         if let Some(summary) = self.pr.summary()
@@ -546,6 +546,7 @@ pub(crate) fn reconcile_worktree_state(repo: &Repository, config: &Config) -> Re
             }
             let old_path = paths[0].display().to_string();
             let replacement_path = replacement.path.display().to_string();
+            let replacement_incarnation = worktree_incarnation(&replacement.path);
             observability::with_writable_db(repo, |conn| {
                 conn.execute(
                     "update task_metadata set worktree = ?1
@@ -553,6 +554,19 @@ pub(crate) fn reconcile_worktree_state(repo: &Repository, config: &Config) -> Re
                     params![replacement_path, branch, old_path],
                 )
                 .map_err(|error| format!("repoint moved worktree metadata: {error}"))?;
+                conn.execute(
+                    "update worktree_harness
+                     set worktree_path = ?1, worktree_incarnation = ?2, updated_unix_ms = ?3
+                     where branch = ?4 and worktree_path = ?5",
+                    params![
+                        replacement_path,
+                        replacement_incarnation,
+                        unix_seconds(),
+                        branch,
+                        old_path,
+                    ],
+                )
+                .map_err(|error| format!("repoint moved worktree harness: {error}"))?;
                 Ok(())
             })?;
         } else {
@@ -675,6 +689,11 @@ fn remove_worktree_owned_state(
                 params![branch, worktree_path],
             )
             .map_err(|error| format!("remove Worktree Session metadata: {error}"))?;
+            conn.execute(
+                "delete from worktree_harness where branch = ?1 and worktree_path = ?2",
+                params![branch, worktree_path],
+            )
+            .map_err(|error| format!("remove worktree harness association: {error}"))?;
             clear_hidden_session_marker_with_conn(conn, branch)?;
             conn.execute(
                 "delete from archived_worktree where branch = ?1 and worktree_path = ?2",
@@ -925,6 +944,15 @@ pub(crate) fn migrate_worktree_session_schema(conn: &rusqlite::Connection) -> Re
           state text not null,
           updated_unix_ms integer not null
         );
+
+        create table if not exists worktree_harness (
+          branch text primary key,
+          worktree_path text not null,
+          worktree_incarnation text not null,
+          harness_id text not null,
+          migration_policy text not null default 'ask',
+          updated_unix_ms integer not null
+        );
         ",
     )
     .map_err(|error| format!("create worktree session schema: {error}"))?;
@@ -940,6 +968,93 @@ pub(crate) fn migrate_worktree_session_schema(conn: &rusqlite::Connection) -> Re
         "visibility",
         "alter table task_metadata add column visibility integer not null default 0",
     )?;
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorktreeHarnessAssociation {
+    pub harness_id: String,
+    pub keep: bool,
+}
+
+pub(crate) fn worktree_harness(
+    repo: &Repository,
+    session: &Session,
+) -> Result<WorktreeHarnessAssociation, String> {
+    observability::with_writable_db(repo, |conn| {
+        migrate_worktree_session_schema(conn)?;
+        let stored = conn
+            .query_row(
+                "select worktree_path, worktree_incarnation, harness_id, migration_policy
+                 from worktree_harness where branch = ?1",
+                params![session.branch.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("load worktree harness: {error}"))?;
+        if let Some((path, incarnation, harness_id, policy)) = stored
+            && path == session.path_display
+            && incarnation == session.incarnation
+        {
+            return Ok(WorktreeHarnessAssociation {
+                harness_id,
+                keep: policy == "keep",
+            });
+        }
+        // Before multi-harness support every existing Agent Session was OpenCode.
+        set_worktree_harness_with_conn(conn, session, "opencode", false)?;
+        Ok(WorktreeHarnessAssociation {
+            harness_id: "opencode".to_string(),
+            keep: false,
+        })
+    })
+}
+
+pub(crate) fn set_worktree_harness(
+    repo: &Repository,
+    session: &Session,
+    harness_id: &str,
+    keep: bool,
+) -> Result<(), String> {
+    observability::with_writable_db(repo, |conn| {
+        migrate_worktree_session_schema(conn)?;
+        set_worktree_harness_with_conn(conn, session, harness_id, keep)
+    })
+}
+
+fn set_worktree_harness_with_conn(
+    conn: &rusqlite::Connection,
+    session: &Session,
+    harness_id: &str,
+    keep: bool,
+) -> Result<(), String> {
+    conn.execute(
+        "insert into worktree_harness (
+           branch, worktree_path, worktree_incarnation, harness_id, migration_policy, updated_unix_ms
+         ) values (?1, ?2, ?3, ?4, ?5, ?6)
+         on conflict(branch) do update set
+           worktree_path = excluded.worktree_path,
+           worktree_incarnation = excluded.worktree_incarnation,
+           harness_id = excluded.harness_id,
+           migration_policy = excluded.migration_policy,
+           updated_unix_ms = excluded.updated_unix_ms",
+        params![
+            session.branch.as_str(),
+            session.path_display.as_str(),
+            session.incarnation.as_str(),
+            harness_id,
+            if keep { "keep" } else { "ask" },
+            unix_seconds(),
+        ],
+    )
+    .map_err(|error| format!("write worktree harness: {error}"))?;
     Ok(())
 }
 
@@ -1953,6 +2068,39 @@ exit 0
         assert_eq!(archived[0].classification, SessionClassification::Planning);
 
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn worktree_harness_binding_isolated_by_incarnation_and_can_be_pinned() {
+        let temp = unique_temp_dir("prism-worktree-harness-test");
+        let repo_path = temp.join("repo");
+        let worktree = temp.join("worktree");
+        fs::create_dir_all(&repo_path).unwrap();
+        fs::create_dir_all(&worktree).unwrap();
+        let repo = Repository::with_config_dir_for_test(repo_path, temp.join("config"));
+        let mut session = test_session("feature", &worktree.display().to_string());
+
+        assert_eq!(
+            worktree_harness(&repo, &session).unwrap().harness_id,
+            "opencode"
+        );
+        set_worktree_harness(&repo, &session, "codex", true).unwrap();
+        assert_eq!(
+            worktree_harness(&repo, &session).unwrap(),
+            WorktreeHarnessAssociation {
+                harness_id: "codex".to_string(),
+                keep: true,
+            }
+        );
+
+        session.incarnation = "replacement".to_string();
+        assert_eq!(
+            worktree_harness(&repo, &session).unwrap(),
+            WorktreeHarnessAssociation {
+                harness_id: "opencode".to_string(),
+                keep: false,
+            }
+        );
     }
 
     #[test]

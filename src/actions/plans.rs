@@ -27,6 +27,12 @@ impl Tui {
         config: crate::config::Config,
         scope_path: PathBuf,
     ) -> Result<(), String> {
+        if !config.selected_harness()?.describe().headless {
+            return Err(format!(
+                "harness '{}' does not support managed Plan execution; configure headless_command and headless_prompt_transport",
+                config.default_harness
+            ));
+        }
         raw.suspend()?;
         let execution = PlanExecution::prepare(&scope_path, &config, None);
         let resume_result = raw.resume();
@@ -39,9 +45,10 @@ impl Tui {
             false,
         )?;
         let mode = plan_run_mode_from_parallel_confirmation(parallel);
-        let launch = execution
-            .launch(&repo.root, mode)?
-            .with_harness(config.default_harness.clone());
+        let launch = execution.launch(&repo.root, mode)?.with_harness(
+            config.default_harness.clone(),
+            config.harness_adapter(&config.default_harness)?,
+        );
         let mut should_execute = true;
         let persisted = crate::observability::with_writable_db(&repo, |conn| {
             if let Some(mut persisted) = load_resumable_plan_run(conn, &launch)? {
@@ -107,19 +114,25 @@ impl Tui {
                     return;
                 }
             };
-            let server_url = (harness_config.adapter == "opencode")
-                .then(|| {
-                    crate::opencode::ensure_opencode_server_with_program(
-                        &repo,
-                        &config,
-                        "plan",
-                        &scope_path,
-                        &harness_config.interactive_command[0],
-                    )
+            if harness_config.adapter != persisted.run.adapter_id {
+                let _ = tx.send(PlanRunResult {
+                    repo_root: repo.root,
+                    run_id,
+                    result: Err(format!(
+                        "plan run harness '{}' was recorded with adapter '{}', but it is now configured as '{}'",
+                        persisted.run.harness_id,
+                        persisted.run.adapter_id,
+                        harness_config.adapter
+                    )),
+                });
+                return;
+            }
+            let server_url =
+                crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
+                    .prepare_server(&repo, &config, "plan", &scope_path)
                     .ok()
-                })
-                .flatten()
-                .map(|runtime| runtime.server_url);
+                    .flatten()
+                    .map(|runtime| runtime.server_url);
             let mut executor = PlanExecutorConfig::for_harness(
                 persisted.run.harness_id.clone(),
                 harness_config.clone(),
@@ -166,15 +179,10 @@ impl Tui {
             self.show_message("selected plan phase was not found")?;
             return Ok(false);
         };
-        let Some(server_url) = plan_step.opencode_server_url.clone() else {
-            self.show_message("selected plan phase has no OpenCode server yet")?;
+        let Some(session_id) = plan_step.session.id.clone() else {
+            self.show_message("selected plan phase has no resumable harness session yet")?;
             return Ok(false);
         };
-        let Some(session_id) = plan_step.opencode_session_id.clone() else {
-            self.show_message("selected plan phase has no OpenCode session yet")?;
-            return Ok(false);
-        };
-        let (_, server_port) = crate::opencode::parse_localhost_url(&server_url)?;
         let Some(session_index) = self.sessions.iter().position(|session| {
             session.path == plan_run.run.scope_path
                 && self
@@ -189,27 +197,75 @@ impl Tui {
             return Ok(true);
         };
         let config = managed.config.clone();
-        if !config.selected_adapter_is("opencode") {
-            self.show_message("selected worktree is not using OpenCode")?;
-            return Ok(false);
+        let harness_config =
+            config.recorded_harness_config(&plan_run.run.harness_id, &plan_run.run.adapter_id)?;
+        let description =
+            crate::harness::Harness::new(&plan_run.run.harness_id, &harness_config).describe();
+        if plan_run.run.adapter_id != "opencode" {
+            if !description.interactive_resume {
+                self.show_message("selected harness does not support interactive session resume")?;
+                return Ok(false);
+            }
+            let run_config = config.for_harness(&plan_run.run.harness_id)?;
+            let session = self.sessions[session_index].background_job_snapshot();
+            let use_ = crate::agent_session::session_use(
+                &self.repos,
+                &mut self.tmux_generations,
+                &session,
+            );
+            self.finish_tmux_warmup_for_key(&use_.warmup_key);
+            let generation = crate::agent_session::rotate_generation(
+                &self.repos,
+                &mut self.tmux_generations,
+                use_.slot,
+            );
+            raw.suspend()?;
+            let result = crate::tmux::attach_resumable_harness_session(
+                &repo,
+                &run_config,
+                &session,
+                generation,
+                &session_id,
+            );
+            let resume_result = raw.resume();
+            self.refresh_sessions()?;
+            self.start_tmux_agent_warmup();
+            resume_result?;
+            result?;
+            return Ok(true);
         }
+        let Some(server_url) = plan_step.session.endpoint.clone() else {
+            self.show_message("selected plan phase has no OpenCode server yet")?;
+            return Ok(false);
+        };
+        let (_, server_port) = crate::opencode::parse_localhost_url(&server_url)?;
         let session = self.sessions[session_index].background_job_snapshot();
-        let plan_runtime = crate::opencode::load_runtime(&repo, "plan", &session.path)
-            .ok()
-            .flatten()
-            .filter(|runtime| runtime.server_url == server_url);
-        let mut runtime = crate::opencode::load_runtime(&repo, &session.branch, &session.path)?
-            .unwrap_or_else(|| crate::opencode::OpencodeRuntime {
-                repo_root: repo.root.display().to_string(),
-                branch: session.branch.clone(),
-                worktree_path: session.path.display().to_string(),
-                server_port,
-                server_url: server_url.clone(),
-                server_pid: plan_runtime.as_ref().and_then(|runtime| runtime.server_pid),
-                opencode_session_id: None,
-                generation: 0,
-                updated_unix_ms: 0,
-            });
+        let plan_runtime =
+            crate::opencode::load_runtime(&repo, &plan_run.run.harness_id, "plan", &session.path)
+                .ok()
+                .flatten()
+                .filter(|runtime| runtime.server_url == server_url);
+        let mut runtime = crate::opencode::load_runtime(
+            &repo,
+            &plan_run.run.harness_id,
+            &session.branch,
+            &session.path,
+        )?
+        .unwrap_or_else(|| crate::opencode::OpencodeRuntime {
+            repo_root: repo.root.display().to_string(),
+            harness_id: plan_run.run.harness_id.clone(),
+            branch: session.branch.clone(),
+            worktree_path: session.path.display().to_string(),
+            server_port,
+            server_url: server_url.clone(),
+            server_pid: plan_runtime.as_ref().and_then(|runtime| runtime.server_pid),
+            server_start_time_ticks: plan_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.server_start_time_ticks),
+            opencode_session_id: None,
+            generation: 0,
+            updated_unix_ms: 0,
+        });
         let server_pid = plan_runtime
             .as_ref()
             .and_then(|runtime| runtime.server_pid)

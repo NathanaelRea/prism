@@ -28,6 +28,7 @@ pub(super) fn scroll_start(selected: usize, visible_rows: usize) -> usize {
 pub(super) fn agent_icon(state: AgentState) -> &'static str {
     match state {
         AgentState::Idle => "○",
+        AgentState::Attached => "◉",
         AgentState::Running => "●",
         AgentState::ExitedOk => "✓",
         AgentState::ExitedError => "✕",
@@ -256,6 +257,7 @@ pub(super) fn todo_summary(todos: &[crate::opencode::OpencodeTodo]) -> String {
 pub(super) fn agent_label(state: AgentState) -> &'static str {
     match state {
         AgentState::Running => "running",
+        AgentState::Attached => "attached",
         AgentState::NeedsInput => "input",
         AgentState::NeedsRestart => "restart",
         AgentState::ExitedOk => "done",

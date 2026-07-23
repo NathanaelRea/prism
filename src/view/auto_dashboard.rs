@@ -64,9 +64,9 @@ pub(super) fn auto_dashboard_lines(
         lines.push(labelled_line("pr", format!("#{pr_number}")));
     }
     if let Some(step) = selected_step {
-        if let Some(session_id) = step.opencode_session_id.as_deref() {
+        if let Some(session_id) = step.session.id.as_deref() {
             lines.push(labelled_line(
-                "opencode session",
+                "harness session",
                 short_id(session_id).to_string(),
             ));
         }
