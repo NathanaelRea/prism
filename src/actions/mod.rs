@@ -67,6 +67,7 @@ mod polling;
 mod pull_requests;
 mod repositories;
 mod tmux_agent;
+mod tmux_portal;
 mod tools;
 mod worktrees;
 

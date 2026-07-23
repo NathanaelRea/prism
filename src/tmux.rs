@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::opencode::{OpencodeRuntime, load_runtime};
 use crate::process::{
-    run_capture, run_output, run_output_allow_failure, run_status_inherited, run_status_with_stdin,
-    split_command_words,
+    run_capture, run_output, run_output_allow_failure, run_output_allow_failure_with_timeout,
+    run_status_inherited, run_status_with_stdin, split_command_words,
 };
 use crate::repo::Repository;
 use crate::session::Session;
@@ -16,6 +16,7 @@ const EXISTING_SESSION_READY_WAIT: Duration = Duration::from_millis(250);
 const CREATED_SESSION_READY_WAIT: Duration = Duration::from_secs(2);
 const SESSION_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const AGENT_INPUT_READY_WAIT: Duration = Duration::from_secs(5);
+const PANE_CAPTURE_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TmuxAgentSession {
@@ -639,14 +640,39 @@ fn opencode_input_ready(output: &str) -> bool {
     output.contains("Ask anything") || output.contains("ctrl+p commands")
 }
 
+pub(crate) fn capture_agent_pane(
+    repo: &Repository,
+    config: &Config,
+    branch: &str,
+    generation: u64,
+) -> Result<String, String> {
+    let runtime = TmuxAgentSession::for_worktree_session(repo, branch, generation);
+    capture_pane(config, &runtime.target(TmuxWindow::Agent), true)
+}
+
 fn pane_capture(config: &Config, name: &str) -> Option<String> {
-    run_capture(
-        Command::new(config.tool("tmux"))
-            .env_remove("TMUX")
-            .args(["capture-pane", "-p", "-t"])
-            .arg(name),
-    )
-    .ok()
+    capture_pane(config, name, false).ok()
+}
+
+fn capture_pane(config: &Config, target: &str, include_styles: bool) -> Result<String, String> {
+    let mut command = Command::new(config.tool("tmux"));
+    command.env_remove("TMUX").args(["capture-pane", "-p"]);
+    if include_styles {
+        command.args(["-e", "-N"]);
+    }
+    command.args(["-t", target]);
+    let output = if include_styles {
+        run_output_allow_failure_with_timeout(&mut command, PANE_CAPTURE_TIMEOUT)?
+    } else {
+        run_output_allow_failure(&mut command)?
+    };
+    if output.status.success() {
+        Ok(output.stdout)
+    } else if output.stderr.trim().is_empty() {
+        Err(format!("tmux exited with {}", output.status))
+    } else {
+        Err(output.stderr.trim().to_string())
+    }
 }
 
 fn run_tmux_status(command: &mut Command) -> Result<(), String> {
@@ -918,9 +944,9 @@ mod tests {
 
     use super::{
         TmuxAgentSession, TmuxWindow, attach_or_create_agent, attach_or_create_plan_mode,
-        attach_or_create_window, ensure_agent_session, latest_agent_session_generation,
-        pane_command_matches_agent, pane_start_command_matches_agent, paste_agent_prompt,
-        shell_quote,
+        attach_or_create_window, capture_agent_pane, ensure_agent_session,
+        latest_agent_session_generation, pane_command_matches_agent,
+        pane_start_command_matches_agent, paste_agent_prompt, shell_quote,
     };
 
     #[test]
@@ -1265,6 +1291,46 @@ exit 1
     }
 
     #[test]
+    fn capture_agent_pane_targets_agent_window() {
+        let temp = unique_temp_dir("prism-tmux-capture-pane-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+echo 'agent output'
+"#,
+                log.display(),
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let runtime = TmuxAgentSession::for_worktree_session(&repo, "feature", 4);
+
+        assert_eq!(
+            capture_agent_pane(&repo, &config, "feature", 4),
+            Ok("agent output\n".to_string()),
+        );
+        assert_eq!(
+            fs::read_to_string(&log).unwrap().trim(),
+            format!("capture-pane -p -e -N -t {}:1", runtime.name()),
+        );
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn paste_agent_prompt_loads_and_pastes_tmux_buffer() {
         let temp = unique_temp_dir("prism-tmux-paste-test");
         fs::create_dir_all(&temp).unwrap();
@@ -1482,6 +1548,8 @@ exit 1
         assert_eq!(fs::read_to_string(&capture_count).unwrap().trim(), "3");
         let commands = fs::read_to_string(&log).unwrap();
         assert!(commands.find("capture-pane").unwrap() < commands.find("load-buffer").unwrap());
+        assert!(commands.contains("capture-pane -p -t"));
+        assert!(!commands.contains("capture-pane -p -e"));
 
         let _ = fs::remove_dir_all(temp);
     }

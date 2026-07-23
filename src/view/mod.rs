@@ -4,10 +4,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Scrollbar, ScrollbarState, Wrap},
 };
 
 use crate::{
@@ -53,7 +53,21 @@ pub(crate) struct FrameModel<'a> {
     pub leader_hint: Option<LeaderHintModel>,
     pub auto_dashboard: Option<AutoDashboard>,
     pub plan_dashboard: Option<PlanDashboard>,
+    pub tmux_portal: Option<TmuxPortalModel<'a>>,
     pub dialog: Option<DialogModel>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TmuxPortalModel<'a> {
+    pub branch: &'a str,
+    pub state: TmuxPortalState<'a>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TmuxPortalState<'a> {
+    Loading,
+    Ready(&'a [Line<'static>]),
+    Unavailable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
