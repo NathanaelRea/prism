@@ -18,7 +18,7 @@ Prism uses a lazygit-style panel model.
 - `Ctrl-/` also opens tmux window 3 where the terminal reports that key combination distinctly; use `Space Enter` as the reliable alternative.
 - `Space g g` opens tmux window 2: lazygit.
 - `Space g o` opens the selected pull request in a browser.
-- `Space g P` pushes a guarded pending PR Stabilization repair commit and continues stabilization. If no pending push exists, Prism reobserves the selected Worktree Session and reports the current blocker/next work.
+- `Space g P` pushes a guarded pending PR Stabilization repair commit and continues stabilization. If actionable review conversations block a run without a pending push, Prism offers to mark all freshly observed conversations resolved before reobserving; the confirmation defaults to No.
 - `Space g M` merges the selected pull request.
 - `Space g c` starts or appends a managed PR Stabilization CI repair for the selected worktree.
 - `Space g f` starts or appends a managed PR Stabilization review repair for the selected worktree.

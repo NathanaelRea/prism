@@ -1,5 +1,22 @@
 use super::*;
 
+pub(super) fn apply_bulk_review_resolution(
+    confirmed: bool,
+    thread_ids: &[String],
+    mut resolve: impl FnMut(&str) -> Result<(), String>,
+) -> Result<usize, String> {
+    if !confirmed {
+        return Ok(0);
+    }
+    let mut thread_ids = thread_ids.to_vec();
+    thread_ids.sort();
+    thread_ids.dedup();
+    for thread_id in &thread_ids {
+        resolve(thread_id)?;
+    }
+    Ok(thread_ids.len())
+}
+
 pub(super) fn pr_target_choice_list(origin: &str, upstream: &str) -> crate::view::ChoiceList {
     crate::view::ChoiceList {
         title: "Create Pull Request Target".to_string(),
@@ -482,6 +499,9 @@ impl Tui {
         if self.push_guarded_pending_repair(raw, selected, &context.repo, &context.config)? {
             return Ok(());
         }
+        if self.resolve_blocking_review_threads(raw, selected, &context.repo, &context.config)? {
+            return Ok(());
+        }
 
         run_pre_push_checks(&context.config, &path)?;
         let set_upstream = !has_upstream(&path, &context.config)?;
@@ -583,6 +603,113 @@ impl Tui {
                 self.show_message("guarded repair pushed; reobserved PR Stabilization")?;
             }
         }
+        Ok(true)
+    }
+
+    fn resolve_blocking_review_threads(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+        selected: usize,
+        repo: &crate::repo::Repository,
+        config: &crate::config::Config,
+    ) -> Result<bool, String> {
+        let path = self.sessions[selected].path.clone();
+        let Some(run_id) = self.active_auto_runs.get(&path).cloned() else {
+            return Ok(false);
+        };
+        let mut persisted =
+            crate::observability::with_writable_db(repo, |conn| load_auto_run(conn, &run_id))?
+                .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?;
+        if persisted.run.stabilization_blocker
+            != Some(
+                crate::auto_flow::stabilization_model::StabilizationBlocker::ReviewFeedbackFound,
+            )
+        {
+            return Ok(false);
+        }
+
+        self.show_loading_dialog(raw, "Review Feedback", "Refreshing review conversations")?;
+        {
+            let session = &mut self.sessions[selected];
+            refresh_pr_cache(
+                repo,
+                &session.branch,
+                &mut session.pr,
+                &session.path,
+                config,
+                true,
+            )?;
+        }
+        let feedback = crate::auto_flow::stabilization_observe::stabilization_review_feedback(
+            self.sessions[selected]
+                .pr
+                .trusted_details()?
+                .ok_or_else(|| "pull request review details are unavailable".to_string())?,
+            persisted.run.review_baseline_json.as_deref(),
+        );
+        let thread_ids = crate::review::review_thread_ids(&feedback);
+        if thread_ids.is_empty() {
+            crate::observability::with_writable_db(repo, |conn| {
+                crate::auto_flow::stabilization_execute::observe_plan_and_save(
+                    conn,
+                    repo,
+                    config,
+                    &mut persisted,
+                )
+            })?;
+            self.remember_auto_run(persisted);
+            self.show_message(
+                "no unresolved actionable review conversations; reobserved PR Stabilization",
+            )?;
+            return Ok(true);
+        }
+
+        let count = thread_ids.len();
+        let confirmed = self.confirm_action_dialog(
+            raw,
+            "Resolve Review Conversations",
+            &format!("Mark all {count} unresolved review conversation(s) as resolved?"),
+            false,
+        )?;
+        if !confirmed {
+            self.show_message("review conversations left unresolved")?;
+            return Ok(true);
+        }
+
+        self.show_loading_dialog(
+            raw,
+            "Resolve Review Conversations",
+            "Resolving review conversations",
+        )?;
+        let resolution = apply_bulk_review_resolution(true, &thread_ids, |thread_id| {
+            crate::github::resolve_review_thread(&path, config, thread_id)
+        });
+        let refresh = {
+            let session = &mut self.sessions[selected];
+            refresh_pr_cache(
+                repo,
+                &session.branch,
+                &mut session.pr,
+                &session.path,
+                config,
+                true,
+            )
+        };
+        let observation = crate::observability::with_writable_db(repo, |conn| {
+            crate::auto_flow::stabilization_execute::observe_plan_and_save(
+                conn,
+                repo,
+                config,
+                &mut persisted,
+            )
+        });
+        self.remember_auto_run(persisted);
+        let resolved = resolution?;
+        refresh?;
+        observation?;
+        self.show_message(&format!(
+            "resolved {resolved} review conversation(s); reobserved PR Stabilization"
+        ))?;
         Ok(true)
     }
 

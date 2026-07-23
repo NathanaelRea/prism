@@ -17,11 +17,12 @@ use crate::tui::{
 };
 
 use super::{
-    archived_picker_overflow_message, discover_wt_columns,
+    apply_bulk_review_resolution, archived_picker_overflow_message, discover_wt_columns,
     plan_run_mode_from_parallel_confirmation, pr_target_choice_list, pr_target_repo_for_choice,
     remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
     should_prompt_pr_target_choice, status_label_with_behind,
 };
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -38,6 +39,46 @@ fn standalone_plan_confirmation_defaults_to_sequential() {
         plan_run_mode_from_parallel_confirmation(true),
         PlanRunMode::Parallel
     );
+}
+
+#[test]
+fn declined_bulk_review_resolution_does_not_resolve_threads() {
+    let resolved = RefCell::new(Vec::new());
+
+    let count = apply_bulk_review_resolution(
+        false,
+        &["thread-1".to_string(), "thread-2".to_string()],
+        |thread_id| {
+            resolved.borrow_mut().push(thread_id.to_string());
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(count, 0);
+    assert!(resolved.borrow().is_empty());
+}
+
+#[test]
+fn confirmed_bulk_review_resolution_resolves_each_thread_once() {
+    let resolved = RefCell::new(Vec::new());
+
+    let count = apply_bulk_review_resolution(
+        true,
+        &[
+            "thread-2".to_string(),
+            "thread-1".to_string(),
+            "thread-2".to_string(),
+        ],
+        |thread_id| {
+            resolved.borrow_mut().push(thread_id.to_string());
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(count, 2);
+    assert_eq!(resolved.into_inner(), vec!["thread-1", "thread-2"]);
 }
 
 #[test]

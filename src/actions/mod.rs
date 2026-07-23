@@ -79,8 +79,9 @@ use plans::plan_run_mode_from_parallel_confirmation;
 use polling::{discover_wt_columns, status_label_with_behind};
 #[cfg(test)]
 use pull_requests::{
-    pr_target_choice_list, pr_target_repo_for_choice, remote_pr_choice_keys,
-    remote_pr_worktree_branch, run_browser_opener, should_prompt_pr_target_choice,
+    apply_bulk_review_resolution, pr_target_choice_list, pr_target_repo_for_choice,
+    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
+    should_prompt_pr_target_choice,
 };
 #[cfg(test)]
 use worktrees::archived_picker_overflow_message;
