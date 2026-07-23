@@ -511,10 +511,10 @@ fn real_prism_opencode_tmux_stack_ensures_reusable_agent_session() {
     assert!(first_stdout.contains(&format!("worktree = {}", worktree.display())));
     assert!(first_stdout.contains("running = true"));
     let tmux_session = output_value(&first_stdout, "tmux_session");
-    let opencode_session = output_value(&first_stdout, "opencode_session_id");
-    let opencode_server_pid = output_value(&first_stdout, "opencode_server_pid");
-    assert!(!opencode_session.is_empty());
-    assert!(!opencode_server_pid.is_empty());
+    let session_id = output_value(&first_stdout, "session_id");
+    let runtime_process_id = output_value(&first_stdout, "runtime_process_id");
+    assert!(!session_id.is_empty());
+    assert!(!runtime_process_id.is_empty());
 
     let sessions =
         run_output(Command::new(&cleanup.tmux).args(["list-sessions", "-F", "#{session_name}"]));
@@ -539,13 +539,10 @@ fn real_prism_opencode_tmux_stack_ensures_reusable_agent_session() {
     assert!(second.status.success(), "{}", stderr(&second));
     let second_stdout = stdout(&second);
     assert_eq!(output_value(&second_stdout, "tmux_session"), tmux_session);
+    assert_eq!(output_value(&second_stdout, "session_id"), session_id);
     assert_eq!(
-        output_value(&second_stdout, "opencode_session_id"),
-        opencode_session
-    );
-    assert_eq!(
-        output_value(&second_stdout, "opencode_server_pid"),
-        opencode_server_pid
+        output_value(&second_stdout, "runtime_process_id"),
+        runtime_process_id
     );
     let second_pane_pid = run_output(Command::new(&cleanup.tmux).args([
         "display-message",
