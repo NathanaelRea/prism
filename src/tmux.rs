@@ -665,6 +665,26 @@ pub(crate) fn capture_agent_pane(
     capture_portal_pane(config, &runtime.target(TmuxWindow::Agent), width, height)
 }
 
+pub(crate) fn resize_agent_pane(
+    repo: &Repository,
+    config: &Config,
+    branch: &str,
+    generation: u64,
+    width: u16,
+    height: u16,
+) -> Result<(), String> {
+    let runtime = TmuxAgentSession::for_worktree_session(repo, branch, generation);
+    run_tmux_status(
+        Command::new(config.tool("tmux"))
+            .env_remove("TMUX")
+            .args(["resize-window", "-x"])
+            .arg(width.to_string())
+            .arg("-y")
+            .arg(height.to_string())
+            .args(["-t", &runtime.target(TmuxWindow::Agent)]),
+    )
+}
+
 fn capture_portal_pane(
     config: &Config,
     target: &str,

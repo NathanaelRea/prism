@@ -1202,6 +1202,11 @@ impl Tui {
     ) -> Result<(), String> {
         self.prepare_worktree_harness_for_open(runtime, index)?;
         let navigation = self.navigation_snapshot();
+        let terminal_area = runtime.area()?;
+        self.prepare_tmux_session_for_attach(
+            index,
+            (terminal_area.width, terminal_area.height.saturating_sub(1)),
+        )?;
         runtime.suspend()?;
         let result = self.attach_tmux_session_for_index(index);
         let resume_result = runtime.resume();
