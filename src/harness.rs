@@ -4,6 +4,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub const BUILTIN_HARNESS_IDS: [&str; 4] = ["opencode", "codex", "claude", "pi"];
+
+pub fn builtin_adapter(id: &str) -> Option<&'static str> {
+    BUILTIN_HARNESS_IDS
+        .into_iter()
+        .find(|adapter| *adapter == id)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PromptTransport {
     Argument,
@@ -67,6 +75,20 @@ impl HarnessConfig {
     }
 
     pub fn validate(&self, id: &str) -> Result<(), String> {
+        match builtin_adapter(id) {
+            Some(adapter) if self.adapter != adapter => {
+                return Err(format!(
+                    "harness ID '{id}' is reserved for the {adapter} adapter"
+                ));
+            }
+            None if self.adapter != "generic" => {
+                return Err(format!(
+                    "the {} adapter uses fixed harness ID '{}'; custom harness '{id}' must use the generic adapter",
+                    self.adapter, self.adapter
+                ));
+            }
+            _ => {}
+        }
         if self.interactive_command.is_empty() || self.interactive_command[0].trim().is_empty() {
             return Err(format!(
                 "harness '{id}' requires a non-empty interactive_command"

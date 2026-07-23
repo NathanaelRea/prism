@@ -112,6 +112,25 @@ pub(crate) struct ChoiceList {
 pub(crate) struct KeyChoice {
     pub key: String,
     pub label: String,
+    pub disabled: bool,
+}
+
+impl KeyChoice {
+    pub fn new(key: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            label: label.into(),
+            disabled: false,
+        }
+    }
+
+    pub fn disabled(key: impl Into<String>, label: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            label: label.into(),
+            disabled: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

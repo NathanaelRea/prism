@@ -69,11 +69,12 @@ Harnesses are configured only in `~/.config/prism/config.toml`. OpenCode, Codex 
 default_harness = "opencode"
 
 [harnesses.opencode]
-adapter = "opencode"
 program = "opencode"
 ```
 
 Prism owns each built-in adapter's structured-output, prompt, session, and protocol flags. `program` may select an executable path or wrapper. `arguments` may contain adapter-approved options such as model, sandbox, permission, or tool settings, but Prism rejects protocol-critical overrides.
+
+Press `H` in the TUI to switch the global default. The chooser lists the four built-ins and configured generic harnesses; the current harness is shown in dark gray and cannot be selected. It can also add a generic harness by collecting its interactive command, optional initial-prompt transport, and optional headless command. Prompt transports that do not match the command's placeholders are disabled. The built-in IDs `opencode`, `codex`, `claude`, and `pi` are reserved: each always selects its matching adapter, and built-in adapters cannot be aliased under custom IDs.
 
 Select another built-in harness without repeating its standard program:
 
@@ -87,7 +88,6 @@ Add a harness table only to override its executable or pass adapter-approved arg
 default_harness = "codex"
 
 [harnesses.codex]
-adapter = "codex"
 program = "/opt/bin/codex"
 arguments = ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"]
 ```
@@ -145,7 +145,6 @@ with:
 ```toml
 default_harness = "opencode"
 [harnesses.opencode]
-adapter = "opencode"
 program = "/opt/bin/opencode"
 ```
 

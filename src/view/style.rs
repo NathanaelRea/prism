@@ -78,6 +78,10 @@ pub(super) fn muted_style() -> Style {
     Style::default().fg(Color::Gray)
 }
 
+pub(super) fn disabled_style() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
 pub(super) fn health_style(health: &str) -> Style {
     if health == "ok" {
         Style::default().fg(Color::Green)

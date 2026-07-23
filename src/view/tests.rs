@@ -571,18 +571,9 @@ fn renders_footer_status_message_and_leader_overlay() {
         Some(ChoiceList {
             title: "Shortcuts".to_string(),
             choices: vec![
-                KeyChoice {
-                    key: "a".to_string(),
-                    label: "one".to_string(),
-                },
-                KeyChoice {
-                    key: "b".to_string(),
-                    label: "two".to_string(),
-                },
-                KeyChoice {
-                    key: "c".to_string(),
-                    label: "three".to_string(),
-                },
+                KeyChoice::new("a", "one"),
+                KeyChoice::new("b", "two"),
+                KeyChoice::new("c", "three"),
             ],
         }),
     );
@@ -617,14 +608,8 @@ fn renders_dialog_overlays() {
         choices: ChoiceList {
             title: "Plan Actions".to_string(),
             choices: vec![
-                KeyChoice {
-                    key: "u".to_string(),
-                    label: "pause/resume".to_string(),
-                },
-                KeyChoice {
-                    key: "f".to_string(),
-                    label: "retry failed".to_string(),
-                },
+                KeyChoice::new("u", "pause/resume"),
+                KeyChoice::disabled("f", "retry failed"),
             ],
         },
     });
@@ -645,6 +630,8 @@ fn renders_dialog_overlays() {
             .bg(highlight_color())
             .add_modifier(Modifier::BOLD)
     );
+    assert_eq!(lines[1].spans[0].style.fg, Some(Color::DarkGray));
+    assert_eq!(lines[1].spans[1].style.fg, Some(Color::DarkGray));
 
     model.dialog = Some(DialogModel::Confirm {
         title: "Delete Session".to_string(),

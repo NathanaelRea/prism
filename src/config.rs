@@ -1,12 +1,17 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
+use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 use crate::agent::{PromptMode, builtin_prompt_mode, detected_agents};
-use crate::harness::{Harness, HarnessConfig, OutputFormat, PromptTransport};
+use crate::harness::{
+    BUILTIN_HARNESS_IDS, Harness, HarnessConfig, OutputFormat, PromptTransport, builtin_adapter,
+};
 use crate::process::{command_exists, command_version, run_capture};
 use crate::repo::Repository;
 use crate::session::discover_sessions;
@@ -40,7 +45,6 @@ icon_style = "unicode" # or "nerd-font"
 columns = []
 
 [harnesses.opencode]
-adapter = "opencode"
 program = "opencode"
 
 [tools]
@@ -343,7 +347,9 @@ struct RawHarnessConfig {
 }
 
 fn harness_config_from_raw(id: &str, raw: RawHarnessConfig) -> Result<HarnessConfig, String> {
-    let adapter = raw.adapter.unwrap_or_else(|| "generic".to_string());
+    let adapter = raw
+        .adapter
+        .unwrap_or_else(|| builtin_adapter(id).unwrap_or("generic").to_string());
     let interactive_command = if adapter != "generic" {
         if raw.interactive_command.is_some() {
             return Err(format!(
@@ -439,7 +445,7 @@ impl Config {
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
 
-        let harnesses = ["opencode", "codex", "claude", "pi"]
+        let harnesses = BUILTIN_HARNESS_IDS
             .into_iter()
             .map(|adapter| {
                 (
@@ -696,6 +702,23 @@ impl Config {
         self.harness(&self.default_harness)
     }
 
+    pub fn save_user_default_harness(&self, harness_id: &str) -> Result<(), String> {
+        if !self.harnesses.contains_key(harness_id) {
+            return Err(format!("harness '{harness_id}' is not configured"));
+        }
+        update_user_harness_config(&self.user_path, harness_id, None)
+    }
+
+    pub fn save_user_generic_harness(
+        &self,
+        harness_id: &str,
+        harness: &HarnessConfig,
+    ) -> Result<(), String> {
+        validate_new_generic_harness_id(harness_id, &self.harnesses)?;
+        harness.validate(harness_id)?;
+        update_user_harness_config(&self.user_path, harness_id, Some(harness))
+    }
+
     pub(crate) fn for_harness(&self, harness_id: &str) -> Result<Self, String> {
         if !self.harnesses.contains_key(harness_id) {
             return Err(format!(
@@ -788,6 +811,170 @@ impl Config {
     pub fn save_user_icon_style(&self, style: IconStyle) -> Result<(), String> {
         save_user_icon_style(&self.user_path, style)
     }
+}
+
+pub fn validate_new_generic_harness_id(
+    id: &str,
+    configured: &BTreeMap<String, HarnessConfig>,
+) -> Result<(), String> {
+    let mut chars = id.chars();
+    let valid = chars.next().is_some_and(|first| first.is_ascii_lowercase())
+        && chars.all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '-' | '_')
+        });
+    if !valid {
+        return Err(
+            "harness ID must start with a lowercase letter and contain only lowercase letters, digits, '-' or '_'"
+                .to_string(),
+        );
+    }
+    if builtin_adapter(id).is_some() {
+        return Err(format!(
+            "harness ID '{id}' is reserved for a built-in adapter"
+        ));
+    }
+    if configured.contains_key(id) {
+        return Err(format!("harness '{id}' is already configured"));
+    }
+    Ok(())
+}
+
+fn update_user_harness_config(
+    path: &Path,
+    default_harness: &str,
+    generic: Option<&HarnessConfig>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("create config dir: {error}"))?;
+    }
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("read config file: {error}")),
+    };
+    let updated = update_user_harness_config_text(&text, default_harness, generic)?;
+    let write_path = fs::symlink_metadata(path)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_symlink())
+        .map(|_| fs::canonicalize(path).map_err(|error| format!("resolve config symlink: {error}")))
+        .transpose()?
+        .unwrap_or_else(|| path.to_path_buf());
+    write_config_atomically(&write_path, updated.as_bytes())
+}
+
+fn write_config_atomically(path: &Path, contents: &[u8]) -> Result<(), String> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let permissions = fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    for _ in 0..100 {
+        let staging = path.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = match options.open(&staging) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create staged config file: {error}")),
+        };
+        let result = file
+            .write_all(contents)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| {
+                if let Some(permissions) = permissions.clone() {
+                    fs::set_permissions(&staging, permissions)?;
+                }
+                fs::rename(&staging, path)
+            });
+        if let Err(error) = result {
+            let _ = fs::remove_file(&staging);
+            return Err(format!("write config file: {error}"));
+        }
+        return Ok(());
+    }
+    Err("create unique staged config file".to_string())
+}
+
+fn update_user_harness_config_text(
+    text: &str,
+    default_harness: &str,
+    generic: Option<&HarnessConfig>,
+) -> Result<String, String> {
+    let mut document = if text.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        text.parse::<DocumentMut>()
+            .map_err(|error| format!("parse user config: {error}"))?
+    };
+    if let Some(current) = document
+        .get_mut("default_harness")
+        .and_then(Item::as_value_mut)
+    {
+        let decor = current.decor().clone();
+        *current = toml_edit::Value::from(default_harness);
+        *current.decor_mut() = decor;
+    } else {
+        document["default_harness"] = value(default_harness);
+    }
+
+    if let Some(generic) = generic {
+        if generic.adapter != "generic" {
+            return Err(
+                "only generic harnesses can be added through the harness dialog".to_string(),
+            );
+        }
+        let harnesses_item = document
+            .entry("harnesses")
+            .or_insert_with(|| Item::Table(Table::new()));
+        if let Some(inline) = harnesses_item.as_inline_table().cloned() {
+            let mut table = Table::new();
+            for (key, value_) in inline.iter() {
+                table[key] = Item::Value(value_.clone());
+            }
+            *harnesses_item = Item::Table(table);
+        }
+        let harnesses = harnesses_item
+            .as_table_mut()
+            .ok_or_else(|| "harnesses must be a table".to_string())?;
+        if harnesses.contains_key(default_harness) {
+            return Err(format!("harness '{default_harness}' is already configured"));
+        }
+        let mut table = Table::new();
+        table["adapter"] = value("generic");
+        table["interactive_command"] = value(string_array(&generic.interactive_command));
+        if let Some(transport) = generic.interactive_prompt_transport {
+            table["interactive_prompt_transport"] = value(transport.label());
+        }
+        if let Some(command) = &generic.headless_command {
+            table["headless_command"] = value(string_array(command));
+        }
+        if let Some(transport) = generic.headless_prompt_transport {
+            table["headless_prompt_transport"] = value(transport.label());
+        }
+        table["output_format"] = value("text");
+        if !generic.environment.is_empty() {
+            let mut environment = Table::new();
+            for (key, value_) in &generic.environment {
+                environment[key] = value(value_);
+            }
+            table["environment"] = Item::Table(environment);
+        }
+        harnesses[default_harness] = Item::Table(table);
+    }
+    Ok(document.to_string())
+}
+
+fn string_array(items: &[String]) -> Array {
+    let mut array = Array::new();
+    for item in items {
+        array.push(item.as_str());
+    }
+    array
 }
 
 fn save_user_icon_style(path: &Path, style: IconStyle) -> Result<(), String> {
@@ -1520,6 +1707,134 @@ review = "fix\nreview"
         let harness = config.selected_harness().unwrap();
 
         assert_eq!(harness.describe().adapter, "codex");
+    }
+
+    #[test]
+    fn reserved_builtin_ids_cannot_be_redefined_as_generic() {
+        for id in ["opencode", "codex", "claude", "pi"] {
+            let error = harness_config_from_raw(
+                id,
+                RawHarnessConfig {
+                    adapter: Some("generic".to_string()),
+                    interactive_command: Some(vec!["other-agent".to_string()]),
+                    ..RawHarnessConfig::default()
+                },
+            )
+            .unwrap_err();
+
+            assert!(error.contains("reserved"), "{id}: {error}");
+        }
+    }
+
+    #[test]
+    fn custom_ids_cannot_alias_builtin_adapters() {
+        let error = harness_config_from_raw(
+            "codex-fast",
+            RawHarnessConfig {
+                adapter: Some("codex".to_string()),
+                ..RawHarnessConfig::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("fixed harness ID 'codex'"), "{error}");
+    }
+
+    #[test]
+    fn harness_config_writer_preserves_comments_and_root_tables() {
+        let input = "# keep me\ndefault_harness = \"opencode\" # selected\n\n[ui]\nicon_style = \"unicode\"\n";
+
+        let updated = update_user_harness_config_text(input, "codex", None).unwrap();
+        let parsed = updated.parse::<toml_edit::DocumentMut>().unwrap();
+
+        assert_eq!(parsed["default_harness"].as_str(), Some("codex"));
+        assert_eq!(parsed["ui"]["icon_style"].as_str(), Some("unicode"));
+        assert!(updated.contains("# keep me"));
+        assert!(updated.contains("# selected"));
+    }
+
+    #[test]
+    fn harness_config_writer_adds_validated_generic_harness_and_selects_it() {
+        let generic = HarnessConfig {
+            adapter: "generic".to_string(),
+            interactive_command: vec!["company-agent".to_string()],
+            arguments: Vec::new(),
+            interactive_prompt_transport: None,
+            headless_command: Some(vec!["company-agent".to_string(), "run".to_string()]),
+            headless_prompt_transport: Some(PromptTransport::Stdin),
+            output_format: OutputFormat::Text,
+            environment: BTreeMap::new(),
+        };
+
+        let updated = update_user_harness_config_text(
+            "[ui]\nicon_style = \"unicode\"\n",
+            "company-agent",
+            Some(&generic),
+        )
+        .unwrap();
+        let parsed = toml::from_str::<RawConfig>(&updated).unwrap();
+        let raw = parsed.harnesses.unwrap().remove("company-agent").unwrap();
+        let parsed_generic = harness_config_from_raw("company-agent", raw).unwrap();
+
+        assert_eq!(parsed.default_harness.as_deref(), Some("company-agent"));
+        assert_eq!(parsed_generic, generic);
+    }
+
+    #[test]
+    fn harness_config_writer_extends_an_inline_harnesses_table() {
+        let generic = HarnessConfig {
+            adapter: "generic".to_string(),
+            interactive_command: vec!["second-agent".to_string()],
+            arguments: Vec::new(),
+            interactive_prompt_transport: None,
+            headless_command: None,
+            headless_prompt_transport: None,
+            output_format: OutputFormat::Text,
+            environment: BTreeMap::new(),
+        };
+        let input = "harnesses = { first = { adapter = \"generic\", interactive_command = [\"first-agent\"] } }\n";
+
+        let updated = update_user_harness_config_text(input, "second", Some(&generic)).unwrap();
+        let parsed = toml::from_str::<RawConfig>(&updated).unwrap();
+        let harnesses = parsed.harnesses.unwrap();
+
+        assert!(harnesses.contains_key("first"));
+        assert!(harnesses.contains_key("second"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn harness_config_writer_preserves_a_symlinked_user_config() {
+        use std::os::unix::fs::symlink;
+
+        let directory = std::env::temp_dir().join(format!(
+            "prism-harness-config-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("managed.toml");
+        let link = directory.join("config.toml");
+        fs::write(&target, "default_harness = \"opencode\"\n").unwrap();
+        symlink(&target, &link).unwrap();
+
+        update_user_harness_config(&link, "codex", None).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::read_to_string(&target)
+                .unwrap()
+                .contains("default_harness = \"codex\"")
+        );
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

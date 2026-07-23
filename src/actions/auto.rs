@@ -180,10 +180,7 @@ impl Tui {
                 title: "Auto Flow: Implementation Source".to_string(),
                 choices: [("p", "prompt"), ("e", "existing plan"), ("d", "draft plan")]
                     .into_iter()
-                    .map(|(key, label)| crate::view::KeyChoice {
-                        key: key.to_string(),
-                        label: label.to_string(),
-                    })
+                    .map(|(key, label)| crate::view::KeyChoice::new(key, label))
                     .collect(),
             },
         )?;
@@ -205,10 +202,7 @@ impl Tui {
                 title: "Auto Flow: Plan Execution".to_string(),
                 choices: [("s", "sequential"), ("p", "parallel")]
                     .into_iter()
-                    .map(|(key, label)| crate::view::KeyChoice {
-                        key: key.to_string(),
-                        label: label.to_string(),
-                    })
+                    .map(|(key, label)| crate::view::KeyChoice::new(key, label))
                     .collect(),
             },
         )?;
@@ -280,17 +274,47 @@ impl Tui {
         let Some(dashboard) = self.current_auto_dashboard() else {
             return Ok(false);
         };
+        let selected_step_run_id = dashboard
+            .run
+            .run
+            .selected_step_run_id
+            .or_else(|| dashboard.run.steps.first().and_then(|step| step.id));
+        let selected_active = selected_step_run_id
+            .and_then(|id| dashboard.run.steps.iter().find(|step| step.id == Some(id)))
+            .is_some_and(|step| {
+                matches!(
+                    step.status,
+                    AutoStepStatus::Queued
+                        | AutoStepStatus::Starting
+                        | AutoStepStatus::Running
+                        | AutoStepStatus::Waiting
+                )
+            });
+        let run_active = dashboard.run.steps.iter().any(|step| {
+            matches!(
+                step.status,
+                AutoStepStatus::Queued
+                    | AutoStepStatus::Starting
+                    | AutoStepStatus::Running
+                    | AutoStepStatus::Waiting
+            )
+        });
         let answer = self.prompt_choice_dialog(
             raw,
             crate::view::ChoiceList {
                 title: "Abort Auto Flow".to_string(),
-                choices: [("s", "selected step"), ("a", "whole run")]
-                    .into_iter()
-                    .map(|(key, label)| crate::view::KeyChoice {
-                        key: key.to_string(),
-                        label: label.to_string(),
-                    })
-                    .collect(),
+                choices: vec![
+                    if selected_active {
+                        crate::view::KeyChoice::new("s", "selected step")
+                    } else {
+                        crate::view::KeyChoice::disabled("s", "selected step")
+                    },
+                    if run_active {
+                        crate::view::KeyChoice::new("a", "whole run")
+                    } else {
+                        crate::view::KeyChoice::disabled("a", "whole run")
+                    },
+                ],
             },
         )?;
         let Some(answer) = answer else {

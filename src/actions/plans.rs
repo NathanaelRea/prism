@@ -1,5 +1,22 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) struct PlanActionAvailability {
+    pause_resume: bool,
+    retry_failed: bool,
+    retry_from_selected: bool,
+    skip: bool,
+    abort: bool,
+}
+
+fn action_choice(key: &str, label: &str, enabled: bool) -> crate::view::KeyChoice {
+    if enabled {
+        crate::view::KeyChoice::new(key, label)
+    } else {
+        crate::view::KeyChoice::disabled(key, label)
+    }
+}
+
 pub(super) fn plan_run_mode_from_parallel_confirmation(parallel: bool) -> PlanRunMode {
     if parallel {
         PlanRunMode::Parallel
@@ -348,14 +365,47 @@ impl Tui {
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
-        if self.current_plan_dashboard().is_none() {
+        let Some(dashboard) = self.current_plan_dashboard() else {
             self.show_message("focus an Auto Flow or plan run to show plan actions")?;
             return Ok(());
-        }
+        };
+        let selected = dashboard
+            .run
+            .steps
+            .iter()
+            .find(|step| step.step == dashboard.run.run.selected_step);
+        let resuming =
+            dashboard.run.run.pause_requested || dashboard.run.run.status == PlanRunStatus::Paused;
+        let availability = PlanActionAvailability {
+            pause_resume: resuming
+                || !matches!(
+                    dashboard.run.run.status,
+                    PlanRunStatus::Done | PlanRunStatus::Failed | PlanRunStatus::Aborted
+                ),
+            retry_failed: dashboard.run.steps.iter().any(|step| {
+                matches!(
+                    step.status,
+                    PlanStepStatus::Failed | PlanStepStatus::Aborted
+                )
+            }),
+            retry_from_selected: selected.is_some(),
+            skip: selected.is_some_and(|step| {
+                !matches!(
+                    step.status,
+                    PlanStepStatus::Starting | PlanStepStatus::Running
+                )
+            }),
+            abort: dashboard.run.steps.iter().any(|step| {
+                matches!(
+                    step.status,
+                    PlanStepStatus::Queued | PlanStepStatus::Starting | PlanStepStatus::Running
+                )
+            }),
+        };
 
         let answer = self.prompt_choice_dialog(
             raw,
-            Self::plan_action_choices("Plan Actions", "skip phase", true),
+            Self::plan_action_choices("Plan Actions", "skip phase", true, availability),
         )?;
         let Some(answer) = answer else {
             return Ok(());
@@ -405,9 +455,60 @@ impl Tui {
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
+        let Some(dashboard) = self.current_auto_dashboard() else {
+            return Ok(());
+        };
+        let selected_auto_step = dashboard
+            .run
+            .run
+            .selected_step_run_id
+            .and_then(|id| dashboard.run.steps.iter().find(|step| step.id == Some(id)));
+        let selected_plan_step = dashboard.linked_plan_dashboard.as_ref().and_then(|linked| {
+            linked
+                .run
+                .steps
+                .iter()
+                .find(|step| step.step == linked.run.run.selected_step)
+        });
+        let resuming =
+            dashboard.run.run.pause_requested || dashboard.run.run.status == AutoRunStatus::Paused;
+        let availability = PlanActionAvailability {
+            pause_resume: resuming
+                || !matches!(
+                    dashboard.run.run.status,
+                    AutoRunStatus::Done | AutoRunStatus::Failed | AutoRunStatus::Aborted
+                ),
+            retry_failed: dashboard.run.steps.iter().any(|step| {
+                matches!(
+                    step.status,
+                    AutoStepStatus::Failed | AutoStepStatus::Aborted
+                )
+            }),
+            retry_from_selected: selected_auto_step.is_some(),
+            skip: selected_plan_step.is_some_and(|step| {
+                !matches!(
+                    step.status,
+                    PlanStepStatus::Starting | PlanStepStatus::Running
+                )
+            }),
+            abort: dashboard.run.steps.iter().any(|step| {
+                matches!(
+                    step.status,
+                    AutoStepStatus::Queued
+                        | AutoStepStatus::Starting
+                        | AutoStepStatus::Running
+                        | AutoStepStatus::Waiting
+                )
+            }),
+        };
         let answer = self.prompt_choice_dialog(
             raw,
-            Self::plan_action_choices("Auto Plan Actions", "skip linked phase", false),
+            Self::plan_action_choices(
+                "Auto Plan Actions",
+                "skip linked phase",
+                false,
+                availability,
+            ),
         )?;
         let Some(answer) = answer else {
             return Ok(());
@@ -445,27 +546,26 @@ impl Tui {
         title: &str,
         skip_label: &str,
         include_run_navigation: bool,
+        availability: PlanActionAvailability,
     ) -> crate::view::ChoiceList {
         let mut choices = Vec::new();
         if include_run_navigation {
             choices.extend([("n", "next run"), ("v", "previous run")]);
         }
-        choices.extend([
-            ("u", "pause/resume"),
-            ("f", "retry failed"),
-            ("b", "retry from selected"),
-            ("s", skip_label),
-            ("x", "abort"),
+        let mut rendered = choices
+            .into_iter()
+            .map(|(key, label)| crate::view::KeyChoice::new(key, label))
+            .collect::<Vec<_>>();
+        rendered.extend([
+            action_choice("u", "pause/resume", availability.pause_resume),
+            action_choice("f", "retry failed", availability.retry_failed),
+            action_choice("b", "retry from selected", availability.retry_from_selected),
+            action_choice("s", skip_label, availability.skip),
+            action_choice("x", "abort", availability.abort),
         ]);
         crate::view::ChoiceList {
             title: title.to_string(),
-            choices: choices
-                .into_iter()
-                .map(|(key, label)| crate::view::KeyChoice {
-                    key: key.to_string(),
-                    label: label.to_string(),
-                })
-                .collect(),
+            choices: rendered,
         }
     }
 
@@ -481,17 +581,27 @@ impl Tui {
         };
         let run_id = dashboard.run.run.id.clone();
         let selected_step = dashboard.run.run.selected_step;
+        let selected_running = dashboard.run.steps.iter().any(|step| {
+            step.step == selected_step
+                && matches!(
+                    step.status,
+                    PlanStepStatus::Starting | PlanStepStatus::Running
+                )
+        });
+        let run_active = dashboard.run.steps.iter().any(|step| {
+            matches!(
+                step.status,
+                PlanStepStatus::Queued | PlanStepStatus::Starting | PlanStepStatus::Running
+            )
+        });
         let answer = self.prompt_choice_dialog(
             raw,
             crate::view::ChoiceList {
                 title: "Abort Plan".to_string(),
-                choices: [("s", "selected phase"), ("a", "all running phases")]
-                    .into_iter()
-                    .map(|(key, label)| crate::view::KeyChoice {
-                        key: key.to_string(),
-                        label: label.to_string(),
-                    })
-                    .collect(),
+                choices: vec![
+                    action_choice("s", "selected phase", selected_running),
+                    action_choice("a", "all running phases", run_active),
+                ],
             },
         )?;
         let Some(answer) = answer else {
@@ -701,5 +811,34 @@ impl Tui {
         }
         self.show_message("dismissed plan run")?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_action_choices_disable_unavailable_operations() {
+        let choices = Tui::plan_action_choices(
+            "Plan Actions",
+            "skip phase",
+            false,
+            PlanActionAvailability {
+                pause_resume: false,
+                retry_failed: true,
+                retry_from_selected: false,
+                skip: true,
+                abort: false,
+            },
+        );
+
+        let disabled = choices
+            .choices
+            .iter()
+            .filter(|choice| choice.disabled)
+            .map(|choice| choice.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(disabled, ["u", "b", "x"]);
     }
 }

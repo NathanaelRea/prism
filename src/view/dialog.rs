@@ -364,9 +364,19 @@ pub(super) fn choice_lines(choices: &crate::view::ChoiceList) -> Vec<Line<'stati
         .choices
         .iter()
         .map(|choice| {
+            let key_style = if choice.disabled {
+                disabled_style()
+            } else {
+                selected_style(true)
+            };
+            let label_style = if choice.disabled {
+                disabled_style()
+            } else {
+                muted_style()
+            };
             Line::from(vec![
-                Span::styled(format!("[{}]", choice.key), selected_style(true)),
-                Span::styled(format!(" {}", choice.label), muted_style()),
+                Span::styled(format!("[{}]", choice.key), key_style),
+                Span::styled(format!(" {}", choice.label), label_style),
             ])
         })
         .collect::<Vec<_>>()

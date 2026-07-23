@@ -4,14 +4,8 @@ pub(super) fn pr_target_choice_list(origin: &str, upstream: &str) -> crate::view
     crate::view::ChoiceList {
         title: "Create Pull Request Target".to_string(),
         choices: vec![
-            crate::view::KeyChoice {
-                key: "u".to_string(),
-                label: format!("upstream ({upstream})"),
-            },
-            crate::view::KeyChoice {
-                key: "o".to_string(),
-                label: format!("origin ({origin})"),
-            },
+            crate::view::KeyChoice::new("u", format!("upstream ({upstream})")),
+            crate::view::KeyChoice::new("o", format!("origin ({origin})")),
         ],
     }
 }
@@ -127,10 +121,7 @@ impl Tui {
             .iter()
             .take(keys.len())
             .zip(keys.iter())
-            .map(|(summary, key)| crate::view::KeyChoice {
-                key: key.clone(),
-                label: remote_pr_choice_label(summary),
-            })
+            .map(|(summary, key)| crate::view::KeyChoice::new(key, remote_pr_choice_label(summary)))
             .collect::<Vec<_>>();
         let Some(answer) = self.prompt_choice_dialog(
             raw,

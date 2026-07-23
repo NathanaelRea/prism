@@ -22,6 +22,7 @@ Prism uses a lazygit-style panel model.
 - `Space g M` merges the selected pull request.
 - `Space g c` starts or appends a managed PR Stabilization CI repair for the selected worktree.
 - `Space g f` starts or appends a managed PR Stabilization review repair for the selected worktree.
+- Unavailable `Space g` actions are shown in dark gray and ignored. PR actions require a known pull request; repair actions also require a headless-capable harness.
 - `P` opens plan mode from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through the selected harness. Active plan runs render automatically in the Worktrees main panel for the selected worktree.
 - `A` starts or focuses Auto Flow for the selected non-default worktree.
 - `u` pauses/resumes the selected Auto Flow or plan run from Status or the Worktrees main panel; paused Auto Flow resumes only after a dialog describes the next step.
@@ -35,6 +36,8 @@ Prism uses a lazygit-style panel model.
 - `c` creates a worktree session from the Repos panel.
 - `x` aborts the selected agent session from the Worktrees panel when its adapter supports native session cancellation.
 - `M` migrates the selected Worktree Session to the current global harness, including a worktree previously pinned with `Keep`.
+- `H` opens the global harness chooser. Built-in harnesses can be selected directly; the generic option collects interactive and optional headless commands.
+- Choice dialogs keep unavailable actions visible in dark gray. Their keys are ignored without closing the dialog; Plan and Auto actions use current run and step state to determine availability.
 - `x` also aborts the selected Plan phase from the active Plan dashboard, or accepts `all` when prompted to abort all running phases.
 - `e` edits the selected Prism repository config and reloads after save.
 - `E` edits the Prism user config and reloads after save.

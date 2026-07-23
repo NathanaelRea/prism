@@ -76,6 +76,7 @@ impl KeyInput {
             KeyCode::Char('R') if plain_char(event) => Key::ManageRepos,
             KeyCode::Char('e') if plain_char(event) => Key::EditConfig,
             KeyCode::Char('E') if plain_char(event) => Key::EditUserConfig,
+            KeyCode::Char('H') if plain_char(event) => Key::SelectHarness,
             KeyCode::Char('D') if plain_char(event) => Key::Delete,
             KeyCode::Char('U') if plain_char(event) => Key::Unarchive,
             KeyCode::Char('M') if plain_char(event) => Key::MigrateHarness,
@@ -195,6 +196,7 @@ pub enum Key {
     DeletePermanent,
     EditConfig,
     EditUserConfig,
+    SelectHarness,
     Search,
     Quit,
     Other,
@@ -388,6 +390,10 @@ mod tests {
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('E'))),
             Key::EditUserConfig
+        );
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('H'))),
+            Key::SelectHarness
         );
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('P'))),

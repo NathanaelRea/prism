@@ -5,6 +5,54 @@
   "description": "Configuration for Prism user and repository config.toml files.",
   "type": "object",
   "additionalProperties": false,
+  "$defs": {
+    "harness": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "adapter": {
+          "type": "string",
+          "enum": ["opencode", "codex", "claude", "pi", "generic"]
+        },
+        "program": {
+          "type": "string",
+          "description": "Built-in adapter executable or wrapper. Prism owns protocol arguments."
+        },
+        "arguments": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Adapter-approved arguments placed before Prism-owned protocol arguments."
+        },
+        "interactive_command": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "interactive_prompt_transport": {
+          "type": "string",
+          "enum": ["argument", "temp-file"]
+        },
+        "headless_command": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string" }
+        },
+        "headless_prompt_transport": {
+          "type": "string",
+          "enum": ["argument", "stdin", "temp-file"]
+        },
+        "output_format": {
+          "type": "string",
+          "enum": ["text"],
+          "default": "text"
+        },
+        "environment": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    }
+  },
   "properties": {
     "default_harness": {
       "type": "string",
@@ -207,52 +255,45 @@
     },
     "harnesses": {
       "type": "object",
-      "additionalProperties": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "adapter": {
-            "type": "string",
-            "enum": ["opencode", "codex", "claude", "pi", "generic"],
-            "default": "generic"
-          },
-          "program": {
-            "type": "string",
-            "description": "Built-in adapter executable or wrapper. Prism owns protocol arguments."
-          },
-          "arguments": {
-            "type": "array",
-            "items": { "type": "string" },
-            "description": "Adapter-approved arguments placed before Prism-owned protocol arguments."
-          },
-          "interactive_command": {
-            "type": "array",
-            "minItems": 1,
-            "items": { "type": "string" }
-          },
-          "interactive_prompt_transport": {
-            "type": "string",
-            "enum": ["argument", "temp-file"]
-          },
-          "headless_command": {
-            "type": "array",
-            "minItems": 1,
-            "items": { "type": "string" }
-          },
-          "headless_prompt_transport": {
-            "type": "string",
-            "enum": ["argument", "stdin", "temp-file"]
-          },
-          "output_format": {
-            "type": "string",
-            "enum": ["text"],
-            "default": "text"
-          },
-          "environment": {
-            "type": "object",
-            "additionalProperties": { "type": "string" }
-          }
+      "description": "Global harness definitions. opencode, codex, claude, and pi are reserved fixed built-in IDs; custom IDs must use the generic adapter.",
+      "properties": {
+        "opencode": {
+          "allOf": [
+            { "$ref": "#/$defs/harness" },
+            { "properties": { "adapter": { "const": "opencode" } } }
+          ]
+        },
+        "codex": {
+          "allOf": [
+            { "$ref": "#/$defs/harness" },
+            { "properties": { "adapter": { "const": "codex" } } }
+          ]
+        },
+        "claude": {
+          "allOf": [
+            { "$ref": "#/$defs/harness" },
+            { "properties": { "adapter": { "const": "claude" } } }
+          ]
+        },
+        "pi": {
+          "allOf": [
+            { "$ref": "#/$defs/harness" },
+            { "properties": { "adapter": { "const": "pi" } } }
+          ]
         }
+      },
+      "additionalProperties": {
+        "allOf": [
+          { "$ref": "#/$defs/harness" },
+          {
+            "properties": {
+              "adapter": {
+                "const": "generic",
+                "default": "generic"
+              }
+            }
+          }
+        ]
       }
     },
     "prompt_templates": {

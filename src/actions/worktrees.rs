@@ -314,14 +314,16 @@ impl Tui {
         let choices = archived
             .iter()
             .zip(keys.iter())
-            .map(|(worktree, key)| crate::view::KeyChoice {
-                key: key.to_string(),
-                label: format!(
-                    "{}  {}  {}",
-                    worktree.branch,
-                    worktree.classification.label(),
-                    worktree.worktree_path
-                ),
+            .map(|(worktree, key)| {
+                crate::view::KeyChoice::new(
+                    key,
+                    format!(
+                        "{}  {}  {}",
+                        worktree.branch,
+                        worktree.classification.label(),
+                        worktree.worktree_path
+                    ),
+                )
             })
             .collect::<Vec<_>>();
         let Some(answer) = self.prompt_choice_dialog(
