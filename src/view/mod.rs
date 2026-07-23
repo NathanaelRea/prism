@@ -53,7 +53,21 @@ pub(crate) struct FrameModel<'a> {
     pub leader_hint: Option<LeaderHintModel>,
     pub auto_dashboard: Option<AutoDashboard>,
     pub plan_dashboard: Option<PlanDashboard>,
+    pub tmux_portal: Option<TmuxPortalModel>,
     pub dialog: Option<DialogModel>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TmuxPortalModel {
+    pub branch: String,
+    pub state: TmuxPortalState,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TmuxPortalState {
+    Loading,
+    Ready(Vec<Line<'static>>),
+    Unavailable,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

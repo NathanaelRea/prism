@@ -7,6 +7,7 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::text::Line;
 
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
@@ -60,6 +61,11 @@ pub struct Tui {
     pub(crate) tmux_warmup_rx: Receiver<AgentSessionWarmupResult>,
     pub(crate) tmux_warmups_in_flight: BTreeSet<AgentSessionWarmupKey>,
     pub(crate) tmux_generations: BTreeMap<AgentSessionSlot, u64>,
+    pub(crate) tmux_portal_tx: Sender<TmuxPortalResult>,
+    pub(crate) tmux_portal_rx: Receiver<TmuxPortalResult>,
+    pub(crate) tmux_portal_polls_in_flight: BTreeSet<AgentSessionWarmupKey>,
+    pub(crate) tmux_portal_last_polled: BTreeMap<AgentSessionWarmupKey, Instant>,
+    pub(crate) tmux_portal: Option<TmuxPortalSnapshot>,
     pub(crate) wt_poll_tx: Sender<WtPollResult>,
     pub(crate) wt_poll_rx: Receiver<WtPollResult>,
     pub(crate) default_branch_poll_tx: Sender<DefaultBranchPollResult>,
@@ -123,6 +129,23 @@ pub(crate) struct SelectedWorktreeContext {
     pub session_index: usize,
     pub repo: Repository,
     pub config: Config,
+}
+
+pub(crate) struct TmuxPortalResult {
+    pub key: AgentSessionWarmupKey,
+    pub capture: Result<String, String>,
+}
+
+pub(crate) struct TmuxPortalTarget {
+    pub key: AgentSessionWarmupKey,
+    pub repo: Repository,
+    pub config: Config,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TmuxPortalSnapshot {
+    pub key: AgentSessionWarmupKey,
+    pub capture: Option<Result<Vec<Line<'static>>, String>>,
 }
 
 impl ManagedRepo {
@@ -367,6 +390,7 @@ fn plan_run_status_sort_key(status: PlanRunStatus) -> u8 {
 #[derive(Default)]
 struct TuiBackgroundChanges {
     tmux: bool,
+    tmux_portal: bool,
     worktree_columns: bool,
     default_branch: bool,
     opencode_status: bool,
@@ -381,6 +405,7 @@ struct TuiBackgroundChanges {
 impl TuiBackgroundChanges {
     fn any(&self) -> bool {
         self.tmux
+            || self.tmux_portal
             || self.worktree_columns
             || self.default_branch
             || self.opencode_status
@@ -452,6 +477,7 @@ impl Tui {
         let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
         let (delete_session_tx, delete_session_rx) = mpsc::channel();
         let (tmux_warmup_tx, tmux_warmup_rx) = mpsc::channel();
+        let (tmux_portal_tx, tmux_portal_rx) = mpsc::channel();
         let (wt_poll_tx, wt_poll_rx) = mpsc::channel();
         let (default_branch_poll_tx, default_branch_poll_rx) = mpsc::channel();
         let (opencode_poll_tx, opencode_poll_rx) = mpsc::channel();
@@ -510,6 +536,11 @@ impl Tui {
             tmux_warmup_rx,
             tmux_warmups_in_flight: BTreeSet::new(),
             tmux_generations: BTreeMap::new(),
+            tmux_portal_tx,
+            tmux_portal_rx,
+            tmux_portal_polls_in_flight: BTreeSet::new(),
+            tmux_portal_last_polled: BTreeMap::new(),
+            tmux_portal: None,
             wt_poll_tx,
             wt_poll_rx,
             default_branch_poll_tx,
@@ -654,6 +685,7 @@ impl Tui {
 
         let mut runtime = TerminalRuntime::enter()?;
         self.start_tmux_agent_warmup();
+        self.poll_tmux_portal();
         self.start_wt_column_poll();
         self.start_default_branch_status_poll(true);
         self.start_opencode_status_poll(true);
@@ -1111,6 +1143,7 @@ impl Tui {
     fn tick_tui_action_jobs(&mut self) -> TuiBackgroundChanges {
         let changes = TuiBackgroundChanges {
             tmux: self.poll_tmux_agent_warmup(),
+            tmux_portal: self.poll_tmux_portal(),
             worktree_columns: self.poll_wt_columns(),
             default_branch: self.poll_default_branch_status(),
             opencode_status: self.poll_opencode_status(),
@@ -3002,8 +3035,32 @@ impl Tui {
             leader_hint: self.leader_hint_model(),
             auto_dashboard: self.current_auto_dashboard(),
             plan_dashboard: self.current_plan_dashboard(),
+            tmux_portal: self.tmux_portal_model(),
             dialog: self.dialog.clone(),
         }
+    }
+
+    fn tmux_portal_model(&self) -> Option<view::TmuxPortalModel> {
+        if self.focused_panel != PanelFocus::Worktrees {
+            return None;
+        }
+        let session = self.sessions.get(self.selected_worktree_index()?)?;
+        let managed = self.repos.get(session.repo_index)?;
+        let slot = AgentSessionSlot::for_repository_session(&managed.identity, session);
+        let generation = self.tmux_generations.get(&slot)?;
+        let portal = self
+            .tmux_portal
+            .as_ref()
+            .filter(|portal| portal.key.slot == slot && portal.key.generation == *generation);
+        let state = match portal.and_then(|portal| portal.capture.as_ref()) {
+            None => view::TmuxPortalState::Loading,
+            Some(Ok(lines)) => view::TmuxPortalState::Ready(lines.clone()),
+            Some(Err(_)) => view::TmuxPortalState::Unavailable,
+        };
+        Some(view::TmuxPortalModel {
+            branch: session.branch.clone(),
+            state,
+        })
     }
 
     fn repo_health_label(&self, repo_index: usize) -> String {
@@ -3337,9 +3394,10 @@ fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
 mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use crate::agent::AgentState;
+    use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey};
     use crate::auto_flow::{
         AutoImplementationSource, AutoRun, AutoRunMode, AutoRunStatus, PersistedAutoRun,
     };
@@ -3353,9 +3411,9 @@ mod tests {
     use crate::view::{ChoiceList, KeyChoice, OrderedToggleItem, RepoMainView, WorktreeMainView};
 
     use super::{
-        GitAction, ManagedRepo, OpenTmuxSessionTarget, PanelFocus, PrPollKey, Tui,
-        WorktreeListMode, confirmation_result, move_enabled_ordered_item, selectable_choice_key,
-        toggle_ordered_item,
+        GitAction, ManagedRepo, OpenTmuxSessionTarget, PanelFocus, PrPollKey, TmuxPortalResult,
+        Tui, WorktreeListMode, confirmation_result, move_enabled_ordered_item,
+        selectable_choice_key, toggle_ordered_item,
     };
 
     #[test]
@@ -3422,6 +3480,44 @@ mod tests {
         assert!(tui.git_action_enabled(GitAction::OpenPr));
         assert!(!tui.git_action_enabled(GitAction::Merge));
         assert!(!tui.git_action_enabled(GitAction::CiFix));
+    }
+
+    #[test]
+    fn tmux_portal_rejects_capture_from_previous_generation() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let mut tui = Tui::new_single(
+            repo,
+            test_config(),
+            vec![test_session(0, "/tmp/repo", "feature")],
+        );
+        tui.focused_panel = PanelFocus::Worktrees;
+        let slot =
+            AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
+        let stale_key = AgentSessionWarmupKey::new(slot.clone(), 0);
+        let current_key = AgentSessionWarmupKey::new(slot.clone(), 1);
+        tui.tmux_generations.insert(slot, 1);
+        tui.tmux_portal_last_polled
+            .insert(current_key.clone(), Instant::now());
+        tui.tmux_portal_tx
+            .send(TmuxPortalResult {
+                key: stale_key,
+                capture: Ok("stale output".to_string()),
+            })
+            .unwrap();
+
+        assert!(tui.poll_tmux_portal());
+        assert_eq!(
+            tui.tmux_portal.as_ref().map(|portal| &portal.key),
+            Some(&current_key),
+        );
+        assert_eq!(
+            tui.tmux_portal
+                .as_ref()
+                .and_then(|portal| portal.capture.as_ref()),
+            None,
+        );
     }
 
     #[test]

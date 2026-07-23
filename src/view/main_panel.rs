@@ -1,14 +1,26 @@
 use super::*;
 
 pub(super) fn render_main(frame: &mut Frame<'_>, area: Rect, model: &crate::view::FrameModel<'_>) {
+    let areas = if model.tmux_portal.is_some() {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(100), Constraint::Length(0)])
+            .split(area)
+    };
+    let main_area = areas[0];
     let content_area = panel_block(
         Line::from(Span::styled("0 Main", title_style(model.main_focused))),
         model.main_focused,
     )
-    .inner(area)
+    .inner(main_area)
     .height
     .saturating_sub(0) as usize;
-    let width = area.width.saturating_sub(2) as usize;
+    let width = main_area.width.saturating_sub(2) as usize;
     let mut lines = match model.focus {
         PanelFocus::Status => status_dashboard_lines(model),
         PanelFocus::Repos => repo_overview_lines(model, width, content_area),
@@ -32,8 +44,39 @@ pub(super) fn render_main(frame: &mut Frame<'_>, area: Rect, model: &crate::view
             ))
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0)),
-        area,
+        main_area,
     );
+
+    if let Some(portal) = &model.tmux_portal {
+        render_tmux_portal(frame, areas[1], portal);
+    }
+}
+
+fn render_tmux_portal(frame: &mut Frame<'_>, area: Rect, portal: &TmuxPortalModel) {
+    let block = panel_block(
+        Line::from(Span::styled(
+            format!(" tmux · {} ", portal.branch),
+            title_style(false),
+        )),
+        false,
+    );
+    let height = block.inner(area).height as usize;
+    let lines = match &portal.state {
+        TmuxPortalState::Loading => vec![Line::from(Span::styled(
+            "Loading tmux preview...",
+            muted_style(),
+        ))],
+        TmuxPortalState::Unavailable => vec![Line::from(Span::styled(
+            "Tmux session unavailable",
+            muted_style(),
+        ))],
+        TmuxPortalState::Ready(lines) => lines
+            .iter()
+            .skip(lines.len().saturating_sub(height))
+            .cloned()
+            .collect(),
+    };
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 pub(super) fn status_dashboard_lines(model: &crate::view::FrameModel<'_>) -> Vec<Line<'static>> {
