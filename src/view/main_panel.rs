@@ -74,10 +74,7 @@ fn render_tmux_portal(frame: &mut Frame<'_>, area: Rect, portal: &TmuxPortalMode
     );
     let height = block.inner(area).height as usize;
     let lines = match &portal.state {
-        TmuxPortalState::Loading => vec![Line::from(Span::styled(
-            "Loading tmux preview...",
-            muted_style(),
-        ))],
+        TmuxPortalState::Loading => Vec::new(),
         TmuxPortalState::Unavailable => vec![Line::from(Span::styled(
             "Tmux session unavailable",
             muted_style(),

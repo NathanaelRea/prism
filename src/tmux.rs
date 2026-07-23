@@ -76,7 +76,7 @@ pub fn attach_or_create_agent(
 ) -> Result<(), String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
     ensure_tmux_agent_session_for_attach(repo, config, session, &runtime)?;
-    match attach_session(config, runtime.name()) {
+    match attach_agent_session(config, &runtime) {
         Ok(()) => Ok(()),
         Err(_) if matches!(session_exists(config, runtime.name()), Ok(false)) => Ok(()),
         Err(error) => Err(error),
@@ -372,18 +372,31 @@ fn agent_session_prefix(repo: &Repository, branch: &str) -> String {
 }
 
 fn attach(config: &Config, runtime: &TmuxAgentSession, window: TmuxWindow) -> Result<(), String> {
-    run_status_inherited(Command::new(config.tool("tmux")).env_remove("TMUX").args([
-        "attach-session",
-        "-t",
-        &runtime.target(window),
-    ]))
+    let target = runtime.target(window);
+    attach_target(config, &target, &target)
+}
+
+fn attach_agent_session(config: &Config, runtime: &TmuxAgentSession) -> Result<(), String> {
+    attach_target(config, &runtime.target(TmuxWindow::Agent), runtime.name())
 }
 
 fn attach_session(config: &Config, name: &str) -> Result<(), String> {
+    attach_target(config, name, name)
+}
+
+fn attach_target(config: &Config, size_target: &str, attach_target: &str) -> Result<(), String> {
+    run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+        "set-option",
+        "-w",
+        "-t",
+        size_target,
+        "window-size",
+        "latest",
+    ]))?;
     run_status_inherited(Command::new(config.tool("tmux")).env_remove("TMUX").args([
         "attach-session",
         "-t",
-        name,
+        attach_target,
     ]))
 }
 
@@ -645,9 +658,40 @@ pub(crate) fn capture_agent_pane(
     config: &Config,
     branch: &str,
     generation: u64,
+    width: u16,
+    height: u16,
 ) -> Result<String, String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, branch, generation);
-    capture_pane(config, &runtime.target(TmuxWindow::Agent), true)
+    capture_portal_pane(config, &runtime.target(TmuxWindow::Agent), width, height)
+}
+
+fn capture_portal_pane(
+    config: &Config,
+    target: &str,
+    width: u16,
+    height: u16,
+) -> Result<String, String> {
+    let output = run_output_allow_failure_with_timeout(
+        Command::new(config.tool("tmux"))
+            .env_remove("TMUX")
+            .args(["resize-window", "-x"])
+            .arg(width.to_string())
+            .arg("-y")
+            .arg(height.to_string())
+            .args([
+                "-t",
+                target,
+                ";",
+                "capture-pane",
+                "-p",
+                "-e",
+                "-N",
+                "-t",
+                target,
+            ]),
+        PANE_CAPTURE_TIMEOUT,
+    )?;
+    tmux_output_result(output)
 }
 
 fn pane_capture(config: &Config, name: &str) -> Option<String> {
@@ -666,6 +710,10 @@ fn capture_pane(config: &Config, target: &str, include_styles: bool) -> Result<S
     } else {
         run_output_allow_failure(&mut command)?
     };
+    tmux_output_result(output)
+}
+
+fn tmux_output_result(output: crate::process::ProcessOutput) -> Result<String, String> {
     if output.status.success() {
         Ok(output.stdout)
     } else if output.stderr.trim().is_empty() {
@@ -1319,12 +1367,15 @@ echo 'agent output'
         let runtime = TmuxAgentSession::for_worktree_session(&repo, "feature", 4);
 
         assert_eq!(
-            capture_agent_pane(&repo, &config, "feature", 4),
+            capture_agent_pane(&repo, &config, "feature", 4, 72, 18),
             Ok("agent output\n".to_string()),
         );
         assert_eq!(
             fs::read_to_string(&log).unwrap().trim(),
-            format!("capture-pane -p -e -N -t {}:1", runtime.name()),
+            format!(
+                "resize-window -x 72 -y 18 -t {0}:1 ; capture-pane -p -e -N -t {0}:1",
+                runtime.name()
+            ),
         );
 
         let _ = fs::remove_dir_all(temp);
@@ -1909,9 +1960,14 @@ exit 0
         let commands = fs::read_to_string(&log).unwrap();
         assert_eq!(commands.matches("new-session -d -s").count(), 1);
         assert_eq!(commands.matches("attach-session -t").count(), 1);
+        let runtime = TmuxAgentSession::for_worktree_session(&repo, "feature", 0);
+        assert!(commands.contains(&format!(
+            "set-option -w -t {}:1 window-size latest",
+            runtime.name()
+        )));
         let attach = commands
             .lines()
-            .find(|line| line.starts_with("attach-session -t "))
+            .find(|line| line.contains("attach-session -t "))
             .unwrap();
         assert!(!attach.contains(":1"));
 
@@ -1971,6 +2027,11 @@ exit 1
 
         let commands = fs::read_to_string(&log).unwrap();
         assert!(commands.contains("attach-session -t"));
+        assert!(
+            commands.find("window-size latest").unwrap()
+                < commands.find("attach-session -t").unwrap(),
+            "attach should restore client-driven sizing after portal capture"
+        );
         assert!(!commands.contains("new-session -d -s"));
 
         let _ = fs::remove_dir_all(temp);
@@ -2030,7 +2091,7 @@ exit 0
         assert!(commands.contains("-n terminal"));
         let attach = commands
             .lines()
-            .find(|line| line.starts_with("attach-session -t "))
+            .find(|line| line.contains("attach-session -t "))
             .unwrap();
         assert!(attach.contains(":2"));
 

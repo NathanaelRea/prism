@@ -2,21 +2,11 @@ use super::*;
 
 pub(crate) fn render(frame: &mut Frame<'_>, model: &crate::view::FrameModel<'_>) {
     let area = frame.area();
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(area);
-    let body = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(sidebar_width(area.width, model.config.layout.sidebar_width)),
-            Constraint::Min(MIN_MAIN_WIDTH),
-        ])
-        .split(vertical[0]);
+    let (sidebar, main, footer) = shell_areas(area, model.config.layout.sidebar_width);
 
-    render_sidebar(frame, body[0], model);
-    render_main(frame, body[1], model);
-    render_footer(frame, vertical[1], model);
+    render_sidebar(frame, sidebar, model);
+    render_main(frame, main, model);
+    render_footer(frame, footer, model);
     if let Some(hint) = &model.leader_hint {
         render_leader_hint(frame, area, hint);
     }
