@@ -1,9 +1,9 @@
 use std::env;
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::path::Path;
-use std::process::ExitStatus;
 use std::process::{Command, Stdio};
-use std::time::Instant;
+use std::process::{ExitStatus, Output};
+use std::time::{Duration, Instant};
 
 use crate::observability::{self, LogLevel};
 
@@ -40,16 +40,24 @@ pub fn run_status(command: &mut Command) -> Result<(), String> {
 }
 
 pub fn run_output(command: &mut Command) -> Result<ProcessOutput, String> {
-    run_output_with_failure_level(command, LogLevel::Error)
+    run_output_with_failure_level(command, LogLevel::Error, None)
 }
 
 pub fn run_output_allow_failure(command: &mut Command) -> Result<ProcessOutput, String> {
-    run_output_with_failure_level(command, LogLevel::Debug)
+    run_output_with_failure_level(command, LogLevel::Debug, None)
+}
+
+pub fn run_output_allow_failure_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<ProcessOutput, String> {
+    run_output_with_failure_level(command, LogLevel::Debug, Some(timeout))
 }
 
 fn run_output_with_failure_level(
     command: &mut Command,
     failure_level: LogLevel,
+    timeout: Option<Duration>,
 ) -> Result<ProcessOutput, String> {
     let include_argv = observability::enabled(LogLevel::Trace);
     let command_display = observability::command_display(command);
@@ -67,27 +75,28 @@ fn run_output_with_failure_level(
         )),
     );
     let started = Instant::now();
-    let output = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|error| {
-            let elapsed_ms = started.elapsed().as_millis() as i64;
-            operation.finish(
-                LogLevel::Error,
-                "process",
-                "error",
-                format!("subprocess failed to start: {error}"),
-                Some(observability::command_data_json(
-                    command,
-                    include_argv,
-                    Some(elapsed_ms),
-                    None,
-                    Some(&error.to_string()),
-                )),
-            );
-            format!("{command_display}: {error}")
-        })?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let output = match timeout {
+        Some(timeout) => output_with_timeout(command, timeout),
+        None => command.output(),
+    }
+    .map_err(|error| {
+        let elapsed_ms = started.elapsed().as_millis() as i64;
+        operation.finish(
+            LogLevel::Error,
+            "process",
+            "error",
+            format!("subprocess failed to start: {error}"),
+            Some(observability::command_data_json(
+                command,
+                include_argv,
+                Some(elapsed_ms),
+                None,
+                Some(&error.to_string()),
+            )),
+        );
+        format!("{command_display}: {error}")
+    })?;
     let elapsed_ms = started.elapsed().as_millis() as i64;
     let status = output.status;
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -123,6 +132,54 @@ fn run_output_with_failure_level(
         )),
     );
     Ok(process_output)
+}
+
+fn output_with_timeout(command: &mut Command, timeout: Duration) -> io::Result<Output> {
+    let mut child = command.spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("stdout unavailable"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("stderr unavailable"))?;
+    let stdout_reader = std::thread::spawn(move || read_all(stdout));
+    let stderr_reader = std::thread::spawn(move || read_all(stderr));
+    let started = Instant::now();
+
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("subprocess timed out after {} ms", timeout.as_millis()),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    Ok(Output {
+        status,
+        stdout: join_reader(stdout_reader)?,
+        stderr: join_reader(stderr_reader)?,
+    })
+}
+
+fn read_all(mut reader: impl Read) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn join_reader(reader: std::thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other("subprocess output reader panicked"))?
 }
 
 pub fn run_status_with_stdin(command: &mut Command, stdin: &str) -> Result<(), String> {
@@ -513,5 +570,17 @@ mod tests {
             first_non_empty_line("\n  first line  \nsecond line"),
             "first line"
         );
+    }
+
+    #[test]
+    fn output_timeout_terminates_long_running_process() {
+        let error = run_output_allow_failure_with_timeout(
+            Command::new("sh").args(["-c", "exec sleep 1"]),
+            Duration::from_millis(20),
+        )
+        .err()
+        .expect("long-running process should time out");
+
+        assert!(error.contains("subprocess timed out"), "{error}");
     }
 }

@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::opencode::{OpencodeRuntime, load_runtime};
 use crate::process::{
-    run_capture, run_output, run_output_allow_failure, run_status_inherited, run_status_with_stdin,
-    split_command_words,
+    run_capture, run_output, run_output_allow_failure, run_output_allow_failure_with_timeout,
+    run_status_inherited, run_status_with_stdin, split_command_words,
 };
 use crate::repo::Repository;
 use crate::session::Session;
@@ -16,6 +16,7 @@ const EXISTING_SESSION_READY_WAIT: Duration = Duration::from_millis(250);
 const CREATED_SESSION_READY_WAIT: Duration = Duration::from_secs(2);
 const SESSION_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const AGENT_INPUT_READY_WAIT: Duration = Duration::from_secs(5);
+const PANE_CAPTURE_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TmuxAgentSession {
@@ -660,7 +661,11 @@ fn capture_pane(config: &Config, target: &str, include_styles: bool) -> Result<S
         command.args(["-e", "-N"]);
     }
     command.args(["-t", target]);
-    let output = run_output_allow_failure(&mut command)?;
+    let output = if include_styles {
+        run_output_allow_failure_with_timeout(&mut command, PANE_CAPTURE_TIMEOUT)?
+    } else {
+        run_output_allow_failure(&mut command)?
+    };
     if output.status.success() {
         Ok(output.stdout)
     } else if output.stderr.trim().is_empty() {

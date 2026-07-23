@@ -61,14 +61,13 @@ fn renders_wide_shell_with_sidebar_main_and_footer() {
 fn renders_tmux_portal_with_latest_pane_rows() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Running)];
+    let lines = (0..20)
+        .map(|index| Line::from(format!("pane row {index}")))
+        .collect::<Vec<_>>();
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.tmux_portal = Some(crate::view::TmuxPortalModel {
-        branch: "feature".to_string(),
-        state: crate::view::TmuxPortalState::Ready(
-            (0..20)
-                .map(|index| Line::from(format!("pane row {index}")))
-                .collect(),
-        ),
+        branch: "feature",
+        state: crate::view::TmuxPortalState::Ready(&lines),
     });
 
     let buffer = render_to_buffer(&model, 120, 30);
@@ -84,7 +83,7 @@ fn renders_unavailable_tmux_portal() {
     let sessions = vec![test_session("feature", AgentState::Running)];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.tmux_portal = Some(crate::view::TmuxPortalModel {
-        branch: "feature".to_string(),
+        branch: "feature",
         state: crate::view::TmuxPortalState::Unavailable,
     });
 
@@ -97,16 +96,17 @@ fn renders_unavailable_tmux_portal() {
 fn renders_tmux_portal_line_styles() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Running)];
+    let lines = vec![Line::from(Span::styled(
+        "colored portal output",
+        Style::default()
+            .fg(Color::Red)
+            .bg(Color::Blue)
+            .add_modifier(Modifier::BOLD),
+    ))];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.tmux_portal = Some(crate::view::TmuxPortalModel {
-        branch: "feature".to_string(),
-        state: crate::view::TmuxPortalState::Ready(vec![Line::from(Span::styled(
-            "colored portal output",
-            Style::default()
-                .fg(Color::Red)
-                .bg(Color::Blue)
-                .add_modifier(Modifier::BOLD),
-        ))]),
+        branch: "feature",
+        state: crate::view::TmuxPortalState::Ready(&lines),
     });
 
     let buffer = render_to_buffer(&model, 120, 30);
@@ -1366,6 +1366,27 @@ fn main_panel_applies_scroll_for_every_focus() {
             "main panel did not scroll for {focus:?}"
         );
     }
+}
+
+#[test]
+fn main_panel_scrolls_wrapped_content_above_tmux_portal() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Running)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
+    model.selected_repo_root = "a-very-long-repository-path-".repeat(8);
+    model.tmux_portal = Some(crate::view::TmuxPortalModel {
+        branch: "feature",
+        state: crate::view::TmuxPortalState::Loading,
+    });
+
+    let unscrolled = render_to_string(&model, 120, 60);
+    model.main_scroll = 2;
+    let scrolled = render_to_string(&model, 120, 60);
+
+    assert_ne!(
+        unscrolled, scrolled,
+        "wrapped main-panel content should scroll above the tmux portal"
+    );
 }
 
 fn render_to_string(model: &FrameModel<'_>, cols: u16, rows: u16) -> String {

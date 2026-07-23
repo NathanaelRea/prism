@@ -8,6 +8,7 @@ use crate::tui::{TmuxPortalResult, TmuxPortalSnapshot, TmuxPortalTarget};
 
 const TMUX_PORTAL_POLL_INTERVAL: Duration = Duration::from_millis(300);
 const TMUX_PORTAL_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+const TMUX_PORTAL_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Tui {
     pub(crate) fn poll_tmux_portal(&mut self) -> bool {
@@ -19,8 +20,12 @@ impl Tui {
         let mut changed = false;
 
         while let Ok(result) = self.tmux_portal_rx.try_recv() {
-            self.tmux_portal_polls_in_flight.remove(&result.key);
-            if target_key == Some(&result.key) {
+            let is_current =
+                self.tmux_portal_polls_in_flight.get(&result.key) == Some(&result.started_at);
+            if is_current {
+                self.tmux_portal_polls_in_flight.remove(&result.key);
+            }
+            if is_current && target_key == Some(&result.key) {
                 let capture = result.capture.map(normalize_capture);
                 let snapshot = TmuxPortalSnapshot {
                     key: result.key,
@@ -35,6 +40,7 @@ impl Tui {
 
         let Some(target) = target else {
             self.tmux_portal_last_polled.clear();
+            self.tmux_portal_polls_in_flight.clear();
             if self.tmux_portal.take().is_some() {
                 changed = true;
             }
@@ -44,6 +50,7 @@ impl Tui {
             Ok(target) => target,
             Err(key) => {
                 self.tmux_portal_last_polled.clear();
+                self.tmux_portal_polls_in_flight.clear();
                 let snapshot = TmuxPortalSnapshot {
                     key,
                     capture: Some(Err("harness unavailable".to_string())),
@@ -57,6 +64,9 @@ impl Tui {
         };
         self.tmux_portal_last_polled
             .retain(|key, _| key == &target.key);
+        self.tmux_portal_polls_in_flight.retain(|key, started_at| {
+            key == &target.key && started_at.elapsed() < TMUX_PORTAL_CAPTURE_TIMEOUT
+        });
         if self.tmux_portal.as_ref().map(|portal| &portal.key) != Some(&target.key) {
             self.tmux_portal = Some(TmuxPortalSnapshot {
                 key: target.key.clone(),
@@ -79,10 +89,12 @@ impl Tui {
             .tmux_portal_last_polled
             .get(&target.key)
             .is_none_or(|last| last.elapsed() >= interval);
-        if due && !self.tmux_portal_polls_in_flight.contains(&target.key) {
+        if due && !self.tmux_portal_polls_in_flight.contains_key(&target.key) {
+            let started_at = Instant::now();
             self.tmux_portal_last_polled
-                .insert(target.key.clone(), Instant::now());
-            self.tmux_portal_polls_in_flight.insert(target.key.clone());
+                .insert(target.key.clone(), started_at);
+            self.tmux_portal_polls_in_flight
+                .insert(target.key.clone(), started_at);
             let tx = self.tmux_portal_tx.clone();
             std::thread::spawn(move || {
                 let capture = crate::tmux::capture_agent_pane(
@@ -93,6 +105,7 @@ impl Tui {
                 );
                 let _ = tx.send(TmuxPortalResult {
                     key: target.key,
+                    started_at,
                     capture,
                 });
             });

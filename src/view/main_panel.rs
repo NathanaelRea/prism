@@ -13,14 +13,13 @@ pub(super) fn render_main(frame: &mut Frame<'_>, area: Rect, model: &crate::view
             .split(area)
     };
     let main_area = areas[0];
-    let content_area = panel_block(
+    let block = panel_block(
         Line::from(Span::styled("0 Main", title_style(model.main_focused))),
         model.main_focused,
-    )
-    .inner(main_area)
-    .height
-    .saturating_sub(0) as usize;
-    let width = main_area.width.saturating_sub(2) as usize;
+    );
+    let inner_area = block.inner(main_area);
+    let content_area = inner_area.height as usize;
+    let width = inner_area.width as usize;
     let mut lines = match model.focus {
         PanelFocus::Status => status_dashboard_lines(model),
         PanelFocus::Repos => repo_overview_lines(model, width, content_area),
@@ -32,27 +31,40 @@ pub(super) fn render_main(frame: &mut Frame<'_>, area: Rect, model: &crate::view
         lines.push(Line::from(""));
         lines.extend(plan_dashboard_lines(dashboard, width, content_area));
     }
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let rendered_lines = paragraph.line_count(inner_area.width);
     let scroll = model
         .main_scroll
-        .min(lines.len().saturating_sub(content_area))
-        .min(u16::MAX as usize) as u16;
+        .min(rendered_lines.saturating_sub(content_area));
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(panel_block(
-                Line::from(Span::styled("0 Main", title_style(model.main_focused))),
-                model.main_focused,
-            ))
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
+        paragraph
+            .block(block)
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         main_area,
     );
+    if rendered_lines > content_area {
+        let mut scrollbar_state = ScrollbarState::new(rendered_lines)
+            .position(scroll)
+            .viewport_content_length(content_area);
+        frame.render_stateful_widget(
+            Scrollbar::default()
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_style(title_style(model.main_focused)),
+            main_area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut scrollbar_state,
+        );
+    }
 
     if let Some(portal) = &model.tmux_portal {
         render_tmux_portal(frame, areas[1], portal);
     }
 }
 
-fn render_tmux_portal(frame: &mut Frame<'_>, area: Rect, portal: &TmuxPortalModel) {
+fn render_tmux_portal(frame: &mut Frame<'_>, area: Rect, portal: &TmuxPortalModel<'_>) {
     let block = panel_block(
         Line::from(Span::styled(
             format!(" tmux · {} ", portal.branch),

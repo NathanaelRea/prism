@@ -63,7 +63,7 @@ pub struct Tui {
     pub(crate) tmux_generations: BTreeMap<AgentSessionSlot, u64>,
     pub(crate) tmux_portal_tx: Sender<TmuxPortalResult>,
     pub(crate) tmux_portal_rx: Receiver<TmuxPortalResult>,
-    pub(crate) tmux_portal_polls_in_flight: BTreeSet<AgentSessionWarmupKey>,
+    pub(crate) tmux_portal_polls_in_flight: BTreeMap<AgentSessionWarmupKey, Instant>,
     pub(crate) tmux_portal_last_polled: BTreeMap<AgentSessionWarmupKey, Instant>,
     pub(crate) tmux_portal: Option<TmuxPortalSnapshot>,
     pub(crate) wt_poll_tx: Sender<WtPollResult>,
@@ -133,6 +133,7 @@ pub(crate) struct SelectedWorktreeContext {
 
 pub(crate) struct TmuxPortalResult {
     pub key: AgentSessionWarmupKey,
+    pub started_at: Instant,
     pub capture: Result<String, String>,
 }
 
@@ -538,7 +539,7 @@ impl Tui {
             tmux_generations: BTreeMap::new(),
             tmux_portal_tx,
             tmux_portal_rx,
-            tmux_portal_polls_in_flight: BTreeSet::new(),
+            tmux_portal_polls_in_flight: BTreeMap::new(),
             tmux_portal_last_polled: BTreeMap::new(),
             tmux_portal: None,
             wt_poll_tx,
@@ -3040,7 +3041,7 @@ impl Tui {
         }
     }
 
-    fn tmux_portal_model(&self) -> Option<view::TmuxPortalModel> {
+    fn tmux_portal_model(&self) -> Option<view::TmuxPortalModel<'_>> {
         if self.focused_panel != PanelFocus::Worktrees {
             return None;
         }
@@ -3054,11 +3055,11 @@ impl Tui {
             .filter(|portal| portal.key.slot == slot && portal.key.generation == *generation);
         let state = match portal.and_then(|portal| portal.capture.as_ref()) {
             None => view::TmuxPortalState::Loading,
-            Some(Ok(lines)) => view::TmuxPortalState::Ready(lines.clone()),
+            Some(Ok(lines)) => view::TmuxPortalState::Ready(lines),
             Some(Err(_)) => view::TmuxPortalState::Unavailable,
         };
         Some(view::TmuxPortalModel {
-            branch: session.branch.clone(),
+            branch: &session.branch,
             state,
         })
     }
@@ -3394,7 +3395,7 @@ fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
 mod tests {
     use std::collections::BTreeMap;
     use std::path::PathBuf;
-    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     use crate::agent::AgentState;
     use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey};
@@ -3503,6 +3504,7 @@ mod tests {
         tui.tmux_portal_tx
             .send(TmuxPortalResult {
                 key: stale_key,
+                started_at: Instant::now(),
                 capture: Ok("stale output".to_string()),
             })
             .unwrap();
@@ -3517,6 +3519,67 @@ mod tests {
                 .as_ref()
                 .and_then(|portal| portal.capture.as_ref()),
             None,
+        );
+    }
+
+    #[test]
+    fn tmux_portal_clears_in_flight_capture_when_inactive() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let mut tui = Tui::new_single(
+            repo,
+            test_config(),
+            vec![test_session(0, "/tmp/repo", "feature")],
+        );
+        let slot =
+            AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
+        let key = AgentSessionWarmupKey::new(slot, 0);
+        tui.tmux_portal_polls_in_flight.insert(key, Instant::now());
+
+        assert!(!tui.poll_tmux_portal());
+        assert!(tui.tmux_portal_polls_in_flight.is_empty());
+    }
+
+    #[test]
+    fn tmux_portal_ignores_superseded_capture_for_same_key() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let mut tui = Tui::new_single(
+            repo,
+            test_config(),
+            vec![test_session(0, "/tmp/repo", "feature")],
+        );
+        tui.focused_panel = PanelFocus::Worktrees;
+        let slot =
+            AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
+        let key = AgentSessionWarmupKey::new(slot.clone(), 0);
+        tui.tmux_generations.insert(slot, 0);
+        let previous_started_at = Instant::now();
+        let current_started_at = previous_started_at + Duration::from_millis(1);
+        tui.tmux_portal_polls_in_flight
+            .insert(key.clone(), current_started_at);
+        tui.tmux_portal_last_polled
+            .insert(key.clone(), current_started_at);
+        tui.tmux_portal_tx
+            .send(TmuxPortalResult {
+                key: key.clone(),
+                started_at: previous_started_at,
+                capture: Ok("superseded output".to_string()),
+            })
+            .unwrap();
+
+        assert!(tui.poll_tmux_portal());
+        assert_eq!(
+            tui.tmux_portal_polls_in_flight.get(&key),
+            Some(&current_started_at)
+        );
+        assert_eq!(
+            tui.tmux_portal
+                .as_ref()
+                .and_then(|portal| portal.capture.as_ref()),
+            None
         );
     }
 
