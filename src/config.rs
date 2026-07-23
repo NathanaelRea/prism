@@ -709,6 +709,14 @@ impl Config {
         update_user_harness_config(&self.user_path, harness_id, None)
     }
 
+    pub(crate) fn needs_initial_harness_setup(&self) -> bool {
+        match fs::read_to_string(&self.user_path) {
+            Ok(text) => toml::from_str::<RawConfig>(&text)
+                .is_ok_and(|config| config.default_harness.is_none()),
+            Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+
     pub fn save_user_generic_harness(
         &self,
         harness_id: &str,

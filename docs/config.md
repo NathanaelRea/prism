@@ -72,6 +72,8 @@ default_harness = "opencode"
 program = "opencode"
 ```
 
+When `default_harness` has not been configured, the first interactive TUI startup lists the installed built-in harnesses and saves the selection. Prism writes only `default_harness`; other settings continue to use built-in defaults. Non-interactive startup cannot prompt and retains the OpenCode fallback.
+
 Prism owns each built-in adapter's structured-output, prompt, session, and protocol flags. `program` may select an executable path or wrapper. `arguments` may contain adapter-approved options such as model, sandbox, permission, or tool settings, but Prism rejects protocol-critical overrides.
 
 Press `H` in the TUI to switch the global default. The chooser lists the four built-ins and configured generic harnesses; the current harness is shown in dark gray and cannot be selected. It can also add a generic harness by collecting its interactive command, optional initial-prompt transport, and optional headless command. Prompt transports that do not match the command's placeholders are disabled. The built-in IDs `opencode`, `codex`, `claude`, and `pi` are reserved: each always selects its matching adapter, and built-in adapters cannot be aliased under custom IDs.

@@ -249,6 +249,13 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
             let repo = entry.repo;
             let mut config = Config::load(&repo);
             observability::phase("ensure_tools", || config::ensure_required_tools(&config))?;
+            if observability::phase("initial_harness_setup", || {
+                setup::maybe_prompt_harness(&config)
+            })?
+            .is_some()
+            {
+                config = Config::load(&repo);
+            }
             observability::phase("ensure_default_agent", || {
                 config::ensure_default_agent(&mut config)
             })?;

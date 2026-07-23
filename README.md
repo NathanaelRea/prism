@@ -48,7 +48,7 @@ Optional integrations:
 - `fzf` for interactive plan selection
 - `lazygit` for the tmux Git window
 
-OpenCode is the default when no harness is configured. To use another built-in or a generic command, set `default_harness` in `~/.config/prism/config.toml`; see [Configuration](docs/config.md#harnesses).
+On first interactive startup, Prism lists the installed built-in harnesses and saves your selection to `~/.config/prism/config.toml`. OpenCode remains the fallback for non-interactive startup when no harness is configured. To use a generic command, configure it from the `H` chooser; see [Configuration](docs/config.md#harnesses).
 
 ## Install
 

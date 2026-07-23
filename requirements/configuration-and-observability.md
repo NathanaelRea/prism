@@ -24,6 +24,9 @@
 - **Behavior**: The TUI provides a global harness chooser for the fixed built-in
   IDs and configured generic harnesses, and can collect interactive and optional
   headless commands when creating a generic harness.
+- **Behavior**: When no global harness has been selected, first interactive
+  startup offers the installed built-in harnesses and persists the selection
+  before validating the selected harness.
 - **Invariant**: `opencode`, `codex`, `claude`, and `pi` are reserved harness IDs
   bound to their matching built-in adapters. Custom IDs use the generic adapter.
 - **Behavior**: Startup validates tools required for the selected mode and names
