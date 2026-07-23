@@ -638,13 +638,7 @@ pub(super) fn harness_choice_entries(config: &Config) -> Vec<(String, String)> {
     );
     ids.into_iter()
         .map(|id| {
-            let name = match id.as_str() {
-                "opencode" => "OpenCode".to_string(),
-                "codex" => "Codex".to_string(),
-                "claude" => "Claude Code".to_string(),
-                "pi" => "Pi".to_string(),
-                _ => id.clone(),
-            };
+            let name = crate::harness::harness_label(&id).to_string();
             (id, name)
         })
         .collect()

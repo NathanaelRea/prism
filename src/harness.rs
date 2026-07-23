@@ -6,6 +6,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 pub const BUILTIN_HARNESS_IDS: [&str; 4] = ["opencode", "codex", "claude", "pi"];
 
+pub fn harness_label(id: &str) -> &str {
+    match id {
+        "opencode" => "OpenCode",
+        "codex" => "Codex",
+        "claude" => "Claude Code",
+        "pi" => "Pi",
+        _ => id,
+    }
+}
+
 pub fn builtin_adapter(id: &str) -> Option<&'static str> {
     BUILTIN_HARNESS_IDS
         .into_iter()

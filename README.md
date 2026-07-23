@@ -28,14 +28,27 @@ Build/install requirements:
 
 - Rust/Cargo
 
-Normal runtime requirements:
+Core runtime requirements:
 
 - `git`
 - GitHub CLI (`gh`)
 - `tmux`
 - WorkTrunk (`wt`)
-- `opencode`
-- `fzf`
+
+Agent harnesses are optional individually. Install and select whichever harness you want Prism to manage:
+
+- OpenCode (`opencode`)
+- Codex CLI (`codex`)
+- Claude Code (`claude`)
+- Pi (`pi`)
+- Any other interactive command configured as a generic harness
+
+Optional integrations:
+
+- `fzf` for interactive plan selection
+- `lazygit` for the tmux Git window
+
+On first interactive startup, Prism lists the installed built-in harnesses and saves your selection to `~/.config/prism/config.toml`. OpenCode remains the fallback for non-interactive startup when no harness is configured. To use a generic command, configure it from the `H` chooser; see [Configuration](docs/config.md#harnesses).
 
 ## Install
 
@@ -49,7 +62,7 @@ Normal runtime requirements:
 prism
 ```
 
-To prepare a worktree's OpenCode-backed tmux session without entering the TUI:
+To prepare a worktree's selected harness session without entering the TUI:
 
 ```sh
 prism agent ensure --branch feature/my-change

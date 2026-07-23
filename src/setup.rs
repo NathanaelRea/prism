@@ -1,8 +1,10 @@
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 
 use crate::config::{Config, IconStyle};
 use crate::git::{RepositoryCheckout, inspect_repository_checkout, worktree_dirty};
+use crate::harness::{BUILTIN_HARNESS_IDS, harness_label};
 use crate::lifecycle::move_current_branch_to_worktree;
+use crate::process::command_exists;
 use crate::repo::Repository;
 use crate::terminal::stdin_is_tty;
 use crate::util::yes;
@@ -69,6 +71,92 @@ pub(crate) fn maybe_prompt_icon_style(config: &Config) -> Result<Option<IconStyl
     };
     config.save_user_icon_style(style)?;
     Ok(Some(style))
+}
+
+pub(crate) fn maybe_prompt_harness(config: &Config) -> Result<Option<String>, String> {
+    if !config.config_errors.is_empty() || !config.needs_initial_harness_setup() || !stdin_is_tty()
+    {
+        return Ok(None);
+    }
+
+    let available = available_builtin_harnesses(config);
+    if available.is_empty() {
+        return Err(format!(
+            "no built-in harness found; install one of: {} or set default_harness in {}",
+            BUILTIN_HARNESS_IDS.join(", "),
+            config.user_path.display()
+        ));
+    }
+
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut input = stdin.lock();
+    let mut output = stdout.lock();
+    prompt_harness_setup(config, &available, &mut input, &mut output).map(Some)
+}
+
+fn available_builtin_harnesses(config: &Config) -> Vec<String> {
+    BUILTIN_HARNESS_IDS
+        .into_iter()
+        .filter(|id| {
+            config.harness_config(id).is_ok_and(|harness| {
+                harness
+                    .interactive_command
+                    .first()
+                    .is_some_and(|program| command_exists(program))
+            })
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+fn prompt_harness_setup(
+    config: &Config,
+    available: &[String],
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+) -> Result<String, String> {
+    if available.is_empty() {
+        return Err("no installed built-in harnesses available".to_string());
+    }
+    writeln!(output).map_err(|error| error.to_string())?;
+    writeln!(output, "Prism setup").map_err(|error| error.to_string())?;
+    writeln!(output).map_err(|error| error.to_string())?;
+    writeln!(output, "Choose your agent harness:").map_err(|error| error.to_string())?;
+    writeln!(output).map_err(|error| error.to_string())?;
+    for (index, id) in available.iter().enumerate() {
+        writeln!(output, "  {}  {}", index + 1, harness_label(id))
+            .map_err(|error| error.to_string())?;
+    }
+    writeln!(output).map_err(|error| error.to_string())?;
+    let selected = loop {
+        write!(output, "Choice [1]: ").map_err(|error| error.to_string())?;
+        output.flush().map_err(|error| error.to_string())?;
+
+        let mut choice = String::new();
+        if input
+            .read_line(&mut choice)
+            .map_err(|error| error.to_string())?
+            == 0
+        {
+            return Err("input closed before harness selection".to_string());
+        }
+        let choice = choice.trim();
+        if choice.is_empty() {
+            break &available[0];
+        }
+        if let Some(selected) = choice
+            .parse::<usize>()
+            .ok()
+            .and_then(|number| number.checked_sub(1))
+            .and_then(|index| available.get(index))
+        {
+            break selected;
+        }
+        writeln!(output, "Unknown choice.").map_err(|error| error.to_string())?;
+    };
+    config.save_user_default_harness(selected)?;
+    Ok(selected.clone())
 }
 
 pub(crate) fn inspect_startup_setup(
@@ -223,6 +311,75 @@ fn read_line() -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::io::Cursor;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::harness::HarnessConfig;
+    use crate::test_support::{install_tool, test_config};
+
+    #[test]
+    fn first_start_harness_selection_persists_choice() {
+        let directory = std::env::temp_dir().join(format!(
+            "prism-harness-setup-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut config = test_config();
+        config.user_path = directory.join("config.toml");
+        config.harnesses.insert(
+            "codex".to_string(),
+            HarnessConfig::builtin("codex", "codex"),
+        );
+        let mut input = Cursor::new(b"not-a-choice\n2\n");
+        let mut output = Vec::new();
+
+        let selected = prompt_harness_setup(
+            &config,
+            &["opencode".to_string(), "codex".to_string()],
+            &mut input,
+            &mut output,
+        )
+        .unwrap();
+
+        assert_eq!(selected, "codex");
+        assert_eq!(
+            fs::read_to_string(&config.user_path).unwrap(),
+            "default_harness = \"codex\"\n"
+        );
+        assert!(!config.needs_initial_harness_setup());
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("2  Codex"));
+        assert!(output.contains("Unknown choice."));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn first_start_harness_choices_include_only_installed_builtins() {
+        let directory = std::env::temp_dir().join(format!(
+            "prism-harness-detection-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut config = test_config();
+        install_tool(&mut config, &directory, "opencode", "#!/bin/sh\nexit 0\n");
+        config.harnesses.insert(
+            "codex".to_string(),
+            HarnessConfig::builtin(
+                "codex",
+                directory.join("missing-codex").display().to_string(),
+            ),
+        );
+
+        assert_eq!(available_builtin_harnesses(&config), ["opencode"]);
+        let _ = fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn startup_prompts_for_single_branch_worktree() {
