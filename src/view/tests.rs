@@ -571,18 +571,9 @@ fn renders_footer_status_message_and_leader_overlay() {
         Some(ChoiceList {
             title: "Shortcuts".to_string(),
             choices: vec![
-                KeyChoice {
-                    key: "a".to_string(),
-                    label: "one".to_string(),
-                },
-                KeyChoice {
-                    key: "b".to_string(),
-                    label: "two".to_string(),
-                },
-                KeyChoice {
-                    key: "c".to_string(),
-                    label: "three".to_string(),
-                },
+                KeyChoice::new("a", "one"),
+                KeyChoice::new("b", "two"),
+                KeyChoice::new("c", "three"),
             ],
         }),
     );
@@ -617,14 +608,8 @@ fn renders_dialog_overlays() {
         choices: ChoiceList {
             title: "Plan Actions".to_string(),
             choices: vec![
-                KeyChoice {
-                    key: "u".to_string(),
-                    label: "pause/resume".to_string(),
-                },
-                KeyChoice {
-                    key: "f".to_string(),
-                    label: "retry failed".to_string(),
-                },
+                KeyChoice::new("u", "pause/resume"),
+                KeyChoice::disabled("f", "retry failed"),
             ],
         },
     });
@@ -645,6 +630,8 @@ fn renders_dialog_overlays() {
             .bg(highlight_color())
             .add_modifier(Modifier::BOLD)
     );
+    assert_eq!(lines[1].spans[0].style.fg, Some(Color::DarkGray));
+    assert_eq!(lines[1].spans[1].style.fg, Some(Color::DarkGray));
 
     model.dialog = Some(DialogModel::Confirm {
         title: "Delete Session".to_string(),
@@ -1535,6 +1522,8 @@ fn test_plan_dashboard(expanded: bool) -> PlanDashboard {
     PlanDashboard {
         run: PersistedPlanRun {
             run: PlanRun {
+                harness_id: "opencode".to_string(),
+                adapter_id: "opencode".to_string(),
                 id: "plan-run".to_string(),
                 repo_root: "/repo".to_string(),
                 scope_path: PathBuf::from("/repo"),
@@ -1557,11 +1546,17 @@ fn test_plan_dashboard(expanded: bool) -> PlanDashboard {
                     step: 1,
                     prompt: "do phase one".to_string(),
                     status: PlanStepStatus::Running,
-                    opencode_state: Some(OpencodeState::Busy),
-                    opencode_server_url: None,
-                    opencode_session_id: Some("abcdefgh1234".to_string()),
+                    execution: crate::harness::ExecutionRef {
+                        state: Some("busy".to_string()),
+                        process_id: None,
+                        process_start_time_ticks: None,
+                    },
+                    session: crate::harness::SessionRef {
+                        adapter_id: Some("opencode".to_string()),
+                        endpoint: None,
+                        id: Some("abcdefgh1234".to_string()),
+                    },
                     agent_variant: Some("medium".to_string()),
-                    process_id: None,
                     started_unix_ms: Some(1_000),
                     finished_unix_ms: None,
                     exit_code: None,
@@ -1576,11 +1571,9 @@ fn test_plan_dashboard(expanded: bool) -> PlanDashboard {
                     step: 2,
                     prompt: "do phase two".to_string(),
                     status: PlanStepStatus::Queued,
-                    opencode_state: None,
-                    opencode_server_url: None,
-                    opencode_session_id: None,
+                    execution: crate::harness::ExecutionRef::default(),
+                    session: crate::harness::SessionRef::default(),
                     agent_variant: None,
-                    process_id: None,
                     started_unix_ms: None,
                     finished_unix_ms: None,
                     exit_code: None,
@@ -1641,6 +1634,8 @@ fn test_auto_dashboard() -> AutoDashboard {
     AutoDashboard {
         run: PersistedAutoRun {
             run: AutoRun {
+                harness_id: "opencode".to_string(),
+                adapter_id: "opencode".to_string(),
                 id: "auto-run".to_string(),
                 repo_root: "/repo".to_string(),
                 worktree_path: PathBuf::from("/repo/feature"),
@@ -1679,9 +1674,12 @@ fn test_auto_dashboard() -> AutoDashboard {
                 attempt: 1,
                 started_unix_ms: Some(1_000),
                 finished_unix_ms: None,
-                opencode_server_url: None,
-                opencode_session_id: Some("abcdefgh1234".to_string()),
-                process_id: None,
+                execution: crate::harness::ExecutionRef::default(),
+                session: crate::harness::SessionRef {
+                    adapter_id: Some("opencode".to_string()),
+                    endpoint: None,
+                    id: Some("abcdefgh1234".to_string()),
+                },
                 plan_run_id: None,
                 commit_sha: None,
                 head_sha: None,

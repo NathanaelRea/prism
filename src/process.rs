@@ -379,43 +379,80 @@ pub fn command_version(command: &str) -> Option<String> {
 }
 
 pub fn split_command_words(command: &str) -> Vec<String> {
+    parse_command_words(command).unwrap_or_else(|_| {
+        command
+            .split_whitespace()
+            .map(ToString::to_string)
+            .collect()
+    })
+}
+
+pub fn parse_command_words(command: &str) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut current = String::new();
     let mut quote = None;
-    let mut escaped = false;
+    let mut word_started = false;
+    let mut chars = command.chars().peekable();
 
-    for ch in command.chars() {
-        if escaped {
-            current.push(ch);
-            escaped = false;
-            continue;
-        }
-        if ch == '\\' {
-            escaped = true;
-            continue;
-        }
+    while let Some(ch) = chars.next() {
         if let Some(active_quote) = quote {
             if ch == active_quote {
                 quote = None;
+            } else if ch == '\\' && active_quote == '"' {
+                match chars.peek().copied() {
+                    Some(next @ ('\\' | '"' | '$' | '`')) => {
+                        chars.next();
+                        current.push(next);
+                    }
+                    Some('\n') => {
+                        chars.next();
+                    }
+                    Some(_) => current.push('\\'),
+                    None => {
+                        return Err("command ends with an incomplete escape".to_string());
+                    }
+                }
             } else {
                 current.push(ch);
             }
             continue;
         }
         match ch {
-            '\'' | '"' => quote = Some(ch),
+            '\\' => {
+                word_started = true;
+                current.push(
+                    chars
+                        .next()
+                        .ok_or_else(|| "command ends with an incomplete escape".to_string())?,
+                );
+            }
+            '\'' | '"' => {
+                word_started = true;
+                quote = Some(ch);
+            }
             ch if ch.is_whitespace() => {
-                if !current.is_empty() {
+                if word_started {
                     words.push(std::mem::take(&mut current));
+                    word_started = false;
                 }
             }
-            ch => current.push(ch),
+            ch => {
+                word_started = true;
+                current.push(ch);
+            }
         }
     }
-    if !current.is_empty() {
+    if quote.is_some() {
+        return Err("command contains an unterminated quote".to_string());
+    }
+    if word_started {
         words.push(current);
     }
-    words
+    if words.is_empty() {
+        Err("command cannot be empty".to_string())
+    } else {
+        Ok(words)
+    }
 }
 
 pub fn run_configured_commands(commands: &[String], cwd: &Path, label: &str) -> Result<(), String> {
@@ -440,6 +477,33 @@ mod tests {
         assert_eq!(
             words,
             vec!["my-agent", "--mode", "two words", "three words"]
+        );
+    }
+
+    #[test]
+    fn split_command_words_falls_back_for_incomplete_input() {
+        assert_eq!(
+            split_command_words("my-agent --mode 'incomplete"),
+            ["my-agent", "--mode", "'incomplete"]
+        );
+    }
+
+    #[test]
+    fn parse_command_words_rejects_incomplete_input() {
+        assert!(parse_command_words("agent '").is_err());
+        assert!(parse_command_words("agent \\").is_err());
+        assert!(parse_command_words("   ").is_err());
+    }
+
+    #[test]
+    fn parse_command_words_preserves_empty_and_single_quoted_arguments() {
+        assert_eq!(
+            parse_command_words(r#"agent --empty "" '\d+'"#).unwrap(),
+            ["agent", "--empty", "", "\\d+"]
+        );
+        assert_eq!(
+            parse_command_words(r#"agent "\d+""#).unwrap(),
+            ["agent", "\\d+"]
         );
     }
 

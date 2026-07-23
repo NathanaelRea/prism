@@ -202,6 +202,16 @@ pub(crate) enum LeaderHint {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GitAction {
+    LazyGit,
+    OpenPr,
+    Push,
+    Merge,
+    CiFix,
+    ReviewFix,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PanelFocus {
     Status,
     Repos,
@@ -583,6 +593,60 @@ impl Tui {
         })
     }
 
+    fn git_action_enabled(&self, action: GitAction) -> bool {
+        if action == GitAction::LazyGit {
+            let program = match self.focused_panel {
+                PanelFocus::Status => None,
+                PanelFocus::Repos => self
+                    .selected_repo_context()
+                    .map(|context| context.config.tool("lazygit")),
+                PanelFocus::Worktrees => self
+                    .selected_worktree_context()
+                    .map(|context| context.config.tool("lazygit")),
+            };
+            return program.is_some_and(|program| crate::process::command_exists(&program));
+        }
+        if self.focused_panel != PanelFocus::Worktrees {
+            return false;
+        }
+        let Some(context) = self.selected_worktree_context() else {
+            return false;
+        };
+        let Some(session) = self.sessions.get(context.session_index) else {
+            return false;
+        };
+        if !session.is_task_branch(&context.config) {
+            return false;
+        }
+        if action == GitAction::Push {
+            return true;
+        }
+        let Some(summary) = session.pr.summary() else {
+            return false;
+        };
+        if action == GitAction::OpenPr {
+            return true;
+        }
+        if summary.merged || !summary.state.eq_ignore_ascii_case("OPEN") {
+            return false;
+        }
+        if matches!(action, GitAction::CiFix | GitAction::ReviewFix) {
+            return context
+                .config
+                .selected_harness()
+                .is_ok_and(|harness| harness.describe().headless);
+        }
+        true
+    }
+
+    fn git_choice(&self, action: GitAction, key: &str, label: &str) -> view::KeyChoice {
+        if self.git_action_enabled(action) {
+            view::KeyChoice::new(key, label)
+        } else {
+            view::KeyChoice::disabled(key, label)
+        }
+    }
+
     pub fn run(&mut self) -> Result<(), String> {
         if !stdin_is_tty() {
             return Err("TUI requires an interactive terminal".to_string());
@@ -758,16 +822,16 @@ impl Tui {
                 Key::LazyGit => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.focused_panel == PanelFocus::Status {
-                        self.show_message("focus repos or worktrees to open lazygit")?;
-                    } else if self.focused_panel == PanelFocus::Repos {
-                        if let Err(error) = self.open_selected_repo_lazygit(&mut runtime) {
-                            self.show_error("repository lazygit failed", &error)?;
+                    if self.git_action_enabled(GitAction::LazyGit) {
+                        if self.focused_panel == PanelFocus::Repos {
+                            if let Err(error) = self.open_selected_repo_lazygit(&mut runtime) {
+                                self.show_error("repository lazygit failed", &error)?;
+                            }
+                        } else if let Err(error) =
+                            self.open_tmux_window(&mut runtime, TmuxWindow::LazyGit)
+                        {
+                            self.show_error("lazygit failed", &error)?;
                         }
-                    } else if let Err(error) =
-                        self.open_tmux_window(&mut runtime, TmuxWindow::LazyGit)
-                    {
-                        self.show_error("lazygit failed", &error)?;
                     }
                 }
                 Key::AutoFlow => {
@@ -783,9 +847,9 @@ impl Tui {
                 Key::OpenPr => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message("focus worktrees to open a PR")?;
-                    } else if let Err(error) = self.open_selected_pr(&mut runtime) {
+                    if self.git_action_enabled(GitAction::OpenPr)
+                        && let Err(error) = self.open_selected_pr(&mut runtime)
+                    {
                         self.show_error("open PR failed", &error)?;
                     }
                 }
@@ -863,36 +927,36 @@ impl Tui {
                 Key::ReviewFix => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message("focus worktrees to send a review-fix prompt")?;
-                    } else if let Err(error) = self.start_review_fix(&mut runtime) {
+                    if self.git_action_enabled(GitAction::ReviewFix)
+                        && let Err(error) = self.start_review_fix(&mut runtime)
+                    {
                         self.show_error("review fix failed", &error)?;
                     }
                 }
                 Key::CiFix => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message("focus worktrees to send a CI-failure prompt")?;
-                    } else if let Err(error) = self.start_ci_fix(&mut runtime) {
+                    if self.git_action_enabled(GitAction::CiFix)
+                        && let Err(error) = self.start_ci_fix(&mut runtime)
+                    {
                         self.show_error("CI failure prompt failed", &error)?;
                     }
                 }
                 Key::Push => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message("focus worktrees to push a branch")?;
-                    } else if let Err(error) = self.push_selected_branch(&mut runtime) {
+                    if self.git_action_enabled(GitAction::Push)
+                        && let Err(error) = self.push_selected_branch(&mut runtime)
+                    {
                         self.show_error("push failed", &error)?;
                     }
                 }
                 Key::Merge => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message("focus worktrees to merge a PR")?;
-                    } else if let Err(error) = self.merge_selected_pr(&mut runtime) {
+                    if self.git_action_enabled(GitAction::Merge)
+                        && let Err(error) = self.merge_selected_pr(&mut runtime)
+                    {
                         self.show_error("merge failed", &error)?;
                     }
                 }
@@ -928,11 +992,18 @@ impl Tui {
                         }
                     }
                 }
+                Key::MigrateHarness => {
+                    if self.focused_panel != PanelFocus::Worktrees {
+                        self.show_message("focus worktrees to migrate an agent harness")?;
+                    } else if let Some(index) = self.selected_worktree_index() {
+                        self.migrate_worktree_harness(index)?;
+                    }
+                }
                 Key::AbortOpencode => {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message("focus worktrees to abort an OpenCode session")?;
+                        self.show_message("focus worktrees to abort an agent session")?;
                     } else if let Err(error) = self.abort_selected_opencode_session(&mut runtime) {
                         self.show_error("abort failed", &error)?;
                     }
@@ -1011,6 +1082,13 @@ impl Tui {
                         self.show_error("edit user config failed", &error)?;
                     }
                 }
+                Key::SelectHarness => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if let Err(error) = self.select_default_harness(&mut runtime) {
+                        self.show_error("select harness failed", &error)?;
+                    }
+                }
                 Key::Search => {
                     self.clear_leader_hint();
                     pending_g = false;
@@ -1054,11 +1132,12 @@ impl Tui {
             self.show_message("delete in progress; wait for it to finish before quitting")?;
             return Ok(false);
         }
-        if !self
-            .sessions
-            .iter()
-            .any(|session| session.agent_state == AgentState::Running)
-        {
+        if !self.sessions.iter().any(|session| {
+            matches!(
+                session.agent_state,
+                AgentState::Attached | AgentState::Running
+            )
+        }) {
             return Ok(true);
         }
         self.confirm_action_dialog(
@@ -1084,6 +1163,7 @@ impl Tui {
         runtime: &mut TerminalRuntime,
         index: usize,
     ) -> Result<(), String> {
+        self.prepare_worktree_harness_for_open(runtime, index)?;
         let navigation = self.navigation_snapshot();
         runtime.suspend()?;
         let result = self.attach_tmux_session_for_index(index);
@@ -1095,6 +1175,106 @@ impl Tui {
         if let Err(error) = result {
             self.show_error("tmux session failed", &error)?;
         }
+        Ok(())
+    }
+
+    fn prepare_worktree_harness_for_open(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        index: usize,
+    ) -> Result<(), String> {
+        let Some(session) = self
+            .sessions
+            .get(index)
+            .map(Session::background_job_snapshot)
+        else {
+            return Ok(());
+        };
+        let Some(managed) = self.repos.get(session.repo_index) else {
+            return Ok(());
+        };
+        let repo = managed.repo.clone();
+        let target = managed.config.default_harness.clone();
+        let association = crate::session::worktree_harness(&repo, &session)?;
+        if association.harness_id == target || association.keep {
+            return Ok(());
+        }
+        let choices = view::ChoiceList {
+            title: "Worktree Harness Changed".to_string(),
+            choices: vec![
+                view::KeyChoice::new("m", format!("Migrate to {target}")),
+                view::KeyChoice::new(
+                    "l",
+                    format!("Later; open {} and ask next time", association.harness_id),
+                ),
+                view::KeyChoice::new("k", format!("Keep {}; stop asking", association.harness_id)),
+            ],
+        };
+        match self.prompt_choice_dialog(runtime, choices)?.as_deref() {
+            Some("m") => {
+                let use_ = crate::agent_session::session_use(
+                    &self.repos,
+                    &mut self.tmux_generations,
+                    &session,
+                );
+                self.finish_tmux_warmup_for_key(&use_.warmup_key);
+                if let Some(managed) = self.repos.get(session.repo_index) {
+                    crate::agent_session::retire_generation(
+                        &repo,
+                        &managed.config,
+                        &session.branch,
+                        use_.generation,
+                    );
+                }
+                crate::session::set_worktree_harness(&repo, &session, &target, false)?;
+                crate::agent_session::rotate_generation(
+                    &self.repos,
+                    &mut self.tmux_generations,
+                    use_.slot,
+                );
+            }
+            Some("k") => crate::session::set_worktree_harness(
+                &repo,
+                &session,
+                &association.harness_id,
+                true,
+            )?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn migrate_worktree_harness(&mut self, index: usize) -> Result<(), String> {
+        let Some(session) = self
+            .sessions
+            .get(index)
+            .map(Session::background_job_snapshot)
+        else {
+            return Ok(());
+        };
+        let Some(managed) = self.repos.get(session.repo_index) else {
+            return Ok(());
+        };
+        let repo = managed.repo.clone();
+        let target = managed.config.default_harness.clone();
+        let repository_config = managed.config.clone();
+        let association = crate::session::worktree_harness(&repo, &session)?;
+        if association.harness_id == target && !association.keep {
+            self.show_message(&format!("worktree already uses harness '{target}'"))?;
+            return Ok(());
+        }
+        let use_ =
+            crate::agent_session::session_use(&self.repos, &mut self.tmux_generations, &session);
+        self.finish_tmux_warmup_for_key(&use_.warmup_key);
+        crate::agent_session::retire_generation(
+            &repo,
+            &repository_config,
+            &session.branch,
+            use_.generation,
+        );
+        crate::session::set_worktree_harness(&repo, &session, &target, false)?;
+        crate::agent_session::rotate_generation(&self.repos, &mut self.tmux_generations, use_.slot);
+        self.show_message(&format!("migrated worktree to harness '{target}'"))?;
         Ok(())
     }
 
@@ -1134,7 +1314,9 @@ impl Tui {
             "C            repos: open a worktree for a remote pull request",
             "c            repos: create worktree session in selected repo",
             "+ / -        worktrees: raise/lower visibility sort",
-            "x            worktrees: abort selected OpenCode session",
+            "x            worktrees: abort selected agent session when supported",
+            "M            worktrees: migrate selected worktree to the default harness",
+            "H            choose the global default harness or add a generic harness",
             "e            edit selected repository config, then reload",
             "E            edit user config, then reload",
             "W            repos: edit visible worktree columns in repo config",
@@ -1396,11 +1578,7 @@ impl Tui {
                 }
                 KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => {
                     let normalized = ch.to_string().to_ascii_lowercase();
-                    if choices
-                        .choices
-                        .iter()
-                        .any(|option| option.key.eq_ignore_ascii_case(&normalized))
-                    {
+                    if selectable_choice_key(&choices, &normalized).is_some() {
                         self.dialog = None;
                         self.draw(runtime)?;
                         return Ok(Some(normalized));
@@ -2844,7 +3022,10 @@ impl Tui {
             if status_count(&session.status_label, "dirty").is_some() {
                 dirty += 1;
             }
-            if session.agent_state == AgentState::Running {
+            if matches!(
+                session.agent_state,
+                AgentState::Attached | AgentState::Running
+            ) {
                 running += 1;
             }
             if matches!(
@@ -2934,7 +3115,10 @@ impl Tui {
             if status_count(&session.status_label, "dirty").is_some() {
                 dirty += 1;
             }
-            if session.agent_state == AgentState::Running {
+            if matches!(
+                session.agent_state,
+                AgentState::Attached | AgentState::Running
+            ) {
                 running += 1;
             }
             if matches!(
@@ -3064,29 +3248,44 @@ impl Tui {
                     ("space", "agent if valid"),
                 ],
             )),
-            (Some(LeaderHint::Git), PanelFocus::Status) => Some(choice_list(
-                "Git Actions",
-                &[("g", "lazygit after focusing repos/worktrees")],
-            )),
-            (Some(LeaderHint::Git), PanelFocus::Repos) => Some(choice_list(
-                "Git Actions",
-                &[("g", "lazygit"), ("p", "pull default branch")],
-            )),
-            (Some(LeaderHint::Git), PanelFocus::Worktrees) => Some(choice_list(
-                "Git Actions",
-                &[
-                    ("a", "auto flow"),
-                    ("g", "lazygit"),
-                    ("o", "open PR"),
-                    ("P", "push/create PR"),
-                    ("M", "merge"),
-                    ("c", "copy CI prompt"),
-                    ("f", "review fix"),
+            (Some(LeaderHint::Git), PanelFocus::Status) => Some(view::ChoiceList {
+                title: "Git Actions".to_string(),
+                choices: vec![self.git_choice(
+                    GitAction::LazyGit,
+                    "g",
+                    "lazygit after focusing repos/worktrees",
+                )],
+            }),
+            (Some(LeaderHint::Git), PanelFocus::Repos) => Some(view::ChoiceList {
+                title: "Git Actions".to_string(),
+                choices: vec![
+                    self.git_choice(GitAction::LazyGit, "g", "lazygit"),
+                    view::KeyChoice::new("p", "pull default branch"),
                 ],
-            )),
+            }),
+            (Some(LeaderHint::Git), PanelFocus::Worktrees) => Some(view::ChoiceList {
+                title: "Git Actions".to_string(),
+                choices: vec![
+                    view::KeyChoice::new("a", "auto flow"),
+                    self.git_choice(GitAction::LazyGit, "g", "lazygit"),
+                    self.git_choice(GitAction::OpenPr, "o", "open PR"),
+                    self.git_choice(GitAction::Push, "P", "push/create PR"),
+                    self.git_choice(GitAction::Merge, "M", "merge"),
+                    self.git_choice(GitAction::CiFix, "c", "CI repair"),
+                    self.git_choice(GitAction::ReviewFix, "f", "review repair"),
+                ],
+            }),
             (None, _) => None,
         }
     }
+}
+
+fn selectable_choice_key(choices: &view::ChoiceList, key: &str) -> Option<String> {
+    choices
+        .choices
+        .iter()
+        .find(|option| !option.disabled && option.key.eq_ignore_ascii_case(key))
+        .map(|option| option.key.to_ascii_lowercase())
 }
 
 fn choice_list(title: &str, choices: &[(&str, &str)]) -> view::ChoiceList {
@@ -3094,10 +3293,7 @@ fn choice_list(title: &str, choices: &[(&str, &str)]) -> view::ChoiceList {
         title: title.to_string(),
         choices: choices
             .iter()
-            .map(|(key, label)| view::KeyChoice {
-                key: (*key).to_string(),
-                label: (*label).to_string(),
-            })
+            .map(|(key, label)| view::KeyChoice::new(*key, *label))
             .collect(),
     }
 }
@@ -3148,17 +3344,18 @@ mod tests {
         AutoImplementationSource, AutoRun, AutoRunMode, AutoRunStatus, PersistedAutoRun,
     };
     use crate::config::Config;
-    use crate::github::PrCache;
+    use crate::github::{PrCache, PrSummary};
     use crate::plan_run::{
         PersistedPlanRun, PlanRun, PlanRunMode, PlanRunStatus, PlanStepRun, PlanStepStatus,
     };
     use crate::repo::Repository;
     use crate::session::{Session, WorktreeRepositoryKey};
-    use crate::view::{OrderedToggleItem, RepoMainView, WorktreeMainView};
+    use crate::view::{ChoiceList, KeyChoice, OrderedToggleItem, RepoMainView, WorktreeMainView};
 
     use super::{
-        ManagedRepo, OpenTmuxSessionTarget, PanelFocus, PrPollKey, Tui, WorktreeListMode,
-        confirmation_result, move_enabled_ordered_item, toggle_ordered_item,
+        GitAction, ManagedRepo, OpenTmuxSessionTarget, PanelFocus, PrPollKey, Tui,
+        WorktreeListMode, confirmation_result, move_enabled_ordered_item, selectable_choice_key,
+        toggle_ordered_item,
     };
 
     #[test]
@@ -3177,6 +3374,54 @@ mod tests {
     fn confirmation_rejects_unknown_answers() {
         assert_eq!(confirmation_result("maybe", true), None);
         assert_eq!(confirmation_result("ny", false), None);
+    }
+
+    #[test]
+    fn disabled_choice_keys_are_not_selectable() {
+        let choices = ChoiceList {
+            title: "Harness".to_string(),
+            choices: vec![
+                KeyChoice::disabled("1", "OpenCode"),
+                KeyChoice::new("2", "Codex"),
+            ],
+        };
+
+        assert_eq!(selectable_choice_key(&choices, "1"), None);
+        assert_eq!(selectable_choice_key(&choices, "2").as_deref(), Some("2"));
+    }
+
+    #[test]
+    fn git_actions_disable_pr_operations_until_a_pr_is_known() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let mut tui = Tui::new_single(
+            repo,
+            test_config(),
+            vec![test_session(0, "/tmp/repo", "feature")],
+        );
+        tui.focused_panel = PanelFocus::Worktrees;
+
+        assert!(tui.git_action_enabled(GitAction::Push));
+        assert!(!tui.git_action_enabled(GitAction::OpenPr));
+        assert!(!tui.git_action_enabled(GitAction::Merge));
+
+        tui.sessions[0].pr = PrCache::observed(test_pr_summary(false), None);
+        assert!(tui.git_action_enabled(GitAction::OpenPr));
+        assert!(tui.git_action_enabled(GitAction::Merge));
+        assert!(tui.git_action_enabled(GitAction::CiFix));
+
+        tui.sessions[0].pr = PrCache::observed(test_pr_summary(true), None);
+        assert!(tui.git_action_enabled(GitAction::OpenPr));
+        assert!(!tui.git_action_enabled(GitAction::Merge));
+        assert!(!tui.git_action_enabled(GitAction::ReviewFix));
+
+        let mut closed = test_pr_summary(false);
+        closed.state = "CLOSED".to_string();
+        tui.sessions[0].pr = PrCache::observed(closed, None);
+        assert!(tui.git_action_enabled(GitAction::OpenPr));
+        assert!(!tui.git_action_enabled(GitAction::Merge));
+        assert!(!tui.git_action_enabled(GitAction::CiFix));
     }
 
     #[test]
@@ -3624,6 +3869,8 @@ mod tests {
     fn test_auto_run(id: &str, worktree_path: &str, updated_unix_ms: u64) -> PersistedAutoRun {
         PersistedAutoRun {
             run: AutoRun {
+                harness_id: "opencode".to_string(),
+                adapter_id: "opencode".to_string(),
                 id: id.to_string(),
                 repo_root: "/repo-one".to_string(),
                 worktree_path: PathBuf::from(worktree_path),
@@ -3659,6 +3906,8 @@ mod tests {
     fn test_plan_run(id: &str, scope_path: &str) -> PersistedPlanRun {
         PersistedPlanRun {
             run: PlanRun {
+                harness_id: "opencode".to_string(),
+                adapter_id: "opencode".to_string(),
                 id: id.to_string(),
                 repo_root: "/repo-one".to_string(),
                 scope_path: PathBuf::from(scope_path),
@@ -3697,10 +3946,8 @@ mod tests {
                 } else {
                     PlanStepStatus::Queued
                 },
-                opencode_state: None,
-                opencode_server_url: None,
-                opencode_session_id: None,
-                process_id: None,
+                execution: crate::harness::ExecutionRef::default(),
+                session: crate::harness::SessionRef::default(),
                 agent_variant: None,
                 started_unix_ms: (step == selected_step).then_some(step as u64),
                 finished_unix_ms: None,
@@ -3757,6 +4004,27 @@ mod tests {
         config.default_agent = "opencode".to_string();
         config.default_base = Some("main".to_string());
         config
+    }
+
+    fn test_pr_summary(merged: bool) -> PrSummary {
+        PrSummary {
+            number: 1,
+            title: "PR".to_string(),
+            body: String::new(),
+            url: "https://example.test/pr/1".to_string(),
+            state: if merged { "MERGED" } else { "OPEN" }.to_string(),
+            review_decision: String::new(),
+            requested_reviewers: Vec::new(),
+            head_ref: "feature".to_string(),
+            base_ref: "main".to_string(),
+            head_sha: "abc123".to_string(),
+            updated_at: String::new(),
+            check_status: String::new(),
+            merge_state_status: String::new(),
+            comment_count: 0,
+            merged,
+            draft: false,
+        }
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

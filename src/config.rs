@@ -1,11 +1,17 @@
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
+use toml_edit::{Array, DocumentMut, Item, Table, value};
 
-use crate::agent::{PromptMode, agent_command_exists, builtin_prompt_mode, detected_agents};
+use crate::agent::{PromptMode, builtin_prompt_mode, detected_agents};
+use crate::harness::{
+    BUILTIN_HARNESS_IDS, Harness, HarnessConfig, OutputFormat, PromptTransport, builtin_adapter,
+};
 use crate::process::{command_exists, command_version, run_capture};
 use crate::repo::Repository;
 use crate::session::discover_sessions;
@@ -19,8 +25,8 @@ pub const CONFIG_SCHEMA_JSON: &str = include_str!("../schemas/config.schema.json
 pub fn config_example() -> String {
     format!("#:schema {CONFIG_SCHEMA_URL}\n")
         + r#"
-# Prism config. Use this file globally or as a repository override.
-default_agent = "opencode"
+# Prism config. Harness settings are global; other settings may be repository overrides.
+default_harness = "opencode"
 default_base = "main"
 merge_method = "squash" # squash, merge, or rebase
 escape_key = "esc-esc" # esc-esc or ctrl-space
@@ -38,8 +44,10 @@ icon_style = "unicode" # or "nerd-font"
 [worktrees]
 columns = []
 
+[harnesses.opencode]
+program = "opencode"
+
 [tools]
-opencode = "opencode"
 gh = "gh"
 git = "git"
 tmux = "tmux"
@@ -66,10 +74,6 @@ review_continue_on_timeout = true
 ci_wait_enabled = true
 ci_max_wait_seconds = 1800
 ci_poll_interval_seconds = 30
-
-[agents.opencode]
-command = "opencode run --format json"
-prompt_mode = "argument"
 
 [prompt_templates]
 auto_create_plan = "Create an implementation plan at `{{plan_path}}`. Do not implement or commit. Include phases, tests, verification, risks, observability, and architecture fit.\n\nTask:\n{{task}}\n\nMode: {{mode}}\nVariant: {{variant}}\nAgent profile: {{agent_profile}}"
@@ -231,6 +235,9 @@ impl MergeMethod {
 
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub default_harness: String,
+    pub harnesses: BTreeMap<String, HarnessConfig>,
+    pub config_errors: Vec<String>,
     pub default_agent: String,
     pub default_base: Option<String>,
     pub plan_dir: String,
@@ -258,6 +265,8 @@ pub struct Config {
 
 #[derive(Debug, Default, Deserialize)]
 struct RawConfig {
+    default_harness: Option<String>,
+    harnesses: Option<BTreeMap<String, RawHarnessConfig>>,
     default_agent: Option<String>,
     default_base: Option<String>,
     plan_dir: Option<String>,
@@ -324,6 +333,79 @@ struct RawAgentConfig {
     prompt_mode: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct RawHarnessConfig {
+    adapter: Option<String>,
+    program: Option<String>,
+    arguments: Option<Vec<String>>,
+    interactive_command: Option<Vec<String>>,
+    interactive_prompt_transport: Option<String>,
+    headless_command: Option<Vec<String>>,
+    headless_prompt_transport: Option<String>,
+    output_format: Option<String>,
+    environment: Option<BTreeMap<String, String>>,
+}
+
+fn harness_config_from_raw(id: &str, raw: RawHarnessConfig) -> Result<HarnessConfig, String> {
+    let adapter = raw
+        .adapter
+        .unwrap_or_else(|| builtin_adapter(id).unwrap_or("generic").to_string());
+    let interactive_command = if adapter != "generic" {
+        if raw.interactive_command.is_some() {
+            return Err(format!(
+                "harness '{id}' uses the {adapter} adapter; configure program instead of interactive_command"
+            ));
+        }
+        vec![raw.program.unwrap_or_else(|| adapter.clone())]
+    } else {
+        if raw.program.is_some() {
+            return Err(format!(
+                "generic harness '{id}' uses interactive_command, not program"
+            ));
+        }
+        raw.interactive_command.unwrap_or_default()
+    };
+    let parse_transport = |field: &str, value: Option<String>| {
+        value
+            .map(|value| {
+                PromptTransport::parse(&value)
+                    .ok_or_else(|| format!("harness '{id}' has invalid {field} '{value}'"))
+            })
+            .transpose()
+    };
+    let output_format = match raw.output_format.as_deref().unwrap_or("text") {
+        "text" => OutputFormat::Text,
+        other => {
+            return Err(format!(
+                "harness '{id}' has unsupported output_format '{other}'; generic harnesses support text"
+            ));
+        }
+    };
+    let output_format = if matches!(adapter.as_str(), "opencode" | "codex" | "claude" | "pi") {
+        OutputFormat::JsonLines
+    } else {
+        output_format
+    };
+    let config = HarnessConfig {
+        adapter,
+        interactive_command,
+        arguments: raw.arguments.unwrap_or_default(),
+        interactive_prompt_transport: parse_transport(
+            "interactive_prompt_transport",
+            raw.interactive_prompt_transport,
+        )?,
+        headless_command: raw.headless_command,
+        headless_prompt_transport: parse_transport(
+            "headless_prompt_transport",
+            raw.headless_prompt_transport,
+        )?,
+        output_format,
+        environment: raw.environment.unwrap_or_default(),
+    };
+    config.validate(id)?;
+    Ok(config)
+}
+
 impl Config {
     pub fn load(repo: &Repository) -> Self {
         let user_path = prism_config_dir().join("config.toml");
@@ -334,6 +416,18 @@ impl Config {
         config.apply_file(&user_path);
         let repo_config_path = config.repo_config_path.clone();
         config.apply_file(&repo_config_path);
+        config.default_agent = config.default_harness.clone();
+        for (id, harness) in &config.harnesses {
+            if let Err(error) = harness.validate(id) {
+                config.config_errors.push(error);
+            }
+        }
+        if !config.harnesses.contains_key(&config.default_harness) {
+            config.config_errors.push(format!(
+                "default_harness '{}' is not configured in [harnesses.{}]",
+                config.default_harness, config.default_harness
+            ));
+        }
         config
     }
 
@@ -351,7 +445,19 @@ impl Config {
         .map(|(key, value)| (key.to_string(), value.to_string()))
         .collect();
 
+        let harnesses = BUILTIN_HARNESS_IDS
+            .into_iter()
+            .map(|adapter| {
+                (
+                    adapter.to_string(),
+                    HarnessConfig::builtin(adapter, adapter),
+                )
+            })
+            .collect();
         Self {
+            default_harness: "opencode".to_string(),
+            harnesses,
+            config_errors: Vec::new(),
             default_agent: "opencode".to_string(),
             default_base: Some("main".to_string()),
             plan_dir: "plans".to_string(),
@@ -382,13 +488,57 @@ impl Config {
         let Ok(text) = fs::read_to_string(path) else {
             return;
         };
-        let Ok(raw) = toml::from_str::<RawConfig>(&text) else {
-            return;
+        let raw = match toml::from_str::<RawConfig>(&text) {
+            Ok(raw) => raw,
+            Err(error) => {
+                self.config_errors
+                    .push(format!("parse {}: {error}", path.display()));
+                return;
+            }
         };
-        self.apply_raw_config(raw);
+        let is_user_config = path == self.user_path;
+        if raw.default_agent.is_some() || raw.agents.is_some() {
+            self.config_errors.push(format!(
+                "{} uses obsolete default_agent/[agents.*] settings; replace them with default_harness/[harnesses.*]",
+                path.display()
+            ));
+        }
+        if raw
+            .tools
+            .as_ref()
+            .is_some_and(|tools| tools.contains_key("opencode"))
+        {
+            self.config_errors.push(format!(
+                "{} uses obsolete [tools].opencode; configure [harnesses.opencode].program instead",
+                path.display()
+            ));
+        }
+        if !is_user_config && (raw.default_harness.is_some() || raw.harnesses.is_some()) {
+            self.config_errors.push(format!(
+                "{} configures default_harness/[harnesses.*], but harness selection is global; move these settings to {}",
+                path.display(),
+                self.user_path.display()
+            ));
+        }
+        self.apply_raw_config(raw, is_user_config);
     }
 
-    fn apply_raw_config(&mut self, raw: RawConfig) {
+    fn apply_raw_config(&mut self, raw: RawConfig, apply_harnesses: bool) {
+        if apply_harnesses {
+            if let Some(value) = raw.default_harness {
+                self.default_harness = value;
+            }
+            if let Some(harnesses) = raw.harnesses {
+                for (id, raw) in harnesses {
+                    match harness_config_from_raw(&id, raw) {
+                        Ok(harness) => {
+                            self.harnesses.insert(id, harness);
+                        }
+                        Err(error) => self.config_errors.push(error),
+                    }
+                }
+            }
+        }
         if let Some(value) = raw.default_agent {
             self.default_agent = value;
         }
@@ -515,6 +665,16 @@ impl Config {
     }
 
     pub fn tool(&self, name: &str) -> String {
+        if name == "opencode"
+            && let Some(program) = self
+                .harnesses
+                .get(&self.default_harness)
+                .filter(|harness| harness.adapter == "opencode")
+                .and_then(|harness| harness.interactive_command.first())
+            && program != "opencode"
+        {
+            return program.clone();
+        }
         self.tools
             .get(name)
             .cloned()
@@ -529,6 +689,105 @@ impl Config {
             return format!("{} run --format json", self.tool("opencode"));
         }
         self.tool(name)
+    }
+
+    pub fn harness(&self, id: &str) -> Result<Harness<'_>, String> {
+        self.harnesses
+            .get(id)
+            .map(|config| Harness::new(id, config))
+            .ok_or_else(|| format!("harness '{id}' is not configured"))
+    }
+
+    pub fn selected_harness(&self) -> Result<Harness<'_>, String> {
+        self.harness(&self.default_harness)
+    }
+
+    pub fn save_user_default_harness(&self, harness_id: &str) -> Result<(), String> {
+        if !self.harnesses.contains_key(harness_id) {
+            return Err(format!("harness '{harness_id}' is not configured"));
+        }
+        update_user_harness_config(&self.user_path, harness_id, None)
+    }
+
+    pub fn save_user_generic_harness(
+        &self,
+        harness_id: &str,
+        harness: &HarnessConfig,
+    ) -> Result<(), String> {
+        validate_new_generic_harness_id(harness_id, &self.harnesses)?;
+        harness.validate(harness_id)?;
+        update_user_harness_config(&self.user_path, harness_id, Some(harness))
+    }
+
+    pub(crate) fn for_harness(&self, harness_id: &str) -> Result<Self, String> {
+        if !self.harnesses.contains_key(harness_id) {
+            return Err(format!(
+                "worktree is bound to harness '{harness_id}', but [harnesses.{harness_id}] is not configured; restore it or migrate the worktree"
+            ));
+        }
+        let mut config = self.clone();
+        config.default_harness = harness_id.to_string();
+        if self.default_agent == self.default_harness
+            || !self.agent_commands.contains_key(&self.default_agent)
+        {
+            config.default_agent = harness_id.to_string();
+        }
+        Ok(config)
+    }
+
+    pub fn selected_adapter_is(&self, adapter: &str) -> bool {
+        if self.default_agent != self.default_harness
+            && self.agent_commands.contains_key(&self.default_agent)
+        {
+            return false;
+        }
+        self.harnesses
+            .get(&self.default_harness)
+            .is_some_and(|harness| harness.adapter == adapter)
+    }
+
+    pub fn harness_config(&self, id: &str) -> Result<HarnessConfig, String> {
+        let mut harness = self
+            .harnesses
+            .get(id)
+            .cloned()
+            .ok_or_else(|| format!("harness '{id}' is not configured"))?;
+        if harness.adapter == "opencode"
+            && harness
+                .interactive_command
+                .first()
+                .is_some_and(|program| program == "opencode")
+        {
+            harness.interactive_command = vec![
+                self.tools
+                    .get("opencode")
+                    .cloned()
+                    .unwrap_or_else(|| "opencode".to_string()),
+            ];
+        }
+        Ok(harness)
+    }
+
+    pub fn harness_adapter(&self, id: &str) -> Result<String, String> {
+        self.harnesses
+            .get(id)
+            .map(|harness| harness.adapter.clone())
+            .ok_or_else(|| format!("harness '{id}' is not configured"))
+    }
+
+    pub fn recorded_harness_config(
+        &self,
+        harness_id: &str,
+        adapter_id: &str,
+    ) -> Result<HarnessConfig, String> {
+        let harness = self.harness_config(harness_id)?;
+        if harness.adapter != adapter_id {
+            return Err(format!(
+                "harness '{harness_id}' was recorded with adapter '{adapter_id}', but it is now configured as '{}'",
+                harness.adapter
+            ));
+        }
+        Ok(harness)
     }
 
     pub fn agent_prompt_mode(&self, name: &str) -> PromptMode {
@@ -552,6 +811,170 @@ impl Config {
     pub fn save_user_icon_style(&self, style: IconStyle) -> Result<(), String> {
         save_user_icon_style(&self.user_path, style)
     }
+}
+
+pub fn validate_new_generic_harness_id(
+    id: &str,
+    configured: &BTreeMap<String, HarnessConfig>,
+) -> Result<(), String> {
+    let mut chars = id.chars();
+    let valid = chars.next().is_some_and(|first| first.is_ascii_lowercase())
+        && chars.all(|character| {
+            character.is_ascii_lowercase()
+                || character.is_ascii_digit()
+                || matches!(character, '-' | '_')
+        });
+    if !valid {
+        return Err(
+            "harness ID must start with a lowercase letter and contain only lowercase letters, digits, '-' or '_'"
+                .to_string(),
+        );
+    }
+    if builtin_adapter(id).is_some() {
+        return Err(format!(
+            "harness ID '{id}' is reserved for a built-in adapter"
+        ));
+    }
+    if configured.contains_key(id) {
+        return Err(format!("harness '{id}' is already configured"));
+    }
+    Ok(())
+}
+
+fn update_user_harness_config(
+    path: &Path,
+    default_harness: &str,
+    generic: Option<&HarnessConfig>,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| format!("create config dir: {error}"))?;
+    }
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(format!("read config file: {error}")),
+    };
+    let updated = update_user_harness_config_text(&text, default_harness, generic)?;
+    let write_path = fs::symlink_metadata(path)
+        .ok()
+        .filter(|metadata| metadata.file_type().is_symlink())
+        .map(|_| fs::canonicalize(path).map_err(|error| format!("resolve config symlink: {error}")))
+        .transpose()?
+        .unwrap_or_else(|| path.to_path_buf());
+    write_config_atomically(&write_path, updated.as_bytes())
+}
+
+fn write_config_atomically(path: &Path, contents: &[u8]) -> Result<(), String> {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let permissions = fs::metadata(path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    for _ in 0..100 {
+        let staging = path.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = match options.open(&staging) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(format!("create staged config file: {error}")),
+        };
+        let result = file
+            .write_all(contents)
+            .and_then(|()| file.sync_all())
+            .and_then(|()| {
+                if let Some(permissions) = permissions.clone() {
+                    fs::set_permissions(&staging, permissions)?;
+                }
+                fs::rename(&staging, path)
+            });
+        if let Err(error) = result {
+            let _ = fs::remove_file(&staging);
+            return Err(format!("write config file: {error}"));
+        }
+        return Ok(());
+    }
+    Err("create unique staged config file".to_string())
+}
+
+fn update_user_harness_config_text(
+    text: &str,
+    default_harness: &str,
+    generic: Option<&HarnessConfig>,
+) -> Result<String, String> {
+    let mut document = if text.trim().is_empty() {
+        DocumentMut::new()
+    } else {
+        text.parse::<DocumentMut>()
+            .map_err(|error| format!("parse user config: {error}"))?
+    };
+    if let Some(current) = document
+        .get_mut("default_harness")
+        .and_then(Item::as_value_mut)
+    {
+        let decor = current.decor().clone();
+        *current = toml_edit::Value::from(default_harness);
+        *current.decor_mut() = decor;
+    } else {
+        document["default_harness"] = value(default_harness);
+    }
+
+    if let Some(generic) = generic {
+        if generic.adapter != "generic" {
+            return Err(
+                "only generic harnesses can be added through the harness dialog".to_string(),
+            );
+        }
+        let harnesses_item = document
+            .entry("harnesses")
+            .or_insert_with(|| Item::Table(Table::new()));
+        if let Some(inline) = harnesses_item.as_inline_table().cloned() {
+            let mut table = Table::new();
+            for (key, value_) in inline.iter() {
+                table[key] = Item::Value(value_.clone());
+            }
+            *harnesses_item = Item::Table(table);
+        }
+        let harnesses = harnesses_item
+            .as_table_mut()
+            .ok_or_else(|| "harnesses must be a table".to_string())?;
+        if harnesses.contains_key(default_harness) {
+            return Err(format!("harness '{default_harness}' is already configured"));
+        }
+        let mut table = Table::new();
+        table["adapter"] = value("generic");
+        table["interactive_command"] = value(string_array(&generic.interactive_command));
+        if let Some(transport) = generic.interactive_prompt_transport {
+            table["interactive_prompt_transport"] = value(transport.label());
+        }
+        if let Some(command) = &generic.headless_command {
+            table["headless_command"] = value(string_array(command));
+        }
+        if let Some(transport) = generic.headless_prompt_transport {
+            table["headless_prompt_transport"] = value(transport.label());
+        }
+        table["output_format"] = value("text");
+        if !generic.environment.is_empty() {
+            let mut environment = Table::new();
+            for (key, value_) in &generic.environment {
+                environment[key] = value(value_);
+            }
+            table["environment"] = Item::Table(environment);
+        }
+        harnesses[default_harness] = Item::Table(table);
+    }
+    Ok(document.to_string())
+}
+
+fn string_array(items: &[String]) -> Array {
+    let mut array = Array::new();
+    for item in items {
+        array.push(item.as_str());
+    }
+    array
 }
 
 fn save_user_icon_style(path: &Path, style: IconStyle) -> Result<(), String> {
@@ -600,7 +1023,7 @@ pub fn print_config(repo: &Repository, config: &Config) {
     println!("repo_root = {}", repo.root.display());
     println!("user_config = {}", config.user_path.display());
     println!("repo_config = {}", config.repo_config_path.display());
-    println!("default_agent = {}", config.default_agent);
+    println!("default_harness = {}", config.default_harness);
     println!(
         "default_base = {}",
         config.default_base.as_deref().unwrap_or("")
@@ -679,14 +1102,18 @@ pub fn print_config(repo: &Repository, config: &Config) {
     println!("pre_pr = {:?}", config.checks.pre_pr);
     println!("pre_push = {:?}", config.checks.pre_push);
     println!("review_fix = {:?}", config.checks.review_fix);
-    if !config.agent_commands.is_empty() {
-        println!("[agents]");
-        for (key, value) in &config.agent_commands {
-            println!("{key}.command = {value}");
-            println!(
-                "{key}.prompt_mode = {}",
-                config.agent_prompt_mode(key).label()
-            );
+    println!("[harnesses]");
+    for (id, harness) in &config.harnesses {
+        println!("{id}.adapter = {}", harness.adapter);
+        println!(
+            "{id}.interactive_command = {:?}",
+            harness.interactive_command
+        );
+        if let Some(command) = &harness.headless_command {
+            println!("{id}.headless_command = {command:?}");
+        }
+        if let Some(transport) = harness.headless_prompt_transport {
+            println!("{id}.headless_prompt_transport = {}", transport.label());
         }
     }
 }
@@ -696,6 +1123,91 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     println!("repo: {}", repo.root.display());
     println!("user config: {}", config.user_path.display());
     println!("repo config: {}", config.repo_config_path.display());
+    println!();
+
+    if let Ok(harness) = config.selected_harness() {
+        let description = harness.describe();
+        let configured = &config.harnesses[&config.default_harness];
+        let program = configured
+            .interactive_command
+            .first()
+            .map(String::as_str)
+            .unwrap_or("-");
+        println!("selected harness: {}", description.id);
+        println!("adapter: {}", description.adapter);
+        println!(
+            "harness configuration source: {}",
+            harness_config_source(config)
+        );
+        println!("supported version: {}", description.supported_version);
+        println!("program: {program}");
+        println!(
+            "resolved program: {}",
+            resolve_executable(program)
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "unavailable".to_string())
+        );
+        println!(
+            "capabilities: interactive={} initial_prompt={} headless={} structured_events={} persistent_sessions={} interactive_resume={} observe={} submit={} cancel_session={}",
+            description.interactive,
+            description.initial_prompt,
+            description.headless,
+            description.structured_events,
+            description.persistent_sessions,
+            description.interactive_resume,
+            description.observe,
+            description.submit,
+            description.cancel_session
+        );
+        print_tool_status("harness", program, true);
+        if let Some(headless_program) = configured
+            .headless_command
+            .as_ref()
+            .and_then(|command| command.first())
+            && headless_program != program
+        {
+            print_tool_status("harness headless", headless_program, true);
+        }
+        for (capability, supported, reason) in [
+            (
+                "initial prompt",
+                description.initial_prompt,
+                "no reliable startup prompt transport is configured",
+            ),
+            (
+                "managed Plan/Auto Flow",
+                description.headless,
+                "no headless command is configured",
+            ),
+            (
+                "interactive resume",
+                description.interactive_resume,
+                "adapter has no persistent resumable session contract",
+            ),
+            (
+                "live observation",
+                description.observe,
+                "adapter exposes process-level status only",
+            ),
+            (
+                "later prompt submission",
+                description.submit,
+                "adapter has no supported live submission protocol",
+            ),
+            (
+                "native cancellation",
+                description.cancel_session,
+                "only the owned local process can be terminated",
+            ),
+        ] {
+            if !supported {
+                println!("unavailable: {capability}: {reason}");
+            }
+        }
+    }
+    for error in &config.config_errors {
+        println!("config error: {error}");
+    }
     println!();
 
     print_tool_status("git", &config.tool("git"), true);
@@ -708,39 +1220,6 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     );
     print_tool_status("fzf", &config.tool("fzf"), false);
     println!();
-
-    let detected = detected_agents(config);
-    if detected.is_empty() {
-        println!("agents: none found");
-        println!(
-            "Install or configure one of: {}",
-            AGENT_CANDIDATES.join(", ")
-        );
-    } else {
-        println!("agents:");
-        for agent in &detected {
-            println!("  ok {agent} ({})", config.agent_prompt_mode(agent).label());
-        }
-    }
-
-    if config.default_agent == "ask" {
-        if let Some(agent) = detected.first() {
-            println!("default agent: ask (would select {agent} on first interactive run)");
-        } else {
-            println!("default agent: ask (blocked until an agent is configured)");
-        }
-    } else {
-        if config.default_agent == "opencode" {
-            let exists = agent_command_exists(config, &config.default_agent);
-            println!(
-                "default agent: {} ({})",
-                config.default_agent,
-                if exists { "available" } else { "missing" }
-            );
-        } else {
-            println!("default agent: {} (unsupported)", config.default_agent);
-        }
-    }
 
     println!();
     match run_capture(Command::new(config.tool("gh")).arg("auth").arg("status")) {
@@ -771,6 +1250,35 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+fn harness_config_source(config: &Config) -> String {
+    let configured_by_user = fs::read_to_string(&config.user_path)
+        .ok()
+        .and_then(|text| toml::from_str::<RawConfig>(&text).ok())
+        .is_some_and(|raw| {
+            raw.default_harness.is_some()
+                || raw
+                    .harnesses
+                    .is_some_and(|harnesses| harnesses.contains_key(&config.default_harness))
+        });
+    if configured_by_user {
+        config.user_path.display().to_string()
+    } else {
+        "built-in defaults".to_string()
+    }
+}
+
+fn resolve_executable(program: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(program);
+    if path.components().count() > 1 {
+        return path.exists().then_some(path);
+    }
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .map(|directory| directory.join(program))
+        .find(|candidate| candidate.is_file())
 }
 
 pub fn ensure_required_tools(config: &Config) -> Result<(), String> {
@@ -871,18 +1379,21 @@ pub fn ensure_default_agent_noninteractive(config: &mut Config) -> Result<(), St
 }
 
 fn ensure_configured_default_agent(config: &Config) -> Result<(), String> {
-    if config.default_agent != "opencode" {
-        return Err(format!(
-            "unsupported default_agent '{}'; Prism uses opencode so it can observe agent status and output",
-            config.default_agent
-        ));
+    if !config.config_errors.is_empty() {
+        return Err(config.config_errors.join("\n"));
     }
-    if agent_command_exists(config, &config.default_agent) {
+    let harness = config.selected_harness()?;
+    let description = harness.describe();
+    let command = config.harnesses[&config.default_harness]
+        .interactive_command
+        .first()
+        .ok_or_else(|| "selected harness has no interactive command".to_string())?;
+    if command_exists(command) {
         return Ok(());
     }
     Err(format!(
-        "configured default_agent '{}' was not found on PATH",
-        config.default_agent
+        "configured harness '{}' ({}) was not found on PATH",
+        description.id, command
     ))
 }
 
@@ -1035,7 +1546,7 @@ mod tests {
     }
 
     #[test]
-    fn config_toml_supports_comments_escaped_strings_arrays_and_agent_tables() {
+    fn config_toml_supports_comments_escaped_strings_arrays_and_harness_tables() {
         let path = std::env::temp_dir().join(format!(
             "prism-config-structured-{}-{}.toml",
             std::process::id(),
@@ -1048,7 +1559,7 @@ mod tests {
             &path,
             r#"
 # top-level comment
-default_agent = "opencode"
+default_harness = "company-agent"
 default_base = "release/main"
 review_packet_dir = ".agent/review \"packets\""
 escape_key = "ctrl-space"
@@ -1068,20 +1579,27 @@ columns = ["url", "ci.status"]
 [tools]
 gh = "/opt/tools/gh"
 
-[agents.opencode]
-command = "opencode run --format json"
-prompt_mode = "argument"
+[harnesses.company-agent]
+adapter = "generic"
+interactive_command = ["company-agent"]
+headless_command = ["company-agent", "run", "{prompt}"]
+headless_prompt_transport = "argument"
 
 [prompt_templates]
 review = "fix\nreview"
 "#,
         )
         .unwrap();
-        let mut config = Config::defaults(PathBuf::from("/tmp/user.toml"), path.clone());
+        let mut config = Config::defaults(path.clone(), PathBuf::from("/tmp/repo.toml"));
 
         config.apply_file(&path);
 
         assert_eq!(config.default_base.as_deref(), Some("release/main"));
+        assert_eq!(config.default_harness, "company-agent");
+        assert_eq!(
+            config.harnesses["company-agent"].headless_prompt_transport,
+            Some(PromptTransport::Argument)
+        );
         assert_eq!(config.review_packet_dir, ".agent/review \"packets\"");
         assert_eq!(config.escape_key, EscapeKey::CtrlSpace);
         assert_eq!(config.icon_style, IconStyle::NerdFont);
@@ -1102,20 +1620,26 @@ review = "fix\nreview"
             PathBuf::from("/tmp/prism-repo-config.toml"),
         );
 
-        config.apply_raw_config(RawConfig {
-            layout: Some(RawLayoutConfig {
-                sidebar_width: Some(4),
-            }),
-            ..RawConfig::default()
-        });
+        config.apply_raw_config(
+            RawConfig {
+                layout: Some(RawLayoutConfig {
+                    sidebar_width: Some(4),
+                }),
+                ..RawConfig::default()
+            },
+            false,
+        );
         assert_eq!(config.layout.sidebar_width, Some(20));
 
-        config.apply_raw_config(RawConfig {
-            layout: Some(RawLayoutConfig {
-                sidebar_width: Some(999),
-            }),
-            ..RawConfig::default()
-        });
+        config.apply_raw_config(
+            RawConfig {
+                layout: Some(RawLayoutConfig {
+                    sidebar_width: Some(999),
+                }),
+                ..RawConfig::default()
+            },
+            false,
+        );
         assert_eq!(config.layout.sidebar_width, Some(120));
     }
 
@@ -1142,16 +1666,260 @@ review = "fix\nreview"
     }
 
     #[test]
-    fn rejects_non_opencode_default_agent() {
+    fn accepts_configured_generic_default_harness() {
         let mut config = Config::defaults(
             PathBuf::from("/tmp/user.toml"),
             PathBuf::from("/tmp/prism-repo-config.toml"),
         );
-        config.default_agent = "other-agent".to_string();
+        config.default_harness = "other-agent".to_string();
+        config.default_agent = config.default_harness.clone();
+        config.harnesses.insert(
+            "other-agent".to_string(),
+            HarnessConfig {
+                adapter: "generic".to_string(),
+                interactive_command: vec!["/bin/sh".to_string()],
+                arguments: Vec::new(),
+                interactive_prompt_transport: None,
+                headless_command: None,
+                headless_prompt_transport: None,
+                output_format: OutputFormat::Text,
+                environment: BTreeMap::new(),
+            },
+        );
 
+        ensure_configured_default_agent(&config).unwrap();
+    }
+
+    #[test]
+    fn selecting_builtin_codex_does_not_require_an_explicit_harness_table() {
+        let mut config = Config::defaults(
+            PathBuf::from("/tmp/user.toml"),
+            PathBuf::from("/tmp/prism-repo-config.toml"),
+        );
+        config.apply_raw_config(
+            RawConfig {
+                default_harness: Some("codex".to_string()),
+                ..RawConfig::default()
+            },
+            true,
+        );
+
+        let harness = config.selected_harness().unwrap();
+
+        assert_eq!(harness.describe().adapter, "codex");
+    }
+
+    #[test]
+    fn reserved_builtin_ids_cannot_be_redefined_as_generic() {
+        for id in ["opencode", "codex", "claude", "pi"] {
+            let error = harness_config_from_raw(
+                id,
+                RawHarnessConfig {
+                    adapter: Some("generic".to_string()),
+                    interactive_command: Some(vec!["other-agent".to_string()]),
+                    ..RawHarnessConfig::default()
+                },
+            )
+            .unwrap_err();
+
+            assert!(error.contains("reserved"), "{id}: {error}");
+        }
+    }
+
+    #[test]
+    fn custom_ids_cannot_alias_builtin_adapters() {
+        let error = harness_config_from_raw(
+            "codex-fast",
+            RawHarnessConfig {
+                adapter: Some("codex".to_string()),
+                ..RawHarnessConfig::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("fixed harness ID 'codex'"), "{error}");
+    }
+
+    #[test]
+    fn harness_config_writer_preserves_comments_and_root_tables() {
+        let input = "# keep me\ndefault_harness = \"opencode\" # selected\n\n[ui]\nicon_style = \"unicode\"\n";
+
+        let updated = update_user_harness_config_text(input, "codex", None).unwrap();
+        let parsed = updated.parse::<toml_edit::DocumentMut>().unwrap();
+
+        assert_eq!(parsed["default_harness"].as_str(), Some("codex"));
+        assert_eq!(parsed["ui"]["icon_style"].as_str(), Some("unicode"));
+        assert!(updated.contains("# keep me"));
+        assert!(updated.contains("# selected"));
+    }
+
+    #[test]
+    fn harness_config_writer_adds_validated_generic_harness_and_selects_it() {
+        let generic = HarnessConfig {
+            adapter: "generic".to_string(),
+            interactive_command: vec!["company-agent".to_string()],
+            arguments: Vec::new(),
+            interactive_prompt_transport: None,
+            headless_command: Some(vec!["company-agent".to_string(), "run".to_string()]),
+            headless_prompt_transport: Some(PromptTransport::Stdin),
+            output_format: OutputFormat::Text,
+            environment: BTreeMap::new(),
+        };
+
+        let updated = update_user_harness_config_text(
+            "[ui]\nicon_style = \"unicode\"\n",
+            "company-agent",
+            Some(&generic),
+        )
+        .unwrap();
+        let parsed = toml::from_str::<RawConfig>(&updated).unwrap();
+        let raw = parsed.harnesses.unwrap().remove("company-agent").unwrap();
+        let parsed_generic = harness_config_from_raw("company-agent", raw).unwrap();
+
+        assert_eq!(parsed.default_harness.as_deref(), Some("company-agent"));
+        assert_eq!(parsed_generic, generic);
+    }
+
+    #[test]
+    fn harness_config_writer_extends_an_inline_harnesses_table() {
+        let generic = HarnessConfig {
+            adapter: "generic".to_string(),
+            interactive_command: vec!["second-agent".to_string()],
+            arguments: Vec::new(),
+            interactive_prompt_transport: None,
+            headless_command: None,
+            headless_prompt_transport: None,
+            output_format: OutputFormat::Text,
+            environment: BTreeMap::new(),
+        };
+        let input = "harnesses = { first = { adapter = \"generic\", interactive_command = [\"first-agent\"] } }\n";
+
+        let updated = update_user_harness_config_text(input, "second", Some(&generic)).unwrap();
+        let parsed = toml::from_str::<RawConfig>(&updated).unwrap();
+        let harnesses = parsed.harnesses.unwrap();
+
+        assert!(harnesses.contains_key("first"));
+        assert!(harnesses.contains_key("second"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn harness_config_writer_preserves_a_symlinked_user_config() {
+        use std::os::unix::fs::symlink;
+
+        let directory = std::env::temp_dir().join(format!(
+            "prism-harness-config-symlink-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("managed.toml");
+        let link = directory.join("config.toml");
+        fs::write(&target, "default_harness = \"opencode\"\n").unwrap();
+        symlink(&target, &link).unwrap();
+
+        update_user_harness_config(&link, "codex", None).unwrap();
+
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            fs::read_to_string(&target)
+                .unwrap()
+                .contains("default_harness = \"codex\"")
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn session_specific_config_does_not_change_global_default() {
+        let mut config = Config::defaults(
+            PathBuf::from("/tmp/user.toml"),
+            PathBuf::from("/tmp/repo.toml"),
+        );
+        config.harnesses.insert(
+            "codex".to_string(),
+            HarnessConfig {
+                adapter: "codex".to_string(),
+                interactive_command: vec!["codex".to_string()],
+                arguments: Vec::new(),
+                interactive_prompt_transport: None,
+                headless_command: None,
+                headless_prompt_transport: None,
+                output_format: OutputFormat::JsonLines,
+                environment: BTreeMap::new(),
+            },
+        );
+        let selected = config.for_harness("codex").unwrap();
+        assert_eq!(selected.default_harness, "codex");
+        assert_eq!(selected.default_agent, "codex");
+        assert_eq!(config.default_harness, "opencode");
+        assert!(
+            config
+                .for_harness("missing")
+                .unwrap_err()
+                .contains("migrate")
+        );
+        assert!(config.recorded_harness_config("codex", "codex").is_ok());
+        config.harnesses.get_mut("codex").unwrap().adapter = "generic".to_string();
+        assert!(
+            config
+                .recorded_harness_config("codex", "codex")
+                .unwrap_err()
+                .contains("now configured as 'generic'")
+        );
+    }
+
+    #[test]
+    fn harness_configuration_source_distinguishes_defaults_from_user_config() {
+        let path = std::env::temp_dir().join(format!(
+            "prism-harness-source-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let config = Config::defaults(path.clone(), PathBuf::from("/tmp/repo.toml"));
+        assert_eq!(harness_config_source(&config), "built-in defaults");
+
+        fs::write(&path, "default_base = 'main'\n").unwrap();
+        assert_eq!(harness_config_source(&config), "built-in defaults");
+
+        fs::write(&path, "default_harness = 'opencode'\n").unwrap();
+        assert_eq!(harness_config_source(&config), path.display().to_string());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn obsolete_agent_settings_report_the_source_and_replacements() {
+        let path = std::env::temp_dir().join(format!(
+            "prism-obsolete-agent-config-{}-{}.toml",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(
+            &path,
+            "default_agent = 'opencode'\n[tools]\nopencode = 'opencode'\n[agents.opencode]\ncommand = 'opencode run'\n",
+        )
+        .unwrap();
+        let mut config = Config::defaults(path.clone(), PathBuf::from("/tmp/repo.toml"));
+
+        config.apply_file(&path);
         let error = ensure_configured_default_agent(&config).unwrap_err();
 
-        assert!(error.contains("unsupported default_agent"));
-        assert!(error.contains("opencode"));
+        assert!(error.contains(&path.display().to_string()));
+        assert!(error.contains("default_harness/[harnesses.*]"));
+        assert!(error.contains("[harnesses.opencode].program"));
+        let _ = fs::remove_file(path);
     }
 }

@@ -52,7 +52,7 @@
 - **Behavior**: Review-repair prompts include actionable inline feedback with
   file/line context; CI-repair prompts include PR identity, failing action facts,
   and a useful bounded failure-log tail.
-- **Invariant**: Starting a review or CI repair creates exactly one new OpenCode
+- **Invariant**: Starting a review or CI repair creates exactly one new harness
   session for the selected worktree and delivers the prompt only there.
 - **Behavior**: Prism records exactly which review threads informed a managed
   repair. After the guarded repair commit is pushed, it may resolve only those

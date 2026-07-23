@@ -54,6 +54,209 @@ pub(super) fn editor_command() -> Option<String> {
 }
 
 impl Tui {
+    pub(crate) fn select_default_harness(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let config = self.config.clone();
+        let entries = harness_choice_entries(&config);
+        let page_size = 4;
+        let page_count = entries.len().div_ceil(page_size).max(1);
+        let mut page = 0;
+        let selected = loop {
+            let start = page * page_size;
+            let visible = &entries[start..entries.len().min(start + page_size)];
+            let mut choices = visible
+                .iter()
+                .enumerate()
+                .map(|(index, (id, label))| {
+                    harness_key_choice(index, id, label, &config.default_harness)
+                })
+                .collect::<Vec<_>>();
+            choices.push(crate::view::KeyChoice::new("a", "Add generic harness..."));
+            if page > 0 {
+                choices.push(crate::view::KeyChoice::new("p", "Previous page"));
+            }
+            if page + 1 < page_count {
+                choices.push(crate::view::KeyChoice::new("n", "Next page"));
+            }
+            let title = if page_count > 1 {
+                format!("Default Harness ({}/{page_count})", page + 1)
+            } else {
+                "Default Harness".to_string()
+            };
+            match self.prompt_choice_dialog(raw, crate::view::ChoiceList { title, choices })? {
+                Some(choice) if choice == "a" => break None,
+                Some(choice) if choice == "p" => page = page.saturating_sub(1),
+                Some(choice) if choice == "n" => page = (page + 1).min(page_count - 1),
+                Some(choice) => {
+                    let index = choice
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|index| index.checked_sub(1))
+                        .ok_or_else(|| format!("unknown harness choice '{choice}'"))?;
+                    let id = visible
+                        .get(index)
+                        .map(|(id, _)| id.clone())
+                        .ok_or_else(|| format!("unknown harness choice '{choice}'"))?;
+                    break Some(id);
+                }
+                None => return Ok(()),
+            }
+        };
+
+        let harness_id = if let Some(id) = selected {
+            if id == config.default_harness {
+                self.show_message(&format!("'{id}' is already the default harness"))?;
+                return Ok(());
+            }
+            config.save_user_default_harness(&id)?;
+            id
+        } else {
+            let Some((id, harness)) = self.prompt_generic_harness(raw, &config)? else {
+                return Ok(());
+            };
+            config.save_user_generic_harness(&id, &harness)?;
+            id
+        };
+
+        self.config = Config::load(&self.repo);
+        self.refresh_sessions()?;
+        self.sync_selected_repo_context();
+        self.start_tmux_agent_warmup();
+        self.start_wt_column_poll();
+        self.show_message(&format!(
+            "default harness changed to '{harness_id}'; existing worktrees offer migration when opened"
+        ))?;
+        Ok(())
+    }
+
+    fn prompt_generic_harness(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+        config: &Config,
+    ) -> Result<Option<(String, HarnessConfig)>, String> {
+        let Some(id) = self.prompt_line_dialog(
+            raw,
+            "Add Generic Harness",
+            "Harness ID (lowercase letters, digits, - or _): ",
+            "",
+        )?
+        else {
+            return Ok(None);
+        };
+        let id = id.trim().to_string();
+        crate::config::validate_new_generic_harness_id(&id, &config.harnesses)?;
+
+        let Some(interactive) = self.prompt_line_dialog(
+            raw,
+            "Add Generic Harness",
+            "Interactive command (include {prompt} or {prompt_file} if used): ",
+            "",
+        )?
+        else {
+            return Ok(None);
+        };
+        let interactive_command = parse_command_words(&interactive)?;
+        let accepts_prompt_argument =
+            command_supports_prompt_transport(&interactive_command, PromptTransport::Argument);
+        let accepts_no_prompt =
+            command_supports_prompt_transport(&interactive_command, PromptTransport::Stdin);
+        let accepts_prompt_file =
+            command_supports_prompt_transport(&interactive_command, PromptTransport::TempFile);
+        let interactive_prompt_transport = match self.prompt_choice_dialog(
+            raw,
+            crate::view::ChoiceList {
+                title: "Interactive Initial Prompt".to_string(),
+                choices: vec![
+                    if accepts_no_prompt {
+                        crate::view::KeyChoice::new("n", "None")
+                    } else {
+                        crate::view::KeyChoice::disabled("n", "None")
+                    },
+                    if accepts_prompt_argument {
+                        crate::view::KeyChoice::new("a", "Argument")
+                    } else {
+                        crate::view::KeyChoice::disabled("a", "Argument")
+                    },
+                    if accepts_prompt_file {
+                        crate::view::KeyChoice::new("f", "Temporary file")
+                    } else {
+                        crate::view::KeyChoice::disabled("f", "Temporary file")
+                    },
+                ],
+            },
+        )? {
+            Some(choice) if choice == "a" => Some(PromptTransport::Argument),
+            Some(choice) if choice == "f" => Some(PromptTransport::TempFile),
+            Some(_) => None,
+            None => return Ok(None),
+        };
+
+        let Some(headless) = self.prompt_line_dialog(
+            raw,
+            "Add Generic Harness",
+            "Headless command (optional; include a prompt placeholder unless using stdin): ",
+            "",
+        )?
+        else {
+            return Ok(None);
+        };
+        let (headless_command, headless_prompt_transport) = if headless.trim().is_empty() {
+            (None, None)
+        } else {
+            let command = parse_command_words(&headless)?;
+            let accepts_prompt_argument =
+                command_supports_prompt_transport(&command, PromptTransport::Argument);
+            let accepts_stdin = command_supports_prompt_transport(&command, PromptTransport::Stdin);
+            let accepts_prompt_file =
+                command_supports_prompt_transport(&command, PromptTransport::TempFile);
+            let transport = match self.prompt_choice_dialog(
+                raw,
+                crate::view::ChoiceList {
+                    title: "Headless Prompt Transport".to_string(),
+                    choices: vec![
+                        if accepts_prompt_argument {
+                            crate::view::KeyChoice::new("a", "Argument")
+                        } else {
+                            crate::view::KeyChoice::disabled("a", "Argument")
+                        },
+                        if accepts_stdin {
+                            crate::view::KeyChoice::new("s", "Standard input")
+                        } else {
+                            crate::view::KeyChoice::disabled("s", "Standard input")
+                        },
+                        if accepts_prompt_file {
+                            crate::view::KeyChoice::new("f", "Temporary file")
+                        } else {
+                            crate::view::KeyChoice::disabled("f", "Temporary file")
+                        },
+                    ],
+                },
+            )? {
+                Some(choice) if choice == "a" => PromptTransport::Argument,
+                Some(choice) if choice == "s" => PromptTransport::Stdin,
+                Some(choice) if choice == "f" => PromptTransport::TempFile,
+                Some(choice) => return Err(format!("unknown prompt transport '{choice}'")),
+                None => return Ok(None),
+            };
+            (Some(command), Some(transport))
+        };
+
+        let harness = HarnessConfig {
+            adapter: "generic".to_string(),
+            interactive_command,
+            arguments: Vec::new(),
+            interactive_prompt_transport,
+            headless_command,
+            headless_prompt_transport,
+            output_format: OutputFormat::Text,
+            environment: BTreeMap::new(),
+        };
+        harness.validate(&id)?;
+        Ok(Some((id, harness)))
+    }
+
     pub(crate) fn edit_config(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
@@ -396,6 +599,57 @@ impl Tui {
     }
 }
 
+fn harness_key_choice(
+    index: usize,
+    id: &str,
+    label: &str,
+    default_harness: &str,
+) -> crate::view::KeyChoice {
+    if id == default_harness {
+        crate::view::KeyChoice::disabled((index + 1).to_string(), label)
+    } else {
+        crate::view::KeyChoice::new((index + 1).to_string(), label)
+    }
+}
+
+fn command_supports_prompt_transport(command: &[String], transport: PromptTransport) -> bool {
+    let prompt_count = command.iter().filter(|arg| *arg == "{prompt}").count();
+    let file_count = command.iter().filter(|arg| *arg == "{prompt_file}").count();
+    match transport {
+        PromptTransport::Argument => prompt_count == 1 && file_count == 0,
+        PromptTransport::Stdin => prompt_count == 0 && file_count == 0,
+        PromptTransport::TempFile => prompt_count == 0 && file_count == 1,
+    }
+}
+
+pub(super) fn harness_choice_entries(config: &Config) -> Vec<(String, String)> {
+    let mut ids = crate::harness::BUILTIN_HARNESS_IDS
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    ids.extend(
+        config
+            .harnesses
+            .iter()
+            .filter(|(id, harness)| {
+                crate::harness::builtin_adapter(id).is_none() && harness.adapter == "generic"
+            })
+            .map(|(id, _)| id.clone()),
+    );
+    ids.into_iter()
+        .map(|id| {
+            let name = match id.as_str() {
+                "opencode" => "OpenCode".to_string(),
+                "codex" => "Codex".to_string(),
+                "claude" => "Claude Code".to_string(),
+                "pi" => "Pi".to_string(),
+                _ => id.clone(),
+            };
+            (id, name)
+        })
+        .collect()
+}
+
 pub(super) fn worktree_column_choices(
     configured: &[String],
     sessions: &[crate::session::Session],
@@ -522,6 +776,89 @@ pub(super) fn set_worktree_columns_text(text: &str, columns_line: &str) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn harness_choices_list_fixed_builtins_then_configured_generics() {
+        let mut config = crate::test_support::test_config();
+        for adapter in ["codex", "claude", "pi"] {
+            config.harnesses.insert(
+                adapter.to_string(),
+                HarnessConfig::builtin(adapter, adapter),
+            );
+        }
+        config.harnesses.insert(
+            "company-agent".to_string(),
+            HarnessConfig {
+                adapter: "generic".to_string(),
+                interactive_command: vec!["company-agent".to_string()],
+                arguments: Vec::new(),
+                interactive_prompt_transport: None,
+                headless_command: None,
+                headless_prompt_transport: None,
+                output_format: OutputFormat::Text,
+                environment: BTreeMap::new(),
+            },
+        );
+
+        let choices = harness_choice_entries(&config);
+
+        assert_eq!(
+            choices
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            ["opencode", "codex", "claude", "pi", "company-agent"]
+        );
+        assert_eq!(choices[0].1, "OpenCode");
+        assert_eq!(choices[4].1, "company-agent");
+        assert!(harness_key_choice(0, &choices[0].0, &choices[0].1, "opencode").disabled);
+    }
+
+    #[test]
+    fn harness_choices_do_not_drop_large_generic_configurations() {
+        let mut config = crate::test_support::test_config();
+        for adapter in ["codex", "claude", "pi"] {
+            config.harnesses.insert(
+                adapter.to_string(),
+                HarnessConfig::builtin(adapter, adapter),
+            );
+        }
+        for index in 0..40 {
+            config.harnesses.insert(
+                format!("generic-{index:02}"),
+                HarnessConfig {
+                    adapter: "generic".to_string(),
+                    interactive_command: vec!["agent".to_string()],
+                    arguments: Vec::new(),
+                    interactive_prompt_transport: None,
+                    headless_command: None,
+                    headless_prompt_transport: None,
+                    output_format: OutputFormat::Text,
+                    environment: BTreeMap::new(),
+                },
+            );
+        }
+
+        assert_eq!(harness_choice_entries(&config).len(), 44);
+    }
+
+    #[test]
+    fn prompt_transport_choices_require_the_matching_placeholder_shape() {
+        let argument = vec!["agent".to_string(), "{prompt}".to_string()];
+        assert!(command_supports_prompt_transport(
+            &argument,
+            PromptTransport::Argument
+        ));
+        assert!(!command_supports_prompt_transport(
+            &argument,
+            PromptTransport::Stdin
+        ));
+        let repeated = vec!["{prompt}".to_string(), "{prompt}".to_string()];
+        assert!(!command_supports_prompt_transport(
+            &repeated,
+            PromptTransport::Argument
+        ));
+    }
 
     #[test]
     fn repository_order_preserves_keys_and_omits_disabled_entries() {

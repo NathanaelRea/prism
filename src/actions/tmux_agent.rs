@@ -20,8 +20,9 @@ impl Tui {
             return Ok(());
         };
         let repo = managed.repo.clone();
-        let config = managed.config.clone();
         let session = self.sessions[session_index].background_job_snapshot();
+        let association = crate::session::worktree_harness(&repo, &session)?;
+        let config = managed.config.for_harness(&association.harness_id)?;
         let use_ =
             crate::agent_session::session_use(&self.repos, &mut self.tmux_generations, &session);
         self.finish_tmux_warmup_for_key(&use_.warmup_key);
@@ -65,8 +66,9 @@ impl Tui {
             return Ok(());
         };
         let repo = managed.repo.clone();
-        let config = managed.config.clone();
         let session = self.sessions[session_index].background_job_snapshot();
+        let association = crate::session::worktree_harness(&repo, &session)?;
+        let config = managed.config.for_harness(&association.harness_id)?;
         let mut use_ =
             crate::agent_session::session_use(&self.repos, &mut self.tmux_generations, &session);
         if force_new_generation {
@@ -161,7 +163,7 @@ impl Tui {
         changed
     }
 
-    pub(super) fn finish_tmux_warmup_for_key(&mut self, key: &AgentSessionWarmupKey) -> bool {
+    pub(crate) fn finish_tmux_warmup_for_key(&mut self, key: &AgentSessionWarmupKey) -> bool {
         let mut changed = self.poll_tmux_agent_warmup();
         while self.tmux_warmups_in_flight.contains(key) {
             let Ok(result) = self.tmux_warmup_rx.recv() else {
@@ -200,7 +202,8 @@ impl Tui {
             .get(session.repo_index)
             .ok_or_else(|| "selected session repository no longer exists".to_string())?;
         let repo = managed.repo.clone();
-        let config = managed.config.clone();
+        let association = crate::session::worktree_harness(&repo, &session)?;
+        let config = managed.config.for_harness(&association.harness_id)?;
         let mut use_ =
             crate::agent_session::session_use(&self.repos, &mut self.tmux_generations, &session);
         if force_new_generation {
@@ -236,7 +239,7 @@ impl Tui {
     }
 
     fn mark_opencode_prompt_submitted(&mut self, index: usize, config: &crate::config::Config) {
-        if config.default_agent != "opencode"
+        if !config.selected_adapter_is("opencode")
             || config.is_default_branch(&self.sessions[index].branch)
         {
             return;

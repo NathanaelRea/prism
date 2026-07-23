@@ -199,6 +199,16 @@ pub fn infer_total_phases(path: &Path) -> Result<usize, String> {
 }
 
 pub fn run_plan_mode(cwd: &Path, config: &Config, path: Option<&Path>) -> Result<(), String> {
+    let selected_harness = config.harness_config(&config.default_harness)?;
+    if !crate::harness::Harness::new(&config.default_harness, &selected_harness)
+        .describe()
+        .headless
+    {
+        return Err(format!(
+            "harness '{}' does not support managed Plan execution; configure headless_command and headless_prompt_transport",
+            config.default_harness
+        ));
+    }
     let execution = PlanExecution::prepare(cwd, config, path)?;
     let repo = Repository {
         root: execution.cwd.clone(),
@@ -211,29 +221,33 @@ pub fn run_plan_mode(cwd: &Path, config: &Config, path: Option<&Path>) -> Result
         execution.start,
         execution.total,
         PlanRunMode::Sequential,
-    )?;
-    let server_url = match crate::opencode::ensure_opencode_server(
-        &repo,
-        config,
-        "plan",
-        &execution.cwd,
-    ) {
-        Ok(runtime) => Some(runtime.server_url),
-        Err(error) => {
-            eprintln!(
-                "warning: could not start OpenCode server for attach; falling back to direct opencode run: {error}"
-            );
-            None
+    )?
+    .with_harness(
+        config.default_harness.clone(),
+        selected_harness.adapter.clone(),
+    );
+    let server_url = {
+        let harness = crate::harness::Harness::new(&config.default_harness, &selected_harness);
+        match harness.prepare_server(&repo, config, "plan", &execution.cwd) {
+            Ok(runtime) => runtime.map(|runtime| runtime.server_url),
+            Err(error) => {
+                eprintln!(
+                    "warning: could not prepare harness server for attach; falling back to a direct harness run: {error}"
+                );
+                None
+            }
         }
     };
 
-    let mut executor = PlanExecutorConfig::new(
-        config.tool("opencode"),
+    let mut executor = PlanExecutorConfig::for_harness(
+        config.default_harness.clone(),
+        selected_harness.clone(),
         server_url,
         execution.cwd.clone(),
         execution.plan_file.clone(),
     );
-    if config.opencode_plan_plugin
+    if selected_harness.adapter == "opencode"
+        && config.opencode_plan_plugin
         && let Ok(plugin) = prepare_plan_plugin_config(&repo.prism_dir())
     {
         executor = executor.with_plugin_config(plugin);

@@ -1,5 +1,22 @@
 use super::*;
 
+#[derive(Clone, Copy)]
+pub(super) struct PlanActionAvailability {
+    pause_resume: bool,
+    retry_failed: bool,
+    retry_from_selected: bool,
+    skip: bool,
+    abort: bool,
+}
+
+fn action_choice(key: &str, label: &str, enabled: bool) -> crate::view::KeyChoice {
+    if enabled {
+        crate::view::KeyChoice::new(key, label)
+    } else {
+        crate::view::KeyChoice::disabled(key, label)
+    }
+}
+
 pub(super) fn plan_run_mode_from_parallel_confirmation(parallel: bool) -> PlanRunMode {
     if parallel {
         PlanRunMode::Parallel
@@ -27,6 +44,12 @@ impl Tui {
         config: crate::config::Config,
         scope_path: PathBuf,
     ) -> Result<(), String> {
+        if !config.selected_harness()?.describe().headless {
+            return Err(format!(
+                "harness '{}' does not support managed Plan execution; configure headless_command and headless_prompt_transport",
+                config.default_harness
+            ));
+        }
         raw.suspend()?;
         let execution = PlanExecution::prepare(&scope_path, &config, None);
         let resume_result = raw.resume();
@@ -39,7 +62,10 @@ impl Tui {
             false,
         )?;
         let mode = plan_run_mode_from_parallel_confirmation(parallel);
-        let launch = execution.launch(&repo.root, mode)?;
+        let launch = execution.launch(&repo.root, mode)?.with_harness(
+            config.default_harness.clone(),
+            config.harness_adapter(&config.default_harness)?,
+        );
         let mut should_execute = true;
         let persisted = crate::observability::with_writable_db(&repo, |conn| {
             if let Some(mut persisted) = load_resumable_plan_run(conn, &launch)? {
@@ -91,17 +117,48 @@ impl Tui {
             let mode = persisted.run.mode;
             let scope_path = persisted.run.scope_path.clone();
             let title_prefix = persisted.run.plan_display.clone();
+            let harness_config = match config.harness_config(&persisted.run.harness_id) {
+                Ok(harness) => harness,
+                Err(_) => {
+                    let _ = tx.send(PlanRunResult {
+                        repo_root: repo.root,
+                        run_id,
+                        result: Err(format!(
+                            "plan run harness '{}' is no longer configured",
+                            persisted.run.harness_id
+                        )),
+                    });
+                    return;
+                }
+            };
+            if harness_config.adapter != persisted.run.adapter_id {
+                let _ = tx.send(PlanRunResult {
+                    repo_root: repo.root,
+                    run_id,
+                    result: Err(format!(
+                        "plan run harness '{}' was recorded with adapter '{}', but it is now configured as '{}'",
+                        persisted.run.harness_id,
+                        persisted.run.adapter_id,
+                        harness_config.adapter
+                    )),
+                });
+                return;
+            }
             let server_url =
-                crate::opencode::ensure_opencode_server(&repo, &config, "plan", &scope_path)
+                crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
+                    .prepare_server(&repo, &config, "plan", &scope_path)
                     .ok()
+                    .flatten()
                     .map(|runtime| runtime.server_url);
-            let mut executor = PlanExecutorConfig::new(
-                config.tool("opencode"),
+            let mut executor = PlanExecutorConfig::for_harness(
+                persisted.run.harness_id.clone(),
+                harness_config.clone(),
                 server_url,
                 scope_path.clone(),
                 title_prefix,
             );
-            if config.opencode_plan_plugin
+            if harness_config.adapter == "opencode"
+                && config.opencode_plan_plugin
                 && let Ok(plugin) = prepare_plan_plugin_config(&repo.prism_dir())
             {
                 executor = executor.with_plugin_config(plugin);
@@ -139,15 +196,10 @@ impl Tui {
             self.show_message("selected plan phase was not found")?;
             return Ok(false);
         };
-        let Some(server_url) = plan_step.opencode_server_url.clone() else {
-            self.show_message("selected plan phase has no OpenCode server yet")?;
+        let Some(session_id) = plan_step.session.id.clone() else {
+            self.show_message("selected plan phase has no resumable harness session yet")?;
             return Ok(false);
         };
-        let Some(session_id) = plan_step.opencode_session_id.clone() else {
-            self.show_message("selected plan phase has no OpenCode session yet")?;
-            return Ok(false);
-        };
-        let (_, server_port) = crate::opencode::parse_localhost_url(&server_url)?;
         let Some(session_index) = self.sessions.iter().position(|session| {
             session.path == plan_run.run.scope_path
                 && self
@@ -162,27 +214,75 @@ impl Tui {
             return Ok(true);
         };
         let config = managed.config.clone();
-        if config.default_agent != "opencode" {
-            self.show_message("selected worktree is not using OpenCode")?;
-            return Ok(false);
+        let harness_config =
+            config.recorded_harness_config(&plan_run.run.harness_id, &plan_run.run.adapter_id)?;
+        let description =
+            crate::harness::Harness::new(&plan_run.run.harness_id, &harness_config).describe();
+        if plan_run.run.adapter_id != "opencode" {
+            if !description.interactive_resume {
+                self.show_message("selected harness does not support interactive session resume")?;
+                return Ok(false);
+            }
+            let run_config = config.for_harness(&plan_run.run.harness_id)?;
+            let session = self.sessions[session_index].background_job_snapshot();
+            let use_ = crate::agent_session::session_use(
+                &self.repos,
+                &mut self.tmux_generations,
+                &session,
+            );
+            self.finish_tmux_warmup_for_key(&use_.warmup_key);
+            let generation = crate::agent_session::rotate_generation(
+                &self.repos,
+                &mut self.tmux_generations,
+                use_.slot,
+            );
+            raw.suspend()?;
+            let result = crate::tmux::attach_resumable_harness_session(
+                &repo,
+                &run_config,
+                &session,
+                generation,
+                &session_id,
+            );
+            let resume_result = raw.resume();
+            self.refresh_sessions()?;
+            self.start_tmux_agent_warmup();
+            resume_result?;
+            result?;
+            return Ok(true);
         }
+        let Some(server_url) = plan_step.session.endpoint.clone() else {
+            self.show_message("selected plan phase has no OpenCode server yet")?;
+            return Ok(false);
+        };
+        let (_, server_port) = crate::opencode::parse_localhost_url(&server_url)?;
         let session = self.sessions[session_index].background_job_snapshot();
-        let plan_runtime = crate::opencode::load_runtime(&repo, "plan", &session.path)
-            .ok()
-            .flatten()
-            .filter(|runtime| runtime.server_url == server_url);
-        let mut runtime = crate::opencode::load_runtime(&repo, &session.branch, &session.path)?
-            .unwrap_or_else(|| crate::opencode::OpencodeRuntime {
-                repo_root: repo.root.display().to_string(),
-                branch: session.branch.clone(),
-                worktree_path: session.path.display().to_string(),
-                server_port,
-                server_url: server_url.clone(),
-                server_pid: plan_runtime.as_ref().and_then(|runtime| runtime.server_pid),
-                opencode_session_id: None,
-                generation: 0,
-                updated_unix_ms: 0,
-            });
+        let plan_runtime =
+            crate::opencode::load_runtime(&repo, &plan_run.run.harness_id, "plan", &session.path)
+                .ok()
+                .flatten()
+                .filter(|runtime| runtime.server_url == server_url);
+        let mut runtime = crate::opencode::load_runtime(
+            &repo,
+            &plan_run.run.harness_id,
+            &session.branch,
+            &session.path,
+        )?
+        .unwrap_or_else(|| crate::opencode::OpencodeRuntime {
+            repo_root: repo.root.display().to_string(),
+            harness_id: plan_run.run.harness_id.clone(),
+            branch: session.branch.clone(),
+            worktree_path: session.path.display().to_string(),
+            server_port,
+            server_url: server_url.clone(),
+            server_pid: plan_runtime.as_ref().and_then(|runtime| runtime.server_pid),
+            server_start_time_ticks: plan_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.server_start_time_ticks),
+            opencode_session_id: None,
+            generation: 0,
+            updated_unix_ms: 0,
+        });
         let server_pid = plan_runtime
             .as_ref()
             .and_then(|runtime| runtime.server_pid)
@@ -265,14 +365,47 @@ impl Tui {
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
-        if self.current_plan_dashboard().is_none() {
+        let Some(dashboard) = self.current_plan_dashboard() else {
             self.show_message("focus an Auto Flow or plan run to show plan actions")?;
             return Ok(());
-        }
+        };
+        let selected = dashboard
+            .run
+            .steps
+            .iter()
+            .find(|step| step.step == dashboard.run.run.selected_step);
+        let resuming =
+            dashboard.run.run.pause_requested || dashboard.run.run.status == PlanRunStatus::Paused;
+        let availability = PlanActionAvailability {
+            pause_resume: resuming
+                || !matches!(
+                    dashboard.run.run.status,
+                    PlanRunStatus::Done | PlanRunStatus::Failed | PlanRunStatus::Aborted
+                ),
+            retry_failed: dashboard.run.steps.iter().any(|step| {
+                matches!(
+                    step.status,
+                    PlanStepStatus::Failed | PlanStepStatus::Aborted
+                )
+            }),
+            retry_from_selected: selected.is_some(),
+            skip: selected.is_some_and(|step| {
+                !matches!(
+                    step.status,
+                    PlanStepStatus::Starting | PlanStepStatus::Running
+                )
+            }),
+            abort: dashboard.run.steps.iter().any(|step| {
+                matches!(
+                    step.status,
+                    PlanStepStatus::Queued | PlanStepStatus::Starting | PlanStepStatus::Running
+                )
+            }),
+        };
 
         let answer = self.prompt_choice_dialog(
             raw,
-            Self::plan_action_choices("Plan Actions", "skip phase", true),
+            Self::plan_action_choices("Plan Actions", "skip phase", true, availability),
         )?;
         let Some(answer) = answer else {
             return Ok(());
@@ -322,9 +455,60 @@ impl Tui {
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
+        let Some(dashboard) = self.current_auto_dashboard() else {
+            return Ok(());
+        };
+        let selected_auto_step = dashboard
+            .run
+            .run
+            .selected_step_run_id
+            .and_then(|id| dashboard.run.steps.iter().find(|step| step.id == Some(id)));
+        let selected_plan_step = dashboard.linked_plan_dashboard.as_ref().and_then(|linked| {
+            linked
+                .run
+                .steps
+                .iter()
+                .find(|step| step.step == linked.run.run.selected_step)
+        });
+        let resuming =
+            dashboard.run.run.pause_requested || dashboard.run.run.status == AutoRunStatus::Paused;
+        let availability = PlanActionAvailability {
+            pause_resume: resuming
+                || !matches!(
+                    dashboard.run.run.status,
+                    AutoRunStatus::Done | AutoRunStatus::Failed | AutoRunStatus::Aborted
+                ),
+            retry_failed: dashboard.run.steps.iter().any(|step| {
+                matches!(
+                    step.status,
+                    AutoStepStatus::Failed | AutoStepStatus::Aborted
+                )
+            }),
+            retry_from_selected: selected_auto_step.is_some(),
+            skip: selected_plan_step.is_some_and(|step| {
+                !matches!(
+                    step.status,
+                    PlanStepStatus::Starting | PlanStepStatus::Running
+                )
+            }),
+            abort: dashboard.run.steps.iter().any(|step| {
+                matches!(
+                    step.status,
+                    AutoStepStatus::Queued
+                        | AutoStepStatus::Starting
+                        | AutoStepStatus::Running
+                        | AutoStepStatus::Waiting
+                )
+            }),
+        };
         let answer = self.prompt_choice_dialog(
             raw,
-            Self::plan_action_choices("Auto Plan Actions", "skip linked phase", false),
+            Self::plan_action_choices(
+                "Auto Plan Actions",
+                "skip linked phase",
+                false,
+                availability,
+            ),
         )?;
         let Some(answer) = answer else {
             return Ok(());
@@ -362,27 +546,26 @@ impl Tui {
         title: &str,
         skip_label: &str,
         include_run_navigation: bool,
+        availability: PlanActionAvailability,
     ) -> crate::view::ChoiceList {
         let mut choices = Vec::new();
         if include_run_navigation {
             choices.extend([("n", "next run"), ("v", "previous run")]);
         }
-        choices.extend([
-            ("u", "pause/resume"),
-            ("f", "retry failed"),
-            ("b", "retry from selected"),
-            ("s", skip_label),
-            ("x", "abort"),
+        let mut rendered = choices
+            .into_iter()
+            .map(|(key, label)| crate::view::KeyChoice::new(key, label))
+            .collect::<Vec<_>>();
+        rendered.extend([
+            action_choice("u", "pause/resume", availability.pause_resume),
+            action_choice("f", "retry failed", availability.retry_failed),
+            action_choice("b", "retry from selected", availability.retry_from_selected),
+            action_choice("s", skip_label, availability.skip),
+            action_choice("x", "abort", availability.abort),
         ]);
         crate::view::ChoiceList {
             title: title.to_string(),
-            choices: choices
-                .into_iter()
-                .map(|(key, label)| crate::view::KeyChoice {
-                    key: key.to_string(),
-                    label: label.to_string(),
-                })
-                .collect(),
+            choices: rendered,
         }
     }
 
@@ -398,17 +581,27 @@ impl Tui {
         };
         let run_id = dashboard.run.run.id.clone();
         let selected_step = dashboard.run.run.selected_step;
+        let selected_running = dashboard.run.steps.iter().any(|step| {
+            step.step == selected_step
+                && matches!(
+                    step.status,
+                    PlanStepStatus::Starting | PlanStepStatus::Running
+                )
+        });
+        let run_active = dashboard.run.steps.iter().any(|step| {
+            matches!(
+                step.status,
+                PlanStepStatus::Queued | PlanStepStatus::Starting | PlanStepStatus::Running
+            )
+        });
         let answer = self.prompt_choice_dialog(
             raw,
             crate::view::ChoiceList {
                 title: "Abort Plan".to_string(),
-                choices: [("s", "selected phase"), ("a", "all running phases")]
-                    .into_iter()
-                    .map(|(key, label)| crate::view::KeyChoice {
-                        key: key.to_string(),
-                        label: label.to_string(),
-                    })
-                    .collect(),
+                choices: vec![
+                    action_choice("s", "selected phase", selected_running),
+                    action_choice("a", "all running phases", run_active),
+                ],
             },
         )?;
         let Some(answer) = answer else {
@@ -618,5 +811,34 @@ impl Tui {
         }
         self.show_message("dismissed plan run")?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_action_choices_disable_unavailable_operations() {
+        let choices = Tui::plan_action_choices(
+            "Plan Actions",
+            "skip phase",
+            false,
+            PlanActionAvailability {
+                pause_resume: false,
+                retry_failed: true,
+                retry_from_selected: false,
+                skip: true,
+                abort: false,
+            },
+        );
+
+        let disabled = choices
+            .choices
+            .iter()
+            .filter(|choice| choice.disabled)
+            .map(|choice| choice.key.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(disabled, ["u", "b", "x"]);
     }
 }

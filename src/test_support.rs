@@ -16,6 +16,12 @@ pub(crate) fn test_config() -> Config {
         .map(|name| (name.to_string(), unconfigured_tool_path(name)))
         .collect();
     Config {
+        default_harness: "opencode".to_string(),
+        harnesses: BTreeMap::from([(
+            "opencode".to_string(),
+            crate::harness::HarnessConfig::opencode("opencode"),
+        )]),
+        config_errors: Vec::new(),
         default_agent: "ask".to_string(),
         default_base: None,
         plan_dir: "plans".to_string(),
@@ -57,11 +63,23 @@ pub(crate) fn install_tool(
     config
         .tools
         .insert(name.to_string(), path.display().to_string());
+    if name == "opencode" {
+        config.harnesses.insert(
+            "opencode".to_string(),
+            crate::harness::HarnessConfig::opencode(path.display().to_string()),
+        );
+    }
     path
 }
 
 pub(crate) fn use_real_tool(config: &mut Config, name: &str) {
     config.tools.insert(name.to_string(), name.to_string());
+    if name == "opencode" {
+        config.harnesses.insert(
+            "opencode".to_string(),
+            crate::harness::HarnessConfig::opencode(name),
+        );
+    }
 }
 
 pub(crate) fn write_executable(path: &Path, contents: &str) {

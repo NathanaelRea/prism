@@ -144,7 +144,7 @@ fn config_prints_effective_repo_config() {
     assert!(output.status.success(), "{}", stderr(&output));
     let stdout = stdout(&output);
     assert!(stdout.contains(&format!("repo_root = {}", canonical_display(&repo))));
-    assert!(stdout.contains("default_agent = opencode"));
+    assert!(stdout.contains("default_harness = opencode"));
     assert!(stdout.contains("default_base = main"));
 }
 
@@ -160,7 +160,7 @@ fn config_discovery_commands_print_templates_schema_and_paths() {
     let example_stdout = stdout(&example);
     assert!(example_stdout.contains("#:schema https://raw.githubusercontent.com/"));
     assert!(example_stdout.contains("[ui]"));
-    assert!(example_stdout.contains("default_agent = \"opencode\""));
+    assert!(example_stdout.contains("default_harness = \"opencode\""));
     assert!(example_stdout.contains("[worktrees]"));
     assert!(example_stdout.contains("auto_implement ="));
 
@@ -213,7 +213,7 @@ fn doctor_reports_repository_and_tool_status() {
     let stdout = stdout(&output);
     assert!(stdout.contains("Prism doctor"));
     assert!(stdout.contains(&format!("repo: {}", canonical_display(&repo))));
-    assert!(stdout.contains("default agent: opencode"));
+    assert!(stdout.contains("selected harness: opencode"));
     assert!(stdout.contains("checks: pre_pr=0 pre_push=0 review_fix=0"));
 }
 
@@ -491,7 +491,7 @@ fn real_prism_opencode_tmux_stack_ensures_reusable_agent_session() {
     fs::write(
         prism_config_dir.join("config.toml"),
         format!(
-            "default_agent = \"opencode\"\ndefault_base = \"main\"\nopencode_port_base = 43000\nopencode_port_span = 1000\n\n[tools]\nopencode = \"{}\"\ntmux = \"{}\"\n",
+            "default_harness = \"opencode\"\ndefault_base = \"main\"\nopencode_port_base = 43000\nopencode_port_span = 1000\n\n[harnesses.opencode]\nadapter = \"opencode\"\nprogram = \"{}\"\n\n[tools]\ntmux = \"{}\"\n",
             toml_escape(&bin.join("opencode").display().to_string()),
             toml_escape(&bin.join("tmux").display().to_string()),
         ),
@@ -511,10 +511,10 @@ fn real_prism_opencode_tmux_stack_ensures_reusable_agent_session() {
     assert!(first_stdout.contains(&format!("worktree = {}", worktree.display())));
     assert!(first_stdout.contains("running = true"));
     let tmux_session = output_value(&first_stdout, "tmux_session");
-    let opencode_session = output_value(&first_stdout, "opencode_session_id");
-    let opencode_server_pid = output_value(&first_stdout, "opencode_server_pid");
-    assert!(!opencode_session.is_empty());
-    assert!(!opencode_server_pid.is_empty());
+    let session_id = output_value(&first_stdout, "session_id");
+    let runtime_process_id = output_value(&first_stdout, "runtime_process_id");
+    assert!(!session_id.is_empty());
+    assert!(!runtime_process_id.is_empty());
 
     let sessions =
         run_output(Command::new(&cleanup.tmux).args(["list-sessions", "-F", "#{session_name}"]));
@@ -539,13 +539,10 @@ fn real_prism_opencode_tmux_stack_ensures_reusable_agent_session() {
     assert!(second.status.success(), "{}", stderr(&second));
     let second_stdout = stdout(&second);
     assert_eq!(output_value(&second_stdout, "tmux_session"), tmux_session);
+    assert_eq!(output_value(&second_stdout, "session_id"), session_id);
     assert_eq!(
-        output_value(&second_stdout, "opencode_session_id"),
-        opencode_session
-    );
-    assert_eq!(
-        output_value(&second_stdout, "opencode_server_pid"),
-        opencode_server_pid
+        output_value(&second_stdout, "runtime_process_id"),
+        runtime_process_id
     );
     let second_pane_pid = run_output(Command::new(&cleanup.tmux).args([
         "display-message",

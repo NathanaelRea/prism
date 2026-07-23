@@ -68,7 +68,8 @@ pub fn execute_plan_parallel(
             let step = &mut persisted.steps[index];
             step.status = PlanStepStatus::Starting;
             step.started_unix_ms = Some(unix_ms());
-            step.opencode_server_url = executor.server_url.clone();
+            step.session.endpoint = executor.server_url.clone();
+            step.session.adapter_id = Some(executor.harness_config.adapter.clone());
             step.agent_variant = executor.agent_variant.clone();
             step.error = None;
             save_step_with_conn(conn, step)?;
@@ -79,10 +80,23 @@ pub fn execute_plan_parallel(
         writeln!(output, "\n==> {prompt}\n")
             .map_err(|error| format!("write plan output: {error}"))?;
 
-        let mut command = opencode_run_command(executor, step_number, &prompt, true);
-        let spawn_result = spawn_opencode(&mut command);
-        let (child, used_attach) = match spawn_result {
-            Ok(child) => (child, true),
+        let (mut command, invocation) =
+            match harness_run_command(executor, step_number, &prompt, true) {
+                Ok(command) => command,
+                Err(error) => {
+                    mark_spawn_failure(
+                        conn,
+                        &mut persisted.steps[index],
+                        &error,
+                        executor.max_output_lines_per_step,
+                    )?;
+                    spawn_errors.push(error);
+                    continue;
+                }
+            };
+        let spawn_result = spawn_harness(&mut command, &invocation);
+        let (mut child, used_attach) = match spawn_result {
+            Ok(child) => (child, invocation.attach),
             Err(error) if executor.server_url.is_some() => {
                 append_system_output(
                     conn,
@@ -91,8 +105,9 @@ pub fn execute_plan_parallel(
                     &format!("attach launch failed, retrying without --attach: {error}"),
                     executor.max_output_lines_per_step,
                 )?;
-                let mut fallback = opencode_run_command(executor, step_number, &prompt, false);
-                match spawn_opencode(&mut fallback) {
+                let (mut fallback, fallback_invocation) =
+                    harness_run_command(executor, step_number, &prompt, false)?;
+                match spawn_harness(&mut fallback, &fallback_invocation) {
                     Ok(child) => (child, false),
                     Err(error) => {
                         mark_spawn_failure(
@@ -107,6 +122,7 @@ pub fn execute_plan_parallel(
                 }
             }
             Err(error) => {
+                invocation.cleanup();
                 mark_spawn_failure(
                     conn,
                     &mut persisted.steps[index],
@@ -118,11 +134,16 @@ pub fn execute_plan_parallel(
             }
         };
 
-        persisted.steps[index].status = PlanStepStatus::Running;
-        persisted.steps[index].process_id = Some(child.id());
+        if !claim_spawned_process(conn, &mut persisted.steps[index], &mut child)? {
+            invocation.cleanup();
+            spawn_errors.push(format!(
+                "plan step {step_number} was aborted while starting"
+            ));
+            continue;
+        }
         identify_attached_plan_session(executor, &mut persisted.steps[index]);
         save_step_with_conn(conn, &persisted.steps[index])?;
-        spawn_parallel_child(index, child, used_attach, tx.clone())?;
+        spawn_parallel_child(index, child, used_attach, invocation, tx.clone())?;
         running += 1;
     }
     drop(tx);
@@ -142,6 +163,8 @@ pub fn execute_plan_parallel(
                         stream,
                         &text,
                         executor.max_output_lines_per_step,
+                        executor.harness_config.output_format
+                            == crate::harness::OutputFormat::JsonLines,
                         output,
                     )?;
                 }
@@ -152,7 +175,13 @@ pub fn execute_plan_parallel(
                 used_attach,
             })) => {
                 if let Some(step) = persisted.steps.get_mut(step_index) {
-                    finish_step_after_exit(conn, step, exit_code, used_attach)?;
+                    finish_step_after_exit(
+                        conn,
+                        step,
+                        exit_code,
+                        used_attach,
+                        &executor.harness_id,
+                    )?;
                     persisted.run.selected_step = step.step;
                     persisted.run.status = persisted.aggregate_status();
                     persisted.run.updated_unix_ms = unix_ms();
@@ -206,7 +235,8 @@ pub(super) fn execute_one_step(
         let step = &mut persisted.steps[step_index];
         step.status = PlanStepStatus::Starting;
         step.started_unix_ms = Some(unix_ms());
-        step.opencode_server_url = executor.server_url.clone();
+        step.session.endpoint = executor.server_url.clone();
+        step.session.adapter_id = Some(executor.harness_config.adapter.clone());
         step.agent_variant = executor.agent_variant.clone();
         step.error = None;
         persisted.run.selected_step = step.step;
@@ -219,10 +249,22 @@ pub(super) fn execute_one_step(
     let prompt = persisted.steps[step_index].prompt.clone();
     writeln!(output, "\n==> {prompt}\n").map_err(|error| format!("write plan output: {error}"))?;
 
-    let mut command = opencode_run_command(executor, step_number, &prompt, true);
-    let spawn_result = spawn_opencode(&mut command);
+    let (mut command, mut invocation) =
+        match harness_run_command(executor, step_number, &prompt, true) {
+            Ok(command) => command,
+            Err(error) => {
+                mark_spawn_failure(
+                    conn,
+                    &mut persisted.steps[step_index],
+                    &error,
+                    executor.max_output_lines_per_step,
+                )?;
+                return Err(error);
+            }
+        };
+    let spawn_result = spawn_harness(&mut command, &invocation);
     let (mut child, used_attach) = match spawn_result {
-        Ok(child) => (child, true),
+        Ok(child) => (child, invocation.attach),
         Err(error) if executor.server_url.is_some() => {
             append_system_output(
                 conn,
@@ -231,9 +273,14 @@ pub(super) fn execute_one_step(
                 &format!("attach launch failed, retrying without --attach: {error}"),
                 executor.max_output_lines_per_step,
             )?;
-            let mut fallback = opencode_run_command(executor, step_number, &prompt, false);
-            match spawn_opencode(&mut fallback) {
-                Ok(child) => (child, false),
+            invocation.cleanup();
+            let (mut fallback, fallback_invocation) =
+                harness_run_command(executor, step_number, &prompt, false)?;
+            match spawn_harness(&mut fallback, &fallback_invocation) {
+                Ok(child) => {
+                    invocation = fallback_invocation;
+                    (child, false)
+                }
                 Err(error) => {
                     mark_spawn_failure(
                         conn,
@@ -246,6 +293,7 @@ pub(super) fn execute_one_step(
             }
         }
         Err(error) => {
+            invocation.cleanup();
             mark_spawn_failure(
                 conn,
                 &mut persisted.steps[step_index],
@@ -258,8 +306,13 @@ pub(super) fn execute_one_step(
 
     {
         let step = &mut persisted.steps[step_index];
-        step.status = PlanStepStatus::Running;
-        step.process_id = Some(child.id());
+        if !claim_spawned_process(conn, step, &mut child)? {
+            invocation.cleanup();
+            return Err(format!(
+                "plan step {} was aborted while starting",
+                step.step
+            ));
+        }
         identify_attached_plan_session(executor, step);
         save_step_with_conn(conn, step)?;
     }
@@ -269,18 +322,23 @@ pub(super) fn execute_one_step(
         &mut persisted.steps[step_index],
         &mut child,
         executor.max_output_lines_per_step,
+        invocation.structured_events,
         output,
-    )?;
+    );
+    invocation.cleanup();
+    let exit_code = exit_code?;
 
     let step = &mut persisted.steps[step_index];
-    finish_step_after_exit(conn, step, exit_code, used_attach)?;
-    if exit_code == 0 {
+    finish_step_after_exit(conn, step, exit_code, used_attach, &executor.harness_id)?;
+    if step.status == PlanStepStatus::Aborted {
+        Err(format!("plan step {} was aborted", step.step))
+    } else if exit_code == 0 && step.status == PlanStepStatus::Done {
         Ok(())
     } else {
         Err(format!(
             "plan step {} failed: {}",
             step.step,
-            step.error.as_deref().unwrap_or("opencode run failed")
+            step.error.as_deref().unwrap_or("harness run failed")
         ))
     }
 }
@@ -290,19 +348,93 @@ pub(super) fn finish_step_after_exit(
     step: &mut PlanStepRun,
     exit_code: i32,
     used_attach: bool,
+    harness_id: &str,
 ) -> Result<(), String> {
-    step.process_id = None;
+    step.execution.process_id = None;
+    step.execution.process_start_time_ticks = None;
     step.finished_unix_ms = Some(unix_ms());
     step.exit_code = Some(exit_code);
-    if exit_code == 0 {
+    if exit_code == 0 && step.error.is_none() {
         step.status = PlanStepStatus::Done;
         step.active_tool = None;
+        step.error = None;
     } else {
         step.status = PlanStepStatus::Failed;
-        let attach_note = if used_attach { " with --attach" } else { "" };
-        step.error = Some(format!("opencode run{attach_note} exited with {exit_code}"));
+        if step.error.is_none() {
+            let attach_note = if used_attach { " while attached" } else { "" };
+            step.error = Some(format!(
+                "harness '{harness_id}'{attach_note} exited with {exit_code}"
+            ));
+        }
     }
-    save_step_with_conn(conn, step)
+    let changed = conn
+        .execute(
+            "update plan_step_run
+             set status = ?1, execution_process_id = null,
+                 execution_process_start_time_ticks = null, finished_unix_ms = ?2,
+                 exit_code = ?3, active_tool = ?4, error = ?5
+             where run_id = ?6 and step = ?7 and status != 'aborted'",
+            params![
+                step.status.as_str(),
+                step.finished_unix_ms.map(u64_to_i64),
+                step.exit_code,
+                step.active_tool,
+                step.error,
+                step.run_id,
+                usize_to_i64(step.step),
+            ],
+        )
+        .map_err(|error| format!("finish plan step: {error}"))?;
+    if changed == 0 {
+        let status = conn
+            .query_row(
+                "select status from plan_step_run where run_id = ?1 and step = ?2",
+                params![step.run_id, usize_to_i64(step.step)],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| format!("reload plan step status: {error}"))?;
+        step.status = PlanStepStatus::parse(&status)?;
+        step.execution.process_id = None;
+        step.execution.process_start_time_ticks = None;
+        if step.status == PlanStepStatus::Aborted {
+            step.error = Some("aborted".to_string());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn claim_spawned_process(
+    conn: &rusqlite::Connection,
+    step: &mut PlanStepRun,
+    child: &mut Child,
+) -> Result<bool, String> {
+    let process_id = child.id();
+    let start_time_ticks = crate::harness::process_start_time_ticks(process_id);
+    let changed = conn
+        .execute(
+            "update plan_step_run
+             set status = 'running', execution_process_id = ?1,
+                 execution_process_start_time_ticks = ?2
+             where run_id = ?3 and step = ?4 and status = 'starting'",
+            params![
+                i64::from(process_id),
+                start_time_ticks.map(u64_to_i64),
+                step.run_id,
+                usize_to_i64(step.step),
+            ],
+        )
+        .map_err(|error| format!("claim plan harness process: {error}"))?;
+    if changed == 0 {
+        let _ = crate::harness::terminate_process(process_id, start_time_ticks);
+        let _ = child.wait();
+        step.status = PlanStepStatus::Aborted;
+        step.execution = crate::harness::ExecutionRef::default();
+        return Ok(false);
+    }
+    step.status = PlanStepStatus::Running;
+    step.execution.process_id = Some(process_id);
+    step.execution.process_start_time_ticks = start_time_ticks;
+    Ok(true)
 }
 
 pub(super) fn mark_spawn_failure(
@@ -324,39 +456,47 @@ pub(super) fn mark_spawn_failure(
     save_step_with_conn(conn, step)
 }
 
+#[cfg(test)]
 pub(super) fn opencode_run_command(
     executor: &PlanExecutorConfig,
     step: usize,
     prompt: &str,
     attach: bool,
 ) -> Command {
-    let mut command = Command::new(&executor.opencode_program);
-    command.arg("run");
-    if attach && let Some(server_url) = executor.server_url.as_deref() {
-        command.arg("--attach").arg(server_url);
-    }
-    if let Some(variant) = executor.agent_variant.as_deref() {
-        command.arg("--variant").arg(variant);
-    }
-    command
-        .arg("--format")
-        .arg("json")
-        .arg("--dir")
-        .arg(&executor.scope_path)
-        .arg("--title")
-        .arg(format!("{} phase {}", executor.title_prefix, step))
-        .arg(prompt)
-        .current_dir(&executor.scope_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    harness_run_command(executor, step, prompt, attach)
+        .expect("valid OpenCode harness invocation")
+        .0
+}
+
+fn harness_run_command(
+    executor: &PlanExecutorConfig,
+    step: usize,
+    prompt: &str,
+    attach: bool,
+) -> Result<(Command, crate::harness::Invocation), String> {
+    let harness = crate::harness::Harness::new(&executor.harness_id, &executor.harness_config);
+    let mut invocation = harness.headless(
+        prompt,
+        &executor.scope_path,
+        &format!("{} phase {}", executor.title_prefix, step),
+        executor.server_url.as_deref(),
+        executor.agent_variant.as_deref(),
+        attach,
+    )?;
     if let Some(config_dir) = executor.plugin_config_dir.as_deref() {
-        command.env("OPENCODE_CONFIG_DIR", config_dir);
+        invocation.environment.insert(
+            "OPENCODE_CONFIG_DIR".to_string(),
+            config_dir.display().to_string(),
+        );
     }
     if let Some(event_log_path) = executor.plugin_event_log_path.as_deref() {
-        command.env("PRISM_PLAN_HOOK_LOG", event_log_path);
+        invocation.environment.insert(
+            "PRISM_PLAN_HOOK_LOG".to_string(),
+            event_log_path.display().to_string(),
+        );
     }
-    command
+    let command = invocation.command(&executor.scope_path)?;
+    Ok((command, invocation))
 }
 
 pub(super) fn identify_attached_plan_session(
@@ -366,25 +506,33 @@ pub(super) fn identify_attached_plan_session(
     let Some(server_url) = executor.server_url.as_deref() else {
         return;
     };
-    if step.opencode_session_id.is_some() {
+    if step.session.id.is_some() {
         return;
     }
     let title = format!("{} phase {}", executor.title_prefix, step.step);
-    if let Ok(sessions) = crate::opencode::list_sessions(server_url)
+    if let Ok(sessions) = crate::harness::list_sessions(server_url)
         && let Some(session) = sessions
             .iter()
             .filter(|session| session.title.as_deref() == Some(title.as_str()))
             .max_by(|left, right| left.time_updated.cmp(&right.time_updated))
     {
-        step.opencode_server_url = Some(server_url.to_string());
-        step.opencode_session_id = Some(session.id.clone());
+        step.session.endpoint = Some(server_url.to_string());
+        step.session.id = Some(session.id.clone());
     }
 }
 
-pub(super) fn spawn_opencode(command: &mut Command) -> Result<Child, String> {
+fn spawn_harness(
+    _command: &mut Command,
+    invocation: &crate::harness::Invocation,
+) -> Result<Child, String> {
+    invocation.spawn(&invocation_cwd(invocation, _command))
+}
+
+fn invocation_cwd(_invocation: &crate::harness::Invocation, command: &Command) -> PathBuf {
     command
-        .spawn()
-        .map_err(|error| format!("opencode: {error}"))
+        .get_current_dir()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 pub(super) fn collect_child_output(
@@ -392,16 +540,17 @@ pub(super) fn collect_child_output(
     step: &mut PlanStepRun,
     child: &mut Child,
     max_output_lines_per_step: usize,
+    structured_events: bool,
     output: &mut dyn Write,
 ) -> Result<i32, String> {
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "open opencode stdout".to_string())?;
+        .ok_or_else(|| "open harness stdout".to_string())?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| "open opencode stderr".to_string())?;
+        .ok_or_else(|| "open harness stderr".to_string())?;
     let (tx, rx) = mpsc::channel::<Result<ChildLine, String>>();
     spawn_reader_thread(StreamKind::Stdout, stdout, tx.clone());
     spawn_reader_thread(StreamKind::Stderr, stderr, tx);
@@ -410,7 +559,15 @@ pub(super) fn collect_child_output(
     while readers_open > 0 {
         match rx.recv() {
             Ok(Ok(ChildLine::Line { stream, text })) => {
-                ingest_child_line(conn, step, stream, &text, max_output_lines_per_step, output)?;
+                ingest_child_line(
+                    conn,
+                    step,
+                    stream,
+                    &text,
+                    max_output_lines_per_step,
+                    structured_events,
+                    output,
+                )?;
             }
             Ok(Ok(ChildLine::End)) => readers_open -= 1,
             Ok(Err(error)) => return Err(error),
@@ -420,7 +577,7 @@ pub(super) fn collect_child_output(
 
     let status = child
         .wait()
-        .map_err(|error| format!("wait for opencode: {error}"))?;
+        .map_err(|error| format!("wait for harness: {error}"))?;
     Ok(status.code().unwrap_or(1))
 }
 
@@ -454,27 +611,29 @@ pub(super) fn spawn_parallel_child(
     step_index: usize,
     mut child: Child,
     used_attach: bool,
+    invocation: crate::harness::Invocation,
     tx: mpsc::Sender<Result<ParallelChildEvent, String>>,
 ) -> Result<(), String> {
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| "open opencode stdout".to_string())?;
+        .ok_or_else(|| "open harness stdout".to_string())?;
     let stderr = child
         .stderr
         .take()
-        .ok_or_else(|| "open opencode stderr".to_string())?;
+        .ok_or_else(|| "open harness stderr".to_string())?;
     spawn_parallel_reader(step_index, StreamKind::Stdout, stdout, tx.clone());
     spawn_parallel_reader(step_index, StreamKind::Stderr, stderr, tx.clone());
     thread::spawn(move || {
         let result = child
             .wait()
-            .map_err(|error| format!("wait for opencode: {error}"))
+            .map_err(|error| format!("wait for harness: {error}"))
             .map(|status| ParallelChildEvent::Exit {
                 step_index,
                 exit_code: status.code().unwrap_or(1),
                 used_attach,
             });
+        invocation.cleanup();
         let _ = tx.send(result);
     });
     Ok(())
@@ -487,24 +646,16 @@ pub(super) fn spawn_parallel_reader(
     tx: mpsc::Sender<Result<ParallelChildEvent, String>>,
 ) {
     thread::spawn(move || {
-        let reader = BufReader::new(reader);
-        for line in reader.lines() {
-            match line {
-                Ok(text) => {
-                    let event = ParallelChildEvent::Line {
-                        step_index,
-                        stream,
-                        text,
-                    };
-                    if tx.send(Ok(event)).is_err() {
-                        return;
-                    }
-                }
-                Err(error) => {
-                    let _ = tx.send(Err(format!("read opencode output: {error}")));
-                    return;
-                }
-            }
+        let result = crate::harness::read_bounded_lines(reader, |text| {
+            tx.send(Ok(ParallelChildEvent::Line {
+                step_index,
+                stream,
+                text,
+            }))
+            .is_ok()
+        });
+        if let Err(error) = result {
+            let _ = tx.send(Err(error));
         }
     });
 }
@@ -515,19 +666,11 @@ pub(super) fn spawn_reader_thread(
     tx: mpsc::Sender<Result<ChildLine, String>>,
 ) {
     thread::spawn(move || {
-        let reader = BufReader::new(reader);
-        for line in reader.lines() {
-            match line {
-                Ok(text) => {
-                    if tx.send(Ok(ChildLine::Line { stream, text })).is_err() {
-                        return;
-                    }
-                }
-                Err(error) => {
-                    let _ = tx.send(Err(format!("read opencode output: {error}")));
-                    return;
-                }
-            }
+        let result = crate::harness::read_bounded_lines(reader, |text| {
+            tx.send(Ok(ChildLine::Line { stream, text })).is_ok()
+        });
+        if let Err(error) = result {
+            let _ = tx.send(Err(error));
         }
         let _ = tx.send(Ok(ChildLine::End));
     });
@@ -539,6 +682,7 @@ pub(super) fn ingest_child_line(
     stream: StreamKind,
     raw: &str,
     max_output_lines_per_step: usize,
+    structured_events: bool,
     output: &mut dyn Write,
 ) -> Result<(), String> {
     if stream == StreamKind::Stderr {
@@ -549,10 +693,22 @@ pub(super) fn ingest_child_line(
             raw,
             max_output_lines_per_step,
         )?;
-        step.error = Some(raw.to_string());
-        save_step_with_conn(conn, step)?;
         writeln!(output, "[stderr] {raw}")
             .map_err(|error| format!("write plan output: {error}"))?;
+        return Ok(());
+    }
+
+    if !structured_events {
+        append_system_output(
+            conn,
+            step,
+            PlanOutputKind::Assistant,
+            raw,
+            max_output_lines_per_step,
+        )?;
+        step.latest_message = Some(raw.to_string());
+        save_step_with_conn(conn, step)?;
+        writeln!(output, "{raw}").map_err(|error| format!("write plan output: {error}"))?;
         return Ok(());
     }
 

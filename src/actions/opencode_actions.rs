@@ -20,6 +20,24 @@ pub(super) fn opencode_poll_key(
     OpencodePollKey::for_repository_session_generation(repository, session, generation)
 }
 
+fn session_uses_opencode(managed: &ManagedRepo, session: &crate::session::Session) -> bool {
+    crate::session::worktree_harness(&managed.repo, session)
+        .ok()
+        .and_then(|association| managed.config.harness_adapter(&association.harness_id).ok())
+        .is_some_and(|adapter| adapter == "opencode")
+}
+
+fn opencode_harness_id(managed: &ManagedRepo, session: &crate::session::Session) -> Option<String> {
+    let association = crate::session::worktree_harness(&managed.repo, session).ok()?;
+    (managed
+        .config
+        .harness_adapter(&association.harness_id)
+        .ok()?
+        .as_str()
+        == "opencode")
+        .then_some(association.harness_id)
+}
+
 impl Tui {
     pub(crate) fn start_opencode_status_poll(&mut self, force: bool) {
         let _ = self.poll_opencode_status();
@@ -33,8 +51,7 @@ impl Tui {
             let Some(managed) = self.repos.get(session.repo_index) else {
                 continue;
             };
-            if managed.config.default_agent != "opencode"
-                || !session.is_task_branch(&managed.config)
+            if !session_uses_opencode(managed, session) || !session.is_task_branch(&managed.config)
             {
                 continue;
             }
@@ -61,13 +78,16 @@ impl Tui {
                 continue;
             }
             let repo = managed.repo.clone();
+            let Some(harness_id) = opencode_harness_id(managed, session) else {
+                continue;
+            };
             let branch = session.branch.clone();
             let path = session.path.clone();
             let tx = self.opencode_poll_tx.clone();
             self.opencode_polls_in_flight.insert(key.clone());
             self.opencode_last_polled.insert(key.clone(), now);
             std::thread::spawn(move || {
-                let status = load_runtime(&repo, &branch, &path).and_then(|runtime| {
+                let status = load_runtime(&repo, &harness_id, &branch, &path).and_then(|runtime| {
                     let Some(runtime) = runtime else {
                         return Err("no OpenCode runtime exists yet".to_string());
                     };
@@ -91,12 +111,15 @@ impl Tui {
             let Some(managed) = self.repos.get(session.repo_index) else {
                 continue;
             };
-            if managed.config.default_agent != "opencode"
-                || !session.is_task_branch(&managed.config)
+            if !session_uses_opencode(managed, session) || !session.is_task_branch(&managed.config)
             {
                 continue;
             }
-            let Ok(Some(runtime)) = load_runtime(&managed.repo, &session.branch, &session.path)
+            let Some(harness_id) = opencode_harness_id(managed, session) else {
+                continue;
+            };
+            let Ok(Some(runtime)) =
+                load_runtime(&managed.repo, &harness_id, &session.branch, &session.path)
             else {
                 continue;
             };
@@ -392,32 +415,42 @@ impl Tui {
         };
         let selected = context.session_index;
         if self.sessions[selected].is_default_branch(&context.config) {
-            self.show_message("default branch does not have an OpenCode session")?;
+            self.show_message("default branch does not have an agent session")?;
             return Ok(());
         }
-        if context.config.default_agent != "opencode" {
-            self.show_message("selected worktree is not using OpenCode")?;
+        let association =
+            crate::session::worktree_harness(&context.repo, &self.sessions[selected])?;
+        let session_config = context.config.for_harness(&association.harness_id)?;
+        if !session_config.selected_adapter_is("opencode") {
+            self.show_message("selected harness does not support native session cancellation")?;
             return Ok(());
         }
         let should_abort = self.confirm_action_dialog(
             raw,
-            "Abort OpenCode",
+            "Abort Agent Session",
             &format!("Abort {}?", self.sessions[selected].branch),
             false,
         )?;
         if !should_abort {
             return Ok(());
         }
-        let runtime = opencode::ensure_opencode_session(
-            &context.repo,
-            &context.config,
-            &self.sessions[selected].branch,
-            &self.sessions[selected].path,
-        )?;
+        let harness_config = session_config.harness_config(&association.harness_id)?;
+        let runtime = crate::harness::Harness::new(&association.harness_id, &harness_config)
+            .prepare_session(
+                &context.repo,
+                &session_config,
+                &self.sessions[selected].branch,
+                &self.sessions[selected].path,
+            )?
+            .ok_or_else(|| "selected harness has no native session protocol".to_string())?;
         let Some(session_id) = runtime.opencode_session_id.clone() else {
             return Err("OpenCode session ID is not available".to_string());
         };
-        opencode::abort_session(&runtime.server_url, &session_id)?;
+        crate::harness::cancel_native_session(&crate::harness::SessionRef {
+            adapter_id: Some("opencode".to_string()),
+            endpoint: Some(runtime.server_url.clone()),
+            id: Some(session_id.clone()),
+        })?;
         self.sessions[selected].opencode_status = Some(OpencodeStatus {
             server_url: Some(runtime.server_url.clone()),
             session_id: Some(session_id.to_string()),
@@ -455,7 +488,7 @@ impl Tui {
             AgentState::NeedsInput,
         );
         self.start_opencode_status_poll(true);
-        self.show_message("abort requested for OpenCode session")?;
+        self.show_message("agent session abort requested")?;
         Ok(())
     }
 
@@ -465,12 +498,14 @@ impl Tui {
             let Some(managed) = self.repos.get(session.repo_index) else {
                 continue;
             };
-            if !managed.config.opencode_shutdown_owned_servers
-                || managed.config.default_agent != "opencode"
-            {
+            if !managed.config.opencode_shutdown_owned_servers {
                 continue;
             }
-            let Ok(Some(runtime)) = load_runtime(&managed.repo, &session.branch, &session.path)
+            let Some(harness_id) = opencode_harness_id(managed, session) else {
+                continue;
+            };
+            let Ok(Some(runtime)) =
+                load_runtime(&managed.repo, &harness_id, &session.branch, &session.path)
             else {
                 continue;
             };

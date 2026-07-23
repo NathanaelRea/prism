@@ -45,8 +45,22 @@ impl Tui {
         if let Some(run_id) = self.active_auto_runs.get(&session_path).cloned() {
             self.load_auto_run_snapshot(&context.repo.root, &run_id);
             self.selected_auto_run = Some(run_id);
+            if self.resolve_blocking_review_threads(
+                raw,
+                context.session_index,
+                &context.repo,
+                &context.config,
+            )? {
+                return Ok(());
+            }
             self.show_message("focused Auto Flow run")?;
             return Ok(());
+        }
+        if !context.config.selected_harness()?.describe().headless {
+            return Err(format!(
+                "harness '{}' does not support managed Auto Flow execution; configure headless_command and headless_prompt_transport",
+                context.config.default_harness
+            ));
         }
         let is_detached = session_branch == "(detached)";
         if context.config.is_default_branch(&session_branch) || is_detached {
@@ -145,6 +159,12 @@ impl Tui {
                 initial_prompt: prompt,
             },
         )?
+        .with_harness(
+            context.config.default_harness.clone(),
+            context
+                .config
+                .harness_adapter(&context.config.default_harness)?,
+        )
         .with_worktree_incarnation(session_incarnation);
         let mut persisted = launch.create_run();
         crate::observability::with_writable_db(&context.repo, |conn| {
@@ -168,10 +188,7 @@ impl Tui {
                 title: "Auto Flow: Implementation Source".to_string(),
                 choices: [("p", "prompt"), ("e", "existing plan"), ("d", "draft plan")]
                     .into_iter()
-                    .map(|(key, label)| crate::view::KeyChoice {
-                        key: key.to_string(),
-                        label: label.to_string(),
-                    })
+                    .map(|(key, label)| crate::view::KeyChoice::new(key, label))
                     .collect(),
             },
         )?;
@@ -193,10 +210,7 @@ impl Tui {
                 title: "Auto Flow: Plan Execution".to_string(),
                 choices: [("s", "sequential"), ("p", "parallel")]
                     .into_iter()
-                    .map(|(key, label)| crate::view::KeyChoice {
-                        key: key.to_string(),
-                        label: label.to_string(),
-                    })
+                    .map(|(key, label)| crate::view::KeyChoice::new(key, label))
                     .collect(),
             },
         )?;
@@ -215,16 +229,35 @@ impl Tui {
     ) {
         thread::spawn(move || {
             let worktree_path = persisted.run.worktree_path.clone();
-            let server_url = crate::opencode::ensure_opencode_server(
-                &repo,
-                &config,
-                &persisted.run.branch,
-                &worktree_path,
-            )
-            .ok()
-            .map(|runtime| runtime.server_url);
-            let executor = AutoExecutorConfig::new(
-                config.tool("opencode"),
+            let Ok(harness_config) = config.harness_config(&persisted.run.harness_id) else {
+                let error = format!(
+                    "auto run harness '{}' is no longer configured",
+                    persisted.run.harness_id
+                );
+                let _ = crate::observability::with_writable_db(&repo, |conn| {
+                    crate::auto_flow::fail_auto_run(conn, &mut persisted, error)
+                });
+                return;
+            };
+            if harness_config.adapter != persisted.run.adapter_id {
+                let error = format!(
+                    "auto run harness '{}' was recorded with adapter '{}', but it is now configured as '{}'",
+                    persisted.run.harness_id, persisted.run.adapter_id, harness_config.adapter
+                );
+                let _ = crate::observability::with_writable_db(&repo, |conn| {
+                    crate::auto_flow::fail_auto_run(conn, &mut persisted, error)
+                });
+                return;
+            }
+            let server_url =
+                crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
+                    .prepare_server(&repo, &config, &persisted.run.branch, &worktree_path)
+                    .ok()
+                    .flatten()
+                    .map(|runtime| runtime.server_url);
+            let executor = AutoExecutorConfig::for_harness(
+                persisted.run.harness_id.clone(),
+                harness_config,
                 server_url,
                 worktree_path,
                 format!("Auto Flow {}", persisted.run.prompt_summary),
@@ -249,17 +282,47 @@ impl Tui {
         let Some(dashboard) = self.current_auto_dashboard() else {
             return Ok(false);
         };
+        let selected_step_run_id = dashboard
+            .run
+            .run
+            .selected_step_run_id
+            .or_else(|| dashboard.run.steps.first().and_then(|step| step.id));
+        let selected_active = selected_step_run_id
+            .and_then(|id| dashboard.run.steps.iter().find(|step| step.id == Some(id)))
+            .is_some_and(|step| {
+                matches!(
+                    step.status,
+                    AutoStepStatus::Queued
+                        | AutoStepStatus::Starting
+                        | AutoStepStatus::Running
+                        | AutoStepStatus::Waiting
+                )
+            });
+        let run_active = dashboard.run.steps.iter().any(|step| {
+            matches!(
+                step.status,
+                AutoStepStatus::Queued
+                    | AutoStepStatus::Starting
+                    | AutoStepStatus::Running
+                    | AutoStepStatus::Waiting
+            )
+        });
         let answer = self.prompt_choice_dialog(
             raw,
             crate::view::ChoiceList {
                 title: "Abort Auto Flow".to_string(),
-                choices: [("s", "selected step"), ("a", "whole run")]
-                    .into_iter()
-                    .map(|(key, label)| crate::view::KeyChoice {
-                        key: key.to_string(),
-                        label: label.to_string(),
-                    })
-                    .collect(),
+                choices: vec![
+                    if selected_active {
+                        crate::view::KeyChoice::new("s", "selected step")
+                    } else {
+                        crate::view::KeyChoice::disabled("s", "selected step")
+                    },
+                    if run_active {
+                        crate::view::KeyChoice::new("a", "whole run")
+                    } else {
+                        crate::view::KeyChoice::disabled("a", "whole run")
+                    },
+                ],
             },
         )?;
         let Some(answer) = answer else {

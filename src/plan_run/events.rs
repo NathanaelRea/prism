@@ -6,8 +6,8 @@ pub fn parse_plan_agent_events(raw: &str) -> Vec<PlanAgentEvent> {
         return Vec::new();
     }
     let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-        return vec![PlanAgentEvent::AssistantText {
-            text: trimmed.to_string(),
+        return vec![PlanAgentEvent::Error {
+            message: "malformed structured harness output".to_string(),
         }];
     };
     let event_type = string_field_deep(&value, &["type", "event", "name"])
@@ -21,9 +21,24 @@ pub fn parse_plan_agent_events(raw: &str) -> Vec<PlanAgentEvent> {
         });
     }
 
-    if let Some(session_id) = string_field_deep(&value, &["session_id", "sessionID", "sessionId"])
-        .or_else(|| nested_string(&value, &["session", "id"]))
-    {
+    if let Some(session_id) = string_field_deep(
+        &value,
+        &[
+            "session_id",
+            "sessionID",
+            "sessionId",
+            "thread_id",
+            "threadId",
+        ],
+    )
+    .or_else(|| nested_string(&value, &["session", "id"]))
+    .or_else(|| nested_string(&value, &["thread", "id"]))
+    .or_else(|| {
+        lower_type
+            .contains("session")
+            .then(|| value.get("id")?.as_str().map(str::to_string))
+            .flatten()
+    }) {
         events.push(PlanAgentEvent::SessionIdentified {
             session_id,
             title: string_field_deep(&value, &["title"]),
@@ -101,7 +116,8 @@ pub fn parse_plan_agent_events(raw: &str) -> Vec<PlanAgentEvent> {
         && !lower_type.contains("status")
         && !lower_type.contains("diff")
         && !lower_type.contains("todo")
-        && let Some(text) = string_field_deep(&value, &["text", "content", "message", "summary"])
+        && let Some(text) =
+            string_field_deep(&value, &["text", "content", "message", "summary", "result"])
     {
         events.push(PlanAgentEvent::AssistantText { text });
     }
@@ -137,13 +153,12 @@ pub fn reconcile_plan_step_from_server(
     step: &mut PlanStepRun,
     max_output_lines_per_step: usize,
 ) -> Result<bool, String> {
-    let (Some(server_url), Some(session_id)) = (
-        step.opencode_server_url.as_deref(),
-        step.opencode_session_id.as_deref(),
-    ) else {
+    let (Some(server_url), Some(session_id)) =
+        (step.session.endpoint.as_deref(), step.session.id.as_deref())
+    else {
         return Ok(false);
     };
-    let status = crate::opencode::poll_session_status(server_url, session_id)?;
+    let status = crate::harness::inspect_session(server_url, session_id)?;
     reconcile_plan_step_from_opencode_status(conn, step, &status, max_output_lines_per_step)
 }
 
@@ -155,22 +170,23 @@ pub fn reconcile_plan_step_from_opencode_status(
 ) -> Result<bool, String> {
     let mut changed = false;
     if let Some(status_session_id) = status.session_id.as_deref() {
-        if let Some(step_session_id) = step.opencode_session_id.as_deref()
+        if let Some(step_session_id) = step.session.id.as_deref()
             && step_session_id != status_session_id
         {
             return Ok(false);
         }
-        if step.opencode_session_id.is_none() {
-            step.opencode_session_id = Some(status_session_id.to_string());
+        if step.session.id.is_none() {
+            step.session.id = Some(status_session_id.to_string());
             changed = true;
         }
     }
-    if step.opencode_server_url.is_none() {
+    if step.session.endpoint.is_none() {
         changed |= status.server_url.is_some();
-        step.opencode_server_url = status.server_url.clone();
+        step.session.endpoint = status.server_url.clone();
     }
-    changed |= step.opencode_state != Some(status.state);
-    step.opencode_state = Some(status.state);
+    let state = status.state.label().to_string();
+    changed |= step.execution.state.as_deref() != Some(state.as_str());
+    step.execution.state = Some(state);
 
     let mut events = Vec::new();
     if let Some(session_id) = status.session_id.clone() {
@@ -256,7 +272,7 @@ pub(super) fn events_match_step_session(step: &PlanStepRun, events: &[PlanAgentE
             _ => None,
         })
         .collect::<Vec<_>>();
-    if let Some(step_session_id) = step.opencode_session_id.as_deref() {
+    if let Some(step_session_id) = step.session.id.as_deref() {
         return event_session_ids
             .iter()
             .all(|event_session_id| *event_session_id == step_session_id);
@@ -270,7 +286,7 @@ pub(super) fn apply_agent_event(
 ) -> (PlanOutputKind, String, Option<String>) {
     match event {
         PlanAgentEvent::SessionIdentified { session_id, title } => {
-            step.opencode_session_id = Some(session_id.clone());
+            step.session.id = Some(session_id.clone());
             let title = title
                 .map(|title| format!(" title: {title}"))
                 .unwrap_or_default();
@@ -281,9 +297,9 @@ pub(super) fn apply_agent_event(
             )
         }
         PlanAgentEvent::StateChanged { state } => {
-            step.opencode_state = OpencodeState::parse(&state);
+            step.execution.state = Some(state.clone());
             if matches!(
-                step.opencode_state,
+                OpencodeState::parse(&state),
                 Some(OpencodeState::Idle | OpencodeState::Done)
             ) {
                 step.active_tool = None;

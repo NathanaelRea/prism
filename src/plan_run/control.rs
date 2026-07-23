@@ -20,7 +20,7 @@ pub fn prepare_plan_run_for_resume(
         ) {
             continue;
         }
-        if let Some(process_id) = step.process_id
+        if let Some(process_id) = step.execution.process_id
             && process_is_running(process_id)
         {
             has_live_child = true;
@@ -55,20 +55,20 @@ pub fn prepare_plan_run_for_resume(
 
 pub fn abort_plan_step(conn: &rusqlite::Connection, step: &mut PlanStepRun) -> Result<(), String> {
     let mut errors = Vec::new();
-    if let (Some(server_url), Some(session_id)) = (
-        step.opencode_server_url.as_deref(),
-        step.opencode_session_id.as_deref(),
-    ) && let Err(error) = crate::opencode::abort_session(server_url, session_id)
+    if step.session.id.is_some()
+        && let Err(error) = crate::harness::cancel_native_session(&step.session)
     {
         errors.push(error);
     }
-    if let Some(process_id) = step.process_id
-        && let Err(error) = terminate_process(process_id)
+    if let Some(process_id) = step.execution.process_id
+        && let Err(error) =
+            crate::harness::terminate_process(process_id, step.execution.process_start_time_ticks)
     {
         errors.push(error);
     }
     step.status = PlanStepStatus::Aborted;
-    step.process_id = None;
+    step.execution.process_id = None;
+    step.execution.process_start_time_ticks = None;
     step.finished_unix_ms = Some(unix_ms());
     step.error = if errors.is_empty() {
         Some("aborted".to_string())
@@ -133,7 +133,7 @@ pub fn reconcile_stale_plan_run(
         ) {
             continue;
         }
-        match recorded_process_state(step.process_id) {
+        match recorded_process_state(step.execution.process_id) {
             RecordedProcessState::Live(process_id) => {
                 if reconcile_plan_step_from_server(conn, step, max_output_lines_per_step)
                     .unwrap_or(false)
@@ -208,7 +208,7 @@ pub(super) fn mark_stale_step_failed(
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
     step.status = PlanStepStatus::Failed;
-    step.process_id = None;
+    step.execution.process_id = None;
     step.finished_unix_ms = Some(unix_ms());
     step.error = Some(message.to_string());
     append_unique_system_output(
@@ -274,9 +274,10 @@ pub(super) fn append_stale_reconciliation_log(
     let repo = Repository {
         root: PathBuf::from(repo_root),
     };
-    let server_url = step.opencode_server_url.as_deref().unwrap_or("none");
-    let session_id = step.opencode_session_id.as_deref().unwrap_or("none");
+    let server_url = step.session.endpoint.as_deref().unwrap_or("none");
+    let session_id = step.session.id.as_deref().unwrap_or("none");
     let process_id = step
+        .execution
         .process_id
         .map(|process_id| process_id.to_string())
         .unwrap_or_else(|| "none".to_string());
@@ -353,7 +354,7 @@ pub fn skip_plan_step(
         return Err(format!("plan phase {selected_step} is running"));
     }
     step.status = PlanStepStatus::Skipped;
-    step.process_id = None;
+    step.execution.process_id = None;
     step.finished_unix_ms = Some(unix_ms());
     step.error = None;
     step.active_tool = None;
@@ -467,25 +468,11 @@ pub(super) fn process_is_running(process_id: u32) -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(unix)]
-pub(super) fn terminate_process(process_id: u32) -> Result<(), String> {
-    let result = unsafe { libc::kill(process_id as libc::pid_t, libc::SIGTERM) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "terminate opencode process {process_id}: {}",
-            std::io::Error::last_os_error()
-        ))
-    }
-}
-
 pub(super) fn reset_step_for_retry(step: &mut PlanStepRun) {
     step.status = PlanStepStatus::Queued;
-    step.opencode_state = None;
-    step.opencode_session_id = None;
+    step.execution = crate::harness::ExecutionRef::default();
+    step.session = crate::harness::SessionRef::default();
     step.agent_variant = None;
-    step.process_id = None;
     step.started_unix_ms = None;
     step.finished_unix_ms = None;
     step.exit_code = None;
@@ -494,19 +481,4 @@ pub(super) fn reset_step_for_retry(step: &mut PlanStepRun) {
     step.todos.clear();
     step.summary = None;
     step.error = None;
-}
-
-#[cfg(not(unix))]
-pub(super) fn terminate_process(process_id: u32) -> Result<(), String> {
-    Command::new("taskkill")
-        .args(["/PID", &process_id.to_string(), "/T", "/F"])
-        .status()
-        .map_err(|error| format!("terminate opencode process {process_id}: {error}"))
-        .and_then(|status| {
-            if status.success() {
-                Ok(())
-            } else {
-                Err(format!("terminate opencode process {process_id}: {status}"))
-            }
-        })
 }

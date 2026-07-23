@@ -116,21 +116,24 @@ fn run_agent_command(
                 ));
             }
             let runtime = ensured.opencode_runtime;
+            let harness = config.selected_harness()?.describe();
 
             println!("branch = {}", selected.branch);
             println!("worktree = {}", selected.path.display());
+            println!("harness_id = {}", harness.id);
+            println!("adapter_id = {}", harness.adapter);
             println!("generation = {}", ensured.generation);
             println!("tmux_session = {}", ensured.tmux_session);
             println!("running = true");
             println!(
-                "opencode_server_url = {}",
+                "session_endpoint = {}",
                 runtime
                     .as_ref()
                     .map(|runtime| runtime.server_url.as_str())
                     .unwrap_or("")
             );
             println!(
-                "opencode_server_pid = {}",
+                "runtime_process_id = {}",
                 runtime
                     .as_ref()
                     .and_then(|runtime| runtime.server_pid)
@@ -138,7 +141,7 @@ fn run_agent_command(
                     .unwrap_or_default()
             );
             println!(
-                "opencode_session_id = {}",
+                "session_id = {}",
                 runtime
                     .as_ref()
                     .and_then(|runtime| runtime.opencode_session_id.as_deref())
@@ -316,6 +319,12 @@ fn run_auto_command(
         );
         return Ok(());
     }
+    if !config.selected_harness()?.describe().headless {
+        return Err(format!(
+            "harness '{}' does not support managed Auto Flow execution; configure headless_command and headless_prompt_transport",
+            config.default_harness
+        ));
+    }
     validate_auto_command_before_launch(repo, &mut command)?;
     let branch = current_branch_name(&repo.root, config)?
         .ok_or_else(|| "Auto Flow cannot start on detached HEAD".to_string())?;
@@ -326,7 +335,10 @@ fn run_auto_command(
         return Err("Auto Flow requires a clean worktree at launch".to_string());
     }
     let launch_options = auto_launch_options_for_command(repo, branch, command)?;
-    let launch = AutoLaunch::with_options(&repo.root, &repo.root, launch_options)?;
+    let launch = AutoLaunch::with_options(&repo.root, &repo.root, launch_options)?.with_harness(
+        config.default_harness.clone(),
+        config.harness_adapter(&config.default_harness)?,
+    );
     let mut persisted = launch.create_run();
     observability::with_writable_db(repo, |conn| save_auto_run(conn, &mut persisted))?;
     run_auto_executor(repo, config, &mut persisted)?;
@@ -439,15 +451,32 @@ fn run_auto_executor(
     config: &Config,
     persisted: &mut crate::auto_flow::PersistedAutoRun,
 ) -> Result<(), String> {
-    let runtime = crate::opencode::ensure_opencode_server(
-        repo,
-        config,
-        &persisted.run.branch,
-        &persisted.run.worktree_path,
-    )
-    .ok();
-    let executor = AutoExecutorConfig::new(
-        config.tool("opencode"),
+    let harness_config = config
+        .harness_config(&persisted.run.harness_id)
+        .map_err(|_| {
+            format!(
+                "auto run harness '{}' is no longer configured",
+                persisted.run.harness_id
+            )
+        })?;
+    if harness_config.adapter != persisted.run.adapter_id {
+        return Err(format!(
+            "auto run harness '{}' was recorded with adapter '{}', but it is now configured as '{}'",
+            persisted.run.harness_id, persisted.run.adapter_id, harness_config.adapter
+        ));
+    }
+    let runtime = crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
+        .prepare_server(
+            repo,
+            config,
+            &persisted.run.branch,
+            &persisted.run.worktree_path,
+        )
+        .ok()
+        .flatten();
+    let executor = AutoExecutorConfig::for_harness(
+        persisted.run.harness_id.clone(),
+        harness_config,
         runtime.map(|runtime| runtime.server_url),
         persisted.run.worktree_path.clone(),
         format!("Auto Flow {}", persisted.run.prompt_summary),
@@ -505,14 +534,18 @@ fn run_debug_command(
                 "default_base = {}",
                 config.default_base.as_deref().unwrap_or("")
             );
-            println!("default_agent = {}", config.default_agent);
+            let harness = config.selected_harness()?;
+            let description = harness.describe();
+            println!("default_harness = {}", description.id);
+            println!("default_adapter = {}", description.adapter);
             println!(
-                "default_agent_prompt_mode = {}",
-                config.agent_prompt_mode(&config.default_agent).label()
-            );
-            println!(
-                "default_agent_command = {}",
-                observability::sanitize_command_text(&config.agent_command(&config.default_agent))
+                "default_harness_command = {}",
+                observability::sanitize_command_text(
+                    &harness
+                        .interactive_argv(None, None, None, &repo.root)?
+                        .argv
+                        .join(" ")
+                )
             );
             println!("worktree_command = {}", config.worktree_command);
             println!("plan_dir = {}", config.plan_dir);

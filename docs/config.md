@@ -14,9 +14,9 @@ path = "/path/to/repo"
 key = "1"
 ```
 
-Repository-specific Prism config lives under the repository config path opened by `e`. Common settings include `default_base`, layout width, worktree columns, merge method, Auto Flow and PR Stabilization behavior, OpenCode runtime settings, tools, and prompt templates.
+Repository-specific Prism config lives under the repository config path opened by `e`. Common settings include `default_base`, layout width, worktree columns, merge method, Auto Flow and PR Stabilization behavior, tools, and prompt templates. Harness selection and definitions are global-only.
 
-Per-repository Prism state also lives under that repository config directory, not inside the project repository. The state database is named `prism.db` and stores worktree session metadata, OpenCode runtime records, Plan Mode and Auto Flow runs, PR cache data, and observability records.
+Per-repository Prism state also lives under that repository config directory, not inside the project repository. The state database is named `prism.db` and stores worktree session metadata, harness runtime records, Plan Mode and Auto Flow runs, PR cache data, and observability records.
 
 Use `R` from Prism to edit repository order, keys, and tracked repositories.
 
@@ -43,7 +43,6 @@ icon_style = "unicode" # or "nerd-font"
 columns = []
 
 [tools]
-opencode = "opencode"
 
 [prompt_templates]
 auto_implement = "Implement this task in the current worktree, then stop without committing: {{task}}"
@@ -61,6 +60,93 @@ The `review_fix` template supports `{inline_comments}`, `{review_bodies}`, and `
 Prism treats `main` as the default branch by default. The default branch is not polled or shown as a pull request branch.
 
 Prism uses squash merges for pull requests by default. Set `merge_method` to `merge` or `rebase` if a repository requires a different GitHub merge method.
+
+## Harnesses
+
+Harnesses are configured only in `~/.config/prism/config.toml`. OpenCode, Codex CLI, Claude Code, and Pi have built-in definitions using their standard executable names. OpenCode remains the default:
+
+```toml
+default_harness = "opencode"
+
+[harnesses.opencode]
+program = "opencode"
+```
+
+Prism owns each built-in adapter's structured-output, prompt, session, and protocol flags. `program` may select an executable path or wrapper. `arguments` may contain adapter-approved options such as model, sandbox, permission, or tool settings, but Prism rejects protocol-critical overrides.
+
+Press `H` in the TUI to switch the global default. The chooser lists the four built-ins and configured generic harnesses; the current harness is shown in dark gray and cannot be selected. It can also add a generic harness by collecting its interactive command, optional initial-prompt transport, and optional headless command. Prompt transports that do not match the command's placeholders are disabled. The built-in IDs `opencode`, `codex`, `claude`, and `pi` are reserved: each always selects its matching adapter, and built-in adapters cannot be aliased under custom IDs.
+
+Select another built-in harness without repeating its standard program:
+
+```toml
+default_harness = "codex"
+```
+
+Add a harness table only to override its executable or pass adapter-approved arguments:
+
+```toml
+default_harness = "codex"
+
+[harnesses.codex]
+program = "/opt/bin/codex"
+arguments = ["--sandbox", "workspace-write", "--ask-for-approval", "on-request"]
+```
+
+Codex uses JSONL from `codex exec --json`; Claude uses print-mode stream JSON; Pi uses JSON print mode. Prism preserves each tool's approval and sandbox defaults unless explicit adapter arguments change them. Current supported-version diagnostics are Codex 0.145.0+, Claude 2.1.214+, Pi 0.81.1+, and current stable OpenCode.
+
+Aider does not expose a reliable interactive initial-prompt contract, so it remains a generic adapter with optional plain-text headless execution:
+
+```toml
+[harnesses.aider]
+adapter = "generic"
+interactive_command = ["aider"]
+headless_command = ["aider", "--message", "{prompt}"]
+headless_prompt_transport = "argument"
+```
+
+Google Antigravity CLI is supported through a generic interactive configuration only. Its official `agy` CLI has interactive resume but no documented headless automation or structured-output contract, so Prism does not advertise a named managed adapter:
+
+```toml
+[harnesses.antigravity]
+adapter = "generic"
+interactive_command = ["agy"]
+```
+
+An arbitrary command can provide the generic interactive floor. Commands are arrays so prompts and shell metacharacters remain single arguments and are never evaluated by a shell:
+
+```toml
+default_harness = "company-agent"
+
+[harnesses.company-agent]
+adapter = "generic"
+interactive_command = ["company-agent"]
+headless_command = ["company-agent", "run", "--prompt", "{prompt}"]
+headless_prompt_transport = "argument"
+output_format = "text"
+```
+
+Generic headless prompt transport may be `argument`, `stdin`, or `temp-file`. `{prompt}` or `{prompt_file}` must occupy one complete array item. Generic interactive initial prompts require an explicit `argument` or `temp-file` transport; Prism does not guess terminal readiness or paste into unknown harnesses. Generic managed runs report bounded plain text and process exit status, not structured tool/session state.
+
+When the global harness changes, opening an existing Worktree Session offers `Migrate`, `Later`, and `Keep`. `Migrate` retires its old tmux generation; `Later` asks again next time; `Keep` pins the old harness. Press `M` in the Worktrees panel to migrate a pinned session explicitly. Historical Plan and Auto Flow runs remain bound to their recorded harness.
+
+The previous keys are intentionally rejected. Replace this:
+
+```toml
+default_agent = "opencode"
+[tools]
+opencode = "/opt/bin/opencode"
+[agents.opencode]
+command = "opencode run --format json"
+prompt_mode = "argument"
+```
+
+with:
+
+```toml
+default_harness = "opencode"
+[harnesses.opencode]
+program = "/opt/bin/opencode"
+```
 
 ## Auto Flow and PR Stabilization
 

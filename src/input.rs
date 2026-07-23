@@ -76,8 +76,10 @@ impl KeyInput {
             KeyCode::Char('R') if plain_char(event) => Key::ManageRepos,
             KeyCode::Char('e') if plain_char(event) => Key::EditConfig,
             KeyCode::Char('E') if plain_char(event) => Key::EditUserConfig,
+            KeyCode::Char('H') if plain_char(event) => Key::SelectHarness,
             KeyCode::Char('D') if plain_char(event) => Key::Delete,
             KeyCode::Char('U') if plain_char(event) => Key::Unarchive,
+            KeyCode::Char('M') if plain_char(event) => Key::MigrateHarness,
             KeyCode::Char('?') if plain_char(event) => Key::Help,
             KeyCode::Char('/') if plain_char(event) => Key::Search,
             _ => Key::Other,
@@ -190,9 +192,11 @@ pub enum Key {
     AbortOpencode,
     Delete,
     Unarchive,
+    MigrateHarness,
     DeletePermanent,
     EditConfig,
     EditUserConfig,
+    SelectHarness,
     Search,
     Quit,
     Other,
@@ -388,8 +392,16 @@ mod tests {
             Key::EditUserConfig
         );
         assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('H'))),
+            Key::SelectHarness
+        );
+        assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('P'))),
             Key::PlanMode
+        );
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('M'))),
+            Key::MigrateHarness
         );
     }
 
@@ -413,7 +425,10 @@ mod tests {
         assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
         assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
         assert_eq!(map(&mut input, shift_key(KeyCode::Char('P'))), Key::Push);
-        assert_eq!(map(&mut input, shift_key(KeyCode::Char('M'))), Key::Other);
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('M'))),
+            Key::MigrateHarness
+        );
         assert_eq!(map(&mut input, key(KeyCode::Char('n'))), Key::Other);
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('R'))),

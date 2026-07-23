@@ -3,22 +3,22 @@
 ## Plan Mode
 
 - **Behavior**: Plan Mode selects a Markdown plan, infers its numbered phases,
-  and executes those phases through OpenCode while exposing current status and
+  and executes those phases through the run's recorded harness while exposing current status and
   useful execution detail in the selected worktree's main panel.
 - **Behavior**: Plan progress shows the current phase, per-step status, and short
   bounded log snippets rather than an unbounded output tail.
 - **Invariant**: Every Plan run has independent persisted identity, phase state,
-  output, history, selected OpenCode variant, and completion state. Multiple runs
+  output, history, adapter-specific model settings, and completion state. Multiple runs
   may coexist for one worktree without inheriting one another's state.
 - **Behavior**: Interrupted Plan runs can resume after Prism restarts. Users can
   pause, resume, dismiss/archive/delete, and move among historical runs, then
   return the main panel to normal worktree content.
 - **Behavior**: Standalone Plan Mode remains available separately from Auto Flow.
   Its dashboard supports pause/resume, retry, skip, abort, and entering the
-  selected phase's OpenCode session.
+   selected phase's interactive session when its adapter supports persistent sessions and interactive resume.
 - **Behavior**: Starting a Plan asks `Run steps in parallel? [y/N]:`.
 - **Default**: Plan steps run sequentially unless the user opts into parallel
-  execution. OpenCode's `medium` agent variant is used unless another variant is
+   execution. OpenCode's `medium` agent variant is used for OpenCode unless another variant is
   selected.
 - **Behavior**: Opting into parallel execution declares that the selected plan
   was authored with independent, parallel-safe phases. Prism does not infer or

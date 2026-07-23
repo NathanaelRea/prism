@@ -2,7 +2,8 @@ use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::stabilization_execute::{GuardedPushProgress, progress_pending_push};
 use crate::auto_flow::stabilization_model::{
-    PendingPushGuard, RepairKind, StabilizationBlocker, StabilizationWorkKind,
+    PendingPushGuard, RepairKind, StabilizationBlocker, StabilizationState, StabilizationStatus,
+    StabilizationWorkKind,
 };
 use crate::auto_flow::{AutoLaunch, AutoStepKey, load_auto_run, save_auto_run};
 use crate::config::Config;
@@ -17,11 +18,13 @@ use crate::tui::{
 };
 
 use super::{
-    archived_picker_overflow_message, discover_wt_columns,
-    plan_run_mode_from_parallel_confirmation, pr_target_choice_list, pr_target_repo_for_choice,
-    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
-    should_prompt_pr_target_choice, status_label_with_behind,
+    apply_bulk_review_resolution, archived_picker_overflow_message, discover_wt_columns,
+    merge_authorization_needs_review_resolution, plan_run_mode_from_parallel_confirmation,
+    pr_target_choice_list, pr_target_repo_for_choice, remote_pr_choice_keys,
+    remote_pr_worktree_branch, run_browser_opener, should_prompt_pr_target_choice,
+    status_label_with_behind,
 };
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -38,6 +41,59 @@ fn standalone_plan_confirmation_defaults_to_sequential() {
         plan_run_mode_from_parallel_confirmation(true),
         PlanRunMode::Parallel
     );
+}
+
+#[test]
+fn declined_bulk_review_resolution_does_not_resolve_threads() {
+    let resolved = RefCell::new(Vec::new());
+
+    let count = apply_bulk_review_resolution(
+        false,
+        &["thread-1".to_string(), "thread-2".to_string()],
+        |thread_id| {
+            resolved.borrow_mut().push(thread_id.to_string());
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(count, 0);
+    assert!(resolved.borrow().is_empty());
+}
+
+#[test]
+fn confirmed_bulk_review_resolution_resolves_each_thread_once() {
+    let resolved = RefCell::new(Vec::new());
+
+    let count = apply_bulk_review_resolution(
+        true,
+        &[
+            "thread-2".to_string(),
+            "thread-1".to_string(),
+            "thread-2".to_string(),
+        ],
+        |thread_id| {
+            resolved.borrow_mut().push(thread_id.to_string());
+            Ok(())
+        },
+    )
+    .unwrap();
+
+    assert_eq!(count, 2);
+    assert_eq!(resolved.into_inner(), vec!["thread-1", "thread-2"]);
+}
+
+#[test]
+fn review_feedback_merge_blocker_offers_thread_resolution() {
+    let authorization =
+        crate::auto_flow::stabilization_execute::MergeAuthorization::Blocked(StabilizationState {
+            status: StabilizationStatus::Blocked,
+            blocker: StabilizationBlocker::ReviewFeedbackFound,
+            next_work: StabilizationWorkKind::FixReview,
+            reason: "actionable review feedback is present".to_string(),
+        });
+
+    assert!(merge_authorization_needs_review_resolution(&authorization));
 }
 
 #[test]
@@ -1550,7 +1606,7 @@ exit 1
         .unwrap();
 
     assert_eq!(fs::read_to_string(&prompt_file).unwrap(), "build the thing");
-    assert_eq!(tui.sessions[0].agent_state, AgentState::NeedsInput);
+    assert_eq!(tui.sessions[0].agent_state, AgentState::Attached);
     let commands = fs::read_to_string(&log).unwrap();
     assert!(commands.contains("load-buffer -b"));
     assert!(commands.contains("paste-buffer -d -b"));

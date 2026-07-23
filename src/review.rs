@@ -221,7 +221,7 @@ pub fn actionable_review_feedback<'a>(
     feedback
 }
 
-fn is_copilot_reviewer(author: &str) -> bool {
+pub(crate) fn is_copilot_reviewer(author: &str) -> bool {
     matches!(
         author.trim().to_ascii_lowercase().trim_end_matches("[bot]"),
         "copilot" | "github-copilot" | "copilot-pull-request-reviewer"
@@ -618,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn actionable_feedback_keeps_copilot_review_body_for_workflow_state() {
+    fn actionable_feedback_preserves_copilot_body_for_caller_filtering() {
         let details = PrDetails {
             reviews: vec![PrReview {
                 author: "copilot-pull-request-reviewer".to_string(),

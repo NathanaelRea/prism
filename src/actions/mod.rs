@@ -29,6 +29,7 @@ use crate::github::{
     refresh_pr_cache, refresh_pr_details_cache_state, refresh_repo_policy_cache,
     wait_for_pr_merged,
 };
+use crate::harness::{HarnessConfig, OutputFormat, PromptTransport};
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::lifecycle::{
     WorktrunkApprovalStatus, check_worktrunk_approval_status, is_worktrunk_approval_failure,
@@ -44,7 +45,7 @@ use crate::plan_run::{
     prepare_plan_run_for_resume, request_plan_run_pause, resume_paused_plan_run,
     retry_failed_steps, retry_from_step, save_plan_run, skip_plan_step,
 };
-use crate::process::{command_exists, run_capture};
+use crate::process::{command_exists, parse_command_words, run_capture};
 use crate::repo::Repository;
 use crate::session::{
     CreateWorktreeOutcome, DeleteWorktreeOutcome, archive_worktree_session,
@@ -78,6 +79,7 @@ use plans::plan_run_mode_from_parallel_confirmation;
 use polling::{discover_wt_columns, status_label_with_behind};
 #[cfg(test)]
 use pull_requests::{
+    apply_bulk_review_resolution, merge_authorization_needs_review_resolution,
     pr_target_choice_list, pr_target_repo_for_choice, remote_pr_choice_keys,
     remote_pr_worktree_branch, run_browser_opener, should_prompt_pr_target_choice,
 };

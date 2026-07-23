@@ -124,15 +124,18 @@ pub(crate) fn warmup_jobs_for_sessions(
             let use_ = session_use(repos, generations, &session);
             (!in_flight.contains(&use_.warmup_key))
                 .then(|| {
-                    repos
-                        .get(session.repo_index)
-                        .map(|repo| AgentSessionWarmupJob {
+                    repos.get(session.repo_index).and_then(|repo| {
+                        let association =
+                            crate::session::worktree_harness(&repo.repo, &session).ok()?;
+                        let config = repo.config.for_harness(&association.harness_id).ok()?;
+                        Some(AgentSessionWarmupJob {
                             key: use_.warmup_key,
                             repo: repo.repo.clone(),
-                            config: repo.config.clone(),
+                            config,
                             session,
                             delay: Duration::ZERO,
                         })
+                    })
                 })
                 .flatten()
         })
@@ -158,10 +161,12 @@ pub(crate) fn warmup_job_for_key(
     let repo = repos
         .iter()
         .find(|repo| repo.identity == key.slot.repository)?;
+    let association = crate::session::worktree_harness(&repo.repo, session).ok()?;
+    let config = repo.config.for_harness(&association.harness_id).ok()?;
     Some(AgentSessionWarmupJob {
         key,
         repo: repo.repo.clone(),
-        config: repo.config.clone(),
+        config,
         session: session.background_job_snapshot(),
         delay,
     })
@@ -246,7 +251,12 @@ pub(crate) fn ensure_latest_session(
         tmux::TmuxAgentSession::for_worktree_session(repo, &session.branch, generation)
             .name()
             .to_string();
-    let opencode_runtime = load_runtime(repo, &session.branch, &session.path)?;
+    let opencode_runtime = load_runtime(
+        repo,
+        &config.default_harness,
+        &session.branch,
+        &session.path,
+    )?;
     Ok(EnsuredAgentSession {
         generation,
         tmux_session,
@@ -403,9 +413,12 @@ fn persist_observed_state(repos: &[ManagedRepo], session: &mut Session, running:
 
 fn observed_agent_state(current: AgentState, tmux_agent_running: bool) -> Option<AgentState> {
     if tmux_agent_running {
-        return Some(AgentState::NeedsInput);
+        return Some(AgentState::Attached);
     }
-    if matches!(current, AgentState::Running | AgentState::NeedsRestart) {
+    if matches!(
+        current,
+        AgentState::Attached | AgentState::Running | AgentState::NeedsRestart
+    ) {
         return Some(AgentState::ExitedOk);
     }
     None
@@ -462,7 +475,7 @@ mod tests {
     fn idle_tmux_opencode_session_does_not_count_as_running_agent() {
         let state = observed_agent_state(AgentState::Idle, true);
 
-        assert_eq!(state, Some(AgentState::NeedsInput));
+        assert_eq!(state, Some(AgentState::Attached));
     }
 
     #[test]

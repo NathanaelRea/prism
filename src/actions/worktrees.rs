@@ -100,6 +100,14 @@ impl Tui {
         else {
             return Ok(false);
         };
+        if !initial_prompt.trim().is_empty()
+            && !context.config.selected_harness()?.describe().initial_prompt
+        {
+            return Err(format!(
+                "harness '{}' does not support an initial prompt; configure a reliable interactive_prompt_transport or create the session without a prompt",
+                context.config.default_harness
+            ));
+        }
         self.show_loading_dialog(
             raw,
             "Create Session",
@@ -130,7 +138,6 @@ impl Tui {
             return Ok(true);
         }
         self.refresh_sessions()?;
-        self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
         let index = self
             .sessions
@@ -146,6 +153,12 @@ impl Tui {
             self.worktree_filter.clear();
         }
         self.select_worktree(index);
+        crate::session::set_worktree_harness(
+            &context.repo,
+            &self.sessions[index],
+            &context.config.default_harness,
+            false,
+        )?;
         let adoption = crate::session::adopt_worktree_session(
             &context.repo,
             &mut self.sessions[index],
@@ -162,7 +175,9 @@ impl Tui {
         if !initial_prompt.trim().is_empty() {
             self.show_loading_dialog(raw, "Create Session", "Starting agent session")?;
             self.paste_prompt_into_tmux_agent(index, &initial_prompt, false)?;
-            self.show_message("pasted initial prompt into agent session")?;
+            self.show_message("submitted initial prompt to agent session")?;
+        } else {
+            self.start_tmux_agent_warmup();
         }
         Ok(true)
     }
@@ -299,14 +314,16 @@ impl Tui {
         let choices = archived
             .iter()
             .zip(keys.iter())
-            .map(|(worktree, key)| crate::view::KeyChoice {
-                key: key.to_string(),
-                label: format!(
-                    "{}  {}  {}",
-                    worktree.branch,
-                    worktree.classification.label(),
-                    worktree.worktree_path
-                ),
+            .map(|(worktree, key)| {
+                crate::view::KeyChoice::new(
+                    key,
+                    format!(
+                        "{}  {}  {}",
+                        worktree.branch,
+                        worktree.classification.label(),
+                        worktree.worktree_path
+                    ),
+                )
             })
             .collect::<Vec<_>>();
         let Some(answer) = self.prompt_choice_dialog(
