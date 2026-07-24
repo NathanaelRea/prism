@@ -1841,11 +1841,11 @@ impl Tui {
 
     fn move_down(&mut self) {
         if self.main_focused {
-            if self.move_comment_selection(1) {
-                return;
-            }
+            let moved_comment = self.move_comment_selection(1);
             self.main_scroll = self.main_scroll.saturating_add(1);
-            self.move_plan_step_selection(1);
+            if !moved_comment {
+                self.move_plan_step_selection(1);
+            }
             return;
         }
         match self.focused_panel {
@@ -1857,11 +1857,11 @@ impl Tui {
 
     fn move_up(&mut self) {
         if self.main_focused {
-            if self.move_comment_selection(-1) {
-                return;
-            }
+            let moved_comment = self.move_comment_selection(-1);
             self.main_scroll = self.main_scroll.saturating_sub(1);
-            self.move_plan_step_selection(-1);
+            if !moved_comment {
+                self.move_plan_step_selection(-1);
+            }
             return;
         }
         match self.focused_panel {
@@ -3868,6 +3868,55 @@ mod tests {
 
         assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
         assert_eq!(tui.repo_main_view, RepoMainView::Github);
+    }
+
+    #[test]
+    fn main_panel_scrolls_when_pr_comments_are_selectable() {
+        let mut tui = test_tui();
+        tui.focus_worktrees();
+        tui.select_worktree(1);
+        tui.sessions[1].pr = PrCache::observed(
+            test_pr_summary(false),
+            Some(crate::github::PrDetails {
+                comments: vec![
+                    crate::github::PrComment {
+                        body: "first comment".to_string(),
+                        ..crate::github::PrComment::default()
+                    },
+                    crate::github::PrComment {
+                        body: "second comment".to_string(),
+                        ..crate::github::PrComment::default()
+                    },
+                ],
+                ..crate::github::PrDetails::default()
+            }),
+        );
+        tui.focus_main();
+
+        tui.move_down();
+
+        assert_eq!(tui.main_scroll, 1);
+        assert_eq!(tui.selected_comment, 1);
+
+        tui.move_up();
+
+        assert_eq!(tui.main_scroll, 0);
+        assert_eq!(tui.selected_comment, 0);
+    }
+
+    #[test]
+    fn sidebar_navigation_leaves_main_focus() {
+        let mut tui = test_tui();
+        tui.focus_main();
+
+        tui.focus_repos();
+        assert!(!tui.main_focused);
+        assert_eq!(tui.focused_panel, PanelFocus::Repos);
+
+        tui.focus_main();
+        tui.focus_next_panel();
+        assert!(!tui.main_focused);
+        assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
     }
 
     #[test]
