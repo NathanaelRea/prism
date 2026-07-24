@@ -431,7 +431,7 @@ pub fn install_claim_guards(conn: &Connection, claim: &ExecutionClaim) -> Result
              and e.worker_id = g.worker_id
              and e.daemon_instance_id = g.daemon_instance_id
              and e.fencing_token = g.fencing_token
-             and e.lease_expires_unix_ms > cast(unixepoch('subsec') * 1000 as integer)
+             and e.lease_expires_unix_ms > cast(unixepoch('now', 'subsec') * 1000 as integer)
          )";
     let guarded_tables = [
         ("plan_run", "id", true, false),
