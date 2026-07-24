@@ -13,8 +13,8 @@ use crate::plan_run::PlanRunMode;
 use crate::repo::Repository;
 use crate::session::Session;
 use crate::tui::{
-    DefaultBranchPollResult, OpencodeEventResult, OpencodePollKey, OpencodePollResult, Tui,
-    WtPollResult,
+    DefaultBranchPollResult, OpencodeEventResult, OpencodePollKey, OpencodePollResult, PanelFocus,
+    Tui, WtPollResult,
 };
 
 use super::{
@@ -1742,8 +1742,11 @@ exit 0
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let session = test_session(temp.join("worktree"), "feature");
     let mut tui = Tui::new_single(repo, config, vec![session]);
+    tui.focused_panel = PanelFocus::Worktrees;
+    tui.tmux_portal_size = Some((72, 18));
 
-    tui.attach_selected_tmux_session().unwrap();
+    tui.prepare_tmux_session_for_attach(0, (120, 39)).unwrap();
+    tui.attach_tmux_session_for_index(0).unwrap();
 
     let wait_started = Instant::now();
     while !tui.tmux_warmups_in_flight.is_empty() && wait_started.elapsed() < Duration::from_secs(5)
@@ -1753,6 +1756,16 @@ exit 0
     }
     assert!(tui.tmux_warmups_in_flight.is_empty());
     let commands = fs::read_to_string(&log).unwrap();
+    assert!(
+        commands.find("resize-window -x 120 -y 39").unwrap()
+            < commands.find("attach-session -t").unwrap(),
+        "agent window should match the terminal before attach"
+    );
+    assert!(
+        commands.find("attach-session -t").unwrap()
+            < commands.rfind("resize-window -x 72 -y 18").unwrap(),
+        "portal should resize the agent window immediately after detach"
+    );
     assert!(commands.contains("kill-session -t"));
     assert!(commands.contains("new-session -d -s"));
 

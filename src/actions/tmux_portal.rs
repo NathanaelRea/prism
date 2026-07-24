@@ -4,9 +4,9 @@ use std::time::Instant;
 use ansi_to_tui::IntoText as _;
 use ratatui::text::Line;
 
-use crate::tui::{TmuxPortalResult, TmuxPortalSnapshot, TmuxPortalTarget};
+use crate::tui::{TmuxPortalCapture, TmuxPortalResult, TmuxPortalSnapshot, TmuxPortalTarget};
 
-const TMUX_PORTAL_POLL_INTERVAL: Duration = Duration::from_millis(300);
+const TMUX_PORTAL_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const TMUX_PORTAL_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const TMUX_PORTAL_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -26,10 +26,13 @@ impl Tui {
                 self.tmux_portal_polls_in_flight.remove(&result.key);
             }
             if is_current && target_key == Some(&result.key) {
-                let capture = result.capture.map(normalize_capture);
+                let key = result.key;
                 let snapshot = TmuxPortalSnapshot {
-                    key: result.key,
-                    capture: Some(capture),
+                    key: key.clone(),
+                    capture: Some(TmuxPortalCapture {
+                        key,
+                        result: result.capture,
+                    }),
                 };
                 if self.tmux_portal.as_ref() != Some(&snapshot) {
                     self.tmux_portal = Some(snapshot);
@@ -52,8 +55,11 @@ impl Tui {
                 self.tmux_portal_last_polled.clear();
                 self.tmux_portal_polls_in_flight.clear();
                 let snapshot = TmuxPortalSnapshot {
-                    key,
-                    capture: Some(Err("harness unavailable".to_string())),
+                    key: key.clone(),
+                    capture: Some(TmuxPortalCapture {
+                        key,
+                        result: Err("harness unavailable".to_string()),
+                    }),
                 };
                 if self.tmux_portal.as_ref() != Some(&snapshot) {
                     self.tmux_portal = Some(snapshot);
@@ -67,23 +73,35 @@ impl Tui {
         self.tmux_portal_polls_in_flight.retain(|key, started_at| {
             key == &target.key && started_at.elapsed() < TMUX_PORTAL_CAPTURE_TIMEOUT
         });
-        if self.tmux_portal.as_ref().map(|portal| &portal.key) != Some(&target.key) {
+        let target_changed =
+            self.tmux_portal.as_ref().map(|portal| &portal.key) != Some(&target.key);
+        if target_changed {
+            let previous_capture = self
+                .tmux_portal
+                .as_ref()
+                .and_then(|portal| portal.capture.as_ref())
+                .filter(|capture| capture.result.is_ok())
+                .cloned();
             self.tmux_portal = Some(TmuxPortalSnapshot {
                 key: target.key.clone(),
-                capture: None,
+                capture: previous_capture,
             });
+            self.tmux_portal_last_polled
+                .entry(target.key.clone())
+                .or_insert_with(Instant::now);
             changed = true;
         }
 
-        let interval = if self
+        let capture = self
             .tmux_portal
             .as_ref()
             .and_then(|portal| portal.capture.as_ref())
-            .is_some_and(Result::is_err)
-        {
-            TMUX_PORTAL_RETRY_INTERVAL
-        } else {
-            TMUX_PORTAL_POLL_INTERVAL
+            .map(|capture| &capture.result);
+        let interval = match (target_changed, capture) {
+            (true, _) => Duration::ZERO,
+            (false, None) => Duration::ZERO,
+            (false, Some(Err(_))) => TMUX_PORTAL_RETRY_INTERVAL,
+            (false, Some(Ok(_))) => TMUX_PORTAL_POLL_INTERVAL,
         };
         let due = self
             .tmux_portal_last_polled
@@ -102,7 +120,10 @@ impl Tui {
                     &target.config,
                     &target.key.slot.branch,
                     target.key.generation,
-                );
+                    target.size.0,
+                    target.size.1,
+                )
+                .map(normalize_capture);
                 let _ = tx.send(TmuxPortalResult {
                     key: target.key,
                     started_at,
@@ -120,6 +141,7 @@ impl Tui {
             return None;
         }
         let context = self.selected_worktree_context()?;
+        let size = self.tmux_portal_size?;
         let session = self
             .sessions
             .get(context.session_index)?
@@ -137,7 +159,12 @@ impl Tui {
             Ok(config) => config,
             Err(_) => return Some(Err(key)),
         };
-        Some(Ok(TmuxPortalTarget { key, repo, config }))
+        Some(Ok(TmuxPortalTarget {
+            key,
+            repo,
+            config,
+            size,
+        }))
     }
 }
 

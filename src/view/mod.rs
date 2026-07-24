@@ -272,6 +272,7 @@ mod worktree_panel;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use layout::tmux_portal_size;
 pub(crate) use shell::render;
 
 pub(crate) fn sidebar_width_for(cols: u16, configured_width: Option<u16>) -> u16 {

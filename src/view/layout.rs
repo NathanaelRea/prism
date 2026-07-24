@@ -2,6 +2,37 @@ use super::*;
 
 pub(super) const MIN_MAIN_WIDTH: u16 = 20;
 
+pub(crate) fn tmux_portal_size(
+    area: Rect,
+    configured_sidebar_width: Option<u16>,
+) -> Option<(u16, u16)> {
+    let (_, main, _) = shell_areas(area, configured_sidebar_width);
+    let portal = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(main)[1]
+        .inner(Margin {
+            vertical: 1,
+            horizontal: 1,
+        });
+    (portal.width > 0 && portal.height > 0).then_some((portal.width, portal.height))
+}
+
+pub(super) fn shell_areas(area: Rect, configured_sidebar_width: Option<u16>) -> (Rect, Rect, Rect) {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(area);
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(sidebar_width(area.width, configured_sidebar_width)),
+            Constraint::Min(MIN_MAIN_WIDTH),
+        ])
+        .split(vertical[0]);
+    (body[0], body[1], vertical[1])
+}
+
 pub(super) fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
     let width = width.min(area.width);
     let height = height.min(area.height);
