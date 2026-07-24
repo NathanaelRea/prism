@@ -17,14 +17,13 @@ pub(super) fn apply_bulk_review_resolution(
     Ok(thread_ids.len())
 }
 
-pub(super) fn merge_authorization_needs_review_resolution(
-    authorization: &crate::auto_flow::stabilization_execute::MergeAuthorization,
-) -> bool {
-    matches!(
-        authorization,
-        crate::auto_flow::stabilization_execute::MergeAuthorization::Blocked(state)
-            if state.blocker
-                == crate::auto_flow::stabilization_model::StabilizationBlocker::ReviewFeedbackFound
+pub(super) fn unresolved_review_thread_ids(details: &crate::github::PrDetails) -> Vec<String> {
+    crate::review::canonical_review_thread_ids(
+        details
+            .review_comments
+            .iter()
+            .filter(|comment| !comment.resolved)
+            .map(|comment| comment.thread_id.as_str()),
     )
 }
 
@@ -129,6 +128,52 @@ pub(super) fn run_browser_opener(
 }
 
 impl Tui {
+    pub(crate) fn resolve_review_comments(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let context = self
+            .selected_worktree_context()
+            .ok_or_else(|| "no worktree selected".to_string())?;
+        let path = self.sessions[context.session_index].path.clone();
+        let details = self.sessions[context.session_index]
+            .pr
+            .details()
+            .ok_or_else(|| "pull request review details are unavailable".to_string())?;
+        let thread_ids = unresolved_review_thread_ids(details);
+        if thread_ids.is_empty() {
+            return self.show_message("no unresolved review conversations");
+        }
+
+        self.show_loading_dialog(
+            raw,
+            "Resolve Review Conversations",
+            "Resolving observed review conversations",
+        )?;
+        let repo = context.repo;
+        let config = context.config;
+        let resolution = apply_bulk_review_resolution(true, &thread_ids, |thread_id| {
+            crate::github::resolve_review_thread(&path, &config, thread_id)
+        });
+        let refresh = {
+            let session = &mut self.sessions[context.session_index];
+            refresh_pr_cache(
+                &repo,
+                &session.branch,
+                &mut session.pr,
+                &session.path,
+                &config,
+                true,
+            )
+        };
+        let count = resolution?;
+        refresh?;
+        self.show_message(&format!(
+            "resolved {count} review conversation{}",
+            if count == 1 { "" } else { "s" }
+        ))
+    }
+
     pub(crate) fn open_remote_pr_worktree(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
@@ -745,30 +790,24 @@ impl Tui {
         }
         let path = self.sessions[selected].path.clone();
         let branch = self.sessions[selected].branch.clone();
-        let mut initial_authorization =
+        run_pre_push_checks(&context.config, &path)?;
+        self.show_loading_dialog(raw, "Merge Pull Request", "Checking pull request gates")?;
+        let initial_authorization =
             crate::auto_flow::stabilization_execute::observe_manual_merge_authorization(
                 &context.repo,
                 &context.config,
                 &mut self.sessions[selected],
             );
-        if merge_authorization_needs_review_resolution(&initial_authorization)
-            && self.resolve_observed_review_threads(
-                raw,
-                selected,
-                &context.repo,
-                &context.config,
-            )?
-        {
-            initial_authorization =
-                crate::auto_flow::stabilization_execute::observe_manual_merge_authorization(
-                    &context.repo,
-                    &context.config,
-                    &mut self.sessions[selected],
-                );
-        }
-        let initially_observed_pr_number = match &initial_authorization {
+        let (initially_observed_pr_number, review_thread_ids) = match &initial_authorization {
             crate::auto_flow::stabilization_execute::MergeAuthorization::Authorized(token) => {
-                token.pr_number()
+                (token.pr_number(), Vec::new())
+            }
+            crate::auto_flow::stabilization_execute::MergeAuthorization::ReviewResolutionRequired {
+                candidate,
+                thread_ids,
+                ..
+            } => {
+                (candidate.pr_number(), thread_ids.clone())
             }
             crate::auto_flow::stabilization_execute::MergeAuthorization::Blocked(state) => {
                 if state.blocker
@@ -785,19 +824,38 @@ impl Tui {
                 return Ok(());
             }
         };
-        run_pre_push_checks(&context.config, &path)?;
-        self.show_loading_dialog(
-            raw,
-            "Merge Pull Request",
-            &format!("Reobserving and merging PR #{initially_observed_pr_number}"),
-        )?;
-        let execution =
+        let execution = if review_thread_ids.is_empty() {
+            self.show_loading_dialog(
+                raw,
+                "Merge Pull Request",
+                &format!("Merging PR #{initially_observed_pr_number}"),
+            )?;
+            crate::auto_flow::stabilization_execute::execute_merge_authorization(
+                &context.config,
+                &path,
+                initial_authorization,
+            )?
+        } else {
+            self.show_loading_dialog(
+                raw,
+                "Merge Pull Request",
+                "Resolving observed review conversations",
+            )?;
+            apply_bulk_review_resolution(true, &review_thread_ids, |thread_id| {
+                crate::github::resolve_review_thread(&path, &context.config, thread_id)
+            })?;
+            self.show_loading_dialog(
+                raw,
+                "Merge Pull Request",
+                &format!("Verifying gates and merging PR #{initially_observed_pr_number}"),
+            )?;
             crate::auto_flow::stabilization_execute::reobserve_and_execute_manual_merge(
                 &context.repo,
                 &context.config,
                 &mut self.sessions[selected],
                 initial_authorization,
-            )?;
+            )?
+        };
         let pr_number = match execution {
             crate::auto_flow::stabilization_execute::ManualMergeExecution::Merged { pr_number } => {
                 pr_number
@@ -842,55 +900,5 @@ impl Tui {
             self.show_message("merge complete")?;
         }
         Ok(())
-    }
-
-    fn resolve_observed_review_threads(
-        &mut self,
-        raw: &mut crate::tui_runtime::TerminalRuntime,
-        selected: usize,
-        repo: &crate::repo::Repository,
-        config: &crate::config::Config,
-    ) -> Result<bool, String> {
-        let feedback = crate::auto_flow::stabilization_observe::stabilization_review_feedback(
-            self.sessions[selected]
-                .pr
-                .trusted_details()?
-                .ok_or_else(|| "pull request review details are unavailable".to_string())?,
-            None,
-        );
-        let thread_ids = crate::review::review_thread_ids(&feedback);
-        if thread_ids.is_empty() {
-            return Ok(false);
-        }
-        let count = thread_ids.len();
-        if !self.confirm_action_dialog(
-            raw,
-            "Resolve Review Conversations",
-            &format!("Mark all {count} unresolved review conversation(s) as resolved?"),
-            false,
-        )? {
-            self.show_message("merge blocked: review conversations left unresolved")?;
-            return Ok(false);
-        }
-
-        self.show_loading_dialog(
-            raw,
-            "Resolve Review Conversations",
-            "Resolving review conversations",
-        )?;
-        let path = self.sessions[selected].path.clone();
-        apply_bulk_review_resolution(true, &thread_ids, |thread_id| {
-            crate::github::resolve_review_thread(&path, config, thread_id)
-        })?;
-        let session = &mut self.sessions[selected];
-        refresh_pr_cache(
-            repo,
-            &session.branch,
-            &mut session.pr,
-            &session.path,
-            config,
-            true,
-        )?;
-        Ok(true)
     }
 }

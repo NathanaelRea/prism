@@ -125,6 +125,7 @@ impl KeyInput {
             KeyCode::Char('M') if plain_char(event) => Key::Merge,
             KeyCode::Char('c') if plain_char(event) => Key::CiFix,
             KeyCode::Char('f') if plain_char(event) => Key::ReviewFix,
+            KeyCode::Char('R') if plain_char(event) => Key::ResolveAllComments,
             KeyCode::Char('p') if plain_char(event) => Key::PullDefault,
             _ => Key::Other,
         }
@@ -184,6 +185,7 @@ pub enum Key {
     EditWorktreeColumns,
     CiFix,
     ReviewFix,
+    ResolveAllComments,
     Push,
     Merge,
     PullDefault,
@@ -342,6 +344,25 @@ mod tests {
         assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
         assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
         assert_eq!(map(&mut input, key(KeyCode::Char('c'))), Key::CiFix);
+    }
+
+    #[test]
+    fn key_input_handles_review_resolution() {
+        let mut input = KeyInput::default();
+        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
+        assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('R'))),
+            Key::ResolveAllComments
+        );
+    }
+
+    #[test]
+    fn key_input_handles_merge() {
+        let mut input = KeyInput::default();
+        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
+        assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
+        assert_eq!(map(&mut input, shift_key(KeyCode::Char('M'))), Key::Merge);
     }
 
     #[test]

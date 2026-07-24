@@ -1063,7 +1063,10 @@ pub(super) fn execute_merge_step(
                 allowed: true,
                 summary: "fresh stabilization observation authorized auto-merge".to_string(),
             },
-            stabilization_execute::MergeAuthorization::Blocked(state) => MergeGateOutcome {
+            stabilization_execute::MergeAuthorization::ReviewResolutionRequired {
+                state, ..
+            }
+            | stabilization_execute::MergeAuthorization::Blocked(state) => MergeGateOutcome {
                 allowed: false,
                 summary: format!("merge blocked:\n- {}", state.reason),
             },

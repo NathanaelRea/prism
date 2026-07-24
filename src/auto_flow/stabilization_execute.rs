@@ -61,6 +61,11 @@ pub(crate) enum WaitProgress {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum MergeAuthorization {
     Authorized(AuthorizedMerge),
+    ReviewResolutionRequired {
+        candidate: AuthorizedMerge,
+        thread_ids: Vec<String>,
+        state: super::stabilization_model::StabilizationState,
+    },
     Blocked(super::stabilization_model::StabilizationState),
 }
 
@@ -138,7 +143,90 @@ pub(crate) fn observe_manual_merge_authorization(
                 .number,
             guard: work.guard,
         }),
-        Err(state) => MergeAuthorization::Blocked(state),
+        Err(state) => review_resolution_authorization(&snapshot, state),
+    }
+}
+
+fn review_resolution_authorization(
+    snapshot: &super::stabilization_model::StabilizationSnapshot,
+    state: super::stabilization_model::StabilizationState,
+) -> MergeAuthorization {
+    let Some(pull_request) = snapshot.pull_request.as_ref() else {
+        return MergeAuthorization::Blocked(state);
+    };
+    if pull_request.review.unresolved_threads.is_empty()
+        || pull_request
+            .review
+            .unresolved_threads
+            .iter()
+            .any(|thread| thread.thread_id.trim().is_empty())
+        || pull_request.review.actionable_reviews.iter().any(|review| {
+            matches!(
+                review,
+                super::stabilization_model::ActionableReviewItem::ReviewBody { .. }
+            )
+        })
+    {
+        return MergeAuthorization::Blocked(state);
+    }
+    let thread_ids = crate::review::canonical_review_thread_ids(
+        pull_request
+            .review
+            .unresolved_threads
+            .iter()
+            .map(|thread| thread.thread_id.as_str()),
+    );
+    let conversations_are_only_policy_blocker = matches!(
+        &snapshot.policy,
+        super::stabilization_model::PolicyFacts::Blocked { blockers }
+            if !blockers.is_empty()
+                && blockers.iter().all(|blocker| blocker
+                    == &super::stabilization_model::PolicyBlocker::ConversationsUnresolved)
+    );
+    let mergeability_is_conversation_blocked = matches!(
+        &pull_request.mergeability,
+        super::stabilization_model::MergeabilityFacts::Blocked { reason }
+            if reason == "GitHub merge state is BLOCKED"
+                && conversations_are_only_policy_blocker
+    );
+    if matches!(
+        pull_request.mergeability,
+        super::stabilization_model::MergeabilityFacts::Blocked { .. }
+    ) && !mergeability_is_conversation_blocked
+    {
+        return MergeAuthorization::Blocked(state);
+    }
+    let mut after_resolution = snapshot.clone();
+    let pull_request = after_resolution
+        .pull_request
+        .as_mut()
+        .expect("review threads require a pull request");
+    let pr_number = pull_request.number;
+    pull_request.review.unresolved_threads.clear();
+    pull_request.review.actionable_reviews.clear();
+    if mergeability_is_conversation_blocked {
+        pull_request.mergeability = super::stabilization_model::MergeabilityFacts::Clean;
+    }
+    if let super::stabilization_model::PolicyFacts::Blocked { blockers } = &after_resolution.policy
+    {
+        if blockers.is_empty()
+            || blockers.iter().any(|blocker| {
+                blocker != &super::stabilization_model::PolicyBlocker::ConversationsUnresolved
+            })
+        {
+            return MergeAuthorization::Blocked(state);
+        }
+        after_resolution.policy = super::stabilization_model::PolicyFacts::Satisfied;
+    }
+    let Ok(work) = stabilization_plan::manual_merge_authorization(&after_resolution) else {
+        return MergeAuthorization::Blocked(state);
+    };
+    let mut guard = work.guard;
+    guard.review_thread_ids = thread_ids.clone();
+    MergeAuthorization::ReviewResolutionRequired {
+        candidate: AuthorizedMerge { pr_number, guard },
+        thread_ids,
+        state,
     }
 }
 
@@ -155,7 +243,8 @@ pub(crate) fn execute_merge_authorization(
             crate::github::merge_pull_request(config, path, pr_number, expected_head_sha)?;
             Ok(ManualMergeExecution::Merged { pr_number })
         }
-        MergeAuthorization::Blocked(state) => Ok(ManualMergeExecution::Blocked(state)),
+        MergeAuthorization::ReviewResolutionRequired { state, .. }
+        | MergeAuthorization::Blocked(state) => Ok(ManualMergeExecution::Blocked(state)),
     }
 }
 
@@ -167,12 +256,16 @@ pub(crate) fn reobserve_and_execute_manual_merge(
 ) -> Result<ManualMergeExecution, String> {
     let initial = match initial_authorization {
         MergeAuthorization::Authorized(initial) => initial,
+        MergeAuthorization::ReviewResolutionRequired { candidate, .. } => candidate,
         MergeAuthorization::Blocked(state) => return Ok(ManualMergeExecution::Blocked(state)),
     };
     let path = session.path.clone();
     let fresh_authorization = observe_manual_merge_authorization(repo, config, session);
     let fresh = match fresh_authorization {
         MergeAuthorization::Authorized(fresh) => fresh,
+        MergeAuthorization::ReviewResolutionRequired { state, .. } => {
+            return Ok(ManualMergeExecution::Blocked(state));
+        }
         MergeAuthorization::Blocked(state) => return Ok(ManualMergeExecution::Blocked(state)),
     };
     execute_merge_authorization(config, &path, reauthorize_observed_merge(initial, fresh))
@@ -1214,7 +1307,7 @@ mod tests {
         stabilization_model::{
             ActionableReviewItem, CiFacts, MergeabilityFacts, PolicyBlocker, PolicyFacts,
             PullRequestFacts, PullRequestState, RepairKind, RepositoryFacts, ReviewFacts,
-            StabilizationGoal, StabilizationSnapshot, WorktreeFacts,
+            ReviewThreadFact, StabilizationGoal, StabilizationSnapshot, WorktreeFacts,
         },
     };
     use crate::config::Config;
@@ -1371,12 +1464,122 @@ mod tests {
             },
             AuthorizedMerge {
                 pr_number: 42,
-                guard: changed_guard,
+                guard: changed_guard.clone(),
+            },
+        );
+        let resolved_reviews = reauthorize_observed_merge(
+            AuthorizedMerge {
+                pr_number: 42,
+                guard: WorkGuard {
+                    review_thread_ids: vec!["thread-1".to_string()],
+                    ..changed_guard.clone()
+                },
+            },
+            AuthorizedMerge {
+                pr_number: 42,
+                guard: WorkGuard {
+                    review_thread_ids: Vec::new(),
+                    ..changed_guard
+                },
             },
         );
 
         assert!(matches!(switched_pr, MergeAuthorization::Blocked(_)));
         assert!(matches!(moved_head, MergeAuthorization::Blocked(_)));
+        assert!(matches!(
+            resolved_reviews,
+            MergeAuthorization::Authorized(_)
+        ));
+    }
+
+    #[test]
+    fn manual_merge_preflight_only_resolves_review_thread_blockers() {
+        let thread = ReviewThreadFact {
+            thread_id: "thread-1".to_string(),
+            comment_id: "comment-1".to_string(),
+            path: "src/lib.rs".to_string(),
+            line: Some(12),
+            body: "please fix".to_string(),
+            author: "reviewer".to_string(),
+            resolved: false,
+            created_at: "now".to_string(),
+        };
+        let mut review_only = ready_manual_merge_snapshot();
+        let pull_request = review_only.pull_request.as_mut().unwrap();
+        pull_request.review.unresolved_threads = vec![thread.clone()];
+        pull_request.review.actionable_reviews =
+            vec![ActionableReviewItem::ReviewThreadComment(thread.clone())];
+        pull_request.mergeability = MergeabilityFacts::Blocked {
+            reason: "GitHub merge state is BLOCKED".to_string(),
+        };
+        review_only.policy = PolicyFacts::Blocked {
+            blockers: vec![PolicyBlocker::ConversationsUnresolved],
+        };
+        let state = stabilization_plan::plan(&review_only).state();
+
+        let authorization = review_resolution_authorization(&review_only, state);
+
+        assert!(matches!(
+            authorization,
+            MergeAuthorization::ReviewResolutionRequired { ref thread_ids, .. }
+                if thread_ids == &["thread-1"]
+        ));
+
+        let mut failed_ci = review_only.clone();
+        failed_ci.pull_request.as_mut().unwrap().ci.aggregate = PrCheckState::Failed;
+        let state = stabilization_plan::plan(&failed_ci).state();
+        assert!(matches!(
+            review_resolution_authorization(&failed_ci, state),
+            MergeAuthorization::Blocked(_)
+        ));
+
+        let mut merge_conflict = review_only.clone();
+        merge_conflict.policy = PolicyFacts::Satisfied;
+        let state = stabilization_plan::plan(&merge_conflict).state();
+        assert!(matches!(
+            review_resolution_authorization(&merge_conflict, state),
+            MergeAuthorization::Blocked(_)
+        ));
+
+        for reason in [
+            "GitHub merge state is DIRTY",
+            "GitHub merge state is BEHIND",
+            "merge conflict against origin/main",
+        ] {
+            let mut known_merge_blocker = review_only.clone();
+            known_merge_blocker
+                .pull_request
+                .as_mut()
+                .unwrap()
+                .mergeability = MergeabilityFacts::Blocked {
+                reason: reason.to_string(),
+            };
+            let state = stabilization_plan::plan(&known_merge_blocker).state();
+            assert!(matches!(
+                review_resolution_authorization(&known_merge_blocker, state),
+                MergeAuthorization::Blocked(_)
+            ));
+        }
+
+        let mut review_body = review_only;
+        review_body
+            .pull_request
+            .as_mut()
+            .unwrap()
+            .review
+            .actionable_reviews
+            .push(ActionableReviewItem::ReviewBody {
+                review_id: "review-1".to_string(),
+                author: "reviewer".to_string(),
+                state: "CHANGES_REQUESTED".to_string(),
+                body: "broader changes requested".to_string(),
+                submitted_at: "now".to_string(),
+            });
+        let state = stabilization_plan::plan(&review_body).state();
+        assert!(matches!(
+            review_resolution_authorization(&review_body, state),
+            MergeAuthorization::Blocked(_)
+        ));
     }
 
     #[test]
