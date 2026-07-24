@@ -5,32 +5,10 @@ pub(super) fn render_sidebar(
     area: Rect,
     model: &crate::view::FrameModel<'_>,
 ) {
-    if model.tmux_portal.is_none() {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(6),
-                Constraint::Percentage(40),
-                Constraint::Percentage(60),
-            ])
-            .split(area);
-        render_status(frame, chunks[0], model);
-        render_repos(frame, chunks[1], model);
-        render_worktrees(frame, chunks[2], model);
-        return;
-    }
-
-    let halves = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
-    let upper = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(1)])
-        .split(halves[0]);
-    render_status(frame, upper[0], model);
-    render_repos(frame, upper[1], model);
-    render_worktrees(frame, halves[1], model);
+    let (status, repos, worktrees) = sidebar_areas(area);
+    render_status(frame, status, model);
+    render_repos(frame, repos, model);
+    render_worktrees(frame, worktrees, model);
 }
 
 pub(super) fn render_status(
