@@ -148,7 +148,13 @@ pub(crate) struct TmuxPortalTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TmuxPortalSnapshot {
     pub key: AgentSessionWarmupKey,
-    pub capture: Option<Result<Vec<Line<'static>>, String>>,
+    pub capture: Option<TmuxPortalCapture>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TmuxPortalCapture {
+    pub key: AgentSessionWarmupKey,
+    pub result: Result<Vec<Line<'static>>, String>,
 }
 
 impl ManagedRepo {
@@ -3059,26 +3065,26 @@ impl Tui {
         let managed = self.repos.get(session.repo_index)?;
         let slot = AgentSessionSlot::for_repository_session(&managed.identity, session);
         let generation = self.tmux_generations.get(&slot)?;
-        let portal = self
+        let current_key = AgentSessionWarmupKey::new(slot, *generation);
+        let capture = self
             .tmux_portal
             .as_ref()
-            .filter(|portal| portal.key.slot == slot && portal.key.generation == *generation);
-        let state = match portal.and_then(|portal| portal.capture.as_ref()) {
-            Some(Ok(lines)) => view::TmuxPortalState::Ready(lines),
-            Some(Err(_)) => view::TmuxPortalState::Unavailable,
-            None => match self
-                .tmux_portal
-                .as_ref()
-                .and_then(|portal| portal.capture.as_ref())
-            {
-                Some(Ok(lines)) => view::TmuxPortalState::Ready(lines),
-                _ => view::TmuxPortalState::Loading,
+            .and_then(|portal| portal.capture.as_ref());
+        let (branch, state) = match capture {
+            Some(capture) if capture.key == current_key => match &capture.result {
+                Ok(lines) => (&session.branch, view::TmuxPortalState::Ready(lines)),
+                Err(_) => (&session.branch, view::TmuxPortalState::Unavailable),
             },
+            Some(capture) => match &capture.result {
+                Ok(lines) => (
+                    &capture.key.slot.branch,
+                    view::TmuxPortalState::Ready(lines),
+                ),
+                Err(_) => (&session.branch, view::TmuxPortalState::Loading),
+            },
+            None => (&session.branch, view::TmuxPortalState::Loading),
         };
-        Some(view::TmuxPortalModel {
-            branch: &session.branch,
-            state,
-        })
+        Some(view::TmuxPortalModel { branch, state })
     }
 
     fn repo_health_label(&self, repo_index: usize) -> String {
@@ -3431,9 +3437,9 @@ mod tests {
     use crate::view::{ChoiceList, KeyChoice, OrderedToggleItem, RepoMainView, WorktreeMainView};
 
     use super::{
-        GitAction, ManagedRepo, OpenTmuxSessionTarget, PanelFocus, PrPollKey, TmuxPortalResult,
-        TmuxPortalSnapshot, Tui, WorktreeListMode, confirmation_result, move_enabled_ordered_item,
-        selectable_choice_key, toggle_ordered_item,
+        GitAction, ManagedRepo, OpenTmuxSessionTarget, PanelFocus, PrPollKey, TmuxPortalCapture,
+        TmuxPortalResult, TmuxPortalSnapshot, Tui, WorktreeListMode, confirmation_result,
+        move_enabled_ordered_item, selectable_choice_key, toggle_ordered_item,
     };
 
     #[test]
@@ -3587,8 +3593,11 @@ mod tests {
         tui.tmux_generations.insert(previous_slot.clone(), 0);
         tui.tmux_generations.insert(selected_slot.clone(), 0);
         tui.tmux_portal = Some(TmuxPortalSnapshot {
-            key: AgentSessionWarmupKey::new(previous_slot, 0),
-            capture: Some(Ok(vec![Line::from("previous capture")])),
+            key: AgentSessionWarmupKey::new(previous_slot.clone(), 0),
+            capture: Some(TmuxPortalCapture {
+                key: AgentSessionWarmupKey::new(previous_slot, 0),
+                result: Ok(vec![Line::from("previous capture")]),
+            }),
         });
         tui.select_worktree(1);
 
@@ -3596,14 +3605,19 @@ mod tests {
         let crate::view::TmuxPortalState::Ready(lines) = model.state else {
             panic!("previous capture should survive the selection redraw");
         };
+        assert_eq!(model.branch, "feature-a");
         assert_eq!(lines, &[Line::from("previous capture")]);
 
         assert!(tui.poll_tmux_portal());
         assert_eq!(
+            tui.tmux_portal.as_ref().map(|portal| &portal.key.slot),
+            Some(&selected_slot)
+        );
+        assert_eq!(
             tui.tmux_portal
                 .as_ref()
                 .and_then(|portal| portal.capture.as_ref())
-                .and_then(|capture| capture.as_ref().ok()),
+                .and_then(|capture| capture.result.as_ref().ok()),
             Some(&vec![Line::from("previous capture")])
         );
         assert!(

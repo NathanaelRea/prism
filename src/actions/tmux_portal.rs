@@ -4,7 +4,7 @@ use std::time::Instant;
 use ansi_to_tui::IntoText as _;
 use ratatui::text::Line;
 
-use crate::tui::{TmuxPortalResult, TmuxPortalSnapshot, TmuxPortalTarget};
+use crate::tui::{TmuxPortalCapture, TmuxPortalResult, TmuxPortalSnapshot, TmuxPortalTarget};
 
 const TMUX_PORTAL_POLL_INTERVAL: Duration = Duration::from_millis(150);
 const TMUX_PORTAL_RETRY_INTERVAL: Duration = Duration::from_secs(2);
@@ -26,9 +26,13 @@ impl Tui {
                 self.tmux_portal_polls_in_flight.remove(&result.key);
             }
             if is_current && target_key == Some(&result.key) {
+                let key = result.key;
                 let snapshot = TmuxPortalSnapshot {
-                    key: result.key,
-                    capture: Some(result.capture),
+                    key: key.clone(),
+                    capture: Some(TmuxPortalCapture {
+                        key,
+                        result: result.capture,
+                    }),
                 };
                 if self.tmux_portal.as_ref() != Some(&snapshot) {
                     self.tmux_portal = Some(snapshot);
@@ -51,8 +55,11 @@ impl Tui {
                 self.tmux_portal_last_polled.clear();
                 self.tmux_portal_polls_in_flight.clear();
                 let snapshot = TmuxPortalSnapshot {
-                    key,
-                    capture: Some(Err("harness unavailable".to_string())),
+                    key: key.clone(),
+                    capture: Some(TmuxPortalCapture {
+                        key,
+                        result: Err("harness unavailable".to_string()),
+                    }),
                 };
                 if self.tmux_portal.as_ref() != Some(&snapshot) {
                     self.tmux_portal = Some(snapshot);
@@ -73,9 +80,8 @@ impl Tui {
                 .tmux_portal
                 .as_ref()
                 .and_then(|portal| portal.capture.as_ref())
-                .and_then(|capture| capture.as_ref().ok())
-                .cloned()
-                .map(Ok);
+                .filter(|capture| capture.result.is_ok())
+                .cloned();
             self.tmux_portal = Some(TmuxPortalSnapshot {
                 key: target.key.clone(),
                 capture: previous_capture,
@@ -89,7 +95,8 @@ impl Tui {
         let capture = self
             .tmux_portal
             .as_ref()
-            .and_then(|portal| portal.capture.as_ref());
+            .and_then(|portal| portal.capture.as_ref())
+            .map(|capture| &capture.result);
         let interval = match (target_changed, capture) {
             (true, _) => Duration::ZERO,
             (false, None) => Duration::ZERO,
