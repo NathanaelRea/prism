@@ -13,6 +13,15 @@
 - **Behavior**: Interrupted Plan runs can resume after Prism restarts. Users can
   pause, resume, dismiss/archive/delete, and move among historical runs, then
   return the main panel to normal worktree content.
+- **Invariant**: Plan runs launched from the board execute in detached workers;
+  closing or reopening the Prism TUI does not interrupt their orchestration.
+- **Invariant**: Managed Plan and Auto Flow work is claimed transactionally from
+  SQLite. Tmux session existence is never workflow ownership.
+- **Invariant**: Lost or expired ownership becomes recovery-pending and is never
+  automatically restarted.
+- **Behavior**: Interactive startup presents recovery-pending runs in one
+  all-unchecked multi-select dialog. Confirmed selections are queued, confirmed
+  omissions are paused, and cancellation records no decision.
 - **Behavior**: Standalone Plan Mode remains available separately from Auto Flow.
   Its dashboard supports pause/resume, retry, skip, abort, and entering the
    selected phase's interactive session when its adapter supports persistent sessions and interactive resume.
@@ -38,6 +47,8 @@
 - **Behavior**: Auto Flow persists its ordered attempts and can resume after
   interruption. Retries remain auditable and never overwrite prior attempt
   output.
+- **Invariant**: Auto Flow runs launched from the board execute in detached
+  workers; closing or reopening the Prism TUI does not interrupt orchestration.
 - **Behavior**: The dashboard reflects the actual workflow as a nested checklist,
   including linked Plan phases and real validation or repair loops, rather than a
   fixed aspirational checklist.

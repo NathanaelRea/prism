@@ -91,7 +91,7 @@ impl Tui {
         self.manual_plan_step_selection_by_run.remove(&run_id);
 
         if should_execute {
-            self.spawn_plan_run_executor(repo, config, persisted);
+            self.spawn_plan_run_executor(repo, config, persisted)?;
         }
         if self.focused_panel == crate::tui::PanelFocus::Worktrees {
             self.worktree_main_view = crate::view::WorktreeMainView::Plan;
@@ -108,75 +108,20 @@ impl Tui {
     pub(super) fn spawn_plan_run_executor(
         &self,
         repo: crate::repo::Repository,
-        config: crate::config::Config,
-        mut persisted: crate::plan_run::PersistedPlanRun,
-    ) {
-        let tx = self.plan_run_tx.clone();
-        thread::spawn(move || {
-            let run_id = persisted.run.id.clone();
-            let mode = persisted.run.mode;
-            let scope_path = persisted.run.scope_path.clone();
-            let title_prefix = persisted.run.plan_display.clone();
-            let harness_config = match config.harness_config(&persisted.run.harness_id) {
-                Ok(harness) => harness,
-                Err(_) => {
-                    let _ = tx.send(PlanRunResult {
-                        repo_root: repo.root,
-                        run_id,
-                        result: Err(format!(
-                            "plan run harness '{}' is no longer configured",
-                            persisted.run.harness_id
-                        )),
-                    });
-                    return;
-                }
-            };
-            if harness_config.adapter != persisted.run.adapter_id {
-                let _ = tx.send(PlanRunResult {
-                    repo_root: repo.root,
-                    run_id,
-                    result: Err(format!(
-                        "plan run harness '{}' was recorded with adapter '{}', but it is now configured as '{}'",
-                        persisted.run.harness_id,
-                        persisted.run.adapter_id,
-                        harness_config.adapter
-                    )),
-                });
-                return;
-            }
-            let server_url =
-                crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
-                    .prepare_server(&repo, &config, "plan", &scope_path)
-                    .ok()
-                    .flatten()
-                    .map(|runtime| runtime.server_url);
-            let mut executor = PlanExecutorConfig::for_harness(
-                persisted.run.harness_id.clone(),
-                harness_config.clone(),
-                server_url,
-                scope_path.clone(),
-                title_prefix,
-            );
-            if harness_config.adapter == "opencode"
-                && config.opencode_plan_plugin
-                && let Ok(plugin) = prepare_plan_plugin_config(&repo.prism_dir())
-            {
-                executor = executor.with_plugin_config(plugin);
-            }
-            let result = crate::observability::with_writable_db(&repo, |conn| match mode {
-                PlanRunMode::Sequential => {
-                    execute_plan_sequential(conn, &mut persisted, &executor, &mut io::sink())
-                }
-                PlanRunMode::Parallel => {
-                    execute_plan_parallel(conn, &mut persisted, &executor, &mut io::sink())
-                }
-            });
-            let _ = tx.send(PlanRunResult {
-                repo_root: repo.root,
-                run_id,
-                result,
-            });
-        });
+        _config: crate::config::Config,
+        persisted: crate::plan_run::PersistedPlanRun,
+    ) -> Result<(), String> {
+        crate::observability::with_writable_db(&repo, |conn| {
+            crate::execution::enqueue(
+                conn,
+                &crate::execution::WorkflowIdentity::new(
+                    crate::execution::WorkflowKind::Plan,
+                    &persisted.run.id,
+                ),
+            )
+        })?;
+        crate::worker::ensure_running()?;
+        crate::worker::wake()
     }
 
     #[allow(dead_code)]
@@ -656,7 +601,7 @@ impl Tui {
             Ok(run)
         })?;
         self.remember_plan_run(persisted.clone());
-        self.spawn_plan_run_executor(repo, config, persisted);
+        self.spawn_plan_run_executor(repo, config, persisted)?;
         self.show_message("retrying failed plan phases")?;
         Ok(true)
     }
@@ -690,7 +635,7 @@ impl Tui {
             Ok(run)
         })?;
         self.remember_plan_run(persisted.clone());
-        self.spawn_plan_run_executor(repo, config, persisted);
+        self.spawn_plan_run_executor(repo, config, persisted)?;
         self.show_message("retrying plan from selected phase")?;
         Ok(true)
     }
@@ -742,7 +687,7 @@ impl Tui {
         self.remember_plan_run(plan_run);
         self.remember_auto_run(auto_run.clone());
         if should_execute {
-            self.spawn_auto_run_executor(repo, config, auto_run);
+            self.spawn_auto_run_executor(repo, config, auto_run)?;
             self.show_message("skipped linked plan phase; continuing Auto Flow")?;
         } else {
             self.show_message("skipped linked plan phase")?;
@@ -778,7 +723,7 @@ impl Tui {
             return Ok(true);
         }
         if should_execute {
-            self.spawn_plan_run_executor(repo, config, persisted);
+            self.spawn_plan_run_executor(repo, config, persisted)?;
             self.show_message("resumed plan run")?;
         } else {
             self.show_message("plan run is already running")?;

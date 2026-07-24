@@ -173,7 +173,7 @@ impl Tui {
         let run_id = persisted.run.id.clone();
         self.remember_auto_run(persisted.clone());
         self.selected_auto_run = Some(run_id);
-        self.spawn_auto_run_executor(context.repo, context.config, persisted);
+        self.spawn_auto_run_executor(context.repo, context.config, persisted)?;
         self.show_message("started Auto Flow run")?;
         Ok(())
     }
@@ -224,55 +224,20 @@ impl Tui {
     pub(super) fn spawn_auto_run_executor(
         &self,
         repo: crate::repo::Repository,
-        config: crate::config::Config,
-        mut persisted: crate::auto_flow::PersistedAutoRun,
-    ) {
-        thread::spawn(move || {
-            let worktree_path = persisted.run.worktree_path.clone();
-            let Ok(harness_config) = config.harness_config(&persisted.run.harness_id) else {
-                let error = format!(
-                    "auto run harness '{}' is no longer configured",
-                    persisted.run.harness_id
-                );
-                let _ = crate::observability::with_writable_db(&repo, |conn| {
-                    crate::auto_flow::fail_auto_run(conn, &mut persisted, error)
-                });
-                return;
-            };
-            if harness_config.adapter != persisted.run.adapter_id {
-                let error = format!(
-                    "auto run harness '{}' was recorded with adapter '{}', but it is now configured as '{}'",
-                    persisted.run.harness_id, persisted.run.adapter_id, harness_config.adapter
-                );
-                let _ = crate::observability::with_writable_db(&repo, |conn| {
-                    crate::auto_flow::fail_auto_run(conn, &mut persisted, error)
-                });
-                return;
-            }
-            let server_url =
-                crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
-                    .prepare_server(&repo, &config, &persisted.run.branch, &worktree_path)
-                    .ok()
-                    .flatten()
-                    .map(|runtime| runtime.server_url);
-            let executor = AutoExecutorConfig::for_harness(
-                persisted.run.harness_id.clone(),
-                harness_config,
-                server_url,
-                worktree_path,
-                format!("Auto Flow {}", persisted.run.prompt_summary),
-            );
-            let _ = crate::observability::with_writable_db(&repo, |conn| {
-                execute_auto_initial_step(
-                    conn,
-                    &repo,
-                    &config,
-                    &mut persisted,
-                    &executor,
-                    &mut io::sink(),
-                )
-            });
-        });
+        _config: crate::config::Config,
+        persisted: crate::auto_flow::PersistedAutoRun,
+    ) -> Result<(), String> {
+        crate::observability::with_writable_db(&repo, |conn| {
+            crate::execution::enqueue(
+                conn,
+                &crate::execution::WorkflowIdentity::new(
+                    crate::execution::WorkflowKind::Auto,
+                    &persisted.run.id,
+                ),
+            )
+        })?;
+        crate::worker::ensure_running()?;
+        crate::worker::wake()
     }
 
     pub(crate) fn abort_selected_auto_run_or_step(
@@ -373,7 +338,7 @@ impl Tui {
         let persisted = outcome.run;
         self.remember_auto_run(persisted.clone());
         if outcome.executor == AutoExecutorDecision::Start {
-            self.spawn_auto_run_executor(repo, config, persisted);
+            self.spawn_auto_run_executor(repo, config, persisted)?;
         }
         self.show_message("retrying Auto Flow step")?;
         Ok(true)
@@ -416,7 +381,7 @@ impl Tui {
         let persisted = outcome.run;
         self.remember_auto_run(persisted.clone());
         if outcome.executor == AutoExecutorDecision::Start {
-            self.spawn_auto_run_executor(repo, config, persisted);
+            self.spawn_auto_run_executor(repo, config, persisted)?;
         }
         self.show_message("retrying Auto Flow from selected step")?;
         Ok(true)
@@ -453,7 +418,7 @@ impl Tui {
         if !resuming {
             self.show_message("Auto Flow will pause before the next step")?;
         } else if executor == AutoExecutorDecision::Start {
-            self.spawn_auto_run_executor(repo.clone(), Config::load(&repo), persisted);
+            self.spawn_auto_run_executor(repo.clone(), Config::load(&repo), persisted)?;
             self.show_message("resumed Auto Flow run")?;
         } else if executor == AutoExecutorDecision::AlreadyRunning {
             self.show_message("resumed Auto Flow run; work is already running")?;

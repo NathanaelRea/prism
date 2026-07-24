@@ -114,9 +114,30 @@ historical phase output remains explainable.
 
 The TUI `P` launcher creates a persisted plan run for the selected repository or
 worktree, starts sequential execution in the background, and renders the active
-run in the main panel from SQLite snapshots. The tmux-backed plan workflow
-remains a compatibility path for CLI/debug use while dashboard parity continues
-to improve.
+run in the main panel from SQLite snapshots. Managed Plan execution belongs to
+the per-user Prism Worker; tmux remains reserved for interactive sessions and
+terminal tools.
+
+### Workflow Execution
+
+Workflow Execution is the durable ownership record shared by managed Plan and
+Auto Flow runs. A workflow is `queued`, `claimed`, `recovery_pending`, `paused`,
+or `terminal`. A claim records the daemon and worker identities, a renewable
+lease, and a monotonically increasing fencing token. SQLite is authoritative;
+the worker socket only provides health checks and wakeups.
+
+An expired or foreign claim means ownership was lost. It becomes
+`recovery_pending`, never automatically `queued`. Interactive Prism startup asks
+which interrupted runs to restart, with every item unchecked. A confirmed
+unselected run becomes paused, while cancelling leaves the decision pending.
+
+### Prism Worker
+
+The Prism Worker is one on-demand per-user daemon that discovers tracked
+repository databases, claims queued workflows transactionally, renews their
+leases, and supervises execution. Closing the TUI does not stop it. It is not a
+login service and does not automatically restart interrupted work after the
+daemon or machine stops.
 
 ### Auto Flow
 

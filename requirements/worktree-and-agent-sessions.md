@@ -66,9 +66,10 @@
 
 ## Process Safety
 
-- **Behavior**: Quitting is immediate when no agent work is running. When work is
-  running, Prism asks for confirmation with No as the default; permanent
-  deletion in progress blocks quitting.
+- **Behavior**: Quitting is immediate. Detached Agent Sessions and the per-user
+  Prism Worker continue running; permanent deletion in progress blocks quitting.
+- **Invariant**: Tmux hosts interactive Agent Sessions and terminal tools, not
+  managed Plan or Auto Flow workers.
 - **Behavior**: Long-running creation, deletion, Git, GitHub, tmux, and agent
   operations expose progress, cancellation where safe, and an actionable retry
   path. Cancellation and restart do not silently duplicate external side

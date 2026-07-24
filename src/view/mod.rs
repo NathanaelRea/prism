@@ -103,6 +103,7 @@ pub(crate) enum DialogModel {
         title: String,
         items: Vec<OrderedToggleItem>,
         selected: usize,
+        reorderable: bool,
     },
     Progress {
         title: String,

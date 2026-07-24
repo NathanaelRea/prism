@@ -254,6 +254,18 @@ pub fn run_plan_mode(cwd: &Path, config: &Config, path: Option<&Path>) -> Result
     }
     observability::with_writable_db(&repo, |conn| {
         let mut persisted = if let Some(mut persisted) = load_resumable_plan_run(conn, &launch)? {
+            let workflow = crate::execution::WorkflowIdentity::new(
+                crate::execution::WorkflowKind::Plan,
+                &persisted.run.id,
+            );
+            if crate::execution::dispatch_state(conn, &workflow)?
+                .is_some_and(|state| !matches!(state, crate::execution::DispatchState::Terminal))
+            {
+                return Err(format!(
+                    "matching plan run {} is managed by Prism; resume it interactively",
+                    persisted.run.id
+                ));
+            }
             if !prepare_plan_run_for_resume(conn, &mut persisted, DEFAULT_OUTPUT_LINES_PER_STEP)? {
                 return Err("matching plan run is already running".to_string());
             }

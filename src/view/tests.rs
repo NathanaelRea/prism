@@ -762,6 +762,7 @@ fn renders_dialog_overlays() {
             enabled: true,
         }],
         selected: 0,
+        reorderable: true,
     });
     let buffer = render_to_string(&model, 80, 20);
 
@@ -769,6 +770,22 @@ fn renders_dialog_overlays() {
     assert!(buffer.contains("[x]"));
     assert!(buffer.contains("Display label"));
     assert!(buffer.contains("J/K move"));
+
+    model.dialog = Some(DialogModel::OrderedToggle {
+        title: "Restart interrupted work".to_string(),
+        items: vec![OrderedToggleItem {
+            id: "run".to_string(),
+            label: "prism / feature  Auto Flow  FixCi".to_string(),
+            enabled: false,
+        }],
+        selected: 0,
+        reorderable: false,
+    });
+    let buffer = render_to_string(&model, 80, 20);
+    assert!(buffer.contains("[ ]"));
+    assert!(buffer.contains("Enter confirm"));
+    assert!(buffer.contains("Esc later"));
+    assert!(!buffer.contains("J/K move"));
 }
 
 #[test]
