@@ -2,24 +2,19 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 struct TempDir {
     path: PathBuf,
 }
 
 impl TempDir {
-    fn new(name: &str) -> Self {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "prism-worker-test-{name}-{}-{unique}",
-            std::process::id()
-        ));
+    fn new() -> Self {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("pw-{:x}-{id:x}", std::process::id()));
         fs::create_dir_all(&path).expect("create worker test directory");
         Self { path }
     }
@@ -57,7 +52,7 @@ fn serial_worker_test() -> MutexGuard<'static, ()> {
 #[test]
 fn real_worker_starts_once_reports_health_and_shuts_down() {
     let _serial = serial_worker_test();
-    let temp = TempDir::new("lifecycle");
+    let temp = TempDir::new();
     let runtime = temp.path.join("runtime");
     let home = temp.path.join("home");
     fs::create_dir_all(&home).unwrap();
@@ -98,7 +93,7 @@ fn real_worker_recovers_stale_socket_and_lock_files() {
     let _serial = serial_worker_test();
     use std::os::unix::net::UnixListener;
 
-    let temp = TempDir::new("stale-runtime");
+    let temp = TempDir::new();
     let runtime = temp.path.join("runtime");
     let home = temp.path.join("home");
     fs::create_dir_all(&runtime).unwrap();
@@ -124,7 +119,7 @@ fn real_worker_recovers_stale_socket_and_lock_files() {
 #[test]
 fn real_worker_executes_a_queued_plan_and_persists_lifecycle() {
     let _serial = serial_worker_test();
-    let temp = TempDir::new("execute-plan");
+    let temp = TempDir::new();
     let runtime = temp.path.join("runtime");
     let home = temp.path.join("home");
     let repo = temp.path.join("repo");
@@ -249,7 +244,7 @@ fn real_worker_executes_a_queued_plan_and_persists_lifecycle() {
 #[test]
 fn daemon_crash_leaves_claimed_work_recovery_pending() {
     let _serial = serial_worker_test();
-    let temp = TempDir::new("crash-recovery");
+    let temp = TempDir::new();
     let runtime = temp.path.join("runtime");
     let home = temp.path.join("home");
     let repo = temp.path.join("repo");
