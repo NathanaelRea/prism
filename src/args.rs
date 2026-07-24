@@ -26,6 +26,15 @@ pub enum CommandKind {
     RunPlan(Option<PathBuf>),
     Debug(DebugCommand),
     Db(DbCommand),
+    Worker(WorkerCommand),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkerCommand {
+    Serve,
+    Ensure,
+    Health,
+    Shutdown,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -221,6 +230,26 @@ impl Args {
                     }
                     break;
                 }
+                "worker" => {
+                    let subcommand = iter
+                        .next()
+                        .ok_or_else(|| "worker requires a subcommand".to_string())?;
+                    let worker_command = match subcommand.to_string_lossy().as_ref() {
+                        "serve" => WorkerCommand::Serve,
+                        "ensure" => WorkerCommand::Ensure,
+                        "health" => WorkerCommand::Health,
+                        "shutdown" => WorkerCommand::Shutdown,
+                        other => return Err(format!("unknown worker subcommand: {other}")),
+                    };
+                    if let Some(extra) = iter.next() {
+                        return Err(format!(
+                            "unknown worker argument: {}",
+                            extra.to_string_lossy()
+                        ));
+                    }
+                    command = CommandKind::Worker(worker_command);
+                    break;
+                }
                 "-h" | "--help" => command = CommandKind::Help,
                 "--version" => command = CommandKind::Version,
                 other => return Err(format!("unknown argument: {other}")),
@@ -381,6 +410,18 @@ mod tests {
         assert!(help.contains("prism [--repo <path>] db\n"));
         assert!(help.contains("prism [--repo <path>] db path"));
         assert!(help.contains("prism [--repo <path>] db <read-only-sql>"));
+    }
+
+    #[test]
+    fn internal_worker_command_parses() {
+        for (name, expected) in [
+            ("serve", WorkerCommand::Serve),
+            ("ensure", WorkerCommand::Ensure),
+            ("health", WorkerCommand::Health),
+            ("shutdown", WorkerCommand::Shutdown),
+        ] {
+            assert_eq!(parse(&["worker", name]), CommandKind::Worker(expected));
+        }
     }
 
     #[test]

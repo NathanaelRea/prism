@@ -297,8 +297,11 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
             lines
         }
         crate::view::DialogModel::OrderedToggle {
-            items, selected, ..
-        } => ordered_toggle_lines(items, *selected),
+            items,
+            selected,
+            reorderable,
+            ..
+        } => ordered_toggle_lines(items, *selected, *reorderable),
         crate::view::DialogModel::Choice { choices, .. } => choice_lines(choices),
         crate::view::DialogModel::Progress { message, .. } => {
             let mut lines = vec![Line::from(Span::styled(
@@ -385,9 +388,14 @@ pub(super) fn choice_lines(choices: &crate::view::ChoiceList) -> Vec<Line<'stati
 pub(super) fn ordered_toggle_lines(
     items: &[crate::view::OrderedToggleItem],
     selected: usize,
+    reorderable: bool,
 ) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(Span::styled(
-        "j/k select  Space toggle  J/K move  Enter save  Esc cancel",
+        if reorderable {
+            "j/k select  Space toggle  J/K move  Enter save  Esc cancel"
+        } else {
+            "j/k select  Space toggle  Enter confirm  Esc later"
+        },
         muted_style(),
     ))];
     lines.push(Line::from(""));

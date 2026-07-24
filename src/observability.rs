@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, OpenFlags, params};
@@ -512,6 +512,14 @@ pub fn with_writable_db<T>(
     writable_db(repo).run(run)
 }
 
+pub fn with_writable_db_mut<T>(
+    repo: &Repository,
+    run: impl FnOnce(&mut Connection) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut conn = open_writable_db_path(&db_path(repo))?;
+    run(&mut conn)
+}
+
 pub fn writable_db(repo: &Repository) -> WritableDb {
     WritableDb {
         path: db_path(repo),
@@ -537,6 +545,8 @@ fn open_writable_db_path(path: &Path) -> Result<Connection, String> {
     }
     let conn =
         Connection::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|error| format!("configure SQLite busy timeout: {error}"))?;
     ensure_schema_for_path(&conn, path, existed_before_open)?;
     Ok(conn)
 }
@@ -892,6 +902,7 @@ fn create_schema(conn: &Connection) -> Result<(), String> {
     crate::opencode::migrate_runtime_schema(conn)?;
     crate::plan_run::migrate_schema(conn)?;
     crate::auto_flow::migrate_schema(conn)?;
+    crate::execution::migrate_schema(conn)?;
     crate::github::migrate_pr_cache_schema(conn)?;
     conn.pragma_update(None, "foreign_keys", true)
         .map_err(|error| format!("enable foreign keys: {error}"))?;

@@ -52,7 +52,7 @@ pub use plugin::{
 };
 pub use storage::{
     load_plan_run, load_recent_plan_runs_for_repo, load_resumable_plan_run, migrate_schema,
-    save_plan_run, save_plan_step,
+    save_plan_run, save_plan_step, submit_plan_run,
 };
 
 use control::*;

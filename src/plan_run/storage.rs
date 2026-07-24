@@ -150,6 +150,28 @@ pub fn save_plan_run(
     Ok(())
 }
 
+pub fn submit_plan_run(
+    conn: &rusqlite::Connection,
+    persisted: &PersistedPlanRun,
+) -> Result<(), String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("begin managed plan submission: {error}"))?;
+    save_run_with_conn(&tx, &persisted.run)?;
+    for step in &persisted.steps {
+        save_step_with_conn(&tx, step)?;
+    }
+    crate::execution::enqueue(
+        &tx,
+        &crate::execution::WorkflowIdentity::new(
+            crate::execution::WorkflowKind::Plan,
+            &persisted.run.id,
+        ),
+    )?;
+    tx.commit()
+        .map_err(|error| format!("commit managed plan submission: {error}"))
+}
+
 pub fn load_plan_run(
     conn: &rusqlite::Connection,
     run_id: &str,

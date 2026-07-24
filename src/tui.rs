@@ -13,16 +13,15 @@ use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{
     AutoRunStatus, PersistedAutoRun, load_auto_run, load_output_lines as load_auto_output_lines,
-    load_recent_active_runs_for_repo, reconcile_stale_auto_run,
+    load_recent_active_runs_for_repo,
 };
 use crate::config::Config;
 use crate::github::{PrCache, PrSummary};
 use crate::input::{Key, KeyInput};
 use crate::opencode::{OpencodeEvent, OpencodeStatus};
 use crate::plan_run::{
-    DEFAULT_OUTPUT_LINES_PER_STEP, PersistedPlanRun, PlanRunStatus, PlanStepStatus,
-    cleanup_stale_archived_plan_runs, load_output_lines, load_plan_run,
-    load_recent_plan_runs_for_repo, reconcile_stale_plan_run,
+    PersistedPlanRun, PlanRunStatus, PlanStepStatus, cleanup_stale_archived_plan_runs,
+    load_output_lines, load_plan_run, load_recent_plan_runs_for_repo,
 };
 use crate::repo::Repository;
 use crate::session::{Session, WorktreeRepositoryKey, WorktreeSessionKey};
@@ -79,8 +78,6 @@ pub struct Tui {
     pub(crate) opencode_event_tx: Sender<OpencodeEventResult>,
     pub(crate) opencode_event_rx: Receiver<OpencodeEventResult>,
     pub(crate) opencode_sse_servers: BTreeSet<String>,
-    pub(crate) plan_run_tx: Sender<PlanRunResult>,
-    pub(crate) plan_run_rx: Receiver<PlanRunResult>,
     pub(crate) plan_runs: BTreeMap<String, PersistedPlanRun>,
     pub(crate) active_plan_runs: BTreeMap<PathBuf, String>,
     pub(crate) selected_plan_step_by_run: BTreeMap<String, usize>,
@@ -306,12 +303,6 @@ pub(crate) struct OpencodeEventResult {
     pub event: Result<OpencodeEvent, String>,
 }
 
-pub(crate) struct PlanRunResult {
-    pub repo_root: PathBuf,
-    pub run_id: String,
-    pub result: Result<(), String>,
-}
-
 impl OpencodePollKey {
     #[cfg(test)]
     pub(crate) fn for_repository_session(
@@ -462,6 +453,12 @@ fn toggle_ordered_item(items: &mut Vec<view::OrderedToggleItem>, selected: &mut 
     *selected = insert_at;
 }
 
+fn toggle_item_in_place(items: &mut [view::OrderedToggleItem], selected: usize) {
+    if let Some(item) = items.get_mut(selected) {
+        item.enabled = !item.enabled;
+    }
+}
+
 fn move_enabled_ordered_item(
     items: &mut [view::OrderedToggleItem],
     selected: &mut usize,
@@ -491,7 +488,6 @@ impl Tui {
         let (default_branch_poll_tx, default_branch_poll_rx) = mpsc::channel();
         let (opencode_poll_tx, opencode_poll_rx) = mpsc::channel();
         let (opencode_event_tx, opencode_event_rx) = mpsc::channel();
-        let (plan_run_tx, plan_run_rx) = mpsc::channel();
         let current_repo = current_repo.min(repos.len().saturating_sub(1));
         let fallback_repo = Repository {
             root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -563,8 +559,6 @@ impl Tui {
             opencode_event_tx,
             opencode_event_rx,
             opencode_sse_servers: BTreeSet::new(),
-            plan_run_tx,
-            plan_run_rx,
             plan_runs: BTreeMap::new(),
             active_plan_runs: BTreeMap::new(),
             selected_plan_step_by_run: BTreeMap::new(),
@@ -694,6 +688,8 @@ impl Tui {
         }
 
         let mut runtime = TerminalRuntime::enter()?;
+        crate::worker::ensure_running()?;
+        self.offer_interrupted_run_recovery(&mut runtime)?;
         self.start_tmux_agent_warmup();
         self.poll_tmux_portal();
         self.start_wt_column_poll();
@@ -701,7 +697,7 @@ impl Tui {
         self.start_opencode_status_poll(true);
         self.start_opencode_event_listeners();
         self.refresh_plan_runs();
-        self.refresh_auto_runs(true);
+        self.refresh_auto_runs(false);
         self.draw(&mut runtime)?;
         if self.repos.is_empty() {
             match self.add_repository(&mut runtime) {
@@ -749,7 +745,7 @@ impl Tui {
                 Key::Quit => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    should_quit = self.confirm_quit(&mut runtime)?;
+                    should_quit = self.confirm_quit()?;
                 }
                 Key::Down => {
                     self.clear_leader_hint();
@@ -1170,25 +1166,12 @@ impl Tui {
         changes
     }
 
-    fn confirm_quit(&mut self, runtime: &mut TerminalRuntime) -> Result<bool, String> {
+    fn confirm_quit(&mut self) -> Result<bool, String> {
         if !self.delete_sessions_in_flight.is_empty() {
             self.show_message("delete in progress; wait for it to finish before quitting")?;
             return Ok(false);
         }
-        if !self.sessions.iter().any(|session| {
-            matches!(
-                session.agent_state,
-                AgentState::Attached | AgentState::Running
-            )
-        }) {
-            return Ok(true);
-        }
-        self.confirm_action_dialog(
-            runtime,
-            "Quit Prism",
-            "Agents are running. Quit Prism?",
-            false,
-        )
+        Ok(true)
     }
 
     fn enter_agent_mode(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
@@ -1654,6 +1637,7 @@ impl Tui {
                 title: title.to_string(),
                 items: items.clone(),
                 selected,
+                reorderable: true,
             });
             self.draw(runtime)?;
             if self.tick_tui_action_jobs().any() {
@@ -1707,6 +1691,163 @@ impl Tui {
                 _ => {}
             }
         }
+    }
+
+    fn recovery_selection_dialog(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        mut items: Vec<view::OrderedToggleItem>,
+    ) -> Result<Option<Vec<String>>, String> {
+        let mut selected = 0usize;
+        loop {
+            self.dialog = Some(view::DialogModel::OrderedToggle {
+                title: "Restart interrupted work".to_string(),
+                items: items.clone(),
+                selected,
+                reorderable: false,
+            });
+            self.draw(runtime)?;
+            let Some(event) = runtime.poll_event(Duration::from_millis(100))? else {
+                continue;
+            };
+            let RuntimeEvent::Key(event) = event else {
+                continue;
+            };
+            if event.kind != KeyEventKind::Press {
+                continue;
+            }
+            match event.code {
+                KeyCode::Esc | KeyCode::Char('c')
+                    if event.code == KeyCode::Esc || ctrl_key(event) =>
+                {
+                    self.dialog = None;
+                    return Ok(None);
+                }
+                KeyCode::Enter if plain_key(event) => {
+                    self.dialog = None;
+                    return Ok(Some(
+                        items
+                            .iter()
+                            .filter(|item| item.enabled)
+                            .map(|item| item.id.clone())
+                            .collect(),
+                    ));
+                }
+                KeyCode::Up | KeyCode::Char('k') if plain_key(event) => {
+                    selected = selected.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') if plain_key(event) => {
+                    selected = selected
+                        .saturating_add(1)
+                        .min(items.len().saturating_sub(1));
+                }
+                KeyCode::Char(' ') if plain_key(event) => {
+                    toggle_item_in_place(&mut items, selected);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn offer_interrupted_run_recovery(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+    ) -> Result<(), String> {
+        let mut candidates = Vec::new();
+        for (repo_index, managed) in self.repos.iter().enumerate() {
+            let repo_candidates = crate::observability::with_writable_db(&managed.repo, |conn| {
+                crate::execution::recovery_candidates(conn)
+            })?;
+            candidates.extend(
+                repo_candidates
+                    .into_iter()
+                    .map(|candidate| (repo_index, candidate)),
+            );
+        }
+        if candidates.is_empty() {
+            return Ok(());
+        }
+        let now = crate::execution::now_ms();
+        let items = candidates
+            .iter()
+            .enumerate()
+            .map(|(index, (repo_index, candidate))| {
+                let repo = &self.repos[*repo_index];
+                let age_ms = candidate
+                    .last_heartbeat_unix_ms
+                    .map(|heartbeat| now.saturating_sub(heartbeat))
+                    .unwrap_or(0);
+                let age = if age_ms >= 60_000 {
+                    format!("{}m ago", age_ms / 60_000)
+                } else {
+                    format!("{}s ago", age_ms / 1_000)
+                };
+                let kind = match candidate.workflow.kind {
+                    crate::execution::WorkflowKind::Auto => "Auto Flow",
+                    crate::execution::WorkflowKind::Plan => "Plan",
+                };
+                let worktree = match candidate.workflow.kind {
+                    crate::execution::WorkflowKind::Auto => candidate.branch.as_str(),
+                    crate::execution::WorkflowKind::Plan => candidate
+                        .worktree
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or_else(|| candidate.worktree.to_str().unwrap_or("worktree")),
+                };
+                view::OrderedToggleItem {
+                    id: index.to_string(),
+                    label: format!(
+                        "{} / {}  {}  {}  {}",
+                        repo.label, worktree, kind, candidate.active_step, age
+                    ),
+                    enabled: false,
+                }
+            })
+            .collect();
+        let Some(selected) = self.recovery_selection_dialog(runtime, items)? else {
+            return Ok(());
+        };
+        let selected = selected.into_iter().collect::<BTreeSet<_>>();
+        for (index, (repo_index, candidate)) in candidates.iter().enumerate() {
+            if !selected.contains(&index.to_string()) {
+                continue;
+            }
+            let managed = &self.repos[*repo_index];
+            if crate::worker::legacy_worker_running(
+                &managed.repo,
+                &managed.config,
+                &candidate.workflow,
+            )? {
+                return Err(format!(
+                    "legacy {} worker for run {} is still active; try recovery after it exits",
+                    candidate.workflow.kind.label(),
+                    candidate.workflow.run_id
+                ));
+            }
+        }
+        for (repo_index, managed) in self.repos.iter().enumerate() {
+            let decisions = candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, (candidate_repo, _))| *candidate_repo == repo_index)
+                .map(|(index, (_, candidate))| {
+                    (
+                        candidate.workflow.clone(),
+                        candidate.interruption_generation,
+                        selected.contains(&index.to_string()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !decisions.is_empty() {
+                crate::observability::with_writable_db_mut(&managed.repo, |conn| {
+                    crate::execution::apply_recovery_decision(conn, &decisions)
+                })?;
+            }
+        }
+        if !selected.is_empty() {
+            crate::worker::wake()?;
+        }
+        Ok(())
     }
 
     pub(crate) fn show_loading_dialog(
@@ -2487,20 +2628,6 @@ impl Tui {
 
     fn poll_plan_runs(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(result) = self.plan_run_rx.try_recv() {
-            changed = true;
-            self.load_plan_run_snapshot(&result.repo_root, &result.run_id);
-            match result.result {
-                Ok(()) => {
-                    self.status_message = Some("plan run completed".to_string());
-                    self.status_message_until = Some(Instant::now() + STATUS_MESSAGE_DURATION);
-                }
-                Err(error) => {
-                    self.status_message = Some(format!("plan run failed: {error}"));
-                    self.status_message_until = Some(Instant::now() + STATUS_MESSAGE_DURATION);
-                }
-            }
-        }
         let should_poll = self
             .last_plan_poll
             .is_none_or(|last| last.elapsed() >= Duration::from_secs(1));
@@ -2524,10 +2651,7 @@ impl Tui {
                     conn,
                     ARCHIVED_PLAN_RETENTION.as_millis() as u64,
                 );
-                let mut runs = load_recent_plan_runs_for_repo(conn, &repo.root, 8)?;
-                for run in &mut runs {
-                    let _ = reconcile_stale_plan_run(conn, run, DEFAULT_OUTPUT_LINES_PER_STEP);
-                }
+                let runs = load_recent_plan_runs_for_repo(conn, &repo.root, 8)?;
                 Ok(runs)
             });
             let Ok(runs) = loaded else {
@@ -2705,12 +2829,8 @@ impl Tui {
             .collect::<Vec<_>>();
         for repo in repos {
             let loaded = crate::observability::with_writable_db(&repo, |conn| {
-                let mut runs = load_recent_active_runs_for_repo(conn, &repo.root, 8)?;
-                if reconcile_stale {
-                    for run in &mut runs {
-                        let _ = reconcile_stale_auto_run(conn, run);
-                    }
-                }
+                let runs = load_recent_active_runs_for_repo(conn, &repo.root, 8)?;
+                let _ = reconcile_stale;
                 Ok(runs)
             });
             let Ok(runs) = loaded else {
@@ -3439,7 +3559,8 @@ mod tests {
     use super::{
         GitAction, ManagedRepo, OpenTmuxSessionTarget, PanelFocus, PrPollKey, TmuxPortalCapture,
         TmuxPortalResult, TmuxPortalSnapshot, Tui, WorktreeListMode, confirmation_result,
-        move_enabled_ordered_item, selectable_choice_key, toggle_ordered_item,
+        move_enabled_ordered_item, selectable_choice_key, toggle_item_in_place,
+        toggle_ordered_item,
     };
 
     #[test]
@@ -3458,6 +3579,19 @@ mod tests {
     fn confirmation_rejects_unknown_answers() {
         assert_eq!(confirmation_result("maybe", true), None);
         assert_eq!(confirmation_result("ny", false), None);
+    }
+
+    #[test]
+    fn running_agent_does_not_block_quit() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let mut session = test_session(0, "/tmp/repo", "feature");
+        session.agent_state = AgentState::Running;
+        let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+
+        assert!(tui.confirm_quit().unwrap());
+        assert!(tui.dialog.is_none());
     }
 
     #[test]
@@ -3735,6 +3869,29 @@ mod tests {
         selected = 2;
         move_enabled_ordered_item(&mut items, &mut selected, -1);
         assert_eq!(selected, 2);
+    }
+
+    #[test]
+    fn recovery_toggle_keeps_stable_order() {
+        let mut items = vec![
+            OrderedToggleItem {
+                id: "first".to_string(),
+                label: "First".to_string(),
+                enabled: false,
+            },
+            OrderedToggleItem {
+                id: "second".to_string(),
+                label: "Second".to_string(),
+                enabled: false,
+            },
+        ];
+
+        toggle_item_in_place(&mut items, 1);
+
+        assert_eq!(items[0].id, "first");
+        assert_eq!(items[1].id, "second");
+        assert!(!items[0].enabled);
+        assert!(items[1].enabled);
     }
 
     fn ordered_toggle_items() -> Vec<OrderedToggleItem> {

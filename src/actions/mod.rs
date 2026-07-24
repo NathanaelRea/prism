@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -11,10 +10,10 @@ use serde_json::Value;
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{
-    AutoExecutorConfig, AutoExecutorDecision, AutoImplementationSource, AutoLaunch,
-    AutoLaunchOptions, AutoRunControlIntent, AutoRunMode, AutoRunStatus, AutoStepKey,
-    AutoStepStatus, PersistedAutoRun, apply_auto_run_control, archive_auto_run,
-    execute_auto_initial_step, load_auto_run, prepare_auto_run_for_resume, save_auto_run,
+    AutoExecutorDecision, AutoImplementationSource, AutoLaunch, AutoLaunchOptions,
+    AutoRunControlIntent, AutoRunMode, AutoRunStatus, AutoStepKey, AutoStepStatus,
+    PersistedAutoRun, apply_auto_run_control, archive_auto_run, load_auto_run,
+    prepare_auto_run_for_resume,
 };
 use crate::config::Config;
 use crate::git::{
@@ -39,9 +38,8 @@ use crate::observability::append_runtime_message;
 use crate::opencode::{self, OpencodeStatus, load_runtime};
 use crate::plan::{PlanExecution, infer_total_phases, open_plan_mode, select_plan_path};
 use crate::plan_run::{
-    DEFAULT_OUTPUT_LINES_PER_STEP, PlanExecutorConfig, PlanRunMode, PlanRunStatus, PlanStepStatus,
-    abort_plan_run, abort_plan_step, archive_plan_run, execute_plan_parallel,
-    execute_plan_sequential, load_plan_run, load_resumable_plan_run, prepare_plan_plugin_config,
+    DEFAULT_OUTPUT_LINES_PER_STEP, PlanRunMode, PlanRunStatus, PlanStepStatus, abort_plan_run,
+    abort_plan_step, archive_plan_run, load_plan_run, load_resumable_plan_run,
     prepare_plan_run_for_resume, request_plan_run_pause, resume_paused_plan_run,
     retry_failed_steps, retry_from_step, save_plan_run, skip_plan_step,
 };
@@ -54,8 +52,8 @@ use crate::session::{
 use crate::tmux::TmuxWindow;
 use crate::tui::{
     DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, ManagedRepo,
-    OpencodeEventResult, OpencodePollKey, OpencodePollResult, PlanRunResult, PrPollKey,
-    PrPollResult, Tui, WtPollResult,
+    OpencodeEventResult, OpencodePollKey, OpencodePollResult, PrPollKey, PrPollResult, Tui,
+    WtPollResult,
 };
 
 use crate::util::status_count;
@@ -70,6 +68,24 @@ mod tmux_agent;
 mod tmux_portal;
 mod tools;
 mod worktrees;
+
+fn reject_claimed_control(
+    repo: &Repository,
+    kind: crate::execution::WorkflowKind,
+    run_id: &str,
+    control: &str,
+) -> Result<(), String> {
+    let workflow = crate::execution::WorkflowIdentity::new(kind, run_id);
+    let state = crate::observability::with_writable_db(repo, |conn| {
+        crate::execution::dispatch_state(conn, &workflow)
+    })?;
+    if state == Some(crate::execution::DispatchState::Claimed) {
+        return Err(format!(
+            "cannot {control} run {run_id} while its executor is active; pause or abort it first"
+        ));
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests;

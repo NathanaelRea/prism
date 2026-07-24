@@ -1078,6 +1078,7 @@ pub(crate) fn progress_pending_push(
         GuardedPushDecision::AlreadySatisfied => GuardedPushProgress::AlreadySatisfied,
         GuardedPushDecision::ValidToPush => {
             before_push()?;
+            crate::execution::validate_installed_claim(conn)?;
             crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
             GuardedPushProgress::Pushed
         }
@@ -1141,6 +1142,7 @@ pub(crate) fn progress_pending_push(
                 .any(|comment| comment.thread_id == thread_id && !comment.resolved)
         });
         if unresolved {
+            crate::execution::validate_installed_claim(conn)?;
             crate::github::resolve_review_thread(&persisted.run.worktree_path, config, &thread_id)?;
         }
         if let Some(guard) = persisted.run.pending_push.as_mut() {

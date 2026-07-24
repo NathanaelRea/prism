@@ -94,6 +94,7 @@ pub fn execute_plan_parallel(
                     continue;
                 }
             };
+        crate::execution::validate_installed_claim(conn)?;
         let spawn_result = spawn_harness(&mut command, &invocation);
         let (mut child, used_attach) = match spawn_result {
             Ok(child) => (child, invocation.attach),
@@ -107,6 +108,7 @@ pub fn execute_plan_parallel(
                 )?;
                 let (mut fallback, fallback_invocation) =
                     harness_run_command(executor, step_number, &prompt, false)?;
+                crate::execution::validate_installed_claim(conn)?;
                 match spawn_harness(&mut fallback, &fallback_invocation) {
                     Ok(child) => (child, false),
                     Err(error) => {
@@ -150,13 +152,13 @@ pub fn execute_plan_parallel(
 
     let mut finished = 0usize;
     while finished < running {
-        match rx.recv() {
+        match rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(Ok(ParallelChildEvent::Line {
                 step_index,
                 stream,
                 text,
             })) => {
-                if let Some(step) = persisted.steps.get_mut(step_index) {
+                let result = if let Some(step) = persisted.steps.get_mut(step_index) {
                     ingest_child_line(
                         conn,
                         step,
@@ -166,7 +168,13 @@ pub fn execute_plan_parallel(
                         executor.harness_config.output_format
                             == crate::harness::OutputFormat::JsonLines,
                         output,
-                    )?;
+                    )
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = result {
+                    terminate_running_plan_steps(&persisted.steps);
+                    return Err(error);
                 }
             }
             Ok(Ok(ParallelChildEvent::Exit {
@@ -175,22 +183,37 @@ pub fn execute_plan_parallel(
                 used_attach,
             })) => {
                 if let Some(step) = persisted.steps.get_mut(step_index) {
-                    finish_step_after_exit(
+                    if let Err(error) = finish_step_after_exit(
                         conn,
                         step,
                         exit_code,
                         used_attach,
                         &executor.harness_id,
-                    )?;
+                    ) {
+                        terminate_running_plan_steps(&persisted.steps);
+                        return Err(error);
+                    }
                     persisted.run.selected_step = step.step;
                     persisted.run.status = persisted.aggregate_status();
                     persisted.run.updated_unix_ms = unix_ms();
-                    save_run_with_conn(conn, &persisted.run)?;
+                    if let Err(error) = save_run_with_conn(conn, &persisted.run) {
+                        terminate_running_plan_steps(&persisted.steps);
+                        return Err(error);
+                    }
                 }
                 finished += 1;
             }
-            Ok(Err(error)) => return Err(error),
-            Err(_) => break,
+            Ok(Err(error)) => {
+                terminate_running_plan_steps(&persisted.steps);
+                return Err(error);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(error) = crate::execution::validate_installed_claim(conn) {
+                    terminate_running_plan_steps(&persisted.steps);
+                    return Err(error);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
@@ -262,6 +285,7 @@ pub(super) fn execute_one_step(
                 return Err(error);
             }
         };
+    crate::execution::validate_installed_claim(conn)?;
     let spawn_result = spawn_harness(&mut command, &invocation);
     let (mut child, used_attach) = match spawn_result {
         Ok(child) => (child, invocation.attach),
@@ -276,6 +300,7 @@ pub(super) fn execute_one_step(
             invocation.cleanup();
             let (mut fallback, fallback_invocation) =
                 harness_run_command(executor, step_number, &prompt, false)?;
+            crate::execution::validate_installed_claim(conn)?;
             match spawn_harness(&mut fallback, &fallback_invocation) {
                 Ok(child) => {
                     invocation = fallback_invocation;
@@ -557,9 +582,9 @@ pub(super) fn collect_child_output(
 
     let mut readers_open = 2;
     while readers_open > 0 {
-        match rx.recv() {
+        match rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(Ok(ChildLine::Line { stream, text })) => {
-                ingest_child_line(
+                if let Err(error) = ingest_child_line(
                     conn,
                     step,
                     stream,
@@ -567,11 +592,23 @@ pub(super) fn collect_child_output(
                     max_output_lines_per_step,
                     structured_events,
                     output,
-                )?;
+                ) {
+                    terminate_plan_child(step, child);
+                    return Err(error);
+                }
             }
             Ok(Ok(ChildLine::End)) => readers_open -= 1,
-            Ok(Err(error)) => return Err(error),
-            Err(_) => break,
+            Ok(Err(error)) => {
+                terminate_plan_child(step, child);
+                return Err(error);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(error) = crate::execution::validate_installed_claim(conn) {
+                    terminate_plan_child(step, child);
+                    return Err(error);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
@@ -579,6 +616,24 @@ pub(super) fn collect_child_output(
         .wait()
         .map_err(|error| format!("wait for harness: {error}"))?;
     Ok(status.code().unwrap_or(1))
+}
+
+fn terminate_plan_child(step: &PlanStepRun, child: &mut Child) {
+    let process_id = step.execution.process_id.unwrap_or_else(|| child.id());
+    let identity = step.execution.process_start_time_ticks;
+    let _ = crate::harness::terminate_process(process_id, identity);
+    let _ = child.wait();
+}
+
+fn terminate_running_plan_steps(steps: &[PlanStepRun]) {
+    for step in steps {
+        if let Some(process_id) = step.execution.process_id {
+            let _ = crate::harness::terminate_process(
+                process_id,
+                step.execution.process_start_time_ticks,
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

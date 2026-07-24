@@ -438,7 +438,7 @@ impl Tui {
         if self.prompt_submissions.is_some() {
             return Ok(());
         }
-        self.spawn_auto_run_executor(repo.clone(), config.clone(), persisted);
+        self.spawn_auto_run_executor(repo.clone(), config.clone(), persisted)?;
         Ok(())
     }
 

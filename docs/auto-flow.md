@@ -24,7 +24,7 @@ Compatibility notes:
 - `A` is the TUI Auto Flow shortcut; the former leader-based Auto Flow shortcut has been removed.
 - `auto plan` drafts, reviews, and waits for approval, then executes the approved `plan.md` by phase; `auto plan-first` and `auto intensive` are aliases.
 
-The CLI resumes the most recent active Auto Flow run for that repository before starting a new one. Auto Flow state is stored in Prism's per-repository SQLite database under `~/.config/prism/repos/...`, not in the project checkout.
+The CLI submits new and explicitly resumable Auto Flow work to the Prism Worker. It never implicitly approves a recovery-pending interruption. Auto Flow state is stored in Prism's per-repository SQLite database under `~/.config/prism/repos/...`, not in the project checkout.
 
 Safety defaults:
 
@@ -89,7 +89,7 @@ PR Cache refresh behavior:
 - Summary and detail observations are associated with the pull request number and head SHA; details from an earlier head are rejected.
 - PR Stabilization requires trustworthy observations and blocks readiness when local, remote, and pull-request heads diverge.
 
-If Prism exits or the machine restarts, rerun `prism` or `prism auto` for the repository. Active Auto Flow steps are reconciled from the persisted run; stale running attempts are marked failed so they can be retried instead of being silently forgotten. A persisted pending guarded push keeps the run active even if older step aggregation recorded it as done. Prism restores the pending guard, reobserves the branch and PR, and either completes the matching effect or replans without pushing.
+Auto Flow runs execute in the on-demand per-user Prism Worker, so closing and reopening the TUI does not interrupt them. If the daemon or machine stops, the abandoned claim becomes recovery-pending and does not restart automatically. The next interactive Prism startup shows interrupted runs in an all-unchecked recovery dialog; select only the runs that should restart, or leave them paused for an explicit dashboard resume. A persisted pending guarded push keeps the run active even if older step aggregation recorded it as done. Prism restores the pending guard, reobserves the branch and PR, and either completes the matching effect or replans without pushing.
 
 Troubleshooting:
 

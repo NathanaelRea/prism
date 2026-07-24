@@ -9,6 +9,7 @@ pub(super) fn execute_one_non_agent_step(
     executor: &AutoExecutorConfig,
 ) -> Result<(), String> {
     start_non_agent_step(conn, persisted, step_index)?;
+    crate::execution::validate_installed_claim(conn)?;
     let max_output_lines_per_step = executor.max_output_lines_per_step;
     let result = match persisted.steps[step_index].step_key {
         AutoStepKey::ApprovePlan => {
@@ -189,9 +190,9 @@ pub(super) fn execute_run_plan_step(
         })?
     } else {
         let plan_run = launch.create_run();
-        save_plan_run(conn, &plan_run)?;
         persisted.steps[step_index].plan_run_id = Some(plan_run.run.id.clone());
         save_step_with_conn(conn, &mut persisted.steps[step_index])?;
+        save_plan_run(conn, &plan_run)?;
         plan_run
     };
 
@@ -342,6 +343,7 @@ pub(super) fn execute_local_verify_step(
     step_index: usize,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
+    crate::execution::validate_installed_claim(conn)?;
     let result =
         crate::verify::run_auto_verify(config, &persisted.run.worktree_path, VerifyMode::Normal);
     let summary = format_verify_result(&result);
@@ -396,6 +398,7 @@ pub(super) fn execute_commit_impl_step(
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
     let message = implementation_commit_message(&persisted.run);
+    crate::execution::validate_installed_claim(conn)?;
     let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
     let step = &mut persisted.steps[step_index];
     step.commit_sha = result.commit_sha.clone();
@@ -462,6 +465,7 @@ pub(super) fn execute_push_pr_step(
     }
 
     let head_sha = crate::git::current_head_sha(&persisted.run.worktree_path, config)?;
+    crate::execution::validate_installed_claim(conn)?;
     crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
 
     let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
@@ -475,6 +479,7 @@ pub(super) fn execute_push_pr_step(
     );
     if cache.trusted_summary()?.is_none() {
         let body = auto_pr_body(config, &persisted.run);
+        crate::execution::validate_installed_claim(conn)?;
         crate::github::create_pull_request(
             repo,
             config,
@@ -620,9 +625,7 @@ pub(super) fn execute_wait_review_step(
 
         persisted.steps[step_index].status = AutoStepStatus::Waiting;
         save_step_with_conn(conn, &mut persisted.steps[step_index])?;
-        std::thread::sleep(std::time::Duration::from_secs(
-            config.auto.review_poll_interval_seconds,
-        ));
+        interruptible_execution_sleep(conn, config.auto.review_poll_interval_seconds)?;
         if reload_pause_request(conn, persisted)? {
             return Ok(());
         }
@@ -638,6 +641,7 @@ pub(super) fn execute_verify_review_fix_step(
     step_index: usize,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
+    crate::execution::validate_installed_claim(conn)?;
     let result =
         crate::verify::run_auto_verify(config, &persisted.run.worktree_path, VerifyMode::ReviewFix);
     let summary = format_verify_result(&result);
@@ -734,6 +738,7 @@ pub(super) fn execute_commit_review_fix_step(
         config,
         &stabilization_model::RepairKind::Review,
     );
+    crate::execution::validate_installed_claim(conn)?;
     let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
     let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
     let pr_summary = cache.trusted_summary()?.cloned();
@@ -850,15 +855,23 @@ pub(super) fn execute_wait_ci_step(
 
         persisted.steps[step_index].status = AutoStepStatus::Waiting;
         save_step_with_conn(conn, &mut persisted.steps[step_index])?;
-        std::thread::sleep(std::time::Duration::from_secs(
-            config.auto.ci_poll_interval_seconds,
-        ));
+        interruptible_execution_sleep(conn, config.auto.ci_poll_interval_seconds)?;
         if reload_pause_request(conn, persisted)? {
             return Ok(());
         }
         persisted.steps[step_index].status = AutoStepStatus::Running;
         save_step_with_conn(conn, &mut persisted.steps[step_index])?;
     }
+}
+
+fn interruptible_execution_sleep(conn: &rusqlite::Connection, seconds: u64) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    while std::time::Instant::now() < deadline {
+        crate::execution::validate_installed_claim(conn)?;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(250)));
+    }
+    Ok(())
 }
 
 pub(super) fn execute_verify_ci_fix_step(
@@ -868,6 +881,7 @@ pub(super) fn execute_verify_ci_fix_step(
     step_index: usize,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
+    crate::execution::validate_installed_claim(conn)?;
     let result =
         crate::verify::run_auto_verify(config, &persisted.run.worktree_path, VerifyMode::Normal);
     let summary = format_verify_result(&result);
@@ -962,6 +976,7 @@ pub(super) fn execute_commit_ci_fix_step(
     }
     let message =
         stabilization_execute::repair_commit_message(config, &stabilization_model::RepairKind::Ci);
+    crate::execution::validate_installed_claim(conn)?;
     let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
     let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
     let pr_summary = cache.trusted_summary()?.cloned();
@@ -1022,6 +1037,7 @@ pub(super) fn execute_merge_step(
         return Ok(());
     }
 
+    crate::execution::validate_installed_claim(conn)?;
     let verify =
         crate::verify::run_auto_verify(config, &persisted.run.worktree_path, VerifyMode::Normal);
     crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
@@ -1072,6 +1088,7 @@ pub(super) fn execute_merge_step(
         return Err(gate.summary);
     }
 
+    crate::execution::validate_installed_claim(conn)?;
     let execution = stabilization_execute::execute_merge_authorization(
         config,
         &persisted.run.worktree_path,
@@ -1188,6 +1205,7 @@ pub(super) fn execute_cleanup_step(
             "auto cleanup retained the worktree because this run has no persisted worktree incarnation"
                 .to_string()
         })?;
+    crate::execution::validate_installed_claim(conn)?;
     let outcome = crate::session::delete_worktree_session_if_current(
         repo,
         config,
