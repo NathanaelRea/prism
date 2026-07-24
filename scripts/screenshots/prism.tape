@@ -11,9 +11,12 @@ Set TypingSpeed 1ms
 
 Type "./prism --repo ."
 Enter
+Sleep 500ms
 Type "3"
 Wait+Screen@30s /fix\/review-comments/
 Type "j"
+Sleep 250ms
 Type "j"
-Sleep 1s
+Wait+Screen@10s /rerun.*smoke.*check/
+Sleep 500ms
 Screenshot "__OUTPUT__"

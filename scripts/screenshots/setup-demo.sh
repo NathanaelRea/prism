@@ -68,7 +68,7 @@ create_repo() {
   local name="$1"
   local path="$root/work/$name"
   git init "$path" >/dev/null
-  git -C "$path" remote add origin "https://github.com/prism-demo/${name}.git"
+  git -C "$path" remote add origin "$demo_url"
   printf '# %s\n' "$name" >"$path/README.md"
   git -C "$path" add README.md
   git -C "$path" commit -m "Initial ${name} service" >/dev/null
@@ -115,9 +115,12 @@ key = "4"
 EOF
 
 cat >"$config_dir/config.toml" <<EOF
-default_agent = "opencode"
+default_harness = "opencode"
 default_base = "main"
 worktree_command = "wt"
+
+[harnesses.opencode]
+program = "$bin_dir/opencode"
 
 [ui]
 icon_style = "nerd-font"
@@ -135,5 +138,4 @@ columns = ["url"]
 gh = "$bin_dir/gh"
 tmux = "$bin_dir/tmux"
 wt = "$bin_dir/wt"
-opencode = "$bin_dir/opencode"
 EOF
