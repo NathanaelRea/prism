@@ -138,7 +138,7 @@ impl Tui {
         let path = self.sessions[context.session_index].path.clone();
         let details = self.sessions[context.session_index]
             .pr
-            .details()
+            .trusted_details()?
             .ok_or_else(|| "pull request review details are unavailable".to_string())?;
         let thread_ids = unresolved_review_thread_ids(details);
         if thread_ids.is_empty() {

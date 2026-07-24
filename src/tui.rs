@@ -668,11 +668,12 @@ impl Tui {
         }
         if action == GitAction::ResolveAllComments {
             return self.main_focused
-                && session.pr.details().is_some_and(|details| {
-                    details
-                        .review_comments
-                        .iter()
-                        .any(|comment| !comment.resolved && !comment.thread_id.trim().is_empty())
+                && session.pr.trusted_details().is_ok_and(|details| {
+                    details.is_some_and(|details| {
+                        details.review_comments.iter().any(|comment| {
+                            !comment.resolved && !comment.thread_id.trim().is_empty()
+                        })
+                    })
                 });
         }
         if matches!(action, GitAction::CiFix | GitAction::ReviewFix) {
@@ -3691,6 +3692,22 @@ mod tests {
 
         tui.focus_main();
         assert!(tui.git_action_enabled(GitAction::ResolveAllComments));
+
+        tui.sessions[0].pr.mark_preserved_stale();
+        assert!(!tui.git_action_enabled(GitAction::ResolveAllComments));
+
+        tui.sessions[0].pr = PrCache::observed(
+            test_pr_summary(false),
+            Some(PrDetails {
+                review_comments: vec![PrReviewComment {
+                    thread_id: "  ".to_string(),
+                    resolved: false,
+                    ..PrReviewComment::default()
+                }],
+                ..PrDetails::default()
+            }),
+        );
+        assert!(!tui.git_action_enabled(GitAction::ResolveAllComments));
 
         tui.sessions[0].pr = PrCache::observed(
             test_pr_summary(false),
