@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::Line;
 
 use crate::agent::AgentState;
@@ -2603,24 +2603,17 @@ impl Tui {
             view::sidebar_width_for(area.width, self.config.layout.sidebar_width),
             body_height,
         );
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(6),
-                Constraint::Percentage(40),
-                Constraint::Percentage(60),
-            ])
-            .split(sidebar);
-        if point_in_rect(x, y, chunks[1]) {
-            let row = y.saturating_sub(chunks[1].y).saturating_sub(1) as usize;
+        let (_, repos, worktrees) = view::sidebar_areas(sidebar);
+        if point_in_rect(x, y, repos) {
+            let row = y.saturating_sub(repos.y).saturating_sub(1) as usize;
             if let Some(index) = self.visible_repo_indices().get(row).copied() {
                 self.select_repo(index);
                 self.focus_repos();
             }
             return;
         }
-        if point_in_rect(x, y, chunks[2]) {
-            let row = y.saturating_sub(chunks[2].y).saturating_sub(2) as usize;
+        if point_in_rect(x, y, worktrees) {
+            let row = y.saturating_sub(worktrees.y).saturating_sub(2) as usize;
             if let Some(index) = self.visible_session_indices().get(row).copied() {
                 self.select_worktree(index);
                 self.focus_worktrees();

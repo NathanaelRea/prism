@@ -2,6 +2,22 @@ use super::*;
 
 pub(super) const MIN_MAIN_WIDTH: u16 = 20;
 
+pub(crate) fn sidebar_areas(area: Rect) -> (Rect, Rect, Rect) {
+    const STATUS_HEIGHT: u16 = 6;
+    const MIN_REPOS_HEIGHT: u16 = 3;
+
+    let halves = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    let status_height = STATUS_HEIGHT.min(halves[0].height.saturating_sub(MIN_REPOS_HEIGHT));
+    let upper = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(status_height), Constraint::Min(1)])
+        .split(halves[0]);
+    (upper[0], upper[1], halves[1])
+}
+
 pub(crate) fn tmux_portal_size(
     area: Rect,
     configured_sidebar_width: Option<u16>,

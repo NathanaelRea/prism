@@ -82,6 +82,33 @@ fn renders_tmux_portal_with_latest_pane_rows() {
 }
 
 #[test]
+fn sidebar_panel_heights_stay_stable_when_tmux_portal_is_hidden() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Running)];
+    let without_portal = test_model(&config, &sessions, PanelFocus::Repos, None, None);
+    let mut with_portal = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    with_portal.tmux_portal = Some(crate::view::TmuxPortalModel {
+        branch: "feature",
+        state: crate::view::TmuxPortalState::Loading,
+    });
+
+    let without_portal = render_to_buffer(&without_portal, 120, 30);
+    let with_portal = render_to_buffer(&with_portal, 120, 30);
+
+    for title in ["[1] Status", "[2] Repos", "[3] Worktrees"] {
+        assert_eq!(
+            find_line(&without_portal, title),
+            find_line(&with_portal, title),
+            "{title} moved when the tmux portal appeared",
+        );
+    }
+    assert_eq!(
+        find_line(&with_portal, "[3] Worktrees"),
+        find_line(&with_portal, "tmux · feature"),
+    );
+}
+
+#[test]
 fn renders_unavailable_tmux_portal() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Running)];
