@@ -148,9 +148,9 @@ fn ensure_tmux_agent_session(
     session: &Session,
     runtime_session: &TmuxAgentSession,
 ) -> Result<bool, String> {
-    let runtime = opencode_runtime_for_session(repo, config, session)?;
     if session_exists(config, runtime_session.name())? {
         if !configure_agent_session(config, runtime_session.name())? {
+            let runtime = opencode_runtime_for_session(repo, config, session)?;
             create_detached_agent_session(
                 repo,
                 config,
@@ -174,6 +174,7 @@ fn ensure_tmux_agent_session(
         }
         kill_session(config, runtime_session.name())?;
     }
+    let runtime = opencode_runtime_for_session(repo, config, session)?;
     create_detached_agent_session(
         repo,
         config,
@@ -1999,6 +2000,7 @@ exit 0
         let temp = unique_temp_dir("prism-tmux-existing-agent-attach-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
+        let display_count = temp.join("display-count");
         let tmux = temp.join("tmux");
         fs::write(
             &tmux,
@@ -2010,6 +2012,10 @@ case "$1" in
     exit 0
     ;;
   display-message)
+    count="$(cat '{}' 2>/dev/null || echo 0)"
+    count="$((count + 1))"
+    echo "$count" > '{}'
+    [ "$count" -gt 1 ] || exit 1
     echo opencode
     exit 0
     ;;
@@ -2023,7 +2029,9 @@ case "$1" in
 esac
 exit 1
 "#,
-                log.display()
+                log.display(),
+                display_count.display(),
+                display_count.display()
             ),
         )
         .unwrap();
