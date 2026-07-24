@@ -8,7 +8,7 @@
 ▓▒░▒▓█▓ M ◤◥◣◢◤◥◣
 ```
 
-Prism is a meta-harness for managing agents in parallel on separate worktrees with tmux. It integrates with github (or other remote), so your hands don't need to leave the keyboard to view PR/CI status to merge.
+Prism is a meta-harness for managing agents in parallel on separate worktrees with tmux. It integrates with github (or other remote), so you don't need to switch between worktrees, terminals, browsers, or repos.
 
 ## Overview
 
@@ -16,17 +16,13 @@ Prism is a meta-harness for managing agents in parallel on separate worktrees wi
 
 ## What it enables
 
-It's a local dashboard to manage code change lifecycles. From planning, implementation, PR, CI checks, CR comments and fixes. We have a centralized location to do all this in parallel for any number of changes at the same time.
+It's a local dashboard to manage code change lifecycles. From planning, implementation, PR, CI checks, CR comments/fixes. It's a centralized location to do this all in one place along different threads at the same time.
 
-- Keep each task in its own Git worktree and tmux-backed agent session.
-- See repository, worktree, pull request, CI, and agent state in one TUI.
-- Kick off repeatable agent flows for implementation, review repair, CI repair, and merge readiness.
+- Isolate tasks with git worktrees and tmux sessions
+- See repo, worktree, PR, CI, and agent state in one TUI.
+- Kick off repeatable agent flows for implementing a plan, or fixing from reviews, ci failures, or merge issues
 
 ## Prerequisites
-
-Build/install requirements:
-
-- Rust/Cargo
 
 Core runtime requirements:
 
@@ -52,20 +48,31 @@ On first interactive startup, Prism lists the installed built-in harnesses and s
 
 ## Install
 
+Prism provides prebuilt archives for:
+
+- Linux x86_64 with glibc 2.35 or newer (for example, Ubuntu 22.04)
+- macOS x86_64 (Intel)
+- macOS aarch64 (Apple Silicon)
+
+Download the archive for your platform from the
+[latest GitHub Release](https://github.com/NathanaelRea/prism/releases/latest),
+verify it against the matching `.sha256` file, extract it, and place `prism`
+somewhere on your `PATH`, such as `~/.local/bin`.
+
+To build from source, install Rust 1.95 or newer, clone this repository, check
+out the desired release tag, and run:
+
 ```sh
 ./install.sh
 ```
+
+This installs a copy to `~/.local/bin/prism`. Set `PRISM_INSTALL_DIR` to choose
+another directory.
 
 ## Start
 
 ```sh
 prism
-```
-
-To prepare a worktree's selected harness session without entering the TUI:
-
-```sh
-prism agent ensure --branch feature/my-change
 ```
 
 ## Learn More

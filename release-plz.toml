@@ -1,0 +1,11 @@
+[workspace]
+git_only = true
+publish = false
+release_always = false
+git_release_enable = true
+git_release_type = "auto"
+git_release_draft = true
+git_release_latest = false
+
+[changelog]
+protect_breaking_commits = true
