@@ -147,7 +147,7 @@ rendered_tape="$sandbox_path/prism.tape"
 capture_name=".prism-capture.png"
 capture_path="$PRISM_DEMO_REPO/$capture_name"
 sed \
-  -e "s|__OUTPUT__|$capture_name|g" \
+  -e "s|__OUTPUT__|$capture_path|g" \
   -e "s|__FRAMES_DIR__|$sandbox_path/frames|g" \
   "$script_dir/prism.tape" >"$rendered_tape"
 
