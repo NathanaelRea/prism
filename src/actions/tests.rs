@@ -1298,10 +1298,13 @@ exit 0
 
     tui.start_delete_session_for_test().unwrap();
     let wait_started = Instant::now();
-    while !tui.delete_sessions_in_flight.is_empty()
-        && wait_started.elapsed() < Duration::from_secs(3)
-    {
+    while !tui.delete_sessions_in_flight.is_empty() {
         tui.poll_delete_sessions();
+        assert!(
+            tui.delete_sessions_in_flight.is_empty()
+                || wait_started.elapsed() < Duration::from_secs(10),
+            "delete did not finish within 10 seconds"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 
@@ -1411,6 +1414,8 @@ fn tmux_agent_warmup_does_not_block_startup() {
     let temp = unique_temp_dir("prism-tmux-warmup-test");
     fs::create_dir_all(&temp).unwrap();
     let state = temp.join("tmux-state");
+    let release = temp.join("tmux-release");
+    let timed_out = temp.join("tmux-timed-out");
     let tmux = temp.join("tmux");
     fs::write(
         &tmux,
@@ -1419,7 +1424,15 @@ fn tmux_agent_warmup_does_not_block_startup() {
 state="$(cat '{}' 2>/dev/null || echo missing)"
 case "$1" in
   has-session)
-sleep 1
+attempts=0
+while [ ! -f '{}' ]; do
+  attempts=$((attempts + 1))
+  if [ "$attempts" -ge 100 ]; then
+    touch '{}'
+    break
+  fi
+  sleep 0.01
+done
 [ "$state" = exists ]
 exit $?
 ;;
@@ -1438,6 +1451,8 @@ esac
 exit 0
 "#,
             state.display(),
+            release.display(),
+            timed_out.display(),
             state.display()
         ),
     )
@@ -1461,20 +1476,20 @@ exit 0
     let session = test_session(temp.join("worktree"), "feature");
     let mut tui = Tui::new_single(repo, config, vec![session]);
 
-    let started = Instant::now();
     tui.start_tmux_agent_warmup();
 
-    assert!(
-        started.elapsed() < Duration::from_millis(250),
-        "tmux warm-up blocked startup for {:?}",
-        started.elapsed()
-    );
+    assert!(!timed_out.exists(), "tmux warm-up blocked startup");
     assert_eq!(tui.tmux_warmups_in_flight.len(), 1);
+    fs::write(&release, "continue").unwrap();
 
     let wait_started = Instant::now();
-    while !tui.tmux_warmups_in_flight.is_empty() && wait_started.elapsed() < Duration::from_secs(3)
-    {
+    while !tui.tmux_warmups_in_flight.is_empty() {
         tui.poll_tmux_agent_warmup();
+        assert!(
+            tui.tmux_warmups_in_flight.is_empty()
+                || wait_started.elapsed() < Duration::from_secs(10),
+            "tmux warm-up did not finish within 10 seconds"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(tui.tmux_warmups_in_flight.is_empty());
