@@ -139,6 +139,14 @@ leases, and supervises execution. Closing the TUI does not stop it. It is not a
 login service and does not automatically restart interrupted work after the
 daemon or machine stops.
 
+Managed executor database connections install claim-bound SQLite guards. The
+guards reject run, step, output, event, and process writes unless the connection
+still owns the current unexpired fencing token; linked Plan writes use their
+parent Auto Flow claim. Executor loops also revalidate ownership before harness,
+verification, Git, GitHub, and cleanup effects. Resume and retry requests made
+while an executor is releasing persist a requeue intent so runnable work cannot
+be stranded by the release race.
+
 ### Auto Flow
 
 Auto Flow is Prism's persisted workflow for taking one clean, non-default

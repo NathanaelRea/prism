@@ -168,12 +168,13 @@ impl Tui {
         .with_worktree_incarnation(session_incarnation);
         let mut persisted = launch.create_run();
         crate::observability::with_writable_db(&context.repo, |conn| {
-            save_auto_run(conn, &mut persisted)
+            crate::auto_flow::submit_auto_run(conn, &mut persisted)
         })?;
         let run_id = persisted.run.id.clone();
         self.remember_auto_run(persisted.clone());
         self.selected_auto_run = Some(run_id);
-        self.spawn_auto_run_executor(context.repo, context.config, persisted)?;
+        crate::worker::ensure_running()?;
+        crate::worker::wake()?;
         self.show_message("started Auto Flow run")?;
         Ok(())
     }
@@ -332,6 +333,12 @@ impl Tui {
         };
         let config = Config::load(&repo);
         let run_id = dashboard.run.run.id.clone();
+        reject_claimed_control(
+            &repo,
+            crate::execution::WorkflowKind::Auto,
+            &run_id,
+            "retry",
+        )?;
         let outcome = crate::observability::with_writable_db(&repo, |conn| {
             apply_auto_run_control(conn, &run_id, AutoRunControlIntent::RetryFailed)
         })?;
@@ -369,6 +376,12 @@ impl Tui {
         };
         let config = Config::load(&repo);
         let run_id = dashboard.run.run.id.clone();
+        reject_claimed_control(
+            &repo,
+            crate::execution::WorkflowKind::Auto,
+            &run_id,
+            "retry",
+        )?;
         let outcome = crate::observability::with_writable_db(&repo, |conn| {
             apply_auto_run_control(
                 conn,

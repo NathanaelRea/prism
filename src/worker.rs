@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -64,13 +65,32 @@ pub fn wake() -> Result<(), String> {
 }
 
 pub fn health() -> Result<(), String> {
-    let response = request("health")?;
+    let response = health_response()?;
     let expected = format!("ok {PROTOCOL_VERSION} ");
     if response.starts_with(&expected) {
         Ok(())
     } else {
         Err(format!("incompatible Prism worker response: {response}"))
     }
+}
+
+pub fn health_response() -> Result<String, String> {
+    request("health")
+}
+
+pub fn shutdown() -> Result<(), String> {
+    let response = request("shutdown")?;
+    if !response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
+        return Err(format!("Prism worker rejected shutdown: {response}"));
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if UnixStream::connect(socket_path()).is_err() {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err("Prism worker did not shut down before the timeout".to_string())
 }
 
 fn request(command: &str) -> Result<String, String> {
@@ -91,20 +111,49 @@ fn request(command: &str) -> Result<String, String> {
 
 pub fn serve() -> Result<(), String> {
     let runtime = runtime_dir();
+    if let Ok(metadata) = fs::symlink_metadata(&runtime) {
+        if metadata.file_type().is_symlink() {
+            return Err(format!(
+                "Prism worker runtime directory is a symlink: {}",
+                runtime.display()
+            ));
+        }
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err(format!(
+                "Prism worker runtime directory is owned by another user: {}",
+                runtime.display()
+            ));
+        }
+    }
     fs::create_dir_all(&runtime).map_err(|error| format!("create worker runtime dir: {error}"))?;
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("secure worker runtime dir: {error}"))?;
     let _lock = acquire_lock(&runtime.join("worker.lock"))?;
     let socket = runtime.join("worker.sock");
     if socket.exists() {
-        if health().is_ok() {
-            return Err("Prism worker is already running".to_string());
+        match UnixStream::connect(&socket) {
+            Ok(_) => {
+                return Err(
+                    "a live Prism worker endpoint already owns the runtime socket".to_string(),
+                );
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                ) => {}
+            Err(error) => {
+                return Err(format!(
+                    "cannot safely classify existing Prism worker socket: {error}"
+                ));
+            }
         }
         fs::remove_file(&socket).map_err(|error| format!("remove stale worker socket: {error}"))?;
     }
 
     let instance_id = execution::new_instance_id("daemon");
     classify_abandoned(&instance_id)?;
+    log_daemon_lifecycle("daemon_start", &instance_id);
     let listener = UnixListener::bind(&socket)
         .map_err(|error| format!("bind Prism worker socket {}: {error}", socket.display()))?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
@@ -115,29 +164,62 @@ pub fn serve() -> Result<(), String> {
 
     let active = Arc::new(Mutex::new(BTreeSet::<PathBuf>::new()));
     let mut next_poll = Instant::now();
+    let mut draining = false;
     loop {
         match listener.accept() {
-            Ok((mut stream, _)) => respond(&mut stream, &instance_id),
+            Ok((mut stream, _)) => {
+                if respond(&mut stream, &instance_id, &active, draining) {
+                    draining = true;
+                }
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(format!("accept Prism worker connection: {error}")),
         }
-        if Instant::now() >= next_poll {
+        if draining
+            && active
+                .lock()
+                .map(|active| active.is_empty())
+                .unwrap_or(false)
+        {
+            break;
+        }
+        if !draining && Instant::now() >= next_poll {
             schedule_queued(&instance_id, Arc::clone(&active));
             next_poll = Instant::now() + POLL_INTERVAL;
         }
         thread::sleep(Duration::from_millis(50));
     }
+    log_daemon_lifecycle("daemon_stop", &instance_id);
+    fs::remove_file(&socket).map_err(|error| format!("remove worker socket: {error}"))
 }
 
-fn respond(stream: &mut UnixStream, instance_id: &str) {
+fn respond(
+    stream: &mut UnixStream,
+    instance_id: &str,
+    active: &Arc<Mutex<BTreeSet<PathBuf>>>,
+    draining: bool,
+) -> bool {
     let mut request = [0_u8; 64];
     let size = stream.read(&mut request).unwrap_or(0);
     let command = String::from_utf8_lossy(&request[..size]);
+    let active = active
+        .lock()
+        .map(|active| active.len())
+        .unwrap_or(usize::MAX);
     let response = match command.trim() {
-        "health" | "wake" => format!("ok {PROTOCOL_VERSION} {instance_id}\n"),
+        "health" | "wake" => format!(
+            "ok {PROTOCOL_VERSION} {instance_id} pid={} state={} active={active}\n",
+            std::process::id(),
+            if draining { "draining" } else { "running" }
+        ),
+        "shutdown" => format!(
+            "ok {PROTOCOL_VERSION} {instance_id} pid={} state=draining active={active}\n",
+            std::process::id()
+        ),
         _ => "error unknown-command\n".to_string(),
     };
     let _ = stream.write_all(response.as_bytes());
+    command.trim() == "shutdown"
 }
 
 fn classify_abandoned(instance_id: &str) -> Result<(), String> {
@@ -199,6 +281,7 @@ fn schedule_queued(instance_id: &str, active: Arc<Mutex<BTreeSet<PathBuf>>>) {
                 }
                 continue;
             };
+            log_claim_lifecycle(&repo, "claim", &claim, "workflow claimed");
             let active = Arc::clone(&active);
             let executor_repo = repo.clone();
             thread::spawn(move || {
@@ -229,7 +312,7 @@ pub fn legacy_worker_running(
         .map_err(|error| format!("inspect legacy tmux workers: {error}"))?;
     if !output.status.success() {
         let error = String::from_utf8_lossy(&output.stderr);
-        if error.contains("no server running") || error.contains("no sessions") {
+        if tmux_list_means_no_server(&error) {
             return Ok(false);
         }
         return Err(format!("inspect legacy tmux workers: {}", error.trim()));
@@ -237,6 +320,12 @@ pub fn legacy_worker_running(
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .any(|name| name == expected))
+}
+
+fn tmux_list_means_no_server(error: &str) -> bool {
+    error.contains("no server running")
+        || error.contains("no sessions")
+        || error.contains("error connecting to")
 }
 
 fn workflow_worktree(repo: &Repository, workflow: &WorkflowIdentity) -> Result<PathBuf, String> {
@@ -256,14 +345,21 @@ fn workflow_worktree(repo: &Repository, workflow: &WorkflowIdentity) -> Result<P
 }
 
 fn execute_claim(repo: &Repository, claim: &ExecutionClaim) {
+    log_claim_lifecycle(repo, "executor_start", claim, "workflow executor started");
     let heartbeat_stop = Arc::new(AtomicBool::new(false));
-    let heartbeat = spawn_heartbeat(repo.clone(), claim.clone(), Arc::clone(&heartbeat_stop));
+    let ownership_lost = Arc::new(AtomicBool::new(false));
+    let heartbeat = spawn_heartbeat(
+        repo.clone(),
+        claim.clone(),
+        Arc::clone(&heartbeat_stop),
+        Arc::clone(&ownership_lost),
+    );
     let config = Config::load(repo);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         observability::with_writable_db(repo, |conn| execution::validate_claim(conn, claim))
             .and_then(|()| match claim.workflow.kind {
-                WorkflowKind::Auto => execute_auto(repo, &config, &claim.workflow.run_id),
-                WorkflowKind::Plan => execute_plan(repo, &config, &claim.workflow.run_id),
+                WorkflowKind::Auto => execute_auto(repo, &config, claim),
+                WorkflowKind::Plan => execute_plan(repo, &config, claim),
             })
     }))
     .unwrap_or_else(|_| Err("workflow executor panicked".to_string()));
@@ -273,36 +369,62 @@ fn execute_claim(repo: &Repository, claim: &ExecutionClaim) {
     let state = match result {
         Ok(()) => workflow_release_state(repo, &claim.workflow).unwrap_or(DispatchState::Terminal),
         Err(error) => {
-            mark_domain_failed(repo, &claim.workflow, &error);
+            if !ownership_lost.load(Ordering::Acquire) {
+                mark_domain_failed(repo, claim, &error);
+            }
             DispatchState::Terminal
         }
     };
-    let _ = observability::with_writable_db(repo, |conn| execution::release(conn, claim, state));
+    match observability::with_writable_db(repo, |conn| execution::release(conn, claim, state)) {
+        Ok(()) => log_claim_lifecycle(repo, "release", claim, state.label()),
+        Err(error) => log_claim_lifecycle(repo, "release_failed", claim, &error),
+    }
+    log_claim_lifecycle(repo, "executor_stop", claim, "workflow executor stopped");
 }
 
 fn spawn_heartbeat(
     repo: Repository,
     claim: ExecutionClaim,
     stop: Arc<AtomicBool>,
+    ownership_lost: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
+        let mut next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
         while !stop.load(Ordering::Acquire) {
-            thread::sleep(HEARTBEAT_INTERVAL);
+            thread::sleep(Duration::from_millis(100));
             if stop.load(Ordering::Acquire) {
                 break;
+            }
+            if Instant::now() < next_heartbeat {
+                continue;
             }
             if observability::with_writable_db(&repo, |conn| execution::heartbeat(conn, &claim))
                 .is_err()
             {
-                // Executors share the daemon process, so losing durable ownership must stop
-                // them before another daemon can acquire the singleton lock.
-                std::process::abort();
+                let validation = observability::with_writable_db(&repo, |conn| {
+                    execution::validate_claim(conn, &claim)
+                });
+                if matches!(
+                    validation,
+                    Err(ref error) if execution::is_stale_claim_error(error)
+                ) {
+                    ownership_lost.store(true, Ordering::Release);
+                    log_claim_lifecycle(
+                        &repo,
+                        "heartbeat_lost",
+                        &claim,
+                        "execution ownership lost",
+                    );
+                    break;
+                }
             }
+            next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
         }
     })
 }
 
-fn execute_auto(repo: &Repository, config: &Config, run_id: &str) -> Result<(), String> {
+fn execute_auto(repo: &Repository, config: &Config, claim: &ExecutionClaim) -> Result<(), String> {
+    let run_id = &claim.workflow.run_id;
     let mut persisted = observability::with_writable_db(repo, |conn| {
         crate::auto_flow::load_auto_run(conn, run_id)
     })?
@@ -337,6 +459,7 @@ fn execute_auto(repo: &Repository, config: &Config, run_id: &str) -> Result<(), 
         format!("Auto Flow {}", persisted.run.prompt_summary),
     );
     observability::with_writable_db(repo, |conn| {
+        execution::install_claim_guards(conn, claim)?;
         crate::auto_flow::execute_auto_initial_step(
             conn,
             repo,
@@ -348,7 +471,8 @@ fn execute_auto(repo: &Repository, config: &Config, run_id: &str) -> Result<(), 
     })
 }
 
-fn execute_plan(repo: &Repository, config: &Config, run_id: &str) -> Result<(), String> {
+fn execute_plan(repo: &Repository, config: &Config, claim: &ExecutionClaim) -> Result<(), String> {
+    let run_id = &claim.workflow.run_id;
     let mut persisted =
         observability::with_writable_db(repo, |conn| crate::plan_run::load_plan_run(conn, run_id))?
             .ok_or_else(|| format!("plan run not found: {run_id}"))?;
@@ -382,19 +506,22 @@ fn execute_plan(repo: &Repository, config: &Config, run_id: &str) -> Result<(), 
     {
         executor = executor.with_plugin_config(plugin);
     }
-    observability::with_writable_db(repo, |conn| match persisted.run.mode {
-        crate::plan_run::PlanRunMode::Sequential => crate::plan_run::execute_plan_sequential(
-            conn,
-            &mut persisted,
-            &executor,
-            &mut std::io::sink(),
-        ),
-        crate::plan_run::PlanRunMode::Parallel => crate::plan_run::execute_plan_parallel(
-            conn,
-            &mut persisted,
-            &executor,
-            &mut std::io::sink(),
-        ),
+    observability::with_writable_db(repo, |conn| {
+        execution::install_claim_guards(conn, claim)?;
+        match persisted.run.mode {
+            crate::plan_run::PlanRunMode::Sequential => crate::plan_run::execute_plan_sequential(
+                conn,
+                &mut persisted,
+                &executor,
+                &mut std::io::sink(),
+            ),
+            crate::plan_run::PlanRunMode::Parallel => crate::plan_run::execute_plan_parallel(
+                conn,
+                &mut persisted,
+                &executor,
+                &mut std::io::sink(),
+            ),
+        }
     })
 }
 
@@ -422,12 +549,13 @@ fn workflow_release_state(
     })
 }
 
-fn mark_domain_failed(repo: &Repository, workflow: &WorkflowIdentity, error: &str) {
+fn mark_domain_failed(repo: &Repository, claim: &ExecutionClaim, error: &str) {
     let _ = observability::with_writable_db(repo, |conn| {
-        match workflow.kind {
+        execution::install_claim_guards(conn, claim)?;
+        match claim.workflow.kind {
             WorkflowKind::Auto => {
                 if let Some(mut persisted) =
-                    crate::auto_flow::load_auto_run(conn, &workflow.run_id)?
+                    crate::auto_flow::load_auto_run(conn, &claim.workflow.run_id)?
                 {
                     crate::auto_flow::fail_auto_run(conn, &mut persisted, error.to_string())?;
                 }
@@ -436,12 +564,55 @@ fn mark_domain_failed(repo: &Repository, workflow: &WorkflowIdentity, error: &st
                 conn.execute(
                     "update plan_run set status = 'failed', updated_unix_ms = ?1
                      where id = ?2 and status not in ('aborted', 'done')",
-                    rusqlite::params![execution::now_ms(), workflow.run_id],
+                    rusqlite::params![execution::now_ms(), claim.workflow.run_id],
                 )
                 .map_err(|db_error| format!("mark plan run failed: {db_error}"))?;
             }
         }
         Ok(())
+    });
+}
+
+fn log_daemon_lifecycle(action: &str, instance_id: &str) {
+    for entry in workspace::discover_valid_entries(workspace::load_entries()) {
+        let data = format!("{{\"daemon_instance_id\":\"{instance_id}\"}}");
+        log_worker_event(
+            &entry.repo,
+            action,
+            "Prism worker daemon lifecycle",
+            Some(&data),
+        );
+    }
+}
+
+fn log_claim_lifecycle(repo: &Repository, action: &str, claim: &ExecutionClaim, message: &str) {
+    let data = format!(
+        "{{\"workflow_kind\":\"{}\",\"run_id\":{},\"worker_id\":{},\"daemon_instance_id\":{},\"fencing_token\":{}}}",
+        claim.workflow.kind.label(),
+        serde_json::to_string(&claim.workflow.run_id).unwrap_or_else(|_| "null".to_string()),
+        serde_json::to_string(&claim.worker_id).unwrap_or_else(|_| "null".to_string()),
+        serde_json::to_string(&claim.daemon_instance_id).unwrap_or_else(|_| "null".to_string()),
+        claim.fencing_token,
+    );
+    log_worker_event(repo, action, message, Some(&data));
+}
+
+fn log_worker_event(repo: &Repository, action: &str, message: &str, data_json: Option<&str>) {
+    let _ = observability::with_writable_db(repo, |conn| {
+        conn.execute(
+            "insert into event (
+               time_unix_ms, level, target, action, repo, message, data_json
+             ) values (?1, 'info', 'worker', ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                execution::now_ms(),
+                action,
+                repo.root.display().to_string(),
+                message,
+                data_json,
+            ],
+        )
+        .map(|_| ())
+        .map_err(|error| format!("record worker lifecycle event: {error}"))
     });
 }
 
@@ -452,8 +623,11 @@ fn acquire_lock(path: &Path) -> Result<File, String> {
         .write(true)
         .truncate(false)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(path)
         .map_err(|error| format!("open Prism worker lock: {error}"))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("secure Prism worker lock: {error}"))?;
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result == -1 {
         return Err(format!(
@@ -465,22 +639,47 @@ fn acquire_lock(path: &Path) -> Result<File, String> {
 }
 
 pub fn runtime_dir() -> PathBuf {
-    if let Some(path) = std::env::var_os("PRISM_RUNTIME_DIR").filter(|path| !path.is_empty()) {
+    let override_path = std::env::var_os("PRISM_RUNTIME_DIR").filter(|path| !path.is_empty());
+    let xdg_runtime = std::env::var_os("XDG_RUNTIME_DIR").filter(|path| !path.is_empty());
+    let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
+    #[cfg(target_os = "linux")]
+    let target = "linux";
+    #[cfg(target_os = "macos")]
+    let target = "macos";
+    runtime_dir_for(
+        target,
+        override_path.as_deref(),
+        xdg_runtime.as_deref(),
+        home.as_deref(),
+        &crate::util::prism_config_dir(),
+    )
+}
+
+fn runtime_dir_for(
+    target: &str,
+    override_path: Option<&std::ffi::OsStr>,
+    xdg_runtime: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+    fallback_config: &Path,
+) -> PathBuf {
+    if let Some(path) = override_path {
         return PathBuf::from(path);
     }
-    #[cfg(target_os = "linux")]
-    if let Some(path) = std::env::var_os("XDG_RUNTIME_DIR").filter(|path| !path.is_empty()) {
+    if target == "linux"
+        && let Some(path) = xdg_runtime
+    {
         return PathBuf::from(path).join("prism");
     }
-    #[cfg(target_os = "macos")]
-    if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+    if target == "macos"
+        && let Some(home) = home
+    {
         return PathBuf::from(home)
             .join("Library")
             .join("Application Support")
             .join("Prism")
             .join("runtime");
     }
-    crate::util::prism_config_dir().join("runtime")
+    fallback_config.join("runtime")
 }
 
 pub fn socket_path() -> PathBuf {
@@ -490,6 +689,7 @@ pub fn socket_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
 
     #[test]
     fn socket_and_lock_share_a_private_runtime_directory() {
@@ -498,5 +698,46 @@ mod tests {
             socket_path().file_name().and_then(|name| name.to_str()),
             Some("worker.sock")
         );
+    }
+
+    #[test]
+    fn runtime_paths_cover_linux_and_macos() {
+        assert_eq!(
+            runtime_dir_for(
+                "linux",
+                None,
+                Some(OsStr::new("/run/user/1000")),
+                Some(OsStr::new("/home/user")),
+                Path::new("/fallback"),
+            ),
+            PathBuf::from("/run/user/1000/prism")
+        );
+        assert_eq!(
+            runtime_dir_for(
+                "macos",
+                None,
+                None,
+                Some(OsStr::new("/Users/user")),
+                Path::new("/fallback"),
+            ),
+            PathBuf::from("/Users/user/Library/Application Support/Prism/runtime")
+        );
+        assert_eq!(
+            runtime_dir_for(
+                "linux",
+                Some(OsStr::new("/override")),
+                Some(OsStr::new("/ignored")),
+                None,
+                Path::new("/fallback"),
+            ),
+            PathBuf::from("/override")
+        );
+    }
+
+    #[test]
+    fn isolated_tmux_connection_error_means_no_legacy_worker() {
+        assert!(tmux_list_means_no_server(
+            "error connecting to /tmp/prism/tmux-0/default (No such file or directory)"
+        ));
     }
 }

@@ -222,6 +222,25 @@ pub fn save_auto_run(
     Ok(())
 }
 
+pub fn submit_auto_run(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+) -> Result<(), String> {
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("begin managed Auto Flow submission: {error}"))?;
+    save_persisted_auto_run_with_conn(&tx, persisted)?;
+    crate::execution::enqueue(
+        &tx,
+        &crate::execution::WorkflowIdentity::new(
+            crate::execution::WorkflowKind::Auto,
+            &persisted.run.id,
+        ),
+    )?;
+    tx.commit()
+        .map_err(|error| format!("commit managed Auto Flow submission: {error}"))
+}
+
 pub(super) fn save_persisted_auto_run_with_conn(
     conn: &rusqlite::Connection,
     persisted: &mut PersistedAutoRun,

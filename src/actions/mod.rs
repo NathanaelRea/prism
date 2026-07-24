@@ -13,7 +13,7 @@ use crate::auto_flow::{
     AutoExecutorDecision, AutoImplementationSource, AutoLaunch, AutoLaunchOptions,
     AutoRunControlIntent, AutoRunMode, AutoRunStatus, AutoStepKey, AutoStepStatus,
     PersistedAutoRun, apply_auto_run_control, archive_auto_run, load_auto_run,
-    prepare_auto_run_for_resume, save_auto_run,
+    prepare_auto_run_for_resume,
 };
 use crate::config::Config;
 use crate::git::{
@@ -68,6 +68,24 @@ mod tmux_agent;
 mod tmux_portal;
 mod tools;
 mod worktrees;
+
+fn reject_claimed_control(
+    repo: &Repository,
+    kind: crate::execution::WorkflowKind,
+    run_id: &str,
+    control: &str,
+) -> Result<(), String> {
+    let workflow = crate::execution::WorkflowIdentity::new(kind, run_id);
+    let state = crate::observability::with_writable_db(repo, |conn| {
+        crate::execution::dispatch_state(conn, &workflow)
+    })?;
+    if state == Some(crate::execution::DispatchState::Claimed) {
+        return Err(format!(
+            "cannot {control} run {run_id} while its executor is active; pause or abort it first"
+        ));
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 mod tests;

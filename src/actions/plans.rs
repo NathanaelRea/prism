@@ -67,6 +67,7 @@ impl Tui {
             config.harness_adapter(&config.default_harness)?,
         );
         let mut should_execute = true;
+        let mut submitted = false;
         let persisted = crate::observability::with_writable_db(&repo, |conn| {
             if let Some(mut persisted) = load_resumable_plan_run(conn, &launch)? {
                 should_execute = prepare_plan_run_for_resume(
@@ -77,7 +78,8 @@ impl Tui {
                 Ok(persisted)
             } else {
                 let persisted = launch.create_run();
-                save_plan_run(conn, &persisted)?;
+                crate::plan_run::submit_plan_run(conn, &persisted)?;
+                submitted = true;
                 Ok(persisted)
             }
         })?;
@@ -91,7 +93,12 @@ impl Tui {
         self.manual_plan_step_selection_by_run.remove(&run_id);
 
         if should_execute {
-            self.spawn_plan_run_executor(repo, config, persisted)?;
+            if submitted {
+                crate::worker::ensure_running()?;
+                crate::worker::wake()?;
+            } else {
+                self.spawn_plan_run_executor(repo, config, persisted)?;
+            }
         }
         if self.focused_panel == crate::tui::PanelFocus::Worktrees {
             self.worktree_main_view = crate::view::WorktreeMainView::Plan;
@@ -594,6 +601,12 @@ impl Tui {
         };
         let config = Config::load(&repo);
         let run_id = dashboard.run.run.id.clone();
+        reject_claimed_control(
+            &repo,
+            crate::execution::WorkflowKind::Plan,
+            &run_id,
+            "retry",
+        )?;
         let persisted = crate::observability::with_writable_db(&repo, |conn| {
             let mut run = load_plan_run(conn, &run_id)?
                 .ok_or_else(|| format!("plan run not found: {run_id}"))?;
@@ -628,6 +641,12 @@ impl Tui {
         };
         let config = Config::load(&repo);
         let run_id = dashboard.run.run.id.clone();
+        reject_claimed_control(
+            &repo,
+            crate::execution::WorkflowKind::Plan,
+            &run_id,
+            "retry",
+        )?;
         let persisted = crate::observability::with_writable_db(&repo, |conn| {
             let mut run = load_plan_run(conn, &run_id)?
                 .ok_or_else(|| format!("plan run not found: {run_id}"))?;

@@ -1794,6 +1794,23 @@ impl Tui {
             return Ok(());
         };
         let selected = selected.into_iter().collect::<BTreeSet<_>>();
+        for (index, (repo_index, candidate)) in candidates.iter().enumerate() {
+            if !selected.contains(&index.to_string()) {
+                continue;
+            }
+            let managed = &self.repos[*repo_index];
+            if crate::worker::legacy_worker_running(
+                &managed.repo,
+                &managed.config,
+                &candidate.workflow,
+            )? {
+                return Err(format!(
+                    "legacy {} worker for run {} is still active; try recovery after it exits",
+                    candidate.workflow.kind.label(),
+                    candidate.workflow.run_id
+                ));
+            }
+        }
         for (repo_index, managed) in self.repos.iter().enumerate() {
             let decisions = candidates
                 .iter()
@@ -1808,19 +1825,6 @@ impl Tui {
                 })
                 .collect::<Vec<_>>();
             if !decisions.is_empty() {
-                for (workflow, _, _) in &decisions {
-                    if crate::worker::legacy_worker_running(
-                        &managed.repo,
-                        &managed.config,
-                        workflow,
-                    )? {
-                        return Err(format!(
-                            "legacy {} worker for run {} is still active; try recovery after it exits",
-                            workflow.kind.label(),
-                            workflow.run_id
-                        ));
-                    }
-                }
                 crate::observability::with_writable_db_mut(&managed.repo, |conn| {
                     crate::execution::apply_recovery_decision(conn, &decisions)
                 })?;

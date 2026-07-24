@@ -771,6 +771,12 @@ pub fn terminate_process(
             "refusing to terminate harness process {process_id}: process identity changed or was not recorded"
         ));
     }
+    #[cfg(not(target_os = "linux"))]
+    if _expected_start_time_ticks.is_none() {
+        return Err(format!(
+            "refusing to terminate harness process {process_id}: reusable process identity is unavailable"
+        ));
+    }
     let process_group = -(process_id as libc::pid_t);
     let result = unsafe { libc::kill(process_group, libc::SIGTERM) };
     if result == 0 {

@@ -4,7 +4,7 @@ use crate::args::{
 };
 use crate::auto_flow::{
     AutoImplementationSource, AutoLaunch, AutoLaunchOptions, AutoRunMode,
-    load_recent_active_runs_for_repo, prepare_auto_run_for_resume, save_auto_run,
+    load_recent_active_runs_for_repo, prepare_auto_run_for_resume, submit_auto_run,
 };
 use crate::config::Config;
 use crate::git::{current_branch_name, selected_dirty};
@@ -194,12 +194,37 @@ fn load_single_repo_context(
     let repo = observability::phase("discover_repo", || Repository::discover(repo_arg))?;
     observability::attach_repo(&repo);
     let config = observability::phase("load_config", || Ok(Config::load(&repo)))?;
+    warn_pending_recovery(&repo);
     Ok((repo, config))
+}
+
+fn warn_pending_recovery(repo: &Repository) {
+    let count = observability::with_writable_db(repo, |conn| {
+        conn.query_row(
+            "select count(*) from workflow_execution where dispatch_state = 'recovery_pending'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("count interrupted workflows: {error}"))
+    });
+    if let Ok(count) = count
+        && count > 0
+    {
+        eprintln!(
+            "Prism has {count} interrupted managed run(s); open interactive Prism to choose which to resume"
+        );
+    }
 }
 
 fn run_worker_command(command: WorkerCommand) -> Result<(), String> {
     match command {
         WorkerCommand::Serve => crate::worker::serve(),
+        WorkerCommand::Ensure => crate::worker::ensure_running(),
+        WorkerCommand::Health => {
+            println!("{}", crate::worker::health_response()?);
+            Ok(())
+        }
+        WorkerCommand::Shutdown => crate::worker::shutdown(),
     }
 }
 
@@ -388,16 +413,7 @@ fn run_auto_command(
         config.harness_adapter(&config.default_harness)?,
     );
     let mut persisted = launch.create_run();
-    observability::with_writable_db(repo, |conn| {
-        save_auto_run(conn, &mut persisted)?;
-        crate::execution::enqueue(
-            conn,
-            &crate::execution::WorkflowIdentity::new(
-                crate::execution::WorkflowKind::Auto,
-                &persisted.run.id,
-            ),
-        )
-    })?;
+    observability::with_writable_db(repo, |conn| submit_auto_run(conn, &mut persisted))?;
     crate::worker::ensure_running()?;
     crate::worker::wake()?;
     println!(
@@ -535,6 +551,18 @@ fn run_debug_command(
             println!("user_config = {}", config.user_path.display());
             println!("repo_config = {}", config.repo_config_path.display());
             println!("logs_dir = {}", repo.prism_dir().join("logs").display());
+            println!(
+                "worker_runtime_dir = {}",
+                crate::worker::runtime_dir().display()
+            );
+            println!(
+                "worker_socket_path = {}",
+                crate::worker::socket_path().display()
+            );
+            println!(
+                "worker_lock_path = {}",
+                crate::worker::runtime_dir().join("worker.lock").display()
+            );
             Ok(())
         }
         DebugCommand::Info => {

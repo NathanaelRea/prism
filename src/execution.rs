@@ -119,6 +119,7 @@ pub fn migrate_schema(conn: &Connection) -> Result<(), String> {
           fencing_token integer not null default 0,
           executor_pid integer,
           executor_process_identity text,
+          requeue_requested integer not null default 0,
           interruption_generation integer not null default 0,
           recovery_decided_unix_ms integer,
           created_unix_ms integer not null,
@@ -168,7 +169,16 @@ pub fn migrate_schema(conn: &Connection) -> Result<(), String> {
         from auto_run;
         ",
     )
-    .map_err(|error| format!("create workflow execution schema: {error}"))
+    .map_err(|error| format!("create workflow execution schema: {error}"))?;
+    if !table_has_column(conn, "workflow_execution", "requeue_requested")? {
+        conn.execute(
+            "alter table workflow_execution
+             add column requeue_requested integer not null default 0",
+            [],
+        )
+        .map_err(|error| format!("add workflow requeue intent: {error}"))?;
+    }
+    Ok(())
 }
 
 pub fn enqueue(conn: &Connection, workflow: &WorkflowIdentity) -> Result<(), String> {
@@ -187,6 +197,7 @@ pub fn enqueue(conn: &Connection, workflow: &WorkflowIdentity) -> Result<(), Str
                heartbeat_unix_ms = null,
                executor_pid = null,
                executor_process_identity = null,
+               requeue_requested = 0,
                recovery_decided_unix_ms = null,
                fencing_token = workflow_execution.fencing_token + 1,
                updated_unix_ms = excluded.updated_unix_ms
@@ -195,7 +206,16 @@ pub fn enqueue(conn: &Connection, workflow: &WorkflowIdentity) -> Result<(), Str
         )
         .map_err(|error| format!("enqueue workflow: {error}"))?;
     if changed == 0 {
-        return Err("workflow is already claimed".to_string());
+        let requested = conn
+            .execute(
+                "update workflow_execution set requeue_requested = 1, updated_unix_ms = ?1
+                 where workflow_kind = ?2 and run_id = ?3 and dispatch_state = 'claimed'",
+                params![now, workflow.kind.label(), workflow.run_id],
+            )
+            .map_err(|error| format!("request workflow requeue: {error}"))?;
+        if requested == 0 {
+            return Err("workflow could not be queued".to_string());
+        }
     }
     Ok(())
 }
@@ -270,14 +290,16 @@ fn claim_with_lease(
                dispatch_state = 'claimed', worker_id = ?1, daemon_instance_id = ?2,
                heartbeat_unix_ms = ?3, lease_expires_unix_ms = ?4,
                fencing_token = fencing_token + 1, executor_pid = ?5,
+               executor_process_identity = ?6,
                updated_unix_ms = ?3
-             where workflow_kind = ?6 and run_id = ?7 and dispatch_state = 'queued'",
+             where workflow_kind = ?7 and run_id = ?8 and dispatch_state = 'queued'",
             params![
                 worker_id,
                 daemon_instance_id,
                 now,
                 now.saturating_add(lease_ms),
                 i64::from(std::process::id()),
+                worker_id,
                 workflow.kind.label(),
                 workflow.run_id,
             ],
@@ -332,6 +354,7 @@ pub fn heartbeat(conn: &Connection, claim: &ExecutionClaim) -> Result<(), String
     conn.execute(
         "update workflow_execution set dispatch_state = 'recovery_pending',
            worker_id = null, daemon_instance_id = null, lease_expires_unix_ms = null,
+           requeue_requested = 0,
            interruption_generation = interruption_generation + 1,
            fencing_token = fencing_token + 1, updated_unix_ms = ?1
          where workflow_kind = ?2 and run_id = ?3 and dispatch_state = 'claimed'
@@ -372,6 +395,141 @@ pub fn validate_claim(conn: &Connection, claim: &ExecutionClaim) -> Result<(), S
     current.ok_or_else(stale_claim_error)
 }
 
+pub fn install_claim_guards(conn: &Connection, claim: &ExecutionClaim) -> Result<(), String> {
+    validate_claim(conn, claim)?;
+    conn.execute_batch(
+        "create temp table if not exists _prism_execution_claim_guard (
+           workflow_kind text not null,
+           run_id text not null,
+           worker_id text not null,
+           daemon_instance_id text not null,
+           fencing_token integer not null
+         );
+         delete from _prism_execution_claim_guard;",
+    )
+    .map_err(|error| format!("initialize execution claim guards: {error}"))?;
+    conn.execute(
+        "insert into _prism_execution_claim_guard
+         (workflow_kind, run_id, worker_id, daemon_instance_id, fencing_token)
+         values (?1, ?2, ?3, ?4, ?5)",
+        params![
+            claim.workflow.kind.label(),
+            claim.workflow.run_id,
+            claim.worker_id,
+            claim.daemon_instance_id,
+            claim.fencing_token,
+        ],
+    )
+    .map_err(|error| format!("store execution claim guard: {error}"))?;
+
+    let current_claim = "exists (
+           select 1
+           from workflow_execution e, _prism_execution_claim_guard g
+           where e.workflow_kind = g.workflow_kind
+             and e.run_id = g.run_id
+             and e.dispatch_state = 'claimed'
+             and e.worker_id = g.worker_id
+             and e.daemon_instance_id = g.daemon_instance_id
+             and e.fencing_token = g.fencing_token
+             and e.lease_expires_unix_ms > cast(unixepoch('subsec') * 1000 as integer)
+         )";
+    let guarded_tables = [
+        ("plan_run", "id", true, false),
+        ("plan_step_run", "run_id", true, false),
+        ("plan_output_line", "run_id", true, false),
+        ("auto_run", "id", false, false),
+        ("auto_step_run", "run_id", false, false),
+        ("auto_output_line", "step_run_id", false, true),
+        ("auto_event", "run_id", false, false),
+    ];
+    for (table, key, plan_table, output_table) in guarded_tables {
+        for operation in ["insert", "update", "delete"] {
+            let rows = match operation {
+                "insert" => vec!["new"],
+                "delete" => vec!["old"],
+                _ => vec!["old", "new"],
+            };
+            let ownership = rows
+                .into_iter()
+                .map(|row| {
+                    if plan_table {
+                        format!(
+                            "exists (
+                               select 1 from _prism_execution_claim_guard g
+                               where (g.workflow_kind = 'plan' and g.run_id = {row}.{key})
+                                  or (g.workflow_kind = 'auto' and exists (
+                                    select 1 from auto_step_run s
+                                    where s.run_id = g.run_id and s.plan_run_id = {row}.{key}
+                                  ))
+                             )"
+                        )
+                    } else if output_table {
+                        format!(
+                            "exists (
+                               select 1 from _prism_execution_claim_guard g
+                               join auto_step_run s on s.run_id = g.run_id
+                               where g.workflow_kind = 'auto' and s.id = {row}.{key}
+                             )"
+                        )
+                    } else {
+                        format!(
+                            "exists (
+                               select 1 from _prism_execution_claim_guard g
+                               where g.workflow_kind = 'auto' and g.run_id = {row}.{key}
+                             )"
+                        )
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" and ");
+            let trigger = format!(
+                "drop trigger if exists temp._prism_guard_{table}_{operation};
+                 create temp trigger _prism_guard_{table}_{operation}
+                 before {operation} on main.{table}
+                 when not (({ownership}) and ({current_claim}))
+                 begin
+                   select raise(abort, 'execution claim is stale');
+                 end;"
+            );
+            conn.execute_batch(&trigger)
+                .map_err(|error| format!("install execution claim guard for {table}: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_installed_claim(conn: &Connection) -> Result<(), String> {
+    let installed = conn
+        .query_row(
+            "select 1 from temp.sqlite_temp_master
+             where type = 'table' and name = '_prism_execution_claim_guard'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| format!("inspect installed execution claim: {error}"))?;
+    if installed.is_none() {
+        return Ok(());
+    }
+    let current = conn
+        .query_row(
+            "select 1
+             from workflow_execution e, temp._prism_execution_claim_guard g
+             where e.workflow_kind = g.workflow_kind
+               and e.run_id = g.run_id
+               and e.dispatch_state = 'claimed'
+               and e.worker_id = g.worker_id
+               and e.daemon_instance_id = g.daemon_instance_id
+               and e.fencing_token = g.fencing_token
+               and e.lease_expires_unix_ms > ?1",
+            [now_ms()],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(|error| format!("validate installed execution claim: {error}"))?;
+    current.ok_or_else(stale_claim_error)
+}
+
 pub fn release(
     conn: &Connection,
     claim: &ExecutionClaim,
@@ -385,12 +543,14 @@ pub fn release(
     }
     let changed = conn
         .execute(
-            "update workflow_execution set dispatch_state = ?1,
-               worker_id = null, daemon_instance_id = null,
-               lease_expires_unix_ms = null, executor_pid = null,
-               executor_process_identity = null, updated_unix_ms = ?2
+            "update workflow_execution set
+                dispatch_state = case when requeue_requested = 1 then 'queued' else ?1 end,
+                worker_id = null, daemon_instance_id = null,
+                lease_expires_unix_ms = null, executor_pid = null,
+                executor_process_identity = null, requeue_requested = 0, updated_unix_ms = ?2
              where workflow_kind = ?3 and run_id = ?4 and dispatch_state = 'claimed'
-               and worker_id = ?5 and daemon_instance_id = ?6 and fencing_token = ?7",
+                and worker_id = ?5 and daemon_instance_id = ?6 and fencing_token = ?7
+                and lease_expires_unix_ms > ?2",
             params![
                 state.label(),
                 now_ms(),
@@ -411,10 +571,11 @@ pub fn mark_abandoned(conn: &Connection, daemon_instance_id: &str) -> Result<usi
         "update workflow_execution set dispatch_state = 'recovery_pending',
            worker_id = null, daemon_instance_id = null, lease_expires_unix_ms = null,
            executor_pid = null, executor_process_identity = null,
+           requeue_requested = 0,
            interruption_generation = interruption_generation + 1,
            fencing_token = fencing_token + 1, updated_unix_ms = ?1
-         where dispatch_state = 'claimed'
-           and daemon_instance_id != ?2",
+          where dispatch_state = 'claimed'
+            and (daemon_instance_id != ?2 or lease_expires_unix_ms <= ?1)",
         params![now, daemon_instance_id],
     )
     .map_err(|error| format!("mark abandoned workflows: {error}"))
@@ -516,6 +677,7 @@ pub fn apply_recovery_decision(
             .execute(
                 "update workflow_execution set dispatch_state = ?1,
                    recovery_decided_unix_ms = ?2, updated_unix_ms = ?2,
+                   requeue_requested = 0,
                    fencing_token = fencing_token + 1,
                    interruption_generation = interruption_generation + 1
                  where workflow_kind = ?3 and run_id = ?4
@@ -539,15 +701,17 @@ pub fn apply_recovery_decision(
         }
         match workflow.kind {
             WorkflowKind::Auto => {
-                tx.execute(
-                    "update auto_step_run set status = 'queued', started_unix_ms = null,
-                       finished_unix_ms = null, execution_state = null,
-                       execution_process_id = null, execution_process_start_time_ticks = null,
-                       process_id = null, error = null
-                     where run_id = ?1 and status in ('starting', 'running', 'waiting')",
-                    [&workflow.run_id],
-                )
-                .map_err(|error| format!("reset interrupted Auto Flow step: {error}"))?;
+                if *selected {
+                    tx.execute(
+                        "update auto_step_run set status = 'queued', started_unix_ms = null,
+                           finished_unix_ms = null, execution_state = null,
+                           execution_process_id = null, execution_process_start_time_ticks = null,
+                           process_id = null, error = null
+                         where run_id = ?1 and status in ('starting', 'running', 'waiting')",
+                        [&workflow.run_id],
+                    )
+                    .map_err(|error| format!("reset interrupted Auto Flow step: {error}"))?;
+                }
                 tx.execute(
                     "update auto_run set status = ?1, pause_requested = 0,
                        updated_unix_ms = ?2 where id = ?3",
@@ -556,15 +720,17 @@ pub fn apply_recovery_decision(
                 .map_err(|error| format!("update recovered Auto Flow run: {error}"))?;
             }
             WorkflowKind::Plan => {
-                tx.execute(
-                    "update plan_step_run set status = 'queued', started_unix_ms = null,
-                       finished_unix_ms = null, execution_state = null,
-                       execution_process_id = null, execution_process_start_time_ticks = null,
-                       process_id = null, error = null
-                     where run_id = ?1 and status in ('starting', 'running')",
-                    [&workflow.run_id],
-                )
-                .map_err(|error| format!("reset interrupted Plan step: {error}"))?;
+                if *selected {
+                    tx.execute(
+                        "update plan_step_run set status = 'queued', started_unix_ms = null,
+                           finished_unix_ms = null, execution_state = null,
+                           execution_process_id = null, execution_process_start_time_ticks = null,
+                           process_id = null, error = null
+                         where run_id = ?1 and status in ('starting', 'running')",
+                        [&workflow.run_id],
+                    )
+                    .map_err(|error| format!("reset interrupted Plan step: {error}"))?;
+                }
                 tx.execute(
                     "update plan_run set status = ?1, pause_requested = 0,
                        updated_unix_ms = ?2 where id = ?3",
@@ -650,6 +816,25 @@ fn stale_claim_error() -> String {
     "execution claim is stale".to_string()
 }
 
+pub fn is_stale_claim_error(error: &str) -> bool {
+    error == "execution claim is stale"
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    let mut statement = conn
+        .prepare(&format!("pragma table_info({table})"))
+        .map_err(|error| format!("inspect {table} schema: {error}"))?;
+    let rows = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("query {table} schema: {error}"))?;
+    for row in rows {
+        if row.map_err(|error| format!("read {table} schema: {error}"))? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -682,15 +867,28 @@ mod tests {
                    created_unix_ms integer, updated_unix_ms integer
                  );
                  create table plan_step_run (
-                   run_id text, status text, started_unix_ms integer, finished_unix_ms integer,
+                   run_id text, step integer, status text, started_unix_ms integer, finished_unix_ms integer,
                    execution_state text, execution_process_id integer,
                    execution_process_start_time_ticks integer, process_id integer, error text
-                 );
-                 create table auto_step_run (
-                   run_id text, status text, started_unix_ms integer, finished_unix_ms integer,
+                  );
+                  create table plan_output_line (
+                    run_id text, step integer, line_number integer, time_unix_ms integer,
+                    kind text, text text
+                  );
+                  create table auto_step_run (
+                   id integer primary key, run_id text, plan_run_id text, status text,
+                   started_unix_ms integer, finished_unix_ms integer,
                    execution_state text, execution_process_id integer,
                    execution_process_start_time_ticks integer, process_id integer, error text
-                 );",
+                  );
+                  create table auto_output_line (
+                    step_run_id integer, line_number integer, time_unix_ms integer,
+                    kind text, text text
+                  );
+                  create table auto_event (
+                    id integer primary key, run_id text, step_run_id integer,
+                    time_unix_ms integer, kind text, data_json text
+                  );",
             )
             .unwrap();
         migrate_schema(&first).unwrap();
@@ -792,6 +990,86 @@ mod tests {
     }
 
     #[test]
+    fn requeue_requested_while_claimed_wins_over_release() {
+        let (path, mut owner, requester) = connections("requeue-release");
+        let workflow = WorkflowIdentity::new(WorkflowKind::Plan, "plan-1");
+        enqueue(&owner, &workflow).unwrap();
+        let claim = claim(&mut owner, &workflow, "daemon", "worker")
+            .unwrap()
+            .unwrap();
+
+        enqueue(&requester, &workflow).unwrap();
+        release(&owner, &claim, DispatchState::Paused).unwrap();
+
+        assert_eq!(
+            dispatch_state(&requester, &workflow).unwrap(),
+            Some(DispatchState::Queued)
+        );
+        drop(owner);
+        drop(requester);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn expired_claim_from_current_daemon_becomes_recovery_pending() {
+        let (path, mut owner, observer) = connections("current-daemon-expired");
+        let workflow = WorkflowIdentity::new(WorkflowKind::Auto, "auto-1");
+        enqueue(&owner, &workflow).unwrap();
+        claim_with_lease(&mut owner, &workflow, "daemon", "worker", -1)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(mark_abandoned(&observer, "daemon").unwrap(), 1);
+        assert_eq!(
+            dispatch_state(&observer, &workflow).unwrap(),
+            Some(DispatchState::RecoveryPending)
+        );
+        drop(owner);
+        drop(observer);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn unselected_recovery_preserves_process_identity_for_later_resume() {
+        let (path, mut conn, other) = connections("unselected-process");
+        conn.execute(
+            "insert into plan_run (id, status, created_unix_ms, updated_unix_ms)
+             values ('plan-1', 'running', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into plan_step_run (
+               run_id, step, status, execution_process_id,
+               execution_process_start_time_ticks
+             ) values ('plan-1', 1, 'running', 999999, null)",
+            [],
+        )
+        .unwrap();
+        migrate_schema(&conn).unwrap();
+        let workflow = WorkflowIdentity::new(WorkflowKind::Plan, "plan-1");
+
+        apply_recovery_decision(&mut conn, &[(workflow.clone(), 1, false)]).unwrap();
+
+        assert_eq!(
+            dispatch_state(&conn, &workflow).unwrap(),
+            Some(DispatchState::Paused)
+        );
+        let process_id: Option<i64> = conn
+            .query_row(
+                "select execution_process_id from plan_step_run
+                 where run_id = 'plan-1' and step = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(process_id, Some(999999));
+        drop(conn);
+        drop(other);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn migration_never_queues_legacy_active_runs() {
         let (path, first, second) = connections("migration");
         first
@@ -820,6 +1098,209 @@ mod tests {
         }
         drop(first);
         drop(second);
+        let _ = fs::remove_file(path);
+    }
+
+    fn assert_stale(result: rusqlite::Result<usize>) {
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("execution claim is stale")
+        );
+    }
+
+    #[test]
+    fn plan_claim_guards_allow_current_mutations_and_fence_every_operation() {
+        let (path, mut managed, other) = connections("plan-claim-guards");
+        let workflow = WorkflowIdentity::new(WorkflowKind::Plan, "plan-guarded");
+        enqueue(&managed, &workflow).unwrap();
+        let claim = claim(&mut managed, &workflow, "daemon", "worker")
+            .unwrap()
+            .unwrap();
+        install_claim_guards(&managed, &claim).unwrap();
+
+        managed
+            .execute(
+                "insert into plan_run (id, status, created_unix_ms, updated_unix_ms)
+                 values (?1, 'running', 1, 1)",
+                [&workflow.run_id],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "insert into plan_step_run (run_id, step, status) values (?1, 1, 'running')",
+                [&workflow.run_id],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "insert into plan_output_line
+                 (run_id, step, line_number, time_unix_ms, kind, text)
+                 values (?1, 1, 1, 1, 'stdout', 'one')",
+                [&workflow.run_id],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "update plan_run set updated_unix_ms = 2 where id = ?1",
+                [&workflow.run_id],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "delete from plan_output_line where run_id = ?1",
+                [&workflow.run_id],
+            )
+            .unwrap();
+
+        other
+            .execute(
+                "update workflow_execution set fencing_token = fencing_token + 1
+                 where workflow_kind = 'plan' and run_id = ?1",
+                [&workflow.run_id],
+            )
+            .unwrap();
+
+        assert_stale(managed.execute(
+            "insert into plan_output_line
+             (run_id, step, line_number, time_unix_ms, kind, text)
+             values (?1, 1, 2, 2, 'stdout', 'two')",
+            [&workflow.run_id],
+        ));
+        assert_stale(managed.execute(
+            "update plan_step_run set status = 'done' where run_id = ?1",
+            [&workflow.run_id],
+        ));
+        assert_stale(managed.execute("delete from plan_run where id = ?1", [&workflow.run_id]));
+
+        drop(managed);
+        drop(other);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn auto_claim_guards_cover_auto_rows_and_linked_plan_rows() {
+        let (path, mut managed, other) = connections("auto-claim-guards");
+        let workflow = WorkflowIdentity::new(WorkflowKind::Auto, "auto-guarded");
+        enqueue(&managed, &workflow).unwrap();
+        let claim = claim(&mut managed, &workflow, "daemon", "worker")
+            .unwrap()
+            .unwrap();
+        managed
+            .execute(
+                "insert into auto_run (id, status, created_unix_ms, updated_unix_ms)
+                 values (?1, 'running', 1, 1)",
+                [&workflow.run_id],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "insert into auto_step_run (id, run_id, plan_run_id, status)
+                 values (10, ?1, 'linked-plan', 'running')",
+                [&workflow.run_id],
+            )
+            .unwrap();
+        install_claim_guards(&managed, &claim).unwrap();
+        managed
+            .execute(
+                "insert into auto_output_line
+                 (step_run_id, line_number, time_unix_ms, kind, text)
+                 values (10, 1, 1, 'stdout', 'one')",
+                [],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "insert into auto_event (id, run_id, step_run_id, time_unix_ms, kind, data_json)
+                 values (20, ?1, 10, 1, 'started', '{}')",
+                [&workflow.run_id],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "insert into plan_run (id, status, created_unix_ms, updated_unix_ms)
+                 values ('linked-plan', 'running', 1, 1)",
+                [],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "insert into plan_step_run (run_id, step, status)
+                 values ('linked-plan', 1, 'running')",
+                [],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "insert into plan_output_line
+                 (run_id, step, line_number, time_unix_ms, kind, text)
+                 values ('linked-plan', 1, 1, 1, 'stdout', 'one')",
+                [],
+            )
+            .unwrap();
+
+        for statement in [
+            "update auto_run set updated_unix_ms = 2 where id = 'auto-guarded'",
+            "update auto_step_run set status = 'done' where id = 10",
+            "update auto_output_line set text = 'two' where step_run_id = 10",
+            "update auto_event set kind = 'finished' where id = 20",
+            "update plan_run set updated_unix_ms = 2 where id = 'linked-plan'",
+            "update plan_step_run set status = 'done' where run_id = 'linked-plan'",
+            "update plan_output_line set text = 'two' where run_id = 'linked-plan'",
+        ] {
+            managed.execute(statement, []).unwrap();
+        }
+
+        other
+            .execute(
+                "update workflow_execution set worker_id = 'replacement',
+                   daemon_instance_id = 'replacement', fencing_token = fencing_token + 1
+                 where workflow_kind = 'auto' and run_id = ?1",
+                [&workflow.run_id],
+            )
+            .unwrap();
+        for statement in [
+            "update auto_run set updated_unix_ms = 3 where id = 'auto-guarded'",
+            "update auto_step_run set status = 'failed' where id = 10",
+            "update auto_output_line set text = 'stale' where step_run_id = 10",
+            "update auto_event set kind = 'stale' where id = 20",
+            "update plan_run set updated_unix_ms = 3 where id = 'linked-plan'",
+            "update plan_step_run set status = 'failed' where run_id = 'linked-plan'",
+            "update plan_output_line set text = 'stale' where run_id = 'linked-plan'",
+        ] {
+            assert_stale(managed.execute(statement, []));
+        }
+
+        drop(managed);
+        drop(other);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn claim_guards_reject_unrelated_workflow_rows() {
+        let (path, mut managed, other) = connections("claim-guard-scope");
+        let workflow = WorkflowIdentity::new(WorkflowKind::Plan, "owned");
+        enqueue(&managed, &workflow).unwrap();
+        let claim = claim(&mut managed, &workflow, "daemon", "worker")
+            .unwrap()
+            .unwrap();
+        managed
+            .execute(
+                "insert into plan_run (id, status, created_unix_ms, updated_unix_ms)
+                 values ('unrelated', 'running', 1, 1)",
+                [],
+            )
+            .unwrap();
+        install_claim_guards(&managed, &claim).unwrap();
+
+        assert_stale(managed.execute(
+            "update plan_run set updated_unix_ms = 2 where id = 'unrelated'",
+            [],
+        ));
+
+        drop(managed);
+        drop(other);
         let _ = fs::remove_file(path);
     }
 }

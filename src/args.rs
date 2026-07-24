@@ -32,6 +32,9 @@ pub enum CommandKind {
 #[derive(Debug, PartialEq, Eq)]
 pub enum WorkerCommand {
     Serve,
+    Ensure,
+    Health,
+    Shutdown,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -230,9 +233,12 @@ impl Args {
                 "worker" => {
                     let subcommand = iter
                         .next()
-                        .ok_or_else(|| "worker requires serve".to_string())?;
+                        .ok_or_else(|| "worker requires a subcommand".to_string())?;
                     let worker_command = match subcommand.to_string_lossy().as_ref() {
                         "serve" => WorkerCommand::Serve,
+                        "ensure" => WorkerCommand::Ensure,
+                        "health" => WorkerCommand::Health,
+                        "shutdown" => WorkerCommand::Shutdown,
                         other => return Err(format!("unknown worker subcommand: {other}")),
                     };
                     if let Some(extra) = iter.next() {
@@ -408,10 +414,14 @@ mod tests {
 
     #[test]
     fn internal_worker_command_parses() {
-        assert_eq!(
-            parse(&["worker", "serve"]),
-            CommandKind::Worker(WorkerCommand::Serve)
-        );
+        for (name, expected) in [
+            ("serve", WorkerCommand::Serve),
+            ("ensure", WorkerCommand::Ensure),
+            ("health", WorkerCommand::Health),
+            ("shutdown", WorkerCommand::Shutdown),
+        ] {
+            assert_eq!(parse(&["worker", name]), CommandKind::Worker(expected));
+        }
     }
 
     #[test]

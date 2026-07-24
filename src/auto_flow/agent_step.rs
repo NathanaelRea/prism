@@ -47,6 +47,7 @@ pub(super) fn execute_one_agent_step(
                 return Err(error);
             }
         };
+    crate::execution::validate_installed_claim(conn)?;
     let spawn_result = spawn_harness(&mut command, &invocation);
     let (mut child, used_attach) = match spawn_result {
         Ok(child) => (child, invocation.attach),
@@ -64,6 +65,7 @@ pub(super) fn execute_one_agent_step(
             invocation.cleanup();
             let (mut fallback, fallback_invocation) =
                 harness_run_command(executor, &persisted.steps[step_index], &prompt, false)?;
+            crate::execution::validate_installed_claim(conn)?;
             match spawn_harness(&mut fallback, &fallback_invocation) {
                 Ok(child) => {
                     invocation = fallback_invocation;
@@ -309,9 +311,9 @@ pub(super) fn collect_child_output(
 
     let mut readers_open = 2;
     while readers_open > 0 {
-        match rx.recv() {
+        match rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(Ok(ChildLine::Line { stream, text })) => {
-                ingest_child_line(
+                if let Err(error) = ingest_child_line(
                     conn,
                     step,
                     stream,
@@ -319,11 +321,23 @@ pub(super) fn collect_child_output(
                     max_output_lines_per_step,
                     structured_events,
                     output,
-                )?;
+                ) {
+                    terminate_auto_child(step, child);
+                    return Err(error);
+                }
             }
             Ok(Ok(ChildLine::End)) => readers_open -= 1,
-            Ok(Err(error)) => return Err(error),
-            Err(_) => break,
+            Ok(Err(error)) => {
+                terminate_auto_child(step, child);
+                return Err(error);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Err(error) = crate::execution::validate_installed_claim(conn) {
+                    terminate_auto_child(step, child);
+                    return Err(error);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
@@ -331,6 +345,13 @@ pub(super) fn collect_child_output(
         .wait()
         .map_err(|error| format!("wait for harness: {error}"))?;
     Ok(status.code().unwrap_or(1))
+}
+
+fn terminate_auto_child(step: &AutoStepRun, child: &mut Child) {
+    let process_id = step.execution.process_id.unwrap_or_else(|| child.id());
+    let identity = step.execution.process_start_time_ticks;
+    let _ = crate::harness::terminate_process(process_id, identity);
+    let _ = child.wait();
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
