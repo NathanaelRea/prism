@@ -238,6 +238,7 @@ enum GitAction {
     Merge,
     CiFix,
     ReviewFix,
+    ResolveAllComments,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -665,6 +666,16 @@ impl Tui {
         if summary.merged || !summary.state.eq_ignore_ascii_case("OPEN") {
             return false;
         }
+        if action == GitAction::ResolveAllComments {
+            return self.main_focused
+                && session.pr.trusted_details().is_ok_and(|details| {
+                    details.is_some_and(|details| {
+                        details.review_comments.iter().any(|comment| {
+                            !comment.resolved && !comment.thread_id.trim().is_empty()
+                        })
+                    })
+                });
+        }
         if matches!(action, GitAction::CiFix | GitAction::ReviewFix) {
             return context
                 .config
@@ -978,6 +989,15 @@ impl Tui {
                         && let Err(error) = self.start_ci_fix(&mut runtime)
                     {
                         self.show_error("CI failure prompt failed", &error)?;
+                    }
+                }
+                Key::ResolveAllComments => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.git_action_enabled(GitAction::ResolveAllComments)
+                        && let Err(error) = self.resolve_review_comments(&mut runtime)
+                    {
+                        self.show_error("resolve review comments failed", &error)?;
                     }
                 }
                 Key::Push => {
@@ -1340,6 +1360,7 @@ impl Tui {
             "P            worktrees: start or focus a plan run dashboard",
             "j/k          main comments: move comment selection; status dashboard: move plan output or phase selection",
             "A            worktrees: start/focus Auto Flow; choose prompt, plan file, or draft plan",
+            "Space g R    main comments: resolve all inline review conversations",
             "r            repos: reorder or remove repositories",
             "R            edit repositories/order/keys/remove in repos.toml",
             "C            repos: open a worktree for a remote pull request",
@@ -3474,6 +3495,7 @@ impl Tui {
                     self.git_choice(GitAction::Merge, "M", "merge"),
                     self.git_choice(GitAction::CiFix, "c", "CI repair"),
                     self.git_choice(GitAction::ReviewFix, "f", "review repair"),
+                    self.git_choice(GitAction::ResolveAllComments, "R", "resolve all comments"),
                 ],
             }),
             (None, _) => None,
@@ -3548,7 +3570,7 @@ mod tests {
         AutoImplementationSource, AutoRun, AutoRunMode, AutoRunStatus, PersistedAutoRun,
     };
     use crate::config::Config;
-    use crate::github::{PrCache, PrSummary};
+    use crate::github::{PrCache, PrDetails, PrReviewComment, PrSummary};
     use crate::plan_run::{
         PersistedPlanRun, PlanRun, PlanRunMode, PlanRunStatus, PlanStepRun, PlanStepStatus,
     };
@@ -3640,6 +3662,65 @@ mod tests {
         assert!(tui.git_action_enabled(GitAction::OpenPr));
         assert!(!tui.git_action_enabled(GitAction::Merge));
         assert!(!tui.git_action_enabled(GitAction::CiFix));
+    }
+
+    #[test]
+    fn review_resolution_action_requires_main_panel_and_unresolved_threads() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let mut tui = Tui::new_single(
+            repo,
+            test_config(),
+            vec![test_session(0, "/tmp/repo", "feature")],
+        );
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.sessions[0].pr = PrCache::observed(
+            test_pr_summary(false),
+            Some(PrDetails {
+                review_comments: vec![PrReviewComment {
+                    thread_id: "thread-1".to_string(),
+                    body: "inline".to_string(),
+                    resolved: false,
+                    ..PrReviewComment::default()
+                }],
+                ..PrDetails::default()
+            }),
+        );
+
+        assert!(!tui.git_action_enabled(GitAction::ResolveAllComments));
+
+        tui.focus_main();
+        assert!(tui.git_action_enabled(GitAction::ResolveAllComments));
+
+        tui.sessions[0].pr.mark_preserved_stale();
+        assert!(!tui.git_action_enabled(GitAction::ResolveAllComments));
+
+        tui.sessions[0].pr = PrCache::observed(
+            test_pr_summary(false),
+            Some(PrDetails {
+                review_comments: vec![PrReviewComment {
+                    thread_id: "  ".to_string(),
+                    resolved: false,
+                    ..PrReviewComment::default()
+                }],
+                ..PrDetails::default()
+            }),
+        );
+        assert!(!tui.git_action_enabled(GitAction::ResolveAllComments));
+
+        tui.sessions[0].pr = PrCache::observed(
+            test_pr_summary(false),
+            Some(PrDetails {
+                review_comments: vec![PrReviewComment {
+                    thread_id: "thread-1".to_string(),
+                    resolved: true,
+                    ..PrReviewComment::default()
+                }],
+                ..PrDetails::default()
+            }),
+        );
+        assert!(!tui.git_action_enabled(GitAction::ResolveAllComments));
     }
 
     #[test]

@@ -2,8 +2,7 @@ use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::stabilization_execute::{GuardedPushProgress, progress_pending_push};
 use crate::auto_flow::stabilization_model::{
-    PendingPushGuard, RepairKind, StabilizationBlocker, StabilizationState, StabilizationStatus,
-    StabilizationWorkKind,
+    PendingPushGuard, RepairKind, StabilizationBlocker, StabilizationWorkKind,
 };
 use crate::auto_flow::{AutoLaunch, AutoStepKey, load_auto_run, save_auto_run};
 use crate::config::Config;
@@ -19,10 +18,9 @@ use crate::tui::{
 
 use super::{
     apply_bulk_review_resolution, archived_picker_overflow_message, discover_wt_columns,
-    merge_authorization_needs_review_resolution, plan_run_mode_from_parallel_confirmation,
-    pr_target_choice_list, pr_target_repo_for_choice, remote_pr_choice_keys,
-    remote_pr_worktree_branch, run_browser_opener, should_prompt_pr_target_choice,
-    status_label_with_behind,
+    plan_run_mode_from_parallel_confirmation, pr_target_choice_list, pr_target_repo_for_choice,
+    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
+    should_prompt_pr_target_choice, status_label_with_behind, unresolved_review_thread_ids,
 };
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -84,16 +82,32 @@ fn confirmed_bulk_review_resolution_resolves_each_thread_once() {
 }
 
 #[test]
-fn review_feedback_merge_blocker_offers_thread_resolution() {
-    let authorization =
-        crate::auto_flow::stabilization_execute::MergeAuthorization::Blocked(StabilizationState {
-            status: StabilizationStatus::Blocked,
-            blocker: StabilizationBlocker::ReviewFeedbackFound,
-            next_work: StabilizationWorkKind::FixReview,
-            reason: "actionable review feedback is present".to_string(),
-        });
+fn review_resolution_uses_only_unresolved_threads_in_the_observed_details() {
+    let details = PrDetails {
+        review_comments: vec![
+            crate::github::PrReviewComment {
+                thread_id: "thread-2".to_string(),
+                resolved: false,
+                ..crate::github::PrReviewComment::default()
+            },
+            crate::github::PrReviewComment {
+                thread_id: "thread-1".to_string(),
+                resolved: false,
+                ..crate::github::PrReviewComment::default()
+            },
+            crate::github::PrReviewComment {
+                thread_id: "thread-2".to_string(),
+                resolved: true,
+                ..crate::github::PrReviewComment::default()
+            },
+        ],
+        ..PrDetails::default()
+    };
 
-    assert!(merge_authorization_needs_review_resolution(&authorization));
+    assert_eq!(
+        unresolved_review_thread_ids(&details),
+        vec!["thread-1", "thread-2"]
+    );
 }
 
 #[test]
@@ -1284,10 +1298,13 @@ exit 0
 
     tui.start_delete_session_for_test().unwrap();
     let wait_started = Instant::now();
-    while !tui.delete_sessions_in_flight.is_empty()
-        && wait_started.elapsed() < Duration::from_secs(3)
-    {
+    while !tui.delete_sessions_in_flight.is_empty() {
         tui.poll_delete_sessions();
+        assert!(
+            tui.delete_sessions_in_flight.is_empty()
+                || wait_started.elapsed() < Duration::from_secs(10),
+            "delete did not finish within 10 seconds"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
 
@@ -1397,6 +1414,8 @@ fn tmux_agent_warmup_does_not_block_startup() {
     let temp = unique_temp_dir("prism-tmux-warmup-test");
     fs::create_dir_all(&temp).unwrap();
     let state = temp.join("tmux-state");
+    let release = temp.join("tmux-release");
+    let timed_out = temp.join("tmux-timed-out");
     let tmux = temp.join("tmux");
     fs::write(
         &tmux,
@@ -1405,7 +1424,15 @@ fn tmux_agent_warmup_does_not_block_startup() {
 state="$(cat '{}' 2>/dev/null || echo missing)"
 case "$1" in
   has-session)
-sleep 1
+attempts=0
+while [ ! -f '{}' ]; do
+  attempts=$((attempts + 1))
+  if [ "$attempts" -ge 100 ]; then
+    touch '{}'
+    break
+  fi
+  sleep 0.01
+done
 [ "$state" = exists ]
 exit $?
 ;;
@@ -1424,6 +1451,8 @@ esac
 exit 0
 "#,
             state.display(),
+            release.display(),
+            timed_out.display(),
             state.display()
         ),
     )
@@ -1447,20 +1476,20 @@ exit 0
     let session = test_session(temp.join("worktree"), "feature");
     let mut tui = Tui::new_single(repo, config, vec![session]);
 
-    let started = Instant::now();
     tui.start_tmux_agent_warmup();
 
-    assert!(
-        started.elapsed() < Duration::from_millis(250),
-        "tmux warm-up blocked startup for {:?}",
-        started.elapsed()
-    );
+    assert!(!timed_out.exists(), "tmux warm-up blocked startup");
     assert_eq!(tui.tmux_warmups_in_flight.len(), 1);
+    fs::write(&release, "continue").unwrap();
 
     let wait_started = Instant::now();
-    while !tui.tmux_warmups_in_flight.is_empty() && wait_started.elapsed() < Duration::from_secs(3)
-    {
+    while !tui.tmux_warmups_in_flight.is_empty() {
         tui.poll_tmux_agent_warmup();
+        assert!(
+            tui.tmux_warmups_in_flight.is_empty()
+                || wait_started.elapsed() < Duration::from_secs(10),
+            "tmux warm-up did not finish within 10 seconds"
+        );
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(tui.tmux_warmups_in_flight.is_empty());

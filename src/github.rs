@@ -2251,16 +2251,23 @@ fn fetch_inline_review_comments(
             .arg(format!("number={pr_number}"))
             .arg("-f")
             .arg(format!("query={PR_REVIEW_THREADS_QUERY}"))
+            .arg("--paginate")
+            .arg("--slurp")
             .current_dir(path),
     )?;
     try_parse_review_thread_comments(&raw)
 }
 
 const PR_REVIEW_THREADS_QUERY: &str = r#"
-query($owner: String!, $name: String!, $number: Int!) {
+query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      reviewThreads(first: 100) {
+      reviewThreads(first: 100, after: $endCursor) {
+        totalCount
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
         nodes {
           id
           isResolved
@@ -2391,20 +2398,37 @@ fn parse_review_thread_comments(raw: &str) -> Vec<PrReviewComment> {
 fn try_parse_review_thread_comments(raw: &str) -> Result<Vec<PrReviewComment>, String> {
     let value = serde_json::from_str::<serde_json::Value>(raw)
         .map_err(|error| format!("parse GitHub review threads: {error}"))?;
-    if !value
-        .pointer("/data/repository/pullRequest/reviewThreads/nodes")
-        .is_some_and(serde_json::Value::is_array)
-    {
-        return Err("parse GitHub review threads: missing review thread connection".to_string());
+    let pages = match value {
+        serde_json::Value::Array(pages) => pages,
+        page => vec![page],
+    };
+    let mut review_threads = Vec::new();
+    let mut total_count = 0;
+    for page in pages {
+        if !page
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+            .is_some_and(serde_json::Value::is_array)
+        {
+            return Err(
+                "parse GitHub review threads: missing review thread connection".to_string(),
+            );
+        }
+        let response = serde_json::from_value::<GithubPrSummaryIndexResponse>(page)
+            .map_err(|error| format!("parse GitHub review threads: {error}"))?;
+        let page_threads = response.data.repository.pull_request.review_threads;
+        total_count = total_count.max(page_threads.total_count);
+        review_threads.extend(page_threads.nodes);
     }
-    let response = serde_json::from_value::<GithubPrSummaryIndexResponse>(value)
-        .map_err(|error| format!("parse GitHub review threads: {error}"))?;
+    if total_count > review_threads.len() as u64 {
+        return Err(format!(
+            "GitHub returned only {} of {} review threads",
+            review_threads.len(),
+            total_count
+        ));
+    }
     let mut comments = Vec::new();
-    for thread in response.data.repository.pull_request.review_threads.nodes {
+    for thread in review_threads {
         for object in thread.comments.nodes {
-            if comments.len() >= 100 {
-                return Ok(comments);
-            }
             let comment = PrReviewComment {
                 thread_id: thread.id.clone(),
                 id: object.id,
@@ -4610,6 +4634,65 @@ exit 0
         assert_eq!(comments[1].path, "src/lib.rs");
         assert_eq!(comments[1].line, "20");
         assert!(!comments[1].resolved);
+    }
+
+    #[test]
+    fn rejects_truncated_review_threads() {
+        let raw = r#"{
+          "data": {
+            "repository": {
+              "pullRequest": {
+                "reviewThreads": {
+                  "totalCount": 2,
+                  "nodes": [
+                    {
+                      "id": "PRRT_kw123",
+                      "isResolved": false,
+                      "comments": {"nodes": []}
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }"#;
+
+        assert_eq!(
+            try_parse_review_thread_comments(raw).unwrap_err(),
+            "GitHub returned only 1 of 2 review threads"
+        );
+    }
+
+    #[test]
+    fn combines_paginated_review_threads() {
+        let raw = r#"[
+          {
+            "data": {"repository": {"pullRequest": {"reviewThreads": {
+              "totalCount": 2,
+              "nodes": [{
+                "id": "PRRT_1",
+                "isResolved": false,
+                "comments": {"nodes": [{"id": "C1", "body": "one"}]}
+              }]
+            }}}}
+          },
+          {
+            "data": {"repository": {"pullRequest": {"reviewThreads": {
+              "totalCount": 2,
+              "nodes": [{
+                "id": "PRRT_2",
+                "isResolved": false,
+                "comments": {"nodes": [{"id": "C2", "body": "two"}]}
+              }]
+            }}}}
+          }
+        ]"#;
+
+        let comments = try_parse_review_thread_comments(raw).unwrap();
+
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0].thread_id, "PRRT_1");
+        assert_eq!(comments[1].thread_id, "PRRT_2");
     }
 
     #[test]
