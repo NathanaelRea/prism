@@ -1,10 +1,13 @@
 use std::{io, time::Duration};
 
 use crossterm::{
-    cursor::{Hide, Show},
+    cursor::{Hide, MoveTo, Show},
     event::{self, EnableMouseCapture, Event, KeyEvent, MouseEvent},
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+        enable_raw_mode,
+    },
 };
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 
@@ -112,6 +115,8 @@ impl TerminalRuntime {
             io::stdout(),
             crossterm::event::DisableMouseCapture,
             LeaveAlternateScreen,
+            Clear(ClearType::All),
+            MoveTo(0, 0),
             Show
         )
         .map_err(|error| error.to_string())?;

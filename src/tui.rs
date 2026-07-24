@@ -66,6 +66,7 @@ pub struct Tui {
     pub(crate) tmux_portal_polls_in_flight: BTreeMap<AgentSessionWarmupKey, Instant>,
     pub(crate) tmux_portal_last_polled: BTreeMap<AgentSessionWarmupKey, Instant>,
     pub(crate) tmux_portal: Option<TmuxPortalSnapshot>,
+    pub(crate) tmux_portal_size: Option<(u16, u16)>,
     pub(crate) wt_poll_tx: Sender<WtPollResult>,
     pub(crate) wt_poll_rx: Receiver<WtPollResult>,
     pub(crate) default_branch_poll_tx: Sender<DefaultBranchPollResult>,
@@ -134,19 +135,26 @@ pub(crate) struct SelectedWorktreeContext {
 pub(crate) struct TmuxPortalResult {
     pub key: AgentSessionWarmupKey,
     pub started_at: Instant,
-    pub capture: Result<String, String>,
+    pub capture: Result<Vec<Line<'static>>, String>,
 }
 
 pub(crate) struct TmuxPortalTarget {
     pub key: AgentSessionWarmupKey,
     pub repo: Repository,
     pub config: Config,
+    pub size: (u16, u16),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TmuxPortalSnapshot {
     pub key: AgentSessionWarmupKey,
-    pub capture: Option<Result<Vec<Line<'static>>, String>>,
+    pub capture: Option<TmuxPortalCapture>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TmuxPortalCapture {
+    pub key: AgentSessionWarmupKey,
+    pub result: Result<Vec<Line<'static>>, String>,
 }
 
 impl ManagedRepo {
@@ -542,6 +550,7 @@ impl Tui {
             tmux_portal_polls_in_flight: BTreeMap::new(),
             tmux_portal_last_polled: BTreeMap::new(),
             tmux_portal: None,
+            tmux_portal_size: None,
             wt_poll_tx,
             wt_poll_rx,
             default_branch_poll_tx,
@@ -1199,6 +1208,11 @@ impl Tui {
     ) -> Result<(), String> {
         self.prepare_worktree_harness_for_open(runtime, index)?;
         let navigation = self.navigation_snapshot();
+        let terminal_area = runtime.area()?;
+        self.prepare_tmux_session_for_attach(
+            index,
+            (terminal_area.width, terminal_area.height.saturating_sub(1)),
+        )?;
         runtime.suspend()?;
         let result = self.attach_tmux_session_for_index(index);
         let resume_result = runtime.resume();
@@ -2464,7 +2478,9 @@ impl Tui {
         false
     }
 
-    pub(crate) fn draw(&self, runtime: &mut TerminalRuntime) -> Result<(), String> {
+    pub(crate) fn draw(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
+        self.tmux_portal_size =
+            view::tmux_portal_size(runtime.area()?, self.config.layout.sidebar_width);
         let model = self.frame_model();
         runtime.draw(&model)
     }
@@ -3049,19 +3065,26 @@ impl Tui {
         let managed = self.repos.get(session.repo_index)?;
         let slot = AgentSessionSlot::for_repository_session(&managed.identity, session);
         let generation = self.tmux_generations.get(&slot)?;
-        let portal = self
+        let current_key = AgentSessionWarmupKey::new(slot, *generation);
+        let capture = self
             .tmux_portal
             .as_ref()
-            .filter(|portal| portal.key.slot == slot && portal.key.generation == *generation);
-        let state = match portal.and_then(|portal| portal.capture.as_ref()) {
-            None => view::TmuxPortalState::Loading,
-            Some(Ok(lines)) => view::TmuxPortalState::Ready(lines),
-            Some(Err(_)) => view::TmuxPortalState::Unavailable,
+            .and_then(|portal| portal.capture.as_ref());
+        let (branch, state) = match capture {
+            Some(capture) if capture.key == current_key => match &capture.result {
+                Ok(lines) => (&session.branch, view::TmuxPortalState::Ready(lines)),
+                Err(_) => (&session.branch, view::TmuxPortalState::Unavailable),
+            },
+            Some(capture) => match &capture.result {
+                Ok(lines) => (
+                    &capture.key.slot.branch,
+                    view::TmuxPortalState::Ready(lines),
+                ),
+                Err(_) => (&session.branch, view::TmuxPortalState::Loading),
+            },
+            None => (&session.branch, view::TmuxPortalState::Loading),
         };
-        Some(view::TmuxPortalModel {
-            branch: &session.branch,
-            state,
-        })
+        Some(view::TmuxPortalModel { branch, state })
     }
 
     fn repo_health_label(&self, repo_index: usize) -> String {
@@ -3397,6 +3420,8 @@ mod tests {
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use ratatui::text::Line;
+
     use crate::agent::AgentState;
     use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey};
     use crate::auto_flow::{
@@ -3412,9 +3437,9 @@ mod tests {
     use crate::view::{ChoiceList, KeyChoice, OrderedToggleItem, RepoMainView, WorktreeMainView};
 
     use super::{
-        GitAction, ManagedRepo, OpenTmuxSessionTarget, PanelFocus, PrPollKey, TmuxPortalResult,
-        Tui, WorktreeListMode, confirmation_result, move_enabled_ordered_item,
-        selectable_choice_key, toggle_ordered_item,
+        GitAction, ManagedRepo, OpenTmuxSessionTarget, PanelFocus, PrPollKey, TmuxPortalCapture,
+        TmuxPortalResult, TmuxPortalSnapshot, Tui, WorktreeListMode, confirmation_result,
+        move_enabled_ordered_item, selectable_choice_key, toggle_ordered_item,
     };
 
     #[test]
@@ -3494,6 +3519,7 @@ mod tests {
             vec![test_session(0, "/tmp/repo", "feature")],
         );
         tui.focused_panel = PanelFocus::Worktrees;
+        tui.tmux_portal_size = Some((72, 18));
         let slot =
             AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
         let stale_key = AgentSessionWarmupKey::new(slot.clone(), 0);
@@ -3505,7 +3531,7 @@ mod tests {
             .send(TmuxPortalResult {
                 key: stale_key,
                 started_at: Instant::now(),
-                capture: Ok("stale output".to_string()),
+                capture: Ok(vec![Line::from("stale output")]),
             })
             .unwrap();
 
@@ -3519,6 +3545,84 @@ mod tests {
                 .as_ref()
                 .and_then(|portal| portal.capture.as_ref()),
             None,
+        );
+    }
+
+    #[test]
+    fn tmux_portal_starts_capture_immediately_after_selection() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let mut tui = Tui::new_single(
+            repo,
+            test_config(),
+            vec![test_session(0, "/tmp/repo", "feature")],
+        );
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.tmux_portal_size = Some((72, 18));
+        let slot =
+            AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
+        tui.tmux_generations.insert(slot, 0);
+
+        assert!(tui.poll_tmux_portal());
+        assert!(
+            !tui.tmux_portal_polls_in_flight.is_empty(),
+            "selecting a worktree should immediately start an asynchronous tmux capture"
+        );
+    }
+
+    #[test]
+    fn tmux_portal_keeps_previous_capture_while_new_selection_loads() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let mut tui = Tui::new_single(
+            repo,
+            test_config(),
+            vec![
+                test_session(0, "/tmp/repo-a", "feature-a"),
+                test_session(0, "/tmp/repo-b", "feature-b"),
+            ],
+        );
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.tmux_portal_size = Some((72, 18));
+        let previous_slot =
+            AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
+        let selected_slot =
+            AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[1]);
+        tui.tmux_generations.insert(previous_slot.clone(), 0);
+        tui.tmux_generations.insert(selected_slot.clone(), 0);
+        tui.tmux_portal = Some(TmuxPortalSnapshot {
+            key: AgentSessionWarmupKey::new(previous_slot.clone(), 0),
+            capture: Some(TmuxPortalCapture {
+                key: AgentSessionWarmupKey::new(previous_slot, 0),
+                result: Ok(vec![Line::from("previous capture")]),
+            }),
+        });
+        tui.select_worktree(1);
+
+        let model = tui.tmux_portal_model().expect("tmux portal model");
+        let crate::view::TmuxPortalState::Ready(lines) = model.state else {
+            panic!("previous capture should survive the selection redraw");
+        };
+        assert_eq!(model.branch, "feature-a");
+        assert_eq!(lines, &[Line::from("previous capture")]);
+
+        assert!(tui.poll_tmux_portal());
+        assert_eq!(
+            tui.tmux_portal.as_ref().map(|portal| &portal.key.slot),
+            Some(&selected_slot)
+        );
+        assert_eq!(
+            tui.tmux_portal
+                .as_ref()
+                .and_then(|portal| portal.capture.as_ref())
+                .and_then(|capture| capture.result.as_ref().ok()),
+            Some(&vec![Line::from("previous capture")])
+        );
+        assert!(
+            tui.tmux_portal_polls_in_flight
+                .contains_key(&AgentSessionWarmupKey::new(selected_slot, 0))
         );
     }
 
@@ -3552,6 +3656,7 @@ mod tests {
             vec![test_session(0, "/tmp/repo", "feature")],
         );
         tui.focused_panel = PanelFocus::Worktrees;
+        tui.tmux_portal_size = Some((72, 18));
         let slot =
             AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
         let key = AgentSessionWarmupKey::new(slot.clone(), 0);
@@ -3566,7 +3671,7 @@ mod tests {
             .send(TmuxPortalResult {
                 key: key.clone(),
                 started_at: previous_started_at,
-                capture: Ok("superseded output".to_string()),
+                capture: Ok(vec![Line::from("superseded output")]),
             })
             .unwrap();
 
