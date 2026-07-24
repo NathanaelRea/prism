@@ -75,6 +75,10 @@ fn renders_tmux_portal_with_latest_pane_rows() {
     assert_region_contains(&buffer, 56..120, 0..29, "tmux · feature");
     assert_region_contains(&buffer, 56..120, 0..29, "pane row 19");
     assert!(!region_text(&buffer, 56..120, 0..29).contains("pane row 0"));
+    assert_eq!(
+        find_line(&buffer, "[3] Worktrees"),
+        find_line(&buffer, "tmux · feature")
+    );
 }
 
 #[test]

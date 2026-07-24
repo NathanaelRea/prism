@@ -30,6 +30,45 @@ unsupported() {
   exit 64
 }
 
+render_session() {
+  local cols
+  local lines
+  cols="$(tput cols 2>/dev/null || printf '80')"
+  lines="$(tput lines 2>/dev/null || printf '24')"
+  ((cols < 40)) && cols=40
+  ((lines < 12)) && lines=12
+  local content_width=$((cols - 4))
+  local content_row=$((lines - 17))
+  ((content_row < 1)) && content_row=1
+  local accent='\033[38;2;240;93;94m'
+  local bright='\033[38;2;241;236;236m'
+  local muted='\033[38;2;137;132;132m'
+  local green='\033[38;2;151;215;151m'
+  local background='\033[48;2;12;12;12m'
+  local panel='\033[48;2;42;42;42m'
+  local reset="\033[0m${background}"
+
+  printf "${background}\033[2J\033[H"
+  printf '\033[%d;1H' "$content_row"
+  printf " ${panel}${bright} %-*.*s ${reset}\n\n" "$content_width" "$content_width" \
+    "Review the comments on PR 17 and fix if applicable"
+  printf "${accent}  + Thought: Checking the review feedback against the checkout tests${reset}\n\n"
+  printf "${bright}  I found the review comment and the failing CI fixture.${reset}\n"
+  printf "${muted}  >${reset}${bright} Bash${reset}${muted}  npm test -- --run checkout${reset}\n"
+  printf "${muted}    ${reset}${green}completed${reset}${muted}  12 tests passed${reset}\n\n"
+  printf "${muted}  Updating the guard keeps successful checkouts unchanged.${reset}\n\n"
+  printf "${bright}\033[1m  Tasks${reset}${muted}  1 of 3 complete${reset}\n"
+  printf "${green}  [x]${reset}${bright} inspect review thread${reset}\n"
+  printf "${accent}  [~]${reset}${bright} patch checkout guard${reset}\n"
+  printf "${muted}  [ ] rerun smoke check${reset}"
+  printf '\033[%d;1H' "$((lines - 2))"
+  printf "${accent}|${panel}${bright} %-*.*s ${reset}\n" "$content_width" "$content_width" \
+    ""
+  printf "${accent}|${panel} %-*.*s ${reset}\n" "$content_width" "$content_width" \
+    "Build  .  GPT-5.6 Sol  OpenAI"
+  printf "${muted}  tab agents   ctrl+p commands${reset}"
+}
+
 if [[ "${1:-}" == "--version" ]]; then
   printf 'opencode 0.0.0-prism-demo\n'
   exit 0
@@ -37,13 +76,7 @@ fi
 
 case "${1:-}" in
   "")
-    printf '\033[2J\033[H'
-    printf 'OpenCode Demo Session\n'
-    printf 'Mode: interactive fallback\n\n'
-    printf 'assistant: I am ready for a follow-up prompt in this worktree.\n'
-    printf 'tool: bash idle\n'
-    printf 'todo:\n  [x] load worktree context\n  [ ] wait for prompt\n\n'
-    printf '> '
+    render_session
     while true; do sleep 60; done
     ;;
   serve)
@@ -187,13 +220,7 @@ PY
   attach)
     url="${2:-}"
     [[ -n "$url" ]] || unsupported attach
-    printf '\033[2J\033[H'
-    printf 'OpenCode Demo Session\n'
-    printf 'Server: %s\n\n' "$url"
-    printf 'assistant: I found the review comment and failing CI fixture.\n'
-    printf 'tool: bash running `npm test -- --run checkout`\n'
-    printf 'todo:\n  [x] inspect review thread\n  [~] patch checkout guard\n  [ ] rerun smoke check\n\n'
-    printf '> '
+    render_session
     while true; do sleep 60; done
     ;;
   run)

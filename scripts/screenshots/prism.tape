@@ -4,8 +4,8 @@ Set Shell "bash"
 Set Theme "Catppuccin Mocha"
 Set FontFamily "JetBrainsMono Nerd Font"
 Set FontSize 18
-Set Width 1200
-Set Height 760
+Set Width 1600
+Set Height 1140
 Set CursorBlink false
 Set TypingSpeed 1ms
 
