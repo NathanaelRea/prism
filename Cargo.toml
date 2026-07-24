@@ -3,6 +3,13 @@ name = "prism"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
+description = "A terminal board for agent-backed coding sessions across Git worktrees"
+license = "MIT"
+repository = "https://github.com/NathanaelRea/prism"
+readme = "README.md"
+keywords = ["cli", "git", "terminal", "tmux", "worktree"]
+categories = ["command-line-utilities", "development-tools"]
+publish = false
 
 [dependencies]
 ansi-to-tui = { version = "8.0.1", default-features = false }
