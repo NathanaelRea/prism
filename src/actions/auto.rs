@@ -98,11 +98,8 @@ impl Tui {
                 )
             }
             AutoStartupSource::ExistingPlan => {
-                raw.suspend()?;
-                let selected = select_plan_path(&session_path, &context.config);
-                let resume_result = raw.resume();
-                resume_result?;
-                let plan_path = selected?;
+                let plan_path =
+                    raw.suspend_for(|| select_plan_path(&session_path, &context.config))?;
                 validate_existing_auto_plan(&plan_path)?;
                 let Some(plan_run_mode) = self.prompt_auto_plan_run_mode(raw)? else {
                     return Ok(());

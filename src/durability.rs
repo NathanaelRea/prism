@@ -16,7 +16,10 @@ pub(crate) fn full_sync(file: &File) -> io::Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 pub(crate) fn full_sync(_file: &File) -> io::Result<()> {
-    Ok(())
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "F_FULLFSYNC is only available on macOS",
+    ))
 }
 
 #[cfg(unix)]
@@ -26,5 +29,8 @@ pub(crate) fn sync_directory(path: &Path) -> io::Result<()> {
 
 #[cfg(not(unix))]
 pub(crate) fn sync_directory(_path: &Path) -> io::Result<()> {
-    Ok(())
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "directory sync is not supported on this platform",
+    ))
 }

@@ -13,7 +13,7 @@ use crate::plan_run::PlanRunMode;
 use crate::repo::Repository;
 use crate::tui::ManagedRepo;
 use crate::{agent_session, config, plan, session, setup, tui, ui_state, workspace};
-use std::process::{Command as ProcessCommand, Stdio};
+use std::process::Command as ProcessCommand;
 
 pub fn run() -> Result<(), String> {
     let args = Args::parse(std::env::args_os().skip(1))?;
@@ -730,28 +730,16 @@ fn run_db_command(command: DbCommand, repo: &Repository) -> Result<(), String> {
 
 fn open_interactive_db(repo: &Repository) -> Result<(), String> {
     observability::with_writable_db(repo, |_| Ok(()))?;
+    if !crate::process::command_exists("sqlite3") {
+        return Err("sqlite3 not found; install sqlite3".to_string());
+    }
 
     let path = observability::db_path(repo);
-    let status = ProcessCommand::new("sqlite3")
-        .args(["-cmd", ".timeout 5000"])
-        .args(["-cmd", "PRAGMA foreign_keys=ON;"])
-        .args(["-cmd", "PRAGMA synchronous=FULL;"])
-        .arg(&path)
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status()
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                "sqlite3 not found; install sqlite3".to_string()
-            } else {
-                format!("launch sqlite3 for {}: {error}", path.display())
-            }
-        })?;
-
-    if status.success() {
-        Ok(())
-    } else {
-        Err(format!("sqlite3 exited with status {status}"))
-    }
+    crate::process::run_status_inherited(
+        ProcessCommand::new("sqlite3")
+            .args(["-cmd", ".timeout 5000"])
+            .args(["-cmd", "PRAGMA foreign_keys=ON;"])
+            .args(["-cmd", "PRAGMA synchronous=FULL;"])
+            .arg(&path),
+    )
 }

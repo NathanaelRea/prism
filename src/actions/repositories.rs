@@ -258,16 +258,11 @@ impl Tui {
         ensure_repo_config_file(&context.config.repo_config_path, false)?;
         let editor =
             editor_command().ok_or_else(|| "no editor found; set VISUAL or EDITOR".to_string())?;
-        raw.suspend()?;
-        let result = Command::new(&editor)
-            .arg(&context.config.repo_config_path)
-            .status();
-        let resume_result = raw.resume();
-        resume_result?;
-        let status = result.map_err(|error| format!("{editor}: {error}"))?;
-        if !status.success() {
-            return Err(format!("{editor} exited with {status}"));
-        }
+        raw.suspend_for(|| {
+            crate::process::run_status_inherited(
+                Command::new(&editor).arg(&context.config.repo_config_path),
+            )
+        })?;
         let config = crate::config::Config::load(&context.repo);
         if !config.config_errors.is_empty() {
             return Err(config.config_errors.join("\n"));
@@ -295,14 +290,7 @@ impl Tui {
         ensure_user_config_file(&path)?;
         let editor =
             editor_command().ok_or_else(|| "no editor found; set VISUAL or EDITOR".to_string())?;
-        raw.suspend()?;
-        let result = Command::new(&editor).arg(&path).status();
-        let resume_result = raw.resume();
-        resume_result?;
-        let status = result.map_err(|error| format!("{editor}: {error}"))?;
-        if !status.success() {
-            return Err(format!("{editor} exited with {status}"));
-        }
+        raw.suspend_for(|| crate::process::run_status_inherited(Command::new(&editor).arg(&path)))?;
         let configs = self
             .repos
             .iter()
@@ -411,14 +399,7 @@ impl Tui {
         }
         let editor =
             editor_command().ok_or_else(|| "no editor found; set VISUAL or EDITOR".to_string())?;
-        raw.suspend()?;
-        let result = Command::new(&editor).arg(&path).status();
-        let resume_result = raw.resume();
-        resume_result?;
-        let status = result.map_err(|error| format!("{editor}: {error}"))?;
-        if !status.success() {
-            return Err(format!("{editor} exited with {status}"));
-        }
+        raw.suspend_for(|| crate::process::run_status_inherited(Command::new(&editor).arg(&path)))?;
         let entries = crate::workspace::load_entries()?;
         if entries.is_empty() {
             return Err("repository list is empty; add at least one [[repos]] block".to_string());

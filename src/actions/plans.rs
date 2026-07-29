@@ -50,11 +50,7 @@ impl Tui {
                 config.default_harness
             ));
         }
-        raw.suspend()?;
-        let execution = PlanExecution::prepare(&scope_path, &config, None);
-        let resume_result = raw.resume();
-        resume_result?;
-        let execution = execution?;
+        let execution = raw.suspend_for(|| PlanExecution::prepare(&scope_path, &config, None))?;
         let parallel = self.confirm_action_dialog(
             raw,
             "Plan Run: Execution",
@@ -188,18 +184,17 @@ impl Tui {
                 &mut self.tmux_generations,
                 use_.slot,
             );
-            raw.suspend()?;
-            let result = crate::tmux::attach_resumable_harness_session(
-                &repo,
-                &run_config,
-                &session,
-                generation,
-                &session_id,
-            );
-            let resume_result = raw.resume();
+            let result = raw.suspend_for(|| {
+                crate::tmux::attach_resumable_harness_session(
+                    &repo,
+                    &run_config,
+                    &session,
+                    generation,
+                    &session_id,
+                )
+            });
             self.refresh_sessions_after_tmux()?;
             self.start_tmux_agent_warmup();
-            resume_result?;
             result?;
             return Ok(true);
         }
@@ -259,16 +254,15 @@ impl Tui {
             runtime.updated_unix_ms = crate::auto_flow::unix_ms();
             crate::opencode::save_runtime(&repo, &runtime)?;
         }
-        raw.suspend()?;
-        let result = self.attach_tmux_window_for_session_index(
-            session_index,
-            TmuxWindow::Agent,
-            changed_attach_target,
-        );
-        let resume_result = raw.resume();
+        let result = raw.suspend_for(|| {
+            self.attach_tmux_window_for_session_index(
+                session_index,
+                TmuxWindow::Agent,
+                changed_attach_target,
+            )
+        });
         self.refresh_sessions_after_tmux()?;
         self.start_tmux_agent_warmup();
-        resume_result?;
         result?;
         Ok(true)
     }

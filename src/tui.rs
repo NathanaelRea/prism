@@ -32,7 +32,7 @@ use crate::tui_jobs::{
     latest_channel,
 };
 use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
-use crate::tui_signal::SigtermNotification;
+use crate::tui_signal::{ShutdownNotification, ShutdownSignal};
 use crate::util::status_count;
 use crate::view;
 
@@ -430,6 +430,7 @@ pub(crate) enum TuiJobKey {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ShutdownReason {
     UserQuit,
+    Sigint,
     Sigterm,
     RunError,
     Panic,
@@ -439,6 +440,7 @@ impl ShutdownReason {
     const fn label(self) -> &'static str {
         match self {
             Self::UserQuit => "user_quit",
+            Self::Sigint => "sigint",
             Self::Sigterm => "sigterm",
             Self::RunError => "run_error",
             Self::Panic => "panic",
@@ -587,8 +589,11 @@ fn plain_key(event: KeyEvent) -> bool {
         .is_empty()
 }
 
-fn tui_loop_should_exit(sigterm: &SigtermNotification) -> bool {
-    sigterm.requested()
+fn requested_shutdown(notification: &ShutdownNotification) -> Option<ShutdownReason> {
+    match notification.signal()? {
+        ShutdownSignal::Sigint => Some(ShutdownReason::Sigint),
+        ShutdownSignal::Sigterm => Some(ShutdownReason::Sigterm),
+    }
 }
 
 fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
@@ -918,22 +923,27 @@ impl Tui {
             return Err("TUI requires an interactive terminal".to_string());
         }
 
-        let sigterm = SigtermNotification::install()?;
+        let shutdown = ShutdownNotification::install()?;
         let mut runtime = TerminalRuntime::enter()?;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            self.run_inner(&mut runtime, &sigterm)
+            crate::process::with_cancellation(shutdown.cancellation(), || {
+                self.run_inner(&mut runtime, &shutdown)
+            })
         }));
-        self.finish_run(outcome)
+        self.finish_run(outcome, shutdown.signal())
     }
 
     fn finish_run(
         &mut self,
         outcome: std::thread::Result<Result<ShutdownReason, String>>,
+        signal: Option<ShutdownSignal>,
     ) -> Result<(), String> {
         let shutdown_reason = match &outcome {
+            Err(_) => ShutdownReason::Panic,
+            _ if signal == Some(ShutdownSignal::Sigint) => ShutdownReason::Sigint,
+            _ if signal == Some(ShutdownSignal::Sigterm) => ShutdownReason::Sigterm,
             Ok(Ok(reason)) => *reason,
             Ok(Err(_)) => ShutdownReason::RunError,
-            Err(_) => ShutdownReason::Panic,
         };
         let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.cleanup_tui_jobs(shutdown_reason)
@@ -945,6 +955,7 @@ impl Tui {
             ))
         });
         match outcome {
+            Ok(_) if signal.is_some() => cleanup,
             Ok(Ok(_)) => cleanup,
             Ok(Err(error)) => {
                 if let Err(cleanup_error) = cleanup {
@@ -964,7 +975,7 @@ impl Tui {
     fn run_inner(
         &mut self,
         runtime: &mut TerminalRuntime,
-        sigterm: &SigtermNotification,
+        shutdown: &ShutdownNotification,
     ) -> Result<ShutdownReason, String> {
         crate::worker::ensure_running()?;
         self.offer_interrupted_run_recovery(runtime)?;
@@ -987,8 +998,8 @@ impl Tui {
         let mut key_input = KeyInput::default();
         let mut pending_g = false;
         let shutdown_reason = loop {
-            if tui_loop_should_exit(sigterm) {
-                break ShutdownReason::Sigterm;
+            if let Some(reason) = requested_shutdown(shutdown) {
+                break reason;
             }
             if self.tick_tui_action_jobs().any() {
                 self.draw(runtime)?;
@@ -2032,13 +2043,10 @@ impl Tui {
             index,
             (terminal_area.width, terminal_area.height.saturating_sub(1)),
         )?;
-        runtime.suspend()?;
-        let result = self.attach_tmux_session_for_index(index);
-        let resume_result = runtime.resume();
+        let result = runtime.suspend_for(|| self.attach_tmux_session_for_index(index));
         self.refresh_sessions_after_tmux()?;
         self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();
-        resume_result?;
         if let Err(error) = result {
             self.show_error("tmux session failed", &error)?;
         }
@@ -2156,13 +2164,10 @@ impl Tui {
             return Ok(());
         }
         let navigation = self.navigation_snapshot();
-        runtime.suspend()?;
-        let result = self.attach_selected_tmux_window(window);
-        let resume_result = runtime.resume();
+        let result = runtime.suspend_for(|| self.attach_selected_tmux_window(window));
         self.refresh_sessions_after_tmux()?;
         self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();
-        resume_result?;
         result
     }
 
@@ -4472,13 +4477,16 @@ mod tests {
     }
 
     #[test]
-    fn sigterm_notification_requests_the_run_loop_exit_path() {
-        let notification = crate::tui_signal::SigtermNotification::for_test();
-        assert!(!super::tui_loop_should_exit(&notification));
+    fn shutdown_notification_requests_the_matching_run_loop_exit_path() {
+        let notification = crate::tui_signal::ShutdownNotification::for_test();
+        assert_eq!(super::requested_shutdown(&notification), None);
 
-        notification.request_for_test();
+        notification.request_for_test(crate::tui_signal::ShutdownSignal::Sigterm);
 
-        assert!(super::tui_loop_should_exit(&notification));
+        assert_eq!(
+            super::requested_shutdown(&notification),
+            Some(super::ShutdownReason::Sigterm)
+        );
     }
 
     #[test]
@@ -4915,7 +4923,7 @@ mod tests {
         let (mut tui, stopped_rx) = tui_with_active_listener("run-error");
 
         let error = tui
-            .finish_run(Ok(Err("injected draw error".to_string())))
+            .finish_run(Ok(Err("injected draw error".to_string())), None)
             .unwrap_err();
 
         assert_eq!(error, "injected draw error");
@@ -4927,15 +4935,18 @@ mod tests {
     #[test]
     fn sigterm_exit_path_cleans_up_active_listener() {
         let (mut tui, stopped_rx) = tui_with_active_listener("sigterm");
-        let notification = crate::tui_signal::SigtermNotification::for_test();
-        notification.request_for_test();
-        let reason = if super::tui_loop_should_exit(&notification) {
-            super::ShutdownReason::Sigterm
-        } else {
-            panic!("SIGTERM notification was not observed")
-        };
+        let notification = crate::tui_signal::ShutdownNotification::for_test();
+        notification.request_for_test(crate::tui_signal::ShutdownSignal::Sigterm);
+        assert_eq!(
+            super::requested_shutdown(&notification),
+            Some(super::ShutdownReason::Sigterm)
+        );
 
-        tui.finish_run(Ok(Ok(reason))).unwrap();
+        tui.finish_run(
+            Ok(Err("interactive subprocess canceled".to_string())),
+            notification.signal(),
+        )
+        .unwrap();
 
         stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(!tui.jobs.has_jobs());

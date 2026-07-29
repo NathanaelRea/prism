@@ -345,7 +345,9 @@ fn write_marker(
         writeln!(marker, "started_unix_ms={}", now_ms())?;
     }
     marker.sync_all()?;
-    crate::durability::full_sync(marker)
+    #[cfg(target_os = "macos")]
+    crate::durability::full_sync(marker)?;
+    Ok(())
 }
 
 fn finish_database_row(run: &ActiveRun, status: &str, error: Option<&str>) -> Result<(), String> {

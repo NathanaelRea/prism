@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use crate::config::Config;
 #[cfg(test)]
@@ -423,27 +423,15 @@ fn choose_with_fzf(config: &Config, files: &[PathBuf]) -> Result<PathBuf, String
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";
-    let mut child = Command::new(config.tool("fzf"))
-        .arg("--prompt")
-        .arg("Plan file> ")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("fzf: {error}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(input.as_bytes())
-            .map_err(|error| format!("write fzf input: {error}"))?;
-    } else {
-        return Err("open fzf stdin".to_string());
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("wait for fzf: {error}"))?;
-    if !output.status.success() {
-        return Err("no plan file selected".to_string());
-    }
-    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let output = crate::process::run_capture_interactive(
+        Command::new(config.tool("fzf"))
+            .arg("--prompt")
+            .arg("Plan file> "),
+        input.as_bytes(),
+        64 * 1024,
+    )
+    .map_err(|_| "no plan file selected".to_string())?;
+    let selected = output.trim().to_string();
     if selected.is_empty() {
         return Err("no plan file selected".to_string());
     }

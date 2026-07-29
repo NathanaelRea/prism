@@ -1106,9 +1106,63 @@ pub fn terminate_active_child(
     }
 }
 
-// This is the explicit interactive exception: the child owns the inherited terminal and
-// remains unbounded so the user can control its lifetime.
+struct InteractiveProcessOutput {
+    status: ExitStatus,
+    stdout: Option<CapturedTail>,
+    canceled: bool,
+}
+
+enum InteractiveIo<'a> {
+    Inherited,
+    CaptureStdout { input: &'a [u8], max_bytes: usize },
+}
+
+// This is the explicit interactive exception: normal execution is unbounded, while
+// signal cancellation still terminates the child group and reaps its leader.
 pub fn run_status_inherited(command: &mut Command) -> Result<(), String> {
+    let command_display = observability::command_display(command);
+    let output = run_interactive(command, InteractiveIo::Inherited)?;
+    if output.canceled {
+        return Err(format!(
+            "{command_display}: interactive subprocess canceled"
+        ));
+    }
+    output
+        .status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("{command_display}: exited with {}", output.status))
+}
+
+pub fn run_capture_interactive(
+    command: &mut Command,
+    input: &[u8],
+    max_bytes: usize,
+) -> Result<String, String> {
+    let command_display = observability::command_display(command);
+    let output = run_interactive(command, InteractiveIo::CaptureStdout { input, max_bytes })?;
+    if output.canceled {
+        return Err(format!(
+            "{command_display}: interactive subprocess canceled"
+        ));
+    }
+    if !output.status.success() {
+        return Err(format!("{command_display}: exited with {}", output.status));
+    }
+    let stdout = output.stdout.expect("interactive stdout capture requested");
+    if stdout.truncated {
+        return Err(format!(
+            "{command_display}: stdout was truncated from {} bytes",
+            stdout.total_bytes
+        ));
+    }
+    Ok(String::from_utf8_lossy(&stdout.bytes).into_owned())
+}
+
+fn run_interactive(
+    command: &mut Command,
+    io_mode: InteractiveIo<'_>,
+) -> Result<InteractiveProcessOutput, String> {
     let include_argv = observability::enabled(LogLevel::Trace);
     let command_display = observability::command_display(command);
     let operation = observability::begin_operation(
@@ -1125,7 +1179,38 @@ pub fn run_status_inherited(command: &mut Command) -> Result<(), String> {
         )),
     );
     let started = Instant::now();
-    let status = command.status().map_err(|error| {
+    let current = current_cancellation();
+    let local_cancellation = if current.is_none() {
+        Some(InteractiveSignalCancellation::install().map_err(|error| {
+            format!("{command_display}: install interactive cancellation: {error}")
+        })?)
+    } else {
+        None
+    };
+    let canceled = current
+        .as_deref()
+        .or_else(|| local_cancellation.as_ref().map(|guard| guard.flag.as_ref()))
+        .expect("interactive cancellation is always installed");
+    match io_mode {
+        InteractiveIo::Inherited => {
+            command
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+        }
+        InteractiveIo::CaptureStdout { .. } => {
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command.spawn().map_err(|error| {
         let elapsed_ms = started.elapsed().as_millis() as i64;
         operation.finish(
             LogLevel::Error,
@@ -1142,8 +1227,87 @@ pub fn run_status_inherited(command: &mut Command) -> Result<(), String> {
         );
         format!("{command_display}: {error}")
     })?;
+    let foreground = ForegroundProcessGroup::give_to(child.id()).map_err(|error| {
+        let _ = terminate_active_child(&mut child, Duration::from_secs(1));
+        format!("{command_display}: give subprocess the terminal: {error}")
+    })?;
+    let stop_reader = Arc::new(AtomicBool::new(false));
+    let (stdin_writer, stdout_reader) = match io_mode {
+        InteractiveIo::Inherited => (None, None),
+        InteractiveIo::CaptureStdout { input, max_bytes } => {
+            let mut stdin = child
+                .stdin
+                .take()
+                .expect("configured interactive stdin pipe");
+            let stdout = child
+                .stdout
+                .take()
+                .expect("configured interactive stdout pipe");
+            let input = input.to_vec();
+            (
+                Some(std::thread::spawn(move || stdin.write_all(&input))),
+                Some(spawn_capture_reader(
+                    stdout,
+                    max_bytes,
+                    Arc::clone(&stop_reader),
+                )),
+            )
+        }
+    };
+    let mut was_canceled = false;
+    let mut termination_stage = TerminationStage::None;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(child_status)) => {
+                break child_status;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = terminate_active_child(&mut child, Duration::from_secs(1));
+                return Err(format!(
+                    "{command_display}: wait for interactive subprocess: {error}"
+                ));
+            }
+        }
+        if canceled.load(Ordering::Acquire) {
+            was_canceled = true;
+            termination_stage = terminate_active_child(&mut child, Duration::from_secs(1))
+                .map_err(|error| {
+                    format!("{command_display}: cancel interactive subprocess: {error}")
+                })?;
+            let status = child
+                .try_wait()
+                .map_err(|error| {
+                    format!("{command_display}: reap interactive subprocess: {error}")
+                })?
+                .ok_or_else(|| format!("{command_display}: subprocess was not reaped"))?;
+            break status;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    drop(foreground);
+
+    if let Some(reader) = stdout_reader.as_ref() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !reader.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !reader.is_finished() {
+            termination_stage = terminate_active_child(&mut child, Duration::from_secs(1))
+                .map_err(|error| format!("{command_display}: drain interactive stdout: {error}"))?;
+        }
+    }
+    stop_reader.store(true, Ordering::Release);
+    let stdin_result = join_stdin(stdin_writer);
+    if !was_canceled {
+        stdin_result.map_err(|error| format!("{command_display}: {error}"))?;
+    }
+    let stdout = stdout_reader
+        .map(|reader| join_capture_reader(reader, "stdout"))
+        .transpose()
+        .map_err(|error| format!("{command_display}: {error}"))?;
     let elapsed_ms = started.elapsed().as_millis() as i64;
-    if status.success() {
+    if status.success() && !was_canceled {
         operation.finish(
             LogLevel::Debug,
             "process",
@@ -1157,9 +1321,17 @@ pub fn run_status_inherited(command: &mut Command) -> Result<(), String> {
                 None,
             )),
         );
-        Ok(())
+        Ok(InteractiveProcessOutput {
+            status,
+            stdout,
+            canceled: false,
+        })
     } else {
-        let message = format!("exited with {status}");
+        let message = if was_canceled {
+            format!("canceled after {termination_stage:?}")
+        } else {
+            format!("exited with {status}")
+        };
         operation.finish(
             LogLevel::Error,
             "process",
@@ -1173,7 +1345,116 @@ pub fn run_status_inherited(command: &mut Command) -> Result<(), String> {
                 Some(&message),
             )),
         );
-        Err(format!("{command_display}: {message}"))
+        Ok(InteractiveProcessOutput {
+            status,
+            stdout,
+            canceled: was_canceled,
+        })
+    }
+}
+
+struct InteractiveSignalCancellation {
+    flag: Arc<AtomicBool>,
+    #[cfg(unix)]
+    registrations: Vec<signal_hook::SigId>,
+}
+
+impl InteractiveSignalCancellation {
+    fn install() -> io::Result<Self> {
+        let flag = Arc::new(AtomicBool::new(false));
+        #[cfg(unix)]
+        let registrations = {
+            let mut registrations = Vec::new();
+            for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
+                match signal_hook::flag::register(signal, Arc::clone(&flag)) {
+                    Ok(registration) => registrations.push(registration),
+                    Err(error) => {
+                        for registration in registrations {
+                            signal_hook::low_level::unregister(registration);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            registrations
+        };
+        Ok(Self {
+            flag,
+            #[cfg(unix)]
+            registrations,
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for InteractiveSignalCancellation {
+    fn drop(&mut self) {
+        for registration in self.registrations.drain(..) {
+            signal_hook::low_level::unregister(registration);
+        }
+    }
+}
+
+struct ForegroundProcessGroup {
+    #[cfg(unix)]
+    original: Option<libc::pid_t>,
+}
+
+impl ForegroundProcessGroup {
+    fn give_to(process_id: u32) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+                return Ok(Self { original: None });
+            }
+            let original = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+            if original == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            set_foreground_process_group(process_id as libc::pid_t)?;
+            Ok(Self {
+                original: Some(original),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = process_id;
+            Ok(Self {})
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ForegroundProcessGroup {
+    fn drop(&mut self) {
+        if let Some(original) = self.original {
+            let _ = set_foreground_process_group(original);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn set_foreground_process_group(process_group: libc::pid_t) -> io::Result<()> {
+    unsafe {
+        let mut blocked = std::mem::zeroed::<libc::sigset_t>();
+        let mut previous = std::mem::zeroed::<libc::sigset_t>();
+        libc::sigemptyset(&mut blocked);
+        libc::sigaddset(&mut blocked, libc::SIGTTOU);
+        let block_result = libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous);
+        if block_result != 0 {
+            return Err(io::Error::from_raw_os_error(block_result));
+        }
+        let result = libc::tcsetpgrp(libc::STDIN_FILENO, process_group);
+        let error = (result == -1).then(io::Error::last_os_error);
+        let restore_result =
+            libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+        if let Some(error) = error {
+            Err(error)
+        } else if restore_result != 0 {
+            Err(io::Error::from_raw_os_error(restore_result))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -1413,6 +1694,95 @@ mod tests {
             assert!(Instant::now() < deadline, "detached process was not reaped");
             std::thread::yield_now();
         }
+    }
+
+    #[test]
+    fn interactive_capture_preserves_input_without_a_deadline() {
+        let output = run_capture_interactive(
+            Command::new("sh").args(["-c", "cat"]),
+            b"selected-plan.md\n",
+            1024,
+        )
+        .unwrap();
+
+        assert_eq!(output, "selected-plan.md\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn interactive_cancellation_kills_process_group_and_reaps_leader() {
+        let temp = std::env::temp_dir().join(format!(
+            "prism-interactive-process-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&temp).unwrap();
+        let leader_path = temp.join("leader.pid");
+        let descendant_path = temp.join("descendant.pid");
+        let canceled = Arc::new(AtomicBool::new(false));
+        let trigger = Arc::clone(&canceled);
+        let ready_path = descendant_path.clone();
+        let trigger_thread = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !ready_path.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "interactive child did not become ready"
+                );
+                std::thread::yield_now();
+            }
+            trigger.store(true, Ordering::Release);
+        });
+        let script = r#"
+            trap '' TERM
+            printf '%s\n' "$$" > "$1"
+            (
+                trap '' TERM
+                while :; do :; done
+            ) &
+            descendant=$!
+            printf '%s\n' "$descendant" > "$2"
+            wait "$descendant"
+        "#;
+        let started = Instant::now();
+        let error = with_cancellation(canceled, || {
+            run_status_inherited(
+                Command::new("sh")
+                    .arg("-c")
+                    .arg(script)
+                    .arg("interactive-fixture")
+                    .arg(&leader_path)
+                    .arg(&descendant_path),
+            )
+        })
+        .unwrap_err();
+        trigger_thread.join().unwrap();
+
+        assert!(error.contains("interactive subprocess canceled"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(4));
+        for path in [&leader_path, &descendant_path] {
+            let pid = std::fs::read_to_string(path)
+                .unwrap()
+                .trim()
+                .parse::<libc::pid_t>()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let result = unsafe { libc::kill(pid, 0) };
+                if result != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "interactive process survived cancellation"
+                );
+                std::thread::yield_now();
+            }
+        }
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
