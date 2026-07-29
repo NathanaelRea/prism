@@ -1,6 +1,6 @@
 [package]
 name = "prism"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.95"
 description = "A terminal board for agent-backed coding sessions across Git worktrees"
