@@ -19,10 +19,56 @@ pub(crate) struct JobMetadata<K, Q> {
 
 #[derive(Debug)]
 pub(crate) enum JobOutcome {
-    Completed(Result<(), String>),
+    Completed,
+    Failed(String),
+    SpawnFailed(std::io::Error),
     Panicked(String),
     Canceled,
     DeadlineExceeded,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JobOutcomeKind {
+    Completed,
+    Failed,
+    SpawnFailed,
+    Panicked,
+    Canceled,
+    DeadlineExceeded,
+}
+
+impl JobOutcomeKind {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::SpawnFailed => "spawn_failed",
+            Self::Panicked => "panicked",
+            Self::Canceled => "canceled",
+            Self::DeadlineExceeded => "deadline_exceeded",
+        }
+    }
+}
+
+impl JobOutcome {
+    pub(crate) const fn kind(&self) -> JobOutcomeKind {
+        match self {
+            Self::Completed => JobOutcomeKind::Completed,
+            Self::Failed(_) => JobOutcomeKind::Failed,
+            Self::SpawnFailed(_) => JobOutcomeKind::SpawnFailed,
+            Self::Panicked(_) => JobOutcomeKind::Panicked,
+            Self::Canceled => JobOutcomeKind::Canceled,
+            Self::DeadlineExceeded => JobOutcomeKind::DeadlineExceeded,
+        }
+    }
+
+    pub(crate) fn error_message(&self) -> Option<String> {
+        match self {
+            Self::Failed(error) | Self::Panicked(error) => Some(error.clone()),
+            Self::SpawnFailed(error) => Some(error.to_string()),
+            Self::Completed | Self::Canceled | Self::DeadlineExceeded => None,
+        }
+    }
 }
 
 pub(crate) enum JobMessage<K, Q, P> {
@@ -368,7 +414,7 @@ where
                 metadata,
                 cancellation,
                 delivery.coalesce_payload,
-                JobOutcome::Completed(Err("TUI is shutting down".to_string())),
+                JobOutcome::Failed("TUI is shutting down".to_string()),
             );
             return id;
         }
@@ -379,7 +425,7 @@ where
                 metadata,
                 cancellation,
                 delivery.coalesce_payload,
-                JobOutcome::Completed(Err("injected thread spawn failure".to_string())),
+                JobOutcome::SpawnFailed(std::io::Error::other("injected thread spawn failure")),
             );
             return id;
         }
@@ -412,11 +458,11 @@ where
                     payload: None,
                 },
                 Ok(Ok(payload)) => JobCompletion {
-                    outcome: JobOutcome::Completed(Ok(())),
+                    outcome: JobOutcome::Completed,
                     payload,
                 },
                 Ok(Err(error)) => JobCompletion {
-                    outcome: JobOutcome::Completed(Err(error)),
+                    outcome: JobOutcome::Failed(error),
                     payload: None,
                 },
             }
@@ -437,7 +483,7 @@ where
                 metadata,
                 cancellation,
                 delivery.coalesce_payload,
-                JobOutcome::Completed(Err(format!("spawn job thread: {error}"))),
+                JobOutcome::SpawnFailed(error),
             ),
         }
         id
@@ -726,7 +772,7 @@ mod tests {
         );
         assert!(matches!(
             wait_for_terminal(&mut jobs),
-            JobOutcome::Completed(Ok(()))
+            JobOutcome::Completed
         ));
     }
 
@@ -744,7 +790,7 @@ mod tests {
         );
         let terminal = wait_for_terminal(&mut jobs);
         assert!(
-            matches!(terminal, JobOutcome::Completed(Err(message)) if message.contains("spawn failure"))
+            matches!(terminal, JobOutcome::SpawnFailed(error) if error.to_string().contains("spawn failure"))
         );
 
         jobs.spawn(
@@ -757,7 +803,7 @@ mod tests {
         );
         assert!(matches!(
             wait_for_terminal(&mut jobs),
-            JobOutcome::Completed(Ok(()))
+            JobOutcome::Completed
         ));
     }
 

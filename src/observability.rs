@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::RefCell;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -15,6 +17,7 @@ use crate::util::{single_line, truncate};
 
 const RUNTIME_LOG_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const RUNTIME_LOG_RETAINED_FILES: usize = 3;
+const DEFERRED_DB_EVENT_CAPACITY: usize = 128;
 
 static OBSERVER: OnceLock<Mutex<ObserverState>> = OnceLock::new();
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
@@ -112,6 +115,22 @@ struct ObserverState {
     next_operation_id: u64,
     startup_run_id: Option<String>,
     phases: Vec<StoredPhaseRecord>,
+    deferred_db_events: Vec<Event>,
+    deferred_db_overflow_total: u64,
+    deferred_db_overflow_pending: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct CapturedEvent {
+    pub target: String,
+    pub action: String,
+    pub data_json: Option<String>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CAPTURED_EVENTS: RefCell<Vec<CapturedEvent>> = const { RefCell::new(Vec::new()) };
 }
 
 #[derive(Clone, Debug)]
@@ -195,7 +214,27 @@ pub fn runtime_log_path(repo: &Repository) -> PathBuf {
 }
 
 pub fn emit(input: EventInput<'_>) {
-    let event = Event {
+    let event = event_from_input(input);
+    capture_event(&event);
+    with_state(|state| state.record_event(event));
+}
+
+/// Records runtime evidence and queues the SQLite copy without opening the database.
+/// Reliability-sensitive callers use this path to avoid a synchronous writer wait.
+pub(crate) fn emit_deferred(input: EventInput<'_>) {
+    let event = event_from_input(input);
+    capture_event(&event);
+    with_state(|state| state.record_deferred_event(event));
+}
+
+pub(crate) fn flush_deferred_events() {
+    // Callers invoke this only after leaving their writer operation and dropping
+    // its connection. ObserverState methods must never recurse through this lock.
+    with_state(ObserverState::flush_deferred_db_events);
+}
+
+fn event_from_input(input: EventInput<'_>) -> Event {
+    Event {
         time_unix_ms: now_ms(),
         level: input.level,
         target: input.target.to_string(),
@@ -207,9 +246,7 @@ pub fn emit(input: EventInput<'_>) {
         session: input.session,
         message: input.message,
         data_json: input.data_json,
-    };
-
-    with_state(|state| state.record_event(event));
+    }
 }
 
 pub fn begin_operation(
@@ -468,6 +505,111 @@ pub fn process_data_json(
     json_object(fields)
 }
 
+pub(crate) fn process_error_data_json(
+    command: &Command,
+    include_argv: bool,
+    policy: &str,
+    elapsed_ms: i64,
+    deadline_ms: i64,
+    category: &str,
+    error: &str,
+) -> String {
+    let mut fields = command_data_fields(command, include_argv);
+    fields.extend([
+        json_string_field("policy", policy),
+        json_number_field("elapsed_ms", elapsed_ms),
+        json_number_field("deadline_ms", deadline_ms),
+        json_string_field("outcome", "supervision_error"),
+        json_string_field("error_category", category),
+        json_string_field("termination_stage", "none"),
+        json_number_field("stdout_bytes", 0),
+        json_number_field("stderr_bytes", 0),
+        json_string_field("error", &redact_freeform(error, 500)),
+    ]);
+    json_object(fields)
+}
+
+pub(crate) struct JobObservation<'a> {
+    pub job_id: u64,
+    pub kind: &'a str,
+    pub key: &'a str,
+    pub generation: u64,
+    pub outcome: &'a str,
+    pub elapsed_ms: i64,
+    pub deadline_ms: Option<i64>,
+    pub error: Option<&'a str>,
+}
+
+pub(crate) fn job_data_json(observation: JobObservation<'_>) -> String {
+    let mut fields = vec![
+        json_u64_field("job_id", observation.job_id),
+        json_string_field("kind", observation.kind),
+        json_string_field("key", &redact_freeform(observation.key, 500)),
+        json_u64_field("generation", observation.generation),
+        json_string_field("outcome", observation.outcome),
+        json_number_field("elapsed_ms", observation.elapsed_ms),
+    ];
+    if let Some(deadline_ms) = observation.deadline_ms {
+        fields.push(json_number_field("deadline_ms", deadline_ms));
+    }
+    if let Some(error) = observation.error {
+        fields.push(json_string_field("error", &redact_freeform(error, 500)));
+    }
+    json_object(fields)
+}
+
+pub(crate) fn storage_error_data_json(
+    kind: &str,
+    primary_code: Option<i32>,
+    extended_code: Option<i32>,
+    busy_ms: Option<i64>,
+) -> String {
+    let mut fields = vec![json_string_field("kind", kind)];
+    if let Some(code) = primary_code {
+        fields.push(json_number_field("primary_code", i64::from(code)));
+    }
+    if let Some(code) = extended_code {
+        fields.push(json_number_field("extended_code", i64::from(code)));
+    }
+    if let Some(busy_ms) = busy_ms {
+        fields.push(json_number_field("busy_ms", busy_ms));
+    }
+    json_object(fields)
+}
+
+pub(crate) fn persistence_data_json(
+    category: &str,
+    stage: &str,
+    committed: bool,
+    durability: &str,
+    error: Option<&str>,
+) -> String {
+    let mut fields = vec![
+        json_string_field("category", category),
+        json_string_field("stage", stage),
+        json_bool_field("committed", committed),
+        json_string_field("durability", durability),
+    ];
+    if let Some(error) = error {
+        fields.push(json_string_field("error", &redact_freeform(error, 500)));
+    }
+    json_object(fields)
+}
+
+pub(crate) fn shutdown_data_json(
+    reason: &str,
+    active_jobs: usize,
+    unfinished_jobs: usize,
+    elapsed_ms: i64,
+) -> String {
+    json_object(vec![
+        json_string_field("reason", reason),
+        json_usize_field("active_jobs", active_jobs),
+        json_usize_field("unfinished_jobs", unfinished_jobs),
+        json_number_field("elapsed_ms", elapsed_ms),
+    ])
+}
+
 fn command_data_fields(command: &Command, include_argv: bool) -> Vec<String> {
     let mut fields = vec![
         json_string_field("program", &os_to_string(command.get_program())),
@@ -546,7 +688,7 @@ pub fn append_runtime_message(repo: &Repository, message: &str) -> Result<(), St
 
 pub fn run_readonly_query(repo: &Repository, query: &str) -> Result<(), String> {
     let path = db_path(repo);
-    let conn = crate::storage::open_readonly(&path).map_err(|error| error.to_string())?;
+    let conn = open_observed_readonly_db_path(&path)?;
     let mut statement = conn
         .prepare(query)
         .map_err(|error| format!("prepare query: {error}"))?;
@@ -578,8 +720,13 @@ pub fn with_writable_db_mut<T>(
     repo: &Repository,
     run: impl FnOnce(&mut Connection) -> Result<T, String>,
 ) -> Result<T, String> {
-    let mut conn = open_writable_db_path(&db_path(repo))?;
-    run(&mut conn)
+    let mut conn = open_observed_writable_db_path(&db_path(repo))?;
+    let result = run(&mut conn);
+    if result.is_ok() {
+        drop(conn);
+        flush_deferred_events();
+    }
+    result
 }
 
 pub fn with_nonblocking_read_db<T>(
@@ -587,7 +734,7 @@ pub fn with_nonblocking_read_db<T>(
     run: impl FnOnce(&Connection) -> Result<T, String>,
 ) -> Result<T, String> {
     let path = db_path(repo);
-    let conn = crate::storage::open_readonly(&path).map_err(|error| error.to_string())?;
+    let conn = open_observed_readonly_db_path(&path)?;
     run(&conn)
 }
 
@@ -604,12 +751,33 @@ pub struct WritableDb {
 
 impl WritableDb {
     pub fn run<T>(&self, run: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
-        let conn = open_writable_db_path(&self.path)?;
-        run(&conn)
+        let conn = open_observed_writable_db_path(&self.path)?;
+        let result = run(&conn);
+        if result.is_ok() {
+            drop(conn);
+            flush_deferred_events();
+        }
+        result
     }
 }
 
+fn open_observed_writable_db_path(path: &Path) -> Result<Connection, String> {
+    crate::storage::open_writable(path).map_err(|error| {
+        crate::storage::record_storage_error(&error);
+        error.to_string()
+    })
+}
+
+fn open_observed_readonly_db_path(path: &Path) -> Result<Connection, String> {
+    crate::storage::open_readonly(path).map_err(|error| {
+        crate::storage::record_storage_error(&error);
+        error.to_string()
+    })
+}
+
 fn open_writable_db_path(path: &Path) -> Result<Connection, String> {
+    // Observer persistence calls this while holding OBSERVER. Keep it unobserved
+    // and never flush deferred events from this path.
     crate::storage::open_writable(path).map_err(|error| error.to_string())
 }
 
@@ -655,6 +823,9 @@ impl ObserverState {
             next_operation_id: 0,
             startup_run_id: None,
             phases: Vec::new(),
+            deferred_db_events: Vec::new(),
+            deferred_db_overflow_total: 0,
+            deferred_db_overflow_pending: 0,
         }
     }
 
@@ -680,6 +851,89 @@ impl ObserverState {
             return;
         }
         self.write_event(&event);
+    }
+
+    fn record_deferred_event(&mut self, mut event: Event) {
+        if !self.file_level.allows(event.level)
+            && !self
+                .stderr_level
+                .is_some_and(|stderr_level| stderr_level.allows(event.level))
+        {
+            return;
+        }
+        if event.repo.is_none() {
+            event.repo = self.repo_string();
+        }
+        self.write_stderr_if_enabled(&event);
+        if self.file_level.allows(event.level) {
+            if let Err(error) = self.write_text_event(&event) {
+                eprintln!("prism observability: {error}");
+            }
+            if self.deferred_db_events.len() == DEFERRED_DB_EVENT_CAPACITY {
+                self.deferred_db_events.remove(0);
+                self.deferred_db_overflow_total = self.deferred_db_overflow_total.saturating_add(1);
+                self.deferred_db_overflow_pending =
+                    self.deferred_db_overflow_pending.saturating_add(1);
+                if self.deferred_db_overflow_total.is_power_of_two() {
+                    let warning = format!(
+                        "deferred event queue overflow: {} event(s) omitted from the SQLite backlog; runtime events remain recorded; capacity={DEFERRED_DB_EVENT_CAPACITY}",
+                        self.deferred_db_overflow_total
+                    );
+                    let _ = self.append_text_warning(&warning);
+                    self.write_stderr_warning(&warning);
+                }
+            }
+            self.deferred_db_events.push(event);
+        }
+    }
+
+    fn flush_deferred_db_events(&mut self) {
+        let pending = std::mem::take(&mut self.deferred_db_events);
+        let mut remaining = pending.into_iter();
+        while let Some(event) = remaining.next() {
+            if let Err(error) = self.write_db_event(&event) {
+                self.deferred_db_events.push(event);
+                self.deferred_db_events.extend(remaining);
+                let warning = format!("deferred observability db write failed: {error}");
+                let _ = self.append_text_warning(&warning);
+                self.write_stderr_warning(&warning);
+                break;
+            }
+        }
+        if self.deferred_db_events.is_empty() && self.deferred_db_overflow_pending > 0 {
+            let event = self.deferred_overflow_event();
+            match self.write_db_event(&event) {
+                Ok(()) => self.deferred_db_overflow_pending = 0,
+                Err(error) => {
+                    let warning = format!("deferred overflow event db write failed: {error}");
+                    let _ = self.append_text_warning(&warning);
+                    self.write_stderr_warning(&warning);
+                }
+            }
+        }
+    }
+
+    fn deferred_overflow_event(&self) -> Event {
+        Event {
+            time_unix_ms: now_ms(),
+            level: LogLevel::Warn,
+            target: "observability".to_string(),
+            action: "deferred_overflow".to_string(),
+            operation_id: None,
+            parent_operation_id: None,
+            repo: self.repo_string(),
+            branch: None,
+            session: None,
+            message: format!(
+                "{} deferred event(s) were omitted from the SQLite backlog; runtime events remain recorded",
+                self.deferred_db_overflow_pending
+            ),
+            data_json: Some(json_object(vec![
+                json_u64_field("overflow_count", self.deferred_db_overflow_pending),
+                json_u64_field("overflow_total", self.deferred_db_overflow_total),
+                json_usize_field("capacity", DEFERRED_DB_EVENT_CAPACITY),
+            ])),
+        }
     }
 
     fn write_event(&mut self, event: &Event) {
@@ -1078,6 +1332,37 @@ fn json_number_field(key: &str, value: i64) -> String {
     format!("\"{}\":{}", json_escape(key), value)
 }
 
+fn json_u64_field(key: &str, value: u64) -> String {
+    format!("\"{}\":{}", json_escape(key), value)
+}
+
+fn json_usize_field(key: &str, value: usize) -> String {
+    format!("\"{}\":{}", json_escape(key), value)
+}
+
+fn json_bool_field(key: &str, value: bool) -> String {
+    format!("\"{}\":{}", json_escape(key), value)
+}
+
+#[cfg(test)]
+fn capture_event(event: &Event) {
+    CAPTURED_EVENTS.with(|events| {
+        events.borrow_mut().push(CapturedEvent {
+            target: event.target.clone(),
+            action: event.action.clone(),
+            data_json: event.data_json.clone(),
+        });
+    });
+}
+
+#[cfg(not(test))]
+fn capture_event(_event: &Event) {}
+
+#[cfg(test)]
+pub(crate) fn take_captured_events() -> Vec<CapturedEvent> {
+    CAPTURED_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
+}
+
 fn sqlite_value_to_string(value: ValueRef<'_>) -> String {
     match value {
         ValueRef::Null => String::new(),
@@ -1097,7 +1382,8 @@ mod tests {
     use crate::repo::Repository;
 
     use super::{
-        db_path, now_ms, open_writable_db_path, sanitize_command_text, sanitized_argv, writable_db,
+        DEFERRED_DB_EVENT_CAPACITY, Event, LogLevel, ObserverOptions, ObserverState, db_path,
+        now_ms, open_writable_db_path, sanitize_command_text, sanitized_argv, writable_db,
     };
 
     #[test]
@@ -1175,6 +1461,114 @@ mod tests {
         assert!(table_exists(&first, "event"));
         assert!(table_exists(&second, "event"));
         let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn deferred_queue_overflow_is_bounded_and_keeps_runtime_evidence() {
+        let dir = test_path("deferred-overflow");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut state = ObserverState::new(ObserverOptions {
+            log_level: LogLevel::Debug,
+            print_logs: false,
+        });
+        state.prism_dir = Some(dir.clone());
+        let overflow = 5;
+
+        for index in 0..DEFERRED_DB_EVENT_CAPACITY + overflow {
+            state.record_deferred_event(Event {
+                time_unix_ms: index as i64,
+                level: LogLevel::Error,
+                target: "deferred_test".to_string(),
+                action: "terminal".to_string(),
+                operation_id: None,
+                parent_operation_id: None,
+                repo: None,
+                branch: None,
+                session: None,
+                message: format!("deferred-evidence-{index}"),
+                data_json: None,
+            });
+        }
+
+        assert_eq!(state.deferred_db_events.len(), DEFERRED_DB_EVENT_CAPACITY);
+        assert_eq!(state.deferred_db_overflow_total, overflow as u64);
+        assert_eq!(state.deferred_db_overflow_pending, overflow as u64);
+        assert_eq!(
+            state.deferred_db_events.first().unwrap().message,
+            format!("deferred-evidence-{overflow}")
+        );
+        let aggregate = state.deferred_overflow_event();
+        let data: serde_json::Value =
+            serde_json::from_str(aggregate.data_json.as_deref().unwrap()).unwrap();
+        assert_eq!(data["overflow_count"], overflow);
+        assert_eq!(data["overflow_total"], overflow);
+        assert_eq!(data["capacity"], DEFERRED_DB_EVENT_CAPACITY);
+
+        let runtime = fs::read_to_string(dir.join("runtime.log")).unwrap();
+        assert_eq!(
+            runtime.matches("deferred-evidence-").count(),
+            DEFERRED_DB_EVENT_CAPACITY + overflow
+        );
+        assert!(runtime.contains("deferred event queue overflow"));
+        assert!(runtime.contains("runtime events remain recorded"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn deferred_flush_persists_backlog_and_overflow_aggregate() {
+        let dir = test_path("deferred-flush");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("prism.db");
+        drop(open_writable_db_path(&db).unwrap());
+        let mut state = ObserverState::new(ObserverOptions {
+            log_level: LogLevel::Debug,
+            print_logs: false,
+        });
+        state.prism_dir = Some(dir.clone());
+        state.record_deferred_event(Event {
+            time_unix_ms: 1,
+            level: LogLevel::Error,
+            target: "deferred_test".to_string(),
+            action: "terminal".to_string(),
+            operation_id: None,
+            parent_operation_id: None,
+            repo: None,
+            branch: None,
+            session: None,
+            message: "persist me".to_string(),
+            data_json: None,
+        });
+        state.deferred_db_overflow_total = 3;
+        state.deferred_db_overflow_pending = 2;
+
+        state.flush_deferred_db_events();
+
+        assert!(state.deferred_db_events.is_empty());
+        assert_eq!(state.deferred_db_overflow_pending, 0);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "select count(*) from event where target = 'deferred_test' and action = 'terminal'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            1
+        );
+        let data: String = conn
+            .query_row(
+                "select data_json from event where target = 'observability' and action = 'deferred_overflow'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let data: serde_json::Value = serde_json::from_str(&data).unwrap();
+        assert_eq!(data["overflow_count"], 2);
+        assert_eq!(data["overflow_total"], 3);
+        drop(conn);
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn table_exists(path: &Path, table: &str) -> bool {

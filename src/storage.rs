@@ -32,6 +32,22 @@ pub enum StorageErrorKind {
     Other,
 }
 
+impl StorageErrorKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Busy => "busy",
+            Self::Locked => "locked",
+            Self::Constraint => "constraint",
+            Self::Corruption => "corruption",
+            Self::Io => "io",
+            Self::ReadOnly => "read_only",
+            Self::Full => "full",
+            Self::CannotOpen => "cannot_open",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Debug)]
 enum StorageErrorSource {
     Sqlite(rusqlite::Error),
@@ -79,6 +95,16 @@ impl StorageError {
 
     pub fn corruption_check_error(&self) -> Option<&str> {
         self.corruption_check_error.as_deref()
+    }
+
+    pub fn observation_data_json(&self) -> String {
+        crate::observability::storage_error_data_json(
+            self.kind.label(),
+            self.primary_code,
+            self.extended_code,
+            self.busy_elapsed
+                .map(|elapsed| elapsed.as_millis().min(i64::MAX as u128) as i64),
+        )
     }
 
     pub fn from_sqlite(
@@ -268,11 +294,34 @@ pub fn run_writer<T>(
     path: &Path,
     run: impl FnOnce(&Connection) -> rusqlite::Result<T>,
 ) -> Result<T, StorageError> {
-    let conn = open_writable(path)?;
-    let started = Instant::now();
-    run(&conn)
-        .map_err(|error| StorageError::from_sqlite("database operation", error, started.elapsed()))
-        .map_err(|error| diagnose_corruption(path, error))
+    let result = (|| {
+        let conn = open_writable(path)?;
+        let started = Instant::now();
+        run(&conn)
+            .map_err(|error| {
+                StorageError::from_sqlite("database operation", error, started.elapsed())
+            })
+            .map_err(|error| diagnose_corruption(path, error))
+    })();
+    match &result {
+        Ok(_) => crate::observability::flush_deferred_events(),
+        Err(error) => record_storage_error(error),
+    }
+    result
+}
+
+pub(crate) fn record_storage_error(error: &StorageError) {
+    crate::observability::emit_deferred(crate::observability::EventInput {
+        level: crate::observability::LogLevel::Error,
+        target: "sqlite",
+        action: "error",
+        operation_id: None,
+        parent_operation_id: None,
+        branch: None,
+        session: None,
+        message: format!("SQLite operation failed: {}", error.kind.label()),
+        data_json: Some(error.observation_data_json()),
+    });
 }
 
 fn reject_empty_database(path: &Path) -> Result<(), StorageError> {
@@ -1437,6 +1486,7 @@ mod tests {
 
     #[test]
     fn coordinated_writer_contention_is_classified_and_data_remains_valid() {
+        let _ = crate::observability::take_captured_events();
         let path = test_path("busy");
         let conn = open_writable(&path).unwrap();
         conn.execute_batch("create table busy_test (id integer primary key, value text not null)")
@@ -1464,6 +1514,22 @@ mod tests {
         assert_eq!(error.primary_code(), Some(rusqlite::ffi::SQLITE_BUSY));
         assert!(error.extended_code().is_some());
         assert!(error.busy_elapsed().unwrap() >= WRITER_BUSY_TIMEOUT);
+        let diagnostic: serde_json::Value =
+            serde_json::from_str(&error.observation_data_json()).unwrap();
+        assert_eq!(diagnostic["kind"], "busy");
+        assert_eq!(diagnostic["primary_code"], rusqlite::ffi::SQLITE_BUSY);
+        assert_eq!(diagnostic["extended_code"], error.extended_code().unwrap());
+        assert!(diagnostic["busy_ms"].as_i64().is_some());
+        let events = crate::observability::take_captured_events()
+            .into_iter()
+            .filter(|event| event.target == "sqlite" && event.action == "error")
+            .filter_map(|event| event.data_json)
+            .map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap())
+            .filter(|data| {
+                data["kind"] == "busy" && data["primary_code"] == rusqlite::ffi::SQLITE_BUSY
+            })
+            .count();
+        assert_eq!(events, 1);
         release_tx.send(()).unwrap();
         holder.join().unwrap();
         let conn = open_readonly(&path).unwrap();

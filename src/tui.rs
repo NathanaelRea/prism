@@ -409,6 +409,24 @@ pub(crate) enum TuiJobKind {
     OpencodeListener,
 }
 
+impl TuiJobKind {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::SessionRefresh => "session_refresh",
+            Self::WorkflowMaintenance => "workflow_maintenance",
+            Self::PrSummary => "pr_summary",
+            Self::PrDetails => "pr_details",
+            Self::DeleteSession => "delete_session",
+            Self::TmuxWarmup => "tmux_warmup",
+            Self::TmuxPortal => "tmux_portal",
+            Self::WorktreeColumns => "worktree_columns",
+            Self::DefaultBranch => "default_branch",
+            Self::OpencodePoll => "opencode_poll",
+            Self::OpencodeListener => "opencode_listener",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum TuiJobKey {
     None,
@@ -419,6 +437,25 @@ pub(crate) enum TuiJobKey {
     Tmux(AgentSessionWarmupKey),
     Opencode(OpencodePollKey),
     OpencodeListener(OpencodeListenerKey),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShutdownReason {
+    UserQuit,
+    Sigterm,
+    RunError,
+    Panic,
+}
+
+impl ShutdownReason {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::UserQuit => "user_quit",
+            Self::Sigterm => "sigterm",
+            Self::RunError => "run_error",
+            Self::Panic => "panic",
+        }
+    }
 }
 
 pub(crate) enum TuiJobPayload {
@@ -893,16 +930,22 @@ impl Tui {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.run_inner(&mut runtime, &sigterm)
         }));
-        let cleanup =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.cleanup_tui_jobs()))
-                .unwrap_or_else(|payload| {
-                    Err(format!(
-                        "TUI cleanup panicked: {}",
-                        panic_payload_message(payload.as_ref())
-                    ))
-                });
+        let shutdown_reason = match &outcome {
+            Ok(Ok(reason)) => *reason,
+            Ok(Err(_)) => ShutdownReason::RunError,
+            Err(_) => ShutdownReason::Panic,
+        };
+        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.cleanup_tui_jobs(shutdown_reason)
+        }))
+        .unwrap_or_else(|payload| {
+            Err(format!(
+                "TUI cleanup panicked: {}",
+                panic_payload_message(payload.as_ref())
+            ))
+        });
         match outcome {
-            Ok(Ok(())) => cleanup,
+            Ok(Ok(_)) => cleanup,
             Ok(Err(error)) => {
                 if let Err(cleanup_error) = cleanup {
                     self.record_tui_cleanup_failure(&cleanup_error);
@@ -922,7 +965,7 @@ impl Tui {
         &mut self,
         runtime: &mut TerminalRuntime,
         sigterm: &SigtermNotification,
-    ) -> Result<(), String> {
+    ) -> Result<ShutdownReason, String> {
         crate::worker::ensure_running()?;
         self.offer_interrupted_run_recovery(runtime)?;
         self.refresh_worktree_harness_configs();
@@ -943,9 +986,9 @@ impl Tui {
         }
         let mut key_input = KeyInput::default();
         let mut pending_g = false;
-        loop {
+        let shutdown_reason = loop {
             if tui_loop_should_exit(sigterm) {
-                break;
+                break ShutdownReason::Sigterm;
             }
             if self.tick_tui_action_jobs().any() {
                 self.draw(runtime)?;
@@ -1383,11 +1426,11 @@ impl Tui {
                 }
             }
             if should_quit {
-                break;
+                break ShutdownReason::UserQuit;
             }
             self.draw(runtime)?;
-        }
-        Ok(())
+        };
+        Ok(shutdown_reason)
     }
 
     fn tick_tui_action_jobs(&mut self) -> TuiBackgroundChanges {
@@ -1512,19 +1555,17 @@ impl Tui {
             };
             processed += 1;
             self.clear_tui_job_in_flight(&metadata);
+            self.record_tui_job_terminal(&metadata, &outcome);
             match outcome {
-                JobOutcome::Completed(Ok(())) | JobOutcome::Canceled => {}
-                JobOutcome::Completed(Err(error)) => {
+                JobOutcome::Completed | JobOutcome::Canceled => {}
+                JobOutcome::Failed(_) | JobOutcome::SpawnFailed(_) => {
                     self.recover_failed_tui_job(&metadata);
-                    self.record_tui_job_failure(&metadata, &error);
                 }
-                JobOutcome::Panicked(error) => {
+                JobOutcome::Panicked(_) => {
                     self.recover_failed_tui_job(&metadata);
-                    self.record_tui_job_failure(&metadata, &format!("panicked: {error}"));
                 }
                 JobOutcome::DeadlineExceeded => {
                     self.recover_failed_tui_job(&metadata);
-                    self.record_tui_job_failure(&metadata, "deadline exceeded");
                 }
             }
             if metadata.kind == TuiJobKind::SessionRefresh && self.session_refresh_pending {
@@ -1797,22 +1838,61 @@ impl Tui {
         }
     }
 
-    fn record_tui_job_failure(&self, metadata: &JobMetadata<TuiJobKind, TuiJobKey>, error: &str) {
-        let _ = crate::observability::append_runtime_message(
-            &self.repo,
-            &format!(
-                "TUI job {:?} #{} ({:?}, generation {}) failed after {:?}: {error}",
-                metadata.kind,
+    fn record_tui_job_terminal(
+        &self,
+        metadata: &JobMetadata<TuiJobKind, TuiJobKey>,
+        outcome: &JobOutcome,
+    ) {
+        let outcome_kind = outcome.kind();
+        let error = outcome.error_message();
+        let key = format!("{:?}", metadata.key);
+        let deadline_ms = metadata.deadline.map(|deadline| {
+            deadline
+                .saturating_duration_since(metadata.started_at)
+                .as_millis() as i64
+        });
+        crate::observability::emit_deferred(crate::observability::EventInput {
+            level: match outcome_kind {
+                crate::tui_jobs::JobOutcomeKind::Failed
+                | crate::tui_jobs::JobOutcomeKind::SpawnFailed
+                | crate::tui_jobs::JobOutcomeKind::Panicked
+                | crate::tui_jobs::JobOutcomeKind::DeadlineExceeded => {
+                    crate::observability::LogLevel::Error
+                }
+                crate::tui_jobs::JobOutcomeKind::Completed
+                | crate::tui_jobs::JobOutcomeKind::Canceled => {
+                    crate::observability::LogLevel::Debug
+                }
+            },
+            target: "tui_job",
+            action: "terminal",
+            operation_id: None,
+            parent_operation_id: None,
+            branch: None,
+            session: None,
+            message: format!(
+                "TUI job {} #{} finished with {}",
+                metadata.kind.label(),
                 metadata.id,
-                metadata.key,
-                metadata.generation,
-                metadata.started_at.elapsed()
+                outcome_kind.label()
             ),
-        );
+            data_json: Some(crate::observability::job_data_json(
+                crate::observability::JobObservation {
+                    job_id: metadata.id,
+                    kind: metadata.kind.label(),
+                    key: &key,
+                    generation: metadata.generation,
+                    outcome: outcome_kind.label(),
+                    elapsed_ms: metadata.started_at.elapsed().as_millis() as i64,
+                    deadline_ms,
+                    error: error.as_deref(),
+                },
+            )),
+        });
     }
 
     fn record_tui_queue_stats(&self, stats: crate::tui_jobs::QueueStats) {
-        crate::observability::emit(crate::observability::EventInput {
+        crate::observability::emit_deferred(crate::observability::EventInput {
             level: if stats.overflow_delta > 0 {
                 crate::observability::LogLevel::Warn
             } else {
@@ -1856,15 +1936,16 @@ impl Tui {
         }
     }
 
-    fn cleanup_tui_jobs(&mut self) -> Result<(), String> {
+    fn cleanup_tui_jobs(&mut self, reason: ShutdownReason) -> Result<(), String> {
         let mut errors = Vec::new();
+        let started = Instant::now();
+        let active_jobs = self.jobs.active_metadata().len();
         self.scheduling_stopped = true;
         self.jobs.stop_accepting();
         self.jobs.cancel_all();
         if let Err(error) = self.shutdown_owned_opencode_servers() {
             errors.push(error);
         }
-        let started = Instant::now();
         while self.jobs.has_jobs() && started.elapsed() < TUI_JOB_SHUTDOWN_GRACE {
             self.route_tui_job_messages();
             if self.jobs.has_jobs() {
@@ -1878,6 +1959,30 @@ impl Tui {
                 "detached {unfinished} uncooperative job(s) after shutdown grace period"
             ));
         }
+        crate::observability::emit_deferred(crate::observability::EventInput {
+            level: if errors.is_empty() {
+                crate::observability::LogLevel::Info
+            } else {
+                crate::observability::LogLevel::Warn
+            },
+            target: "tui",
+            action: "shutdown_cleanup",
+            operation_id: None,
+            parent_operation_id: None,
+            branch: None,
+            session: None,
+            message: format!(
+                "TUI shutdown cleanup finished: reason={}, active_jobs={}, unfinished_jobs={unfinished}",
+                reason.label(),
+                active_jobs
+            ),
+            data_json: Some(crate::observability::shutdown_data_json(
+                reason.label(),
+                active_jobs,
+                unfinished,
+                started.elapsed().as_millis() as i64,
+            )),
+        });
         if errors.is_empty() {
             Ok(())
         } else {
@@ -4409,6 +4514,7 @@ mod tests {
 
     #[test]
     fn opencode_in_flight_clears_after_panic_and_spawn_failure_then_restarts() {
+        let _ = crate::observability::take_captured_events();
         let temp = unique_temp_dir("prism-tui-job-recovery-test");
         fs::create_dir_all(&temp).unwrap();
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -4455,6 +4561,26 @@ mod tests {
         );
         wait_for_opencode_job(&mut tui, &key);
         assert!(!tui.opencode_polls_in_flight.contains(&key));
+
+        let terminal_events = crate::observability::take_captured_events()
+            .into_iter()
+            .filter(|event| event.target == "tui_job" && event.action == "terminal")
+            .filter_map(|event| event.data_json)
+            .map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap())
+            .filter(|data| data["kind"] == "opencode_poll")
+            .filter(|data| {
+                data["key"]
+                    .as_str()
+                    .is_some_and(|key| key.contains(&temp.display().to_string()))
+            })
+            .collect::<Vec<_>>();
+        for (job_id, outcome) in [(1, "panicked"), (2, "spawn_failed"), (3, "completed")] {
+            let matching = terminal_events
+                .iter()
+                .filter(|data| data["job_id"] == job_id && data["outcome"] == outcome)
+                .count();
+            assert_eq!(matching, 1, "job {job_id} outcome {outcome}");
+        }
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -4652,6 +4778,7 @@ mod tests {
 
     #[test]
     fn cleanup_cancels_and_joins_listener_job() {
+        let _ = crate::observability::take_captured_events();
         let repo = Repository {
             root: PathBuf::from("/tmp/repo"),
         };
@@ -4679,11 +4806,22 @@ mod tests {
             },
         );
 
-        tui.cleanup_tui_jobs().unwrap();
+        tui.cleanup_tui_jobs(super::ShutdownReason::UserQuit)
+            .unwrap();
 
         stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert!(!tui.jobs.has_jobs());
         assert!(tui.opencode_listeners.is_empty());
+        let cleanup = crate::observability::take_captured_events()
+            .into_iter()
+            .filter(|event| event.target == "tui" && event.action == "shutdown_cleanup")
+            .filter_map(|event| event.data_json)
+            .map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap())
+            .find(|data| data["reason"] == "user_quit" && data["active_jobs"] == 1)
+            .unwrap();
+        assert_eq!(cleanup["reason"], "user_quit");
+        assert_eq!(cleanup["active_jobs"], 1);
+        assert_eq!(cleanup["unfinished_jobs"], 0);
     }
 
     fn wait_for_opencode_job(tui: &mut Tui, key: &super::OpencodePollKey) {

@@ -172,6 +172,48 @@ pub enum ProcessError {
     ThreadPanicked(&'static str),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessErrorKind {
+    Spawn,
+    Signal,
+    Wait,
+    Reap,
+    Stdin,
+    Read,
+    MissingPipe,
+    ThreadPanicked,
+}
+
+impl ProcessErrorKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Spawn => "spawn",
+            Self::Signal => "signal",
+            Self::Wait => "wait",
+            Self::Reap => "reap",
+            Self::Stdin => "stdin",
+            Self::Read => "read",
+            Self::MissingPipe => "missing_pipe",
+            Self::ThreadPanicked => "thread_panicked",
+        }
+    }
+}
+
+impl ProcessError {
+    pub const fn kind(&self) -> ProcessErrorKind {
+        match self {
+            Self::Spawn(_) => ProcessErrorKind::Spawn,
+            Self::Signal { .. } => ProcessErrorKind::Signal,
+            Self::Wait(_) => ProcessErrorKind::Wait,
+            Self::Reap(_) => ProcessErrorKind::Reap,
+            Self::Stdin(_) => ProcessErrorKind::Stdin,
+            Self::Read { .. } => ProcessErrorKind::Read,
+            Self::MissingPipe(_) => ProcessErrorKind::MissingPipe,
+            Self::ThreadPanicked(_) => ProcessErrorKind::ThreadPanicked,
+        }
+    }
+}
+
 impl fmt::Display for ProcessError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -283,12 +325,14 @@ fn run_output_with_settings(
                 ProcessError::Spawn(_) => format!("subprocess failed to start: {error}"),
                 _ => format!("subprocess supervision failed: {error}"),
             },
-            Some(observability::command_data_json(
+            Some(observability::process_error_data_json(
                 command,
                 include_argv,
-                Some(elapsed_ms),
-                None,
-                Some(&error.to_string()),
+                policy.label(),
+                elapsed_ms,
+                settings.deadline.as_millis() as i64,
+                error.kind().label(),
+                &error.to_string(),
             )),
         );
         format!("{command_display}: {error}")
@@ -1166,6 +1210,8 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, ProcessError::Spawn(_)));
+        assert_eq!(error.kind(), ProcessErrorKind::Spawn);
+        assert_eq!(error.kind().label(), "spawn");
         assert!(error.source().is_some());
     }
 

@@ -27,6 +27,15 @@ pub enum Durability {
     MacOsFullSync,
 }
 
+impl Durability {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::FileAndDirectory => "file_and_directory",
+            Self::MacOsFullSync => "macos_full_sync",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FinalSymlink {
     Follow,
@@ -77,7 +86,32 @@ pub enum Stage {
 
 impl fmt::Display for Stage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let label = match self {
+        formatter.write_str(self.description())
+    }
+}
+
+impl Stage {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CreateParent => "create_parent",
+            Self::ResolveFinalSymlink => "resolve_final_symlink",
+            Self::OpenLock => "open_lock",
+            Self::AcquireLock => "acquire_lock",
+            Self::Read => "read",
+            Self::Transform => "transform",
+            Self::InspectPermissions => "inspect_permissions",
+            Self::CreateStaging => "create_staging",
+            Self::Write => "write",
+            Self::ApplyPermissions => "apply_permissions",
+            Self::SyncFile => "sync_file",
+            Self::FullSyncFile => "full_sync_file",
+            Self::Rename => "rename",
+            Self::SyncParent => "sync_parent",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
             Self::CreateParent => "create parent directory",
             Self::ResolveFinalSymlink => "resolve final symlink",
             Self::OpenLock => "open lock file",
@@ -92,20 +126,42 @@ impl fmt::Display for Stage {
             Self::FullSyncFile => "fully sync staging file",
             Self::Rename => "rename staging file",
             Self::SyncParent => "sync parent directory",
-        };
-        formatter.write_str(label)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PersistenceErrorKind {
+    Contention,
+    InvalidData,
+    Io,
+}
+
+impl PersistenceErrorKind {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Contention => "contention",
+            Self::InvalidData => "invalid_data",
+            Self::Io => "io",
+        }
     }
 }
 
 #[derive(Debug)]
 pub struct PersistenceError {
+    kind: PersistenceErrorKind,
     stage: Stage,
     path: PathBuf,
     committed: bool,
+    durability: Option<Durability>,
     source: BoxError,
 }
 
 impl PersistenceError {
+    pub fn kind(&self) -> PersistenceErrorKind {
+        self.kind
+    }
+
     pub fn stage(&self) -> Stage {
         self.stage
     }
@@ -118,27 +174,70 @@ impl PersistenceError {
         self.committed
     }
 
+    pub fn durability(&self) -> Option<Durability> {
+        self.durability
+    }
+
     fn new(
         stage: Stage,
         path: impl Into<PathBuf>,
         committed: bool,
         source: impl Error + Send + Sync + 'static,
     ) -> Self {
+        Self::new_with_kind(
+            persistence_error_kind(stage),
+            stage,
+            path,
+            committed,
+            source,
+        )
+    }
+
+    fn new_with_kind(
+        kind: PersistenceErrorKind,
+        stage: Stage,
+        path: impl Into<PathBuf>,
+        committed: bool,
+        source: impl Error + Send + Sync + 'static,
+    ) -> Self {
         Self {
+            kind,
             stage,
             path: path.into(),
             committed,
+            durability: None,
             source: Box::new(source),
         }
     }
 
     fn boxed(stage: Stage, path: impl Into<PathBuf>, committed: bool, source: BoxError) -> Self {
         Self {
+            kind: persistence_error_kind(stage),
             stage,
             path: path.into(),
             committed,
+            durability: None,
             source,
         }
+    }
+}
+
+const fn persistence_error_kind(stage: Stage) -> PersistenceErrorKind {
+    match stage {
+        Stage::Transform => PersistenceErrorKind::InvalidData,
+        Stage::CreateParent
+        | Stage::ResolveFinalSymlink
+        | Stage::OpenLock
+        | Stage::AcquireLock
+        | Stage::Read
+        | Stage::InspectPermissions
+        | Stage::CreateStaging
+        | Stage::Write
+        | Stage::ApplyPermissions
+        | Stage::SyncFile
+        | Stage::FullSyncFile
+        | Stage::Rename
+        | Stage::SyncParent => PersistenceErrorKind::Io,
     }
 }
 
@@ -217,8 +316,72 @@ fn update_with_fault<T>(
     path: &Path,
     options: UpdateOptions,
     transform: impl FnOnce(FileContents) -> Result<(T, Option<Vec<u8>>), BoxError>,
-    mut fault: impl FnMut(Stage) -> io::Result<()>,
+    fault: impl FnMut(Stage) -> io::Result<()>,
 ) -> Result<T, PersistenceError> {
+    let result = update_inner_with_fault(path, options, transform, fault);
+    match result {
+        Ok((value, committed)) => {
+            crate::observability::emit_deferred(crate::observability::EventInput {
+                level: crate::observability::LogLevel::Debug,
+                target: "atomic_write",
+                action: "terminal",
+                operation_id: None,
+                parent_operation_id: None,
+                branch: None,
+                session: None,
+                message: if committed {
+                    "atomic replacement committed".to_string()
+                } else {
+                    "atomic replacement not needed".to_string()
+                },
+                data_json: Some(crate::observability::persistence_data_json(
+                    if committed { "success" } else { "no_change" },
+                    if committed {
+                        "sync_parent"
+                    } else {
+                        "transform"
+                    },
+                    committed,
+                    options.durability.label(),
+                    None,
+                )),
+            });
+            Ok(value)
+        }
+        Err(mut error) => {
+            error.durability = Some(options.durability);
+            crate::observability::emit_deferred(crate::observability::EventInput {
+                level: crate::observability::LogLevel::Error,
+                target: "atomic_write",
+                action: "terminal",
+                operation_id: None,
+                parent_operation_id: None,
+                branch: None,
+                session: None,
+                message: format!(
+                    "atomic replacement failed: category={}, stage={}",
+                    error.kind.label(),
+                    error.stage.label()
+                ),
+                data_json: Some(crate::observability::persistence_data_json(
+                    error.kind.label(),
+                    error.stage.label(),
+                    error.committed,
+                    options.durability.label(),
+                    Some(&error.to_string()),
+                )),
+            });
+            Err(error)
+        }
+    }
+}
+
+fn update_inner_with_fault<T>(
+    path: &Path,
+    options: UpdateOptions,
+    transform: impl FnOnce(FileContents) -> Result<(T, Option<Vec<u8>>), BoxError>,
+    mut fault: impl FnMut(Stage) -> io::Result<()>,
+) -> Result<(T, bool), PersistenceError> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -255,7 +418,7 @@ fn update_with_fault<T>(
     let (value, replacement) = transform(contents)
         .map_err(|error| PersistenceError::boxed(Stage::Transform, &target, false, error))?;
     let Some(replacement) = replacement else {
-        return Ok(value);
+        return Ok((value, false));
     };
 
     let (mut staging_file, staging_path) = create_staging(&target, target_parent)?;
@@ -293,7 +456,7 @@ fn update_with_fault<T>(
         .map_err(|error| PersistenceError::new(Stage::SyncParent, target_parent, true, error))?;
     fault(Stage::SyncParent)
         .map_err(|error| PersistenceError::new(Stage::SyncParent, target_parent, true, error))?;
-    Ok(value)
+    Ok((value, true))
 }
 
 fn resolve_final_symlink(path: &Path, behavior: FinalSymlink) -> Result<PathBuf, PersistenceError> {
@@ -339,7 +502,8 @@ fn acquire_lock(file: &File, path: &Path, timeout: Duration) -> Result<(), Persi
             Ok(()) => return Ok(()),
             Err(fs::TryLockError::WouldBlock) => {
                 if started.elapsed() >= timeout {
-                    return Err(PersistenceError::new(
+                    return Err(PersistenceError::new_with_kind(
+                        PersistenceErrorKind::Contention,
                         Stage::AcquireLock,
                         path,
                         false,
@@ -435,6 +599,7 @@ mod tests {
 
     #[test]
     fn pre_rename_failure_leaves_old_file_and_removes_staging() {
+        let _ = crate::observability::take_captured_events();
         let dir = temp_dir("failure");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
@@ -455,7 +620,25 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.stage(), Stage::SyncFile);
+        assert_eq!(error.kind(), PersistenceErrorKind::Io);
         assert!(!error.committed());
+        assert_eq!(error.durability(), Some(Durability::MacOsFullSync));
+        assert!(error.source().is_some());
+        let event = crate::observability::take_captured_events()
+            .into_iter()
+            .filter(|event| event.target == "atomic_write" && event.action == "terminal")
+            .filter_map(|event| event.data_json)
+            .map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap())
+            .find(|data| {
+                data["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("injected sync failure"))
+            })
+            .unwrap();
+        assert_eq!(event["category"], "io");
+        assert_eq!(event["stage"], "sync_file");
+        assert_eq!(event["committed"], false);
+        assert_eq!(event["durability"], "macos_full_sync");
         assert_eq!(fs::read_to_string(&path).unwrap(), "value = 'old'\n");
         let staging_count = fs::read_dir(&dir)
             .unwrap()
@@ -488,7 +671,9 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(error.stage(), Stage::SyncParent);
+        assert_eq!(error.kind(), PersistenceErrorKind::Io);
         assert!(error.committed());
+        assert_eq!(error.durability(), Some(Durability::MacOsFullSync));
         assert_eq!(error.path(), dir.as_path());
         assert_eq!(fs::read_to_string(&path).unwrap(), "value = 'new'\n");
         fs::remove_dir_all(dir).unwrap();
@@ -508,7 +693,9 @@ mod tests {
         let error = update(&path, options, |_| Ok(((), Some(Vec::new())))).unwrap_err();
 
         assert_eq!(error.stage(), Stage::AcquireLock);
+        assert_eq!(error.kind(), PersistenceErrorKind::Contention);
         assert!(!error.committed());
+        assert_eq!(error.durability(), Some(Durability::MacOsFullSync));
         drop(lock);
         assert!(lock_path.exists());
         fs::remove_dir_all(dir).unwrap();

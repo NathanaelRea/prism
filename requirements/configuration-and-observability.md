@@ -77,6 +77,21 @@
 - **Behavior**: Corruption-class SQLite failures trigger best-effort read-only
   `quick_check` and foreign-key diagnostics without replacing the original error
   or modifying the database.
+- **Behavior**: Reliability boundaries use the existing event store with stable
+  structured fields: supervised jobs record identity, generation, terminal
+  outcome, elapsed time, and deadline; queue-pressure records are aggregated;
+  SQLite failures expose classified primary and extended codes and busy time;
+  atomic writes record category, stage, commit state, and durability; and TUI
+  cleanup records its shutdown reason and active/unfinished job counts.
+- **Constraint**: SQLite failures, supervised-job terminals, TUI queue pressure
+  and shutdown cleanup, and atomic-write terminals are deferred rather than
+  synchronously opening the observability database. They remain in the runtime
+  log and are flushed to the event table after a later successful typed writer
+  operation. The bounded deferred queue reports sparse overflow totals; overflow
+  can omit database copies but not the original runtime-log evidence.
+- **Invariant**: Structured diagnostics retain command-argument and free-form
+  secret redaction. High-rate SSE drops are represented by sparse aggregate queue
+  events rather than one synchronous event per drop.
 - **Invariant**: Cache observations distinguish never loaded, refreshing, stale,
   failed, confirmed absent, and present states. A transient failure does not
   erase known state, while confirmed absence requires affirmative evidence.
