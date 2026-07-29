@@ -748,19 +748,42 @@ pub fn run_readonly_query(repo: &Repository, query: &str) -> Result<(), String> 
     Ok(())
 }
 
+#[track_caller]
 pub fn with_writable_db<T>(
     repo: &Repository,
     run: impl FnOnce(&Connection) -> Result<T, String>,
 ) -> Result<T, String> {
-    writable_db(repo).run(run)
+    let caller = std::panic::Location::caller();
+    writable_db(repo).run_observed(&format!("{}:{}", caller.file(), caller.line()), run)
 }
 
+pub fn with_writable_db_named<T>(
+    repo: &Repository,
+    operation: &'static str,
+    run: impl FnOnce(&Connection) -> Result<T, String>,
+) -> Result<T, String> {
+    writable_db(repo).run_observed(operation, run)
+}
+
+#[track_caller]
 pub fn with_writable_db_mut<T>(
     repo: &Repository,
     run: impl FnOnce(&mut Connection) -> Result<T, String>,
 ) -> Result<T, String> {
+    let caller = std::panic::Location::caller();
+    let operation = format!("{}:{}", caller.file(), caller.line());
+    let started = Instant::now();
+    let open_started = Instant::now();
     let mut conn = open_observed_writable_db_path(&db_path(repo))?;
+    let open_elapsed = open_started.elapsed();
     let result = run(&mut conn);
+    record_db_operation(
+        "writable",
+        &operation,
+        started.elapsed(),
+        open_elapsed,
+        result.is_ok(),
+    );
     if result.is_ok() {
         drop(conn);
         crate::storage::monitor_wal_growth(&db_path(repo));
@@ -769,13 +792,46 @@ pub fn with_writable_db_mut<T>(
     result
 }
 
+#[track_caller]
 pub fn with_nonblocking_read_db<T>(
     repo: &Repository,
     run: impl FnOnce(&Connection) -> Result<T, String>,
 ) -> Result<T, String> {
+    let caller = std::panic::Location::caller();
+    with_nonblocking_read_db_observed(
+        repo,
+        &format!("{}:{}", caller.file(), caller.line()),
+        run,
+    )
+}
+
+pub fn with_nonblocking_read_db_named<T>(
+    repo: &Repository,
+    operation: &'static str,
+    run: impl FnOnce(&Connection) -> Result<T, String>,
+) -> Result<T, String> {
+    with_nonblocking_read_db_observed(repo, operation, run)
+}
+
+fn with_nonblocking_read_db_observed<T>(
+    repo: &Repository,
+    operation: &str,
+    run: impl FnOnce(&Connection) -> Result<T, String>,
+) -> Result<T, String> {
+    let started = Instant::now();
+    let open_started = Instant::now();
     let path = db_path(repo);
     let conn = open_observed_readonly_db_path(&path)?;
-    run(&conn)
+    let open_elapsed = open_started.elapsed();
+    let result = run(&conn);
+    record_db_operation(
+        "readonly",
+        operation,
+        started.elapsed(),
+        open_elapsed,
+        result.is_ok(),
+    );
+    result
 }
 
 pub fn writable_db(repo: &Repository) -> WritableDb {
@@ -790,9 +846,29 @@ pub struct WritableDb {
 }
 
 impl WritableDb {
+    #[track_caller]
     pub fn run<T>(&self, run: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
+        let caller = std::panic::Location::caller();
+        self.run_observed(&format!("{}:{}", caller.file(), caller.line()), run)
+    }
+
+    fn run_observed<T>(
+        &self,
+        operation: &str,
+        run: impl FnOnce(&Connection) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let started = Instant::now();
+        let open_started = Instant::now();
         let conn = open_observed_writable_db_path(&self.path)?;
+        let open_elapsed = open_started.elapsed();
         let result = run(&conn);
+        record_db_operation(
+            "writable",
+            operation,
+            started.elapsed(),
+            open_elapsed,
+            result.is_ok(),
+        );
         if result.is_ok() {
             drop(conn);
             crate::storage::monitor_wal_growth(&self.path);
@@ -800,6 +876,30 @@ impl WritableDb {
         }
         result
     }
+}
+
+fn record_db_operation(
+    access: &'static str,
+    operation: &str,
+    total: std::time::Duration,
+    open: std::time::Duration,
+    success: bool,
+) {
+    crate::flight_recorder::record(
+        "sqlite",
+        "operation",
+        Some(total),
+        vec![
+            crate::flight_recorder::text("name", operation),
+            crate::flight_recorder::text("access", access),
+            crate::flight_recorder::unsigned("open_us", open.as_micros()),
+            crate::flight_recorder::unsigned(
+                "query_or_tx_us",
+                total.saturating_sub(open).as_micros(),
+            ),
+            crate::flight_recorder::boolean("success", success),
+        ],
+    );
 }
 
 fn open_observed_writable_db_path(path: &Path) -> Result<Connection, String> {

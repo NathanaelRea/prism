@@ -228,7 +228,10 @@ impl Error for StorageError {
 }
 
 pub fn open_writable(path: &Path) -> Result<Connection, StorageError> {
-    open_writable_inner(path).map_err(|error| diagnose_corruption(path, error))
+    let started = Instant::now();
+    let result = open_writable_inner(path).map_err(|error| diagnose_corruption(path, error));
+    record_open("writable", started.elapsed(), &result);
+    result
 }
 
 fn open_writable_inner(path: &Path) -> Result<Connection, StorageError> {
@@ -278,7 +281,31 @@ fn open_writable_inner(path: &Path) -> Result<Connection, StorageError> {
 }
 
 pub fn open_readonly(path: &Path) -> Result<Connection, StorageError> {
-    open_readonly_inner(path).map_err(|error| diagnose_corruption(path, error))
+    let started = Instant::now();
+    let result = open_readonly_inner(path).map_err(|error| diagnose_corruption(path, error));
+    record_open("readonly", started.elapsed(), &result);
+    result
+}
+
+fn record_open(
+    access: &'static str,
+    elapsed: Duration,
+    result: &Result<Connection, StorageError>,
+) {
+    let mut fields = vec![
+        crate::flight_recorder::text("access", access),
+        crate::flight_recorder::boolean("success", result.is_ok()),
+    ];
+    if let Err(error) = result {
+        fields.push(crate::flight_recorder::text("error_kind", error.kind.label()));
+        if let Some(busy) = error.busy_elapsed {
+            fields.push(crate::flight_recorder::unsigned(
+                "busy_wait_us",
+                busy.as_micros(),
+            ));
+        }
+    }
+    crate::flight_recorder::record("sqlite", "open", Some(elapsed), fields);
 }
 
 fn open_readonly_inner(path: &Path) -> Result<Connection, StorageError> {

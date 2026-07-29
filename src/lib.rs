@@ -8,6 +8,7 @@ pub mod cli;
 mod config;
 mod durability;
 mod execution;
+mod flight_recorder;
 pub mod file_persistence;
 mod git;
 mod github;

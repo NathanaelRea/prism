@@ -17,6 +17,12 @@ use std::process::Command as ProcessCommand;
 
 pub fn run() -> Result<(), String> {
     let args = Args::parse(std::env::args_os().skip(1))?;
+    if let CommandKind::Debug(DebugCommand::Record(options)) = &args.command {
+        let repo = load_integrity_repo_context(args.repo.as_deref())?;
+        let path = crate::flight_recorder::trigger(&repo, *options)?;
+        println!("{}", path.display());
+        return Ok(());
+    }
     if matches!(args.command, CommandKind::Debug(DebugCommand::Integrity)) {
         let repo = load_integrity_repo_context(args.repo.as_deref())?;
         return crate::storage::print_integrity(&observability::db_path(&repo))
@@ -347,6 +353,9 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
         })?;
         let sessions =
             observability::phase("discover_sessions", || discover_workspace_sessions(&repos))?;
+        let _flight_recorder = crate::flight_recorder::serve_repositories(
+            repos.iter().map(|managed| &managed.repo),
+        );
         let mut tui = observability::phase("initialize_tui", || {
             Ok(tui::Tui::new(repos, selected_repo, sessions))
         })?;
@@ -664,6 +673,9 @@ fn run_debug_command(
         DebugCommand::Startup => run_debug_startup(repo, config),
         DebugCommand::Integrity => {
             unreachable!("integrity runs before observability initialization")
+        }
+        DebugCommand::Record(_) => {
+            unreachable!("record runs before observability initialization")
         }
     }
 }
