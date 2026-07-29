@@ -839,6 +839,23 @@ pub(crate) fn worktree_incarnation(path: &Path) -> String {
     let Ok(metadata) = fs::metadata(&git_link) else {
         return String::new();
     };
+    if metadata.is_dir() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            return format!("directory:{}:{}", metadata.dev(), metadata.ino());
+        }
+        #[cfg(not(unix))]
+        {
+            let created = metadata
+                .created()
+                .ok()
+                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos())
+                .unwrap_or_default();
+            return format!("directory:{created}");
+        }
+    }
     let modified = metadata
         .modified()
         .ok()
@@ -1025,12 +1042,13 @@ pub(crate) fn worktree_harness(
             .map_err(|error| format!("load worktree harness: {error}"))?;
         if let Some((path, incarnation, harness_id, policy)) = stored
             && path == session.path_display
-            && incarnation == session.incarnation
+            && worktree_incarnations_match(&incarnation, &session.incarnation)
         {
-            return Ok(WorktreeHarnessAssociation {
-                harness_id,
-                keep: policy == "keep",
-            });
+            let keep = policy == "keep";
+            if incarnation != session.incarnation {
+                set_worktree_harness_with_conn(conn, session, &harness_id, keep)?;
+            }
+            return Ok(WorktreeHarnessAssociation { harness_id, keep });
         }
         // Before multi-harness support every existing Agent Session was OpenCode.
         set_worktree_harness_with_conn(conn, session, "opencode", false)?;
@@ -1039,6 +1057,28 @@ pub(crate) fn worktree_harness(
             keep: false,
         })
     })
+}
+
+fn worktree_incarnations_match(stored: &str, current: &str) -> bool {
+    if stored == current {
+        return true;
+    }
+    let Some(current_inode) = current
+        .strip_prefix("directory:")
+        .and_then(|identity| identity.rsplit(':').next())
+    else {
+        return false;
+    };
+    let mut legacy = stored.splitn(4, ':');
+    let (Some(legacy_inode), Some(modified), Some(length), Some(target)) =
+        (legacy.next(), legacy.next(), legacy.next(), legacy.next())
+    else {
+        return false;
+    };
+    legacy_inode == current_inode
+        && modified.parse::<u128>().is_ok()
+        && length.parse::<u64>().is_ok()
+        && target.is_empty()
 }
 
 pub(crate) fn set_worktree_harness(
@@ -2017,6 +2057,26 @@ exit 0
     }
 
     #[test]
+    fn worktree_incarnation_ignores_git_directory_activity_but_detects_replacement() {
+        let temp = unique_temp_dir("prism-worktree-directory-incarnation-test");
+        let worktree = temp.join("worktree");
+        let git_dir = worktree.join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        let original = worktree_incarnation(&worktree);
+
+        fs::write(git_dir.join("FETCH_HEAD"), "refreshed\n").unwrap();
+        assert_eq!(worktree_incarnation(&worktree), original);
+
+        let replacement = worktree.join("replacement.git");
+        fs::create_dir(&replacement).unwrap();
+        fs::rename(&git_dir, worktree.join("old.git")).unwrap();
+        fs::rename(replacement, &git_dir).unwrap();
+        assert_ne!(worktree_incarnation(&worktree), original);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn worktree_session_default_branch_sorts_first() {
         let mut config = test_config();
         config.default_base = Some("main".to_string());
@@ -2130,6 +2190,48 @@ exit 0
                 keep: false,
             }
         );
+    }
+
+    #[test]
+    fn worktree_harness_migrates_legacy_directory_incarnation() {
+        let temp = unique_temp_dir("prism-worktree-harness-incarnation-migration-test");
+        let worktree = temp.join("worktree");
+        fs::create_dir_all(worktree.join(".git")).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        let mut session = test_session("main", &worktree.display().to_string());
+        session.incarnation = worktree_incarnation(&worktree);
+        set_worktree_harness(&repo, &session, "codex", true).unwrap();
+        let inode = session.incarnation.rsplit(':').next().unwrap();
+        let legacy_incarnation = format!("{inode}:123:40:");
+        observability::with_writable_db(&repo, |conn| {
+            conn.execute(
+                "update worktree_harness set worktree_incarnation = ?1 where branch = ?2",
+                params![legacy_incarnation, session.branch.as_str()],
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(
+            worktree_harness(&repo, &session).unwrap(),
+            WorktreeHarnessAssociation {
+                harness_id: "codex".to_string(),
+                keep: true,
+            }
+        );
+        let migrated = observability::with_writable_db(&repo, |conn| {
+            conn.query_row(
+                "select worktree_incarnation from worktree_harness where branch = ?1",
+                params![session.branch.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert_eq!(migrated, session.incarnation);
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
