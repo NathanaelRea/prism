@@ -168,7 +168,7 @@ fn harness_run_command(
 fn spawn_harness(
     command: &mut Command,
     invocation: &crate::harness::Invocation,
-) -> Result<Child, String> {
+) -> Result<crate::process::SupervisedChild, String> {
     let cwd = command
         .get_current_dir()
         .map(Path::to_path_buf)
@@ -256,7 +256,7 @@ pub(super) fn finish_step_after_exit(
 pub(super) fn claim_spawned_process(
     conn: &rusqlite::Connection,
     step: &mut AutoStepRun,
-    child: &mut Child,
+    child: &mut crate::process::SupervisedChild,
 ) -> Result<bool, String> {
     let step_id = step
         .id
@@ -291,7 +291,7 @@ pub(super) fn claim_spawned_process(
 pub(super) fn collect_child_output(
     conn: &rusqlite::Connection,
     step: &mut AutoStepRun,
-    child: &mut Child,
+    child: &mut crate::process::SupervisedChild,
     max_output_lines_per_step: usize,
     structured_events: bool,
     output: &mut dyn Write,
@@ -309,10 +309,11 @@ pub(super) fn collect_child_output(
     let stderr_reader = spawn_reader_thread(StreamKind::Stderr, stderr, tx);
 
     let mut readers_open = 2;
-    let started = std::time::Instant::now();
     let mut stream_result = loop {
-        let deadline = crate::process::ProcessPolicy::WorkflowStep.deadline();
-        if started.elapsed() >= deadline {
+        let deadline = child
+            .deadline()
+            .expect("harness child has a workflow deadline");
+        if child.deadline_exceeded() {
             break Err(format!(
                 "harness timed out after {} ms",
                 deadline.as_millis()
@@ -341,8 +342,7 @@ pub(super) fn collect_child_output(
                 if let Err(error) = crate::execution::validate_installed_claim(conn) {
                     break Err(error);
                 }
-                let deadline = crate::process::ProcessPolicy::WorkflowStep.deadline();
-                if started.elapsed() >= deadline {
+                if child.deadline_exceeded() {
                     break Err(format!(
                         "harness timed out after {} ms",
                         deadline.as_millis()
@@ -356,11 +356,13 @@ pub(super) fn collect_child_output(
     };
 
     let status = if stream_result.is_ok() {
-        let deadline = crate::process::ProcessPolicy::WorkflowStep.deadline();
+        let deadline = child
+            .deadline()
+            .expect("harness child has a workflow deadline");
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => break Some(status),
-                Ok(None) if started.elapsed() < deadline => {
+                Ok(None) if !child.deadline_exceeded() => {
                     std::thread::sleep(std::time::Duration::from_millis(250));
                 }
                 Ok(None) => {
@@ -391,11 +393,14 @@ pub(super) fn collect_child_output(
     stdout_result?;
     stderr_result?;
     stream_result?;
+    child
+        .finish_stdin()
+        .map_err(|error| format!("deliver harness stdin: {error}"))?;
     let status = status.expect("successful stream collection has an exit status");
     Ok(status.code().unwrap_or(1))
 }
 
-fn terminate_auto_child(step: &AutoStepRun, child: &mut Child) {
+fn terminate_auto_child(step: &AutoStepRun, child: &mut crate::process::SupervisedChild) {
     let _ = step;
     let _ = crate::harness::terminate_active_process(child);
 }

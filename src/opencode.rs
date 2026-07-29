@@ -29,9 +29,9 @@ const SERVER_START_POLL: Duration = Duration::from_millis(100);
 
 static OWNED_SERVER_PROCESSES: OnceLock<Mutex<BTreeMap<u32, OwnedServerProcess>>> = OnceLock::new();
 
-#[derive(Clone, Copy, Debug)]
 struct OwnedServerProcess {
     start_time_ticks: Option<u64>,
+    child: crate::process::SupervisedChild,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -217,21 +217,19 @@ pub fn ensure_opencode_server_with_program(
     let server_pid = if check_health(&server_url) {
         existing.as_ref().and_then(|runtime| runtime.server_pid)
     } else {
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .arg("serve")
             .args(["--hostname", "127.0.0.1"])
             .args(["--port", &port.to_string()])
             .current_dir(worktree)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
+            .stderr(Stdio::null());
+        let mut child = crate::process::SupervisedChild::spawn(&mut command, None, None)
             .map_err(|error| format!("start opencode server: {error}"))?;
-        record_owned_server_process(child.id());
         if let Err(error) = wait_for_health(&server_url) {
-            let _ = child.kill();
-            let _ = child.wait();
-            forget_owned_server_process(child.id());
+            let _ = child.terminate();
             return Err(error);
         }
         let pid = child.id();
@@ -254,11 +252,12 @@ pub fn ensure_opencode_server_with_program(
     };
     if let Err(error) = save_runtime(repo, &runtime) {
         if let Some(mut child) = started_server {
-            let _ = child.kill();
-            let _ = child.wait();
-            forget_owned_server_process(child.id());
+            let _ = child.terminate();
         }
         return Err(error);
+    }
+    if let Some(child) = started_server {
+        record_owned_server_process(child);
     }
     Ok(runtime)
 }
@@ -407,38 +406,22 @@ pub fn shutdown_owned_server(runtime: &OpencodeRuntime) -> Result<(), String> {
     let Some(pid) = runtime.server_pid else {
         return Ok(());
     };
-    let Some(owned) = owned_server_process(pid) else {
+    let Some(mut owned) = take_owned_server_process(pid) else {
         return Ok(());
     };
-    if !process_matches_owned_start(pid, owned) {
-        forget_owned_server_process(pid);
+    if !process_matches_owned_start(pid, owned.start_time_ticks) {
+        let _ = owned.child.try_wait();
         return Ok(());
     }
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-        if result == 0 {
-            forget_owned_server_process(pid);
-            Ok(())
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                forget_owned_server_process(pid);
-                Ok(())
-            } else {
-                Err(format!("stop opencode server {pid}: {error}"))
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        Ok(())
-    }
+    owned
+        .child
+        .terminate()
+        .map(|_| ())
+        .map_err(|error| format!("stop opencode server {pid}: {error}"))
 }
 
 pub(crate) fn shutdown_stored_server(runtime: &OpencodeRuntime) -> Result<(), String> {
-    if runtime.server_pid.and_then(owned_server_process).is_some() {
+    if runtime.server_pid.is_some_and(owned_server_process) {
         return shutdown_owned_server(runtime);
     }
     let Some(pid) = runtime.server_pid else {
@@ -524,29 +507,34 @@ fn owned_server_processes() -> &'static Mutex<BTreeMap<u32, OwnedServerProcess>>
     OWNED_SERVER_PROCESSES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn record_owned_server_process(pid: u32) {
-    if let Ok(mut processes) = owned_server_processes().lock() {
-        processes.insert(
-            pid,
-            OwnedServerProcess {
-                start_time_ticks: process_start_time_ticks(pid),
-            },
-        );
-    }
+fn record_owned_server_process(child: crate::process::SupervisedChild) {
+    let pid = child.id();
+    let process = OwnedServerProcess {
+        start_time_ticks: process_start_time_ticks(pid),
+        child,
+    };
+    owned_server_processes()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(pid, process);
 }
 
-fn owned_server_process(pid: u32) -> Option<OwnedServerProcess> {
-    owned_server_processes().lock().ok()?.get(&pid).copied()
+fn owned_server_process(pid: u32) -> bool {
+    owned_server_processes()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains_key(&pid)
 }
 
-fn forget_owned_server_process(pid: u32) {
-    if let Ok(mut processes) = owned_server_processes().lock() {
-        processes.remove(&pid);
-    }
+fn take_owned_server_process(pid: u32) -> Option<OwnedServerProcess> {
+    owned_server_processes()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&pid)
 }
 
-fn process_matches_owned_start(pid: u32, owned: OwnedServerProcess) -> bool {
-    match (owned.start_time_ticks, process_start_time_ticks(pid)) {
+fn process_matches_owned_start(pid: u32, expected_start_time_ticks: Option<u64>) -> bool {
+    match (expected_start_time_ticks, process_start_time_ticks(pid)) {
         (Some(expected), Some(actual)) => expected == actual,
         (Some(_), None) => false,
         (None, _) => true,
@@ -2898,6 +2886,81 @@ mod tests {
 
         result.unwrap();
         shutdown.unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn owned_server_shutdown_kills_term_ignoring_descendant_and_reaps_leader() {
+        let temp = unique_temp_dir("prism-owned-opencode-process");
+        fs::create_dir_all(&temp).unwrap();
+        let descendant_path = temp.join("descendant.pid");
+        let script = r#"
+            trap '' TERM
+            (
+                trap '' TERM
+                while :; do sleep 1; done
+            ) &
+            descendant=$!
+            printf '%s\n' "$descendant" > "$1"
+            wait "$descendant"
+        "#;
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .arg("owned-opencode-fixture")
+            .arg(&descendant_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = crate::process::SupervisedChild::spawn(&mut command, None, None).unwrap();
+        let process_id = child.id();
+        record_owned_server_process(child);
+        let runtime = OpencodeRuntime {
+            repo_root: "/repo".to_string(),
+            harness_id: "opencode".to_string(),
+            branch: "feature/test".to_string(),
+            worktree_path: "/repo/worktree".to_string(),
+            server_port: 41_000,
+            server_url: "http://127.0.0.1:41000".to_string(),
+            server_pid: Some(process_id),
+            server_start_time_ticks: process_start_time_ticks(process_id),
+            opencode_session_id: None,
+            generation: 0,
+            updated_unix_ms: 0,
+        };
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !descendant_path.exists() {
+            assert!(std::time::Instant::now() < ready_deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let descendant_id = fs::read_to_string(&descendant_path)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        shutdown_owned_server(&runtime).unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(!owned_server_process(process_id));
+        for pid in [process_id as libc::pid_t, descendant_id] {
+            let gone_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let result = unsafe { libc::kill(pid, 0) };
+                if result != 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < gone_deadline,
+                    "owned server process {pid} survived shutdown"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        fs::remove_dir_all(temp).unwrap();
     }
 
     fn shell_quote_for_test(value: &str) -> String {

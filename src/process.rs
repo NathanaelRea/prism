@@ -1,7 +1,9 @@
+use std::cell::RefCell;
 use std::env;
 use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Write};
+use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -10,6 +12,30 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::observability::{self, LogLevel};
+
+thread_local! {
+    static CURRENT_CANCELLATION: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn with_cancellation<T>(canceled: Arc<AtomicBool>, operation: impl FnOnce() -> T) -> T {
+    struct ResetCancellation(Option<Arc<AtomicBool>>);
+
+    impl Drop for ResetCancellation {
+        fn drop(&mut self) {
+            CURRENT_CANCELLATION.with(|current| {
+                current.replace(self.0.take());
+            });
+        }
+    }
+
+    let previous = CURRENT_CANCELLATION.with(|current| current.replace(Some(canceled)));
+    let _reset = ResetCancellation(previous);
+    operation()
+}
+
+fn current_cancellation() -> Option<Arc<AtomicBool>> {
+    CURRENT_CANCELLATION.with(|current| current.borrow().clone())
+}
 
 pub struct ProcessOutput {
     pub status: ExitStatus,
@@ -78,6 +104,107 @@ struct PolicySettings {
     deadline: Duration,
     termination_grace: Duration,
     capture_bytes: usize,
+}
+
+pub struct SupervisedChild {
+    child: Child,
+    stdin_writer: Option<JoinHandle<io::Result<()>>>,
+    started: Instant,
+    deadline: Option<Duration>,
+    termination_grace: Duration,
+    terminate_on_drop: bool,
+}
+
+impl SupervisedChild {
+    pub fn spawn(
+        command: &mut Command,
+        policy: Option<ProcessPolicy>,
+        input: Option<Vec<u8>>,
+    ) -> Result<Self, ProcessError> {
+        command.stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            command.process_group(0);
+        }
+
+        let started = Instant::now();
+        let mut child = command.spawn().map_err(ProcessError::Spawn)?;
+        let stdin_writer = if let Some(bytes) = input {
+            let Some(mut stdin) = child.stdin.take() else {
+                let _ = terminate_active_child(&mut child, Duration::from_secs(1));
+                return Err(ProcessError::MissingPipe("stdin"));
+            };
+            Some(std::thread::spawn(move || stdin.write_all(&bytes)))
+        } else {
+            None
+        };
+        let settings = policy.map(ProcessPolicy::settings);
+        Ok(Self {
+            child,
+            stdin_writer,
+            started,
+            deadline: settings.map(|settings| settings.deadline),
+            termination_grace: settings
+                .map(|settings| settings.termination_grace)
+                .unwrap_or(Duration::from_secs(1)),
+            terminate_on_drop: policy.is_some(),
+        })
+    }
+
+    pub fn deadline(&self) -> Option<Duration> {
+        self.deadline
+    }
+
+    pub fn deadline_exceeded(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| self.started.elapsed() >= deadline)
+    }
+
+    pub fn finish_stdin(&mut self) -> Result<(), ProcessError> {
+        join_stdin(self.stdin_writer.take())
+    }
+
+    pub fn terminate(&mut self) -> Result<TerminationStage, ProcessError> {
+        let termination = terminate_active_child(&mut self.child, self.termination_grace);
+        // Closing the process group releases a writer blocked on a full stdin pipe.
+        let _ = self.finish_stdin();
+        termination
+    }
+}
+
+impl Deref for SupervisedChild {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.child
+    }
+}
+
+impl DerefMut for SupervisedChild {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.child
+    }
+}
+
+impl Drop for SupervisedChild {
+    fn drop(&mut self) {
+        let child_running = !matches!(self.child.try_wait(), Ok(Some(_)));
+        if child_running
+            && (self.terminate_on_drop
+                || self
+                    .stdin_writer
+                    .as_ref()
+                    .is_some_and(|writer| !writer.is_finished()))
+        {
+            let _ = terminate_active_child(&mut self.child, self.termination_grace);
+        }
+        let _ = self.finish_stdin();
+    }
 }
 
 impl PolicySettings {
@@ -315,7 +442,8 @@ fn run_output_with_settings(
         )),
     );
     let started = Instant::now();
-    let outcome = supervise(command, policy, input, None).map_err(|error| {
+    let canceled = current_cancellation();
+    let outcome = supervise(command, policy, input, canceled.as_deref()).map_err(|error| {
         let elapsed_ms = started.elapsed().as_millis() as i64;
         operation.finish(
             LogLevel::Error,
@@ -433,6 +561,8 @@ pub fn supervise(
     input: ProcessInput<'_>,
     canceled: Option<&AtomicBool>,
 ) -> Result<ProcessOutcome, ProcessError> {
+    let current_cancellation = canceled.is_none().then(current_cancellation).flatten();
+    let canceled = canceled.or(current_cancellation.as_deref());
     supervise_with_settings(command, policy, policy.settings(), input, canceled)
 }
 

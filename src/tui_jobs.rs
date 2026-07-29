@@ -160,7 +160,7 @@ pub(crate) fn latest_channel<K: Ord, T>(
 }
 
 struct CancellationState {
-    canceled: AtomicBool,
+    canceled: Arc<AtomicBool>,
     mutex: Mutex<()>,
     wake: Condvar,
 }
@@ -405,7 +405,7 @@ where
             deadline: delivery.timeout.map(|timeout| started_at + timeout),
         };
         let cancellation = Arc::new(CancellationState {
-            canceled: AtomicBool::new(false),
+            canceled: Arc::new(AtomicBool::new(false)),
             mutex: Mutex::new(()),
             wake: Condvar::new(),
         });
@@ -437,7 +437,11 @@ where
         };
         let terminal_metadata = metadata.clone();
         let thread = thread::Builder::new().name(name).spawn(move || {
-            let result = catch_unwind(AssertUnwindSafe(|| job(context.clone())));
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                crate::process::with_cancellation(context.cancellation.canceled.clone(), || {
+                    job(context.clone())
+                })
+            }));
             match result {
                 Err(payload) => JobCompletion {
                     outcome: JobOutcome::Panicked(panic_message(payload)),
@@ -743,6 +747,8 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::process::Command;
     use std::time::Duration;
 
     use super::{JobMessage, JobOutcome, JobRegistry};
@@ -921,6 +927,53 @@ mod tests {
         drop(jobs);
 
         stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn canceled_job_terminates_and_joins_a_supervised_domain_command() {
+        let marker = std::env::temp_dir().join(format!(
+            "prism-canceled-job-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let job_marker = marker.clone();
+        let mut jobs = JobRegistry::<&'static str, &'static str, ()>::default();
+        jobs.spawn(
+            "action",
+            "command",
+            0,
+            Some(Duration::from_secs(30)),
+            "supervised-command".to_string(),
+            move |_| {
+                crate::process::run_status(
+                    Command::new("sh")
+                        .arg("-c")
+                        .arg("printf ready > \"$1\"; exec sleep 30")
+                        .arg("job-command")
+                        .arg(&job_marker),
+                    crate::process::ProcessPolicy::WorkflowStep,
+                )?;
+                Ok(None)
+            },
+        );
+        let marker_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !marker.exists() {
+            assert!(std::time::Instant::now() < marker_deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let canceled_at = std::time::Instant::now();
+        jobs.stop_accepting();
+        jobs.cancel_all();
+
+        assert!(matches!(wait_for_terminal(&mut jobs), JobOutcome::Canceled));
+        assert!(canceled_at.elapsed() < Duration::from_secs(1));
+        assert!(!jobs.has_jobs());
+        std::fs::remove_file(marker).unwrap();
     }
 
     fn wait_until_all_finished<K, Q, P>(jobs: &mut JobRegistry<K, Q, P>)
