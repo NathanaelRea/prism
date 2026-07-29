@@ -1215,6 +1215,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn terminating_absent_process_group_is_successful() {
+        terminate_process(i32::MAX as u32, None).unwrap();
+    }
+
+    #[test]
     #[cfg(unix)]
     fn large_stdin_to_non_reading_term_ignoring_child_is_deadline_bounded() {
         let invocation = Invocation {
