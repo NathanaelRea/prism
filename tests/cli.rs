@@ -384,6 +384,52 @@ fn db_whitespace_query_stays_non_interactive() {
 }
 
 #[test]
+fn debug_integrity_reports_healthy_database_read_only() {
+    let temp = TempDir::new("debug-integrity-healthy");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+    let path_output = run(["db", "path"], &repo, &config_home);
+    assert!(path_output.status.success(), "{}", stderr(&path_output));
+    let path = stdout(&path_output).trim().to_string();
+    let before = fs::read(&path).expect("read database before integrity check");
+
+    let output = run(["debug", "integrity"], &repo, &config_home);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let output = stdout(&output);
+    assert!(output.contains(&format!("path = {path}")));
+    assert!(output.contains("user_version = 1"));
+    assert!(output.contains("journal_mode = wal"));
+    assert!(output.contains("integrity_check:\n  ok"));
+    assert!(output.contains("foreign_key_check:\n  ok"));
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn debug_integrity_reports_corruption_and_preserves_original_bytes() {
+    let temp = TempDir::new("debug-integrity-corrupt");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+    let path_output = run(["db", "path"], &repo, &config_home);
+    assert!(path_output.status.success(), "{}", stderr(&path_output));
+    let path = PathBuf::from(stdout(&path_output).trim());
+    let corrupt = b"this is not a sqlite database";
+    fs::write(&path, corrupt).expect("corrupt database");
+
+    let output = run(["debug", "integrity"], &repo, &config_home);
+
+    assert!(!output.status.success());
+    let output_text = stdout(&output);
+    assert!(output_text.contains(&format!("path = {}", path.display())));
+    assert!(output_text.contains("user_version = unavailable"));
+    assert!(output_text.contains("integrity_check:\n  ERROR:"));
+    assert!(stderr(&output).contains("not a database"));
+    assert_eq!(fs::read(&path).unwrap(), corrupt);
+}
+
+#[test]
 fn unknown_argument_fails_with_stderr() {
     let temp = TempDir::new("unknown-arg");
     let output = run(["--definitely-not-real"], temp.path(), temp.path());
@@ -734,9 +780,15 @@ fn install_sqlite3_db_asserting_shim(bin: &Path, marker: &Path) {
         &path,
         format!(
             "#!/bin/sh\n\
-             test \"$#\" -eq 1 || exit 11\n\
-             test -f \"$1\" || exit 12\n\
-             printf '%s\\n' \"$1\" > \"{}\"\n",
+             test \"$#\" -eq 7 || exit 11\n\
+             test \"$1\" = '-cmd' || exit 13\n\
+             test \"$2\" = '.timeout 5000' || exit 14\n\
+             test \"$3\" = '-cmd' || exit 15\n\
+             test \"$4\" = 'PRAGMA foreign_keys=ON;' || exit 16\n\
+             test \"$5\" = '-cmd' || exit 17\n\
+             test \"$6\" = 'PRAGMA synchronous=FULL;' || exit 18\n\
+             test -f \"$7\" || exit 12\n\
+             printf '%s\\n' \"$7\" > \"{}\"\n",
             marker.display()
         ),
     )

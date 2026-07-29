@@ -1,14 +1,13 @@
-use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::types::ValueRef;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, params};
 
 use crate::json::json_escape;
 use crate::repo::Repository;
@@ -19,7 +18,6 @@ const RUNTIME_LOG_RETAINED_FILES: usize = 3;
 
 static OBSERVER: OnceLock<Mutex<ObserverState>> = OnceLock::new();
 static PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
-static INITIALIZED_DB_PATHS: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LogLevel {
@@ -548,13 +546,7 @@ pub fn append_runtime_message(repo: &Repository, message: &str) -> Result<(), St
 
 pub fn run_readonly_query(repo: &Repository, query: &str) -> Result<(), String> {
     let path = db_path(repo);
-    let conn = Connection::open_with_flags(
-        &path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| format!("open {} read-only: {error}", path.display()))?;
-    conn.pragma_update(None, "query_only", true)
-        .map_err(|error| format!("enable SQLite query_only: {error}"))?;
+    let conn = crate::storage::open_readonly(&path).map_err(|error| error.to_string())?;
     let mut statement = conn
         .prepare(query)
         .map_err(|error| format!("prepare query: {error}"))?;
@@ -595,15 +587,7 @@ pub fn with_nonblocking_read_db<T>(
     run: impl FnOnce(&Connection) -> Result<T, String>,
 ) -> Result<T, String> {
     let path = db_path(repo);
-    let conn = Connection::open_with_flags(
-        &path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| format!("open {} read-only: {error}", path.display()))?;
-    conn.busy_timeout(Duration::ZERO)
-        .map_err(|error| format!("configure SQLite busy timeout: {error}"))?;
-    conn.pragma_update(None, "query_only", true)
-        .map_err(|error| format!("enable SQLite query_only: {error}"))?;
+    let conn = crate::storage::open_readonly(&path).map_err(|error| error.to_string())?;
     run(&conn)
 }
 
@@ -626,33 +610,7 @@ impl WritableDb {
 }
 
 fn open_writable_db_path(path: &Path) -> Result<Connection, String> {
-    let existed_before_open = path.exists();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("create db dir: {error}"))?;
-    }
-    let conn =
-        Connection::open(path).map_err(|error| format!("open {}: {error}", path.display()))?;
-    conn.busy_timeout(Duration::from_secs(5))
-        .map_err(|error| format!("configure SQLite busy timeout: {error}"))?;
-    ensure_schema_for_path(&conn, path, existed_before_open)?;
-    Ok(conn)
-}
-
-fn ensure_schema_for_path(
-    conn: &Connection,
-    path: &Path,
-    existed_before_open: bool,
-) -> Result<(), String> {
-    let initialized_paths = INITIALIZED_DB_PATHS.get_or_init(|| Mutex::new(BTreeSet::new()));
-    let mut initialized_paths = initialized_paths
-        .lock()
-        .map_err(|_| "schema initialization lock poisoned".to_string())?;
-    if existed_before_open && initialized_paths.contains(path) {
-        return Ok(());
-    }
-    create_schema(conn)?;
-    initialized_paths.insert(path.to_path_buf());
-    Ok(())
+    crate::storage::open_writable(path).map_err(|error| error.to_string())
 }
 
 fn record_panic(message: String) {
@@ -931,69 +889,6 @@ fn with_state<T>(run: impl FnOnce(&mut ObserverState) -> T) -> Option<T> {
     let mutex = OBSERVER.get()?;
     let mut state = mutex.lock().ok()?;
     Some(run(&mut state))
-}
-
-fn create_schema(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch(
-        "
-        create table if not exists metadata (
-          key text primary key,
-          value text not null
-        );
-
-        create table if not exists event (
-          id integer primary key autoincrement,
-          time_unix_ms integer not null,
-          level text not null,
-          target text not null,
-          action text not null,
-          operation_id text,
-          parent_operation_id text,
-          repo text,
-          branch text,
-          session text,
-          message text not null,
-          data_json text
-        );
-
-        create index if not exists event_time_idx on event(time_unix_ms);
-        create index if not exists event_target_idx on event(target);
-        create index if not exists event_action_idx on event(action);
-        create index if not exists event_branch_idx on event(branch);
-        create index if not exists event_operation_idx on event(operation_id);
-
-        create table if not exists startup_run (
-          id text primary key,
-          time_started_unix_ms integer not null,
-          time_finished_unix_ms integer,
-          status text not null,
-          repo text,
-          version text not null,
-          error text
-        );
-
-        create table if not exists startup_phase (
-          id integer primary key autoincrement,
-          run_id text not null references startup_run(id) on delete cascade,
-          phase text not null,
-          time_started_unix_ms integer not null,
-          time_finished_unix_ms integer,
-          status text not null,
-          error text
-        );
-
-        ",
-    )
-    .map_err(|error| format!("create schema: {error}"))?;
-    crate::session::migrate_worktree_session_schema(conn)?;
-    crate::opencode::migrate_runtime_schema(conn)?;
-    crate::plan_run::migrate_schema(conn)?;
-    crate::auto_flow::migrate_schema(conn)?;
-    crate::execution::migrate_schema(conn)?;
-    crate::github::migrate_pr_cache_schema(conn)?;
-    conn.pragma_update(None, "foreign_keys", true)
-        .map_err(|error| format!("enable foreign keys: {error}"))?;
-    Ok(())
 }
 
 fn append_text_line(path: &Path, line: &str) -> Result<(), String> {

@@ -17,6 +17,11 @@ use std::process::{Command as ProcessCommand, Stdio};
 
 pub fn run() -> Result<(), String> {
     let args = Args::parse(std::env::args_os().skip(1))?;
+    if matches!(args.command, CommandKind::Debug(DebugCommand::Integrity)) {
+        let repo = load_integrity_repo_context(args.repo.as_deref())?;
+        return crate::storage::print_integrity(&observability::db_path(&repo))
+            .map_err(|error| error.to_string());
+    }
     if matches!(
         args.command,
         CommandKind::Help | CommandKind::Version | CommandKind::DebugHelp | CommandKind::DbHelp
@@ -246,6 +251,20 @@ fn load_db_repo_context(repo_arg: Option<&std::path::Path>) -> Result<Repository
             observability::attach_repo(&entry.repo);
             Ok(entry.repo)
         }
+    }
+}
+
+fn load_integrity_repo_context(repo_arg: Option<&std::path::Path>) -> Result<Repository, String> {
+    if repo_arg.is_some() {
+        return Repository::discover(repo_arg);
+    }
+    match Repository::discover(None) {
+        Ok(repo) => Ok(repo),
+        Err(discover_error) => workspace::discover_valid_entries(workspace::load_entries())
+            .into_iter()
+            .next()
+            .map(|entry| entry.repo)
+            .ok_or(discover_error),
     }
 }
 
@@ -620,6 +639,9 @@ fn run_debug_command(
             Ok(())
         }
         DebugCommand::Startup => run_debug_startup(repo, config),
+        DebugCommand::Integrity => {
+            unreachable!("integrity runs before observability initialization")
+        }
     }
 }
 
@@ -693,6 +715,9 @@ fn open_interactive_db(repo: &Repository) -> Result<(), String> {
 
     let path = observability::db_path(repo);
     let status = ProcessCommand::new("sqlite3")
+        .args(["-cmd", ".timeout 5000"])
+        .args(["-cmd", "PRAGMA foreign_keys=ON;"])
+        .args(["-cmd", "PRAGMA synchronous=FULL;"])
         .arg(&path)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())

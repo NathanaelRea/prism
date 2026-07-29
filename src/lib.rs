@@ -22,6 +22,7 @@ mod repo;
 mod review;
 mod session;
 mod setup;
+pub mod storage;
 mod terminal;
 #[cfg(test)]
 mod test_support;

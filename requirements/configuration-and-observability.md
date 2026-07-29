@@ -59,6 +59,10 @@
   then opens writable interactive access through `sqlite3`; `prism db path`
   prints its path; `prism db <query>` uses built-in read-only SQLite support and
   prints tab-separated rows.
+- **Invariant**: Every SQLite connection enables foreign keys and
+  `synchronous=FULL`; TUI/read-only connections additionally use `query_only`
+  with no busy wait, while writers use a bounded busy wait. Repository databases
+  require verified WAL support on a local filesystem.
 
 ## Diagnostics
 
@@ -67,6 +71,12 @@
 - **Behavior**: Debug controls expose state paths, effective runtime facts,
   bounded recent logs, and startup timing. Log-level and stderr controls are
   available without changing normal output.
+- **Behavior**: `prism debug integrity` reports full SQLite integrity and foreign
+  key checks through a read-only path that never initializes, migrates, repairs,
+  or records observability data.
+- **Behavior**: Corruption-class SQLite failures trigger best-effort read-only
+  `quick_check` and foreign-key diagnostics without replacing the original error
+  or modifying the database.
 - **Invariant**: Cache observations distinguish never loaded, refreshing, stale,
   failed, confirmed absent, and present states. A transient failure does not
   erase known state, while confirmed absence requires affirmative evidence.
