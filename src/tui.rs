@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -28,7 +27,10 @@ use crate::repo::Repository;
 use crate::session::{Session, WorktreeRepositoryKey, WorktreeSessionKey};
 use crate::terminal::stdin_is_tty;
 use crate::tmux::TmuxWindow;
-use crate::tui_jobs::{JobContext, JobMessage, JobMetadata, JobOutcome, JobRegistry};
+use crate::tui_jobs::{
+    JobContext, JobMessage, JobMetadata, JobOutcome, JobRegistry, LatestReceiver, LatestSender,
+    latest_channel,
+};
 use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
 use crate::tui_signal::SigtermNotification;
 use crate::util::status_count;
@@ -43,13 +45,13 @@ pub struct Tui {
     pub(crate) session_repository_identities: BTreeMap<usize, WorktreeRepositoryKey>,
     pub(crate) worktree_generations: BTreeMap<WorktreeSessionKey, u64>,
     pub(crate) worktree_harness_configs: BTreeMap<WorktreeSessionKey, Config>,
-    pub(crate) session_refresh_tx: Sender<SessionRefreshResult>,
-    pub(crate) session_refresh_rx: Receiver<SessionRefreshResult>,
+    pub(crate) session_refresh_tx: LatestSender<u64, SessionRefreshResult>,
+    pub(crate) session_refresh_rx: LatestReceiver<u64, SessionRefreshResult>,
     pub(crate) session_refresh_in_flight: bool,
     pub(crate) session_refresh_pending: bool,
     pub(crate) session_inventory_generation: u64,
-    workflow_maintenance_tx: Sender<()>,
-    workflow_maintenance_rx: Receiver<()>,
+    workflow_maintenance_tx: LatestSender<(), ()>,
+    workflow_maintenance_rx: LatestReceiver<(), ()>,
     workflow_maintenance_in_flight: bool,
     workflow_maintenance_due: bool,
     workflow_maintenance_last_started: Instant,
@@ -64,37 +66,44 @@ pub struct Tui {
     ui_state_path: Option<PathBuf>,
     pub(crate) selected_comment: usize,
     pub(crate) selected_worktree_by_repo: BTreeMap<PathBuf, PathBuf>,
-    pub(crate) pr_poll_tx: Sender<PrPollResult>,
-    pub(crate) pr_poll_rx: Receiver<PrPollResult>,
+    pub(crate) pr_poll_tx: LatestSender<PrDeliveryKey, PrPollResult>,
+    pub(crate) pr_poll_rx: LatestReceiver<PrDeliveryKey, PrPollResult>,
     pub(crate) pr_polls_in_flight: BTreeSet<PrPollKey>,
-    pub(crate) delete_session_tx: Sender<DeleteSessionResult>,
-    pub(crate) delete_session_rx: Receiver<DeleteSessionResult>,
+    pub(crate) delete_session_tx: LatestSender<(DeleteSessionKey, u64), DeleteSessionResult>,
+    pub(crate) delete_session_rx: LatestReceiver<(DeleteSessionKey, u64), DeleteSessionResult>,
     pub(crate) delete_sessions_in_flight: BTreeSet<DeleteSessionKey>,
-    pub(crate) tmux_warmup_tx: Sender<AgentSessionWarmupResult>,
-    pub(crate) tmux_warmup_rx: Receiver<AgentSessionWarmupResult>,
+    pub(crate) tmux_warmup_tx: LatestSender<AgentSessionWarmupKey, AgentSessionWarmupResult>,
+    pub(crate) tmux_warmup_rx: LatestReceiver<AgentSessionWarmupKey, AgentSessionWarmupResult>,
     pub(crate) tmux_warmups_in_flight: BTreeSet<AgentSessionWarmupKey>,
     pub(crate) tmux_generations: BTreeMap<AgentSessionSlot, u64>,
-    pub(crate) tmux_portal_tx: Sender<TmuxPortalResult>,
-    pub(crate) tmux_portal_rx: Receiver<TmuxPortalResult>,
+    pub(crate) tmux_portal_tx: LatestSender<AgentSessionWarmupKey, TmuxPortalResult>,
+    pub(crate) tmux_portal_rx: LatestReceiver<AgentSessionWarmupKey, TmuxPortalResult>,
     pub(crate) tmux_portal_polls_in_flight: BTreeMap<AgentSessionWarmupKey, Instant>,
     pub(crate) tmux_portal_last_polled: BTreeMap<AgentSessionWarmupKey, Instant>,
     pub(crate) tmux_portal: Option<TmuxPortalSnapshot>,
     pub(crate) tmux_portal_size: Option<(u16, u16)>,
     pub(crate) tmux_portal_resized: Option<(AgentSessionWarmupKey, (u16, u16))>,
-    pub(crate) wt_poll_tx: Sender<WtPollResult>,
-    pub(crate) wt_poll_rx: Receiver<WtPollResult>,
-    pub(crate) default_branch_poll_tx: Sender<DefaultBranchPollResult>,
-    pub(crate) default_branch_poll_rx: Receiver<DefaultBranchPollResult>,
-    pub(crate) opencode_poll_tx: Sender<OpencodePollResult>,
-    pub(crate) opencode_poll_rx: Receiver<OpencodePollResult>,
+    pub(crate) wt_poll_tx: LatestSender<WorktreeRepositoryKey, WtPollResult>,
+    pub(crate) wt_poll_rx: LatestReceiver<WorktreeRepositoryKey, WtPollResult>,
+    pub(crate) default_branch_poll_tx: LatestSender<WorktreeSessionKey, DefaultBranchPollResult>,
+    pub(crate) default_branch_poll_rx: LatestReceiver<WorktreeSessionKey, DefaultBranchPollResult>,
+    pub(crate) opencode_poll_tx: LatestSender<OpencodePollKey, OpencodePollResult>,
+    pub(crate) opencode_poll_rx: LatestReceiver<OpencodePollKey, OpencodePollResult>,
     pub(crate) opencode_polls_in_flight: BTreeSet<OpencodePollKey>,
     pub(crate) opencode_last_polled: BTreeMap<OpencodePollKey, Instant>,
     pub(crate) opencode_last_state_event: BTreeMap<OpencodePollKey, Instant>,
-    pub(crate) opencode_event_tx: Sender<OpencodeEventResult>,
-    pub(crate) opencode_event_rx: Receiver<OpencodeEventResult>,
+    pub(crate) opencode_reconcile_requested: BTreeMap<WorktreeSessionKey, Instant>,
+    pub(crate) opencode_event_watermarks: BTreeMap<WorktreeSessionKey, Instant>,
+    #[cfg(test)]
+    pub(crate) opencode_event_tx: LatestSender<Instant, OpencodeEventResult>,
+    #[cfg(test)]
+    pub(crate) opencode_event_rx: LatestReceiver<Instant, OpencodeEventResult>,
     pub(crate) opencode_listeners: BTreeSet<OpencodeListenerKey>,
     pub(crate) opencode_listener_last_scanned: Option<Instant>,
     pub(crate) jobs: JobRegistry<TuiJobKind, TuiJobKey, TuiJobPayload>,
+    pub(crate) opencode_events_changed: bool,
+    pub(crate) tui_tick_active: bool,
+    pub(crate) routing_tui_jobs: bool,
     scheduling_stopped: bool,
     pub(crate) plan_runs: BTreeMap<String, PersistedPlanRun>,
     pub(crate) active_plan_runs: BTreeMap<PathBuf, String>,
@@ -125,6 +134,8 @@ const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
 const WORKFLOW_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub(crate) const TUI_ACTION_JOB_TIMEOUT: Duration = Duration::from_secs(120);
 const TUI_JOB_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const TUI_TICK_ITEM_BUDGET: usize = 32;
+const TUI_TICK_TIME_BUDGET: Duration = Duration::from_millis(8);
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedRepo {
     pub repo: Repository,
@@ -246,6 +257,12 @@ pub(crate) enum PrPollResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PrDeliveryKey {
+    Summary(WorktreeRepositoryKey),
+    Details(PrPollKey),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct DeleteSessionKey {
     pub repository: WorktreeRepositoryKey,
     pub path: PathBuf,
@@ -256,6 +273,7 @@ pub(crate) struct DeleteSessionKey {
 
 pub(crate) struct DeleteSessionResult {
     pub key: DeleteSessionKey,
+    pub delivery_id: u64,
     pub result: Result<crate::session::DeleteWorktreeOutcome, String>,
 }
 
@@ -364,6 +382,7 @@ pub(crate) struct OpencodePollResult {
 
 pub(crate) struct OpencodeEventResult {
     pub stream: OpencodeListenerKey,
+    pub received_at: Instant,
     pub event: Result<OpencodeEvent, String>,
 }
 
@@ -375,7 +394,7 @@ pub(crate) struct OpencodeListenerKey {
     pub server_url: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum TuiJobKind {
     SessionRefresh,
     WorkflowMaintenance,
@@ -390,7 +409,7 @@ pub(crate) enum TuiJobKind {
     OpencodeListener,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum TuiJobKey {
     None,
     Repository(WorktreeRepositoryKey),
@@ -436,6 +455,13 @@ impl OpencodePollKey {
             generation,
             incarnation: session.incarnation.clone(),
         }
+    }
+}
+
+fn pr_delivery_key(result: &PrPollResult) -> PrDeliveryKey {
+    match result {
+        PrPollResult::Summary { repository, .. } => PrDeliveryKey::Summary(repository.clone()),
+        PrPollResult::Details { key, .. } => PrDeliveryKey::Details(key.clone()),
     }
 }
 
@@ -608,16 +634,25 @@ fn move_enabled_ordered_item(
 
 impl Tui {
     pub fn new(repos: Vec<ManagedRepo>, current_repo: usize, sessions: Vec<Session>) -> Self {
-        let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
-        let (session_refresh_tx, session_refresh_rx) = mpsc::channel();
-        let (workflow_maintenance_tx, workflow_maintenance_rx) = mpsc::channel();
-        let (delete_session_tx, delete_session_rx) = mpsc::channel();
-        let (tmux_warmup_tx, tmux_warmup_rx) = mpsc::channel();
-        let (tmux_portal_tx, tmux_portal_rx) = mpsc::channel();
-        let (wt_poll_tx, wt_poll_rx) = mpsc::channel();
-        let (default_branch_poll_tx, default_branch_poll_rx) = mpsc::channel();
-        let (opencode_poll_tx, opencode_poll_rx) = mpsc::channel();
-        let (opencode_event_tx, opencode_event_rx) = mpsc::channel();
+        let (pr_poll_tx, pr_poll_rx) = latest_channel(pr_delivery_key);
+        let (session_refresh_tx, session_refresh_rx) =
+            latest_channel(|result: &SessionRefreshResult| result.base_generation);
+        let (workflow_maintenance_tx, workflow_maintenance_rx) = latest_channel(|_| ());
+        let (delete_session_tx, delete_session_rx) =
+            latest_channel(|result: &DeleteSessionResult| (result.key.clone(), result.delivery_id));
+        let (tmux_warmup_tx, tmux_warmup_rx) =
+            latest_channel(|result: &AgentSessionWarmupResult| result.key.clone());
+        let (tmux_portal_tx, tmux_portal_rx) =
+            latest_channel(|result: &TmuxPortalResult| result.key.clone());
+        let (wt_poll_tx, wt_poll_rx) =
+            latest_channel(|result: &WtPollResult| result.repository.clone());
+        let (default_branch_poll_tx, default_branch_poll_rx) =
+            latest_channel(|result: &DefaultBranchPollResult| result.key.clone());
+        let (opencode_poll_tx, opencode_poll_rx) =
+            latest_channel(|result: &OpencodePollResult| result.key.clone());
+        #[cfg(test)]
+        let (opencode_event_tx, opencode_event_rx) =
+            latest_channel(|result: &OpencodeEventResult| result.received_at);
         let current_repo = current_repo.min(repos.len().saturating_sub(1));
         let fallback_repo = Repository {
             root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -698,11 +733,18 @@ impl Tui {
             opencode_polls_in_flight: BTreeSet::new(),
             opencode_last_polled: BTreeMap::new(),
             opencode_last_state_event: BTreeMap::new(),
+            opencode_reconcile_requested: BTreeMap::new(),
+            opencode_event_watermarks: BTreeMap::new(),
+            #[cfg(test)]
             opencode_event_tx,
+            #[cfg(test)]
             opencode_event_rx,
             opencode_listeners: BTreeSet::new(),
             opencode_listener_last_scanned: None,
             jobs: JobRegistry::default(),
+            opencode_events_changed: false,
+            tui_tick_active: false,
+            routing_tui_jobs: false,
             scheduling_stopped: false,
             plan_runs: BTreeMap::new(),
             active_plan_runs: BTreeMap::new(),
@@ -1348,6 +1390,7 @@ impl Tui {
     }
 
     fn tick_tui_action_jobs(&mut self) -> TuiBackgroundChanges {
+        self.tui_tick_active = true;
         self.route_tui_job_messages();
         let changes = TuiBackgroundChanges {
             sessions: self.poll_session_refresh(),
@@ -1367,6 +1410,7 @@ impl Tui {
         self.start_opencode_status_poll(false);
         self.start_opencode_event_listeners();
         self.poll_workflow_maintenance();
+        self.tui_tick_active = false;
         changes
     }
 
@@ -1383,7 +1427,6 @@ impl Tui {
     }
 
     fn poll_workflow_maintenance(&mut self) {
-        self.route_tui_job_messages();
         while self.workflow_maintenance_rx.try_recv().is_ok() {}
         let due = self.workflow_maintenance_due
             || self.workflow_maintenance_last_started.elapsed() >= WORKFLOW_MAINTENANCE_INTERVAL;
@@ -1433,64 +1476,155 @@ impl Tui {
             + Send
             + 'static,
     {
-        self.jobs.spawn(kind, key, generation, timeout, name, job);
+        if kind == TuiJobKind::DeleteSession {
+            self.jobs
+                .spawn_reliable(kind, key, generation, timeout, name, job);
+        } else {
+            self.jobs.spawn(kind, key, generation, timeout, name, job);
+        }
     }
 
     pub(crate) fn route_tui_job_messages(&mut self) {
+        if self.routing_tui_jobs {
+            return;
+        }
+        self.routing_tui_jobs = true;
+        let deadline = Instant::now() + TUI_TICK_TIME_BUDGET;
+        self.route_tui_job_messages_with_budget(TUI_TICK_ITEM_BUDGET, deadline);
+        self.routing_tui_jobs = false;
+    }
+
+    fn route_tui_job_messages_with_budget(&mut self, limit: usize, deadline: Instant) -> usize {
         for metadata in self.jobs.active_metadata() {
             if !self.job_generation_is_current(&metadata) {
                 self.jobs.cancel(metadata.id);
             }
         }
-        let messages = self.jobs.drain();
+        let mut processed = 0;
         let mut restart_session_refresh = false;
-        for message in messages {
-            match message {
-                JobMessage::Payload { metadata, payload } => {
-                    if self.job_generation_is_current(&metadata) {
-                        self.route_tui_job_payload(payload);
-                    }
+        while processed < limit && (processed == 0 || Instant::now() < deadline) {
+            let Some(message) = self.jobs.drain_terminals(1).into_iter().next() else {
+                break;
+            };
+            let JobMessage::Terminal { metadata, outcome } = message else {
+                unreachable!();
+            };
+            processed += 1;
+            self.clear_tui_job_in_flight(&metadata);
+            match outcome {
+                JobOutcome::Completed(Ok(())) | JobOutcome::Canceled => {}
+                JobOutcome::Completed(Err(error)) => {
+                    self.recover_failed_tui_job(&metadata);
+                    self.record_tui_job_failure(&metadata, &error);
                 }
-                JobMessage::Terminal { metadata, outcome } => {
-                    self.clear_tui_job_in_flight(&metadata);
-                    let mut payload_routed = false;
-                    match outcome {
-                        JobOutcome::Completed(Ok(Some(payload))) => {
-                            if self.job_generation_is_current(&metadata) {
-                                self.route_tui_job_payload(payload);
-                                payload_routed = true;
-                            } else if metadata.kind == TuiJobKind::SessionRefresh {
-                                restart_session_refresh = self.session_refresh_pending;
-                                self.session_refresh_pending = false;
-                            }
-                        }
-                        JobOutcome::Completed(Ok(None)) | JobOutcome::Canceled => {}
-                        JobOutcome::Completed(Err(error)) => {
-                            self.recover_failed_tui_job(&metadata);
-                            self.record_tui_job_failure(&metadata, &error);
-                        }
-                        JobOutcome::Panicked(error) => {
-                            self.recover_failed_tui_job(&metadata);
-                            self.record_tui_job_failure(&metadata, &format!("panicked: {error}"));
-                        }
-                        JobOutcome::DeadlineExceeded => {
-                            self.recover_failed_tui_job(&metadata);
-                            self.record_tui_job_failure(&metadata, "deadline exceeded");
-                        }
-                    }
-                    if metadata.kind == TuiJobKind::SessionRefresh
-                        && !payload_routed
-                        && self.session_refresh_pending
-                    {
-                        restart_session_refresh = true;
-                        self.session_refresh_pending = false;
-                    }
+                JobOutcome::Panicked(error) => {
+                    self.recover_failed_tui_job(&metadata);
+                    self.record_tui_job_failure(&metadata, &format!("panicked: {error}"));
+                }
+                JobOutcome::DeadlineExceeded => {
+                    self.recover_failed_tui_job(&metadata);
+                    self.record_tui_job_failure(&metadata, "deadline exceeded");
                 }
             }
+            if metadata.kind == TuiJobKind::SessionRefresh && self.session_refresh_pending {
+                restart_session_refresh = true;
+                self.session_refresh_pending = false;
+            }
+        }
+
+        let selected = self.selected_worktree_context().and_then(|context| {
+            let session = self.sessions.get(context.session_index)?;
+            let repo = self.repos.get(session.repo_index)?;
+            Some(session.identity_key(&repo.identity))
+        });
+        let priority = |metadata: &JobMetadata<TuiJobKind, TuiJobKey>| {
+            if metadata.kind == TuiJobKind::DeleteSession {
+                return 0;
+            }
+            let selected_job = selected
+                .as_ref()
+                .is_some_and(|selected| match &metadata.key {
+                    TuiJobKey::Worktree(key) => key == selected,
+                    TuiJobKey::Tmux(key) => {
+                        key.slot.repository == selected.repository
+                            && key.slot.path == selected.path
+                            && key.slot.branch == selected.branch
+                            && key.slot.incarnation == selected.incarnation
+                    }
+                    TuiJobKey::Pr(key) => {
+                        key.repository == selected.repository
+                            && key.path == selected.path
+                            && key.branch == selected.branch
+                            && key.incarnation == selected.incarnation
+                    }
+                    TuiJobKey::Opencode(key) => {
+                        key.repository == selected.repository
+                            && key.path == selected.path
+                            && key.branch == selected.branch
+                            && key.incarnation == selected.incarnation
+                    }
+                    TuiJobKey::OpencodeListener(stream) => &stream.worktree == selected,
+                    TuiJobKey::None | TuiJobKey::Repository(_) | TuiJobKey::Delete(_) => false,
+                });
+            if selected_job { 1 } else { 3 }
+        };
+
+        while processed < limit
+            && Instant::now() < deadline
+            && self
+                .jobs
+                .latest_min_priority(priority)
+                .is_some_and(|value| value <= 1)
+        {
+            let Some(JobMessage::Payload { metadata, payload }) =
+                self.jobs.take_latest_by(priority)
+            else {
+                break;
+            };
+            processed += 1;
+            if self.job_generation_is_current(&metadata) {
+                self.route_tui_job_payload(payload);
+            }
+        }
+
+        while processed < limit && Instant::now() < deadline {
+            let Some(message) = self.jobs.drain_events(1).into_iter().next() else {
+                break;
+            };
+            let JobMessage::Payload { metadata, payload } = message else {
+                unreachable!();
+            };
+            processed += 1;
+            if self.job_generation_is_current(&metadata)
+                && let TuiJobPayload::OpencodeEvent(result) = payload
+            {
+                self.opencode_events_changed |= self.apply_opencode_event_result(result);
+            }
+        }
+
+        while processed < limit && Instant::now() < deadline {
+            let Some(JobMessage::Payload { metadata, payload }) =
+                self.jobs.take_latest_by(priority)
+            else {
+                break;
+            };
+            processed += 1;
+            if self.job_generation_is_current(&metadata) {
+                self.route_tui_job_payload(payload);
+            }
+        }
+
+        let stats = self.jobs.queue_stats();
+        if stats.dirty {
+            self.request_opencode_reconciliation();
+        }
+        if stats.overflow_delta > 0 || stats.coalesced_delta > 0 {
+            self.record_tui_queue_stats(stats);
         }
         if restart_session_refresh && !self.scheduling_stopped {
             let _ = self.refresh_sessions_after_tmux();
         }
+        processed
     }
 
     fn route_tui_job_payload(&self, payload: TuiJobPayload) {
@@ -1523,7 +1657,10 @@ impl Tui {
                 let _ = self.opencode_poll_tx.send(result);
             }
             TuiJobPayload::OpencodeEvent(result) => {
+                #[cfg(test)]
                 let _ = self.opencode_event_tx.send(result);
+                #[cfg(not(test))]
+                let _ = result;
             }
         }
     }
@@ -1671,6 +1808,38 @@ impl Tui {
                 metadata.started_at.elapsed()
             ),
         );
+    }
+
+    fn record_tui_queue_stats(&self, stats: crate::tui_jobs::QueueStats) {
+        crate::observability::emit(crate::observability::EventInput {
+            level: if stats.overflow_delta > 0 {
+                crate::observability::LogLevel::Warn
+            } else {
+                crate::observability::LogLevel::Debug
+            },
+            target: "tui",
+            action: "queue_pressure",
+            operation_id: None,
+            parent_operation_id: None,
+            branch: None,
+            session: None,
+            message: format!(
+                "TUI delivery pressure: {} overflowed, {} coalesced",
+                stats.overflow_delta, stats.coalesced_delta
+            ),
+            data_json: Some(format!(
+                "{{\"event_depth\":{},\"event_capacity\":{},\"latest_depth\":{},\"terminal_depth\":{},\"overflow_count\":{},\"overflow_total\":{},\"coalesced_count\":{},\"coalesced_total\":{},\"stream_dirty\":{}}}",
+                stats.event_depth,
+                stats.event_capacity,
+                stats.latest_depth,
+                stats.terminal_depth,
+                stats.overflow_delta,
+                stats.overflow_total,
+                stats.coalesced_delta,
+                stats.coalesced_total,
+                stats.dirty,
+            )),
+        });
     }
 
     fn recover_failed_tui_job(&mut self, metadata: &JobMetadata<TuiJobKind, TuiJobKey>) {
@@ -4180,6 +4349,7 @@ mod tests {
     };
     use crate::config::Config;
     use crate::github::{PrCache, PrDetails, PrReviewComment, PrSummary};
+    use crate::opencode::{OpencodeEvent, OpencodeState, OpencodeStatus};
     use crate::plan_run::{
         PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRun, PlanRunMode, PlanRunStatus,
         PlanStepRun, PlanStepStatus,
@@ -4285,6 +4455,146 @@ mod tests {
         wait_for_opencode_job(&mut tui, &key);
         assert!(!tui.opencode_polls_in_flight.contains(&key));
 
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn tui_tick_terminal_budget_retains_every_remaining_outcome() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let mut tui = Tui::new_single(repo, test_config(), Vec::new());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(101));
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for index in 0..100 {
+            let barrier = barrier.clone();
+            let completed = completed.clone();
+            tui.spawn_tui_job(
+                TuiJobKind::WorkflowMaintenance,
+                TuiJobKey::None,
+                0,
+                None,
+                format!("budget-{index}"),
+                move |_| {
+                    barrier.wait();
+                    completed.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    Ok(None)
+                },
+            );
+        }
+        barrier.wait();
+        while completed.load(std::sync::atomic::Ordering::Acquire) != 100 {
+            std::thread::yield_now();
+        }
+        while !tui.jobs.active_metadata().is_empty() {
+            tui.jobs.collect_finished();
+            std::thread::yield_now();
+        }
+
+        tui.route_tui_job_messages();
+
+        assert_eq!(
+            tui.jobs.queue_stats().terminal_depth,
+            100 - super::TUI_TICK_ITEM_BUDGET
+        );
+    }
+
+    #[test]
+    fn opencode_overflow_requests_full_reconciliation_and_stale_events_cannot_regress_it() {
+        let temp = unique_temp_dir("prism-opencode-overflow-reconcile-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+        session.agent_state = AgentState::Running;
+        session.opencode_status = Some(OpencodeStatus {
+            server_url: Some("http://127.0.0.1:1".to_string()),
+            session_id: Some("ses_1".to_string()),
+            title: None,
+            state: OpencodeState::Busy,
+            detail: None,
+            latest_message: None,
+            latest_user_message: None,
+            recent_messages: Vec::new(),
+            active_tool: None,
+            todos: Vec::new(),
+            last_updated_unix_ms: None,
+        });
+        let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+        let worktree = tui.sessions[0].identity_key(&tui.repos[0].identity);
+        let stream = super::OpencodeListenerKey {
+            worktree: worktree.clone(),
+            generation: 0,
+            session_id: "ses_1".to_string(),
+            server_url: "http://127.0.0.1:1".to_string(),
+        };
+        tui.opencode_listeners.insert(stream.clone());
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let job_stream = stream.clone();
+        tui.spawn_tui_job(
+            TuiJobKind::OpencodeListener,
+            TuiJobKey::OpencodeListener(stream),
+            0,
+            None,
+            "overflow-listener".to_string(),
+            move |context| {
+                for _ in 0..1_000 {
+                    context.send(super::TuiJobPayload::OpencodeEvent(
+                        super::OpencodeEventResult {
+                            stream: job_stream.clone(),
+                            received_at: Instant::now(),
+                            event: Ok(OpencodeEvent {
+                                session_id: Some("ses_1".to_string()),
+                                title: None,
+                                state: Some(OpencodeState::Busy),
+                                detail: None,
+                                latest_message: None,
+                                active_tool: None,
+                                todos: None,
+                            }),
+                        },
+                    ))?;
+                }
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(None)
+            },
+        );
+        ready_rx.recv().unwrap();
+
+        tui.route_tui_job_messages();
+        let requested_at = *tui.opencode_reconcile_requested.get(&worktree).unwrap();
+        let stats = tui.jobs.queue_stats();
+        assert_eq!(stats.overflow_total, 1_000 - stats.event_capacity as u64);
+        assert!(stats.event_depth <= stats.event_capacity);
+
+        let poll_key = super::OpencodePollKey::for_repository_session(
+            &tui.repos[0].identity,
+            &tui.sessions[0],
+        );
+        tui.opencode_poll_tx
+            .send(super::OpencodePollResult {
+                key: poll_key,
+                started_at: requested_at + Duration::from_nanos(1),
+                status: Ok(OpencodeStatus {
+                    state: OpencodeState::Done,
+                    ..tui.sessions[0].opencode_status.clone().unwrap()
+                }),
+            })
+            .unwrap();
+        tui.poll_opencode_status();
+        assert!(!tui.opencode_reconcile_requested.contains_key(&worktree));
+
+        for _ in 0..16 {
+            tui.route_tui_job_messages();
+            tui.poll_opencode_events();
+        }
+        assert_eq!(
+            tui.sessions[0].opencode_status.as_ref().unwrap().state,
+            OpencodeState::Done
+        );
+
+        release_tx.send(()).unwrap();
         let _ = fs::remove_dir_all(temp);
     }
 

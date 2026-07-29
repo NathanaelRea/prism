@@ -13,7 +13,9 @@ const TMUX_PORTAL_CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Tui {
     pub(crate) fn poll_tmux_portal(&mut self) -> bool {
-        self.route_tui_job_messages();
+        if !self.tui_tick_active && !self.routing_tui_jobs {
+            self.route_tui_job_messages();
+        }
         let target = self.selected_tmux_portal_target();
         let target_key = target.as_ref().map(|target| match target {
             Ok(target) => &target.key,

@@ -67,7 +67,8 @@ impl Tui {
                 .get(&key)
                 .map(|last| now.duration_since(*last) >= interval)
                 .unwrap_or(true);
-            if !force && !due {
+            let reconciliation_due = self.opencode_reconcile_requested.contains_key(&session_key);
+            if !force && !reconciliation_due && !due {
                 continue;
             }
             let repo = managed.repo.clone();
@@ -104,7 +105,9 @@ impl Tui {
     }
 
     pub(crate) fn start_opencode_event_listeners(&mut self) {
-        self.route_tui_job_messages();
+        if !self.tui_tick_active && !self.routing_tui_jobs {
+            self.route_tui_job_messages();
+        }
         let now = Instant::now();
         if self
             .opencode_listener_last_scanned
@@ -224,6 +227,7 @@ impl Tui {
                             |event| {
                                 context.send(TuiJobPayload::OpencodeEvent(OpencodeEventResult {
                                     stream: job_stream.clone(),
+                                    received_at: Instant::now(),
                                     event: Ok(event),
                                 }))
                             },
@@ -235,6 +239,7 @@ impl Tui {
                             && context
                                 .send(TuiJobPayload::OpencodeEvent(OpencodeEventResult {
                                     stream: job_stream.clone(),
+                                    received_at: Instant::now(),
                                     event: Err(error),
                                 }))
                                 .is_err()
@@ -271,7 +276,9 @@ impl Tui {
     }
 
     pub(crate) fn poll_opencode_status(&mut self) -> bool {
-        self.route_tui_job_messages();
+        if !self.tui_tick_active && !self.routing_tui_jobs {
+            self.route_tui_job_messages();
+        }
         let mut changed = false;
         while let Ok(result) = self.opencode_poll_rx.try_recv() {
             match result.status {
@@ -286,6 +293,13 @@ impl Tui {
                             opencode_poll_key(&repo.identity, session, generation) == result.key
                         })
                     }) {
+                        let worktree = self.sessions[index]
+                            .identity_key(&self.repos[self.sessions[index].repo_index].identity);
+                        let reconciliation = self
+                            .opencode_reconcile_requested
+                            .get(&worktree)
+                            .copied()
+                            .filter(|requested_at| result.started_at >= *requested_at);
                         let state_event_is_newer = self
                             .opencode_last_state_event
                             .get(&result.key)
@@ -320,6 +334,11 @@ impl Tui {
                                 .unwrap_or(opencode::OpencodeState::Busy);
                         }
                         changed |= self.apply_opencode_status(index, status);
+                        if let Some(requested_at) = reconciliation {
+                            self.opencode_reconcile_requested.remove(&worktree);
+                            self.opencode_event_watermarks
+                                .insert(worktree, requested_at);
+                        }
                     }
                 }
                 Err(error) => {
@@ -346,128 +365,149 @@ impl Tui {
     }
 
     pub(crate) fn poll_opencode_events(&mut self) -> bool {
-        self.route_tui_job_messages();
-        let mut changed = false;
+        #[cfg(test)]
         while let Ok(result) = self.opencode_event_rx.try_recv() {
-            match result.event {
-                Ok(event) => {
-                    let Some(session_id) = event.session_id.as_deref() else {
-                        continue;
-                    };
-                    if session_id != result.stream.session_id {
-                        continue;
-                    }
-                    let Some(index) = self.sessions.iter().position(|session| {
-                        self.repos.get(session.repo_index).is_some_and(|managed| {
-                            session.identity_key(&managed.identity) == result.stream.worktree
-                        }) && session
-                            .opencode_status
-                            .as_ref()
-                            .and_then(|status| status.server_url.as_deref())
-                            == Some(result.stream.server_url.as_str())
-                            && session
-                                .opencode_status
-                                .as_ref()
-                                .and_then(|status| status.session_id.as_deref())
-                                == Some(result.stream.session_id.as_str())
-                    }) else {
-                        continue;
-                    };
-                    let current = self.sessions[index].opencode_status.clone();
-                    let mut status = current.unwrap_or_else(|| OpencodeStatus {
-                        server_url: Some(result.stream.server_url.clone()),
-                        session_id: Some(session_id.to_string()),
-                        title: None,
-                        state: opencode::OpencodeState::Unknown,
-                        detail: None,
-                        latest_message: None,
-                        latest_user_message: None,
-                        recent_messages: Vec::new(),
-                        active_tool: None,
-                        todos: Vec::new(),
-                        last_updated_unix_ms: None,
-                    });
-                    status.server_url = Some(result.stream.server_url.clone());
-                    status.session_id = Some(session_id.to_string());
-                    if let Some(title) = event.title {
-                        status.title = Some(title);
-                    }
-                    if let Some(state) = event.state {
-                        self.opencode_last_state_event.insert(
-                            opencode_poll_key(
-                                &self.repos[self.sessions[index].repo_index].identity,
-                                &self.sessions[index],
-                                self.worktree_generations
-                                    .get(&self.sessions[index].identity_key(
-                                        &self.repos[self.sessions[index].repo_index].identity,
-                                    ))
-                                    .copied()
-                                    .unwrap_or_default(),
-                            ),
-                            std::time::Instant::now(),
-                        );
-                        if state != opencode::OpencodeState::Idle
-                            || status.state != opencode::OpencodeState::Done
-                        {
-                            status.state = state;
-                        }
-                        if !matches!(
-                            state,
-                            opencode::OpencodeState::Busy | opencode::OpencodeState::Retry
-                        ) {
-                            status.active_tool = None;
-                        }
-                    }
-                    if let Some(detail) = event.detail {
-                        status.detail = Some(detail);
-                    } else if event.state == Some(opencode::OpencodeState::Busy) {
-                        status.detail = None;
-                    }
-                    if let Some(message) = event.latest_message {
-                        status.latest_message = Some(message.clone());
-                        if status.recent_messages.first() != Some(&message) {
-                            status.recent_messages.insert(0, message);
-                            status.recent_messages.truncate(5);
-                        }
-                    }
-                    if let Some(tool) = event.active_tool {
-                        status.active_tool = Some(tool);
-                    }
-                    if let Some(todos) = event.todos {
-                        status.todos = todos;
-                    }
-                    status.last_updated_unix_ms = Some(current_unix_ms());
-                    changed |= self.apply_opencode_status(index, status);
+            self.opencode_events_changed |= self.apply_opencode_event_result(result);
+        }
+        std::mem::take(&mut self.opencode_events_changed)
+    }
+
+    pub(crate) fn apply_opencode_event_result(&mut self, result: OpencodeEventResult) -> bool {
+        if self
+            .opencode_event_watermarks
+            .get(&result.stream.worktree)
+            .is_some_and(|watermark| result.received_at <= *watermark)
+        {
+            return false;
+        }
+        let mut changed = false;
+        match result.event {
+            Ok(event) => {
+                let Some(session_id) = event.session_id.as_deref() else {
+                    return false;
+                };
+                if session_id != result.stream.session_id {
+                    return false;
                 }
-                Err(error) => {
-                    if let Some(repo) = self.sessions.iter().find_map(|session| {
-                        (self.repos.get(session.repo_index).is_some_and(|managed| {
-                            session.identity_key(&managed.identity) == result.stream.worktree
-                        }) && session
+                let Some(index) = self.sessions.iter().position(|session| {
+                    self.repos.get(session.repo_index).is_some_and(|managed| {
+                        session.identity_key(&managed.identity) == result.stream.worktree
+                    }) && session
+                        .opencode_status
+                        .as_ref()
+                        .and_then(|status| status.server_url.as_deref())
+                        == Some(result.stream.server_url.as_str())
+                        && session
                             .opencode_status
                             .as_ref()
-                            .and_then(|status| status.server_url.as_deref())
-                            == Some(result.stream.server_url.as_str())
-                            && session
-                                .opencode_status
-                                .as_ref()
-                                .and_then(|status| status.session_id.as_deref())
-                                == Some(result.stream.session_id.as_str()))
-                        .then(|| self.repos.get(session.repo_index))
-                        .flatten()
-                    }) {
-                        let _ = append_runtime_message(
-                            &repo.repo,
-                            &format!(
-                                "opencode event stream disconnected for {}: {error}",
-                                result.stream.server_url
-                            ),
-                        );
+                            .and_then(|status| status.session_id.as_deref())
+                            == Some(result.stream.session_id.as_str())
+                }) else {
+                    return false;
+                };
+                let current = self.sessions[index].opencode_status.clone();
+                let mut status = current.unwrap_or_else(|| OpencodeStatus {
+                    server_url: Some(result.stream.server_url.clone()),
+                    session_id: Some(session_id.to_string()),
+                    title: None,
+                    state: opencode::OpencodeState::Unknown,
+                    detail: None,
+                    latest_message: None,
+                    latest_user_message: None,
+                    recent_messages: Vec::new(),
+                    active_tool: None,
+                    todos: Vec::new(),
+                    last_updated_unix_ms: None,
+                });
+                status.server_url = Some(result.stream.server_url.clone());
+                status.session_id = Some(session_id.to_string());
+                if let Some(title) = event.title {
+                    status.title = Some(title);
+                }
+                if let Some(state) = event.state {
+                    self.opencode_last_state_event.insert(
+                        opencode_poll_key(
+                            &self.repos[self.sessions[index].repo_index].identity,
+                            &self.sessions[index],
+                            self.worktree_generations
+                                .get(&self.sessions[index].identity_key(
+                                    &self.repos[self.sessions[index].repo_index].identity,
+                                ))
+                                .copied()
+                                .unwrap_or_default(),
+                        ),
+                        result.received_at,
+                    );
+                    if state != opencode::OpencodeState::Idle
+                        || status.state != opencode::OpencodeState::Done
+                    {
+                        status.state = state;
                     }
+                    if !matches!(
+                        state,
+                        opencode::OpencodeState::Busy | opencode::OpencodeState::Retry
+                    ) {
+                        status.active_tool = None;
+                    }
+                }
+                if let Some(detail) = event.detail {
+                    status.detail = Some(detail);
+                } else if event.state == Some(opencode::OpencodeState::Busy) {
+                    status.detail = None;
+                }
+                if let Some(message) = event.latest_message {
+                    status.latest_message = Some(message.clone());
+                    if status.recent_messages.first() != Some(&message) {
+                        status.recent_messages.insert(0, message);
+                        status.recent_messages.truncate(5);
+                    }
+                }
+                if let Some(tool) = event.active_tool {
+                    status.active_tool = Some(tool);
+                }
+                if let Some(todos) = event.todos {
+                    status.todos = todos;
+                }
+                status.last_updated_unix_ms = Some(current_unix_ms());
+                changed |= self.apply_opencode_status(index, status);
+            }
+            Err(error) => {
+                if let Some(repo) = self.sessions.iter().find_map(|session| {
+                    (self.repos.get(session.repo_index).is_some_and(|managed| {
+                        session.identity_key(&managed.identity) == result.stream.worktree
+                    }) && session
+                        .opencode_status
+                        .as_ref()
+                        .and_then(|status| status.server_url.as_deref())
+                        == Some(result.stream.server_url.as_str())
+                        && session
+                            .opencode_status
+                            .as_ref()
+                            .and_then(|status| status.session_id.as_deref())
+                            == Some(result.stream.session_id.as_str()))
+                    .then(|| self.repos.get(session.repo_index))
+                    .flatten()
+                }) {
+                    let _ = append_runtime_message(
+                        &repo.repo,
+                        &format!(
+                            "opencode event stream disconnected for {}: {error}",
+                            result.stream.server_url
+                        ),
+                    );
                 }
             }
         }
         changed
+    }
+
+    pub(crate) fn request_opencode_reconciliation(&mut self) {
+        let requested_at = Instant::now();
+        for stream in &self.opencode_listeners {
+            self.opencode_reconcile_requested
+                .insert(stream.worktree.clone(), requested_at);
+        }
+        self.start_opencode_status_poll(true);
     }
 
     pub(super) fn apply_opencode_status(&mut self, index: usize, status: OpencodeStatus) -> bool {

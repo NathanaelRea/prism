@@ -865,6 +865,7 @@ fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
     tui.opencode_event_tx
         .send(OpencodeEventResult {
             stream: test_opencode_stream(&tui),
+            received_at: Instant::now(),
             event: Ok(parse_event_payload(
                 r#"{"type":"message.updated","properties":{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"}}}"#,
             )
@@ -882,6 +883,7 @@ fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
     tui.opencode_event_tx
         .send(OpencodeEventResult {
             stream: test_opencode_stream(&tui),
+            received_at: Instant::now(),
             event: Ok(parse_event_payload(
                 r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":"busy"}}"#,
             )
@@ -901,6 +903,7 @@ fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
     tui.opencode_event_tx
         .send(OpencodeEventResult {
             stream: test_opencode_stream(&tui),
+            received_at: Instant::now(),
             event: Ok(parse_event_payload(
                 r#"{"type":"message.updated","properties":{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":3,"completed":4},"finish":"stop"}}}"#,
             )
@@ -946,6 +949,7 @@ fn opencode_poll_does_not_mark_reconnected_running_session_done_before_completed
     tui.opencode_event_tx
         .send(OpencodeEventResult {
             stream: test_opencode_stream(&tui),
+            received_at: Instant::now(),
             event: Ok(parse_event_payload(
                 r#"{"type":"message.updated","properties":{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":1,"completed":2},"error":{"name":"MessageAbortedError"}}}}"#,
             )
@@ -984,6 +988,7 @@ fn opencode_permission_event_marks_session_as_needing_input() {
     tui.opencode_event_tx
         .send(OpencodeEventResult {
             stream: test_opencode_stream(&tui),
+            received_at: Instant::now(),
             event: Ok(parse_event_payload(
                 r#"{"type":"permission.asked","properties":{"sessionID":"ses_1","permission":"bash"}}"#,
             )

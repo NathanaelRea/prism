@@ -234,7 +234,9 @@ impl Tui {
     }
 
     pub(crate) fn poll_tmux_agent_warmup(&mut self) -> bool {
-        self.route_tui_job_messages();
+        if !self.tui_tick_active && !self.routing_tui_jobs {
+            self.route_tui_job_messages();
+        }
         let mut changed = false;
         while let Ok(result) = self.tmux_warmup_rx.try_recv() {
             changed |= self.apply_tmux_warmup_result(result);

@@ -100,7 +100,9 @@ impl Tui {
     }
 
     pub(crate) fn poll_session_refresh(&mut self) -> bool {
-        self.route_tui_job_messages();
+        if !self.tui_tick_active && !self.routing_tui_jobs {
+            self.route_tui_job_messages();
+        }
         let mut changed = false;
         let mut restart = false;
         while let Ok(result) = self.session_refresh_rx.try_recv() {
@@ -625,7 +627,7 @@ impl Tui {
             key.generation,
             Some(TUI_ACTION_JOB_TIMEOUT),
             format!("prism-delete-{}", branch),
-            move |_| {
+            move |context| {
                 let result = crate::session::delete_worktree_session_if_current(
                     &repo,
                     &config,
@@ -635,6 +637,7 @@ impl Tui {
                 );
                 Ok(Some(TuiJobPayload::DeleteSession(DeleteSessionResult {
                     key: job_key,
+                    delivery_id: context.id(),
                     result,
                 })))
             },
@@ -643,7 +646,9 @@ impl Tui {
     }
 
     pub(crate) fn poll_delete_sessions(&mut self) -> bool {
-        self.route_tui_job_messages();
+        if !self.tui_tick_active && !self.routing_tui_jobs {
+            self.route_tui_job_messages();
+        }
         let mut changed = false;
         while let Ok(result) = self.delete_session_rx.try_recv() {
             let Some(current_generation) = self

@@ -272,7 +272,9 @@ impl Tui {
     }
 
     pub(super) fn drain_pr_poll_results(&mut self) -> bool {
-        self.route_tui_job_messages();
+        if !self.tui_tick_active && !self.routing_tui_jobs {
+            self.route_tui_job_messages();
+        }
         let mut changed = false;
         let selected = self.selected_worktree_index();
         while let Ok(result) = self.pr_poll_rx.try_recv() {
@@ -453,7 +455,9 @@ impl Tui {
     }
 
     pub(crate) fn poll_wt_columns(&mut self) -> bool {
-        self.route_tui_job_messages();
+        if !self.tui_tick_active && !self.routing_tui_jobs {
+            self.route_tui_job_messages();
+        }
         let mut changed = false;
         while let Ok(result) = self.wt_poll_rx.try_recv() {
             let Some(repo_index) = self
@@ -556,7 +560,9 @@ impl Tui {
     }
 
     pub(crate) fn poll_default_branch_status(&mut self) -> bool {
-        self.route_tui_job_messages();
+        if !self.tui_tick_active && !self.routing_tui_jobs {
+            self.route_tui_job_messages();
+        }
         let mut changed = false;
         while let Ok(result) = self.default_branch_poll_rx.try_recv() {
             let Some(repo_index) = self
