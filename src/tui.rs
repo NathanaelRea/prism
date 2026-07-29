@@ -5111,19 +5111,21 @@ mod tests {
         fs::create_dir_all(&worktree).unwrap();
         fs::write(worktree.join(".git"), "gitdir: /tmp/gitdir\n").unwrap();
         let git = temp.join("git");
+        let refresh_gate = temp.join("allow-refresh");
         fs::write(
             &git,
             format!(
                 r#"#!/bin/sh
 case "$*" in
   *"worktree list --porcelain"*)
-    sleep 1
+    while [ ! -f {:?} ]; do sleep 0.1; done
     printf 'worktree {}\nHEAD abc\nbranch refs/heads/feature\n\n'
     ;;
   *"status --short --branch"*) printf '## feature\n' ;;
   *"remote get-url origin"*) printf 'git@github.com:owner/repo.git\n' ;;
 esac
 "#,
+                refresh_gate.display().to_string(),
                 worktree.display()
             ),
         )
@@ -5152,6 +5154,7 @@ esac
             "returning from tmux waited for refresh for {elapsed:?}"
         );
 
+        fs::write(refresh_gate, "").unwrap();
         let wait_started = Instant::now();
         while tui.session_refresh_in_flight && wait_started.elapsed() < Duration::from_secs(3) {
             tui.poll_session_refresh();
