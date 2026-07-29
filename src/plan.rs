@@ -430,7 +430,7 @@ fn choose_with_fzf(config: &Config, files: &[PathBuf]) -> Result<PathBuf, String
         input.as_bytes(),
         64 * 1024,
     )
-    .map_err(|_| "no plan file selected".to_string())?;
+    .map_err(|error| format!("select plan file: {error}"))?;
     let selected = output.trim().to_string();
     if selected.is_empty() {
         return Err("no plan file selected".to_string());
@@ -570,6 +570,19 @@ mod tests {
         assert_eq!(error, "could not infer phases; add headings like 'Phase 1'");
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn plan_selection_preserves_fzf_execution_errors() {
+        let mut config = test_config();
+        config
+            .tools
+            .insert("fzf".to_string(), "/prism-test/nonexistent-fzf".to_string());
+
+        let error = choose_with_fzf(&config, &[PathBuf::from("plan.md")]).unwrap_err();
+
+        assert!(error.starts_with("select plan file: "), "{error}");
+        assert!(error.contains("/prism-test/nonexistent-fzf"), "{error}");
     }
 
     #[test]

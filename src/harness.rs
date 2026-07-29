@@ -775,10 +775,11 @@ pub fn terminate_process(
     let process_group = -(process_id as libc::pid_t);
     let result = unsafe { libc::kill(process_group, libc::SIGTERM) };
     if result != 0 {
-        return Err(format!(
-            "terminate harness process {process_id}: {}",
-            std::io::Error::last_os_error()
-        ));
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(format!("terminate harness process {process_id}: {error}"));
     }
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     while std::time::Instant::now() < deadline {
