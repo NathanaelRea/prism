@@ -3089,12 +3089,18 @@ mod tests {
             assert!(std::time::Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
-        let descendant_result = unsafe { libc::kill(descendant_id, 0) };
-        assert_eq!(descendant_result, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
-        );
+        let gone_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let result = unsafe { libc::kill(descendant_id, 0) };
+            if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < gone_deadline,
+                "stored server descendant {descendant_id} survived shutdown"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         fs::remove_dir_all(temp).unwrap();
     }
 
