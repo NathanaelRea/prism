@@ -35,7 +35,7 @@ use crate::lifecycle::{
     push_branch, run_pre_pr_checks, run_pre_push_checks, run_worktrunk_approval_prompt,
 };
 use crate::observability::append_runtime_message;
-use crate::opencode::{self, OpencodeStatus, load_runtime};
+use crate::opencode::{self, OpencodeStatus, load_runtime, load_runtime_snapshot};
 use crate::plan::{PlanExecution, infer_total_phases, open_plan_mode, select_plan_path};
 use crate::plan_run::{
     DEFAULT_OUTPUT_LINES_PER_STEP, PlanRunMode, PlanRunStatus, PlanStepStatus, abort_plan_run,
@@ -52,8 +52,8 @@ use crate::session::{
 use crate::tmux::TmuxWindow;
 use crate::tui::{
     DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, ManagedRepo,
-    OpencodeEventResult, OpencodePollKey, OpencodePollResult, PrPollKey, PrPollResult, Tui,
-    WtPollResult,
+    OpencodeEventResult, OpencodePollKey, OpencodePollResult, PrPollKey, PrPollResult,
+    SessionRefreshResult, SessionRefreshSnapshot, Tui, WtPollResult,
 };
 
 use crate::util::status_count;

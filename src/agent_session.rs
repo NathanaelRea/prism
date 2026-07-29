@@ -8,7 +8,7 @@ use crate::agent::AgentState;
 use crate::config::Config;
 use crate::opencode::{OpencodeRuntime, load_runtime};
 use crate::repo::Repository;
-use crate::session::{Session, WorktreeRepositoryKey, save_agent_state};
+use crate::session::{Session, WorktreeRepositoryKey, WorktreeSessionKey, save_agent_state};
 use crate::tmux;
 use crate::tui::ManagedRepo;
 
@@ -114,6 +114,7 @@ pub(crate) fn session_use(
 pub(crate) fn warmup_jobs_for_sessions(
     repos: &[ManagedRepo],
     sessions: &[Session],
+    harness_configs: &BTreeMap<WorktreeSessionKey, Config>,
     generations: &mut BTreeMap<AgentSessionSlot, u64>,
     in_flight: &BTreeSet<AgentSessionWarmupKey>,
 ) -> Vec<AgentSessionWarmupJob> {
@@ -125,9 +126,8 @@ pub(crate) fn warmup_jobs_for_sessions(
             (!in_flight.contains(&use_.warmup_key))
                 .then(|| {
                     repos.get(session.repo_index).and_then(|repo| {
-                        let association =
-                            crate::session::worktree_harness(&repo.repo, &session).ok()?;
-                        let config = repo.config.for_harness(&association.harness_id).ok()?;
+                        let session_key = session.identity_key(&repo.identity);
+                        let config = harness_configs.get(&session_key)?.clone();
                         Some(AgentSessionWarmupJob {
                             key: use_.warmup_key,
                             repo: repo.repo.clone(),
@@ -145,6 +145,7 @@ pub(crate) fn warmup_jobs_for_sessions(
 pub(crate) fn warmup_job_for_key(
     repos: &[ManagedRepo],
     sessions: &[Session],
+    harness_configs: &BTreeMap<WorktreeSessionKey, Config>,
     generations: &BTreeMap<AgentSessionSlot, u64>,
     in_flight: &BTreeSet<AgentSessionWarmupKey>,
     key: AgentSessionWarmupKey,
@@ -161,8 +162,8 @@ pub(crate) fn warmup_job_for_key(
     let repo = repos
         .iter()
         .find(|repo| repo.identity == key.slot.repository)?;
-    let association = crate::session::worktree_harness(&repo.repo, session).ok()?;
-    let config = repo.config.for_harness(&association.harness_id).ok()?;
+    let session_key = session.identity_key(&repo.identity);
+    let config = harness_configs.get(&session_key)?.clone();
     Some(AgentSessionWarmupJob {
         key,
         repo: repo.repo.clone(),
@@ -533,6 +534,7 @@ mod tests {
             warmup_job_for_key(
                 &repos,
                 &sessions,
+                &BTreeMap::new(),
                 &generations,
                 &BTreeSet::new(),
                 AgentSessionWarmupKey::new(slot.clone(), 0),
@@ -547,6 +549,7 @@ mod tests {
             warmup_job_for_key(
                 &repos,
                 &sessions,
+                &BTreeMap::new(),
                 &generations,
                 &in_flight,
                 current,
@@ -566,8 +569,16 @@ mod tests {
         let sessions = vec![test_session("feature")];
         let slot = AgentSessionSlot::for_repository_session(&repos[0].identity, &sessions[0]);
         let mut generations = BTreeMap::from([(slot.clone(), 4)]);
+        let harness_configs =
+            BTreeMap::from([(sessions[0].identity_key(&repos[0].identity), test_config())]);
 
-        let jobs = warmup_jobs_for_sessions(&repos, &sessions, &mut generations, &BTreeSet::new());
+        let jobs = warmup_jobs_for_sessions(
+            &repos,
+            &sessions,
+            &harness_configs,
+            &mut generations,
+            &BTreeSet::new(),
+        );
 
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].key, AgentSessionWarmupKey::new(slot, 4));

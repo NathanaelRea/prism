@@ -19,6 +19,150 @@ pub(super) fn archived_picker_overflow_message(
 }
 
 impl Tui {
+    pub(crate) fn refresh_sessions_after_tmux(&mut self) -> Result<(), String> {
+        self.poll_session_refresh();
+        if self.session_refresh_in_flight {
+            self.session_refresh_pending = true;
+            return Ok(());
+        }
+        let base_generation = self.session_inventory_generation;
+        let mut repos = self.repos.clone();
+        let previous_repository_identities = self.session_repository_identities.clone();
+        let mut sessions = self
+            .sessions
+            .iter()
+            .map(crate::session::Session::background_job_snapshot)
+            .collect::<Vec<_>>();
+        let tx = self.session_refresh_tx.clone();
+        self.session_refresh_in_flight = true;
+        thread::spawn(move || {
+            for managed in &mut repos {
+                managed.config = crate::config::Config::load(&managed.repo);
+            }
+            let repositories = repos
+                .iter()
+                .enumerate()
+                .map(
+                    |(repo_index, managed)| crate::session::WorktreeSessionRepository {
+                        repo_index,
+                        repo: &managed.repo,
+                        config: &managed.config,
+                        label: &managed.label,
+                        key: managed.key,
+                        identity: &managed.identity,
+                    },
+                )
+                .collect::<Vec<_>>();
+            let baseline_sessions = sessions
+                .iter()
+                .filter_map(|session| {
+                    let managed = repos.get(session.repo_index)?;
+                    Some((
+                        session.identity_key(&managed.identity),
+                        session.background_job_snapshot(),
+                    ))
+                })
+                .collect();
+            let result = crate::session::refresh_worktree_sessions(
+                &repositories,
+                &previous_repository_identities,
+                &mut sessions,
+            )
+            .map(|()| SessionRefreshSnapshot {
+                repository_identities: repos
+                    .iter()
+                    .enumerate()
+                    .map(|(index, repo)| (index, repo.identity.clone()))
+                    .collect(),
+                configs: repos
+                    .iter()
+                    .map(|repo| (repo.identity.clone(), repo.config.clone()))
+                    .collect(),
+                baseline_sessions,
+                worktree_harness_configs: crate::tui::load_worktree_harness_configs(
+                    &repos, &sessions,
+                ),
+                sessions,
+            });
+            let _ = tx.send(SessionRefreshResult {
+                base_generation,
+                result,
+            });
+        });
+        Ok(())
+    }
+
+    pub(crate) fn poll_session_refresh(&mut self) -> bool {
+        let mut changed = false;
+        let mut restart = false;
+        while let Ok(result) = self.session_refresh_rx.try_recv() {
+            self.session_refresh_in_flight = false;
+            if self.session_refresh_pending
+                || result.base_generation != self.session_inventory_generation
+            {
+                restart |= self.session_refresh_pending;
+                self.session_refresh_pending = false;
+                continue;
+            }
+            let snapshot = match result.result {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    let _ = append_runtime_message(
+                        &self.repo,
+                        &format!("background Worktree Session refresh failed: {error}"),
+                    );
+                    continue;
+                }
+            };
+            for managed in &mut self.repos {
+                if let Some(config) = snapshot.configs.get(&managed.identity) {
+                    managed.config = config.clone();
+                }
+            }
+            let mut previous = self
+                .sessions
+                .iter()
+                .filter_map(|session| {
+                    let managed = self.repos.get(session.repo_index)?;
+                    Some((
+                        session.identity_key(&managed.identity),
+                        session.background_job_snapshot(),
+                    ))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let mut baseline = snapshot.baseline_sessions;
+            self.sessions = snapshot
+                .sessions
+                .into_iter()
+                .filter_map(|mut session| {
+                    let repository = snapshot.repository_identities.get(&session.repo_index)?;
+                    let repo_index = self
+                        .repos
+                        .iter()
+                        .position(|managed| &managed.identity == repository)?;
+                    let managed = &self.repos[repo_index];
+                    session.apply_repo_identity(repo_index, managed.label.clone(), managed.key);
+                    let identity = session.identity_key(&managed.identity);
+                    if let Some(old) = previous.remove(&identity) {
+                        if let Some(baseline) = baseline.remove(&identity) {
+                            session.preserve_concurrent_refresh_state_from(&old, &baseline);
+                        }
+                        session.preserve_refresh_state_from(old, &managed.config);
+                    }
+                    Some(session)
+                })
+                .collect();
+            self.worktree_harness_configs = snapshot.worktree_harness_configs;
+            self.reconcile_session_inventory();
+            self.session_inventory_generation = self.session_inventory_generation.saturating_add(1);
+            changed = true;
+        }
+        if restart {
+            let _ = self.refresh_sessions_after_tmux();
+        }
+        changed
+    }
+
     pub(crate) fn refresh_sessions(&mut self) -> Result<(), String> {
         for managed in &mut self.repos {
             managed.config = crate::config::Config::load(&managed.repo);
@@ -43,6 +187,15 @@ impl Tui {
             &self.session_repository_identities,
             &mut self.sessions,
         )?;
+        self.session_inventory_generation = self.session_inventory_generation.saturating_add(1);
+        self.reconcile_session_inventory();
+        self.worktree_harness_configs =
+            crate::tui::load_worktree_harness_configs(&self.repos, &self.sessions);
+        self.request_workflow_maintenance();
+        Ok(())
+    }
+
+    fn reconcile_session_inventory(&mut self) {
         let live = self
             .sessions
             .iter()
@@ -71,7 +224,6 @@ impl Tui {
             &mut self.tmux_generations,
         );
         self.ensure_navigation_valid();
-        Ok(())
     }
 
     pub(crate) fn create_session(
@@ -159,6 +311,7 @@ impl Tui {
             &context.config.default_harness,
             false,
         )?;
+        self.reload_worktree_harness_config(index);
         let adoption = crate::session::adopt_worktree_session(
             &context.repo,
             &mut self.sessions[index],

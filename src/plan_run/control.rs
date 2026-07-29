@@ -1,5 +1,7 @@
 use super::*;
 
+pub const ARCHIVED_PLAN_RETENTION_MS: u64 = 60 * 60 * 24 * 30 * 1_000;
+
 pub(super) enum RecordedProcessState {
     Missing,
     Live(u32),

@@ -262,23 +262,22 @@ pub fn load_auto_run(
     let Some(mut run) = run else {
         return Ok(None);
     };
-    if run.status == AutoRunStatus::Done
-        && (run.pending_push.is_some()
-            || run
-                .stabilization_status
-                .is_some_and(stabilization_model::StabilizationStatus::keeps_run_active))
-    {
-        run.status = AutoRunStatus::Paused;
-        if run.pending_push.is_some() {
-            run.stabilization_status = Some(stabilization_model::StabilizationStatus::Blocked);
-            run.stabilization_blocker =
-                Some(stabilization_model::StabilizationBlocker::PendingPush);
-            run.stabilization_next_work =
-                Some(stabilization_model::StabilizationWorkKind::PushPendingRepair);
-        }
+    if normalize_active_run(&mut run) {
         run.updated_unix_ms = unix_ms();
         save_run_with_conn(conn, &run)?;
     }
+    let steps = load_steps_with_conn(conn, run_id)?;
+    Ok(Some(PersistedAutoRun { run, steps }))
+}
+
+pub fn load_auto_run_snapshot(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+) -> Result<Option<PersistedAutoRun>, String> {
+    let Some(mut run) = load_run_with_conn(conn, run_id)? else {
+        return Ok(None);
+    };
+    normalize_active_run(&mut run);
     let steps = load_steps_with_conn(conn, run_id)?;
     Ok(Some(PersistedAutoRun { run, steps }))
 }
@@ -288,6 +287,28 @@ pub fn load_recent_active_runs_for_repo(
     repo_root: &Path,
     limit: usize,
 ) -> Result<Vec<PersistedAutoRun>, String> {
+    load_recent_active_run_ids_for_repo(conn, repo_root, limit)?
+        .into_iter()
+        .filter_map(|id| load_auto_run(conn, &id).transpose())
+        .collect()
+}
+
+pub fn load_recent_active_run_snapshots_for_repo(
+    conn: &rusqlite::Connection,
+    repo_root: &Path,
+    limit: usize,
+) -> Result<Vec<PersistedAutoRun>, String> {
+    load_recent_active_run_ids_for_repo(conn, repo_root, limit)?
+        .into_iter()
+        .filter_map(|id| load_auto_run_snapshot(conn, &id).transpose())
+        .collect()
+}
+
+fn load_recent_active_run_ids_for_repo(
+    conn: &rusqlite::Connection,
+    repo_root: &Path,
+    limit: usize,
+) -> Result<Vec<String>, String> {
     let mut statement = conn
         .prepare(
             "select id
@@ -309,17 +330,33 @@ pub fn load_recent_active_runs_for_repo(
              limit ?2",
         )
         .map_err(|error| format!("prepare recent auto run load: {error}"))?;
-    let ids = statement
+    statement
         .query_map(
             params![repo_root.display().to_string(), usize_to_i64(limit)],
             |row| row.get::<_, String>(0),
         )
         .map_err(|error| format!("load recent auto run ids: {error}"))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("read recent auto run ids: {error}"))?;
-    ids.into_iter()
-        .filter_map(|id| load_auto_run(conn, &id).transpose())
-        .collect()
+        .map_err(|error| format!("read recent auto run ids: {error}"))
+}
+
+fn normalize_active_run(run: &mut AutoRun) -> bool {
+    if run.status != AutoRunStatus::Done
+        || (run.pending_push.is_none()
+            && !run
+                .stabilization_status
+                .is_some_and(stabilization_model::StabilizationStatus::keeps_run_active))
+    {
+        return false;
+    }
+    run.status = AutoRunStatus::Paused;
+    if run.pending_push.is_some() {
+        run.stabilization_status = Some(stabilization_model::StabilizationStatus::Blocked);
+        run.stabilization_blocker = Some(stabilization_model::StabilizationBlocker::PendingPush);
+        run.stabilization_next_work =
+            Some(stabilization_model::StabilizationWorkKind::PushPendingRepair);
+    }
+    true
 }
 
 pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &AutoRun) -> Result<(), String> {

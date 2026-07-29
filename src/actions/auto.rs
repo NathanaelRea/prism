@@ -464,6 +464,13 @@ impl Tui {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
         let run_id = dashboard.run.run.id.clone();
+        let step_ids = dashboard
+            .run
+            .steps
+            .iter()
+            .filter_map(|step| step.id)
+            .collect::<BTreeSet<_>>();
+        let repository = crate::session::WorktreeRepositoryKey::new(repo.root.clone());
         crate::observability::with_writable_db(&repo, |conn| {
             let mut run = load_auto_run(conn, &run_id)?
                 .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
@@ -476,6 +483,11 @@ impl Tui {
         }
         self.selected_auto_step_by_run.remove(&run_id);
         self.auto_output_state_by_run.remove(&run_id);
+        self.auto_output_cache
+            .borrow_mut()
+            .retain(|(cached_repository, step_run_id), _| {
+                cached_repository != &repository || !step_ids.contains(step_run_id)
+            });
         self.show_message("dismissed Auto Flow run")?;
         Ok(true)
     }

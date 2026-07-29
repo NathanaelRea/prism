@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -12,16 +13,16 @@ use ratatui::text::Line;
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{
-    AutoRunStatus, PersistedAutoRun, load_auto_run, load_output_lines as load_auto_output_lines,
-    load_recent_active_runs_for_repo,
+    AutoOutputLine, AutoRunStatus, PersistedAutoRun, load_auto_run_snapshot,
+    load_output_lines as load_auto_output_lines, load_recent_active_run_snapshots_for_repo,
 };
 use crate::config::Config;
 use crate::github::{PrCache, PrSummary};
 use crate::input::{Key, KeyInput};
 use crate::opencode::{OpencodeEvent, OpencodeStatus};
 use crate::plan_run::{
-    PersistedPlanRun, PlanRunStatus, PlanStepStatus, cleanup_stale_archived_plan_runs,
-    load_output_lines, load_plan_run, load_recent_plan_runs_for_repo,
+    PersistedPlanRun, PlanOutputLine, PlanRunStatus, PlanStepStatus, load_output_lines,
+    load_plan_run, load_recent_plan_runs_for_repo,
 };
 use crate::repo::Repository;
 use crate::session::{Session, WorktreeRepositoryKey, WorktreeSessionKey};
@@ -39,6 +40,17 @@ pub struct Tui {
     pub(crate) sessions: Vec<Session>,
     pub(crate) session_repository_identities: BTreeMap<usize, WorktreeRepositoryKey>,
     pub(crate) worktree_generations: BTreeMap<WorktreeSessionKey, u64>,
+    pub(crate) worktree_harness_configs: BTreeMap<WorktreeSessionKey, Config>,
+    pub(crate) session_refresh_tx: Sender<SessionRefreshResult>,
+    pub(crate) session_refresh_rx: Receiver<SessionRefreshResult>,
+    pub(crate) session_refresh_in_flight: bool,
+    pub(crate) session_refresh_pending: bool,
+    pub(crate) session_inventory_generation: u64,
+    workflow_maintenance_tx: Sender<()>,
+    workflow_maintenance_rx: Receiver<()>,
+    workflow_maintenance_in_flight: bool,
+    workflow_maintenance_due: bool,
+    workflow_maintenance_last_started: Instant,
     pub(crate) selected: usize,
     pub(crate) selected_repo_root: Option<PathBuf>,
     pub(crate) focused_panel: PanelFocus,
@@ -66,6 +78,7 @@ pub struct Tui {
     pub(crate) tmux_portal_last_polled: BTreeMap<AgentSessionWarmupKey, Instant>,
     pub(crate) tmux_portal: Option<TmuxPortalSnapshot>,
     pub(crate) tmux_portal_size: Option<(u16, u16)>,
+    pub(crate) tmux_portal_resized: Option<(AgentSessionWarmupKey, (u16, u16))>,
     pub(crate) wt_poll_tx: Sender<WtPollResult>,
     pub(crate) wt_poll_rx: Receiver<WtPollResult>,
     pub(crate) default_branch_poll_tx: Sender<DefaultBranchPollResult>,
@@ -78,17 +91,22 @@ pub struct Tui {
     pub(crate) opencode_event_tx: Sender<OpencodeEventResult>,
     pub(crate) opencode_event_rx: Receiver<OpencodeEventResult>,
     pub(crate) opencode_sse_servers: BTreeSet<String>,
+    pub(crate) opencode_listener_last_scanned: Option<Instant>,
     pub(crate) plan_runs: BTreeMap<String, PersistedPlanRun>,
     pub(crate) active_plan_runs: BTreeMap<PathBuf, String>,
     pub(crate) selected_plan_step_by_run: BTreeMap<String, usize>,
     pub(crate) manual_plan_step_selection_by_run: BTreeSet<String>,
     pub(crate) plan_output_state_by_run: BTreeMap<String, view::PlanOutputViewerState>,
+    pub(crate) plan_output_cache: RefCell<BTreeMap<(String, usize), Vec<PlanOutputLine>>>,
     pub(crate) auto_runs: BTreeMap<String, PersistedAutoRun>,
     pub(crate) active_auto_runs: BTreeMap<PathBuf, String>,
     pub(crate) selected_auto_run: Option<String>,
     pub(crate) selected_auto_step_by_run: BTreeMap<String, i64>,
     pub(crate) auto_output_state_by_run: BTreeMap<String, view::AutoOutputViewerState>,
+    pub(crate) auto_output_cache:
+        RefCell<BTreeMap<(WorktreeRepositoryKey, i64), Vec<AutoOutputLine>>>,
     pub(crate) last_plan_poll: Option<Instant>,
+    pub(crate) last_auto_poll: Option<Instant>,
     pub(crate) repo_filter: String,
     pub(crate) worktree_filter: String,
     pub(crate) leader_hint: Option<LeaderHint>,
@@ -100,7 +118,7 @@ pub struct Tui {
 }
 
 const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
-const ARCHIVED_PLAN_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 30);
+const WORKFLOW_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedRepo {
     pub repo: Repository,
@@ -133,6 +151,7 @@ pub(crate) struct TmuxPortalResult {
     pub key: AgentSessionWarmupKey,
     pub started_at: Instant,
     pub capture: Result<Vec<Line<'static>>, String>,
+    pub resized_size: Option<(u16, u16)>,
 }
 
 pub(crate) struct TmuxPortalTarget {
@@ -152,6 +171,32 @@ pub(crate) struct TmuxPortalSnapshot {
 pub(crate) struct TmuxPortalCapture {
     pub key: AgentSessionWarmupKey,
     pub result: Result<Vec<Line<'static>>, String>,
+}
+
+pub(crate) fn load_worktree_harness_configs(
+    repos: &[ManagedRepo],
+    sessions: &[Session],
+) -> BTreeMap<WorktreeSessionKey, Config> {
+    sessions
+        .iter()
+        .filter_map(|session| {
+            let managed = repos.get(session.repo_index)?;
+            let association = crate::session::worktree_harness(&managed.repo, session).ok()?;
+            let config = managed.config.for_harness(&association.harness_id).ok()?;
+            Some((session.identity_key(&managed.identity), config))
+        })
+        .collect()
+}
+
+pub(crate) fn maintain_workflow_storage(repo: &Repository) -> Result<(), String> {
+    crate::observability::with_writable_db(repo, |conn| {
+        crate::plan_run::cleanup_stale_archived_plan_runs(
+            conn,
+            crate::plan_run::ARCHIVED_PLAN_RETENTION_MS,
+        )?;
+        crate::auto_flow::load_recent_active_runs_for_repo(conn, &repo.root, usize::MAX)?;
+        Ok(())
+    })
 }
 
 impl ManagedRepo {
@@ -283,6 +328,19 @@ pub(crate) struct DefaultBranchPollResult {
     pub status_label: Result<String, String>,
 }
 
+pub(crate) struct SessionRefreshResult {
+    pub base_generation: u64,
+    pub result: Result<SessionRefreshSnapshot, String>,
+}
+
+pub(crate) struct SessionRefreshSnapshot {
+    pub repository_identities: BTreeMap<usize, WorktreeRepositoryKey>,
+    pub configs: BTreeMap<WorktreeRepositoryKey, Config>,
+    pub baseline_sessions: BTreeMap<WorktreeSessionKey, Session>,
+    pub sessions: Vec<Session>,
+    pub worktree_harness_configs: BTreeMap<WorktreeSessionKey, Config>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct OpencodePollKey {
     pub repository: WorktreeRepositoryKey,
@@ -390,6 +448,7 @@ fn plan_run_status_sort_key(status: PlanRunStatus) -> u8 {
 
 #[derive(Default)]
 struct TuiBackgroundChanges {
+    sessions: bool,
     tmux: bool,
     tmux_portal: bool,
     worktree_columns: bool,
@@ -406,6 +465,7 @@ struct TuiBackgroundChanges {
 impl TuiBackgroundChanges {
     fn any(&self) -> bool {
         self.tmux
+            || self.sessions
             || self.tmux_portal
             || self.worktree_columns
             || self.default_branch
@@ -482,6 +542,8 @@ fn move_enabled_ordered_item(
 impl Tui {
     pub fn new(repos: Vec<ManagedRepo>, current_repo: usize, sessions: Vec<Session>) -> Self {
         let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
+        let (session_refresh_tx, session_refresh_rx) = mpsc::channel();
+        let (workflow_maintenance_tx, workflow_maintenance_rx) = mpsc::channel();
         let (delete_session_tx, delete_session_rx) = mpsc::channel();
         let (tmux_warmup_tx, tmux_warmup_rx) = mpsc::channel();
         let (tmux_portal_tx, tmux_portal_rx) = mpsc::channel();
@@ -521,6 +583,17 @@ impl Tui {
             sessions,
             session_repository_identities,
             worktree_generations,
+            worktree_harness_configs: BTreeMap::new(),
+            session_refresh_tx,
+            session_refresh_rx,
+            session_refresh_in_flight: false,
+            session_refresh_pending: false,
+            session_inventory_generation: 0,
+            workflow_maintenance_tx,
+            workflow_maintenance_rx,
+            workflow_maintenance_in_flight: false,
+            workflow_maintenance_due: false,
+            workflow_maintenance_last_started: Instant::now(),
             selected: 0,
             selected_repo_root: None,
             focused_panel: PanelFocus::Repos,
@@ -548,6 +621,7 @@ impl Tui {
             tmux_portal_last_polled: BTreeMap::new(),
             tmux_portal: None,
             tmux_portal_size: None,
+            tmux_portal_resized: None,
             wt_poll_tx,
             wt_poll_rx,
             default_branch_poll_tx,
@@ -560,17 +634,21 @@ impl Tui {
             opencode_event_tx,
             opencode_event_rx,
             opencode_sse_servers: BTreeSet::new(),
+            opencode_listener_last_scanned: None,
             plan_runs: BTreeMap::new(),
             active_plan_runs: BTreeMap::new(),
             selected_plan_step_by_run: BTreeMap::new(),
             manual_plan_step_selection_by_run: BTreeSet::new(),
             plan_output_state_by_run: BTreeMap::new(),
+            plan_output_cache: RefCell::new(BTreeMap::new()),
             auto_runs: BTreeMap::new(),
             active_auto_runs: BTreeMap::new(),
             selected_auto_run: None,
             selected_auto_step_by_run: BTreeMap::new(),
             auto_output_state_by_run: BTreeMap::new(),
+            auto_output_cache: RefCell::new(BTreeMap::new()),
             last_plan_poll: None,
+            last_auto_poll: None,
             repo_filter: String::new(),
             worktree_filter: String::new(),
             leader_hint: None,
@@ -701,6 +779,7 @@ impl Tui {
         let mut runtime = TerminalRuntime::enter()?;
         crate::worker::ensure_running()?;
         self.offer_interrupted_run_recovery(&mut runtime)?;
+        self.refresh_worktree_harness_configs();
         self.start_tmux_agent_warmup();
         self.poll_tmux_portal();
         self.start_wt_column_poll();
@@ -1168,6 +1247,7 @@ impl Tui {
 
     fn tick_tui_action_jobs(&mut self) -> TuiBackgroundChanges {
         let changes = TuiBackgroundChanges {
+            sessions: self.poll_session_refresh(),
             tmux: self.poll_tmux_agent_warmup(),
             tmux_portal: self.poll_tmux_portal(),
             worktree_columns: self.poll_wt_columns(),
@@ -1183,6 +1263,7 @@ impl Tui {
         self.start_default_branch_status_poll(false);
         self.start_opencode_status_poll(false);
         self.start_opencode_event_listeners();
+        self.poll_workflow_maintenance();
         changes
     }
 
@@ -1192,6 +1273,86 @@ impl Tui {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    pub(crate) fn request_workflow_maintenance(&mut self) {
+        self.workflow_maintenance_due = true;
+    }
+
+    fn poll_workflow_maintenance(&mut self) {
+        while self.workflow_maintenance_rx.try_recv().is_ok() {
+            self.workflow_maintenance_in_flight = false;
+        }
+        let due = self.workflow_maintenance_due
+            || self.workflow_maintenance_last_started.elapsed() >= WORKFLOW_MAINTENANCE_INTERVAL;
+        if self.workflow_maintenance_in_flight || !due {
+            return;
+        }
+        let repos = self
+            .repos
+            .iter()
+            .map(|managed| managed.repo.clone())
+            .collect::<Vec<_>>();
+        let tx = self.workflow_maintenance_tx.clone();
+        self.workflow_maintenance_in_flight = true;
+        self.workflow_maintenance_due = false;
+        self.workflow_maintenance_last_started = Instant::now();
+        std::thread::spawn(move || {
+            for repo in &repos {
+                if let Err(error) = maintain_workflow_storage(repo) {
+                    let _ = crate::observability::append_runtime_message(
+                        repo,
+                        &format!("workflow maintenance failed: {error}"),
+                    );
+                }
+            }
+            let _ = tx.send(());
+        });
+    }
+
+    pub(crate) fn refresh_worktree_harness_configs(&mut self) {
+        let live = self
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                let managed = self.repos.get(session.repo_index)?;
+                Some(session.identity_key(&managed.identity))
+            })
+            .collect::<BTreeSet<_>>();
+        self.worktree_harness_configs
+            .retain(|key, _| live.contains(key));
+        for session in &self.sessions {
+            let Some(managed) = self.repos.get(session.repo_index) else {
+                continue;
+            };
+            let key = session.identity_key(&managed.identity);
+            if self.worktree_harness_configs.contains_key(&key) {
+                continue;
+            }
+            let Some(config) = crate::session::worktree_harness(&managed.repo, session)
+                .ok()
+                .and_then(|association| managed.config.for_harness(&association.harness_id).ok())
+            else {
+                continue;
+            };
+            self.worktree_harness_configs.insert(key, config);
+        }
+    }
+
+    pub(crate) fn reload_worktree_harness_config(&mut self, session_index: usize) {
+        let Some(session) = self.sessions.get(session_index) else {
+            return;
+        };
+        let Some(managed) = self.repos.get(session.repo_index) else {
+            return;
+        };
+        let key = session.identity_key(&managed.identity);
+        self.worktree_harness_configs.remove(&key);
+        self.refresh_worktree_harness_configs();
+        self.session_inventory_generation = self.session_inventory_generation.saturating_add(1);
+        if self.session_refresh_in_flight {
+            self.session_refresh_pending = true;
+        }
     }
 
     fn enter_agent_mode(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
@@ -1219,7 +1380,7 @@ impl Tui {
         runtime.suspend()?;
         let result = self.attach_tmux_session_for_index(index);
         let resume_result = runtime.resume();
-        self.refresh_sessions()?;
+        self.refresh_sessions_after_tmux()?;
         self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();
         resume_result?;
@@ -1278,6 +1439,7 @@ impl Tui {
                     );
                 }
                 crate::session::set_worktree_harness(&repo, &session, &target, false)?;
+                self.reload_worktree_harness_config(index);
                 crate::agent_session::rotate_generation(
                     &self.repos,
                     &mut self.tmux_generations,
@@ -1324,6 +1486,7 @@ impl Tui {
             use_.generation,
         );
         crate::session::set_worktree_harness(&repo, &session, &target, false)?;
+        self.reload_worktree_harness_config(index);
         crate::agent_session::rotate_generation(&self.repos, &mut self.tmux_generations, use_.slot);
         self.show_message(&format!("migrated worktree to harness '{target}'"))?;
         Ok(())
@@ -1341,7 +1504,7 @@ impl Tui {
         runtime.suspend()?;
         let result = self.attach_selected_tmux_window(window);
         let resume_result = runtime.resume();
-        self.refresh_sessions()?;
+        self.refresh_sessions_after_tmux()?;
         self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();
         resume_result?;
@@ -2660,11 +2823,7 @@ impl Tui {
             .map(|managed| managed.repo.clone())
             .collect::<Vec<_>>();
         for repo in repos {
-            let loaded = crate::observability::with_writable_db(&repo, |conn| {
-                let _ = cleanup_stale_archived_plan_runs(
-                    conn,
-                    ARCHIVED_PLAN_RETENTION.as_millis() as u64,
-                );
+            let loaded = crate::observability::with_nonblocking_read_db(&repo, |conn| {
                 let runs = load_recent_plan_runs_for_repo(conn, &repo.root, 8)?;
                 Ok(runs)
             });
@@ -2682,9 +2841,9 @@ impl Tui {
         let repo = Repository {
             root: repo_root.to_path_buf(),
         };
-        if let Ok(Some(run)) =
-            crate::observability::with_writable_db(&repo, |conn| load_plan_run(conn, run_id))
-        {
+        if let Ok(Some(run)) = crate::observability::with_nonblocking_read_db(&repo, |conn| {
+            load_plan_run(conn, run_id)
+        }) {
             self.remember_plan_run(run);
         }
     }
@@ -2715,10 +2874,7 @@ impl Tui {
         let mut run = self.plan_runs.get(&run_id)?.clone();
         let run_scope_path = run.run.scope_path.clone();
         run.run.selected_step = self.resolved_plan_step_selection(&run);
-        let output_lines = crate::observability::with_writable_db(&repo, |conn| {
-            load_output_lines(conn, &run.run.id, run.run.selected_step)
-        })
-        .unwrap_or_default();
+        let output_lines = self.plan_output_snapshot(&repo, &run.run.id, run.run.selected_step);
         let mut output_state = self
             .plan_output_state_by_run
             .get(&run.run.id)
@@ -2831,6 +2987,13 @@ impl Tui {
     }
 
     fn poll_auto_runs(&mut self) -> bool {
+        if self
+            .last_auto_poll
+            .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
+        {
+            return false;
+        }
+        self.last_auto_poll = Some(Instant::now());
         self.refresh_auto_runs(false)
     }
 
@@ -2842,8 +3005,8 @@ impl Tui {
             .map(|managed| managed.repo.clone())
             .collect::<Vec<_>>();
         for repo in repos {
-            let loaded = crate::observability::with_writable_db(&repo, |conn| {
-                let runs = load_recent_active_runs_for_repo(conn, &repo.root, 8)?;
+            let loaded = crate::observability::with_nonblocking_read_db(&repo, |conn| {
+                let runs = load_recent_active_run_snapshots_for_repo(conn, &repo.root, 8)?;
                 let _ = reconcile_stale;
                 Ok(runs)
             });
@@ -2861,9 +3024,9 @@ impl Tui {
         let repo = Repository {
             root: repo_root.to_path_buf(),
         };
-        if let Ok(Some(run)) =
-            crate::observability::with_writable_db(&repo, |conn| load_auto_run(conn, run_id))
-        {
+        if let Ok(Some(run)) = crate::observability::with_nonblocking_read_db(&repo, |conn| {
+            load_auto_run_snapshot(conn, run_id)
+        }) {
             self.remember_auto_run(run);
         }
     }
@@ -2902,12 +3065,7 @@ impl Tui {
             .selected_step_run_id
             .or_else(|| run.steps.first().and_then(|step| step.id));
         let output_lines = selected_step_run_id
-            .and_then(|step_run_id| {
-                crate::observability::with_writable_db(&repo, |conn| {
-                    load_auto_output_lines(conn, step_run_id)
-                })
-                .ok()
-            })
+            .map(|step_run_id| self.auto_output_snapshot(&repo, step_run_id))
             .unwrap_or_default();
         let mut output_state = self
             .auto_output_state_by_run
@@ -2944,16 +3102,15 @@ impl Tui {
         plan_run_id: &str,
     ) -> Option<view::PlanDashboard> {
         let mut run = self.plan_runs.get(plan_run_id).cloned().or_else(|| {
-            crate::observability::with_writable_db(repo, |conn| load_plan_run(conn, plan_run_id))
-                .ok()
-                .flatten()
+            crate::observability::with_nonblocking_read_db(repo, |conn| {
+                load_plan_run(conn, plan_run_id)
+            })
+            .ok()
+            .flatten()
         })?;
         let run_scope_path = run.run.scope_path.clone();
         run.run.selected_step = self.resolved_plan_step_selection(&run);
-        let output_lines = crate::observability::with_writable_db(repo, |conn| {
-            load_output_lines(conn, &run.run.id, run.run.selected_step)
-        })
-        .unwrap_or_default();
+        let output_lines = self.plan_output_snapshot(repo, &run.run.id, run.run.selected_step);
         let mut output_state = self
             .plan_output_state_by_run
             .get(&run.run.id)
@@ -2976,6 +3133,51 @@ impl Tui {
             output_lines,
             output_state,
         })
+    }
+
+    fn plan_output_snapshot(
+        &self,
+        repo: &Repository,
+        run_id: &str,
+        step: usize,
+    ) -> Vec<PlanOutputLine> {
+        let key = (run_id.to_string(), step);
+        match crate::observability::with_nonblocking_read_db(repo, |conn| {
+            load_output_lines(conn, run_id, step)
+        }) {
+            Ok(lines) => {
+                self.plan_output_cache
+                    .borrow_mut()
+                    .insert(key, lines.clone());
+                lines
+            }
+            Err(_) => self
+                .plan_output_cache
+                .borrow()
+                .get(&key)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    fn auto_output_snapshot(&self, repo: &Repository, step_run_id: i64) -> Vec<AutoOutputLine> {
+        let key = (WorktreeRepositoryKey::new(repo.root.clone()), step_run_id);
+        match crate::observability::with_nonblocking_read_db(repo, |conn| {
+            load_auto_output_lines(conn, step_run_id)
+        }) {
+            Ok(lines) => {
+                self.auto_output_cache
+                    .borrow_mut()
+                    .insert(key.clone(), lines.clone());
+                lines
+            }
+            Err(_) => self
+                .auto_output_cache
+                .borrow()
+                .get(&key)
+                .cloned()
+                .unwrap_or_default(),
+        }
     }
 
     fn resolved_plan_step_selection(&self, run: &PersistedPlanRun) -> usize {
@@ -3552,6 +3754,8 @@ fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -3565,7 +3769,8 @@ mod tests {
     use crate::config::Config;
     use crate::github::{PrCache, PrDetails, PrReviewComment, PrSummary};
     use crate::plan_run::{
-        PersistedPlanRun, PlanRun, PlanRunMode, PlanRunStatus, PlanStepRun, PlanStepStatus,
+        PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRun, PlanRunMode, PlanRunStatus,
+        PlanStepRun, PlanStepStatus,
     };
     use crate::repo::Repository;
     use crate::session::{Session, WorktreeRepositoryKey};
@@ -3607,6 +3812,172 @@ mod tests {
 
         assert!(tui.confirm_quit().unwrap());
         assert!(tui.dialog.is_none());
+    }
+
+    #[test]
+    fn workflow_database_writer_does_not_block_input_loop() {
+        let temp = unique_temp_dir("prism-tui-database-poll-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        crate::observability::with_writable_db(&repo, |_| Ok(())).unwrap();
+        let blocker = rusqlite::Connection::open(crate::observability::db_path(&repo)).unwrap();
+        blocker
+            .execute_batch("begin exclusive transaction")
+            .unwrap();
+        let mut tui = Tui::new_single(repo, test_config(), Vec::new());
+        tui.last_plan_poll = Some(Instant::now());
+
+        let started = Instant::now();
+        tui.tick_tui_action_jobs();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "workflow polling blocked input for {elapsed:?}"
+        );
+
+        drop(tui);
+        drop(blocker);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn plan_database_writer_does_not_block_input_loop() {
+        let temp = unique_temp_dir("prism-tui-plan-database-poll-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        crate::observability::with_writable_db(&repo, |_| Ok(())).unwrap();
+        let blocker = rusqlite::Connection::open(crate::observability::db_path(&repo)).unwrap();
+        blocker
+            .execute_batch("begin exclusive transaction")
+            .unwrap();
+        let mut tui = Tui::new_single(repo, test_config(), Vec::new());
+        tui.last_auto_poll = Some(Instant::now());
+
+        let started = Instant::now();
+        tui.tick_tui_action_jobs();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "plan polling blocked input for {elapsed:?}"
+        );
+
+        drop(tui);
+        drop(blocker);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn workflow_database_writer_does_not_block_dashboard_rendering() {
+        let temp = unique_temp_dir("prism-tui-dashboard-database-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        crate::observability::with_writable_db(&repo, |_| Ok(())).unwrap();
+        let session = test_session(0, &temp.display().to_string(), "feature");
+        let scope_path = session.path.clone();
+        let mut run = test_plan_run_with_steps("plan", &scope_path.display().to_string(), 1);
+        run.run.repo_root = temp.display().to_string();
+        crate::observability::with_writable_db(&repo, |conn| {
+            crate::plan_run::save_plan_run(conn, &run)?;
+            crate::plan_run::append_output_line(
+                conn,
+                &PlanOutputLine {
+                    run_id: "plan".to_string(),
+                    step: 1,
+                    line_number: 1,
+                    time_unix_ms: 1,
+                    kind: PlanOutputKind::Assistant,
+                    text: "cached output".to_string(),
+                    block_id: None,
+                },
+                100,
+            )
+        })
+        .unwrap();
+        let mut tui = Tui::new_single(repo.clone(), test_config(), vec![session]);
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.remember_plan_run(run);
+        assert_eq!(
+            tui.current_plan_dashboard().unwrap().output_lines[0].text,
+            "cached output"
+        );
+        let blocker = rusqlite::Connection::open(crate::observability::db_path(&repo)).unwrap();
+        blocker
+            .execute_batch("begin exclusive transaction")
+            .unwrap();
+
+        let started = Instant::now();
+        let dashboard = tui.current_plan_dashboard();
+        let elapsed = started.elapsed();
+
+        assert_eq!(dashboard.unwrap().output_lines[0].text, "cached output");
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "dashboard rendering blocked for {elapsed:?}"
+        );
+
+        drop(blocker);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn returning_from_tmux_does_not_wait_for_worktree_refresh() {
+        let temp = unique_temp_dir("prism-tmux-return-refresh-test");
+        let worktree = temp.join("feature");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(worktree.join(".git"), "gitdir: /tmp/gitdir\n").unwrap();
+        let git = temp.join("git");
+        fs::write(
+            &git,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  *"worktree list --porcelain"*)
+    sleep 1
+    printf 'worktree {}\nHEAD abc\nbranch refs/heads/feature\n\n'
+    ;;
+  *"status --short --branch"*) printf '## feature\n' ;;
+  *"remote get-url origin"*) printf 'git@github.com:owner/repo.git\n' ;;
+esac
+"#,
+                worktree.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&git, permissions).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        fs::create_dir_all(repo.prism_dir()).unwrap();
+        fs::write(
+            repo.prism_dir().join("config.toml"),
+            format!("[tools]\ngit = {:?}\n", git.display().to_string()),
+        )
+        .unwrap();
+        let config = Config::load(&repo);
+        let session = test_session(0, &temp.display().to_string(), "feature");
+        let mut tui = Tui::new_single(repo, config, vec![session]);
+
+        let started = Instant::now();
+        tui.refresh_sessions_after_tmux().unwrap();
+        tui.refresh_sessions_after_tmux().unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "returning from tmux waited for refresh for {elapsed:?}"
+        );
+
+        let wait_started = Instant::now();
+        while tui.session_refresh_in_flight && wait_started.elapsed() < Duration::from_secs(3) {
+            tui.poll_session_refresh();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!tui.session_refresh_in_flight);
+        assert!(!tui.session_refresh_pending);
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -3728,6 +4099,7 @@ mod tests {
         );
         tui.focused_panel = PanelFocus::Worktrees;
         tui.tmux_portal_size = Some((72, 18));
+        tui.refresh_worktree_harness_configs();
         let slot =
             AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
         let stale_key = AgentSessionWarmupKey::new(slot.clone(), 0);
@@ -3740,6 +4112,7 @@ mod tests {
                 key: stale_key,
                 started_at: Instant::now(),
                 capture: Ok(vec![Line::from("stale output")]),
+                resized_size: None,
             })
             .unwrap();
 
@@ -3768,6 +4141,7 @@ mod tests {
         );
         tui.focused_panel = PanelFocus::Worktrees;
         tui.tmux_portal_size = Some((72, 18));
+        tui.refresh_worktree_harness_configs();
         let slot =
             AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
         tui.tmux_generations.insert(slot, 0);
@@ -3777,6 +4151,101 @@ mod tests {
             !tui.tmux_portal_polls_in_flight.is_empty(),
             "selecting a worktree should immediately start an asynchronous tmux capture"
         );
+    }
+
+    #[test]
+    fn workflow_database_writer_does_not_block_tmux_portal_polling() {
+        let temp = unique_temp_dir("prism-tmux-portal-database-test");
+        fs::create_dir_all(&temp).unwrap();
+        let tmux = temp.join("tmux");
+        fs::write(&tmux, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        let session = test_session(0, &temp.display().to_string(), "feature");
+        crate::session::worktree_harness(&repo, &session).unwrap();
+        let mut tui = Tui::new_single(repo.clone(), config, vec![session]);
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.tmux_portal_size = Some((72, 18));
+        tui.refresh_worktree_harness_configs();
+        let slot =
+            AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
+        tui.tmux_generations.insert(slot, 0);
+        let blocker = rusqlite::Connection::open(crate::observability::db_path(&repo)).unwrap();
+        blocker
+            .execute_batch("begin exclusive transaction")
+            .unwrap();
+
+        let started = Instant::now();
+        tui.tick_tui_action_jobs();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "worktree polling blocked input for {elapsed:?}"
+        );
+
+        drop(blocker);
+        let _ = tui.tmux_portal_rx.recv_timeout(Duration::from_secs(1));
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn tmux_portal_resizes_once_for_unchanged_target_and_size() {
+        let temp = unique_temp_dir("prism-tmux-portal-resize-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {:?}\nif [ \"$1\" = capture-pane ]; then printf 'output\\n'; fi\nexit 0\n",
+                log.display().to_string()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        let session = test_session(0, &temp.display().to_string(), "feature");
+        let mut tui = Tui::new_single(repo, config, vec![session]);
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.tmux_portal_size = Some((72, 18));
+        tui.refresh_worktree_harness_configs();
+        let slot =
+            AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
+        let key = AgentSessionWarmupKey::new(slot.clone(), 0);
+        tui.tmux_generations.insert(slot, 0);
+
+        tui.poll_tmux_portal();
+        let first = tui
+            .tmux_portal_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        tui.tmux_portal_tx.send(first).unwrap();
+        tui.poll_tmux_portal();
+        tui.tmux_portal_last_polled
+            .insert(key, Instant::now() - Duration::from_secs(1));
+        tui.poll_tmux_portal();
+        tui.tmux_portal_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let commands = fs::read_to_string(log).unwrap();
+        assert_eq!(commands.matches("resize-window").count(), 1);
+        assert_eq!(commands.matches("capture-pane").count(), 2);
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -3794,6 +4263,7 @@ mod tests {
         );
         tui.focused_panel = PanelFocus::Worktrees;
         tui.tmux_portal_size = Some((72, 18));
+        tui.refresh_worktree_harness_configs();
         let previous_slot =
             AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
         let selected_slot =
@@ -3835,7 +4305,41 @@ mod tests {
     }
 
     #[test]
-    fn tmux_portal_clears_in_flight_capture_when_inactive() {
+    fn tmux_portal_waits_for_running_capture_after_selection_changes() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let mut tui = Tui::new_single(
+            repo,
+            test_config(),
+            vec![
+                test_session(0, "/tmp/repo-a", "feature-a"),
+                test_session(0, "/tmp/repo-b", "feature-b"),
+            ],
+        );
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.tmux_portal_size = Some((72, 18));
+        tui.refresh_worktree_harness_configs();
+        let first_slot =
+            AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
+        let second_slot =
+            AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[1]);
+        let first_key = AgentSessionWarmupKey::new(first_slot.clone(), 0);
+        let second_key = AgentSessionWarmupKey::new(second_slot.clone(), 0);
+        tui.tmux_generations.insert(first_slot, 0);
+        tui.tmux_generations.insert(second_slot, 0);
+        tui.tmux_portal_polls_in_flight
+            .insert(first_key.clone(), Instant::now());
+        tui.select_worktree(1);
+
+        tui.poll_tmux_portal();
+
+        assert!(tui.tmux_portal_polls_in_flight.contains_key(&first_key));
+        assert!(!tui.tmux_portal_polls_in_flight.contains_key(&second_key));
+    }
+
+    #[test]
+    fn tmux_portal_tracks_in_flight_capture_when_inactive() {
         let repo = Repository {
             root: PathBuf::from("/tmp/repo"),
         };
@@ -3847,10 +4351,11 @@ mod tests {
         let slot =
             AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
         let key = AgentSessionWarmupKey::new(slot, 0);
-        tui.tmux_portal_polls_in_flight.insert(key, Instant::now());
+        tui.tmux_portal_polls_in_flight
+            .insert(key.clone(), Instant::now());
 
         assert!(!tui.poll_tmux_portal());
-        assert!(tui.tmux_portal_polls_in_flight.is_empty());
+        assert!(tui.tmux_portal_polls_in_flight.contains_key(&key));
     }
 
     #[test]
@@ -3865,6 +4370,7 @@ mod tests {
         );
         tui.focused_panel = PanelFocus::Worktrees;
         tui.tmux_portal_size = Some((72, 18));
+        tui.refresh_worktree_harness_configs();
         let slot =
             AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
         let key = AgentSessionWarmupKey::new(slot.clone(), 0);
@@ -3880,6 +4386,7 @@ mod tests {
                 key: key.clone(),
                 started_at: previous_started_at,
                 capture: Ok(vec![Line::from("superseded output")]),
+                resized_size: None,
             })
             .unwrap();
 

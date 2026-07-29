@@ -61,7 +61,7 @@ impl Tui {
         raw.suspend()?;
         let result = open_plan_mode(&config, &root);
         let resume_result = raw.resume();
-        self.refresh_sessions()?;
+        self.refresh_sessions_after_tmux()?;
         self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
@@ -85,7 +85,7 @@ impl Tui {
         raw.suspend()?;
         let result = open_plan_mode(&config, &path);
         let resume_result = raw.resume();
-        self.refresh_sessions()?;
+        self.refresh_sessions_after_tmux()?;
         self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();

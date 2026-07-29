@@ -520,6 +520,23 @@ pub fn with_writable_db_mut<T>(
     run(&mut conn)
 }
 
+pub fn with_nonblocking_read_db<T>(
+    repo: &Repository,
+    run: impl FnOnce(&Connection) -> Result<T, String>,
+) -> Result<T, String> {
+    let path = db_path(repo);
+    let conn = Connection::open_with_flags(
+        &path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| format!("open {} read-only: {error}", path.display()))?;
+    conn.busy_timeout(Duration::ZERO)
+        .map_err(|error| format!("configure SQLite busy timeout: {error}"))?;
+    conn.pragma_update(None, "query_only", true)
+        .map_err(|error| format!("enable SQLite query_only: {error}"))?;
+    run(&conn)
+}
+
 pub fn writable_db(repo: &Repository) -> WritableDb {
     WritableDb {
         path: db_path(repo),

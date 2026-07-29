@@ -197,7 +197,7 @@ impl Tui {
                 &session_id,
             );
             let resume_result = raw.resume();
-            self.refresh_sessions()?;
+            self.refresh_sessions_after_tmux()?;
             self.start_tmux_agent_warmup();
             resume_result?;
             result?;
@@ -266,7 +266,7 @@ impl Tui {
             changed_attach_target,
         );
         let resume_result = raw.resume();
-        self.refresh_sessions()?;
+        self.refresh_sessions_after_tmux()?;
         self.start_tmux_agent_warmup();
         resume_result?;
         result?;
@@ -761,13 +761,21 @@ impl Tui {
         crate::observability::with_writable_db(&repo, |conn| {
             let mut run = load_plan_run(conn, &run_id)?
                 .ok_or_else(|| format!("plan run not found: {run_id}"))?;
-            archive_plan_run(conn, &mut run)
+            archive_plan_run(conn, &mut run)?;
+            let _ = crate::plan_run::cleanup_stale_archived_plan_runs(
+                conn,
+                crate::plan_run::ARCHIVED_PLAN_RETENTION_MS,
+            );
+            Ok(())
         })?;
         self.plan_runs.remove(&run_id);
         self.active_plan_runs.retain(|_, active| active != &run_id);
         self.selected_plan_step_by_run.remove(&run_id);
         self.manual_plan_step_selection_by_run.remove(&run_id);
         self.plan_output_state_by_run.remove(&run_id);
+        self.plan_output_cache
+            .borrow_mut()
+            .retain(|(cached_run_id, _), _| cached_run_id != &run_id);
         if self.focused_panel == crate::tui::PanelFocus::Worktrees
             && self.current_plan_dashboard().is_none()
         {

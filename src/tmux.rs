@@ -659,11 +659,9 @@ pub(crate) fn capture_agent_pane(
     config: &Config,
     branch: &str,
     generation: u64,
-    width: u16,
-    height: u16,
 ) -> Result<String, String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, branch, generation);
-    capture_portal_pane(config, &runtime.target(TmuxWindow::Agent), width, height)
+    capture_pane(config, &runtime.target(TmuxWindow::Agent), true)
 }
 
 pub(crate) fn resize_agent_pane(
@@ -675,23 +673,6 @@ pub(crate) fn resize_agent_pane(
     height: u16,
 ) -> Result<(), String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, branch, generation);
-    run_tmux_status(
-        Command::new(config.tool("tmux"))
-            .env_remove("TMUX")
-            .args(["resize-window", "-x"])
-            .arg(width.to_string())
-            .arg("-y")
-            .arg(height.to_string())
-            .args(["-t", &runtime.target(TmuxWindow::Agent)]),
-    )
-}
-
-fn capture_portal_pane(
-    config: &Config,
-    target: &str,
-    width: u16,
-    height: u16,
-) -> Result<String, String> {
     let output = run_output_allow_failure_with_timeout(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
@@ -699,20 +680,10 @@ fn capture_portal_pane(
             .arg(width.to_string())
             .arg("-y")
             .arg(height.to_string())
-            .args([
-                "-t",
-                target,
-                ";",
-                "capture-pane",
-                "-p",
-                "-e",
-                "-N",
-                "-t",
-                target,
-            ]),
+            .args(["-t", &runtime.target(TmuxWindow::Agent)]),
         PANE_CAPTURE_TIMEOUT,
     )?;
-    tmux_output_result(output)
+    tmux_output_result(output).map(|_| ())
 }
 
 fn pane_capture(config: &Config, name: &str) -> Option<String> {
@@ -1360,7 +1331,7 @@ exit 1
     }
 
     #[test]
-    fn capture_agent_pane_targets_agent_window() {
+    fn capture_agent_pane_does_not_resize_agent_window() {
         let temp = unique_temp_dir("prism-tmux-capture-pane-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -1388,15 +1359,12 @@ echo 'agent output'
         let runtime = TmuxAgentSession::for_worktree_session(&repo, "feature", 4);
 
         assert_eq!(
-            capture_agent_pane(&repo, &config, "feature", 4, 72, 18),
+            capture_agent_pane(&repo, &config, "feature", 4),
             Ok("agent output\n".to_string()),
         );
         assert_eq!(
             fs::read_to_string(&log).unwrap().trim(),
-            format!(
-                "resize-window -x 72 -y 18 -t {0}:1 ; capture-pane -p -e -N -t {0}:1",
-                runtime.name()
-            ),
+            format!("capture-pane -p -e -N -t {0}:1", runtime.name()),
         );
 
         let _ = fs::remove_dir_all(temp);

@@ -133,7 +133,7 @@ impl Session {
         self.repo_key = repo_key;
     }
 
-    fn preserve_refresh_state_from(&mut self, previous: Session, config: &Config) {
+    pub(crate) fn preserve_refresh_state_from(&mut self, previous: Session, config: &Config) {
         crate::agent_session::reconcile_session_refresh(
             &mut self.agent_state,
             previous.agent_state,
@@ -150,6 +150,31 @@ impl Session {
             self.unseen_comments = previous.unseen_comments;
         } else {
             self.unseen_comments = false;
+        }
+    }
+
+    pub(crate) fn preserve_concurrent_refresh_state_from(
+        &mut self,
+        current: &Session,
+        baseline: &Session,
+    ) {
+        if current.prompt_summary != baseline.prompt_summary {
+            self.prompt_summary = current.prompt_summary.clone();
+        }
+        if current.classification != baseline.classification {
+            self.classification = current.classification;
+        }
+        if current.visibility != baseline.visibility {
+            self.visibility = current.visibility;
+        }
+        if current.adopted != baseline.adopted {
+            self.adopted = current.adopted;
+        }
+        if current.hidden != baseline.hidden {
+            self.hidden = current.hidden;
+        }
+        if current.status_label != baseline.status_label {
+            self.status_label = current.status_label.clone();
         }
     }
 

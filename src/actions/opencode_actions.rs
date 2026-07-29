@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Instant;
 
 pub(super) const SELECTED_OPENCODE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 pub(super) const VISIBLE_OPENCODE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
@@ -20,24 +21,6 @@ pub(super) fn opencode_poll_key(
     OpencodePollKey::for_repository_session_generation(repository, session, generation)
 }
 
-fn session_uses_opencode(managed: &ManagedRepo, session: &crate::session::Session) -> bool {
-    crate::session::worktree_harness(&managed.repo, session)
-        .ok()
-        .and_then(|association| managed.config.harness_adapter(&association.harness_id).ok())
-        .is_some_and(|adapter| adapter == "opencode")
-}
-
-fn opencode_harness_id(managed: &ManagedRepo, session: &crate::session::Session) -> Option<String> {
-    let association = crate::session::worktree_harness(&managed.repo, session).ok()?;
-    (managed
-        .config
-        .harness_adapter(&association.harness_id)
-        .ok()?
-        .as_str()
-        == "opencode")
-        .then_some(association.harness_id)
-}
-
 impl Tui {
     pub(crate) fn start_opencode_status_poll(&mut self, force: bool) {
         let _ = self.poll_opencode_status();
@@ -51,7 +34,12 @@ impl Tui {
             let Some(managed) = self.repos.get(session.repo_index) else {
                 continue;
             };
-            if !session_uses_opencode(managed, session) || !session.is_task_branch(&managed.config)
+            let session_key = session.identity_key(&managed.identity);
+            let Some(harness_config) = self.worktree_harness_configs.get(&session_key) else {
+                continue;
+            };
+            if !harness_config.selected_adapter_is("opencode")
+                || !session.is_task_branch(&managed.config)
             {
                 continue;
             }
@@ -78,9 +66,7 @@ impl Tui {
                 continue;
             }
             let repo = managed.repo.clone();
-            let Some(harness_id) = opencode_harness_id(managed, session) else {
-                continue;
-            };
+            let harness_id = harness_config.default_harness.clone();
             let branch = session.branch.clone();
             let path = session.path.clone();
             let tx = self.opencode_poll_tx.clone();
@@ -104,6 +90,14 @@ impl Tui {
     }
 
     pub(crate) fn start_opencode_event_listeners(&mut self) {
+        let now = Instant::now();
+        if self
+            .opencode_listener_last_scanned
+            .is_some_and(|last| now.duration_since(last) < Duration::from_secs(1))
+        {
+            return;
+        }
+        self.opencode_listener_last_scanned = Some(now);
         for session_index in self.visible_session_indices() {
             let Some(session) = self.sessions.get(session_index) else {
                 continue;
@@ -111,22 +105,32 @@ impl Tui {
             let Some(managed) = self.repos.get(session.repo_index) else {
                 continue;
             };
-            if !session_uses_opencode(managed, session) || !session.is_task_branch(&managed.config)
+            let key = session.identity_key(&managed.identity);
+            let Some(harness_config) = self.worktree_harness_configs.get(&key) else {
+                continue;
+            };
+            if !harness_config.selected_adapter_is("opencode")
+                || !session.is_task_branch(&managed.config)
             {
                 continue;
             }
-            let Some(harness_id) = opencode_harness_id(managed, session) else {
+            if session
+                .opencode_status
+                .as_ref()
+                .and_then(|status| status.server_url.as_ref())
+                .is_some_and(|server_url| self.opencode_sse_servers.contains(server_url))
+            {
                 continue;
-            };
+            }
+            let harness_id = harness_config.default_harness.clone();
             let Ok(Some(runtime)) =
-                load_runtime(&managed.repo, &harness_id, &session.branch, &session.path)
+                load_runtime_snapshot(&managed.repo, &harness_id, &session.branch, &session.path)
             else {
                 continue;
             };
             let Some(session_id) = runtime.opencode_session_id.clone() else {
                 continue;
             };
-            let key = session.identity_key(&managed.identity);
             if let Some(session) = self.sessions.get_mut(session_index) {
                 let current = session.opencode_status.clone();
                 if current
@@ -501,9 +505,14 @@ impl Tui {
             if !managed.config.opencode_shutdown_owned_servers {
                 continue;
             }
-            let Some(harness_id) = opencode_harness_id(managed, session) else {
+            let key = session.identity_key(&managed.identity);
+            let Some(harness_config) = self.worktree_harness_configs.get(&key) else {
                 continue;
             };
+            if !harness_config.selected_adapter_is("opencode") {
+                continue;
+            }
+            let harness_id = harness_config.default_harness.clone();
             let Ok(Some(runtime)) =
                 load_runtime(&managed.repo, &harness_id, &session.branch, &session.path)
             else {

@@ -1050,48 +1050,69 @@ pub fn load_runtime(
     branch: &str,
     worktree: &Path,
 ) -> Result<Option<OpencodeRuntime>, String> {
+    observability::with_writable_db(repo, |conn| {
+        load_runtime_with_conn(conn, repo, harness_id, branch, worktree)
+    })
+}
+
+pub fn load_runtime_snapshot(
+    repo: &Repository,
+    harness_id: &str,
+    branch: &str,
+    worktree: &Path,
+) -> Result<Option<OpencodeRuntime>, String> {
+    observability::with_nonblocking_read_db(repo, |conn| {
+        load_runtime_with_conn(conn, repo, harness_id, branch, worktree)
+    })
+}
+
+fn load_runtime_with_conn(
+    conn: &rusqlite::Connection,
+    repo: &Repository,
+    harness_id: &str,
+    branch: &str,
+    worktree: &Path,
+) -> Result<Option<OpencodeRuntime>, String> {
     let repo_root = repo.root.display().to_string();
     let worktree_path = worktree.display().to_string();
-    observability::with_writable_db(repo, |conn| {
-        conn.query_row(
-            "select repo_root, harness_id, branch, worktree_path, server_port, server_url, server_pid,
-                     opencode_session_id, generation, updated_unix_ms, server_start_time_ticks
-              from opencode_runtime
-              where repo_root = ?1 and harness_id = ?2 and branch = ?3 and worktree_path = ?4",
-            params![repo_root, harness_id, branch, worktree_path],
-            |row| {
-                let server_port = row.get::<_, i64>(4)?;
-                let server_pid = row
-                    .get::<_, Option<i64>>(6)?
-                    .and_then(|pid| u32::try_from(pid).ok());
-                Ok(OpencodeRuntime {
-                    repo_root: row.get(0)?,
-                    harness_id: row.get(1)?,
-                    branch: row.get(2)?,
-                    worktree_path: row.get(3)?,
-                    server_port: u16::try_from(server_port).unwrap_or_default(),
-                    server_url: row.get(5)?,
-                    server_pid,
-                    server_start_time_ticks: row
-                        .get::<_, Option<i64>>(10)?
-                        .map(|value| value.max(0) as u64),
-                    opencode_session_id: row.get(7)?,
-                    generation: row
-                        .get::<_, i64>(8)
-                        .ok()
-                        .and_then(|value| u64::try_from(value).ok())
-                        .unwrap_or_default(),
-                    updated_unix_ms: row
-                        .get::<_, i64>(9)
-                        .ok()
-                        .and_then(|value| u64::try_from(value).ok())
-                        .unwrap_or_default(),
-                })
-            },
-        )
-        .optional()
-        .map_err(|error| format!("read opencode runtime: {error}"))
-    })
+    conn.query_row(
+        "select repo_root, harness_id, branch, worktree_path, server_port, server_url, server_pid,
+                 opencode_session_id, generation, updated_unix_ms, server_start_time_ticks
+          from opencode_runtime
+          where repo_root = ?1 and harness_id = ?2 and branch = ?3 and worktree_path = ?4",
+        params![repo_root, harness_id, branch, worktree_path],
+        |row| {
+            let server_port = row.get::<_, i64>(4)?;
+            let server_pid = row
+                .get::<_, Option<i64>>(6)?
+                .and_then(|pid| u32::try_from(pid).ok());
+            Ok(OpencodeRuntime {
+                repo_root: row.get(0)?,
+                harness_id: row.get(1)?,
+                branch: row.get(2)?,
+                worktree_path: row.get(3)?,
+                server_port: u16::try_from(server_port).unwrap_or_default(),
+                server_url: row.get(5)?,
+                server_pid,
+                server_start_time_ticks: row
+                    .get::<_, Option<i64>>(10)?
+                    .map(|value| value.max(0) as u64),
+                opencode_session_id: row.get(7)?,
+                generation: row
+                    .get::<_, i64>(8)
+                    .ok()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or_default(),
+                updated_unix_ms: row
+                    .get::<_, i64>(9)
+                    .ok()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or_default(),
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| format!("read opencode runtime: {error}"))
 }
 
 pub(crate) fn load_runtimes_for_worktree_session(
