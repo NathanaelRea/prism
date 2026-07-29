@@ -6,6 +6,7 @@ pub mod auto_flow;
 mod ci;
 pub mod cli;
 mod config;
+mod durability;
 mod execution;
 pub mod file_persistence;
 mod git;

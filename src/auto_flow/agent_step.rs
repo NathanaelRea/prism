@@ -304,7 +304,9 @@ pub(super) fn collect_child_output(
         .stderr
         .take()
         .ok_or_else(|| "open harness stderr".to_string())?;
-    let (tx, rx) = mpsc::channel::<Result<ChildLine, String>>();
+    let (tx, rx) = mpsc::sync_channel::<Result<ChildLine, String>>(
+        crate::harness::WORKFLOW_OUTPUT_CHANNEL_CAPACITY,
+    );
     let stdout_reader = spawn_reader_thread(StreamKind::Stdout, stdout, tx.clone());
     let stderr_reader = spawn_reader_thread(StreamKind::Stderr, stderr, tx);
 
@@ -354,6 +356,7 @@ pub(super) fn collect_child_output(
             }
         }
     };
+    drop(rx);
 
     let status = if stream_result.is_ok() {
         let deadline = child
@@ -420,7 +423,7 @@ pub(super) enum ChildLine {
 pub(super) fn spawn_reader_thread(
     stream: StreamKind,
     reader: impl std::io::Read + Send + 'static,
-    tx: mpsc::Sender<Result<ChildLine, String>>,
+    tx: mpsc::SyncSender<Result<ChildLine, String>>,
 ) -> std::thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = crate::harness::read_bounded_lines(reader, |text| {

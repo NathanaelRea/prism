@@ -197,6 +197,7 @@ struct StreamPayload<K, Q, P> {
 pub(crate) struct JobContext<K, Q, P> {
     metadata: JobMetadata<K, Q>,
     cancellation: Arc<CancellationState>,
+    dirty: Arc<AtomicBool>,
     delivery: Arc<EventDelivery<K, Q, P>>,
 }
 
@@ -205,6 +206,7 @@ impl<K: Clone, Q: Clone, P> Clone for JobContext<K, Q, P> {
         Self {
             metadata: self.metadata.clone(),
             cancellation: self.cancellation.clone(),
+            dirty: self.dirty.clone(),
             delivery: self.delivery.clone(),
         }
     }
@@ -250,12 +252,13 @@ impl<K: Clone, Q: Clone, P> JobContext<K, Q, P> {
             Err(mpsc::TrySendError::Full(message)) => {
                 self.delivery.depth.fetch_sub(1, Ordering::AcqRel);
                 self.delivery.overflow_total.fetch_add(1, Ordering::AcqRel);
+                self.delivery.dirty.store(true, Ordering::Release);
+                self.dirty.store(true, Ordering::Release);
                 if let Some(facet) = facet {
                     let mut slots = match self.delivery.coalesced.try_lock() {
                         Ok(slots) => slots,
                         Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
                         Err(std::sync::TryLockError::WouldBlock) => {
-                            self.delivery.dirty.store(true, Ordering::Release);
                             return Ok(());
                         }
                     };
@@ -275,7 +278,6 @@ impl<K: Clone, Q: Clone, P> JobContext<K, Q, P> {
                     }
                     return Ok(());
                 }
-                self.delivery.dirty.store(true, Ordering::Release);
                 Ok(())
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -329,6 +331,7 @@ enum JobState<P> {
 struct JobEntry<K, Q, P> {
     metadata: JobMetadata<K, Q>,
     cancellation: Arc<CancellationState>,
+    dirty: Arc<AtomicBool>,
     coalesce_payload: bool,
     state: JobState<P>,
 }
@@ -344,6 +347,7 @@ pub(crate) struct JobRegistry<K, Q, P> {
     delivery: Arc<EventDelivery<K, Q, P>>,
     event_rx: mpsc::Receiver<StreamPayload<K, Q, P>>,
     pending_event: Option<StreamPayload<K, Q, P>>,
+    pending_dirty: BTreeMap<JobId, JobMetadata<K, Q>>,
     overflow_reported: u64,
     coalesced_reported: u64,
     #[cfg(test)]
@@ -378,6 +382,7 @@ impl<K, Q, P> JobRegistry<K, Q, P> {
             }),
             event_rx,
             pending_event: None,
+            pending_dirty: BTreeMap::new(),
             overflow_reported: 0,
             coalesced_reported: 0,
             #[cfg(test)]
@@ -470,10 +475,12 @@ where
             mutex: Mutex::new(()),
             wake: Condvar::new(),
         });
+        let dirty = Arc::new(AtomicBool::new(false));
         if !self.accepting {
             self.insert_finished(
                 metadata,
                 cancellation,
+                dirty,
                 delivery.coalesce_payload,
                 JobOutcome::Failed("TUI is shutting down".to_string()),
             );
@@ -485,6 +492,7 @@ where
             self.insert_finished(
                 metadata,
                 cancellation,
+                dirty,
                 delivery.coalesce_payload,
                 JobOutcome::SpawnFailed(std::io::Error::other("injected thread spawn failure")),
             );
@@ -494,6 +502,7 @@ where
         let context = JobContext {
             metadata: metadata.clone(),
             cancellation: cancellation.clone(),
+            dirty: dirty.clone(),
             delivery: self.delivery.clone(),
         };
         let terminal_metadata = metadata.clone();
@@ -539,6 +548,7 @@ where
                     JobEntry {
                         metadata,
                         cancellation,
+                        dirty,
                         coalesce_payload: delivery.coalesce_payload,
                         state: JobState::Running(handle),
                     },
@@ -547,6 +557,7 @@ where
             Err(error) => self.insert_finished(
                 metadata,
                 cancellation,
+                dirty,
                 delivery.coalesce_payload,
                 JobOutcome::SpawnFailed(error),
             ),
@@ -609,6 +620,7 @@ where
                             JobEntry {
                                 metadata: entry.metadata,
                                 cancellation: entry.cancellation,
+                                dirty: entry.dirty,
                                 coalesce_payload: entry.coalesce_payload,
                                 state: JobState::Finished(completion.outcome),
                             },
@@ -626,6 +638,7 @@ where
                 JobEntry {
                     metadata: entry.metadata,
                     cancellation: entry.cancellation,
+                    dirty: entry.dirty,
                     coalesce_payload: entry.coalesce_payload,
                     state: JobState::Finished(completion.outcome),
                 },
@@ -644,6 +657,10 @@ where
         ids.into_iter()
             .filter_map(|id| {
                 let entry = self.jobs.remove(&id)?;
+                if entry.dirty.swap(false, Ordering::AcqRel) {
+                    self.pending_dirty
+                        .insert(entry.metadata.id, entry.metadata.clone());
+                }
                 let JobState::Finished(outcome) = entry.state else {
                     unreachable!();
                 };
@@ -768,6 +785,18 @@ where
         }
     }
 
+    pub(crate) fn take_dirty_jobs(&mut self) -> Vec<JobMetadata<K, Q>> {
+        for entry in self.jobs.values() {
+            if entry.dirty.swap(false, Ordering::AcqRel) {
+                self.pending_dirty
+                    .insert(entry.metadata.id, entry.metadata.clone());
+            }
+        }
+        std::mem::take(&mut self.pending_dirty)
+            .into_values()
+            .collect()
+    }
+
     pub(crate) fn stop_accepting(&mut self) {
         self.accepting = false;
     }
@@ -820,6 +849,7 @@ where
         &mut self,
         metadata: JobMetadata<K, Q>,
         cancellation: Arc<CancellationState>,
+        dirty: Arc<AtomicBool>,
         coalesce_payload: bool,
         outcome: JobOutcome,
     ) {
@@ -828,6 +858,7 @@ where
             JobEntry {
                 metadata,
                 cancellation,
+                dirty,
                 coalesce_payload,
                 state: JobState::Finished(outcome),
             },
@@ -976,6 +1007,9 @@ mod tests {
         assert_eq!(stats.overflow_total, (burst - capacity) as u64);
         assert_eq!(stats.overflow_delta, (burst - capacity) as u64);
         assert!(stats.dirty);
+        let dirty = jobs.take_dirty_jobs();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].key, "stream");
         assert_eq!(jobs.drain_events(usize::MAX).len(), capacity);
         assert_eq!(jobs.queue_stats().event_depth, 0);
     }
@@ -1012,7 +1046,10 @@ mod tests {
         assert_eq!(stats.coalesced_capacity, 2);
         assert_eq!(stats.coalesced_total, 2 * (snapshots_per_facet - 1) as u64);
         assert_eq!(stats.overflow_total, (2 * snapshots_per_facet) as u64);
-        assert!(!stats.dirty);
+        assert!(stats.dirty);
+        let dirty = jobs.take_dirty_jobs();
+        assert_eq!(dirty.len(), 1);
+        assert_eq!(dirty[0].id, id);
 
         jobs.cancel(id);
         assert_eq!(jobs.queue_stats().coalesced_depth, 0);

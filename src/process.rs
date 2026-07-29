@@ -6,8 +6,8 @@ use std::io::{self, Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -57,6 +57,11 @@ pub enum ProcessPolicy {
     TmuxCapture,
     #[cfg(test)]
     Test,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DetachedProcessPolicy {
+    WorkerDaemon,
 }
 
 impl ProcessPolicy {
@@ -296,6 +301,10 @@ pub enum ProcessError {
         source: io::Error,
     },
     MissingPipe(&'static str),
+    ThreadSpawn {
+        thread: &'static str,
+        source: io::Error,
+    },
     ThreadPanicked(&'static str),
 }
 
@@ -308,6 +317,7 @@ pub enum ProcessErrorKind {
     Stdin,
     Read,
     MissingPipe,
+    ThreadSpawn,
     ThreadPanicked,
 }
 
@@ -321,6 +331,7 @@ impl ProcessErrorKind {
             Self::Stdin => "stdin",
             Self::Read => "read",
             Self::MissingPipe => "missing_pipe",
+            Self::ThreadSpawn => "thread_spawn",
             Self::ThreadPanicked => "thread_panicked",
         }
     }
@@ -336,6 +347,7 @@ impl ProcessError {
             Self::Stdin(_) => ProcessErrorKind::Stdin,
             Self::Read { .. } => ProcessErrorKind::Read,
             Self::MissingPipe(_) => ProcessErrorKind::MissingPipe,
+            Self::ThreadSpawn { .. } => ProcessErrorKind::ThreadSpawn,
             Self::ThreadPanicked(_) => ProcessErrorKind::ThreadPanicked,
         }
     }
@@ -355,6 +367,9 @@ impl fmt::Display for ProcessError {
                 write!(formatter, "read subprocess {stream}: {source}")
             }
             Self::MissingPipe(stream) => write!(formatter, "subprocess {stream} unavailable"),
+            Self::ThreadSpawn { thread, source } => {
+                write!(formatter, "start subprocess {thread} thread: {source}")
+            }
             Self::ThreadPanicked(thread) => {
                 write!(formatter, "subprocess {thread} thread panicked")
             }
@@ -370,16 +385,72 @@ impl Error for ProcessError {
             }
             Self::Signal { source, .. } => Some(source),
             Self::Read { source, .. } => Some(source),
+            Self::ThreadSpawn { source, .. } => Some(source),
             Self::MissingPipe(_) | Self::ThreadPanicked(_) => None,
         }
     }
 }
 
+pub fn spawn_detached(
+    command: &mut Command,
+    policy: DetachedProcessPolicy,
+) -> Result<u32, ProcessError> {
+    match policy {
+        DetachedProcessPolicy::WorkerDaemon => {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            #[cfg(unix)]
+            unsafe {
+                use std::os::unix::process::CommandExt;
+
+                // Daemons deliberately escape the normal supervised process group.
+                command.pre_exec(|| {
+                    if libc::setsid() == -1 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+
+    let child = command.spawn().map_err(ProcessError::Spawn)?;
+    let child_pid = child.id();
+    let child = Arc::new(Mutex::new(Some(child)));
+    let reaper_child = Arc::clone(&child);
+    if let Err(source) = std::thread::Builder::new()
+        .name("prism-detached-reaper".to_string())
+        .spawn(move || {
+            let Some(mut child) = reaper_child.lock().ok().and_then(|mut child| child.take())
+            else {
+                return;
+            };
+            let _ = child.wait();
+        })
+    {
+        if let Some(mut child) = child.lock().ok().and_then(|mut child| child.take()) {
+            let _ = terminate_active_child(&mut child, Duration::from_secs(1));
+        }
+        return Err(ProcessError::ThreadSpawn {
+            thread: "detached reaper",
+            source,
+        });
+    }
+    Ok(child_pid)
+}
+
 pub fn run_capture(command: &mut Command, policy: ProcessPolicy) -> Result<String, String> {
     let command_display = observability::command_display(command);
     let output = run_output(command, policy)?;
-    if output.status.success() {
+    if output.status.success() && !output.stdout_truncated {
         Ok(output.stdout)
+    } else if output.status.success() {
+        Err(format!(
+            "{command_display}: stdout was truncated after capturing a bounded tail of {} total bytes",
+            output.stdout_total_bytes
+        ))
     } else {
         Err(format!(
             "{command_display}: {}",
@@ -1310,6 +1381,38 @@ mod tests {
         .expect("long-running process should time out");
 
         assert!(error.contains("subprocess timed out"), "{error}");
+    }
+
+    #[test]
+    fn run_capture_rejects_truncated_success_output() {
+        let error = run_capture(
+            Command::new("sh").args(["-c", "dd if=/dev/zero bs=2048 count=1 2>/dev/null"]),
+            ProcessPolicy::Test,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("stdout was truncated"), "{error}");
+        assert!(error.contains("2048 total bytes"), "{error}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn detached_process_is_reaped_after_exit() {
+        let pid = spawn_detached(
+            Command::new("sh").args(["-c", "exit 0"]),
+            DetachedProcessPolicy::WorkerDaemon,
+        )
+        .unwrap() as libc::pid_t;
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        loop {
+            let result = unsafe { libc::kill(pid, 0) };
+            if result != 0 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "detached process was not reaped");
+            std::thread::yield_now();
+        }
     }
 
     #[test]

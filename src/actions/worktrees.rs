@@ -568,38 +568,25 @@ impl Tui {
         path: PathBuf,
         branch: String,
     ) -> Result<(), String> {
+        let repository = self
+            .repos
+            .iter()
+            .find(|managed| managed.repo.root == repo.root)
+            .map(|managed| managed.identity.clone())
+            .ok_or_else(|| "repository identity was not found".to_string())?;
+        let worktree = self
+            .sessions
+            .iter()
+            .find(|session| session.path == path && session.branch == branch)
+            .map(|session| session.identity_key(&repository))
+            .ok_or_else(|| "worktree session identity was not found".to_string())?;
         let key = DeleteSessionKey {
-            repository: self
-                .repos
-                .iter()
-                .find(|managed| managed.repo.root == repo.root)
-                .map(|managed| managed.identity.clone())
-                .ok_or_else(|| "repository identity was not found".to_string())?,
-            path: path.clone(),
-            branch: branch.clone(),
-            incarnation: self
-                .sessions
-                .iter()
-                .find(|session| session.path == path && session.branch == branch)
-                .map(|session| session.incarnation.clone())
-                .unwrap_or_default(),
             generation: self
                 .worktree_generations
-                .get(
-                    &self
-                        .repos
-                        .iter()
-                        .find(|managed| managed.repo.root == repo.root)
-                        .and_then(|managed| {
-                            self.sessions
-                                .iter()
-                                .find(|session| session.path == path && session.branch == branch)
-                                .map(|session| session.identity_key(&managed.identity))
-                        })
-                        .ok_or_else(|| "worktree session identity was not found".to_string())?,
-                )
+                .get(&worktree)
                 .copied()
                 .unwrap_or_default(),
+            worktree,
         };
         if !self.delete_sessions_in_flight.insert(key.clone()) {
             self.show_message("delete already in progress")?;
@@ -633,7 +620,7 @@ impl Tui {
                     &config,
                     &path,
                     &branch_for_job,
-                    Some(&key.incarnation),
+                    Some(&key.worktree.incarnation),
                 );
                 Ok(Some(TuiJobPayload::DeleteSession(DeleteSessionResult {
                     key: job_key,
@@ -651,17 +638,8 @@ impl Tui {
         }
         let mut changed = false;
         while let Ok(result) = self.delete_session_rx.try_recv() {
-            let Some(current_generation) = self
-                .worktree_generations
-                .iter()
-                .find_map(|(key, generation)| {
-                    (key.repository == result.key.repository
-                        && key.path == result.key.path
-                        && key.branch == result.key.branch
-                        && key.incarnation == result.key.incarnation)
-                        .then_some(generation)
-                })
-                .copied()
+            let Some(current_generation) =
+                self.worktree_generations.get(&result.key.worktree).copied()
             else {
                 continue;
             };
@@ -672,15 +650,16 @@ impl Tui {
             match result.result {
                 Ok(DeleteWorktreeOutcome::Deleted) => {
                     self.sessions.retain(|session| {
-                        session.path != result.key.path || session.branch != result.key.branch
+                        session.path != result.key.worktree.path
+                            || session.branch != result.key.worktree.branch
                     });
                     if self
                         .selected_worktree_by_repo
-                        .get(&result.key.repository.root)
-                        == Some(&result.key.path)
+                        .get(&result.key.worktree.repository.root)
+                        == Some(&result.key.worktree.path)
                     {
                         self.selected_worktree_by_repo
-                            .remove(&result.key.repository.root);
+                            .remove(&result.key.worktree.repository.root);
                     }
                     self.ensure_navigation_valid();
                     match self.refresh_sessions() {
@@ -699,15 +678,16 @@ impl Tui {
                 }
                 Ok(DeleteWorktreeOutcome::BranchRetained { error }) => {
                     self.sessions.retain(|session| {
-                        session.path != result.key.path || session.branch != result.key.branch
+                        session.path != result.key.worktree.path
+                            || session.branch != result.key.worktree.branch
                     });
                     if self
                         .selected_worktree_by_repo
-                        .get(&result.key.repository.root)
-                        == Some(&result.key.path)
+                        .get(&result.key.worktree.repository.root)
+                        == Some(&result.key.worktree.path)
                     {
                         self.selected_worktree_by_repo
-                            .remove(&result.key.repository.root);
+                            .remove(&result.key.worktree.repository.root);
                     }
                     self.ensure_navigation_valid();
                     let _ = self.refresh_sessions();
@@ -717,7 +697,8 @@ impl Tui {
                 }
                 Ok(DeleteWorktreeOutcome::DeletedWithWarnings { errors }) => {
                     self.sessions.retain(|session| {
-                        session.path != result.key.path || session.branch != result.key.branch
+                        session.path != result.key.worktree.path
+                            || session.branch != result.key.worktree.branch
                     });
                     self.ensure_navigation_valid();
                     let _ = self.refresh_sessions();
@@ -728,7 +709,8 @@ impl Tui {
                 }
                 Err(error) => {
                     if let Some(session) = self.sessions.iter_mut().find(|session| {
-                        session.path == result.key.path && session.branch == result.key.branch
+                        session.path == result.key.worktree.path
+                            && session.branch == result.key.worktree.branch
                     }) {
                         session.hidden = false;
                     }

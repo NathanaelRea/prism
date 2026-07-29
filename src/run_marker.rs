@@ -133,7 +133,7 @@ fn begin_new(repo: &Repository, version: &str) -> Result<NewRun, String> {
     let mut marker = create_marker(&marker_path)?;
     write_marker(&mut marker, &run_id, "running", None)
         .map_err(|error| format!("write run marker {}: {error}", marker_path.display()))?;
-    sync_directory(&marker_dir).map_err(|error| {
+    crate::durability::sync_directory(&marker_dir).map_err(|error| {
         format!(
             "sync run marker directory {}: {error}",
             marker_dir.display()
@@ -345,34 +345,7 @@ fn write_marker(
         writeln!(marker, "started_unix_ms={}", now_ms())?;
     }
     marker.sync_all()?;
-    full_sync(marker)
-}
-
-#[cfg(target_os = "macos")]
-fn full_sync(file: &File) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
-    if result == -1 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn full_sync(_file: &File) -> std::io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn sync_directory(path: &Path) -> std::io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_directory(_path: &Path) -> std::io::Result<()> {
-    Ok(())
+    crate::durability::full_sync(marker)
 }
 
 fn finish_database_row(run: &ActiveRun, status: &str, error: Option<&str>) -> Result<(), String> {

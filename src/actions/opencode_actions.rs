@@ -362,13 +362,13 @@ impl Tui {
                     if let Some(repo) = self
                         .repos
                         .iter()
-                        .find(|repo| repo.identity == result.key.repository)
+                        .find(|repo| repo.identity == result.key.worktree.repository)
                     {
                         let _ = append_runtime_message(
                             &repo.repo,
                             &format!(
                                 "opencode status refresh failed for {}: {error}",
-                                result.key.branch
+                                result.key.worktree.branch
                             ),
                         );
                     }
@@ -515,12 +515,13 @@ impl Tui {
         changed
     }
 
-    pub(crate) fn request_opencode_reconciliation(&mut self) {
+    pub(crate) fn request_opencode_reconciliation_for(
+        &mut self,
+        worktree: crate::session::WorktreeSessionKey,
+    ) {
         let requested_at = Instant::now();
-        for stream in &self.opencode_listeners {
-            self.opencode_reconcile_requested
-                .insert(stream.worktree.clone(), requested_at);
-        }
+        self.opencode_reconcile_requested
+            .insert(worktree, requested_at);
         self.start_opencode_status_poll(true);
     }
 

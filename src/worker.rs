@@ -5,9 +5,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -15,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::execution::{self, DispatchState, ExecutionClaim, WorkflowIdentity, WorkflowKind};
-use crate::process::{ProcessPolicy, run_output_allow_failure};
+use crate::process::DetachedProcessPolicy;
 use crate::repo::Repository;
 use crate::util::stable_hash;
 use crate::{observability, workspace};
@@ -32,21 +31,8 @@ pub fn ensure_running() -> Result<(), String> {
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve Prism worker executable: {error}"))?;
     let mut command = Command::new(executable);
-    command
-        .args(["worker", "serve"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    command
-        .spawn()
+    command.args(["worker", "serve"]);
+    crate::process::spawn_detached(&mut command, DetachedProcessPolicy::WorkerDaemon)
         .map_err(|error| format!("start Prism worker daemon: {error}"))?;
 
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -321,29 +307,8 @@ pub fn legacy_worker_running(
         workflow.kind.label(),
         stable_hash(Path::new(&workflow.run_id))
     );
-    let output = run_output_allow_failure(
-        Command::new(config.tool("tmux")).env_remove("TMUX").args([
-            "list-sessions",
-            "-F",
-            "#{session_name}",
-        ]),
-        ProcessPolicy::TmuxPoll,
-    )
-    .map_err(|error| format!("inspect legacy tmux workers: {error}"))?;
-    if !output.status.success() {
-        let error = &output.stderr;
-        if tmux_list_means_no_server(error) {
-            return Ok(false);
-        }
-        return Err(format!("inspect legacy tmux workers: {}", error.trim()));
-    }
-    Ok(output.stdout.lines().any(|name| name == expected))
-}
-
-fn tmux_list_means_no_server(error: &str) -> bool {
-    error.contains("no server running")
-        || error.contains("no sessions")
-        || error.contains("error connecting to")
+    crate::tmux::named_session_exists(config, &expected)
+        .map_err(|error| format!("inspect legacy tmux workers: {error}"))
 }
 
 fn workflow_worktree(repo: &Repository, workflow: &WorkflowIdentity) -> Result<PathBuf, String> {
@@ -757,12 +722,5 @@ mod tests {
             ),
             PathBuf::from("/override")
         );
-    }
-
-    #[test]
-    fn isolated_tmux_connection_error_means_no_legacy_worker() {
-        assert!(tmux_list_means_no_server(
-            "error connecting to /tmp/prism/tmux-0/default (No such file or directory)"
-        ));
     }
 }

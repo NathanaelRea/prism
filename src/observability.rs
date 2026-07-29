@@ -1357,6 +1357,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::time::Duration;
 
     use crate::repo::Repository;
 
@@ -1383,6 +1384,46 @@ mod tests {
                 "ok"
             ]
         );
+    }
+
+    #[test]
+    fn nonblocking_read_returns_committed_snapshot_promptly_while_writer_is_active() {
+        let temp = test_path("nonblocking-read-writer");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        super::with_writable_db(&repo, |conn| {
+            conn.execute_batch(
+                "create table read_probe (value text not null);\
+                 insert into read_probe (value) values ('committed');",
+            )
+            .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        let blocker = super::open_writable_db_path(&super::db_path(&repo)).unwrap();
+        blocker
+            .execute_batch(
+                "begin immediate;\
+                 update read_probe set value = 'uncommitted';",
+            )
+            .unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(0);
+        let reader_repo = repo.clone();
+        let reader = std::thread::spawn(move || {
+            let result = super::with_nonblocking_read_db(&reader_repo, |conn| {
+                conn.query_row("select value from read_probe", [], |row| {
+                    row.get::<_, String>(0)
+                })
+                .map_err(|error| error.to_string())
+            });
+            let _ = tx.send(result);
+        });
+
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        blocker.execute_batch("rollback").unwrap();
+        reader.join().unwrap();
+
+        assert_eq!(result.unwrap().unwrap(), "committed");
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

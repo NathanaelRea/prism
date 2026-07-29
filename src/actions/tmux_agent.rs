@@ -209,7 +209,7 @@ impl Tui {
             TuiJobKey::Tmux(key.clone()),
             key.generation,
             Some(TUI_ACTION_JOB_TIMEOUT),
-            format!("prism-tmux-warmup-{}", job.key.slot.branch),
+            format!("prism-tmux-warmup-{}", job.key.slot.worktree.branch),
             move |context| {
                 if !job.delay.is_zero() && context.wait(job.delay) {
                     return Ok(None);

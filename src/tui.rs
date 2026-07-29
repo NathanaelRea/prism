@@ -236,11 +236,8 @@ impl ManagedRepo {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PrPollKey {
-    pub repository: WorktreeRepositoryKey,
-    pub branch: String,
-    pub path: PathBuf,
+    pub worktree: WorktreeSessionKey,
     pub generation: u64,
-    pub incarnation: String,
 }
 
 pub(crate) enum PrPollResult {
@@ -264,11 +261,8 @@ pub(crate) enum PrDeliveryKey {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct DeleteSessionKey {
-    pub repository: WorktreeRepositoryKey,
-    pub path: PathBuf,
-    pub branch: String,
+    pub worktree: WorktreeSessionKey,
     pub generation: u64,
-    pub incarnation: String,
 }
 
 pub(crate) struct DeleteSessionResult {
@@ -284,11 +278,8 @@ impl PrPollKey {
         generation: u64,
     ) -> Self {
         Self {
-            repository: repository.clone(),
-            branch: session.branch.clone(),
-            path: session.path.clone(),
+            worktree: session.identity_key(repository),
             generation,
-            incarnation: session.incarnation.clone(),
         }
     }
 }
@@ -367,11 +358,8 @@ pub(crate) struct SessionRefreshSnapshot {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct OpencodePollKey {
-    pub repository: WorktreeRepositoryKey,
-    pub branch: String,
-    pub path: PathBuf,
+    pub worktree: WorktreeSessionKey,
     pub generation: u64,
-    pub incarnation: String,
 }
 
 pub(crate) struct OpencodePollResult {
@@ -486,11 +474,8 @@ impl OpencodePollKey {
         generation: u64,
     ) -> Self {
         Self {
-            repository: repository.clone(),
-            branch: session.branch.clone(),
-            path: session.path.clone(),
+            worktree: session.identity_key(repository),
             generation,
-            incarnation: session.incarnation.clone(),
         }
     }
 }
@@ -938,6 +923,13 @@ impl Tui {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             self.run_inner(&mut runtime, &sigterm)
         }));
+        self.finish_run(outcome)
+    }
+
+    fn finish_run(
+        &mut self,
+        outcome: std::thread::Result<Result<ShutdownReason, String>>,
+    ) -> Result<(), String> {
         let shutdown_reason = match &outcome {
             Ok(Ok(reason)) => *reason,
             Ok(Err(_)) => ShutdownReason::RunError,
@@ -1595,24 +1587,9 @@ impl Tui {
                 .as_ref()
                 .is_some_and(|selected| match &metadata.key {
                     TuiJobKey::Worktree(key) => key == selected,
-                    TuiJobKey::Tmux(key) => {
-                        key.slot.repository == selected.repository
-                            && key.slot.path == selected.path
-                            && key.slot.branch == selected.branch
-                            && key.slot.incarnation == selected.incarnation
-                    }
-                    TuiJobKey::Pr(key) => {
-                        key.repository == selected.repository
-                            && key.path == selected.path
-                            && key.branch == selected.branch
-                            && key.incarnation == selected.incarnation
-                    }
-                    TuiJobKey::Opencode(key) => {
-                        key.repository == selected.repository
-                            && key.path == selected.path
-                            && key.branch == selected.branch
-                            && key.incarnation == selected.incarnation
-                    }
+                    TuiJobKey::Tmux(key) => &key.slot.worktree == selected,
+                    TuiJobKey::Pr(key) => &key.worktree == selected,
+                    TuiJobKey::Opencode(key) => &key.worktree == selected,
                     TuiJobKey::OpencodeListener(stream) => &stream.worktree == selected,
                     TuiJobKey::None | TuiJobKey::Repository(_) | TuiJobKey::Delete(_) => false,
                 });
@@ -1664,10 +1641,14 @@ impl Tui {
             }
         }
 
-        let stats = self.jobs.queue_stats();
-        if stats.dirty {
-            self.request_opencode_reconciliation();
+        for metadata in self.jobs.take_dirty_jobs() {
+            if self.job_generation_is_current(&metadata)
+                && let TuiJobKey::OpencodeListener(stream) = metadata.key
+            {
+                self.request_opencode_reconciliation_for(stream.worktree);
+            }
         }
+        let stats = self.jobs.queue_stats();
         if stats.overflow_delta > 0 || stats.coalesced_delta > 0 {
             self.record_tui_queue_stats(stats);
         }
@@ -1775,55 +1756,24 @@ impl Tui {
                     || metadata.generation == self.session_inventory_generation
             }
             TuiJobKey::Repository(_) => metadata.generation == self.session_inventory_generation,
-            TuiJobKey::Worktree(key) => self
-                .worktree_generations
-                .get(key)
-                .is_some_and(|generation| *generation == metadata.generation),
+            TuiJobKey::Worktree(key) => {
+                self.worktree_generation_is_current(key, metadata.generation)
+            }
             TuiJobKey::Pr(key) => {
                 key.generation == metadata.generation
-                    && self
-                        .worktree_generations
-                        .iter()
-                        .any(|(session, generation)| {
-                            session.repository == key.repository
-                                && session.path == key.path
-                                && session.branch == key.branch
-                                && session.incarnation == key.incarnation
-                                && *generation == metadata.generation
-                        })
+                    && self.worktree_generation_is_current(&key.worktree, metadata.generation)
             }
             TuiJobKey::Delete(key) => {
                 key.generation == metadata.generation
-                    && self
-                        .worktree_generations
-                        .iter()
-                        .any(|(session, generation)| {
-                            session.repository == key.repository
-                                && session.path == key.path
-                                && session.branch == key.branch
-                                && session.incarnation == key.incarnation
-                                && *generation == metadata.generation
-                        })
+                    && self.worktree_generation_is_current(&key.worktree, metadata.generation)
             }
             TuiJobKey::Tmux(key) => {
-                self.tmux_generations
-                    .get(&key.slot)
-                    .is_some_and(|generation| {
-                        *generation == metadata.generation && key.generation == metadata.generation
-                    })
+                key.generation == metadata.generation
+                    && crate::agent_session::key_is_current(&self.tmux_generations, key)
             }
             TuiJobKey::Opencode(key) => {
                 key.generation == metadata.generation
-                    && self
-                        .worktree_generations
-                        .iter()
-                        .any(|(session, generation)| {
-                            session.repository == key.repository
-                                && session.path == key.path
-                                && session.branch == key.branch
-                                && session.incarnation == key.incarnation
-                                && *generation == metadata.generation
-                        })
+                    && self.worktree_generation_is_current(&key.worktree, metadata.generation)
             }
             TuiJobKey::OpencodeListener(stream) => self
                 .worktree_generations
@@ -1844,6 +1794,14 @@ impl Tui {
                         })
                 }),
         }
+    }
+
+    fn worktree_generation_is_current(
+        &self,
+        worktree: &WorktreeSessionKey,
+        generation: u64,
+    ) -> bool {
+        self.worktree_generations.get(worktree).copied() == Some(generation)
     }
 
     fn record_tui_job_terminal(
@@ -1936,9 +1894,9 @@ impl Tui {
     fn recover_failed_tui_job(&mut self, metadata: &JobMetadata<TuiJobKind, TuiJobKey>) {
         if let (TuiJobKind::DeleteSession, TuiJobKey::Delete(key)) = (&metadata.kind, &metadata.key)
             && let Some(session) = self.sessions.iter_mut().find(|session| {
-                session.path == key.path
-                    && session.branch == key.branch
-                    && session.incarnation == key.incarnation
+                self.repos
+                    .get(session.repo_index)
+                    .is_some_and(|repo| session.identity_key(&repo.identity) == key.worktree)
             })
         {
             session.hidden = false;
@@ -4110,7 +4068,7 @@ impl Tui {
             },
             Some(capture) => match &capture.result {
                 Ok(lines) => (
-                    &capture.key.slot.branch,
+                    &capture.key.slot.worktree.branch,
                     view::TmuxPortalState::Ready(lines),
                 ),
                 Err(_) => (&session.branch, view::TmuxPortalState::Loading),
@@ -4661,7 +4619,7 @@ mod tests {
         tui.jobs = JobRegistry::with_event_capacity(2);
         let worktree = tui.sessions[0].identity_key(&tui.repos[0].identity);
         let stream = super::OpencodeListenerKey {
-            worktree,
+            worktree: worktree.clone(),
             generation: 0,
             session_id: "ses_1".to_string(),
             server_url: "http://127.0.0.1:1".to_string(),
@@ -4733,7 +4691,7 @@ mod tests {
         let status = tui.sessions[0].opencode_status.as_ref().unwrap();
         assert_eq!(status.state, OpencodeState::Retry);
         assert_eq!(status.latest_message.as_deref(), Some("message-99"));
-        assert!(tui.opencode_reconcile_requested.is_empty());
+        assert!(tui.opencode_reconcile_requested.contains_key(&worktree));
         let stats = tui.jobs.queue_stats();
         assert_eq!(stats.event_capacity, 2);
         assert_eq!(stats.event_depth, 0);
@@ -4932,10 +4890,67 @@ mod tests {
     #[test]
     fn cleanup_cancels_and_joins_listener_job() {
         let _ = crate::observability::take_captured_events();
-        let repo = Repository {
-            root: PathBuf::from("/tmp/repo"),
+        let (mut tui, stopped_rx) = tui_with_active_listener("user-quit");
+
+        tui.cleanup_tui_jobs(super::ShutdownReason::UserQuit)
+            .unwrap();
+
+        stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!tui.jobs.has_jobs());
+        assert!(tui.opencode_listeners.is_empty());
+        let cleanup = crate::observability::take_captured_events()
+            .into_iter()
+            .filter(|event| event.target == "tui" && event.action == "shutdown_cleanup")
+            .filter_map(|event| event.data_json)
+            .map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap())
+            .find(|data| data["reason"] == "user_quit" && data["active_jobs"] == 1)
+            .unwrap();
+        assert_eq!(cleanup["reason"], "user_quit");
+        assert_eq!(cleanup["active_jobs"], 1);
+        assert_eq!(cleanup["unfinished_jobs"], 0);
+    }
+
+    #[test]
+    fn run_error_path_cleans_up_active_listener() {
+        let (mut tui, stopped_rx) = tui_with_active_listener("run-error");
+
+        let error = tui
+            .finish_run(Ok(Err("injected draw error".to_string())))
+            .unwrap_err();
+
+        assert_eq!(error, "injected draw error");
+        stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!tui.jobs.has_jobs());
+        assert!(tui.opencode_listeners.is_empty());
+    }
+
+    #[test]
+    fn sigterm_exit_path_cleans_up_active_listener() {
+        let (mut tui, stopped_rx) = tui_with_active_listener("sigterm");
+        let notification = crate::tui_signal::SigtermNotification::for_test();
+        notification.request_for_test();
+        let reason = if super::tui_loop_should_exit(&notification) {
+            super::ShutdownReason::Sigterm
+        } else {
+            panic!("SIGTERM notification was not observed")
         };
-        let session = test_session(0, "/tmp/repo/worktree", "feature");
+
+        tui.finish_run(Ok(Ok(reason))).unwrap();
+
+        stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!tui.jobs.has_jobs());
+        assert!(tui.opencode_listeners.is_empty());
+    }
+
+    fn tui_with_active_listener(label: &str) -> (Tui, std::sync::mpsc::Receiver<()>) {
+        let repo = Repository {
+            root: PathBuf::from(format!("/tmp/prism-cleanup-{label}")),
+        };
+        let session = test_session(
+            0,
+            &format!("/tmp/prism-cleanup-{label}/worktree"),
+            "feature",
+        );
         let mut tui = Tui::new_single(repo, test_config(), vec![session]);
         let key = tui.sessions[0].identity_key(&tui.repos[0].identity);
         let stream = super::OpencodeListenerKey {
@@ -4959,22 +4974,7 @@ mod tests {
             },
         );
 
-        tui.cleanup_tui_jobs(super::ShutdownReason::UserQuit)
-            .unwrap();
-
-        stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(!tui.jobs.has_jobs());
-        assert!(tui.opencode_listeners.is_empty());
-        let cleanup = crate::observability::take_captured_events()
-            .into_iter()
-            .filter(|event| event.target == "tui" && event.action == "shutdown_cleanup")
-            .filter_map(|event| event.data_json)
-            .map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap())
-            .find(|data| data["reason"] == "user_quit" && data["active_jobs"] == 1)
-            .unwrap();
-        assert_eq!(cleanup["reason"], "user_quit");
-        assert_eq!(cleanup["active_jobs"], 1);
-        assert_eq!(cleanup["unfinished_jobs"], 0);
+        (tui, stopped_rx)
     }
 
     fn wait_for_opencode_job(tui: &mut Tui, key: &super::OpencodePollKey) {

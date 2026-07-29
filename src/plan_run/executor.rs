@@ -54,7 +54,9 @@ pub fn execute_plan_parallel(
     persisted.run.updated_unix_ms = unix_ms();
     save_run_with_conn(conn, &persisted.run)?;
 
-    let (tx, rx) = mpsc::channel::<Result<ParallelChildEvent, String>>();
+    let (tx, rx) = mpsc::sync_channel::<Result<ParallelChildEvent, String>>(
+        crate::harness::WORKFLOW_OUTPUT_CHANNEL_CAPACITY,
+    );
     let mut running = 0usize;
     let mut spawn_errors = Vec::new();
 
@@ -575,7 +577,9 @@ pub(super) fn collect_child_output(
         .stderr
         .take()
         .ok_or_else(|| "open harness stderr".to_string())?;
-    let (tx, rx) = mpsc::channel::<Result<ChildLine, String>>();
+    let (tx, rx) = mpsc::sync_channel::<Result<ChildLine, String>>(
+        crate::harness::WORKFLOW_OUTPUT_CHANNEL_CAPACITY,
+    );
     let stdout_reader = spawn_reader_thread(StreamKind::Stdout, stdout, tx.clone());
     let stderr_reader = spawn_reader_thread(StreamKind::Stderr, stderr, tx);
 
@@ -625,6 +629,7 @@ pub(super) fn collect_child_output(
             }
         }
     };
+    drop(rx);
 
     let status = if stream_result.is_ok() {
         let deadline = child
@@ -718,7 +723,7 @@ pub(super) fn spawn_parallel_child(
     mut child: crate::process::SupervisedChild,
     used_attach: bool,
     invocation: crate::harness::Invocation,
-    tx: mpsc::Sender<Result<ParallelChildEvent, String>>,
+    tx: mpsc::SyncSender<Result<ParallelChildEvent, String>>,
 ) -> Result<(), String> {
     let stdout = child
         .stdout
@@ -772,7 +777,7 @@ pub(super) fn spawn_parallel_reader(
     step_index: usize,
     stream: StreamKind,
     reader: impl std::io::Read + Send + 'static,
-    tx: mpsc::Sender<Result<ParallelChildEvent, String>>,
+    tx: mpsc::SyncSender<Result<ParallelChildEvent, String>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = crate::harness::read_bounded_lines(reader, |text| {
@@ -792,7 +797,7 @@ pub(super) fn spawn_parallel_reader(
 pub(super) fn spawn_reader_thread(
     stream: StreamKind,
     reader: impl std::io::Read + Send + 'static,
-    tx: mpsc::Sender<Result<ChildLine, String>>,
+    tx: mpsc::SyncSender<Result<ChildLine, String>>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = crate::harness::read_bounded_lines(reader, |text| {

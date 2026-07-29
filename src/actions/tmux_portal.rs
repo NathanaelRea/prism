@@ -125,14 +125,14 @@ impl Tui {
                 TuiJobKey::Tmux(key.clone()),
                 key.generation,
                 Some(TMUX_PORTAL_CAPTURE_TIMEOUT),
-                format!("prism-tmux-portal-{}", key.slot.branch),
+                format!("prism-tmux-portal-{}", key.slot.worktree.branch),
                 move |_| {
                     let (capture, resized_size) = (|| {
                         if resize {
                             crate::tmux::resize_agent_pane(
                                 &target.repo,
                                 &target.config,
-                                &target.key.slot.branch,
+                                &target.key.slot.worktree.branch,
                                 target.key.generation,
                                 target.size.0,
                                 target.size.1,
@@ -142,7 +142,7 @@ impl Tui {
                             crate::tmux::capture_agent_pane(
                                 &target.repo,
                                 &target.config,
-                                &target.key.slot.branch,
+                                &target.key.slot.worktree.branch,
                                 target.key.generation,
                             )
                             .map(normalize_capture),

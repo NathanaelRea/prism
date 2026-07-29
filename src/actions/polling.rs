@@ -380,7 +380,7 @@ impl Tui {
                         let repo = self
                             .repos
                             .iter()
-                            .find(|repo| repo.identity == key.repository)
+                            .find(|repo| repo.identity == key.worktree.repository)
                             .map(|repo| repo.repo.clone());
                         let session = &mut self.sessions[session_index];
                         let before = pr_cache_render_signature(&session.pr);

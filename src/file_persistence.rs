@@ -36,15 +36,9 @@ impl Durability {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FinalSymlink {
-    Follow,
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct UpdateOptions {
     pub durability: Durability,
-    pub final_symlink: FinalSymlink,
     pub lock_timeout: Duration,
 }
 
@@ -52,7 +46,6 @@ impl UpdateOptions {
     pub const fn important_toml() -> Self {
         Self {
             durability: Durability::MacOsFullSync,
-            final_symlink: FinalSymlink::Follow,
             lock_timeout: Duration::from_millis(250),
         }
     }
@@ -60,7 +53,6 @@ impl UpdateOptions {
     pub const fn ui_state() -> Self {
         Self {
             durability: Durability::FileAndDirectory,
-            final_symlink: FinalSymlink::Follow,
             lock_timeout: Duration::from_millis(100),
         }
     }
@@ -389,7 +381,7 @@ fn update_inner_with_fault<T>(
     fs::create_dir_all(parent)
         .map_err(|error| PersistenceError::new(Stage::CreateParent, parent, false, error))?;
 
-    let target = resolve_final_symlink(path, options.final_symlink)?;
+    let target = resolve_final_symlink(path)?;
     let target_parent = target
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -442,7 +434,7 @@ fn update_inner_with_fault<T>(
     fault(Stage::SyncFile)
         .map_err(|error| PersistenceError::new(Stage::SyncFile, &staging_path, false, error))?;
     if options.durability == Durability::MacOsFullSync {
-        full_sync(&staging_file).map_err(|error| {
+        crate::durability::full_sync(&staging_file).map_err(|error| {
             PersistenceError::new(Stage::FullSyncFile, &staging_path, false, error)
         })?;
     }
@@ -452,30 +444,25 @@ fn update_inner_with_fault<T>(
     staging.renamed = true;
     fault(Stage::Rename)
         .map_err(|error| PersistenceError::new(Stage::Rename, &target, true, error))?;
-    sync_parent(target_parent)
+    crate::durability::sync_directory(target_parent)
         .map_err(|error| PersistenceError::new(Stage::SyncParent, target_parent, true, error))?;
     fault(Stage::SyncParent)
         .map_err(|error| PersistenceError::new(Stage::SyncParent, target_parent, true, error))?;
     Ok((value, true))
 }
 
-fn resolve_final_symlink(path: &Path, behavior: FinalSymlink) -> Result<PathBuf, PersistenceError> {
-    match behavior {
-        FinalSymlink::Follow => match fs::symlink_metadata(path) {
-            Ok(metadata) if metadata.file_type().is_symlink() => {
-                fs::canonicalize(path).map_err(|error| {
-                    PersistenceError::new(Stage::ResolveFinalSymlink, path, false, error)
-                })
-            }
-            Ok(_) => Ok(path.to_path_buf()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path.to_path_buf()),
-            Err(error) => Err(PersistenceError::new(
-                Stage::ResolveFinalSymlink,
-                path,
-                false,
-                error,
-            )),
-        },
+fn resolve_final_symlink(path: &Path) -> Result<PathBuf, PersistenceError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => fs::canonicalize(path)
+            .map_err(|error| PersistenceError::new(Stage::ResolveFinalSymlink, path, false, error)),
+        Ok(_) => Ok(path.to_path_buf()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(error) => Err(PersistenceError::new(
+            Stage::ResolveFinalSymlink,
+            path,
+            false,
+            error,
+        )),
     }
 }
 
@@ -561,33 +548,6 @@ fn create_staging(target: &Path, parent: &Path) -> Result<(File, PathBuf), Persi
             "could not allocate a unique staging file",
         ),
     ))
-}
-
-#[cfg(target_os = "macos")]
-fn full_sync(file: &File) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    let result = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_FULLFSYNC) };
-    if result == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn full_sync(_file: &File) -> io::Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn sync_parent(parent: &Path) -> io::Result<()> {
-    File::open(parent)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_parent(_parent: &Path) -> io::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]
@@ -729,6 +689,31 @@ mod tests {
         assert_eq!(
             fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o640
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dangling_final_symlink_reports_resolve_stage_and_preserves_link() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("dangling-symlink");
+        fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("config.toml");
+        symlink(dir.join("missing.toml"), &link).unwrap();
+
+        let error = update(&link, UpdateOptions::important_toml(), |_| {
+            Ok(((), Some(b"value = 'new'\n".to_vec())))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.stage(), Stage::ResolveFinalSymlink);
+        assert!(
+            fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
         fs::remove_dir_all(dir).unwrap();
     }

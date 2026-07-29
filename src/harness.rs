@@ -403,6 +403,7 @@ impl Invocation {
 }
 
 pub const MAX_OUTPUT_LINE_BYTES: usize = 1024 * 1024;
+pub(crate) const WORKFLOW_OUTPUT_CHANNEL_CAPACITY: usize = 16;
 
 pub fn read_bounded_lines(
     reader: impl Read,
