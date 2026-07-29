@@ -450,8 +450,7 @@ pub(super) fn claim_spawned_process(
         )
         .map_err(|error| format!("claim plan harness process: {error}"))?;
     if changed == 0 {
-        let _ = crate::harness::terminate_process(process_id, start_time_ticks);
-        let _ = child.wait();
+        let _ = crate::harness::terminate_active_process(child);
         step.status = PlanStepStatus::Aborted;
         step.execution = crate::harness::ExecutionRef::default();
         return Ok(false);
@@ -577,11 +576,22 @@ pub(super) fn collect_child_output(
         .take()
         .ok_or_else(|| "open harness stderr".to_string())?;
     let (tx, rx) = mpsc::channel::<Result<ChildLine, String>>();
-    spawn_reader_thread(StreamKind::Stdout, stdout, tx.clone());
-    spawn_reader_thread(StreamKind::Stderr, stderr, tx);
+    let stdout_reader = spawn_reader_thread(StreamKind::Stdout, stdout, tx.clone());
+    let stderr_reader = spawn_reader_thread(StreamKind::Stderr, stderr, tx);
 
     let mut readers_open = 2;
-    while readers_open > 0 {
+    let started = std::time::Instant::now();
+    let mut stream_result = loop {
+        let deadline = crate::process::ProcessPolicy::WorkflowStep.deadline();
+        if started.elapsed() >= deadline {
+            break Err(format!(
+                "harness timed out after {} ms",
+                deadline.as_millis()
+            ));
+        }
+        if readers_open == 0 {
+            break Ok(());
+        }
         match rx.recv_timeout(std::time::Duration::from_millis(250)) {
             Ok(Ok(ChildLine::Line { stream, text })) => {
                 if let Err(error) = ingest_child_line(
@@ -593,36 +603,72 @@ pub(super) fn collect_child_output(
                     structured_events,
                     output,
                 ) {
-                    terminate_plan_child(step, child);
-                    return Err(error);
+                    break Err(error);
                 }
             }
             Ok(Ok(ChildLine::End)) => readers_open -= 1,
-            Ok(Err(error)) => {
-                terminate_plan_child(step, child);
-                return Err(error);
-            }
+            Ok(Err(error)) => break Err(error),
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if let Err(error) = crate::execution::validate_installed_claim(conn) {
-                    terminate_plan_child(step, child);
-                    return Err(error);
+                    break Err(error);
+                }
+                let deadline = crate::process::ProcessPolicy::WorkflowStep.deadline();
+                if started.elapsed() >= deadline {
+                    break Err(format!(
+                        "harness timed out after {} ms",
+                        deadline.as_millis()
+                    ));
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                break Err("harness output readers disconnected".to_string());
+            }
         }
-    }
+    };
 
-    let status = child
-        .wait()
-        .map_err(|error| format!("wait for harness: {error}"))?;
+    let status = if stream_result.is_ok() {
+        let deadline = crate::process::ProcessPolicy::WorkflowStep.deadline();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if started.elapsed() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                Ok(None) => {
+                    terminate_plan_child(step, child);
+                    stream_result = Err(format!(
+                        "harness timed out after {} ms",
+                        deadline.as_millis()
+                    ));
+                    break None;
+                }
+                Err(error) => {
+                    terminate_plan_child(step, child);
+                    stream_result = Err(format!("wait for harness: {error}"));
+                    break None;
+                }
+            }
+        }
+    } else {
+        terminate_plan_child(step, child);
+        None
+    };
+    let stdout_result = stdout_reader
+        .join()
+        .map_err(|_| "plan stdout reader panicked".to_string());
+    let stderr_result = stderr_reader
+        .join()
+        .map_err(|_| "plan stderr reader panicked".to_string());
+    stdout_result?;
+    stderr_result?;
+    stream_result?;
+    let status = status.expect("successful stream collection has an exit status");
     Ok(status.code().unwrap_or(1))
 }
 
 fn terminate_plan_child(step: &PlanStepRun, child: &mut Child) {
-    let process_id = step.execution.process_id.unwrap_or_else(|| child.id());
-    let identity = step.execution.process_start_time_ticks;
-    let _ = crate::harness::terminate_process(process_id, identity);
-    let _ = child.wait();
+    let _ = step;
+    let _ = crate::harness::terminate_active_process(child);
 }
 
 fn terminate_running_plan_steps(steps: &[PlanStepRun]) {
@@ -677,17 +723,34 @@ pub(super) fn spawn_parallel_child(
         .stderr
         .take()
         .ok_or_else(|| "open harness stderr".to_string())?;
-    spawn_parallel_reader(step_index, StreamKind::Stdout, stdout, tx.clone());
-    spawn_parallel_reader(step_index, StreamKind::Stderr, stderr, tx.clone());
+    let stdout_reader = spawn_parallel_reader(step_index, StreamKind::Stdout, stdout, tx.clone());
+    let stderr_reader = spawn_parallel_reader(step_index, StreamKind::Stderr, stderr, tx.clone());
     thread::spawn(move || {
-        let result = child
-            .wait()
-            .map_err(|error| format!("wait for harness: {error}"))
-            .map(|status| ParallelChildEvent::Exit {
-                step_index,
-                exit_code: status.code().unwrap_or(1),
-                used_attach,
-            });
+        let deadline = crate::process::ProcessPolicy::WorkflowStep.deadline();
+        let started = std::time::Instant::now();
+        let result = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) if started.elapsed() < deadline => {
+                    thread::sleep(std::time::Duration::from_millis(250));
+                }
+                Ok(None) => {
+                    let _ = crate::harness::terminate_active_process(&mut child);
+                    break Err(format!(
+                        "harness timed out after {} ms",
+                        deadline.as_millis()
+                    ));
+                }
+                Err(error) => break Err(format!("wait for harness: {error}")),
+            }
+        }
+        .map(|status| ParallelChildEvent::Exit {
+            step_index,
+            exit_code: status.code().unwrap_or(1),
+            used_attach,
+        });
+        let _ = stdout_reader.join();
+        let _ = stderr_reader.join();
         invocation.cleanup();
         let _ = tx.send(result);
     });
@@ -699,7 +762,7 @@ pub(super) fn spawn_parallel_reader(
     stream: StreamKind,
     reader: impl std::io::Read + Send + 'static,
     tx: mpsc::Sender<Result<ParallelChildEvent, String>>,
-) {
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = crate::harness::read_bounded_lines(reader, |text| {
             tx.send(Ok(ParallelChildEvent::Line {
@@ -712,14 +775,14 @@ pub(super) fn spawn_parallel_reader(
         if let Err(error) = result {
             let _ = tx.send(Err(error));
         }
-    });
+    })
 }
 
 pub(super) fn spawn_reader_thread(
     stream: StreamKind,
     reader: impl std::io::Read + Send + 'static,
     tx: mpsc::Sender<Result<ChildLine, String>>,
-) {
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = crate::harness::read_bounded_lines(reader, |text| {
             tx.send(Ok(ChildLine::Line { stream, text })).is_ok()
@@ -728,7 +791,7 @@ pub(super) fn spawn_reader_thread(
             let _ = tx.send(Err(error));
         }
         let _ = tx.send(Ok(ChildLine::End));
-    });
+    })
 }
 
 pub(super) fn ingest_child_line(

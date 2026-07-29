@@ -1,7 +1,7 @@
 use std::process::Command;
 
 use crate::config::Config;
-use crate::process::{run_capture, run_output_allow_failure, run_status};
+use crate::process::{ProcessPolicy, run_capture, run_output_allow_failure, run_status};
 use crate::repo::Repository;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -30,6 +30,7 @@ pub fn git_status_label(path: &std::path::Path, config: &Config) -> String {
             .arg("-C")
             .arg(path)
             .args(["status", "--short", "--branch"]),
+        ProcessPolicy::Metadata,
     ) {
         Ok(output) => parse_git_status_label(&output),
         Err(_) => "status error".to_string(),
@@ -82,6 +83,7 @@ pub fn worktree_dirty(repo: &Repository, config: &Config) -> Result<bool, String
             .arg("-C")
             .arg(&repo.root)
             .args(["status", "--short"]),
+        ProcessPolicy::Metadata,
     )?;
     Ok(!status.trim().is_empty())
 }
@@ -92,6 +94,7 @@ fn current_branch(repo: &Repository, config: &Config) -> Result<Option<String>, 
             .arg("-C")
             .arg(&repo.root)
             .args(["branch", "--show-current"]),
+        ProcessPolicy::Metadata,
     )?;
     let branch = output.trim();
     if branch.is_empty() {
@@ -120,6 +123,7 @@ fn local_branch_exists(repo: &Repository, config: &Config, branch: &str) -> bool
                 "--quiet",
                 &format!("refs/heads/{branch}"),
             ]),
+        ProcessPolicy::Metadata,
     )
     .map(|output| output.status.success())
     .unwrap_or(false)
@@ -131,6 +135,7 @@ fn worktree_count(repo: &Repository, config: &Config) -> Result<usize, String> {
             .arg("-C")
             .arg(&repo.root)
             .args(["worktree", "list", "--porcelain"]),
+        ProcessPolicy::Metadata,
     )?;
     Ok(output
         .lines()
@@ -151,6 +156,7 @@ pub fn branch_behind(
             .arg(path)
             .args(["rev-list", "--count"])
             .arg(format!("{branch}..{upstream}")),
+        ProcessPolicy::Metadata,
     )?;
     Ok(count.trim().parse().unwrap_or(0))
 }
@@ -162,13 +168,17 @@ pub fn pull_branch(path: &std::path::Path, branch: &str, config: &Config) -> Res
             .arg("-C")
             .arg(path)
             .args(["switch", branch]),
+        ProcessPolicy::LocalMutation,
     )?;
-    crate::process::run_status(Command::new(config.tool("git")).arg("-C").arg(path).args([
-        "pull",
-        "--ff-only",
-        "origin",
-        branch,
-    ]))
+    crate::process::run_status(
+        Command::new(config.tool("git")).arg("-C").arg(path).args([
+            "pull",
+            "--ff-only",
+            "origin",
+            branch,
+        ]),
+        ProcessPolicy::NetworkQuery,
+    )
 }
 
 pub(crate) fn fetch_origin(path: &std::path::Path, config: &Config) -> Result<(), String> {
@@ -177,6 +187,7 @@ pub(crate) fn fetch_origin(path: &std::path::Path, config: &Config) -> Result<()
             .arg("-C")
             .arg(path)
             .args(["fetch", "origin"]),
+        ProcessPolicy::NetworkQuery,
     )
 }
 
@@ -195,6 +206,7 @@ pub(crate) fn fetch_pull_request_branch(
             .arg(path)
             .args(["fetch", "origin"])
             .arg(format!("+pull/{number}/head:refs/heads/{branch}")),
+        ProcessPolicy::NetworkQuery,
     )
 }
 
@@ -203,13 +215,15 @@ pub fn selected_dirty(path: &std::path::Path, config: &Config) -> Result<bool, S
 }
 
 pub fn has_upstream(path: &std::path::Path, config: &Config) -> Result<bool, String> {
-    let upstream =
-        run_output_allow_failure(Command::new(config.tool("git")).arg("-C").arg(path).args([
+    let upstream = run_output_allow_failure(
+        Command::new(config.tool("git")).arg("-C").arg(path).args([
             "rev-parse",
             "--abbrev-ref",
             "--symbolic-full-name",
             "@{u}",
-        ]))?;
+        ]),
+        ProcessPolicy::Metadata,
+    )?;
     Ok(upstream.status.success())
 }
 
@@ -240,6 +254,7 @@ pub(crate) fn inspect_dirty(path: &std::path::Path, config: &Config) -> Result<D
             .arg("-C")
             .arg(path)
             .args(["status", "--short"]),
+        ProcessPolicy::Metadata,
     )?;
     let entries = status
         .lines()
@@ -260,6 +275,7 @@ pub(crate) fn stage_all(path: &std::path::Path, config: &Config) -> Result<(), S
             .arg("-C")
             .arg(path)
             .args(["add", "-A"]),
+        ProcessPolicy::LocalMutation,
     )
 }
 
@@ -283,6 +299,7 @@ pub(crate) fn commit_if_dirty(
             .arg("-C")
             .arg(path)
             .args(["commit", "-m", message]),
+        ProcessPolicy::LocalMutation,
     )?;
     let commit_sha = current_head_sha(path, config)?;
     Ok(GitCommitResult {
@@ -299,6 +316,7 @@ pub(crate) fn current_head_sha(path: &std::path::Path, config: &Config) -> Resul
             .arg("-C")
             .arg(path)
             .args(["rev-parse", "HEAD"]),
+        ProcessPolicy::Metadata,
     )?;
     Ok(sha.trim().to_string())
 }
@@ -320,6 +338,7 @@ pub(crate) fn push_current_branch(
             .arg("-C")
             .arg(path)
             .args(args),
+        ProcessPolicy::NetworkQuery,
     )?;
     Ok(GitPushResult {
         branch,
@@ -337,6 +356,7 @@ pub(crate) fn current_branch_name(
             .arg("-C")
             .arg(path)
             .args(["branch", "--show-current"]),
+        ProcessPolicy::Metadata,
     )?;
     let branch = output.trim();
     if branch.is_empty() {
@@ -361,6 +381,7 @@ pub(crate) fn remote_branch_head_sha(
             .arg(path)
             .args(["rev-parse", "--verify", "--quiet"])
             .arg(format!("refs/remotes/origin/{branch}")),
+        ProcessPolicy::Metadata,
     )?;
     if !output.status.success() {
         return match output.status.code() {

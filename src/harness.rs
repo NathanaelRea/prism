@@ -758,6 +758,12 @@ pub fn process_start_time_ticks(process_id: u32) -> Option<u64> {
     }
 }
 
+pub fn terminate_active_process(child: &mut std::process::Child) -> Result<(), String> {
+    crate::process::terminate_active_child(child, std::time::Duration::from_secs(1))
+        .map(|_| ())
+        .map_err(|error| format!("terminate harness process {}: {error}", child.id()))
+}
+
 #[cfg(unix)]
 pub fn terminate_process(
     process_id: u32,
@@ -773,11 +779,26 @@ pub fn terminate_process(
     }
     let process_group = -(process_id as libc::pid_t);
     let result = unsafe { libc::kill(process_group, libc::SIGTERM) };
-    if result == 0 {
+    if result != 0 {
+        return Err(format!(
+            "terminate harness process {process_id}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while std::time::Instant::now() < deadline {
+        #[cfg(target_os = "linux")]
+        if process_start_time_ticks(process_id) != _expected_start_time_ticks {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let result = unsafe { libc::kill(process_group, libc::SIGKILL) };
+    if result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
         Ok(())
     } else {
         Err(format!(
-            "terminate harness process {process_id}: {}",
+            "kill harness process {process_id}: {}",
             std::io::Error::last_os_error()
         ))
     }

@@ -392,6 +392,85 @@ pub fn command_data_json(
     status: Option<&str>,
     stderr: Option<&str>,
 ) -> String {
+    let mut fields = command_data_fields(command, include_argv);
+    if let Some(elapsed_ms) = elapsed_ms {
+        fields.push(json_number_field("elapsed_ms", elapsed_ms));
+    }
+    if let Some(status) = status {
+        fields.push(json_string_field("status", status));
+    }
+    if let Some(stderr) = stderr {
+        fields.push(json_string_field("stderr", &redact_freeform(stderr, 500)));
+    }
+    json_object(fields)
+}
+
+pub struct ProcessObservation<'a> {
+    pub policy: &'a str,
+    pub elapsed_ms: i64,
+    pub deadline_ms: i64,
+    pub child_pid: u32,
+    #[cfg(unix)]
+    pub process_group: libc::pid_t,
+    pub status: &'a str,
+    pub completion: &'a str,
+    pub termination_stage: &'a str,
+    pub stdout_bytes: u64,
+    pub stdout_truncated: bool,
+    pub stderr_bytes: u64,
+    pub stderr_truncated: bool,
+    pub error: Option<&'a str>,
+}
+
+pub fn process_start_data_json(
+    command: &Command,
+    include_argv: bool,
+    policy: &str,
+    deadline_ms: i64,
+) -> String {
+    let mut fields = command_data_fields(command, include_argv);
+    fields.push(json_string_field("policy", policy));
+    fields.push(json_number_field("deadline_ms", deadline_ms));
+    json_object(fields)
+}
+
+pub fn process_data_json(
+    command: &Command,
+    include_argv: bool,
+    observation: ProcessObservation<'_>,
+) -> String {
+    let mut fields = command_data_fields(command, include_argv);
+    fields.extend([
+        json_string_field("policy", observation.policy),
+        json_number_field("elapsed_ms", observation.elapsed_ms),
+        json_number_field("deadline_ms", observation.deadline_ms),
+        json_number_field("child_pid", i64::from(observation.child_pid)),
+        json_string_field("status", observation.status),
+        json_string_field("completion", observation.completion),
+        json_string_field("termination_stage", observation.termination_stage),
+        json_number_field(
+            "stdout_bytes",
+            observation.stdout_bytes.min(i64::MAX as u64) as i64,
+        ),
+        format!("\"stdout_truncated\":{}", observation.stdout_truncated),
+        json_number_field(
+            "stderr_bytes",
+            observation.stderr_bytes.min(i64::MAX as u64) as i64,
+        ),
+        format!("\"stderr_truncated\":{}", observation.stderr_truncated),
+    ]);
+    #[cfg(unix)]
+    fields.push(json_number_field(
+        "process_group",
+        i64::from(observation.process_group),
+    ));
+    if let Some(error) = observation.error {
+        fields.push(json_string_field("error", &redact_freeform(error, 500)));
+    }
+    json_object(fields)
+}
+
+fn command_data_fields(command: &Command, include_argv: bool) -> Vec<String> {
     let mut fields = vec![
         json_string_field("program", &os_to_string(command.get_program())),
         json_number_field("arg_count", command.get_args().count() as i64 + 1),
@@ -409,16 +488,7 @@ pub fn command_data_json(
     if let Some(cwd) = command.get_current_dir() {
         fields.push(json_string_field("cwd", &cwd.display().to_string()));
     }
-    if let Some(elapsed_ms) = elapsed_ms {
-        fields.push(json_number_field("elapsed_ms", elapsed_ms));
-    }
-    if let Some(status) = status {
-        fields.push(json_string_field("status", status));
-    }
-    if let Some(stderr) = stderr {
-        fields.push(json_string_field("stderr", &redact_freeform(stderr, 500)));
-    }
-    json_object(fields)
+    fields
 }
 
 pub fn command_display(command: &Command) -> String {

@@ -12,7 +12,7 @@ use crate::agent::{PromptMode, builtin_prompt_mode, detected_agents};
 use crate::harness::{
     BUILTIN_HARNESS_IDS, Harness, HarnessConfig, OutputFormat, PromptTransport, builtin_adapter,
 };
-use crate::process::{command_exists, command_version, run_capture};
+use crate::process::{ProcessPolicy, command_exists, command_version, run_capture};
 use crate::repo::Repository;
 use crate::session::discover_sessions;
 use crate::util::prism_config_dir;
@@ -1230,7 +1230,10 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     println!();
 
     println!();
-    match run_capture(Command::new(config.tool("gh")).arg("auth").arg("status")) {
+    match run_capture(
+        Command::new(config.tool("gh")).arg("auth").arg("status"),
+        ProcessPolicy::NetworkQuery,
+    ) {
         Ok(_) => println!("gh auth: ok"),
         Err(error) => println!("gh auth: {error}"),
     }

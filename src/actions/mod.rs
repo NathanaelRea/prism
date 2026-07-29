@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
@@ -43,7 +43,9 @@ use crate::plan_run::{
     prepare_plan_run_for_resume, request_plan_run_pause, resume_paused_plan_run,
     retry_failed_steps, retry_from_step, save_plan_run, skip_plan_step,
 };
-use crate::process::{command_exists, parse_command_words, run_capture};
+use crate::process::{
+    ProcessPolicy, command_exists, parse_command_words, run_capture, run_output_allow_failure,
+};
 use crate::repo::Repository;
 use crate::session::{
     CreateWorktreeOutcome, DeleteWorktreeOutcome, archive_worktree_session,

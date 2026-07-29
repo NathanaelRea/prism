@@ -5,8 +5,8 @@ use std::sync::LazyLock;
 use crate::config::Config;
 use crate::observability;
 use crate::process::{
-    ProcessOutput, run_capture, run_configured_commands, run_output, run_output_allow_failure,
-    run_status, run_status_inherited,
+    ProcessOutput, ProcessPolicy, run_capture, run_configured_commands, run_output,
+    run_output_allow_failure, run_status, run_status_inherited,
 };
 use crate::repo::Repository;
 
@@ -25,6 +25,7 @@ pub(crate) fn list_worktrees(
             .arg("-C")
             .arg(&repo.root)
             .args(["worktree", "list", "--porcelain"]),
+        ProcessPolicy::Metadata,
     )?;
     Ok(parse_worktree_inventory(&output))
 }
@@ -75,7 +76,7 @@ pub(crate) fn create_worktree(
         config.default_base.as_deref(),
     ));
     let command_display = observability::command_display(&command);
-    let output = run_output(&mut command)?;
+    let output = run_output(&mut command, ProcessPolicy::LocalMutation)?;
     if !output.status.success() {
         return Err(worktree_command_failure_message(
             &command_display,
@@ -95,7 +96,7 @@ pub(crate) fn checkout_worktree(
     let mut command = Command::new(config.tool(&config.worktree_command));
     command.args(checkout_worktree_args(&repo.root, branch));
     let command_display = observability::command_display(&command);
-    let output = run_output(&mut command)?;
+    let output = run_output(&mut command, ProcessPolicy::LocalMutation)?;
     if !output.status.success() {
         return Err(worktree_command_failure_message(
             &command_display,
@@ -126,6 +127,7 @@ pub(crate) fn check_worktrunk_approval_status(
             .arg("-C")
             .arg(&repo.root)
             .args(["config", "approvals", "add"]),
+        ProcessPolicy::Metadata,
     )?;
     if output.status.success() {
         return Ok(WorktrunkApprovalStatus::Approved);
@@ -166,6 +168,7 @@ pub(crate) fn branch_has_worktree(
             .arg("-C")
             .arg(&repo.root)
             .args(["worktree", "list", "--porcelain"]),
+        ProcessPolicy::Metadata,
     )?;
     Ok(output.lines().any(|line| {
         line.strip_prefix("branch refs/heads/")
@@ -179,10 +182,14 @@ pub(crate) fn move_current_branch_to_worktree(
     branch: &str,
     base: &str,
 ) -> Result<(), String> {
-    run_status(Command::new(config.tool("git")).args(switch_checkout_args(&repo.root, base)))?;
+    run_status(
+        Command::new(config.tool("git")).args(switch_checkout_args(&repo.root, base)),
+        ProcessPolicy::LocalMutation,
+    )?;
     run_status(
         Command::new(config.tool(&config.worktree_command))
             .args(move_branch_to_worktree_args(&repo.root, branch)),
+        ProcessPolicy::LocalMutation,
     )?;
     let _ = crate::observability::append_runtime_message(
         repo,
@@ -212,6 +219,7 @@ pub(crate) fn push_branch(
             .arg("-C")
             .arg(path)
             .args(args),
+        ProcessPolicy::NetworkQuery,
     )?;
     Ok(())
 }
@@ -366,6 +374,7 @@ pub(crate) fn delete_branch_if_same_incarnation(
             .arg("-C")
             .arg(&repo.root)
             .args(["branch", "-D", branch]),
+        ProcessPolicy::LocalMutation,
     )
 }
 
@@ -379,6 +388,7 @@ pub(crate) fn branch_oid(
             .arg("-C")
             .arg(&repo.root)
             .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")]),
+        ProcessPolicy::Metadata,
     )?;
     let oid = oid.trim();
     if oid.is_empty() {
@@ -399,6 +409,7 @@ pub(crate) fn remove_worktree(
             .arg(&repo.root)
             .args(["worktree", "remove", "--force"])
             .arg(path),
+        ProcessPolicy::LocalMutation,
     );
     match remove_result {
         Ok(()) => Ok(()),
@@ -444,6 +455,7 @@ fn worktree_path_registered(
             .arg("-C")
             .arg(&repo.root)
             .args(["worktree", "list", "--porcelain"]),
+        ProcessPolicy::Metadata,
     )?;
     Ok(output.lines().any(|line| {
         line.strip_prefix("worktree ")
@@ -467,6 +479,7 @@ pub(crate) fn prune_worktrees(repo: &Repository, config: &Config) -> Result<(), 
             .arg("-C")
             .arg(&repo.root)
             .args(["worktree", "prune"]),
+        ProcessPolicy::LocalMutation,
     )
 }
 

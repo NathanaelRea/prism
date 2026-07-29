@@ -15,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::execution::{self, DispatchState, ExecutionClaim, WorkflowIdentity, WorkflowKind};
+use crate::process::{ProcessPolicy, run_output_allow_failure};
 use crate::repo::Repository;
 use crate::util::stable_hash;
 use crate::{observability, workspace};
@@ -305,21 +306,23 @@ pub fn legacy_worker_running(
         workflow.kind.label(),
         stable_hash(Path::new(&workflow.run_id))
     );
-    let output = Command::new(config.tool("tmux"))
-        .env_remove("TMUX")
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-        .map_err(|error| format!("inspect legacy tmux workers: {error}"))?;
+    let output = run_output_allow_failure(
+        Command::new(config.tool("tmux")).env_remove("TMUX").args([
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+        ]),
+        ProcessPolicy::TmuxPoll,
+    )
+    .map_err(|error| format!("inspect legacy tmux workers: {error}"))?;
     if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        if tmux_list_means_no_server(&error) {
+        let error = &output.stderr;
+        if tmux_list_means_no_server(error) {
             return Ok(false);
         }
         return Err(format!("inspect legacy tmux workers: {}", error.trim()));
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|name| name == expected))
+    Ok(output.stdout.lines().any(|name| name == expected))
 }
 
 fn tmux_list_means_no_server(error: &str) -> bool {

@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::config::MergeMethod;
 use crate::git::current_head_sha;
 use crate::observability;
-use crate::process::{run_capture, run_output_allow_failure};
+use crate::process::{ProcessPolicy, run_capture, run_output_allow_failure};
 use crate::repo::Repository;
 use crate::session::Session;
 use crate::util::{strip_ansi, timestamp_label};
@@ -1155,6 +1155,7 @@ pub(crate) fn create_pull_request(
                 target_repo,
             ))
             .current_dir(path),
+        ProcessPolicy::NetworkQuery,
     )?;
     refresh_pr_cache(repo, branch, cache, path, config, true)
 }
@@ -1173,6 +1174,7 @@ pub(crate) fn merge_pull_request(
                 expected_head_sha,
             ))
             .current_dir(path),
+        ProcessPolicy::NetworkQuery,
     )?;
     Ok(())
 }
@@ -1224,6 +1226,7 @@ fn fetch_pr_merged_status(
             .arg("--json")
             .arg("state,mergedAt")
             .current_dir(path),
+        ProcessPolicy::NetworkQuery,
     )?;
     if !output.status.success() {
         let stderr = output.stderr.trim().to_string();
@@ -1534,6 +1537,7 @@ pub(crate) fn github_remote_configured(path: &std::path::Path, config: &Config) 
             .arg("-C")
             .arg(path)
             .args(["remote", "get-url", "origin"]),
+        ProcessPolicy::Metadata,
     )
     .ok()
     .filter(|output| output.status.success())
@@ -1637,6 +1641,7 @@ pub fn fetch_pr_summary_index(
             .arg("-f")
             .arg(format!("query={PR_SUMMARY_INDEX_QUERY}"))
             .current_dir(path),
+        ProcessPolicy::NetworkQuery,
     )?;
     try_parse_pr_summary_index(&raw)
 }
@@ -1672,6 +1677,7 @@ pub(crate) fn resolve_review_thread(
         Command::new(config.tool("gh"))
             .args(resolve_review_thread_args(thread_id))
             .current_dir(path),
+        ProcessPolicy::NetworkQuery,
     )?;
     let value = serde_json::from_str::<serde_json::Value>(&raw)
         .map_err(|error| format!("parse review thread resolution: {error}"))?;
@@ -1763,6 +1769,7 @@ fn fetch_repo_policy(path: &std::path::Path, config: &Config) -> Result<RepoPoli
             .arg("-f")
             .arg(format!("query={REPO_POLICY_QUERY}"))
             .current_dir(path),
+        ProcessPolicy::NetworkQuery,
     )?;
     parse_repo_policy(&format!("{owner}/{name}"), &raw).ok_or_else(|| {
         "GitHub repository policy response did not include repository data".to_string()
@@ -1862,11 +1869,14 @@ fn github_remote_owner_repo(
     config: &Config,
     remote_name: &str,
 ) -> Result<(String, String), String> {
-    let remote = run_capture(Command::new(config.tool("git")).arg("-C").arg(path).args([
-        "remote",
-        "get-url",
-        remote_name,
-    ]))?;
+    let remote = run_capture(
+        Command::new(config.tool("git")).arg("-C").arg(path).args([
+            "remote",
+            "get-url",
+            remote_name,
+        ]),
+        ProcessPolicy::Metadata,
+    )?;
     parse_github_remote(remote.trim()).ok_or_else(|| {
         format!(
             "{remote_name} remote is not a GitHub repository: {}",
@@ -2036,6 +2046,7 @@ fn fetch_pr_summary(
             .arg("--json")
             .arg(fields)
             .current_dir(path),
+        ProcessPolicy::NetworkQuery,
     )?;
     if !output.status.success() {
         let stderr = output.stderr.trim().to_string();
@@ -2076,6 +2087,7 @@ fn fetch_pr_details(
             .arg("--json")
             .arg(fields)
             .current_dir(path),
+        ProcessPolicy::NetworkQuery,
     )?;
     let details = try_parse_pr_details(&raw)?;
     let review_comments = fetch_inline_review_comments(path, pr_number, config);
@@ -2157,6 +2169,7 @@ fn fetch_ci_failures(
             .arg("--json")
             .arg("databaseId,workflowName,displayTitle,name,conclusion,status,headSha,url")
             .current_dir(path),
+        ProcessPolicy::NetworkQuery,
     )?;
     if !output.status.success() {
         let message = output.stderr.trim();
@@ -2208,6 +2221,7 @@ fn fetch_failed_run_log_tail(
             .arg(run_id)
             .arg("--log-failed")
             .current_dir(path),
+        ProcessPolicy::NetworkQuery,
     )?;
     if !output.status.success() {
         let message = output.stderr.trim();
@@ -2254,6 +2268,7 @@ fn fetch_inline_review_comments(
             .arg("--paginate")
             .arg("--slurp")
             .current_dir(path),
+        ProcessPolicy::NetworkQuery,
     )?;
     try_parse_review_thread_comments(&raw)
 }

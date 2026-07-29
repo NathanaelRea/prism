@@ -20,6 +20,7 @@ pub(super) fn fetch_wt_columns(
             .arg("-C")
             .arg(&repo.root)
             .args(["list", "--format=json"]),
+        crate::process::ProcessPolicy::Metadata,
     )?;
     let mut by_path = BTreeMap::new();
     for object in json_top_level_objects(&raw) {

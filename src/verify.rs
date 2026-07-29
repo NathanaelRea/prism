@@ -4,7 +4,9 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::config::Config;
-use crate::process::{run_configured_commands, run_output_allow_failure, run_status};
+use crate::process::{
+    ProcessPolicy, run_configured_commands, run_output_allow_failure, run_status,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum VerifyMode {
@@ -106,6 +108,7 @@ pub(crate) fn run_merge_conflict_check_against(
             .arg("-C")
             .arg(path)
             .args(["fetch", "origin", base]),
+        ProcessPolicy::NetworkQuery,
     );
     if let Err(error) = fetch {
         return VerifyCheckResult {
@@ -178,6 +181,7 @@ fn merge_tree_write_tree(config: &Config, path: &Path, base: &str) -> MergeTreeO
             .arg(path)
             .args(["merge-tree", "--write-tree", "HEAD"])
             .arg(format!("origin/{base}")),
+        ProcessPolicy::WorkflowStep,
     ) {
         Ok(output) => output,
         Err(error) => return MergeTreeOutcome::Unsupported(error),
@@ -215,6 +219,7 @@ fn fallback_merge_conflict_check(
             .args(["worktree", "add", "--detach"])
             .arg(&temp)
             .arg("HEAD"),
+        ProcessPolicy::LocalMutation,
     );
     if let Err(error) = add {
         let _ = std::fs::remove_dir_all(&temp);
@@ -232,6 +237,7 @@ fn fallback_merge_conflict_check(
             .arg(&temp)
             .args(["merge", "--no-commit", "--no-ff"])
             .arg(format!("origin/{base}")),
+        ProcessPolicy::WorkflowStep,
     );
     let remove = run_status(
         Command::new(config.tool("git"))
@@ -239,6 +245,7 @@ fn fallback_merge_conflict_check(
             .arg(path)
             .args(["worktree", "remove", "--force"])
             .arg(&temp),
+        ProcessPolicy::LocalMutation,
     );
     let _ = std::fs::remove_dir_all(&temp);
 

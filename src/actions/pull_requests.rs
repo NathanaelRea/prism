@@ -102,16 +102,12 @@ pub(super) fn run_browser_opener(
         if !command_exists(program) {
             continue;
         }
-        match Command::new(program)
-            .args(*args)
-            .arg(url)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-        {
-            Ok(status) if status.success() => return Ok((*program).to_string()),
-            Ok(status) => errors.push(format!("{program}: exited with {status}")),
+        match run_output_allow_failure(
+            Command::new(program).args(*args).arg(url),
+            ProcessPolicy::LocalMutation,
+        ) {
+            Ok(output) if output.status.success() => return Ok((*program).to_string()),
+            Ok(output) => errors.push(format!("{program}: exited with {}", output.status)),
             Err(error) => errors.push(format!("{program}: {error}")),
         }
     }
