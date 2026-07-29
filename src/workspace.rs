@@ -1,8 +1,12 @@
+use std::error::Error;
+use std::fmt;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::file_persistence::{self, BoxError, FileContents, UpdateOptions};
 use crate::observability::{self, LogLevel};
 use crate::repo::Repository;
 use crate::util::prism_config_dir;
@@ -35,34 +39,92 @@ pub fn repos_path() -> PathBuf {
     prism_config_dir().join("repos.toml")
 }
 
-pub fn load_entries() -> Vec<RepoEntry> {
-    let Ok(text) = fs::read_to_string(repos_path()) else {
-        return Vec::new();
-    };
-    parse_entries(&text)
+#[derive(Debug)]
+enum ReposFormatError {
+    Utf8(std::string::FromUtf8Error),
+    Toml(toml::de::Error),
+    Semantic(String),
 }
 
-pub fn save_entries(entries: &[RepoEntry]) -> Result<(), String> {
-    let path = repos_path();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("create Prism config dir: {error}"))?;
+impl fmt::Display for ReposFormatError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Utf8(error) => write!(formatter, "repository file is unreadable text: {error}"),
+            Self::Toml(error) => write!(formatter, "repository file has invalid TOML: {error}"),
+            Self::Semantic(error) => write!(
+                formatter,
+                "repository file is semantically invalid: {error}"
+            ),
+        }
     }
-    fs::write(path, format_entries(entries)).map_err(|error| format!("write repos.toml: {error}"))
+}
+
+impl Error for ReposFormatError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Utf8(error) => Some(error),
+            Self::Toml(error) => Some(error),
+            Self::Semantic(_) => None,
+        }
+    }
+}
+
+pub fn load_entries() -> Result<Vec<RepoEntry>, String> {
+    load_entries_from_path(&repos_path())
+}
+
+fn load_entries_from_path(path: &Path) -> Result<Vec<RepoEntry>, String> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("read {}: {error}", path.display())),
+    };
+    parse_entries(&text).map_err(|error| format!("load {}: {error}", path.display()))
+}
+
+pub fn initialize_entries(entries: &[RepoEntry]) -> Result<Vec<RepoEntry>, String> {
+    update_entries(&repos_path(), |current, missing| {
+        if missing {
+            *current = entries.to_vec();
+            Ok((current.clone(), true))
+        } else {
+            Ok((current.clone(), false))
+        }
+    })
+}
+
+pub fn replace_entries(
+    expected: &[RepoEntry],
+    replacement: &[RepoEntry],
+) -> Result<Vec<RepoEntry>, String> {
+    update_entries(&repos_path(), |current, _| {
+        if current != expected {
+            return Err(ReposFormatError::Semantic(
+                "repos.toml changed while the dialog was open; reopen the dialog and retry"
+                    .to_string(),
+            ));
+        }
+        *current = replacement.to_vec();
+        Ok((current.clone(), true))
+    })
 }
 
 pub fn ensure_repo_entry(path: &Path) -> Result<(Repository, usize, Vec<RepoEntry>), String> {
     let repo = Repository::discover(Some(path))?;
-    let mut entries = load_entries();
-    if let Some(index) = entries.iter().position(|entry| entry.root == repo.root) {
-        return Ok((repo, index, entries));
-    }
-    let key = next_key(&entries);
-    entries.push(RepoEntry {
-        root: repo.root.clone(),
-        key,
-    });
-    save_entries(&entries)?;
-    Ok((repo, entries.len() - 1, entries))
+    let root = repo.root.clone();
+    let (index, entries) = ensure_repo_root(&repos_path(), root)?;
+    Ok((repo, index, entries))
+}
+
+fn ensure_repo_root(path: &Path, root: PathBuf) -> Result<(usize, Vec<RepoEntry>), String> {
+    update_entries(path, move |entries, _| {
+        if let Some(index) = entries.iter().position(|entry| entry.root == root) {
+            return Ok(((index, entries.clone()), false));
+        }
+        let key = next_key(entries);
+        entries.push(RepoEntry { root, key });
+        Ok(((entries.len() - 1, entries.clone()), true))
+    })
 }
 
 pub fn ensure_entries_for_tui(repo_arg: Option<&Path>) -> Result<(Vec<RepoEntry>, usize), String> {
@@ -71,7 +133,7 @@ pub fn ensure_entries_for_tui(repo_arg: Option<&Path>) -> Result<(Vec<RepoEntry>
         return Ok((entries, index));
     }
 
-    let entries = load_entries();
+    let entries = load_entries()?;
     if !entries.is_empty() {
         return Ok((entries, 0));
     }
@@ -106,9 +168,24 @@ pub fn discover_valid_entries(entries: Vec<RepoEntry>) -> Vec<DiscoveredRepoEntr
     discovered
 }
 
-pub fn remove_missing_entries(entries: Vec<RepoEntry>, selected: usize) -> (Vec<RepoEntry>, usize) {
-    let original_len = entries.len();
-    for entry in entries.iter().filter(|entry| !entry.root.exists()) {
+pub fn remove_missing_entries(
+    entries: Vec<RepoEntry>,
+    selected: usize,
+) -> Result<(Vec<RepoEntry>, usize), String> {
+    let selected_root = entries.get(selected).map(|entry| entry.root.clone());
+    let (retained, removed) = update_entries(&repos_path(), |current, missing| {
+        if missing {
+            return Ok(((current.clone(), Vec::new()), false));
+        }
+        let removed = current
+            .iter()
+            .filter(|entry| !entry.root.exists())
+            .map(|entry| entry.root.clone())
+            .collect::<Vec<_>>();
+        current.retain(|entry| entry.root.exists());
+        Ok(((current.clone(), removed.clone()), !removed.is_empty()))
+    })?;
+    for root in removed {
         observability::emit(observability::EventInput {
             level: LogLevel::Info,
             target: "workspace",
@@ -117,29 +194,17 @@ pub fn remove_missing_entries(entries: Vec<RepoEntry>, selected: usize) -> (Vec<
             parent_operation_id: None,
             branch: None,
             session: None,
-            message: format!("removing missing repository {}", entry.root.display()),
+            message: format!("removing missing repository {}", root.display()),
             data_json: None,
         });
     }
-    let (retained, selected) = retain_existing_entries(entries, selected);
-    if retained.len() != original_len
-        && let Err(error) = save_entries(&retained)
-    {
-        observability::emit(observability::EventInput {
-            level: LogLevel::Warn,
-            target: "workspace",
-            action: "save_reconciled_repos_failed",
-            operation_id: None,
-            parent_operation_id: None,
-            branch: None,
-            session: None,
-            message: error,
-            data_json: None,
-        });
-    }
-    (retained, selected)
+    let selected = selected_root
+        .and_then(|root| retained.iter().position(|entry| entry.root == root))
+        .unwrap_or_else(|| selected.min(retained.len().saturating_sub(1)));
+    Ok((retained, selected))
 }
 
+#[cfg(test)]
 fn retain_existing_entries(entries: Vec<RepoEntry>, selected: usize) -> (Vec<RepoEntry>, usize) {
     let selected_root = entries.get(selected).map(|entry| entry.root.clone());
     let retained: Vec<_> = entries
@@ -164,24 +229,77 @@ pub fn next_key(entries: &[RepoEntry]) -> Option<char> {
     ('1'..='9').find(|candidate| !entries.iter().any(|entry| entry.key == Some(*candidate)))
 }
 
-fn parse_entries(text: &str) -> Vec<RepoEntry> {
-    let Ok(raw) = toml::from_str::<RawRepos>(text) else {
-        return Vec::new();
-    };
-    raw.repos
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|entry| {
-            let root = entry.path?;
-            let key = entry.key.and_then(|value| value.chars().next());
-            Some(RepoEntry { root, key })
-        })
-        .fold(Vec::new(), |mut entries, entry| {
-            if !entries.iter().any(|existing| existing.root == entry.root) {
-                entries.push(entry);
+fn update_entries<T>(
+    path: &Path,
+    transform: impl FnOnce(&mut Vec<RepoEntry>, bool) -> Result<(T, bool), ReposFormatError>,
+) -> Result<T, String> {
+    file_persistence::update(path, UpdateOptions::important_toml(), |contents| {
+        let missing = matches!(contents, FileContents::Missing);
+        let mut entries = match contents {
+            FileContents::Missing => Vec::new(),
+            FileContents::Present(bytes) => {
+                let text = String::from_utf8(bytes)
+                    .map_err(|error| Box::new(ReposFormatError::Utf8(error)) as BoxError)?;
+                parse_entries(&text).map_err(|error| Box::new(error) as BoxError)?
             }
-            entries
-        })
+        };
+        let (value, changed) =
+            transform(&mut entries, missing).map_err(|error| Box::new(error) as BoxError)?;
+        let replacement = changed.then(|| format_entries(&entries).into_bytes());
+        Ok((value, replacement))
+    })
+    .map_err(|error| error.to_string())
+}
+
+fn parse_entries(text: &str) -> Result<Vec<RepoEntry>, ReposFormatError> {
+    let value = toml::from_str::<toml::Value>(text).map_err(ReposFormatError::Toml)?;
+    let raw = value
+        .try_into::<RawRepos>()
+        .map_err(|error| ReposFormatError::Semantic(error.to_string()))?;
+    let mut entries = Vec::new();
+    for (index, raw) in raw.repos.unwrap_or_default().into_iter().enumerate() {
+        let root = raw.path.ok_or_else(|| {
+            ReposFormatError::Semantic(format!("repos entry {} is missing path", index + 1))
+        })?;
+        if root.as_os_str().is_empty() {
+            return Err(ReposFormatError::Semantic(format!(
+                "repos entry {} has an empty path",
+                index + 1
+            )));
+        }
+        let key = raw
+            .key
+            .map(|value| {
+                let mut chars = value.chars();
+                let key = chars.next().filter(|key| ('1'..='9').contains(key));
+                if key.is_none() || chars.next().is_some() {
+                    Err(ReposFormatError::Semantic(format!(
+                        "repos entry {} has invalid key {:?}; expected one digit from 1 through 9",
+                        index + 1,
+                        value
+                    )))
+                } else {
+                    Ok(key)
+                }
+            })
+            .transpose()?
+            .flatten();
+        if entries.iter().any(|entry: &RepoEntry| entry.root == root) {
+            return Err(ReposFormatError::Semantic(format!(
+                "repository path {} is listed more than once",
+                root.display()
+            )));
+        }
+        if let Some(key) = key
+            && entries.iter().any(|entry| entry.key == Some(key))
+        {
+            return Err(ReposFormatError::Semantic(format!(
+                "repository shortcut {key} is assigned more than once"
+            )));
+        }
+        entries.push(RepoEntry { root, key });
+    }
+    Ok(entries)
 }
 
 fn format_entries(entries: &[RepoEntry]) -> String {
@@ -211,6 +329,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::process::Command;
+    use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -225,7 +344,8 @@ key = "2"
 path = "/two"
 key = "1"
 "#,
-        );
+        )
+        .unwrap();
 
         assert_eq!(entries[0].root, PathBuf::from("/one"));
         assert_eq!(entries[0].key, Some('2'));
@@ -234,8 +354,8 @@ key = "1"
     }
 
     #[test]
-    fn parses_repos_toml_escaped_strings_and_skips_missing_fields() {
-        let entries = parse_entries(
+    fn semantically_invalid_repos_are_rejected() {
+        let error = parse_entries(
             r#"[[repos]]
 path = "/tmp/repo \"quoted\""
 key = "9"
@@ -247,11 +367,10 @@ key = "1"
 path = "/tmp/repo \"quoted\""
 key = "8"
 "#,
-        );
+        )
+        .unwrap_err();
 
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].root, PathBuf::from("/tmp/repo \"quoted\""));
-        assert_eq!(entries[0].key, Some('9'));
+        assert!(error.to_string().contains("missing path"));
     }
 
     #[test]
@@ -320,6 +439,86 @@ key = "8"
         assert_eq!(retained.len(), 2);
         assert_eq!(selected_index, 1);
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn concurrent_repository_additions_retain_both_entries() {
+        let temp = unique_temp_dir("prism-workspace-concurrent-test");
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("repos.toml");
+        let first_path = path.clone();
+        let second_path = path.clone();
+
+        let first = thread::spawn(move || {
+            ensure_repo_root(&first_path, PathBuf::from("/first")).unwrap();
+        });
+        let second = thread::spawn(move || {
+            ensure_repo_root(&second_path, PathBuf::from("/second")).unwrap();
+        });
+        first.join().unwrap();
+        second.join().unwrap();
+
+        let entries = load_entries_from_path(&path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.root == Path::new("/first"))
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.root == Path::new("/second"))
+        );
+        assert!(crate::file_persistence::adjacent_lock_path(&path).exists());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn invalid_repos_toml_is_not_overwritten_by_a_mutator() {
+        let temp = unique_temp_dir("prism-workspace-invalid-test");
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("repos.toml");
+        let invalid = "[[repos]\npath = '/old'\n";
+        fs::write(&path, invalid).unwrap();
+
+        let error = ensure_repo_root(&path, PathBuf::from("/new")).unwrap_err();
+
+        assert!(error.contains(&path.display().to_string()));
+        assert!(error.contains("invalid TOML"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn semantically_invalid_repos_toml_is_not_overwritten_by_a_mutator() {
+        let temp = unique_temp_dir("prism-workspace-semantic-invalid-test");
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("repos.toml");
+        let invalid = "[[repos]]\npath = '/old'\nkey = '12'\n";
+        fs::write(&path, invalid).unwrap();
+
+        let error = ensure_repo_root(&path, PathBuf::from("/new")).unwrap_err();
+
+        assert!(error.contains("semantically invalid"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn unreadable_repos_path_is_reported_and_not_replaced() {
+        let temp = unique_temp_dir("prism-workspace-unreadable-test");
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("repos.toml");
+        fs::create_dir(&path).unwrap();
+
+        let load_error = load_entries_from_path(&path).unwrap_err();
+        let mutation_error = ensure_repo_root(&path, PathBuf::from("/new")).unwrap_err();
+
+        assert!(load_error.contains(&path.display().to_string()));
+        assert!(mutation_error.contains(&path.display().to_string()));
+        assert!(path.is_dir());
+        fs::remove_dir_all(temp).unwrap();
     }
 
     fn run(command: &mut Command) {

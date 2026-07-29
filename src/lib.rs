@@ -7,6 +7,7 @@ mod ci;
 pub mod cli;
 mod config;
 mod execution;
+pub mod file_persistence;
 mod git;
 mod github;
 mod harness;

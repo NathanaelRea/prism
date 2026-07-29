@@ -782,12 +782,13 @@ impl Tui {
         Self::new(vec![ManagedRepo::new(repo, config, None)], 0, sessions)
     }
 
-    pub(crate) fn use_persisted_ui_state(&mut self, path: PathBuf) {
-        if let Some(mode) = crate::ui_state::load_from_path(&path) {
+    pub(crate) fn use_persisted_ui_state(&mut self, path: PathBuf) -> Result<(), String> {
+        if let Some(mode) = crate::ui_state::load_from_path(&path)? {
             self.worktree_list_mode = mode;
             self.restore_selected_worktree_for_repo();
         }
         self.ui_state_path = Some(path);
+        Ok(())
     }
 
     pub(crate) fn sync_selected_repo_context(&mut self) {
@@ -5419,7 +5420,7 @@ esac
         crate::ui_state::save_to_path(&path, WorktreeListMode::Global).unwrap();
         let mut tui = test_tui();
 
-        tui.use_persisted_ui_state(path.clone());
+        tui.use_persisted_ui_state(path.clone()).unwrap();
 
         assert_eq!(tui.worktree_list_mode, WorktreeListMode::Global);
 
@@ -5428,7 +5429,7 @@ esac
 
         assert_eq!(tui.worktree_list_mode, WorktreeListMode::Repo);
         assert_eq!(
-            crate::ui_state::load_from_path(&path),
+            crate::ui_state::load_from_path(&path).unwrap(),
             Some(WorktreeListMode::Repo)
         );
 

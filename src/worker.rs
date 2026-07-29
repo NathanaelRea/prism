@@ -224,7 +224,7 @@ fn respond(
 }
 
 fn classify_abandoned(instance_id: &str) -> Result<(), String> {
-    for entry in workspace::discover_valid_entries(workspace::load_entries()) {
+    for entry in workspace::discover_valid_entries(workspace::load_entries()?) {
         observability::with_writable_db(&entry.repo, |conn| {
             execution::mark_abandoned(conn, instance_id).map(|_| ())
         })?;
@@ -240,7 +240,14 @@ fn schedule_queued(instance_id: &str, active: Arc<Mutex<BTreeSet<PathBuf>>>) {
     if active_count >= GLOBAL_CONCURRENCY {
         return;
     }
-    for entry in workspace::discover_valid_entries(workspace::load_entries()) {
+    let entries = match workspace::load_entries() {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("Prism worker cannot load repositories: {error}");
+            return;
+        }
+    };
+    for entry in workspace::discover_valid_entries(entries) {
         let repo = entry.repo;
         let _ = observability::with_writable_db(&repo, |conn| {
             execution::mark_abandoned(conn, instance_id).map(|_| ())
@@ -577,7 +584,14 @@ fn mark_domain_failed(repo: &Repository, claim: &ExecutionClaim, error: &str) {
 }
 
 fn log_daemon_lifecycle(action: &str, instance_id: &str) {
-    for entry in workspace::discover_valid_entries(workspace::load_entries()) {
+    let entries = match workspace::load_entries() {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("Prism worker cannot load repositories: {error}");
+            return;
+        }
+    };
+    for entry in workspace::discover_valid_entries(entries) {
         let data = format!("{{\"daemon_instance_id\":\"{instance_id}\"}}");
         log_worker_event(
             &entry.repo,

@@ -244,7 +244,7 @@ fn load_db_repo_context(repo_arg: Option<&std::path::Path>) -> Result<Repository
             Ok(repo)
         }
         Err(discover_error) => {
-            let entries = workspace::discover_valid_entries(workspace::load_entries());
+            let entries = workspace::discover_valid_entries(workspace::load_entries()?);
             let Some(entry) = entries.into_iter().next() else {
                 return Err(discover_error);
             };
@@ -260,7 +260,7 @@ fn load_integrity_repo_context(repo_arg: Option<&std::path::Path>) -> Result<Rep
     }
     match Repository::discover(None) {
         Ok(repo) => Ok(repo),
-        Err(discover_error) => workspace::discover_valid_entries(workspace::load_entries())
+        Err(discover_error) => workspace::discover_valid_entries(workspace::load_entries()?)
             .into_iter()
             .next()
             .map(|entry| entry.repo)
@@ -287,7 +287,7 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
             workspace::ensure_entries_for_tui(repo_arg)
         })?;
         let (entries, selected_repo) = observability::phase("reconcile_workspace", || {
-            Ok(workspace::remove_missing_entries(entries, selected_repo))
+            workspace::remove_missing_entries(entries, selected_repo)
         })?;
         let mut repos = Vec::new();
         let discovered_entries = workspace::discover_valid_entries(entries);
@@ -339,7 +339,7 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
         let mut tui = observability::phase("initialize_tui", || {
             Ok(tui::Tui::new(repos, selected_repo, sessions))
         })?;
-        tui.use_persisted_ui_state(ui_state::path());
+        tui.use_persisted_ui_state(ui_state::path())?;
         tui.select_repo(selected_repo);
         observability::phase("run_tui", || tui.run())
     })();

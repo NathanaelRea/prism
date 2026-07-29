@@ -4,36 +4,27 @@ pub(super) fn ensure_repo_config_file(
     path: &Path,
     include_worktree_columns: bool,
 ) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("create config dir: {error}"))?;
-    }
-    if path.exists() {
-        if include_worktree_columns {
-            let mut text =
-                fs::read_to_string(path).map_err(|error| format!("read config file: {error}"))?;
-            if !text.contains("[worktrees]") {
-                if !text.ends_with('\n') && !text.is_empty() {
-                    text.push('\n');
-                }
-                text.push_str("\n[worktrees]\ncolumns = []\n");
-                fs::write(path, text).map_err(|error| format!("update config file: {error}"))?;
-            }
+    crate::config::update_config_file(path, false, |text, missing| {
+        if missing {
+            return Ok(crate::config::repo_config_template(
+                include_worktree_columns,
+            ));
         }
-        return Ok(());
-    }
-    let text = crate::config::repo_config_template(include_worktree_columns);
-    fs::write(path, text).map_err(|error| format!("create config file: {error}"))
+        if include_worktree_columns && !text.contains("[worktrees]") {
+            return Ok(set_worktree_columns_text(text, "columns = []"));
+        }
+        Ok(text.to_string())
+    })
 }
 
 pub(super) fn ensure_user_config_file(path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("create config dir: {error}"))?;
-    }
-    if path.exists() {
-        return Ok(());
-    }
-    let text = crate::config::user_config_template();
-    fs::write(path, text).map_err(|error| format!("create user config file: {error}"))
+    crate::config::update_config_file(path, true, |text, missing| {
+        if missing {
+            Ok(crate::config::user_config_template())
+        } else {
+            Ok(text.to_string())
+        }
+    })
 }
 
 pub(super) fn editor_command() -> Option<String> {
@@ -278,6 +269,9 @@ impl Tui {
             return Err(format!("{editor} exited with {status}"));
         }
         let config = crate::config::Config::load(&context.repo);
+        if !config.config_errors.is_empty() {
+            return Err(config.config_errors.join("\n"));
+        }
         if let Some(repo) = self.repos.get_mut(context.repo_index) {
             repo.config = config.clone();
         }
@@ -309,8 +303,20 @@ impl Tui {
         if !status.success() {
             return Err(format!("{editor} exited with {status}"));
         }
-        for repo in &mut self.repos {
-            repo.config = Config::load(&repo.repo);
+        let configs = self
+            .repos
+            .iter()
+            .map(|repo| {
+                let config = Config::load(&repo.repo);
+                if config.config_errors.is_empty() {
+                    Ok(config)
+                } else {
+                    Err(config.config_errors.join("\n"))
+                }
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        for (repo, config) in self.repos.iter_mut().zip(configs) {
+            repo.config = config;
         }
         self.sync_selected_repo_context();
         self.refresh_sessions()?;
@@ -342,6 +348,9 @@ impl Tui {
         };
         update_worktree_columns_config(&context.config.repo_config_path, &columns)?;
         let config = crate::config::Config::load(&context.repo);
+        if !config.config_errors.is_empty() {
+            return Err(config.config_errors.join("\n"));
+        }
         if let Some(repo) = self.repos.get_mut(context.repo_index) {
             repo.config = config.clone();
         }
@@ -398,7 +407,7 @@ impl Tui {
                     key: repo.key,
                 })
                 .collect::<Vec<_>>();
-            crate::workspace::save_entries(&entries)?;
+            crate::workspace::initialize_entries(&entries)?;
         }
         let editor =
             editor_command().ok_or_else(|| "no editor found; set VISUAL or EDITOR".to_string())?;
@@ -410,7 +419,7 @@ impl Tui {
         if !status.success() {
             return Err(format!("{editor} exited with {status}"));
         }
-        let entries = crate::workspace::load_entries();
+        let entries = crate::workspace::load_entries()?;
         if entries.is_empty() {
             return Err("repository list is empty; add at least one [[repos]] block".to_string());
         }
@@ -451,7 +460,7 @@ impl Tui {
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
-        let entries = crate::workspace::load_entries();
+        let entries = crate::workspace::load_entries()?;
         let items = repository_order_choices(&entries);
         let Some(order) = self.ordered_toggle_dialog(raw, "Repositories", items)? else {
             return Ok(());
@@ -490,7 +499,7 @@ impl Tui {
         let current_root = self
             .selected_repo_context()
             .map(|context| context.repo.root);
-        crate::workspace::save_entries(&updated)?;
+        let updated = crate::workspace::replace_entries(&entries, &updated)?;
         self.reload_repositories(updated)?;
         let index = current_root
             .and_then(|root| self.repos.iter().position(|repo| repo.repo.root == root))
@@ -714,8 +723,6 @@ pub(super) fn update_worktree_columns_config(
     path: &Path,
     columns: &[String],
 ) -> Result<(), String> {
-    let mut text =
-        fs::read_to_string(path).map_err(|error| format!("read config file: {error}"))?;
     let line = format!(
         "columns = [{}]",
         columns
@@ -724,8 +731,9 @@ pub(super) fn update_worktree_columns_config(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    text = set_worktree_columns_text(&text, &line);
-    fs::write(path, text).map_err(|error| format!("write config file: {error}"))
+    crate::config::update_config_file(path, false, |text, _| {
+        Ok(set_worktree_columns_text(text, &line))
+    })
 }
 
 pub(super) fn set_worktree_columns_text(text: &str, columns_line: &str) -> String {
@@ -770,6 +778,31 @@ pub(super) fn set_worktree_columns_text(text: &str, columns_line: &str) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn config_template_initialization_does_not_replace_existing_empty_files() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "prism-config-initialize-empty-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let user = directory.join("user.toml");
+        let repo = directory.join("repo.toml");
+        std::fs::write(&user, "").unwrap();
+        std::fs::write(&repo, "").unwrap();
+
+        ensure_user_config_file(&user).unwrap();
+        ensure_repo_config_file(&repo, false).unwrap();
+
+        assert_eq!(std::fs::read_to_string(user).unwrap(), "");
+        assert_eq!(std::fs::read_to_string(repo).unwrap(), "");
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn harness_choices_list_fixed_builtins_then_configured_generics() {
