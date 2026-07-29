@@ -13,6 +13,7 @@ const TMUX_PORTAL_CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Tui {
     pub(crate) fn poll_tmux_portal(&mut self) -> bool {
+        self.route_tui_job_messages();
         let target = self.selected_tmux_portal_target();
         let target_key = target.as_ref().map(|target| match target {
             Ok(target) => &target.key,
@@ -21,9 +22,12 @@ impl Tui {
         let mut changed = false;
 
         while let Ok(result) = self.tmux_portal_rx.try_recv() {
-            let is_current =
-                self.tmux_portal_polls_in_flight.get(&result.key) == Some(&result.started_at);
-            if is_current {
+            let is_current = self
+                .tmux_portal_polls_in_flight
+                .get(&result.key)
+                .map(|started_at| *started_at == result.started_at)
+                .unwrap_or_else(|| target_key == Some(&result.key));
+            if self.tmux_portal_polls_in_flight.contains_key(&result.key) && is_current {
                 self.tmux_portal_polls_in_flight.remove(&result.key);
             }
             if is_current && let Some(size) = result.resized_size {
@@ -44,9 +48,6 @@ impl Tui {
                 }
             }
         }
-        self.tmux_portal_polls_in_flight
-            .retain(|_, started_at| started_at.elapsed() < TMUX_PORTAL_CAPTURE_TIMEOUT);
-
         let Some(target) = target else {
             self.tmux_portal_last_polled.clear();
             if self.tmux_portal.take().is_some() {
@@ -116,38 +117,45 @@ impl Tui {
                 .insert(target.key.clone(), started_at);
             let resize =
                 self.tmux_portal_resized.as_ref() != Some(&(target.key.clone(), target.size));
-            let tx = self.tmux_portal_tx.clone();
-            std::thread::spawn(move || {
-                let (capture, resized_size) = (|| {
-                    if resize {
-                        crate::tmux::resize_agent_pane(
-                            &target.repo,
-                            &target.config,
-                            &target.key.slot.branch,
-                            target.key.generation,
-                            target.size.0,
-                            target.size.1,
-                        )?;
-                    }
-                    Ok((
-                        crate::tmux::capture_agent_pane(
-                            &target.repo,
-                            &target.config,
-                            &target.key.slot.branch,
-                            target.key.generation,
-                        )
-                        .map(normalize_capture),
-                        resize.then_some(target.size),
-                    ))
-                })()
-                .unwrap_or_else(|error| (Err(error), None));
-                let _ = tx.send(TmuxPortalResult {
-                    key: target.key,
-                    started_at,
-                    capture,
-                    resized_size,
-                });
-            });
+            let key = target.key.clone();
+            self.spawn_tui_job(
+                TuiJobKind::TmuxPortal,
+                TuiJobKey::Tmux(key.clone()),
+                key.generation,
+                Some(TMUX_PORTAL_CAPTURE_TIMEOUT),
+                format!("prism-tmux-portal-{}", key.slot.branch),
+                move |_| {
+                    let (capture, resized_size) = (|| {
+                        if resize {
+                            crate::tmux::resize_agent_pane(
+                                &target.repo,
+                                &target.config,
+                                &target.key.slot.branch,
+                                target.key.generation,
+                                target.size.0,
+                                target.size.1,
+                            )?;
+                        }
+                        Ok((
+                            crate::tmux::capture_agent_pane(
+                                &target.repo,
+                                &target.config,
+                                &target.key.slot.branch,
+                                target.key.generation,
+                            )
+                            .map(normalize_capture),
+                            resize.then_some(target.size),
+                        ))
+                    })()
+                    .unwrap_or_else(|error| (Err(error), None));
+                    Ok(Some(TuiJobPayload::TmuxPortal(TmuxPortalResult {
+                        key,
+                        started_at,
+                        capture,
+                        resized_size,
+                    })))
+                },
+            );
         }
         changed
     }

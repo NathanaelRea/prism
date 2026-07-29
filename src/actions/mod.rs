@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::thread;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -54,8 +53,9 @@ use crate::session::{
 use crate::tmux::TmuxWindow;
 use crate::tui::{
     DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, ManagedRepo,
-    OpencodeEventResult, OpencodePollKey, OpencodePollResult, PrPollKey, PrPollResult,
-    SessionRefreshResult, SessionRefreshSnapshot, Tui, WtPollResult,
+    OpencodeEventResult, OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PrPollKey,
+    PrPollResult, SessionRefreshResult, SessionRefreshSnapshot, TUI_ACTION_JOB_TIMEOUT, Tui,
+    TuiJobKey, TuiJobKind, TuiJobPayload, WtPollResult,
 };
 
 use crate::util::status_count;

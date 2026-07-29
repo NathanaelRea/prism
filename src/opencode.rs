@@ -23,6 +23,7 @@ const HEALTH_TIMEOUT: Duration = Duration::from_millis(250);
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 const SSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SSE_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const SSE_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_START_POLL: Duration = Duration::from_millis(100);
 
@@ -684,9 +685,44 @@ pub fn listen_events(
     })
 }
 
+pub fn listen_events_until(
+    server_url: &str,
+    mut should_stop: impl FnMut() -> bool,
+    mut on_event: impl FnMut(OpencodeEvent) -> Result<(), String>,
+) -> Result<(), String> {
+    listen_event_payloads_with_stop(
+        server_url,
+        SSE_CANCEL_POLL_INTERVAL,
+        SSE_CANCEL_POLL_INTERVAL,
+        &mut should_stop,
+        &mut |payload| {
+            if let Some(event) = parse_event_payload(&payload) {
+                on_event(event)?;
+            }
+            Ok(())
+        },
+    )
+}
+
 pub fn listen_event_payloads(
     server_url: &str,
     mut on_payload: impl FnMut(String) -> Result<(), String>,
+) -> Result<(), String> {
+    listen_event_payloads_with_stop(
+        server_url,
+        SSE_CONNECT_TIMEOUT,
+        SSE_READ_TIMEOUT,
+        &mut || false,
+        &mut on_payload,
+    )
+}
+
+fn listen_event_payloads_with_stop(
+    server_url: &str,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    should_stop: &mut impl FnMut() -> bool,
+    on_payload: &mut impl FnMut(String) -> Result<(), String>,
 ) -> Result<(), String> {
     let (host, port) = parse_localhost_url(server_url)?;
     let mut stream = TcpStream::connect_timeout(
@@ -695,14 +731,14 @@ pub fn listen_event_payloads(
             .map_err(|error| format!("resolve {server_url}: {error}"))?
             .next()
             .ok_or_else(|| format!("resolve {server_url}: no address"))?,
-        SSE_CONNECT_TIMEOUT,
+        connect_timeout,
     )
     .map_err(|error| format!("connect {server_url}: {error}"))?;
     stream
-        .set_read_timeout(Some(SSE_READ_TIMEOUT))
+        .set_read_timeout(Some(read_timeout))
         .map_err(|error| format!("configure SSE read timeout: {error}"))?;
     stream
-        .set_write_timeout(Some(SSE_CONNECT_TIMEOUT))
+        .set_write_timeout(Some(connect_timeout))
         .map_err(|error| format!("configure SSE write timeout: {error}"))?;
     write!(
         stream,
@@ -712,9 +748,9 @@ pub fn listen_event_payloads(
 
     let mut reader = BufReader::new(stream);
     let mut status_line = String::new();
-    reader
-        .read_line(&mut status_line)
-        .map_err(|error| format!("read SSE status: {error}"))?;
+    if read_line_until(&mut reader, &mut status_line, should_stop)? == 0 {
+        return Ok(());
+    }
     let status_code = status_line
         .split_whitespace()
         .nth(1)
@@ -731,9 +767,10 @@ pub fn listen_event_payloads(
     let mut chunked = false;
     loop {
         line.clear();
-        let count = reader
-            .read_line(&mut line)
-            .map_err(|error| format!("read SSE headers: {error}"))?;
+        let count = read_line_until(&mut reader, &mut line, should_stop)?;
+        if (should_stop)() {
+            return Ok(());
+        }
         if count == 0 {
             return Err("opencode event stream closed before body".to_string());
         }
@@ -747,26 +784,32 @@ pub fn listen_event_payloads(
     }
 
     if chunked {
-        read_sse_payloads(
+        read_sse_payloads_until(
             BufReader::new(ChunkedBodyReader::new(reader)),
-            &mut on_payload,
+            on_payload,
+            should_stop,
         )
     } else {
-        read_sse_payloads(reader, &mut on_payload)
+        read_sse_payloads_until(reader, on_payload, should_stop)
     }
 }
 
-fn read_sse_payloads(
+fn read_sse_payloads_until(
     mut reader: impl BufRead,
     on_payload: &mut impl FnMut(String) -> Result<(), String>,
+    should_stop: &mut impl FnMut() -> bool,
 ) -> Result<(), String> {
     let mut line = String::new();
     let mut data = String::new();
     loop {
-        line.clear();
-        let count = reader
-            .read_line(&mut line)
-            .map_err(|error| format!("read opencode event stream: {error}"))?;
+        if (should_stop)() {
+            return Ok(());
+        }
+        let count = match reader.read_line(&mut line) {
+            Ok(count) => count,
+            Err(error) if is_timeout(&error) => continue,
+            Err(error) => return Err(format!("read opencode event stream: {error}")),
+        };
         if count == 0 {
             return Err("opencode event stream closed".to_string());
         }
@@ -776,6 +819,7 @@ fn read_sse_payloads(
                 on_payload(data.trim().to_string())?;
                 data.clear();
             }
+            line.clear();
             continue;
         }
         if let Some(value) = trimmed.strip_prefix("data:") {
@@ -784,7 +828,32 @@ fn read_sse_payloads(
             }
             data.push_str(value.trim_start());
         }
+        line.clear();
     }
+}
+
+fn read_line_until(
+    reader: &mut impl BufRead,
+    line: &mut String,
+    should_stop: &mut impl FnMut() -> bool,
+) -> Result<usize, String> {
+    loop {
+        if (should_stop)() {
+            return Ok(0);
+        }
+        match reader.read_line(line) {
+            Ok(count) => return Ok(count),
+            Err(error) if is_timeout(&error) => continue,
+            Err(error) => return Err(format!("read opencode event stream: {error}")),
+        }
+    }
+}
+
+fn is_timeout(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 struct ChunkedBodyReader<R> {
@@ -2021,12 +2090,56 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
 
     use super::*;
 
     #[test]
     fn server_url_maps_port_to_local_http_url() {
         assert_eq!(server_url(41_234), "http://127.0.0.1:41234");
+    }
+
+    #[test]
+    fn event_listener_stops_when_canceled_while_receiver_is_idle() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        let canceled = Arc::new(AtomicBool::new(false));
+        let listener_canceled = canceled.clone();
+        let (result_tx, result_rx) = mpsc::sync_channel(0);
+        std::thread::spawn(move || {
+            let result = listen_events_until(
+                &url,
+                || listener_canceled.load(Ordering::Acquire),
+                |_| Ok(()),
+            );
+            result_tx.send(result).unwrap();
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        canceled.store(true, Ordering::Release);
+        assert!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
     }
 
     #[test]

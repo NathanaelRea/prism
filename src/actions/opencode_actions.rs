@@ -1,6 +1,11 @@
 use super::*;
 use std::time::Instant;
 
+struct OpencodeListenerTarget {
+    session_index: usize,
+    stream: OpencodeListenerKey,
+}
+
 pub(super) const SELECTED_OPENCODE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(2);
 pub(super) const VISIBLE_OPENCODE_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(5);
 pub(super) const OPENCODE_SSE_RECONNECT_INITIAL: Duration = Duration::from_millis(500);
@@ -49,7 +54,7 @@ impl Tui {
                 .copied()
                 .unwrap_or_default();
             let key = opencode_poll_key(&managed.identity, session, generation);
-            if !force && self.opencode_polls_in_flight.contains(&key) {
+            if self.opencode_polls_in_flight.contains(&key) {
                 continue;
             }
             let interval = if Some(session_index) == selected {
@@ -69,27 +74,37 @@ impl Tui {
             let harness_id = harness_config.default_harness.clone();
             let branch = session.branch.clone();
             let path = session.path.clone();
-            let tx = self.opencode_poll_tx.clone();
             self.opencode_polls_in_flight.insert(key.clone());
             self.opencode_last_polled.insert(key.clone(), now);
-            std::thread::spawn(move || {
-                let status = load_runtime(&repo, &harness_id, &branch, &path).and_then(|runtime| {
-                    let Some(runtime) = runtime else {
-                        return Err("no OpenCode runtime exists yet".to_string());
-                    };
-                    let runtime = opencode::refresh_opencode_session(&repo, runtime, &path)?;
-                    opencode::poll_status(&runtime)
-                });
-                let _ = tx.send(OpencodePollResult {
-                    key,
-                    started_at: now,
-                    status,
-                });
-            });
+            let job_key = key.clone();
+            self.spawn_tui_job(
+                TuiJobKind::OpencodePoll,
+                TuiJobKey::Opencode(key.clone()),
+                generation,
+                Some(TUI_ACTION_JOB_TIMEOUT),
+                format!("prism-opencode-poll-{}", session_index),
+                move |_| {
+                    let status =
+                        load_runtime(&repo, &harness_id, &branch, &path).and_then(|runtime| {
+                            let Some(runtime) = runtime else {
+                                return Err("no OpenCode runtime exists yet".to_string());
+                            };
+                            let runtime =
+                                opencode::refresh_opencode_session(&repo, runtime, &path)?;
+                            opencode::poll_status(&runtime)
+                        });
+                    Ok(Some(TuiJobPayload::OpencodePoll(OpencodePollResult {
+                        key: job_key,
+                        started_at: now,
+                        status,
+                    })))
+                },
+            );
         }
     }
 
     pub(crate) fn start_opencode_event_listeners(&mut self) {
+        self.route_tui_job_messages();
         let now = Instant::now();
         if self
             .opencode_listener_last_scanned
@@ -98,6 +113,7 @@ impl Tui {
             return;
         }
         self.opencode_listener_last_scanned = Some(now);
+        let mut targets = Vec::new();
         for session_index in self.visible_session_indices() {
             let Some(session) = self.sessions.get(session_index) else {
                 continue;
@@ -111,14 +127,6 @@ impl Tui {
             };
             if !harness_config.selected_adapter_is("opencode")
                 || !session.is_task_branch(&managed.config)
-            {
-                continue;
-            }
-            if session
-                .opencode_status
-                .as_ref()
-                .and_then(|status| status.server_url.as_ref())
-                .is_some_and(|server_url| self.opencode_sse_servers.contains(server_url))
             {
                 continue;
             }
@@ -169,40 +177,103 @@ impl Tui {
                     });
                 }
             }
-            if !self.opencode_sse_servers.insert(runtime.server_url.clone()) {
+            let generation = self
+                .worktree_generations
+                .get(&key)
+                .copied()
+                .unwrap_or_default();
+            targets.push(OpencodeListenerTarget {
+                session_index,
+                stream: OpencodeListenerKey {
+                    worktree: key,
+                    generation,
+                    session_id,
+                    server_url: runtime.server_url,
+                },
+            });
+        }
+
+        let desired = targets
+            .iter()
+            .map(|target| target.stream.clone())
+            .collect::<BTreeSet<_>>();
+        let to_start = self.reconcile_opencode_listener_jobs(&desired);
+        for target in targets {
+            if !to_start.contains(&target.stream) {
                 continue;
             }
-            let server_url = runtime.server_url;
-            let tx = self.opencode_event_tx.clone();
-            std::thread::spawn(move || {
-                let mut backoff = OPENCODE_SSE_RECONNECT_INITIAL;
-                loop {
-                    let result = opencode::listen_events(&server_url, |event| {
-                        tx.send(OpencodeEventResult {
-                            key: key.clone(),
-                            server_url: server_url.clone(),
-                            event: Ok(event),
-                        })
-                        .map_err(|error| error.to_string())
-                    });
-                    if let Err(error) = result {
-                        let _ = tx.send(OpencodeEventResult {
-                            key: key.clone(),
-                            server_url: server_url.clone(),
-                            event: Err(error),
-                        });
+            self.opencode_listeners.insert(target.stream.clone());
+            let stream = target.stream;
+            let listener_url = stream.server_url.clone();
+            let job_stream = stream.clone();
+            self.spawn_tui_job(
+                TuiJobKind::OpencodeListener,
+                TuiJobKey::OpencodeListener(stream.clone()),
+                stream.generation,
+                None,
+                format!("prism-opencode-sse-{}", target.session_index),
+                move |context| {
+                    let mut backoff = OPENCODE_SSE_RECONNECT_INITIAL;
+                    loop {
+                        if context.is_canceled() {
+                            return Ok(None);
+                        }
+                        let result = opencode::listen_events_until(
+                            &listener_url,
+                            || context.is_canceled(),
+                            |event| {
+                                context.send(TuiJobPayload::OpencodeEvent(OpencodeEventResult {
+                                    stream: job_stream.clone(),
+                                    event: Ok(event),
+                                }))
+                            },
+                        );
+                        if context.is_canceled() {
+                            return Ok(None);
+                        }
+                        if let Err(error) = result
+                            && context
+                                .send(TuiJobPayload::OpencodeEvent(OpencodeEventResult {
+                                    stream: job_stream.clone(),
+                                    event: Err(error),
+                                }))
+                                .is_err()
+                        {
+                            return Ok(None);
+                        }
+                        if context.wait(backoff) {
+                            return Ok(None);
+                        }
+                        backoff = (backoff * 2).min(OPENCODE_SSE_RECONNECT_MAX);
                     }
-                    std::thread::sleep(backoff);
-                    backoff = (backoff * 2).min(OPENCODE_SSE_RECONNECT_MAX);
-                }
-            });
+                },
+            );
         }
     }
 
+    pub(crate) fn reconcile_opencode_listener_jobs(
+        &mut self,
+        desired: &BTreeSet<OpencodeListenerKey>,
+    ) -> BTreeSet<OpencodeListenerKey> {
+        for metadata in self.jobs.active_metadata() {
+            if metadata.kind == TuiJobKind::OpencodeListener
+                && let TuiJobKey::OpencodeListener(stream) = &metadata.key
+                && !desired.contains(stream)
+            {
+                self.jobs.cancel(metadata.id);
+            }
+        }
+        desired
+            .iter()
+            .filter(|stream| !self.opencode_listeners.contains(*stream))
+            .cloned()
+            .collect()
+    }
+
     pub(crate) fn poll_opencode_status(&mut self) -> bool {
+        self.route_tui_job_messages();
         let mut changed = false;
         while let Ok(result) = self.opencode_poll_rx.try_recv() {
-            self.opencode_polls_in_flight.remove(&result.key);
             match result.status {
                 Ok(mut status) => {
                     if let Some(index) = self.sessions.iter().position(|session| {
@@ -275,6 +346,7 @@ impl Tui {
     }
 
     pub(crate) fn poll_opencode_events(&mut self) -> bool {
+        self.route_tui_job_messages();
         let mut changed = false;
         while let Ok(result) = self.opencode_event_rx.try_recv() {
             match result.event {
@@ -282,25 +354,28 @@ impl Tui {
                     let Some(session_id) = event.session_id.as_deref() else {
                         continue;
                     };
+                    if session_id != result.stream.session_id {
+                        continue;
+                    }
                     let Some(index) = self.sessions.iter().position(|session| {
                         self.repos.get(session.repo_index).is_some_and(|managed| {
-                            session.identity_key(&managed.identity) == result.key
+                            session.identity_key(&managed.identity) == result.stream.worktree
                         }) && session
                             .opencode_status
                             .as_ref()
                             .and_then(|status| status.server_url.as_deref())
-                            == Some(result.server_url.as_str())
+                            == Some(result.stream.server_url.as_str())
                             && session
                                 .opencode_status
                                 .as_ref()
                                 .and_then(|status| status.session_id.as_deref())
-                                == Some(session_id)
+                                == Some(result.stream.session_id.as_str())
                     }) else {
                         continue;
                     };
                     let current = self.sessions[index].opencode_status.clone();
                     let mut status = current.unwrap_or_else(|| OpencodeStatus {
-                        server_url: Some(result.server_url.clone()),
+                        server_url: Some(result.stream.server_url.clone()),
                         session_id: Some(session_id.to_string()),
                         title: None,
                         state: opencode::OpencodeState::Unknown,
@@ -312,7 +387,7 @@ impl Tui {
                         todos: Vec::new(),
                         last_updated_unix_ms: None,
                     });
-                    status.server_url = Some(result.server_url.clone());
+                    status.server_url = Some(result.stream.server_url.clone());
                     status.session_id = Some(session_id.to_string());
                     if let Some(title) = event.title {
                         status.title = Some(title);
@@ -367,12 +442,17 @@ impl Tui {
                 Err(error) => {
                     if let Some(repo) = self.sessions.iter().find_map(|session| {
                         (self.repos.get(session.repo_index).is_some_and(|managed| {
-                            session.identity_key(&managed.identity) == result.key
+                            session.identity_key(&managed.identity) == result.stream.worktree
                         }) && session
                             .opencode_status
                             .as_ref()
                             .and_then(|status| status.server_url.as_deref())
-                            == Some(result.server_url.as_str()))
+                            == Some(result.stream.server_url.as_str())
+                            && session
+                                .opencode_status
+                                .as_ref()
+                                .and_then(|status| status.session_id.as_deref())
+                                == Some(result.stream.session_id.as_str()))
                         .then(|| self.repos.get(session.repo_index))
                         .flatten()
                     }) {
@@ -380,7 +460,7 @@ impl Tui {
                             &repo.repo,
                             &format!(
                                 "opencode event stream disconnected for {}: {error}",
-                                result.server_url
+                                result.stream.server_url
                             ),
                         );
                     }
@@ -496,8 +576,9 @@ impl Tui {
         Ok(())
     }
 
-    pub(crate) fn shutdown_owned_opencode_servers(&mut self) {
+    pub(crate) fn shutdown_owned_opencode_servers(&mut self) -> Result<(), String> {
         let mut seen = BTreeSet::new();
+        let mut errors = Vec::new();
         for session in &self.sessions {
             let Some(managed) = self.repos.get(session.repo_index) else {
                 continue;
@@ -513,11 +594,18 @@ impl Tui {
                 continue;
             }
             let harness_id = harness_config.default_harness.clone();
-            let Ok(Some(runtime)) =
-                load_runtime(&managed.repo, &harness_id, &session.branch, &session.path)
-            else {
-                continue;
-            };
+            let runtime =
+                match load_runtime(&managed.repo, &harness_id, &session.branch, &session.path) {
+                    Ok(Some(runtime)) => runtime,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        errors.push(format!(
+                            "load OpenCode runtime for {}: {error}",
+                            session.branch
+                        ));
+                        continue;
+                    }
+                };
             let Some(pid) = runtime.server_pid else {
                 continue;
             };
@@ -525,11 +613,13 @@ impl Tui {
                 continue;
             }
             if let Err(error) = opencode::shutdown_owned_server(&runtime) {
-                let _ = append_runtime_message(
-                    &managed.repo,
-                    &format!("opencode server shutdown failed for pid {pid}: {error}"),
-                );
+                errors.push(format!("stop OpenCode server pid {pid}: {error}"));
             }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
         }
     }
 }

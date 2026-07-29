@@ -20,6 +20,7 @@ pub(super) fn archived_picker_overflow_message(
 
 impl Tui {
     pub(crate) fn refresh_sessions_after_tmux(&mut self) -> Result<(), String> {
+        self.route_tui_job_messages();
         self.poll_session_refresh();
         if self.session_refresh_in_flight {
             self.session_refresh_pending = true;
@@ -33,70 +34,76 @@ impl Tui {
             .iter()
             .map(crate::session::Session::background_job_snapshot)
             .collect::<Vec<_>>();
-        let tx = self.session_refresh_tx.clone();
         self.session_refresh_in_flight = true;
-        thread::spawn(move || {
-            for managed in &mut repos {
-                managed.config = crate::config::Config::load(&managed.repo);
-            }
-            let repositories = repos
-                .iter()
-                .enumerate()
-                .map(
-                    |(repo_index, managed)| crate::session::WorktreeSessionRepository {
-                        repo_index,
-                        repo: &managed.repo,
-                        config: &managed.config,
-                        label: &managed.label,
-                        key: managed.key,
-                        identity: &managed.identity,
-                    },
-                )
-                .collect::<Vec<_>>();
-            let baseline_sessions = sessions
-                .iter()
-                .filter_map(|session| {
-                    let managed = repos.get(session.repo_index)?;
-                    Some((
-                        session.identity_key(&managed.identity),
-                        session.background_job_snapshot(),
-                    ))
-                })
-                .collect();
-            let result = crate::session::refresh_worktree_sessions(
-                &repositories,
-                &previous_repository_identities,
-                &mut sessions,
-            )
-            .map(|()| SessionRefreshSnapshot {
-                repository_identities: repos
+        self.spawn_tui_job(
+            TuiJobKind::SessionRefresh,
+            TuiJobKey::None,
+            base_generation,
+            Some(TUI_ACTION_JOB_TIMEOUT),
+            "prism-session-refresh".to_string(),
+            move |_| {
+                for managed in &mut repos {
+                    managed.config = crate::config::Config::load(&managed.repo);
+                }
+                let repositories = repos
                     .iter()
                     .enumerate()
-                    .map(|(index, repo)| (index, repo.identity.clone()))
-                    .collect(),
-                configs: repos
+                    .map(
+                        |(repo_index, managed)| crate::session::WorktreeSessionRepository {
+                            repo_index,
+                            repo: &managed.repo,
+                            config: &managed.config,
+                            label: &managed.label,
+                            key: managed.key,
+                            identity: &managed.identity,
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                let baseline_sessions = sessions
                     .iter()
-                    .map(|repo| (repo.identity.clone(), repo.config.clone()))
-                    .collect(),
-                baseline_sessions,
-                worktree_harness_configs: crate::tui::load_worktree_harness_configs(
-                    &repos, &sessions,
-                ),
-                sessions,
-            });
-            let _ = tx.send(SessionRefreshResult {
-                base_generation,
-                result,
-            });
-        });
+                    .filter_map(|session| {
+                        let managed = repos.get(session.repo_index)?;
+                        Some((
+                            session.identity_key(&managed.identity),
+                            session.background_job_snapshot(),
+                        ))
+                    })
+                    .collect();
+                let result = crate::session::refresh_worktree_sessions(
+                    &repositories,
+                    &previous_repository_identities,
+                    &mut sessions,
+                )
+                .map(|()| SessionRefreshSnapshot {
+                    repository_identities: repos
+                        .iter()
+                        .enumerate()
+                        .map(|(index, repo)| (index, repo.identity.clone()))
+                        .collect(),
+                    configs: repos
+                        .iter()
+                        .map(|repo| (repo.identity.clone(), repo.config.clone()))
+                        .collect(),
+                    baseline_sessions,
+                    worktree_harness_configs: crate::tui::load_worktree_harness_configs(
+                        &repos, &sessions,
+                    ),
+                    sessions,
+                });
+                Ok(Some(TuiJobPayload::SessionRefresh(SessionRefreshResult {
+                    base_generation,
+                    result,
+                })))
+            },
+        );
         Ok(())
     }
 
     pub(crate) fn poll_session_refresh(&mut self) -> bool {
+        self.route_tui_job_messages();
         let mut changed = false;
         let mut restart = false;
         while let Ok(result) = self.session_refresh_rx.try_recv() {
-            self.session_refresh_in_flight = false;
             if self.session_refresh_pending
                 || result.base_generation != self.session_inventory_generation
             {
@@ -610,25 +617,35 @@ impl Tui {
         if selected_path.as_ref() == Some(&path) {
             self.ensure_navigation_valid();
         }
-        let tx = self.delete_session_tx.clone();
         let branch_for_job = branch.clone();
-        thread::spawn(move || {
-            let result = crate::session::delete_worktree_session_if_current(
-                &repo,
-                &config,
-                &path,
-                &branch_for_job,
-                Some(&key.incarnation),
-            );
-            let _ = tx.send(DeleteSessionResult { key, result });
-        });
+        let job_key = key.clone();
+        self.spawn_tui_job(
+            TuiJobKind::DeleteSession,
+            TuiJobKey::Delete(key.clone()),
+            key.generation,
+            Some(TUI_ACTION_JOB_TIMEOUT),
+            format!("prism-delete-{}", branch),
+            move |_| {
+                let result = crate::session::delete_worktree_session_if_current(
+                    &repo,
+                    &config,
+                    &path,
+                    &branch_for_job,
+                    Some(&key.incarnation),
+                );
+                Ok(Some(TuiJobPayload::DeleteSession(DeleteSessionResult {
+                    key: job_key,
+                    result,
+                })))
+            },
+        );
         self.show_message(&format!("deleting {branch}..."))
     }
 
     pub(crate) fn poll_delete_sessions(&mut self) -> bool {
+        self.route_tui_job_messages();
         let mut changed = false;
         while let Ok(result) = self.delete_session_rx.try_recv() {
-            self.delete_sessions_in_flight.remove(&result.key);
             let Some(current_generation) = self
                 .worktree_generations
                 .iter()

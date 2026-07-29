@@ -28,7 +28,9 @@ use crate::repo::Repository;
 use crate::session::{Session, WorktreeRepositoryKey, WorktreeSessionKey};
 use crate::terminal::stdin_is_tty;
 use crate::tmux::TmuxWindow;
+use crate::tui_jobs::{JobContext, JobMessage, JobMetadata, JobOutcome, JobRegistry};
 use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
+use crate::tui_signal::SigtermNotification;
 use crate::util::status_count;
 use crate::view;
 
@@ -90,8 +92,10 @@ pub struct Tui {
     pub(crate) opencode_last_state_event: BTreeMap<OpencodePollKey, Instant>,
     pub(crate) opencode_event_tx: Sender<OpencodeEventResult>,
     pub(crate) opencode_event_rx: Receiver<OpencodeEventResult>,
-    pub(crate) opencode_sse_servers: BTreeSet<String>,
+    pub(crate) opencode_listeners: BTreeSet<OpencodeListenerKey>,
     pub(crate) opencode_listener_last_scanned: Option<Instant>,
+    pub(crate) jobs: JobRegistry<TuiJobKind, TuiJobKey, TuiJobPayload>,
+    scheduling_stopped: bool,
     pub(crate) plan_runs: BTreeMap<String, PersistedPlanRun>,
     pub(crate) active_plan_runs: BTreeMap<PathBuf, String>,
     pub(crate) selected_plan_step_by_run: BTreeMap<String, usize>,
@@ -119,6 +123,8 @@ pub struct Tui {
 
 const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
 const WORKFLOW_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+pub(crate) const TUI_ACTION_JOB_TIMEOUT: Duration = Duration::from_secs(120);
+const TUI_JOB_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedRepo {
     pub repo: Repository,
@@ -357,9 +363,56 @@ pub(crate) struct OpencodePollResult {
 }
 
 pub(crate) struct OpencodeEventResult {
-    pub key: WorktreeSessionKey,
-    pub server_url: String,
+    pub stream: OpencodeListenerKey,
     pub event: Result<OpencodeEvent, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct OpencodeListenerKey {
+    pub worktree: WorktreeSessionKey,
+    pub generation: u64,
+    pub session_id: String,
+    pub server_url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TuiJobKind {
+    SessionRefresh,
+    WorkflowMaintenance,
+    PrSummary,
+    PrDetails,
+    DeleteSession,
+    TmuxWarmup,
+    TmuxPortal,
+    WorktreeColumns,
+    DefaultBranch,
+    OpencodePoll,
+    OpencodeListener,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TuiJobKey {
+    None,
+    Repository(WorktreeRepositoryKey),
+    Worktree(WorktreeSessionKey),
+    Pr(PrPollKey),
+    Delete(DeleteSessionKey),
+    Tmux(AgentSessionWarmupKey),
+    Opencode(OpencodePollKey),
+    OpencodeListener(OpencodeListenerKey),
+}
+
+pub(crate) enum TuiJobPayload {
+    SessionRefresh(SessionRefreshResult),
+    WorkflowMaintenance,
+    PrPoll(PrPollResult),
+    DeleteSession(DeleteSessionResult),
+    TmuxWarmup(AgentSessionWarmupResult),
+    TmuxPortal(TmuxPortalResult),
+    WorktreeColumns(WtPollResult),
+    DefaultBranch(DefaultBranchPollResult),
+    OpencodePoll(OpencodePollResult),
+    OpencodeEvent(OpencodeEventResult),
 }
 
 impl OpencodePollKey {
@@ -484,6 +537,20 @@ fn plain_key(event: KeyEvent) -> bool {
         .modifiers
         .intersection(KeyModifiers::CONTROL | KeyModifiers::ALT)
         .is_empty()
+}
+
+fn tui_loop_should_exit(sigterm: &SigtermNotification) -> bool {
+    sigterm.requested()
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "non-string panic payload"
+    }
 }
 
 fn ctrl_key(event: KeyEvent) -> bool {
@@ -633,8 +700,10 @@ impl Tui {
             opencode_last_state_event: BTreeMap::new(),
             opencode_event_tx,
             opencode_event_rx,
-            opencode_sse_servers: BTreeSet::new(),
+            opencode_listeners: BTreeSet::new(),
             opencode_listener_last_scanned: None,
+            jobs: JobRegistry::default(),
+            scheduling_stopped: false,
             plan_runs: BTreeMap::new(),
             active_plan_runs: BTreeMap::new(),
             selected_plan_step_by_run: BTreeMap::new(),
@@ -776,9 +845,43 @@ impl Tui {
             return Err("TUI requires an interactive terminal".to_string());
         }
 
+        let sigterm = SigtermNotification::install()?;
         let mut runtime = TerminalRuntime::enter()?;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.run_inner(&mut runtime, &sigterm)
+        }));
+        let cleanup =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.cleanup_tui_jobs()))
+                .unwrap_or_else(|payload| {
+                    Err(format!(
+                        "TUI cleanup panicked: {}",
+                        panic_payload_message(payload.as_ref())
+                    ))
+                });
+        match outcome {
+            Ok(Ok(())) => cleanup,
+            Ok(Err(error)) => {
+                if let Err(cleanup_error) = cleanup {
+                    self.record_tui_cleanup_failure(&cleanup_error);
+                }
+                Err(error)
+            }
+            Err(payload) => {
+                if let Err(cleanup_error) = cleanup {
+                    self.record_tui_cleanup_failure(&cleanup_error);
+                }
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    fn run_inner(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        sigterm: &SigtermNotification,
+    ) -> Result<(), String> {
         crate::worker::ensure_running()?;
-        self.offer_interrupted_run_recovery(&mut runtime)?;
+        self.offer_interrupted_run_recovery(runtime)?;
         self.refresh_worktree_harness_configs();
         self.start_tmux_agent_warmup();
         self.poll_tmux_portal();
@@ -788,9 +891,9 @@ impl Tui {
         self.start_opencode_event_listeners();
         self.refresh_plan_runs();
         self.refresh_auto_runs(false);
-        self.draw(&mut runtime)?;
+        self.draw(runtime)?;
         if self.repos.is_empty() {
-            match self.add_repository(&mut runtime) {
+            match self.add_repository(runtime) {
                 Ok(()) => {}
                 Err(error) => self.show_error("add repository failed", &error)?,
             }
@@ -798,8 +901,11 @@ impl Tui {
         let mut key_input = KeyInput::default();
         let mut pending_g = false;
         loop {
+            if tui_loop_should_exit(sigterm) {
+                break;
+            }
             if self.tick_tui_action_jobs().any() {
-                self.draw(&mut runtime)?;
+                self.draw(runtime)?;
             }
             let event = runtime.poll_event(Duration::from_millis(100))?;
             let Some(event) = event else {
@@ -811,18 +917,18 @@ impl Tui {
                     if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
                         let area = runtime.area()?;
                         self.handle_mouse_click(event.column, event.row, area);
-                        self.draw(&mut runtime)?;
+                        self.draw(runtime)?;
                     }
                     continue;
                 }
                 RuntimeEvent::Resize => {
-                    self.draw(&mut runtime)?;
+                    self.draw(runtime)?;
                     continue;
                 }
                 RuntimeEvent::FocusGained => {
                     self.start_default_branch_status_poll(true);
                     self.poll_pull_requests(true);
-                    self.draw(&mut runtime)?;
+                    self.draw(runtime)?;
                     continue;
                 }
             };
@@ -928,22 +1034,20 @@ impl Tui {
                 Key::OpenTmuxSession => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.open_selected_comment_dialog(&mut runtime)? {
-                        self.draw(&mut runtime)?;
+                    if self.open_selected_comment_dialog(runtime)? {
+                        self.draw(runtime)?;
                         continue;
                     }
                     match self.open_tmux_session_target() {
                         OpenTmuxSessionTarget::RepoDefaultAgent(index) => {
-                            self.enter_agent_mode_for_index(&mut runtime, index)?
+                            self.enter_agent_mode_for_index(runtime, index)?
                         }
                         OpenTmuxSessionTarget::PlanPhaseAgent => {
-                            if let Err(error) = self.open_current_plan_tmux_session(&mut runtime) {
+                            if let Err(error) = self.open_current_plan_tmux_session(runtime) {
                                 self.show_error("plan phase tmux failed", &error)?;
                             }
                         }
-                        OpenTmuxSessionTarget::WorktreeAgent => {
-                            self.enter_agent_mode(&mut runtime)?
-                        }
+                        OpenTmuxSessionTarget::WorktreeAgent => self.enter_agent_mode(runtime)?,
                         OpenTmuxSessionTarget::Blocked(message) => self.show_message(message)?,
                     }
                 }
@@ -952,11 +1056,11 @@ impl Tui {
                     pending_g = false;
                     if self.git_action_enabled(GitAction::LazyGit) {
                         if self.focused_panel == PanelFocus::Repos {
-                            if let Err(error) = self.open_selected_repo_lazygit(&mut runtime) {
+                            if let Err(error) = self.open_selected_repo_lazygit(runtime) {
                                 self.show_error("repository lazygit failed", &error)?;
                             }
                         } else if let Err(error) =
-                            self.open_tmux_window(&mut runtime, TmuxWindow::LazyGit)
+                            self.open_tmux_window(runtime, TmuxWindow::LazyGit)
                         {
                             self.show_error("lazygit failed", &error)?;
                         }
@@ -968,7 +1072,7 @@ impl Tui {
                     if self.focused_panel == PanelFocus::Status {
                     } else if self.focused_panel != PanelFocus::Worktrees {
                         self.show_message("focus worktrees to start or focus Auto Flow")?;
-                    } else if let Err(error) = self.start_or_focus_selected_auto_run(&mut runtime) {
+                    } else if let Err(error) = self.start_or_focus_selected_auto_run(runtime) {
                         self.show_error("auto flow failed", &error)?;
                     }
                 }
@@ -976,7 +1080,7 @@ impl Tui {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.git_action_enabled(GitAction::OpenPr)
-                        && let Err(error) = self.open_selected_pr(&mut runtime)
+                        && let Err(error) = self.open_selected_pr(runtime)
                     {
                         self.show_error("open PR failed", &error)?;
                     }
@@ -987,11 +1091,10 @@ impl Tui {
                     if self.focused_panel == PanelFocus::Status {
                         self.show_message("focus repos or worktrees to open a terminal")?;
                     } else if self.focused_panel == PanelFocus::Repos {
-                        if let Err(error) = self.open_selected_repo_terminal(&mut runtime) {
+                        if let Err(error) = self.open_selected_repo_terminal(runtime) {
                             self.show_error("repository terminal failed", &error)?;
                         }
-                    } else if let Err(error) =
-                        self.open_tmux_window(&mut runtime, TmuxWindow::Terminal)
+                    } else if let Err(error) = self.open_tmux_window(runtime, TmuxWindow::Terminal)
                     {
                         self.show_error("terminal failed", &error)?;
                     }
@@ -999,20 +1102,20 @@ impl Tui {
                 Key::PlanActions => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if let Err(error) = self.show_plan_actions_dialog(&mut runtime) {
+                    if let Err(error) = self.show_plan_actions_dialog(runtime) {
                         self.show_error("plan actions failed", &error)?;
                     }
                 }
                 Key::Help => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    self.show_keybindings_dialog(&mut runtime)?;
+                    self.show_keybindings_dialog(runtime)?;
                 }
                 Key::Refresh => {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.focused_panel == PanelFocus::Repos && !self.main_focused {
-                        if let Err(error) = self.reorder_repositories(&mut runtime) {
+                        if let Err(error) = self.reorder_repositories(runtime) {
                             self.show_error("reorder repositories failed", &error)?;
                         }
                     } else {
@@ -1056,7 +1159,7 @@ impl Tui {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.git_action_enabled(GitAction::ReviewFix)
-                        && let Err(error) = self.start_review_fix(&mut runtime)
+                        && let Err(error) = self.start_review_fix(runtime)
                     {
                         self.show_error("review fix failed", &error)?;
                     }
@@ -1065,7 +1168,7 @@ impl Tui {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.git_action_enabled(GitAction::CiFix)
-                        && let Err(error) = self.start_ci_fix(&mut runtime)
+                        && let Err(error) = self.start_ci_fix(runtime)
                     {
                         self.show_error("CI failure prompt failed", &error)?;
                     }
@@ -1074,7 +1177,7 @@ impl Tui {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.git_action_enabled(GitAction::ResolveAllComments)
-                        && let Err(error) = self.resolve_review_comments(&mut runtime)
+                        && let Err(error) = self.resolve_review_comments(runtime)
                     {
                         self.show_error("resolve review comments failed", &error)?;
                     }
@@ -1083,7 +1186,7 @@ impl Tui {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.git_action_enabled(GitAction::Push)
-                        && let Err(error) = self.push_selected_branch(&mut runtime)
+                        && let Err(error) = self.push_selected_branch(runtime)
                     {
                         self.show_error("push failed", &error)?;
                     }
@@ -1092,7 +1195,7 @@ impl Tui {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.git_action_enabled(GitAction::Merge)
-                        && let Err(error) = self.merge_selected_pr(&mut runtime)
+                        && let Err(error) = self.merge_selected_pr(runtime)
                     {
                         self.show_error("merge failed", &error)?;
                     }
@@ -1102,7 +1205,7 @@ impl Tui {
                     pending_g = false;
                     if self.focused_panel != PanelFocus::Repos {
                         self.show_message("focus repos to pull the default branch")?;
-                    } else if let Err(error) = self.pull_default_branch(&mut runtime) {
+                    } else if let Err(error) = self.pull_default_branch(runtime) {
                         self.show_error("pull failed", &error)?;
                     }
                 }
@@ -1112,7 +1215,7 @@ impl Tui {
                     if self.focused_panel == PanelFocus::Status {
                     } else if self.focused_panel != PanelFocus::Worktrees {
                         self.show_message("focus worktrees to run plan mode")?;
-                    } else if let Err(error) = self.start_selected_worktree_plan_run(&mut runtime) {
+                    } else if let Err(error) = self.start_selected_worktree_plan_run(runtime) {
                         self.show_error("plan mode failed", &error)?;
                     }
                 }
@@ -1122,7 +1225,7 @@ impl Tui {
                     if self.focused_panel != PanelFocus::Repos {
                         self.show_message("focus repos to create a worktree session")?;
                     } else {
-                        match self.create_session(&mut runtime) {
+                        match self.create_session(runtime) {
                             Ok(true) => self.focus_worktrees(),
                             Ok(false) => {}
                             Err(error) => self.show_error("create session failed", &error)?,
@@ -1141,14 +1244,14 @@ impl Tui {
                     pending_g = false;
                     if self.focused_panel != PanelFocus::Worktrees {
                         self.show_message("focus worktrees to abort an agent session")?;
-                    } else if let Err(error) = self.abort_selected_opencode_session(&mut runtime) {
+                    } else if let Err(error) = self.abort_selected_opencode_session(runtime) {
                         self.show_error("abort failed", &error)?;
                     }
                 }
                 Key::ManageRepos => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if let Err(error) = self.edit_repositories(&mut runtime) {
+                    if let Err(error) = self.edit_repositories(runtime) {
                         self.show_error("edit repositories failed", &error)?;
                     }
                 }
@@ -1157,7 +1260,7 @@ impl Tui {
                     pending_g = false;
                     if self.focused_panel != PanelFocus::Repos {
                         self.show_message("focus repos to open a remote PR worktree")?;
-                    } else if let Err(error) = self.open_remote_pr_worktree(&mut runtime) {
+                    } else if let Err(error) = self.open_remote_pr_worktree(runtime) {
                         self.show_error("open remote PR worktree failed", &error)?;
                     }
                 }
@@ -1171,7 +1274,7 @@ impl Tui {
                         self.show_message("focus worktrees to delete a worktree/session")?;
                     } else if self.focused_panel == PanelFocus::Repos {
                         self.show_message("repository removal is available from r")?;
-                    } else if let Err(error) = self.archive_session(&mut runtime) {
+                    } else if let Err(error) = self.archive_session(runtime) {
                         self.show_error("archive failed", &error)?;
                     }
                 }
@@ -1180,7 +1283,7 @@ impl Tui {
                     pending_g = false;
                     if self.focused_panel != PanelFocus::Repos {
                         self.show_message("focus repos to unarchive a worktree")?;
-                    } else if let Err(error) = self.unarchive_session(&mut runtime) {
+                    } else if let Err(error) = self.unarchive_session(runtime) {
                         self.show_error("unarchive failed", &error)?;
                     }
                 }
@@ -1194,42 +1297,42 @@ impl Tui {
                         self.show_message(
                             "focus worktrees to permanently delete a worktree/session",
                         )?;
-                    } else if let Err(error) = self.delete_session(&mut runtime) {
+                    } else if let Err(error) = self.delete_session(runtime) {
                         self.show_error("delete failed", &error)?;
                     }
                 }
                 Key::EditWorktreeColumns => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if let Err(error) = self.edit_worktree_columns(&mut runtime) {
+                    if let Err(error) = self.edit_worktree_columns(runtime) {
                         self.show_error("edit worktree columns failed", &error)?;
                     }
                 }
                 Key::EditConfig => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if let Err(error) = self.edit_config(&mut runtime) {
+                    if let Err(error) = self.edit_config(runtime) {
                         self.show_error("edit config failed", &error)?;
                     }
                 }
                 Key::EditUserConfig => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if let Err(error) = self.edit_user_config(&mut runtime) {
+                    if let Err(error) = self.edit_user_config(runtime) {
                         self.show_error("edit user config failed", &error)?;
                     }
                 }
                 Key::SelectHarness => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if let Err(error) = self.select_default_harness(&mut runtime) {
+                    if let Err(error) = self.select_default_harness(runtime) {
                         self.show_error("select harness failed", &error)?;
                     }
                 }
                 Key::Search => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    self.search_sessions(&mut runtime)?;
+                    self.search_sessions(runtime)?;
                 }
                 Key::Other => {
                     self.clear_leader_hint();
@@ -1239,13 +1342,13 @@ impl Tui {
             if should_quit {
                 break;
             }
-            self.draw(&mut runtime)?;
+            self.draw(runtime)?;
         }
-        self.shutdown_owned_opencode_servers();
         Ok(())
     }
 
     fn tick_tui_action_jobs(&mut self) -> TuiBackgroundChanges {
+        self.route_tui_job_messages();
         let changes = TuiBackgroundChanges {
             sessions: self.poll_session_refresh(),
             tmux: self.poll_tmux_agent_warmup(),
@@ -1280,9 +1383,8 @@ impl Tui {
     }
 
     fn poll_workflow_maintenance(&mut self) {
-        while self.workflow_maintenance_rx.try_recv().is_ok() {
-            self.workflow_maintenance_in_flight = false;
-        }
+        self.route_tui_job_messages();
+        while self.workflow_maintenance_rx.try_recv().is_ok() {}
         let due = self.workflow_maintenance_due
             || self.workflow_maintenance_last_started.elapsed() >= WORKFLOW_MAINTENANCE_INTERVAL;
         if self.workflow_maintenance_in_flight || !due {
@@ -1293,21 +1395,331 @@ impl Tui {
             .iter()
             .map(|managed| managed.repo.clone())
             .collect::<Vec<_>>();
-        let tx = self.workflow_maintenance_tx.clone();
         self.workflow_maintenance_in_flight = true;
         self.workflow_maintenance_due = false;
         self.workflow_maintenance_last_started = Instant::now();
-        std::thread::spawn(move || {
-            for repo in &repos {
-                if let Err(error) = maintain_workflow_storage(repo) {
-                    let _ = crate::observability::append_runtime_message(
-                        repo,
-                        &format!("workflow maintenance failed: {error}"),
-                    );
+        self.spawn_tui_job(
+            TuiJobKind::WorkflowMaintenance,
+            TuiJobKey::None,
+            0,
+            Some(TUI_ACTION_JOB_TIMEOUT),
+            "prism-tui-maintenance".to_string(),
+            move |_| {
+                for repo in &repos {
+                    if let Err(error) = maintain_workflow_storage(repo) {
+                        let _ = crate::observability::append_runtime_message(
+                            repo,
+                            &format!("workflow maintenance failed: {error}"),
+                        );
+                    }
+                }
+                Ok(Some(TuiJobPayload::WorkflowMaintenance))
+            },
+        );
+    }
+
+    pub(crate) fn spawn_tui_job<F>(
+        &mut self,
+        kind: TuiJobKind,
+        key: TuiJobKey,
+        generation: u64,
+        timeout: Option<Duration>,
+        name: String,
+        job: F,
+    ) where
+        F: FnOnce(
+                JobContext<TuiJobKind, TuiJobKey, TuiJobPayload>,
+            ) -> Result<Option<TuiJobPayload>, String>
+            + Send
+            + 'static,
+    {
+        self.jobs.spawn(kind, key, generation, timeout, name, job);
+    }
+
+    pub(crate) fn route_tui_job_messages(&mut self) {
+        for metadata in self.jobs.active_metadata() {
+            if !self.job_generation_is_current(&metadata) {
+                self.jobs.cancel(metadata.id);
+            }
+        }
+        let messages = self.jobs.drain();
+        let mut restart_session_refresh = false;
+        for message in messages {
+            match message {
+                JobMessage::Payload { metadata, payload } => {
+                    if self.job_generation_is_current(&metadata) {
+                        self.route_tui_job_payload(payload);
+                    }
+                }
+                JobMessage::Terminal { metadata, outcome } => {
+                    self.clear_tui_job_in_flight(&metadata);
+                    let mut payload_routed = false;
+                    match outcome {
+                        JobOutcome::Completed(Ok(Some(payload))) => {
+                            if self.job_generation_is_current(&metadata) {
+                                self.route_tui_job_payload(payload);
+                                payload_routed = true;
+                            } else if metadata.kind == TuiJobKind::SessionRefresh {
+                                restart_session_refresh = self.session_refresh_pending;
+                                self.session_refresh_pending = false;
+                            }
+                        }
+                        JobOutcome::Completed(Ok(None)) | JobOutcome::Canceled => {}
+                        JobOutcome::Completed(Err(error)) => {
+                            self.recover_failed_tui_job(&metadata);
+                            self.record_tui_job_failure(&metadata, &error);
+                        }
+                        JobOutcome::Panicked(error) => {
+                            self.recover_failed_tui_job(&metadata);
+                            self.record_tui_job_failure(&metadata, &format!("panicked: {error}"));
+                        }
+                        JobOutcome::DeadlineExceeded => {
+                            self.recover_failed_tui_job(&metadata);
+                            self.record_tui_job_failure(&metadata, "deadline exceeded");
+                        }
+                    }
+                    if metadata.kind == TuiJobKind::SessionRefresh
+                        && !payload_routed
+                        && self.session_refresh_pending
+                    {
+                        restart_session_refresh = true;
+                        self.session_refresh_pending = false;
+                    }
                 }
             }
-            let _ = tx.send(());
-        });
+        }
+        if restart_session_refresh && !self.scheduling_stopped {
+            let _ = self.refresh_sessions_after_tmux();
+        }
+    }
+
+    fn route_tui_job_payload(&self, payload: TuiJobPayload) {
+        match payload {
+            TuiJobPayload::SessionRefresh(result) => {
+                let _ = self.session_refresh_tx.send(result);
+            }
+            TuiJobPayload::WorkflowMaintenance => {
+                let _ = self.workflow_maintenance_tx.send(());
+            }
+            TuiJobPayload::PrPoll(result) => {
+                let _ = self.pr_poll_tx.send(result);
+            }
+            TuiJobPayload::DeleteSession(result) => {
+                let _ = self.delete_session_tx.send(result);
+            }
+            TuiJobPayload::TmuxWarmup(result) => {
+                let _ = self.tmux_warmup_tx.send(result);
+            }
+            TuiJobPayload::TmuxPortal(result) => {
+                let _ = self.tmux_portal_tx.send(result);
+            }
+            TuiJobPayload::WorktreeColumns(result) => {
+                let _ = self.wt_poll_tx.send(result);
+            }
+            TuiJobPayload::DefaultBranch(result) => {
+                let _ = self.default_branch_poll_tx.send(result);
+            }
+            TuiJobPayload::OpencodePoll(result) => {
+                let _ = self.opencode_poll_tx.send(result);
+            }
+            TuiJobPayload::OpencodeEvent(result) => {
+                let _ = self.opencode_event_tx.send(result);
+            }
+        }
+    }
+
+    fn clear_tui_job_in_flight(&mut self, metadata: &JobMetadata<TuiJobKind, TuiJobKey>) {
+        match (&metadata.kind, &metadata.key) {
+            (TuiJobKind::SessionRefresh, _) => self.session_refresh_in_flight = false,
+            (TuiJobKind::WorkflowMaintenance, _) => self.workflow_maintenance_in_flight = false,
+            (TuiJobKind::PrSummary, TuiJobKey::Repository(repository)) => {
+                if let Some(repo) = self
+                    .repos
+                    .iter_mut()
+                    .find(|repo| &repo.identity == repository)
+                {
+                    repo.pr_summary_poll_in_flight = false;
+                }
+            }
+            (TuiJobKind::PrDetails, TuiJobKey::Pr(key)) => {
+                self.pr_polls_in_flight.remove(key);
+            }
+            (TuiJobKind::DeleteSession, TuiJobKey::Delete(key)) => {
+                self.delete_sessions_in_flight.remove(key);
+            }
+            (TuiJobKind::TmuxWarmup, TuiJobKey::Tmux(key)) => {
+                self.tmux_warmups_in_flight.remove(key);
+            }
+            (TuiJobKind::TmuxPortal, TuiJobKey::Tmux(key)) => {
+                self.tmux_portal_polls_in_flight.remove(key);
+            }
+            (TuiJobKind::WorktreeColumns, TuiJobKey::Repository(repository)) => {
+                if let Some(repo) = self
+                    .repos
+                    .iter_mut()
+                    .find(|repo| &repo.identity == repository)
+                {
+                    repo.wt_poll_in_flight = false;
+                }
+            }
+            (TuiJobKind::DefaultBranch, TuiJobKey::Worktree(key)) => {
+                if let Some(repo) = self
+                    .repos
+                    .iter_mut()
+                    .find(|repo| repo.identity == key.repository)
+                {
+                    repo.default_branch_poll_in_flight = false;
+                }
+            }
+            (TuiJobKind::OpencodePoll, TuiJobKey::Opencode(key)) => {
+                self.opencode_polls_in_flight.remove(key);
+            }
+            (TuiJobKind::OpencodeListener, TuiJobKey::OpencodeListener(stream)) => {
+                self.opencode_listeners.remove(stream);
+            }
+            _ => {}
+        }
+    }
+
+    fn job_generation_is_current(&self, metadata: &JobMetadata<TuiJobKind, TuiJobKey>) -> bool {
+        match &metadata.key {
+            TuiJobKey::None => {
+                metadata.kind == TuiJobKind::WorkflowMaintenance
+                    || metadata.generation == self.session_inventory_generation
+            }
+            TuiJobKey::Repository(_) => metadata.generation == self.session_inventory_generation,
+            TuiJobKey::Worktree(key) => self
+                .worktree_generations
+                .get(key)
+                .is_some_and(|generation| *generation == metadata.generation),
+            TuiJobKey::Pr(key) => {
+                key.generation == metadata.generation
+                    && self
+                        .worktree_generations
+                        .iter()
+                        .any(|(session, generation)| {
+                            session.repository == key.repository
+                                && session.path == key.path
+                                && session.branch == key.branch
+                                && session.incarnation == key.incarnation
+                                && *generation == metadata.generation
+                        })
+            }
+            TuiJobKey::Delete(key) => {
+                key.generation == metadata.generation
+                    && self
+                        .worktree_generations
+                        .iter()
+                        .any(|(session, generation)| {
+                            session.repository == key.repository
+                                && session.path == key.path
+                                && session.branch == key.branch
+                                && session.incarnation == key.incarnation
+                                && *generation == metadata.generation
+                        })
+            }
+            TuiJobKey::Tmux(key) => {
+                self.tmux_generations
+                    .get(&key.slot)
+                    .is_some_and(|generation| {
+                        *generation == metadata.generation && key.generation == metadata.generation
+                    })
+            }
+            TuiJobKey::Opencode(key) => {
+                key.generation == metadata.generation
+                    && self
+                        .worktree_generations
+                        .iter()
+                        .any(|(session, generation)| {
+                            session.repository == key.repository
+                                && session.path == key.path
+                                && session.branch == key.branch
+                                && session.incarnation == key.incarnation
+                                && *generation == metadata.generation
+                        })
+            }
+            TuiJobKey::OpencodeListener(stream) => self
+                .worktree_generations
+                .get(&stream.worktree)
+                .is_some_and(|generation| {
+                    *generation == metadata.generation
+                        && stream.generation == metadata.generation
+                        && self.sessions.iter().enumerate().any(|(index, session)| {
+                            self.visible_session_indices().contains(&index)
+                                && self.repos.get(session.repo_index).is_some_and(|managed| {
+                                    session.identity_key(&managed.identity) == stream.worktree
+                                })
+                                && session.opencode_status.as_ref().is_some_and(|status| {
+                                    status.server_url.as_deref() == Some(stream.server_url.as_str())
+                                        && status.session_id.as_deref()
+                                            == Some(stream.session_id.as_str())
+                                })
+                        })
+                }),
+        }
+    }
+
+    fn record_tui_job_failure(&self, metadata: &JobMetadata<TuiJobKind, TuiJobKey>, error: &str) {
+        let _ = crate::observability::append_runtime_message(
+            &self.repo,
+            &format!(
+                "TUI job {:?} #{} ({:?}, generation {}) failed after {:?}: {error}",
+                metadata.kind,
+                metadata.id,
+                metadata.key,
+                metadata.generation,
+                metadata.started_at.elapsed()
+            ),
+        );
+    }
+
+    fn recover_failed_tui_job(&mut self, metadata: &JobMetadata<TuiJobKind, TuiJobKey>) {
+        if let (TuiJobKind::DeleteSession, TuiJobKey::Delete(key)) = (&metadata.kind, &metadata.key)
+            && let Some(session) = self.sessions.iter_mut().find(|session| {
+                session.path == key.path
+                    && session.branch == key.branch
+                    && session.incarnation == key.incarnation
+            })
+        {
+            session.hidden = false;
+            self.ensure_navigation_valid();
+        }
+    }
+
+    fn cleanup_tui_jobs(&mut self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        self.scheduling_stopped = true;
+        self.jobs.stop_accepting();
+        self.jobs.cancel_all();
+        if let Err(error) = self.shutdown_owned_opencode_servers() {
+            errors.push(error);
+        }
+        let started = Instant::now();
+        while self.jobs.has_jobs() && started.elapsed() < TUI_JOB_SHUTDOWN_GRACE {
+            self.route_tui_job_messages();
+            if self.jobs.has_jobs() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        self.route_tui_job_messages();
+        let unfinished = self.jobs.abandon_unfinished();
+        if unfinished > 0 {
+            errors.push(format!(
+                "detached {unfinished} uncooperative job(s) after shutdown grace period"
+            ));
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    fn record_tui_cleanup_failure(&self, error: &str) {
+        let message = format!("TUI cleanup failed: {error}");
+        if crate::observability::append_runtime_message(&self.repo, &message).is_err() {
+            eprintln!("prism: {message}");
+        }
     }
 
     pub(crate) fn refresh_worktree_harness_configs(&mut self) {
@@ -3778,9 +4190,9 @@ mod tests {
 
     use super::{
         GitAction, ManagedRepo, OpenTmuxSessionTarget, PanelFocus, PrPollKey, TmuxPortalCapture,
-        TmuxPortalResult, TmuxPortalSnapshot, Tui, WorktreeListMode, confirmation_result,
-        move_enabled_ordered_item, selectable_choice_key, toggle_item_in_place,
-        toggle_ordered_item,
+        TmuxPortalResult, TmuxPortalSnapshot, Tui, TuiJobKey, TuiJobKind, WorktreeListMode,
+        confirmation_result, move_enabled_ordered_item, selectable_choice_key,
+        toggle_item_in_place, toggle_ordered_item,
     };
 
     #[test]
@@ -3812,6 +4224,164 @@ mod tests {
 
         assert!(tui.confirm_quit().unwrap());
         assert!(tui.dialog.is_none());
+    }
+
+    #[test]
+    fn sigterm_notification_requests_the_run_loop_exit_path() {
+        let notification = crate::tui_signal::SigtermNotification::for_test();
+        assert!(!super::tui_loop_should_exit(&notification));
+
+        notification.request_for_test();
+
+        assert!(super::tui_loop_should_exit(&notification));
+    }
+
+    #[test]
+    fn opencode_in_flight_clears_after_panic_and_spawn_failure_then_restarts() {
+        let temp = unique_temp_dir("prism-tui-job-recovery-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+        let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+        let key = super::OpencodePollKey::for_repository_session(
+            &tui.repos[0].identity,
+            &tui.sessions[0],
+        );
+
+        tui.opencode_polls_in_flight.insert(key.clone());
+        tui.spawn_tui_job(
+            TuiJobKind::OpencodePoll,
+            TuiJobKey::Opencode(key.clone()),
+            key.generation,
+            Some(Duration::from_secs(1)),
+            "panic-before-result".to_string(),
+            |_| panic!("before result"),
+        );
+        wait_for_opencode_job(&mut tui, &key);
+        assert!(!tui.opencode_polls_in_flight.contains(&key));
+
+        tui.opencode_polls_in_flight.insert(key.clone());
+        tui.jobs.fail_next_spawn();
+        tui.spawn_tui_job(
+            TuiJobKind::OpencodePoll,
+            TuiJobKey::Opencode(key.clone()),
+            key.generation,
+            Some(Duration::from_secs(1)),
+            "spawn-failure".to_string(),
+            |_| Ok(None),
+        );
+        wait_for_opencode_job(&mut tui, &key);
+        assert!(!tui.opencode_polls_in_flight.contains(&key));
+
+        tui.opencode_polls_in_flight.insert(key.clone());
+        tui.spawn_tui_job(
+            TuiJobKind::OpencodePoll,
+            TuiJobKey::Opencode(key.clone()),
+            key.generation,
+            Some(Duration::from_secs(1)),
+            "restart-after-failure".to_string(),
+            |_| Ok(None),
+        );
+        wait_for_opencode_job(&mut tui, &key);
+        assert!(!tui.opencode_polls_in_flight.contains(&key));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn stale_opencode_job_payload_is_rejected_after_generation_changes() {
+        let temp = unique_temp_dir("prism-tui-job-generation-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+        let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+        let session_key = tui.sessions[0].identity_key(&tui.repos[0].identity);
+        let key = super::OpencodePollKey::for_repository_session(
+            &tui.repos[0].identity,
+            &tui.sessions[0],
+        );
+        tui.opencode_polls_in_flight.insert(key.clone());
+        let payload_key = key.clone();
+        tui.spawn_tui_job(
+            TuiJobKind::OpencodePoll,
+            TuiJobKey::Opencode(key.clone()),
+            key.generation,
+            Some(Duration::from_secs(1)),
+            "stale-opencode-poll".to_string(),
+            move |_| {
+                Ok(Some(super::TuiJobPayload::OpencodePoll(
+                    super::OpencodePollResult {
+                        key: payload_key,
+                        started_at: Instant::now(),
+                        status: Ok(crate::opencode::OpencodeStatus {
+                            server_url: None,
+                            session_id: None,
+                            title: None,
+                            state: crate::opencode::OpencodeState::Busy,
+                            detail: None,
+                            latest_message: None,
+                            latest_user_message: None,
+                            recent_messages: Vec::new(),
+                            active_tool: None,
+                            todos: Vec::new(),
+                            last_updated_unix_ms: None,
+                        }),
+                    },
+                )))
+            },
+        );
+        *tui.worktree_generations.get_mut(&session_key).unwrap() = 1;
+
+        wait_for_opencode_job(&mut tui, &key);
+        tui.poll_opencode_status();
+
+        assert!(tui.sessions[0].opencode_status.is_none());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn cleanup_cancels_and_joins_listener_job() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let session = test_session(0, "/tmp/repo/worktree", "feature");
+        let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+        let key = tui.sessions[0].identity_key(&tui.repos[0].identity);
+        let stream = super::OpencodeListenerKey {
+            worktree: key,
+            generation: 0,
+            session_id: "ses_1".to_string(),
+            server_url: "http://127.0.0.1:41000".to_string(),
+        };
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        tui.opencode_listeners.insert(stream.clone());
+        tui.spawn_tui_job(
+            TuiJobKind::OpencodeListener,
+            TuiJobKey::OpencodeListener(stream),
+            0,
+            None,
+            "cleanup-listener".to_string(),
+            move |context| {
+                while !context.wait(Duration::from_secs(60)) {}
+                stopped_tx.send(()).unwrap();
+                Ok(None)
+            },
+        );
+
+        tui.cleanup_tui_jobs().unwrap();
+
+        stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!tui.jobs.has_jobs());
+        assert!(tui.opencode_listeners.is_empty());
+    }
+
+    fn wait_for_opencode_job(tui: &mut Tui, key: &super::OpencodePollKey) {
+        let started = Instant::now();
+        while tui.opencode_polls_in_flight.contains(key) {
+            tui.route_tui_job_messages();
+            assert!(started.elapsed() < Duration::from_secs(1));
+            std::thread::yield_now();
+        }
     }
 
     #[test]
@@ -4228,24 +4798,26 @@ esac
         tui.tmux_generations.insert(slot, 0);
 
         tui.poll_tmux_portal();
-        let first = tui
-            .tmux_portal_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
-        tui.tmux_portal_tx.send(first).unwrap();
-        tui.poll_tmux_portal();
+        wait_for_tmux_portal_job(&mut tui);
         tui.tmux_portal_last_polled
             .insert(key, Instant::now() - Duration::from_secs(1));
         tui.poll_tmux_portal();
-        tui.tmux_portal_rx
-            .recv_timeout(Duration::from_secs(1))
-            .unwrap();
+        wait_for_tmux_portal_job(&mut tui);
 
         let commands = fs::read_to_string(log).unwrap();
         assert_eq!(commands.matches("resize-window").count(), 1);
         assert_eq!(commands.matches("capture-pane").count(), 2);
 
         let _ = fs::remove_dir_all(temp);
+    }
+
+    fn wait_for_tmux_portal_job(tui: &mut Tui) {
+        let started = Instant::now();
+        while !tui.tmux_portal_polls_in_flight.is_empty() {
+            tui.poll_tmux_portal();
+            assert!(started.elapsed() < Duration::from_secs(1));
+            std::thread::yield_now();
+        }
     }
 
     #[test]

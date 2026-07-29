@@ -12,8 +12,8 @@ use crate::plan_run::PlanRunMode;
 use crate::repo::Repository;
 use crate::session::Session;
 use crate::tui::{
-    DefaultBranchPollResult, OpencodeEventResult, OpencodePollKey, OpencodePollResult, PanelFocus,
-    Tui, WtPollResult,
+    DefaultBranchPollResult, OpencodeEventResult, OpencodeListenerKey, OpencodePollKey,
+    OpencodePollResult, PanelFocus, Tui, TuiJobKey, TuiJobKind, WtPollResult,
 };
 
 use super::{
@@ -23,7 +23,7 @@ use super::{
     should_prompt_pr_target_choice, status_label_with_behind, unresolved_review_thread_ids,
 };
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -864,8 +864,7 @@ fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
 
     tui.opencode_event_tx
         .send(OpencodeEventResult {
-            key: tui.sessions[0].identity_key(&tui.repos[0].identity),
-            server_url: "http://127.0.0.1:41000".to_string(),
+            stream: test_opencode_stream(&tui),
             event: Ok(parse_event_payload(
                 r#"{"type":"message.updated","properties":{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"}}}"#,
             )
@@ -882,8 +881,7 @@ fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
 
     tui.opencode_event_tx
         .send(OpencodeEventResult {
-            key: tui.sessions[0].identity_key(&tui.repos[0].identity),
-            server_url: "http://127.0.0.1:41000".to_string(),
+            stream: test_opencode_stream(&tui),
             event: Ok(parse_event_payload(
                 r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":"busy"}}"#,
             )
@@ -902,8 +900,7 @@ fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
         .unwrap();
     tui.opencode_event_tx
         .send(OpencodeEventResult {
-            key: tui.sessions[0].identity_key(&tui.repos[0].identity),
-            server_url: "http://127.0.0.1:41000".to_string(),
+            stream: test_opencode_stream(&tui),
             event: Ok(parse_event_payload(
                 r#"{"type":"message.updated","properties":{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":3,"completed":4},"finish":"stop"}}}"#,
             )
@@ -948,8 +945,7 @@ fn opencode_poll_does_not_mark_reconnected_running_session_done_before_completed
 
     tui.opencode_event_tx
         .send(OpencodeEventResult {
-            key: tui.sessions[0].identity_key(&tui.repos[0].identity),
-            server_url: "http://127.0.0.1:41000".to_string(),
+            stream: test_opencode_stream(&tui),
             event: Ok(parse_event_payload(
                 r#"{"type":"message.updated","properties":{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":1,"completed":2},"error":{"name":"MessageAbortedError"}}}}"#,
             )
@@ -987,8 +983,7 @@ fn opencode_permission_event_marks_session_as_needing_input() {
 
     tui.opencode_event_tx
         .send(OpencodeEventResult {
-            key: tui.sessions[0].identity_key(&tui.repos[0].identity),
-            server_url: "http://127.0.0.1:41000".to_string(),
+            stream: test_opencode_stream(&tui),
             event: Ok(parse_event_payload(
                 r#"{"type":"permission.asked","properties":{"sessionID":"ses_1","permission":"bash"}}"#,
             )
@@ -1002,6 +997,45 @@ fn opencode_permission_event_marks_session_as_needing_input() {
         OpencodeState::NeedsInput
     );
     assert_eq!(tui.sessions[0].agent_state, AgentState::NeedsInput);
+
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn opencode_listener_replaces_reused_url_when_stream_identity_changes() {
+    let temp = unique_temp_dir("prism-opencode-listener-identity-test");
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut session = test_session(temp.join("worktree"), "feature");
+    session.opencode_status = Some(test_opencode_status(OpencodeState::Busy));
+    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    let old = test_opencode_stream(&tui);
+    let mut current = old.clone();
+    current.session_id = "ses_2".to_string();
+    tui.sessions[0].opencode_status.as_mut().unwrap().session_id = Some(current.session_id.clone());
+    tui.opencode_listeners.insert(old.clone());
+    tui.spawn_tui_job(
+        TuiJobKind::OpencodeListener,
+        TuiJobKey::OpencodeListener(old.clone()),
+        old.generation,
+        None,
+        "obsolete-opencode-listener".to_string(),
+        |context| {
+            while !context.wait(Duration::from_secs(60)) {}
+            Ok(None)
+        },
+    );
+
+    let to_start = tui.reconcile_opencode_listener_jobs(&BTreeSet::from([current.clone()]));
+
+    assert_eq!(to_start, BTreeSet::from([current.clone()]));
+    tui.opencode_listeners.insert(current.clone());
+    let started = Instant::now();
+    while tui.opencode_listeners.contains(&old) {
+        tui.route_tui_job_messages();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        std::thread::yield_now();
+    }
+    assert!(tui.opencode_listeners.contains(&current));
 
     let _ = fs::remove_dir_all(temp);
 }
@@ -1838,6 +1872,20 @@ fn test_opencode_status(state: OpencodeState) -> OpencodeStatus {
         active_tool: None,
         todos: Vec::new(),
         last_updated_unix_ms: Some(1),
+    }
+}
+
+fn test_opencode_stream(tui: &Tui) -> OpencodeListenerKey {
+    let worktree = tui.sessions[0].identity_key(&tui.repos[0].identity);
+    OpencodeListenerKey {
+        generation: tui
+            .worktree_generations
+            .get(&worktree)
+            .copied()
+            .unwrap_or_default(),
+        worktree,
+        session_id: "ses_1".to_string(),
+        server_url: "http://127.0.0.1:41000".to_string(),
     }
 }
 
