@@ -1757,6 +1757,78 @@ fn default_branch_result_is_rejected_after_default_branch_config_changes() {
 }
 
 #[test]
+fn attach_creates_session_when_pre_attach_resize_finds_it_missing() {
+    let temp = unique_temp_dir("prism-tmux-missing-before-attach-test");
+    fs::create_dir_all(&temp).unwrap();
+    let log = temp.join("tmux.log");
+    let state = temp.join("state");
+    let tmux = temp.join("tmux");
+    fs::write(
+        &tmux,
+        format!(
+            r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+state="$(cat '{}' 2>/dev/null || echo missing)"
+case "$1" in
+  resize-window)
+    [ "$state" = exists ] || {{
+      echo "can't find session: prism-missing" >&2
+      exit 1
+    }}
+    ;;
+  has-session)
+    [ "$state" = exists ]
+    exit $?
+    ;;
+  new-session)
+    echo exists > '{}'
+    ;;
+  display-message)
+    echo opencode
+    ;;
+  list-windows)
+    echo 1
+    ;;
+esac
+exit 0
+"#,
+            log.display(),
+            state.display(),
+            state.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&tmux, permissions).unwrap();
+
+    let mut config = test_config();
+    config.default_agent = "custom".to_string();
+    config
+        .agent_commands
+        .insert("custom".to_string(), "opencode".to_string());
+    config
+        .tools
+        .insert("tmux".to_string(), tmux.display().to_string());
+    config
+        .tools
+        .insert("opencode".to_string(), "opencode".to_string());
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(temp.join("worktree"), "feature");
+    let mut tui = Tui::new_single(repo, config, vec![session]);
+
+    tui.prepare_tmux_session_for_attach(0, (120, 39)).unwrap();
+    tui.attach_tmux_session_for_index(0).unwrap();
+
+    let commands = fs::read_to_string(&log).unwrap();
+    assert!(commands.contains("resize-window -x 120 -y 39"));
+    assert!(commands.contains("new-session -d -s"));
+    assert!(commands.contains("attach-session -t"));
+
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
 fn attach_schedules_delayed_rewarm_after_return() {
     let temp = unique_temp_dir("prism-tmux-delayed-rewarm-test");
     fs::create_dir_all(&temp).unwrap();
