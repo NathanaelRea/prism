@@ -219,9 +219,9 @@ Bare `prism db` opens an interactive `sqlite3` shell for the selected repository
 
 Prism databases require WAL mode and `synchronous=FULL`. WAL is requested and verified before versioned migrations acquire SQLite's immediate write lock. The database location must be on a local filesystem that supports SQLite WAL shared memory; Prism fails explicitly instead of silently falling back to a rollback journal. Do not copy only `prism.db` while Prism is running because committed data may still be in the `-wal` file.
 
-`prism debug integrity` opens the existing database read-only, prints its path, schema version, journal mode, complete `integrity_check` output, and `foreign_key_check` output. It exits nonzero on any failure and never migrates, repairs, recreates, or writes observability data.
+`prism debug integrity` opens the existing database read-only, prints its path, main/WAL/shared-memory file sizes, schema version, journal mode, complete `integrity_check` output, and `foreign_key_check` output. It exits nonzero on any failure and never migrates, repairs, recreates, checkpoints, or writes observability data. `prism debug info` additionally reports the result of an explicitly requested passive WAL checkpoint; normal TUI reads never request a checkpoint.
 
-When SQLite returns a corruption-class error, Prism also attempts read-only `quick_check` and `foreign_key_check` diagnostics and keeps the original error and database intact. Prism does not currently persist a reliable clean-shutdown marker, so it cannot automatically identify every unclean prior exit; use `prism debug integrity` when an unclean shutdown is suspected.
+Prism keeps a locked per-process run marker for every repository database it attaches. A marker left unlocked and incomplete by a crash or `SIGKILL` causes the next process to run read-only `quick_check` and `foreign_key_check` before normal database use; live concurrent processes keep their marker locked and are not classified as unclean. Failed checks stop startup without repair or recreation. SQLite corruption-class errors independently trigger the same best-effort read-only diagnostics while preserving the original error and database.
 
 When running outside the checkout you want to inspect, select the repository explicitly:
 

@@ -56,6 +56,7 @@ use crate::tui::{
     PrPollResult, SessionRefreshResult, SessionRefreshSnapshot, TUI_ACTION_JOB_TIMEOUT, Tui,
     TuiJobKey, TuiJobKind, TuiJobPayload, WtPollResult,
 };
+use crate::tui_jobs::CoalescedFacet;
 
 use crate::util::status_count;
 

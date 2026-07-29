@@ -1,5 +1,6 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::error::Error;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -12,6 +13,9 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 pub const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 static VALIDATED_DATABASES: OnceLock<Mutex<HashSet<DatabaseIdentity>>> = OnceLock::new();
+static WAL_WARNING_BUCKETS: OnceLock<Mutex<BTreeMap<std::path::PathBuf, u64>>> = OnceLock::new();
+
+const WAL_WARNING_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct DatabaseIdentity {
@@ -70,6 +74,16 @@ pub struct StorageError {
 pub struct StorageCheckReport {
     pub quick_check: Vec<String>,
     pub foreign_key_check: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WalStatus {
+    pub main_bytes: u64,
+    pub wal_bytes: u64,
+    pub shm_bytes: u64,
+    pub checkpoint_busy: i64,
+    pub checkpoint_log_frames: i64,
+    pub checkpointed_frames: i64,
 }
 
 impl StorageError {
@@ -1027,6 +1041,31 @@ pub fn quick_check_readonly(path: &Path) -> Result<StorageCheckReport, StorageEr
     })
 }
 
+pub(crate) fn verify_unclean_database_readonly(
+    path: &Path,
+) -> Result<StorageCheckReport, StorageError> {
+    let report = quick_check_readonly(path)?;
+    if report.quick_check.as_slice() != ["ok"] {
+        return Err(StorageError::policy(
+            format!(
+                "read-only quick_check after an unclean run reported: {}",
+                report.quick_check.join("; ")
+            ),
+            StorageErrorKind::Corruption,
+        ));
+    }
+    if !report.foreign_key_check.is_empty() {
+        return Err(StorageError::policy(
+            format!(
+                "read-only foreign_key_check after an unclean run reported: {}",
+                report.foreign_key_check.join("; ")
+            ),
+            StorageErrorKind::Constraint,
+        ));
+    }
+    Ok(report)
+}
+
 fn quick_check(conn: &Connection) -> Result<Vec<String>, StorageError> {
     let started = Instant::now();
     let mut statement = conn.prepare("pragma quick_check").map_err(|error| {
@@ -1072,6 +1111,18 @@ fn execute_batch(conn: &Connection, sql: &str, context: &str) -> Result<(), Stor
 
 pub(crate) fn print_integrity(path: &Path) -> Result<(), StorageError> {
     println!("path = {}", path.display());
+    match database_file_sizes(path) {
+        Ok((main, wal, shm)) => {
+            println!("main_bytes = {main}");
+            println!("wal_bytes = {wal}");
+            println!("shm_bytes = {shm}");
+        }
+        Err(error) => {
+            println!("main_bytes = unavailable ({error})");
+            println!("wal_bytes = unavailable");
+            println!("shm_bytes = unavailable");
+        }
+    }
     let conn = match open_readonly(path) {
         Ok(conn) => conn,
         Err(error) => {
@@ -1156,6 +1207,100 @@ pub(crate) fn print_integrity(path: &Path) -> Result<(), StorageError> {
     }
 }
 
+pub(crate) fn passive_checkpoint_status(path: &Path) -> Result<WalStatus, StorageError> {
+    let conn = open_writable(path)?;
+    let started = Instant::now();
+    let (checkpoint_busy, checkpoint_log_frames, checkpointed_frames) = conn
+        .query_row("pragma wal_checkpoint(passive)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
+        .map_err(|error| {
+            StorageError::from_sqlite("run passive WAL checkpoint", error, started.elapsed())
+        })?;
+    let (main_bytes, wal_bytes, shm_bytes) = database_file_sizes(path)?;
+    Ok(WalStatus {
+        main_bytes,
+        wal_bytes,
+        shm_bytes,
+        checkpoint_busy,
+        checkpoint_log_frames,
+        checkpointed_frames,
+    })
+}
+
+pub(crate) fn monitor_wal_growth(path: &Path) {
+    let Ok((main_bytes, wal_bytes, shm_bytes)) = database_file_sizes(path) else {
+        return;
+    };
+    let ratio = wal_bytes / WAL_WARNING_BYTES;
+    let bucket = if ratio == 0 {
+        0
+    } else {
+        u64::from(ratio.ilog2()) + 1
+    };
+    let Ok(mut warned) = WAL_WARNING_BUCKETS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    else {
+        return;
+    };
+    let previous = warned.get(path).copied().unwrap_or_default();
+    if bucket == 0 {
+        warned.remove(path);
+        return;
+    }
+    if bucket <= previous {
+        return;
+    }
+    warned.insert(path.to_path_buf(), bucket);
+    drop(warned);
+
+    crate::observability::emit_deferred(crate::observability::EventInput {
+        level: crate::observability::LogLevel::Warn,
+        target: "sqlite",
+        action: "wal_growth",
+        operation_id: None,
+        parent_operation_id: None,
+        branch: None,
+        session: None,
+        message: format!(
+            "SQLite WAL grew to {wal_bytes} bytes; inspect checkpoint progress with `prism debug info`"
+        ),
+        data_json: Some(crate::observability::wal_growth_data_json(
+            main_bytes,
+            wal_bytes,
+            shm_bytes,
+            WAL_WARNING_BYTES,
+            bucket,
+        )),
+    });
+}
+
+fn database_file_sizes(path: &Path) -> Result<(u64, u64, u64), StorageError> {
+    Ok((
+        file_size(path)?,
+        file_size(&sidecar_path(path, "-wal"))?,
+        file_size(&sidecar_path(path, "-shm"))?,
+    ))
+}
+
+fn file_size(path: &Path) -> Result<u64, StorageError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(StorageError::from_io(
+            format!("inspect {} size", path.display()),
+            error,
+        )),
+    }
+}
+
+fn sidecar_path(path: &Path, suffix: &str) -> std::path::PathBuf {
+    let mut value = OsString::from(path.as_os_str());
+    value.push(suffix);
+    value.into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1210,6 +1355,45 @@ mod tests {
 
         second.execute("insert into startup_phase (run_id, phase, time_started_unix_ms, status) values ('missing', 'x', 1, 'x')", []).unwrap_err();
         drop(second);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn wal_growth_warnings_are_sparse_and_reset_after_shrink() {
+        let _ = crate::observability::take_captured_events();
+        let path = test_path("wal-growth-warning");
+        drop(open_writable(&path).unwrap());
+        let wal_path = sidecar_path(&path, "-wal");
+        let wal = fs::File::create(&wal_path).unwrap();
+        wal.set_len(WAL_WARNING_BYTES + 1).unwrap();
+
+        monitor_wal_growth(&path);
+        monitor_wal_growth(&path);
+
+        let first = crate::observability::take_captured_events();
+        assert_eq!(
+            first
+                .iter()
+                .filter(|event| event.action == "wal_growth")
+                .count(),
+            1
+        );
+
+        wal.set_len(0).unwrap();
+        monitor_wal_growth(&path);
+        wal.set_len(WAL_WARNING_BYTES + 1).unwrap();
+        monitor_wal_growth(&path);
+
+        let reset = crate::observability::take_captured_events();
+        assert_eq!(
+            reset
+                .iter()
+                .filter(|event| event.action == "wal_growth")
+                .count(),
+            1
+        );
+        drop(wal);
+        let _ = fs::remove_file(wal_path);
         let _ = fs::remove_file(path);
     }
 

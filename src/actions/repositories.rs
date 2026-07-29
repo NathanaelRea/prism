@@ -589,6 +589,7 @@ impl Tui {
         let mut repos = Vec::new();
         for entry in crate::workspace::discover_valid_entries(entries) {
             let repo = entry.repo;
+            crate::observability::attach_run_repo(&repo)?;
             let config = crate::config::Config::load(&repo);
             let mut managed = ManagedRepo::new(repo, config, entry.key);
             if let Some(identity) = identities.get(&managed.repo.root) {

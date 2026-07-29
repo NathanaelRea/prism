@@ -43,7 +43,7 @@ pub fn run() -> Result<(), String> {
         data_json: None,
     });
 
-    match args.command {
+    let result = match args.command {
         CommandKind::Help | CommandKind::Version | CommandKind::DebugHelp | CommandKind::DbHelp => {
             run_static_command(args.command)
         }
@@ -79,7 +79,15 @@ pub fn run() -> Result<(), String> {
         }
         CommandKind::Worker(command) => run_worker_command(command),
         CommandKind::Tui => run_tui(args.repo.as_deref()),
+    };
+    match &result {
+        Ok(()) => observability::finish_process_runs("ok", None),
+        Err(error) => {
+            emit_fatal_error(error);
+            observability::finish_process_runs("error", Some(error));
+        }
     }
+    result
 }
 
 fn run_config_command(command: ConfigCommand, repo: &Repository, config: &Config) {
@@ -197,7 +205,7 @@ fn load_single_repo_context(
     repo_arg: Option<&std::path::Path>,
 ) -> Result<(Repository, Config), String> {
     let repo = observability::phase("discover_repo", || Repository::discover(repo_arg))?;
-    observability::attach_repo(&repo);
+    observability::attach_repo(&repo)?;
     let config = observability::phase("load_config", || Ok(Config::load(&repo)))?;
     warn_pending_recovery(&repo);
     Ok((repo, config))
@@ -240,7 +248,7 @@ fn load_db_repo_context(repo_arg: Option<&std::path::Path>) -> Result<Repository
     }
     match Repository::discover(None) {
         Ok(repo) => {
-            observability::attach_repo(&repo);
+            observability::attach_repo(&repo)?;
             Ok(repo)
         }
         Err(discover_error) => {
@@ -248,7 +256,7 @@ fn load_db_repo_context(repo_arg: Option<&std::path::Path>) -> Result<Repository
             let Some(entry) = entries.into_iter().next() else {
                 return Err(discover_error);
             };
-            observability::attach_repo(&entry.repo);
+            observability::attach_repo(&entry.repo)?;
             Ok(entry.repo)
         }
     }
@@ -281,8 +289,7 @@ fn observer_options(args: &Args) -> ObserverOptions {
 }
 
 fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
-    observability::start_startup_run(env!("CARGO_PKG_VERSION"));
-    let result: Result<(), String> = (|| {
+    (|| {
         let (entries, selected_repo) = observability::phase("load_workspace", || {
             workspace::ensure_entries_for_tui(repo_arg)
         })?;
@@ -295,6 +302,13 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
             .iter()
             .position(|entry| entry.source_index == selected_repo)
             .unwrap_or_else(|| selected_repo.min(discovered_entries.len().saturating_sub(1)));
+        for (index, entry) in discovered_entries.iter().enumerate() {
+            if index == selected_repo {
+                observability::attach_repo(&entry.repo)?;
+            } else {
+                observability::attach_run_repo(&entry.repo)?;
+            }
+        }
         for entry in discovered_entries {
             let repo = entry.repo;
             let mut config = Config::load(&repo);
@@ -320,9 +334,6 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
         }
         let selected_repo = selected_repo.min(repos.len().saturating_sub(1));
         if let Some(repo) = repos.get(selected_repo) {
-            observability::attach_repo(&repo.repo);
-        }
-        if let Some(repo) = repos.get(selected_repo) {
             observability::phase("startup_setup_prompt", || {
                 setup::maybe_prompt_startup_setup(&repo.repo, &repo.config)
             })?;
@@ -342,12 +353,7 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
         tui.use_persisted_ui_state(ui_state::path())?;
         tui.select_repo(selected_repo);
         observability::phase("run_tui", || tui.run())
-    })();
-    match &result {
-        Ok(_) => observability::finish_startup_run("ok", None),
-        Err(error) => observability::finish_startup_run("error", Some(error.as_str())),
-    }
-    result
+    })()
 }
 
 fn run_auto_command(
@@ -630,6 +636,23 @@ fn run_debug_command(
                 }
                 Err(error) => println!("startup_setup_error = {error}"),
             }
+            match crate::storage::passive_checkpoint_status(&observability::db_path(repo)) {
+                Ok(status) => {
+                    println!("database_main_bytes = {}", status.main_bytes);
+                    println!("database_wal_bytes = {}", status.wal_bytes);
+                    println!("database_shm_bytes = {}", status.shm_bytes);
+                    println!("wal_checkpoint_passive_busy = {}", status.checkpoint_busy);
+                    println!(
+                        "wal_checkpoint_passive_log_frames = {}",
+                        status.checkpoint_log_frames
+                    );
+                    println!(
+                        "wal_checkpoint_passive_checkpointed_frames = {}",
+                        status.checkpointed_frames
+                    );
+                }
+                Err(error) => println!("wal_checkpoint_passive_error = {error}"),
+            }
             Ok(())
         }
         DebugCommand::Logs => {
@@ -646,7 +669,6 @@ fn run_debug_command(
 }
 
 fn run_debug_startup(repo: &Repository, config: &mut Config) -> Result<(), String> {
-    observability::start_startup_run(env!("CARGO_PKG_VERSION"));
     let result: Result<(), String> = (|| {
         observability::phase("ensure_tools", || config::ensure_required_tools(config))?;
         observability::phase("ensure_default_agent", || {
@@ -672,10 +694,6 @@ fn run_debug_startup(repo: &Repository, config: &mut Config) -> Result<(), Strin
         println!("sessions = {}", sessions.len());
         Ok(())
     })();
-    match &result {
-        Ok(_) => observability::finish_startup_run("ok", None),
-        Err(error) => observability::finish_startup_run("error", Some(error.as_str())),
-    }
     print_startup_phases();
     result
 }

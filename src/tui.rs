@@ -820,9 +820,17 @@ impl Tui {
     }
 
     pub(crate) fn use_persisted_ui_state(&mut self, path: PathBuf) -> Result<(), String> {
-        if let Some(mode) = crate::ui_state::load_from_path(&path)? {
-            self.worktree_list_mode = mode;
-            self.restore_selected_worktree_for_repo();
+        match crate::ui_state::load_from_path(&path) {
+            Ok(Some(mode)) => {
+                self.worktree_list_mode = mode;
+                self.restore_selected_worktree_for_repo();
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.show_message(&format!(
+                    "UI state was not loaded; keeping the current mode: {error}"
+                ))?;
+            }
         }
         self.ui_state_path = Some(path);
         Ok(())
@@ -1630,7 +1638,7 @@ impl Tui {
         }
 
         while processed < limit && Instant::now() < deadline {
-            let Some(message) = self.jobs.drain_events(1).into_iter().next() else {
+            let Some(message) = self.jobs.take_stream_event() else {
                 break;
             };
             let JobMessage::Payload { metadata, payload } = message else {
@@ -1909,9 +1917,11 @@ impl Tui {
                 stats.overflow_delta, stats.coalesced_delta
             ),
             data_json: Some(format!(
-                "{{\"event_depth\":{},\"event_capacity\":{},\"latest_depth\":{},\"terminal_depth\":{},\"overflow_count\":{},\"overflow_total\":{},\"coalesced_count\":{},\"coalesced_total\":{},\"stream_dirty\":{}}}",
+                "{{\"event_depth\":{},\"event_capacity\":{},\"coalesced_depth\":{},\"coalesced_capacity\":{},\"latest_depth\":{},\"terminal_depth\":{},\"overflow_count\":{},\"overflow_total\":{},\"coalesced_count\":{},\"coalesced_total\":{},\"stream_dirty\":{}}}",
                 stats.event_depth,
                 stats.event_capacity,
+                stats.coalesced_depth,
+                stats.coalesced_capacity,
                 stats.latest_depth,
                 stats.terminal_depth,
                 stats.overflow_delta,
@@ -4455,13 +4465,14 @@ mod tests {
     };
     use crate::config::Config;
     use crate::github::{PrCache, PrDetails, PrReviewComment, PrSummary};
-    use crate::opencode::{OpencodeEvent, OpencodeState, OpencodeStatus};
+    use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
     use crate::plan_run::{
         PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRun, PlanRunMode, PlanRunStatus,
         PlanStepRun, PlanStepStatus,
     };
     use crate::repo::Repository;
     use crate::session::{Session, WorktreeRepositoryKey};
+    use crate::tui_jobs::{CoalescedFacet, JobRegistry};
     use crate::view::{ChoiceList, KeyChoice, OrderedToggleItem, RepoMainView, WorktreeMainView};
 
     use super::{
@@ -4627,6 +4638,119 @@ mod tests {
     }
 
     #[test]
+    fn opencode_snapshot_burst_converges_through_bounded_coalesced_slots() {
+        let temp = unique_temp_dir("prism-opencode-coalesced-burst-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+        session.agent_state = AgentState::Running;
+        session.opencode_status = Some(OpencodeStatus {
+            server_url: Some("http://127.0.0.1:1".to_string()),
+            session_id: Some("ses_1".to_string()),
+            title: None,
+            state: OpencodeState::Busy,
+            detail: None,
+            latest_message: None,
+            latest_user_message: None,
+            recent_messages: Vec::new(),
+            active_tool: None,
+            todos: Vec::new(),
+            last_updated_unix_ms: None,
+        });
+        let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+        tui.jobs = JobRegistry::with_event_capacity(2);
+        let worktree = tui.sessions[0].identity_key(&tui.repos[0].identity);
+        let stream = super::OpencodeListenerKey {
+            worktree,
+            generation: 0,
+            session_id: "ses_1".to_string(),
+            server_url: "http://127.0.0.1:1".to_string(),
+        };
+        tui.opencode_listeners.insert(stream.clone());
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let job_stream = stream.clone();
+        let job_id = tui.jobs.spawn(
+            TuiJobKind::OpencodeListener,
+            TuiJobKey::OpencodeListener(stream),
+            0,
+            None,
+            "coalesced-listener".to_string(),
+            move |context| {
+                let send = |context: &crate::tui_jobs::JobContext<_, _, _>, facet, event| {
+                    context.send_coalesced(
+                        facet,
+                        super::TuiJobPayload::OpencodeEvent(super::OpencodeEventResult {
+                            stream: job_stream.clone(),
+                            received_at: Instant::now(),
+                            event: Ok(event),
+                        }),
+                    )
+                };
+                send(
+                    &context,
+                    CoalescedFacet::Status,
+                    parse_event_payload(
+                        r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":"busy"}}"#,
+                    )
+                    .unwrap(),
+                )?;
+                send(
+                    &context,
+                    CoalescedFacet::Message,
+                    parse_event_payload(
+                        r#"{"type":"message.part.updated","properties":{"sessionID":"ses_1","role":"assistant","text":"initial"}}"#,
+                    )
+                    .unwrap(),
+                )?;
+                for index in 0..100 {
+                    let state = if index == 99 { "retry" } else { "busy" };
+                    send(
+                        &context,
+                        CoalescedFacet::Status,
+                        parse_event_payload(&format!(
+                            r#"{{"type":"session.status","properties":{{"sessionID":"ses_1","status":"{state}"}}}}"#
+                        ))
+                        .unwrap(),
+                    )?;
+                    send(
+                        &context,
+                        CoalescedFacet::Message,
+                        parse_event_payload(&format!(
+                            r#"{{"type":"message.part.updated","properties":{{"sessionID":"ses_1","role":"assistant","text":"message-{index}"}}}}"#
+                        ))
+                        .unwrap(),
+                    )?;
+                }
+                ready_tx.send(()).unwrap();
+                while !context.wait(Duration::from_secs(60)) {}
+                Ok(None)
+            },
+        );
+        ready_rx.recv().unwrap();
+
+        tui.route_tui_job_messages();
+
+        let status = tui.sessions[0].opencode_status.as_ref().unwrap();
+        assert_eq!(status.state, OpencodeState::Retry);
+        assert_eq!(status.latest_message.as_deref(), Some("message-99"));
+        assert!(tui.opencode_reconcile_requested.is_empty());
+        let stats = tui.jobs.queue_stats();
+        assert_eq!(stats.event_capacity, 2);
+        assert_eq!(stats.event_depth, 0);
+        assert_eq!(stats.coalesced_depth, 0);
+        assert_eq!(stats.coalesced_capacity, 2);
+        assert_eq!(stats.overflow_total, 200);
+        assert_eq!(stats.coalesced_total, 198);
+
+        tui.jobs.cancel(job_id);
+        while tui.jobs.has_jobs() {
+            tui.route_tui_job_messages();
+            std::thread::yield_now();
+        }
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
     fn opencode_overflow_requests_full_reconciliation_and_stale_events_cannot_regress_it() {
         let temp = unique_temp_dir("prism-opencode-overflow-reconcile-test");
         fs::create_dir_all(&temp).unwrap();
@@ -4670,18 +4794,35 @@ mod tests {
                         super::OpencodeEventResult {
                             stream: job_stream.clone(),
                             received_at: Instant::now(),
-                            event: Ok(OpencodeEvent {
-                                session_id: Some("ses_1".to_string()),
-                                title: None,
-                                state: Some(OpencodeState::Busy),
-                                detail: None,
-                                latest_message: None,
-                                active_tool: None,
-                                todos: None,
-                            }),
+                            event: Ok(parse_event_payload(
+                                r#"{"type":"todo.updated","properties":{"sessionID":"ses_1","todos":[{"content":"ordered","status":"pending"}]}}"#,
+                            )
+                            .unwrap()),
                         },
                     ))?;
                 }
+                context.send_coalesced(
+                    CoalescedFacet::Status,
+                    super::TuiJobPayload::OpencodeEvent(super::OpencodeEventResult {
+                        stream: job_stream.clone(),
+                        received_at: Instant::now(),
+                        event: Ok(parse_event_payload(
+                            r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":"error"}}"#,
+                        )
+                        .unwrap()),
+                    }),
+                )?;
+                context.send_coalesced(
+                    CoalescedFacet::Message,
+                    super::TuiJobPayload::OpencodeEvent(super::OpencodeEventResult {
+                        stream: job_stream.clone(),
+                        received_at: Instant::now(),
+                        event: Ok(parse_event_payload(
+                            r#"{"type":"message.part.updated","properties":{"sessionID":"ses_1","role":"assistant","text":"stale message"}}"#,
+                        )
+                        .unwrap()),
+                    }),
+                )?;
                 ready_tx.send(()).unwrap();
                 release_rx.recv().unwrap();
                 Ok(None)
@@ -4692,8 +4833,9 @@ mod tests {
         tui.route_tui_job_messages();
         let requested_at = *tui.opencode_reconcile_requested.get(&worktree).unwrap();
         let stats = tui.jobs.queue_stats();
-        assert_eq!(stats.overflow_total, 1_000 - stats.event_capacity as u64);
+        assert_eq!(stats.overflow_total, 1_002 - stats.event_capacity as u64);
         assert!(stats.event_depth <= stats.event_capacity);
+        assert_eq!(stats.coalesced_depth, 2);
 
         let poll_key = super::OpencodePollKey::for_repository_session(
             &tui.repos[0].identity,
@@ -4705,6 +4847,7 @@ mod tests {
                 started_at: requested_at + Duration::from_nanos(1),
                 status: Ok(OpencodeStatus {
                     state: OpencodeState::Done,
+                    latest_message: Some("fresh poll message".to_string()),
                     ..tui.sessions[0].opencode_status.clone().unwrap()
                 }),
             })
@@ -4720,6 +4863,16 @@ mod tests {
             tui.sessions[0].opencode_status.as_ref().unwrap().state,
             OpencodeState::Done
         );
+        assert_eq!(
+            tui.sessions[0]
+                .opencode_status
+                .as_ref()
+                .unwrap()
+                .latest_message
+                .as_deref(),
+            Some("fresh poll message")
+        );
+        assert_eq!(tui.jobs.queue_stats().coalesced_depth, 0);
 
         release_tx.send(()).unwrap();
         let _ = fs::remove_dir_all(temp);
@@ -5572,6 +5725,29 @@ esac
         );
 
         let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn invalid_persisted_ui_state_keeps_current_mode_and_reports_error() {
+        let temp = unique_temp_dir("prism-tui-invalid-ui-state-test");
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("ui-state.toml");
+        fs::write(&path, "worktree_list_mode = 42\n").unwrap();
+        let mut tui = Tui::new(Vec::new(), 0, Vec::new());
+
+        tui.use_persisted_ui_state(path.clone()).unwrap();
+
+        assert_eq!(tui.worktree_list_mode, WorktreeListMode::Repo);
+        assert!(
+            tui.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains(&path.display().to_string()))
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "worktree_list_mode = 42\n"
+        );
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

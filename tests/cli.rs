@@ -291,6 +291,40 @@ fn db_without_arguments_launches_sqlite3_with_initialized_database() {
 }
 
 #[test]
+fn repository_command_completes_only_its_own_run_marker() {
+    let temp = TempDir::new("clean-run-marker");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+
+    let output = run(["db", "path"], &repo, &config_home);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let db_path = PathBuf::from(stdout(&output).trim());
+    let conn =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let (run_id, status, finished): (String, String, Option<i64>) = conn
+        .query_row(
+            "select id, status, time_finished_unix_ms
+             from startup_run order by time_started_unix_ms desc limit 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "ok");
+    assert!(finished.is_some());
+    let marker = db_path
+        .parent()
+        .unwrap()
+        .join("run-markers")
+        .join(format!("{run_id}.run"));
+    let marker = fs::read_to_string(marker).unwrap();
+    assert!(marker.contains("status=complete\n"));
+    assert!(marker.contains("exit_status=ok\n"));
+}
+
+#[test]
 #[cfg(unix)]
 fn db_without_arguments_reports_missing_sqlite3() {
     let temp = TempDir::new("db-shell-missing-sqlite3");
@@ -401,9 +435,31 @@ fn debug_integrity_reports_healthy_database_read_only() {
     assert!(output.contains(&format!("path = {path}")));
     assert!(output.contains("user_version = 1"));
     assert!(output.contains("journal_mode = wal"));
+    assert!(output.contains("main_bytes = "));
+    assert!(output.contains("wal_bytes = "));
+    assert!(output.contains("shm_bytes = "));
     assert!(output.contains("integrity_check:\n  ok"));
     assert!(output.contains("foreign_key_check:\n  ok"));
     assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn debug_info_reports_passive_checkpoint_facts() {
+    let temp = TempDir::new("debug-info-wal");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+
+    let output = run(["debug", "info"], &repo, &config_home);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let output = stdout(&output);
+    assert!(output.contains("database_main_bytes = "));
+    assert!(output.contains("database_wal_bytes = "));
+    assert!(output.contains("database_shm_bytes = "));
+    assert!(output.contains("wal_checkpoint_passive_busy = "));
+    assert!(output.contains("wal_checkpoint_passive_log_frames = "));
+    assert!(output.contains("wal_checkpoint_passive_checkpointed_frames = "));
 }
 
 #[test]

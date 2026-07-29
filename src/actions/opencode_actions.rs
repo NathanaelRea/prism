@@ -221,15 +221,29 @@ impl Tui {
                         if context.is_canceled() {
                             return Ok(None);
                         }
-                        let result = opencode::listen_events_until(
+                        let result = opencode::listen_classified_events_until(
                             &listener_url,
                             || context.is_canceled(),
-                            |event| {
-                                context.send(TuiJobPayload::OpencodeEvent(OpencodeEventResult {
+                            |event, snapshot_facet| {
+                                let facet = match snapshot_facet {
+                                    Some(opencode::OpencodeSnapshotFacet::Status) => {
+                                        Some(CoalescedFacet::Status)
+                                    }
+                                    Some(opencode::OpencodeSnapshotFacet::Message) => {
+                                        Some(CoalescedFacet::Message)
+                                    }
+                                    None => None,
+                                };
+                                let payload = TuiJobPayload::OpencodeEvent(OpencodeEventResult {
                                     stream: job_stream.clone(),
                                     received_at: Instant::now(),
                                     event: Ok(event),
-                                }))
+                                });
+                                if let Some(facet) = facet {
+                                    context.send_coalesced(facet, payload)
+                                } else {
+                                    context.send(payload)
+                                }
                             },
                         );
                         if context.is_canceled() {

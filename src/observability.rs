@@ -118,6 +118,7 @@ struct ObserverState {
     deferred_db_events: Vec<Event>,
     deferred_db_overflow_total: u64,
     deferred_db_overflow_pending: u64,
+    database_writes_disabled: bool,
 }
 
 #[cfg(test)]
@@ -191,10 +192,16 @@ pub fn install_panic_hook() {
     });
 }
 
-pub fn attach_repo(repo: &Repository) {
+pub fn attach_repo(repo: &Repository) -> Result<(), String> {
     with_state(|state| {
         state.repo_root = Some(repo.root.clone());
         state.prism_dir = Some(repo.prism_dir());
+        state.database_writes_disabled = true;
+    });
+    let outcome = crate::run_marker::begin(repo, env!("CARGO_PKG_VERSION"))?;
+    with_state(|state| {
+        state.startup_run_id = Some(outcome.run_id.clone());
+        state.database_writes_disabled = false;
         let buffered = std::mem::take(&mut state.buffered);
         for mut event in buffered {
             if event.repo.is_none() {
@@ -202,7 +209,41 @@ pub fn attach_repo(repo: &Repository) {
             }
             state.write_persistent_event(&event);
         }
+        state.persist_unpersisted_phases();
     });
+    start_startup_run(&outcome.run_id, env!("CARGO_PKG_VERSION"));
+    for stale_run_id in outcome.stale_run_ids {
+        emit(EventInput {
+            level: LogLevel::Warn,
+            target: "startup",
+            action: "previous_incomplete",
+            operation_id: None,
+            parent_operation_id: None,
+            branch: None,
+            session: None,
+            message: format!(
+                "stale prior run {stale_run_id} passed read-only quick_check and foreign_key_check"
+            ),
+            data_json: Some(json_object(vec![json_string_field(
+                "run_id",
+                &stale_run_id,
+            )])),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn attach_run_repo(repo: &Repository) -> Result<(), String> {
+    let outcome = crate::run_marker::begin(repo, env!("CARGO_PKG_VERSION"))?;
+    for stale_run_id in outcome.stale_run_ids {
+        let _ = append_runtime_message(
+            repo,
+            &format!(
+                "warn startup.previous_incomplete stale prior run {stale_run_id} passed read-only quick_check and foreign_key_check"
+            ),
+        );
+    }
+    Ok(())
 }
 
 pub fn db_path(repo: &Repository) -> PathBuf {
@@ -336,67 +377,49 @@ where
     result
 }
 
-pub fn start_startup_run(version: &str) -> String {
-    let id = format!("startup-{}-{}", std::process::id(), now_ms().max(0));
-    with_state(|state| {
-        if let Some(previous) = state.previous_incomplete_startup() {
-            state.record_event(Event {
-                time_unix_ms: now_ms(),
-                level: LogLevel::Warn,
-                target: "startup".to_string(),
-                action: "previous_incomplete".to_string(),
-                operation_id: None,
-                parent_operation_id: None,
-                repo: state.repo_string(),
-                branch: None,
-                session: None,
-                message: format!("previous startup did not finish: {previous}"),
-                data_json: Some(json_object(vec![json_string_field("run_id", &previous)])),
-            });
-        }
-        state.startup_run_id = Some(id.clone());
-        state.insert_startup_run(&id, version);
-        state.persist_unpersisted_phases();
-    });
+fn start_startup_run(id: &str, version: &str) {
     emit(EventInput {
         level: LogLevel::Info,
         target: "startup",
         action: "run_begin",
-        operation_id: Some(id.clone()),
+        operation_id: Some(id.to_string()),
         parent_operation_id: None,
         branch: None,
         session: None,
         message: "startup run began".to_string(),
         data_json: Some(json_object(vec![json_string_field("version", version)])),
     });
-    id
 }
 
-pub fn finish_startup_run(status: &str, error: Option<&str>) {
-    with_state(|state| {
-        let Some(run_id) = state.startup_run_id.clone() else {
-            return;
-        };
-        state.update_startup_run(&run_id, status, error);
-    });
-    emit(EventInput {
-        level: if status == "ok" {
-            LogLevel::Info
-        } else {
-            LogLevel::Error
-        },
-        target: "startup",
-        action: "run_end",
-        operation_id: None,
-        parent_operation_id: None,
-        branch: None,
-        session: None,
-        message: match error {
-            Some(error) => format!("startup run finished with {status}: {error}"),
-            None => format!("startup run finished with {status}"),
-        },
-        data_json: Some(json_object(vec![json_string_field("status", status)])),
-    });
+pub fn finish_process_runs(status: &str, error: Option<&str>) {
+    let has_attached_run = with_state(|state| state.startup_run_id.is_some()).unwrap_or(false);
+    if has_attached_run {
+        emit(EventInput {
+            level: if status == "ok" {
+                LogLevel::Info
+            } else {
+                LogLevel::Error
+            },
+            target: "startup",
+            action: "run_end",
+            operation_id: None,
+            parent_operation_id: None,
+            branch: None,
+            session: None,
+            message: match error {
+                Some(error) => format!("process run finished with {status}: {error}"),
+                None => format!("process run finished with {status}"),
+            },
+            data_json: Some(json_object(vec![json_string_field("status", status)])),
+        });
+    }
+    for finish_error in crate::run_marker::finish_all(status, error) {
+        with_state(|state| {
+            let warning = format!("run marker completion failed: {finish_error}");
+            let _ = state.append_text_warning(&warning);
+            state.write_stderr_warning(&warning);
+        });
+    }
 }
 
 pub fn startup_phases() -> Vec<PhaseRecord> {
@@ -577,6 +600,22 @@ pub(crate) fn storage_error_data_json(
     json_object(fields)
 }
 
+pub(crate) fn wal_growth_data_json(
+    main_bytes: u64,
+    wal_bytes: u64,
+    shm_bytes: u64,
+    warning_bytes: u64,
+    warning_bucket: u64,
+) -> String {
+    json_object(vec![
+        json_u64_field("main_bytes", main_bytes),
+        json_u64_field("wal_bytes", wal_bytes),
+        json_u64_field("shm_bytes", shm_bytes),
+        json_u64_field("warning_bytes", warning_bytes),
+        json_u64_field("warning_bucket", warning_bucket),
+    ])
+}
+
 pub(crate) fn persistence_data_json(
     category: &str,
     stage: &str,
@@ -724,6 +763,7 @@ pub fn with_writable_db_mut<T>(
     let result = run(&mut conn);
     if result.is_ok() {
         drop(conn);
+        crate::storage::monitor_wal_growth(&db_path(repo));
         flush_deferred_events();
     }
     result
@@ -755,6 +795,7 @@ impl WritableDb {
         let result = run(&conn);
         if result.is_ok() {
             drop(conn);
+            crate::storage::monitor_wal_growth(&self.path);
             flush_deferred_events();
         }
         result
@@ -826,6 +867,7 @@ impl ObserverState {
             deferred_db_events: Vec::new(),
             deferred_db_overflow_total: 0,
             deferred_db_overflow_pending: 0,
+            database_writes_disabled: false,
         }
     }
 
@@ -946,7 +988,9 @@ impl ObserverState {
             if let Err(error) = self.write_text_event(event) {
                 eprintln!("prism observability: {error}");
             }
-            if let Err(error) = self.write_db_event(event) {
+            if !self.database_writes_disabled
+                && let Err(error) = self.write_db_event(event)
+            {
                 let warning = format!("observability db write failed: {error}");
                 let _ = self.append_text_warning(&warning);
                 self.write_stderr_warning(&warning);
@@ -1019,71 +1063,6 @@ impl ObserverState {
 
     fn open_writable_db(&mut self, path: &Path) -> Result<Connection, String> {
         open_writable_db_path(path)
-    }
-
-    fn insert_startup_run(&mut self, run_id: &str, version: &str) {
-        let Some(prism_dir) = &self.prism_dir else {
-            return;
-        };
-        let path = prism_dir.join("prism.db");
-        let result = (|| -> Result<(), String> {
-            let conn = self.open_writable_db(&path)?;
-            let repo = self.repo_string();
-            conn.execute(
-                "insert into startup_run (
-                    id, time_started_unix_ms, time_finished_unix_ms, status, repo, version, error
-                ) values (?1, ?2, null, 'running', ?3, ?4, null)",
-                params![run_id, now_ms(), repo.as_deref(), version,],
-            )
-            .map_err(|error| format!("insert startup_run: {error}"))?;
-            Ok(())
-        })();
-        if let Err(error) = result {
-            let warning = format!("startup run insert failed: {error}");
-            let _ = self.append_text_warning(&warning);
-            self.write_stderr_warning(&warning);
-        }
-    }
-
-    fn update_startup_run(&mut self, run_id: &str, status: &str, error: Option<&str>) {
-        let Some(prism_dir) = &self.prism_dir else {
-            return;
-        };
-        let path = prism_dir.join("prism.db");
-        let result = (|| -> Result<(), String> {
-            let conn = self.open_writable_db(&path)?;
-            conn.execute(
-                "update startup_run
-                 set time_finished_unix_ms = ?1, status = ?2, error = ?3
-                 where id = ?4",
-                params![now_ms(), status, error, run_id],
-            )
-            .map_err(|error| format!("update startup_run: {error}"))?;
-            Ok(())
-        })();
-        if let Err(error) = result {
-            let warning = format!("startup run update failed: {error}");
-            let _ = self.append_text_warning(&warning);
-            self.write_stderr_warning(&warning);
-        }
-    }
-
-    fn previous_incomplete_startup(&mut self) -> Option<String> {
-        let prism_dir = self.prism_dir.clone()?;
-        let path = prism_dir.join("prism.db");
-        if !path.exists() {
-            return None;
-        }
-        let conn = self.open_writable_db(&path).ok()?;
-        conn.query_row(
-            "select id from startup_run
-             where status = 'running'
-             order by time_started_unix_ms desc
-             limit 1",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
     }
 
     fn persist_unpersisted_phases(&mut self) {

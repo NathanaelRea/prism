@@ -154,6 +154,12 @@ pub struct OpencodeEvent {
     pub todos: Option<Vec<OpencodeTodo>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpencodeSnapshotFacet {
+    Status,
+    Message,
+}
+
 impl OpencodeStatus {
     pub fn offline(server_url: Option<String>, session_id: Option<String>) -> Self {
         Self {
@@ -430,21 +436,20 @@ pub(crate) fn shutdown_stored_server(runtime: &OpencodeRuntime) -> Result<(), St
     if !stored_server_process_matches(pid, runtime.server_port) {
         return Ok(());
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
-        let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-        if result == 0 {
-            Ok(())
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                Ok(())
-            } else {
-                Err(format!("stop opencode server {pid}: {error}"))
-            }
+        let Some(expected_start) = runtime.server_start_time_ticks else {
+            return Ok(());
+        };
+        match crate::harness::process_start_time_ticks(pid) {
+            None => return Ok(()),
+            Some(actual_start) if actual_start != expected_start => return Ok(()),
+            Some(_) => {}
         }
+        crate::harness::terminate_process(pid, Some(expected_start))
+            .map_err(|error| format!("stop opencode server {pid}: {error}"))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     {
         let _ = pid;
         Ok(())
@@ -675,8 +680,16 @@ pub fn listen_events(
 
 pub fn listen_events_until(
     server_url: &str,
-    mut should_stop: impl FnMut() -> bool,
+    should_stop: impl FnMut() -> bool,
     mut on_event: impl FnMut(OpencodeEvent) -> Result<(), String>,
+) -> Result<(), String> {
+    listen_classified_events_until(server_url, should_stop, |event, _| on_event(event))
+}
+
+pub(crate) fn listen_classified_events_until(
+    server_url: &str,
+    mut should_stop: impl FnMut() -> bool,
+    mut on_event: impl FnMut(OpencodeEvent, Option<OpencodeSnapshotFacet>) -> Result<(), String>,
 ) -> Result<(), String> {
     listen_event_payloads_with_stop(
         server_url,
@@ -684,8 +697,8 @@ pub fn listen_events_until(
         SSE_CANCEL_POLL_INTERVAL,
         &mut should_stop,
         &mut |payload| {
-            if let Some(event) = parse_event_payload(&payload) {
-                on_event(event)?;
+            if let Some((event, facet)) = parse_event_payload_classified(&payload) {
+                on_event(event, facet)?;
             }
             Ok(())
         },
@@ -900,6 +913,12 @@ impl<R: BufRead> Read for ChunkedBodyReader<R> {
 }
 
 pub fn parse_event_payload(payload: &str) -> Option<OpencodeEvent> {
+    parse_event_payload_classified(payload).map(|(event, _)| event)
+}
+
+fn parse_event_payload_classified(
+    payload: &str,
+) -> Option<(OpencodeEvent, Option<OpencodeSnapshotFacet>)> {
     let value = serde_json::from_str::<Value>(payload).ok()?;
     let event_type = string_field(&value, &["type", "event"]).unwrap_or_default();
     let object = event_body(&value).unwrap_or(&value);
@@ -938,6 +957,25 @@ pub fn parse_event_payload(payload: &str) -> Option<OpencodeEvent> {
         None
     };
     let title = string_field(object, &["title"]).or_else(|| string_field(&value, &["title"]));
+    let snapshot_facet = match event_type.as_str() {
+        "session.status" | "session.idle" | "session.error" => Some(OpencodeSnapshotFacet::Status),
+        "message.updated"
+            if latest_message.is_none() && active_tool.is_none() && todos.is_none() =>
+        {
+            Some(OpencodeSnapshotFacet::Status)
+        }
+        event_type
+            if (event_type.contains("message") || event_type.contains("part"))
+                && latest_message.is_some()
+                && state.is_none()
+                && detail.is_none()
+                && active_tool.is_none()
+                && todos.is_none() =>
+        {
+            Some(OpencodeSnapshotFacet::Message)
+        }
+        _ => None,
+    };
 
     let event = OpencodeEvent {
         session_id,
@@ -955,7 +993,7 @@ pub fn parse_event_payload(payload: &str) -> Option<OpencodeEvent> {
         || event.latest_message.is_some()
         || event.active_tool.is_some()
         || event.todos.is_some())
-    .then_some(event)
+    .then_some((event, snapshot_facet))
 }
 
 fn prompt_async_body(prompt: &str) -> String {
@@ -2718,6 +2756,31 @@ mod tests {
     }
 
     #[test]
+    fn classifies_only_supersedable_status_and_text_snapshots() {
+        let (_, status_facet) = parse_event_payload_classified(
+            r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":"busy"}}"#,
+        )
+        .unwrap();
+        let (_, message_facet) = parse_event_payload_classified(
+            r#"{"type":"message.part.updated","properties":{"sessionID":"ses_1","role":"assistant","text":"latest"}}"#,
+        )
+        .unwrap();
+        let (_, permission_facet) = parse_event_payload_classified(
+            r#"{"type":"permission.asked","properties":{"sessionID":"ses_1","permission":"bash"}}"#,
+        )
+        .unwrap();
+        let (_, tool_facet) = parse_event_payload_classified(
+            r#"{"type":"message.part.updated","properties":{"sessionID":"ses_1","type":"tool","name":"bash","status":"running"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(status_facet, Some(OpencodeSnapshotFacet::Status));
+        assert_eq!(message_facet, Some(OpencodeSnapshotFacet::Message));
+        assert_eq!(permission_facet, None);
+        assert_eq!(tool_facet, None);
+    }
+
+    #[test]
     fn ignores_malformed_opencode_events() {
         assert_eq!(parse_event_payload("not json"), None);
         assert_eq!(parse_event_payload(r#"{"type":"session.status"}"#), None);
@@ -2960,6 +3023,78 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stored_server_shutdown_uses_verified_bounded_process_group_recovery() {
+        use std::os::unix::process::CommandExt;
+
+        let temp = unique_temp_dir("prism-stored-opencode-process");
+        fs::create_dir_all(&temp).unwrap();
+        let descendant_path = temp.join("descendant.pid");
+        let script = r#"
+            trap '' TERM
+            (
+                trap '' TERM
+                while :; do sleep 1; done
+            ) &
+            descendant=$!
+            printf '%s\n' "$descendant" > "$1"
+            wait "$descendant"
+        "#;
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .arg("stored-opencode-fixture")
+            .arg(&descendant_path)
+            .args(["serve", "--hostname", "127.0.0.1", "--port", "41000"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+        let process_id = child.id();
+        let runtime = OpencodeRuntime {
+            repo_root: "/repo".to_string(),
+            harness_id: "opencode".to_string(),
+            branch: "feature/test".to_string(),
+            worktree_path: "/repo/worktree".to_string(),
+            server_port: 41_000,
+            server_url: "http://127.0.0.1:41000".to_string(),
+            server_pid: Some(process_id),
+            server_start_time_ticks: process_start_time_ticks(process_id),
+            opencode_session_id: None,
+            generation: 0,
+            updated_unix_ms: 0,
+        };
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !descendant_path.exists() {
+            assert!(std::time::Instant::now() < ready_deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let descendant_id = fs::read_to_string(&descendant_path)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        shutdown_stored_server(&runtime).unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while child.try_wait().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let descendant_result = unsafe { libc::kill(descendant_id, 0) };
+        assert_eq!(descendant_result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
         fs::remove_dir_all(temp).unwrap();
     }
 

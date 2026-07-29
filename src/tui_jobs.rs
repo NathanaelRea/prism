@@ -37,6 +37,14 @@ pub(crate) enum JobOutcomeKind {
     DeadlineExceeded,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum CoalescedFacet {
+    Status,
+    Message,
+}
+
+const COALESCED_FACET_COUNT: usize = 2;
+
 impl JobOutcomeKind {
     pub(crate) const fn label(self) -> &'static str {
         match self {
@@ -86,6 +94,8 @@ pub(crate) enum JobMessage<K, Q, P> {
 pub(crate) struct QueueStats {
     pub event_depth: usize,
     pub event_capacity: usize,
+    pub coalesced_depth: usize,
+    pub coalesced_capacity: usize,
     pub latest_depth: usize,
     pub terminal_depth: usize,
     pub overflow_total: u64,
@@ -165,12 +175,23 @@ struct CancellationState {
     wake: Condvar,
 }
 
+type CoalescedSlots<K, Q, P> = BTreeMap<(JobId, CoalescedFacet), StreamPayload<K, Q, P>>;
+
 struct EventDelivery<K, Q, P> {
-    tx: mpsc::SyncSender<JobMessage<K, Q, P>>,
+    tx: mpsc::SyncSender<StreamPayload<K, Q, P>>,
     depth: AtomicUsize,
     capacity: usize,
+    coalesced: Mutex<CoalescedSlots<K, Q, P>>,
+    next_sequence: AtomicU64,
+    coalesced_total: AtomicU64,
     overflow_total: AtomicU64,
     dirty: AtomicBool,
+}
+
+struct StreamPayload<K, Q, P> {
+    sequence: u64,
+    metadata: JobMetadata<K, Q>,
+    payload: P,
 }
 
 pub(crate) struct JobContext<K, Q, P> {
@@ -202,21 +223,58 @@ impl<K: Clone, Q: Clone, P> JobContext<K, Q, P> {
                 .is_some_and(|deadline| Instant::now() >= deadline)
     }
 
-    /// Streaming payloads are best effort. A full queue marks the stream dirty;
-    /// the consumer reconciles from authoritative state instead of blocking SSE.
+    /// Ordered streaming payloads are best effort. A full queue marks the stream
+    /// dirty; the consumer reconciles from authoritative state instead of blocking.
     pub(crate) fn send(&self, payload: P) -> Result<(), String> {
+        self.send_inner(payload, None)
+    }
+
+    /// Supersedable snapshots use one bounded overflow slot per job and facet.
+    /// Neither the queue nor the slot path ever blocks the producer.
+    pub(crate) fn send_coalesced(&self, facet: CoalescedFacet, payload: P) -> Result<(), String> {
+        self.send_inner(payload, Some(facet))
+    }
+
+    fn send_inner(&self, payload: P, facet: Option<CoalescedFacet>) -> Result<(), String> {
         if self.is_canceled() {
             return Err("job canceled".to_string());
         }
-        self.delivery.depth.fetch_add(1, Ordering::AcqRel);
-        match self.delivery.tx.try_send(JobMessage::Payload {
+        let message = StreamPayload {
+            sequence: self.delivery.next_sequence.fetch_add(1, Ordering::AcqRel),
             metadata: self.metadata.clone(),
             payload,
-        }) {
+        };
+        self.delivery.depth.fetch_add(1, Ordering::AcqRel);
+        match self.delivery.tx.try_send(message) {
             Ok(()) => Ok(()),
-            Err(mpsc::TrySendError::Full(_)) => {
+            Err(mpsc::TrySendError::Full(message)) => {
                 self.delivery.depth.fetch_sub(1, Ordering::AcqRel);
                 self.delivery.overflow_total.fetch_add(1, Ordering::AcqRel);
+                if let Some(facet) = facet {
+                    let mut slots = match self.delivery.coalesced.try_lock() {
+                        Ok(slots) => slots,
+                        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+                        Err(std::sync::TryLockError::WouldBlock) => {
+                            self.delivery.dirty.store(true, Ordering::Release);
+                            return Ok(());
+                        }
+                    };
+                    if self.is_canceled() {
+                        return Err("job canceled".to_string());
+                    }
+                    match slots.entry((message.metadata.id, facet)) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(message);
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            if message.sequence > entry.get().sequence {
+                                entry.insert(message);
+                            }
+                            self.delivery.coalesced_total.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    return Ok(());
+                }
                 self.delivery.dirty.store(true, Ordering::Release);
                 Ok(())
             }
@@ -284,9 +342,9 @@ pub(crate) struct JobRegistry<K, Q, P> {
     jobs: BTreeMap<JobId, JobEntry<K, Q, P>>,
     latest: BTreeMap<LatestKey<K, Q>, LatestValue<K, Q, P>>,
     delivery: Arc<EventDelivery<K, Q, P>>,
-    event_rx: mpsc::Receiver<JobMessage<K, Q, P>>,
+    event_rx: mpsc::Receiver<StreamPayload<K, Q, P>>,
+    pending_event: Option<StreamPayload<K, Q, P>>,
     overflow_reported: u64,
-    coalesced_total: u64,
     coalesced_reported: u64,
     #[cfg(test)]
     fail_next_spawn: bool,
@@ -301,7 +359,7 @@ impl<K, Q, P> Default for JobRegistry<K, Q, P> {
 }
 
 impl<K, Q, P> JobRegistry<K, Q, P> {
-    fn with_event_capacity(capacity: usize) -> Self {
+    pub(crate) fn with_event_capacity(capacity: usize) -> Self {
         let (tx, event_rx) = mpsc::sync_channel(capacity);
         Self {
             next_id: 1,
@@ -312,12 +370,15 @@ impl<K, Q, P> JobRegistry<K, Q, P> {
                 tx,
                 depth: AtomicUsize::new(0),
                 capacity,
+                coalesced: Mutex::new(BTreeMap::new()),
+                next_sequence: AtomicU64::new(0),
+                coalesced_total: AtomicU64::new(0),
                 overflow_total: AtomicU64::new(0),
                 dirty: AtomicBool::new(false),
             }),
             event_rx,
+            pending_event: None,
             overflow_reported: 0,
-            coalesced_total: 0,
             coalesced_reported: 0,
             #[cfg(test)]
             fail_next_spawn: false,
@@ -541,7 +602,7 @@ where
                     })
                     .flatten();
                 if let Some(current_key) = current_key {
-                    self.coalesced_total = self.coalesced_total.saturating_add(1);
+                    self.delivery.coalesced_total.fetch_add(1, Ordering::AcqRel);
                     if current_key.3 > entry.metadata.id {
                         self.jobs.insert(
                             id,
@@ -558,6 +619,8 @@ where
                 }
                 self.latest.insert(key, (entry.metadata.clone(), payload));
             }
+            entry.cancellation.canceled.store(true, Ordering::Release);
+            self.clear_coalesced(id);
             self.jobs.insert(
                 id,
                 JobEntry {
@@ -615,14 +678,55 @@ where
             .min()
     }
 
+    pub(crate) fn take_stream_event(&mut self) -> Option<JobMessage<K, Q, P>> {
+        if self.pending_event.is_none()
+            && let Ok(message) = self.event_rx.try_recv()
+        {
+            self.delivery.depth.fetch_sub(1, Ordering::AcqRel);
+            self.pending_event = Some(message);
+        }
+        let mut slots = self
+            .delivery
+            .coalesced
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let coalesced_key = slots
+            .iter()
+            .min_by_key(|(_, value)| value.sequence)
+            .map(|(key, _)| *key);
+        let take_coalesced = coalesced_key.is_some_and(|key| {
+            self.pending_event
+                .as_ref()
+                .is_none_or(|pending| slots[&key].sequence < pending.sequence)
+        });
+        let value = if take_coalesced {
+            slots.remove(&coalesced_key?)?
+        } else {
+            self.pending_event.take()?
+        };
+        Some(JobMessage::Payload {
+            metadata: value.metadata,
+            payload: value.payload,
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn drain_events(&mut self, limit: usize) -> Vec<JobMessage<K, Q, P>> {
         let mut messages = Vec::new();
         for _ in 0..limit {
-            let Ok(message) = self.event_rx.try_recv() else {
-                break;
+            let message = if let Some(message) = self.pending_event.take() {
+                message
+            } else {
+                let Ok(message) = self.event_rx.try_recv() else {
+                    break;
+                };
+                self.delivery.depth.fetch_sub(1, Ordering::AcqRel);
+                message
             };
-            self.delivery.depth.fetch_sub(1, Ordering::AcqRel);
-            messages.push(message);
+            messages.push(JobMessage::Payload {
+                metadata: message.metadata,
+                payload: message.payload,
+            });
         }
         messages
     }
@@ -631,11 +735,25 @@ where
         let overflow_total = self.delivery.overflow_total.load(Ordering::Acquire);
         let overflow_delta = overflow_total.saturating_sub(self.overflow_reported);
         self.overflow_reported = overflow_total;
-        let coalesced_delta = self.coalesced_total.saturating_sub(self.coalesced_reported);
-        self.coalesced_reported = self.coalesced_total;
+        let coalesced_total = self.delivery.coalesced_total.load(Ordering::Acquire);
+        let coalesced_delta = coalesced_total.saturating_sub(self.coalesced_reported);
+        self.coalesced_reported = coalesced_total;
+        let coalesced_depth = self
+            .delivery
+            .coalesced
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len();
         QueueStats {
             event_depth: self.delivery.depth.load(Ordering::Acquire),
             event_capacity: self.delivery.capacity,
+            coalesced_depth,
+            coalesced_capacity: self
+                .jobs
+                .values()
+                .filter(|entry| matches!(entry.state, JobState::Running(_)))
+                .count()
+                .saturating_mul(COALESCED_FACET_COUNT),
             latest_depth: self.latest.len(),
             terminal_depth: self
                 .jobs
@@ -644,7 +762,7 @@ where
                 .count(),
             overflow_total,
             overflow_delta,
-            coalesced_total: self.coalesced_total,
+            coalesced_total,
             coalesced_delta,
             dirty: self.delivery.dirty.swap(false, Ordering::AcqRel),
         }
@@ -659,6 +777,11 @@ where
             entry.cancellation.canceled.store(true, Ordering::Release);
             entry.cancellation.wake.notify_all();
         }
+        self.delivery
+            .coalesced
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
     }
 
     pub(crate) fn cancel(&self, id: JobId) {
@@ -666,6 +789,7 @@ where
             entry.cancellation.canceled.store(true, Ordering::Release);
             entry.cancellation.wake.notify_all();
         }
+        self.clear_coalesced(id);
     }
 
     pub(crate) fn active_metadata(&self) -> Vec<JobMetadata<K, Q>> {
@@ -684,6 +808,11 @@ where
         let count = self.jobs.len();
         self.jobs.clear();
         self.latest.clear();
+        self.delivery
+            .coalesced
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         count
     }
 
@@ -719,6 +848,14 @@ where
         }
     }
 
+    fn clear_coalesced(&self, id: JobId) {
+        self.delivery
+            .coalesced
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .retain(|(job_id, _), _| *job_id != id);
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_next_spawn(&mut self) {
         self.fail_next_spawn = true;
@@ -751,7 +888,7 @@ mod tests {
     use std::process::Command;
     use std::time::Duration;
 
-    use super::{JobMessage, JobOutcome, JobRegistry};
+    use super::{CoalescedFacet, JobMessage, JobOutcome, JobRegistry};
 
     #[test]
     fn panic_emits_one_terminal_outcome_and_a_later_job_can_start() {
@@ -841,6 +978,89 @@ mod tests {
         assert!(stats.dirty);
         assert_eq!(jobs.drain_events(usize::MAX).len(), capacity);
         assert_eq!(jobs.queue_stats().event_depth, 0);
+    }
+
+    #[test]
+    fn coalesced_overflow_has_two_slots_per_active_stream_and_clears_on_cancel() {
+        let capacity = 1;
+        let snapshots_per_facet = 100;
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let mut jobs =
+            JobRegistry::<&'static str, &'static str, usize>::with_event_capacity(capacity);
+        let id = jobs.spawn(
+            "listener",
+            "stream",
+            1,
+            None,
+            "coalesced-burst".to_string(),
+            move |context| {
+                context.send(usize::MAX)?;
+                for value in 0..snapshots_per_facet {
+                    context.send_coalesced(CoalescedFacet::Status, value)?;
+                    context.send_coalesced(CoalescedFacet::Message, snapshots_per_facet + value)?;
+                }
+                ready_tx.send(()).unwrap();
+                while !context.wait(Duration::from_secs(60)) {}
+                Ok(None)
+            },
+        );
+        ready_rx.recv().unwrap();
+
+        let stats = jobs.queue_stats();
+        assert_eq!(stats.event_depth, capacity);
+        assert_eq!(stats.coalesced_depth, 2);
+        assert_eq!(stats.coalesced_capacity, 2);
+        assert_eq!(stats.coalesced_total, 2 * (snapshots_per_facet - 1) as u64);
+        assert_eq!(stats.overflow_total, (2 * snapshots_per_facet) as u64);
+        assert!(!stats.dirty);
+
+        jobs.cancel(id);
+        assert_eq!(jobs.queue_stats().coalesced_depth, 0);
+        assert!(matches!(wait_for_terminal(&mut jobs), JobOutcome::Canceled));
+    }
+
+    #[test]
+    fn coalesced_snapshot_keeps_its_position_before_a_later_ordered_event() {
+        let (overflowed_tx, overflowed_rx) = std::sync::mpsc::sync_channel(0);
+        let (continue_tx, continue_rx) = std::sync::mpsc::sync_channel(0);
+        let (ordered_tx, ordered_rx) = std::sync::mpsc::sync_channel(0);
+        let mut jobs = JobRegistry::<&'static str, &'static str, usize>::with_event_capacity(1);
+        let id = jobs.spawn(
+            "listener",
+            "stream",
+            1,
+            None,
+            "ordered-coalesced".to_string(),
+            move |context| {
+                context.send_coalesced(CoalescedFacet::Status, 1)?;
+                context.send_coalesced(CoalescedFacet::Status, 2)?;
+                overflowed_tx.send(()).unwrap();
+                continue_rx.recv().unwrap();
+                context.send(3)?;
+                ordered_tx.send(()).unwrap();
+                while !context.wait(Duration::from_secs(60)) {}
+                Ok(None)
+            },
+        );
+        overflowed_rx.recv().unwrap();
+
+        assert!(matches!(
+            jobs.take_stream_event(),
+            Some(JobMessage::Payload { payload: 1, .. })
+        ));
+        continue_tx.send(()).unwrap();
+        ordered_rx.recv().unwrap();
+
+        assert!(matches!(
+            jobs.take_stream_event(),
+            Some(JobMessage::Payload { payload: 2, .. })
+        ));
+        assert!(matches!(
+            jobs.take_stream_event(),
+            Some(JobMessage::Payload { payload: 3, .. })
+        ));
+        jobs.cancel(id);
+        assert!(matches!(wait_for_terminal(&mut jobs), JobOutcome::Canceled));
     }
 
     #[test]

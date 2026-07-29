@@ -225,6 +225,7 @@ fn respond(
 
 fn classify_abandoned(instance_id: &str) -> Result<(), String> {
     for entry in workspace::discover_valid_entries(workspace::load_entries()?) {
+        observability::attach_run_repo(&entry.repo)?;
         observability::with_writable_db(&entry.repo, |conn| {
             execution::mark_abandoned(conn, instance_id).map(|_| ())
         })?;
@@ -249,6 +250,13 @@ fn schedule_queued(instance_id: &str, active: Arc<Mutex<BTreeSet<PathBuf>>>) {
     };
     for entry in workspace::discover_valid_entries(entries) {
         let repo = entry.repo;
+        if let Err(error) = observability::attach_run_repo(&repo) {
+            eprintln!(
+                "Prism worker cannot attach repository {}: {error}",
+                repo.root.display()
+            );
+            continue;
+        }
         let _ = observability::with_writable_db(&repo, |conn| {
             execution::mark_abandoned(conn, instance_id).map(|_| ())
         });
