@@ -1,6 +1,6 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -12,22 +12,27 @@ use ratatui::text::Line;
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{
-    AutoRunStatus, PersistedAutoRun, load_auto_run, load_output_lines as load_auto_output_lines,
-    load_recent_active_runs_for_repo,
+    AutoOutputLine, AutoRunStatus, PersistedAutoRun, load_auto_run_snapshot,
+    load_output_lines as load_auto_output_lines, load_recent_active_run_snapshots_for_repo,
 };
 use crate::config::Config;
 use crate::github::{PrCache, PrSummary};
 use crate::input::{Key, KeyInput};
 use crate::opencode::{OpencodeEvent, OpencodeStatus};
 use crate::plan_run::{
-    PersistedPlanRun, PlanRunStatus, PlanStepStatus, cleanup_stale_archived_plan_runs,
-    load_output_lines, load_plan_run, load_recent_plan_runs_for_repo,
+    PersistedPlanRun, PlanOutputLine, PlanRunStatus, PlanStepStatus, load_output_lines,
+    load_plan_run, load_recent_plan_runs_for_repo,
 };
 use crate::repo::Repository;
 use crate::session::{Session, WorktreeRepositoryKey, WorktreeSessionKey};
 use crate::terminal::stdin_is_tty;
 use crate::tmux::TmuxWindow;
+use crate::tui_jobs::{
+    JobContext, JobMessage, JobMetadata, JobOutcome, JobRegistry, LatestReceiver, LatestSender,
+    latest_channel,
+};
 use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
+use crate::tui_signal::{ShutdownNotification, ShutdownSignal};
 use crate::util::status_count;
 use crate::view;
 
@@ -39,6 +44,17 @@ pub struct Tui {
     pub(crate) sessions: Vec<Session>,
     pub(crate) session_repository_identities: BTreeMap<usize, WorktreeRepositoryKey>,
     pub(crate) worktree_generations: BTreeMap<WorktreeSessionKey, u64>,
+    pub(crate) worktree_harness_configs: BTreeMap<WorktreeSessionKey, Config>,
+    pub(crate) session_refresh_tx: LatestSender<u64, SessionRefreshResult>,
+    pub(crate) session_refresh_rx: LatestReceiver<u64, SessionRefreshResult>,
+    pub(crate) session_refresh_in_flight: bool,
+    pub(crate) session_refresh_pending: bool,
+    pub(crate) session_inventory_generation: u64,
+    workflow_maintenance_tx: LatestSender<(), ()>,
+    workflow_maintenance_rx: LatestReceiver<(), ()>,
+    workflow_maintenance_in_flight: bool,
+    workflow_maintenance_due: bool,
+    workflow_maintenance_last_started: Instant,
     pub(crate) selected: usize,
     pub(crate) selected_repo_root: Option<PathBuf>,
     pub(crate) focused_panel: PanelFocus,
@@ -50,45 +66,60 @@ pub struct Tui {
     ui_state_path: Option<PathBuf>,
     pub(crate) selected_comment: usize,
     pub(crate) selected_worktree_by_repo: BTreeMap<PathBuf, PathBuf>,
-    pub(crate) pr_poll_tx: Sender<PrPollResult>,
-    pub(crate) pr_poll_rx: Receiver<PrPollResult>,
+    pub(crate) pr_poll_tx: LatestSender<PrDeliveryKey, PrPollResult>,
+    pub(crate) pr_poll_rx: LatestReceiver<PrDeliveryKey, PrPollResult>,
     pub(crate) pr_polls_in_flight: BTreeSet<PrPollKey>,
-    pub(crate) delete_session_tx: Sender<DeleteSessionResult>,
-    pub(crate) delete_session_rx: Receiver<DeleteSessionResult>,
+    pub(crate) delete_session_tx: LatestSender<(DeleteSessionKey, u64), DeleteSessionResult>,
+    pub(crate) delete_session_rx: LatestReceiver<(DeleteSessionKey, u64), DeleteSessionResult>,
     pub(crate) delete_sessions_in_flight: BTreeSet<DeleteSessionKey>,
-    pub(crate) tmux_warmup_tx: Sender<AgentSessionWarmupResult>,
-    pub(crate) tmux_warmup_rx: Receiver<AgentSessionWarmupResult>,
+    pub(crate) tmux_warmup_tx: LatestSender<AgentSessionWarmupKey, AgentSessionWarmupResult>,
+    pub(crate) tmux_warmup_rx: LatestReceiver<AgentSessionWarmupKey, AgentSessionWarmupResult>,
     pub(crate) tmux_warmups_in_flight: BTreeSet<AgentSessionWarmupKey>,
     pub(crate) tmux_generations: BTreeMap<AgentSessionSlot, u64>,
-    pub(crate) tmux_portal_tx: Sender<TmuxPortalResult>,
-    pub(crate) tmux_portal_rx: Receiver<TmuxPortalResult>,
+    pub(crate) tmux_portal_tx: LatestSender<AgentSessionWarmupKey, TmuxPortalResult>,
+    pub(crate) tmux_portal_rx: LatestReceiver<AgentSessionWarmupKey, TmuxPortalResult>,
     pub(crate) tmux_portal_polls_in_flight: BTreeMap<AgentSessionWarmupKey, Instant>,
     pub(crate) tmux_portal_last_polled: BTreeMap<AgentSessionWarmupKey, Instant>,
     pub(crate) tmux_portal: Option<TmuxPortalSnapshot>,
     pub(crate) tmux_portal_size: Option<(u16, u16)>,
-    pub(crate) wt_poll_tx: Sender<WtPollResult>,
-    pub(crate) wt_poll_rx: Receiver<WtPollResult>,
-    pub(crate) default_branch_poll_tx: Sender<DefaultBranchPollResult>,
-    pub(crate) default_branch_poll_rx: Receiver<DefaultBranchPollResult>,
-    pub(crate) opencode_poll_tx: Sender<OpencodePollResult>,
-    pub(crate) opencode_poll_rx: Receiver<OpencodePollResult>,
+    pub(crate) tmux_portal_resized: Option<(AgentSessionWarmupKey, (u16, u16))>,
+    pub(crate) wt_poll_tx: LatestSender<WorktreeRepositoryKey, WtPollResult>,
+    pub(crate) wt_poll_rx: LatestReceiver<WorktreeRepositoryKey, WtPollResult>,
+    pub(crate) default_branch_poll_tx: LatestSender<WorktreeSessionKey, DefaultBranchPollResult>,
+    pub(crate) default_branch_poll_rx: LatestReceiver<WorktreeSessionKey, DefaultBranchPollResult>,
+    pub(crate) opencode_poll_tx: LatestSender<OpencodePollKey, OpencodePollResult>,
+    pub(crate) opencode_poll_rx: LatestReceiver<OpencodePollKey, OpencodePollResult>,
     pub(crate) opencode_polls_in_flight: BTreeSet<OpencodePollKey>,
     pub(crate) opencode_last_polled: BTreeMap<OpencodePollKey, Instant>,
     pub(crate) opencode_last_state_event: BTreeMap<OpencodePollKey, Instant>,
-    pub(crate) opencode_event_tx: Sender<OpencodeEventResult>,
-    pub(crate) opencode_event_rx: Receiver<OpencodeEventResult>,
-    pub(crate) opencode_sse_servers: BTreeSet<String>,
+    pub(crate) opencode_reconcile_requested: BTreeMap<WorktreeSessionKey, Instant>,
+    pub(crate) opencode_event_watermarks: BTreeMap<WorktreeSessionKey, Instant>,
+    #[cfg(test)]
+    pub(crate) opencode_event_tx: LatestSender<Instant, OpencodeEventResult>,
+    #[cfg(test)]
+    pub(crate) opencode_event_rx: LatestReceiver<Instant, OpencodeEventResult>,
+    pub(crate) opencode_listeners: BTreeSet<OpencodeListenerKey>,
+    pub(crate) opencode_listener_last_scanned: Option<Instant>,
+    pub(crate) jobs: JobRegistry<TuiJobKind, TuiJobKey, TuiJobPayload>,
+    pub(crate) opencode_events_changed: bool,
+    pub(crate) tui_tick_active: bool,
+    pub(crate) routing_tui_jobs: bool,
+    scheduling_stopped: bool,
     pub(crate) plan_runs: BTreeMap<String, PersistedPlanRun>,
     pub(crate) active_plan_runs: BTreeMap<PathBuf, String>,
     pub(crate) selected_plan_step_by_run: BTreeMap<String, usize>,
     pub(crate) manual_plan_step_selection_by_run: BTreeSet<String>,
     pub(crate) plan_output_state_by_run: BTreeMap<String, view::PlanOutputViewerState>,
+    pub(crate) plan_output_cache: RefCell<BTreeMap<(String, usize), Vec<PlanOutputLine>>>,
     pub(crate) auto_runs: BTreeMap<String, PersistedAutoRun>,
     pub(crate) active_auto_runs: BTreeMap<PathBuf, String>,
     pub(crate) selected_auto_run: Option<String>,
     pub(crate) selected_auto_step_by_run: BTreeMap<String, i64>,
     pub(crate) auto_output_state_by_run: BTreeMap<String, view::AutoOutputViewerState>,
+    pub(crate) auto_output_cache:
+        RefCell<BTreeMap<(WorktreeRepositoryKey, i64), Vec<AutoOutputLine>>>,
     pub(crate) last_plan_poll: Option<Instant>,
+    pub(crate) last_auto_poll: Option<Instant>,
     pub(crate) repo_filter: String,
     pub(crate) worktree_filter: String,
     pub(crate) leader_hint: Option<LeaderHint>,
@@ -100,7 +131,11 @@ pub struct Tui {
 }
 
 const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
-const ARCHIVED_PLAN_RETENTION: Duration = Duration::from_secs(60 * 60 * 24 * 30);
+const WORKFLOW_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
+pub(crate) const TUI_ACTION_JOB_TIMEOUT: Duration = Duration::from_secs(120);
+const TUI_JOB_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const TUI_TICK_ITEM_BUDGET: usize = 32;
+const TUI_TICK_TIME_BUDGET: Duration = Duration::from_millis(8);
 #[derive(Clone, Debug)]
 pub(crate) struct ManagedRepo {
     pub repo: Repository,
@@ -133,6 +168,7 @@ pub(crate) struct TmuxPortalResult {
     pub key: AgentSessionWarmupKey,
     pub started_at: Instant,
     pub capture: Result<Vec<Line<'static>>, String>,
+    pub resized_size: Option<(u16, u16)>,
 }
 
 pub(crate) struct TmuxPortalTarget {
@@ -152,6 +188,32 @@ pub(crate) struct TmuxPortalSnapshot {
 pub(crate) struct TmuxPortalCapture {
     pub key: AgentSessionWarmupKey,
     pub result: Result<Vec<Line<'static>>, String>,
+}
+
+pub(crate) fn load_worktree_harness_configs(
+    repos: &[ManagedRepo],
+    sessions: &[Session],
+) -> BTreeMap<WorktreeSessionKey, Config> {
+    sessions
+        .iter()
+        .filter_map(|session| {
+            let managed = repos.get(session.repo_index)?;
+            let association = crate::session::worktree_harness(&managed.repo, session).ok()?;
+            let config = managed.config.for_harness(&association.harness_id).ok()?;
+            Some((session.identity_key(&managed.identity), config))
+        })
+        .collect()
+}
+
+pub(crate) fn maintain_workflow_storage(repo: &Repository) -> Result<(), String> {
+    crate::observability::with_writable_db(repo, |conn| {
+        crate::plan_run::cleanup_stale_archived_plan_runs(
+            conn,
+            crate::plan_run::ARCHIVED_PLAN_RETENTION_MS,
+        )?;
+        crate::auto_flow::load_recent_active_runs_for_repo(conn, &repo.root, usize::MAX)?;
+        Ok(())
+    })
 }
 
 impl ManagedRepo {
@@ -174,11 +236,8 @@ impl ManagedRepo {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PrPollKey {
-    pub repository: WorktreeRepositoryKey,
-    pub branch: String,
-    pub path: PathBuf,
+    pub worktree: WorktreeSessionKey,
     pub generation: u64,
-    pub incarnation: String,
 }
 
 pub(crate) enum PrPollResult {
@@ -195,16 +254,20 @@ pub(crate) enum PrPollResult {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum PrDeliveryKey {
+    Summary(WorktreeRepositoryKey),
+    Details(PrPollKey),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct DeleteSessionKey {
-    pub repository: WorktreeRepositoryKey,
-    pub path: PathBuf,
-    pub branch: String,
+    pub worktree: WorktreeSessionKey,
     pub generation: u64,
-    pub incarnation: String,
 }
 
 pub(crate) struct DeleteSessionResult {
     pub key: DeleteSessionKey,
+    pub delivery_id: u64,
     pub result: Result<crate::session::DeleteWorktreeOutcome, String>,
 }
 
@@ -215,11 +278,8 @@ impl PrPollKey {
         generation: u64,
     ) -> Self {
         Self {
-            repository: repository.clone(),
-            branch: session.branch.clone(),
-            path: session.path.clone(),
+            worktree: session.identity_key(repository),
             generation,
-            incarnation: session.incarnation.clone(),
         }
     }
 }
@@ -283,13 +343,23 @@ pub(crate) struct DefaultBranchPollResult {
     pub status_label: Result<String, String>,
 }
 
+pub(crate) struct SessionRefreshResult {
+    pub base_generation: u64,
+    pub result: Result<SessionRefreshSnapshot, String>,
+}
+
+pub(crate) struct SessionRefreshSnapshot {
+    pub repository_identities: BTreeMap<usize, WorktreeRepositoryKey>,
+    pub configs: BTreeMap<WorktreeRepositoryKey, Config>,
+    pub baseline_sessions: BTreeMap<WorktreeSessionKey, Session>,
+    pub sessions: Vec<Session>,
+    pub worktree_harness_configs: BTreeMap<WorktreeSessionKey, Config>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct OpencodePollKey {
-    pub repository: WorktreeRepositoryKey,
-    pub branch: String,
-    pub path: PathBuf,
+    pub worktree: WorktreeSessionKey,
     pub generation: u64,
-    pub incarnation: String,
 }
 
 pub(crate) struct OpencodePollResult {
@@ -299,9 +369,96 @@ pub(crate) struct OpencodePollResult {
 }
 
 pub(crate) struct OpencodeEventResult {
-    pub key: WorktreeSessionKey,
-    pub server_url: String,
+    pub stream: OpencodeListenerKey,
+    pub received_at: Instant,
     pub event: Result<OpencodeEvent, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct OpencodeListenerKey {
+    pub worktree: WorktreeSessionKey,
+    pub generation: u64,
+    pub session_id: String,
+    pub server_url: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum TuiJobKind {
+    SessionRefresh,
+    WorkflowMaintenance,
+    PrSummary,
+    PrDetails,
+    DeleteSession,
+    TmuxWarmup,
+    TmuxPortal,
+    WorktreeColumns,
+    DefaultBranch,
+    OpencodePoll,
+    OpencodeListener,
+}
+
+impl TuiJobKind {
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::SessionRefresh => "session_refresh",
+            Self::WorkflowMaintenance => "workflow_maintenance",
+            Self::PrSummary => "pr_summary",
+            Self::PrDetails => "pr_details",
+            Self::DeleteSession => "delete_session",
+            Self::TmuxWarmup => "tmux_warmup",
+            Self::TmuxPortal => "tmux_portal",
+            Self::WorktreeColumns => "worktree_columns",
+            Self::DefaultBranch => "default_branch",
+            Self::OpencodePoll => "opencode_poll",
+            Self::OpencodeListener => "opencode_listener",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum TuiJobKey {
+    None,
+    Repository(WorktreeRepositoryKey),
+    Worktree(WorktreeSessionKey),
+    Pr(PrPollKey),
+    Delete(DeleteSessionKey),
+    Tmux(AgentSessionWarmupKey),
+    Opencode(OpencodePollKey),
+    OpencodeListener(OpencodeListenerKey),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShutdownReason {
+    UserQuit,
+    Sigint,
+    Sigterm,
+    RunError,
+    Panic,
+}
+
+impl ShutdownReason {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::UserQuit => "user_quit",
+            Self::Sigint => "sigint",
+            Self::Sigterm => "sigterm",
+            Self::RunError => "run_error",
+            Self::Panic => "panic",
+        }
+    }
+}
+
+pub(crate) enum TuiJobPayload {
+    SessionRefresh(SessionRefreshResult),
+    WorkflowMaintenance,
+    PrPoll(PrPollResult),
+    DeleteSession(DeleteSessionResult),
+    TmuxWarmup(AgentSessionWarmupResult),
+    TmuxPortal(TmuxPortalResult),
+    WorktreeColumns(WtPollResult),
+    DefaultBranch(DefaultBranchPollResult),
+    OpencodePoll(OpencodePollResult),
+    OpencodeEvent(OpencodeEventResult),
 }
 
 impl OpencodePollKey {
@@ -319,12 +476,16 @@ impl OpencodePollKey {
         generation: u64,
     ) -> Self {
         Self {
-            repository: repository.clone(),
-            branch: session.branch.clone(),
-            path: session.path.clone(),
+            worktree: session.identity_key(repository),
             generation,
-            incarnation: session.incarnation.clone(),
         }
+    }
+}
+
+fn pr_delivery_key(result: &PrPollResult) -> PrDeliveryKey {
+    match result {
+        PrPollResult::Summary { repository, .. } => PrDeliveryKey::Summary(repository.clone()),
+        PrPollResult::Details { key, .. } => PrDeliveryKey::Details(key.clone()),
     }
 }
 
@@ -390,6 +551,7 @@ fn plan_run_status_sort_key(status: PlanRunStatus) -> u8 {
 
 #[derive(Default)]
 struct TuiBackgroundChanges {
+    sessions: bool,
     tmux: bool,
     tmux_portal: bool,
     worktree_columns: bool,
@@ -406,6 +568,7 @@ struct TuiBackgroundChanges {
 impl TuiBackgroundChanges {
     fn any(&self) -> bool {
         self.tmux
+            || self.sessions
             || self.tmux_portal
             || self.worktree_columns
             || self.default_branch
@@ -424,6 +587,23 @@ fn plain_key(event: KeyEvent) -> bool {
         .modifiers
         .intersection(KeyModifiers::CONTROL | KeyModifiers::ALT)
         .is_empty()
+}
+
+fn requested_shutdown(notification: &ShutdownNotification) -> Option<ShutdownReason> {
+    match notification.signal()? {
+        ShutdownSignal::Sigint => Some(ShutdownReason::Sigint),
+        ShutdownSignal::Sigterm => Some(ShutdownReason::Sigterm),
+    }
+}
+
+fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "non-string panic payload"
+    }
 }
 
 fn ctrl_key(event: KeyEvent) -> bool {
@@ -481,14 +661,25 @@ fn move_enabled_ordered_item(
 
 impl Tui {
     pub fn new(repos: Vec<ManagedRepo>, current_repo: usize, sessions: Vec<Session>) -> Self {
-        let (pr_poll_tx, pr_poll_rx) = mpsc::channel();
-        let (delete_session_tx, delete_session_rx) = mpsc::channel();
-        let (tmux_warmup_tx, tmux_warmup_rx) = mpsc::channel();
-        let (tmux_portal_tx, tmux_portal_rx) = mpsc::channel();
-        let (wt_poll_tx, wt_poll_rx) = mpsc::channel();
-        let (default_branch_poll_tx, default_branch_poll_rx) = mpsc::channel();
-        let (opencode_poll_tx, opencode_poll_rx) = mpsc::channel();
-        let (opencode_event_tx, opencode_event_rx) = mpsc::channel();
+        let (pr_poll_tx, pr_poll_rx) = latest_channel(pr_delivery_key);
+        let (session_refresh_tx, session_refresh_rx) =
+            latest_channel(|result: &SessionRefreshResult| result.base_generation);
+        let (workflow_maintenance_tx, workflow_maintenance_rx) = latest_channel(|_| ());
+        let (delete_session_tx, delete_session_rx) =
+            latest_channel(|result: &DeleteSessionResult| (result.key.clone(), result.delivery_id));
+        let (tmux_warmup_tx, tmux_warmup_rx) =
+            latest_channel(|result: &AgentSessionWarmupResult| result.key.clone());
+        let (tmux_portal_tx, tmux_portal_rx) =
+            latest_channel(|result: &TmuxPortalResult| result.key.clone());
+        let (wt_poll_tx, wt_poll_rx) =
+            latest_channel(|result: &WtPollResult| result.repository.clone());
+        let (default_branch_poll_tx, default_branch_poll_rx) =
+            latest_channel(|result: &DefaultBranchPollResult| result.key.clone());
+        let (opencode_poll_tx, opencode_poll_rx) =
+            latest_channel(|result: &OpencodePollResult| result.key.clone());
+        #[cfg(test)]
+        let (opencode_event_tx, opencode_event_rx) =
+            latest_channel(|result: &OpencodeEventResult| result.received_at);
         let current_repo = current_repo.min(repos.len().saturating_sub(1));
         let fallback_repo = Repository {
             root: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
@@ -521,6 +712,17 @@ impl Tui {
             sessions,
             session_repository_identities,
             worktree_generations,
+            worktree_harness_configs: BTreeMap::new(),
+            session_refresh_tx,
+            session_refresh_rx,
+            session_refresh_in_flight: false,
+            session_refresh_pending: false,
+            session_inventory_generation: 0,
+            workflow_maintenance_tx,
+            workflow_maintenance_rx,
+            workflow_maintenance_in_flight: false,
+            workflow_maintenance_due: false,
+            workflow_maintenance_last_started: Instant::now(),
             selected: 0,
             selected_repo_root: None,
             focused_panel: PanelFocus::Repos,
@@ -548,6 +750,7 @@ impl Tui {
             tmux_portal_last_polled: BTreeMap::new(),
             tmux_portal: None,
             tmux_portal_size: None,
+            tmux_portal_resized: None,
             wt_poll_tx,
             wt_poll_rx,
             default_branch_poll_tx,
@@ -557,20 +760,33 @@ impl Tui {
             opencode_polls_in_flight: BTreeSet::new(),
             opencode_last_polled: BTreeMap::new(),
             opencode_last_state_event: BTreeMap::new(),
+            opencode_reconcile_requested: BTreeMap::new(),
+            opencode_event_watermarks: BTreeMap::new(),
+            #[cfg(test)]
             opencode_event_tx,
+            #[cfg(test)]
             opencode_event_rx,
-            opencode_sse_servers: BTreeSet::new(),
+            opencode_listeners: BTreeSet::new(),
+            opencode_listener_last_scanned: None,
+            jobs: JobRegistry::default(),
+            opencode_events_changed: false,
+            tui_tick_active: false,
+            routing_tui_jobs: false,
+            scheduling_stopped: false,
             plan_runs: BTreeMap::new(),
             active_plan_runs: BTreeMap::new(),
             selected_plan_step_by_run: BTreeMap::new(),
             manual_plan_step_selection_by_run: BTreeSet::new(),
             plan_output_state_by_run: BTreeMap::new(),
+            plan_output_cache: RefCell::new(BTreeMap::new()),
             auto_runs: BTreeMap::new(),
             active_auto_runs: BTreeMap::new(),
             selected_auto_run: None,
             selected_auto_step_by_run: BTreeMap::new(),
             auto_output_state_by_run: BTreeMap::new(),
+            auto_output_cache: RefCell::new(BTreeMap::new()),
             last_plan_poll: None,
+            last_auto_poll: None,
             repo_filter: String::new(),
             worktree_filter: String::new(),
             leader_hint: None,
@@ -593,12 +809,21 @@ impl Tui {
         Self::new(vec![ManagedRepo::new(repo, config, None)], 0, sessions)
     }
 
-    pub(crate) fn use_persisted_ui_state(&mut self, path: PathBuf) {
-        if let Some(mode) = crate::ui_state::load_from_path(&path) {
-            self.worktree_list_mode = mode;
-            self.restore_selected_worktree_for_repo();
+    pub(crate) fn use_persisted_ui_state(&mut self, path: PathBuf) -> Result<(), String> {
+        match crate::ui_state::load_from_path(&path) {
+            Ok(Some(mode)) => {
+                self.worktree_list_mode = mode;
+                self.restore_selected_worktree_for_repo();
+            }
+            Ok(None) => {}
+            Err(error) => {
+                self.show_message(&format!(
+                    "UI state was not loaded; keeping the current mode: {error}"
+                ))?;
+            }
         }
         self.ui_state_path = Some(path);
+        Ok(())
     }
 
     pub(crate) fn sync_selected_repo_context(&mut self) {
@@ -698,9 +923,63 @@ impl Tui {
             return Err("TUI requires an interactive terminal".to_string());
         }
 
+        let shutdown = ShutdownNotification::install()?;
         let mut runtime = TerminalRuntime::enter()?;
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::process::with_cancellation(shutdown.cancellation(), || {
+                self.run_inner(&mut runtime, &shutdown)
+            })
+        }));
+        self.finish_run(outcome, shutdown.signal())
+    }
+
+    fn finish_run(
+        &mut self,
+        outcome: std::thread::Result<Result<ShutdownReason, String>>,
+        signal: Option<ShutdownSignal>,
+    ) -> Result<(), String> {
+        let shutdown_reason = match &outcome {
+            Err(_) => ShutdownReason::Panic,
+            _ if signal == Some(ShutdownSignal::Sigint) => ShutdownReason::Sigint,
+            _ if signal == Some(ShutdownSignal::Sigterm) => ShutdownReason::Sigterm,
+            Ok(Ok(reason)) => *reason,
+            Ok(Err(_)) => ShutdownReason::RunError,
+        };
+        let cleanup = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.cleanup_tui_jobs(shutdown_reason)
+        }))
+        .unwrap_or_else(|payload| {
+            Err(format!(
+                "TUI cleanup panicked: {}",
+                panic_payload_message(payload.as_ref())
+            ))
+        });
+        match outcome {
+            Ok(_) if signal.is_some() => cleanup,
+            Ok(Ok(_)) => cleanup,
+            Ok(Err(error)) => {
+                if let Err(cleanup_error) = cleanup {
+                    self.record_tui_cleanup_failure(&cleanup_error);
+                }
+                Err(error)
+            }
+            Err(payload) => {
+                if let Err(cleanup_error) = cleanup {
+                    self.record_tui_cleanup_failure(&cleanup_error);
+                }
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    fn run_inner(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        shutdown: &ShutdownNotification,
+    ) -> Result<ShutdownReason, String> {
         crate::worker::ensure_running()?;
-        self.offer_interrupted_run_recovery(&mut runtime)?;
+        self.offer_interrupted_run_recovery(runtime)?;
+        self.refresh_worktree_harness_configs();
         self.start_tmux_agent_warmup();
         self.poll_tmux_portal();
         self.start_wt_column_poll();
@@ -709,18 +988,21 @@ impl Tui {
         self.start_opencode_event_listeners();
         self.refresh_plan_runs();
         self.refresh_auto_runs(false);
-        self.draw(&mut runtime)?;
+        self.draw(runtime)?;
         if self.repos.is_empty() {
-            match self.add_repository(&mut runtime) {
+            match self.add_repository(runtime) {
                 Ok(()) => {}
                 Err(error) => self.show_error("add repository failed", &error)?,
             }
         }
         let mut key_input = KeyInput::default();
         let mut pending_g = false;
-        loop {
+        let shutdown_reason = loop {
+            if let Some(reason) = requested_shutdown(shutdown) {
+                break reason;
+            }
             if self.tick_tui_action_jobs().any() {
-                self.draw(&mut runtime)?;
+                self.draw(runtime)?;
             }
             let event = runtime.poll_event(Duration::from_millis(100))?;
             let Some(event) = event else {
@@ -732,18 +1014,18 @@ impl Tui {
                     if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
                         let area = runtime.area()?;
                         self.handle_mouse_click(event.column, event.row, area);
-                        self.draw(&mut runtime)?;
+                        self.draw(runtime)?;
                     }
                     continue;
                 }
                 RuntimeEvent::Resize => {
-                    self.draw(&mut runtime)?;
+                    self.draw(runtime)?;
                     continue;
                 }
                 RuntimeEvent::FocusGained => {
                     self.start_default_branch_status_poll(true);
                     self.poll_pull_requests(true);
-                    self.draw(&mut runtime)?;
+                    self.draw(runtime)?;
                     continue;
                 }
             };
@@ -849,22 +1131,20 @@ impl Tui {
                 Key::OpenTmuxSession => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.open_selected_comment_dialog(&mut runtime)? {
-                        self.draw(&mut runtime)?;
+                    if self.open_selected_comment_dialog(runtime)? {
+                        self.draw(runtime)?;
                         continue;
                     }
                     match self.open_tmux_session_target() {
                         OpenTmuxSessionTarget::RepoDefaultAgent(index) => {
-                            self.enter_agent_mode_for_index(&mut runtime, index)?
+                            self.enter_agent_mode_for_index(runtime, index)?
                         }
                         OpenTmuxSessionTarget::PlanPhaseAgent => {
-                            if let Err(error) = self.open_current_plan_tmux_session(&mut runtime) {
+                            if let Err(error) = self.open_current_plan_tmux_session(runtime) {
                                 self.show_error("plan phase tmux failed", &error)?;
                             }
                         }
-                        OpenTmuxSessionTarget::WorktreeAgent => {
-                            self.enter_agent_mode(&mut runtime)?
-                        }
+                        OpenTmuxSessionTarget::WorktreeAgent => self.enter_agent_mode(runtime)?,
                         OpenTmuxSessionTarget::Blocked(message) => self.show_message(message)?,
                     }
                 }
@@ -873,11 +1153,11 @@ impl Tui {
                     pending_g = false;
                     if self.git_action_enabled(GitAction::LazyGit) {
                         if self.focused_panel == PanelFocus::Repos {
-                            if let Err(error) = self.open_selected_repo_lazygit(&mut runtime) {
+                            if let Err(error) = self.open_selected_repo_lazygit(runtime) {
                                 self.show_error("repository lazygit failed", &error)?;
                             }
                         } else if let Err(error) =
-                            self.open_tmux_window(&mut runtime, TmuxWindow::LazyGit)
+                            self.open_tmux_window(runtime, TmuxWindow::LazyGit)
                         {
                             self.show_error("lazygit failed", &error)?;
                         }
@@ -889,7 +1169,7 @@ impl Tui {
                     if self.focused_panel == PanelFocus::Status {
                     } else if self.focused_panel != PanelFocus::Worktrees {
                         self.show_message("focus worktrees to start or focus Auto Flow")?;
-                    } else if let Err(error) = self.start_or_focus_selected_auto_run(&mut runtime) {
+                    } else if let Err(error) = self.start_or_focus_selected_auto_run(runtime) {
                         self.show_error("auto flow failed", &error)?;
                     }
                 }
@@ -897,7 +1177,7 @@ impl Tui {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.git_action_enabled(GitAction::OpenPr)
-                        && let Err(error) = self.open_selected_pr(&mut runtime)
+                        && let Err(error) = self.open_selected_pr(runtime)
                     {
                         self.show_error("open PR failed", &error)?;
                     }
@@ -908,11 +1188,10 @@ impl Tui {
                     if self.focused_panel == PanelFocus::Status {
                         self.show_message("focus repos or worktrees to open a terminal")?;
                     } else if self.focused_panel == PanelFocus::Repos {
-                        if let Err(error) = self.open_selected_repo_terminal(&mut runtime) {
+                        if let Err(error) = self.open_selected_repo_terminal(runtime) {
                             self.show_error("repository terminal failed", &error)?;
                         }
-                    } else if let Err(error) =
-                        self.open_tmux_window(&mut runtime, TmuxWindow::Terminal)
+                    } else if let Err(error) = self.open_tmux_window(runtime, TmuxWindow::Terminal)
                     {
                         self.show_error("terminal failed", &error)?;
                     }
@@ -920,20 +1199,20 @@ impl Tui {
                 Key::PlanActions => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if let Err(error) = self.show_plan_actions_dialog(&mut runtime) {
+                    if let Err(error) = self.show_plan_actions_dialog(runtime) {
                         self.show_error("plan actions failed", &error)?;
                     }
                 }
                 Key::Help => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    self.show_keybindings_dialog(&mut runtime)?;
+                    self.show_keybindings_dialog(runtime)?;
                 }
                 Key::Refresh => {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.focused_panel == PanelFocus::Repos && !self.main_focused {
-                        if let Err(error) = self.reorder_repositories(&mut runtime) {
+                        if let Err(error) = self.reorder_repositories(runtime) {
                             self.show_error("reorder repositories failed", &error)?;
                         }
                     } else {
@@ -977,7 +1256,7 @@ impl Tui {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.git_action_enabled(GitAction::ReviewFix)
-                        && let Err(error) = self.start_review_fix(&mut runtime)
+                        && let Err(error) = self.start_review_fix(runtime)
                     {
                         self.show_error("review fix failed", &error)?;
                     }
@@ -986,7 +1265,7 @@ impl Tui {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.git_action_enabled(GitAction::CiFix)
-                        && let Err(error) = self.start_ci_fix(&mut runtime)
+                        && let Err(error) = self.start_ci_fix(runtime)
                     {
                         self.show_error("CI failure prompt failed", &error)?;
                     }
@@ -995,7 +1274,7 @@ impl Tui {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.git_action_enabled(GitAction::ResolveAllComments)
-                        && let Err(error) = self.resolve_review_comments(&mut runtime)
+                        && let Err(error) = self.resolve_review_comments(runtime)
                     {
                         self.show_error("resolve review comments failed", &error)?;
                     }
@@ -1004,7 +1283,7 @@ impl Tui {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.git_action_enabled(GitAction::Push)
-                        && let Err(error) = self.push_selected_branch(&mut runtime)
+                        && let Err(error) = self.push_selected_branch(runtime)
                     {
                         self.show_error("push failed", &error)?;
                     }
@@ -1013,7 +1292,7 @@ impl Tui {
                     self.clear_leader_hint();
                     pending_g = false;
                     if self.git_action_enabled(GitAction::Merge)
-                        && let Err(error) = self.merge_selected_pr(&mut runtime)
+                        && let Err(error) = self.merge_selected_pr(runtime)
                     {
                         self.show_error("merge failed", &error)?;
                     }
@@ -1023,7 +1302,7 @@ impl Tui {
                     pending_g = false;
                     if self.focused_panel != PanelFocus::Repos {
                         self.show_message("focus repos to pull the default branch")?;
-                    } else if let Err(error) = self.pull_default_branch(&mut runtime) {
+                    } else if let Err(error) = self.pull_default_branch(runtime) {
                         self.show_error("pull failed", &error)?;
                     }
                 }
@@ -1033,7 +1312,7 @@ impl Tui {
                     if self.focused_panel == PanelFocus::Status {
                     } else if self.focused_panel != PanelFocus::Worktrees {
                         self.show_message("focus worktrees to run plan mode")?;
-                    } else if let Err(error) = self.start_selected_worktree_plan_run(&mut runtime) {
+                    } else if let Err(error) = self.start_selected_worktree_plan_run(runtime) {
                         self.show_error("plan mode failed", &error)?;
                     }
                 }
@@ -1043,7 +1322,7 @@ impl Tui {
                     if self.focused_panel != PanelFocus::Repos {
                         self.show_message("focus repos to create a worktree session")?;
                     } else {
-                        match self.create_session(&mut runtime) {
+                        match self.create_session(runtime) {
                             Ok(true) => self.focus_worktrees(),
                             Ok(false) => {}
                             Err(error) => self.show_error("create session failed", &error)?,
@@ -1062,14 +1341,14 @@ impl Tui {
                     pending_g = false;
                     if self.focused_panel != PanelFocus::Worktrees {
                         self.show_message("focus worktrees to abort an agent session")?;
-                    } else if let Err(error) = self.abort_selected_opencode_session(&mut runtime) {
+                    } else if let Err(error) = self.abort_selected_opencode_session(runtime) {
                         self.show_error("abort failed", &error)?;
                     }
                 }
                 Key::ManageRepos => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if let Err(error) = self.edit_repositories(&mut runtime) {
+                    if let Err(error) = self.edit_repositories(runtime) {
                         self.show_error("edit repositories failed", &error)?;
                     }
                 }
@@ -1078,7 +1357,7 @@ impl Tui {
                     pending_g = false;
                     if self.focused_panel != PanelFocus::Repos {
                         self.show_message("focus repos to open a remote PR worktree")?;
-                    } else if let Err(error) = self.open_remote_pr_worktree(&mut runtime) {
+                    } else if let Err(error) = self.open_remote_pr_worktree(runtime) {
                         self.show_error("open remote PR worktree failed", &error)?;
                     }
                 }
@@ -1092,7 +1371,7 @@ impl Tui {
                         self.show_message("focus worktrees to delete a worktree/session")?;
                     } else if self.focused_panel == PanelFocus::Repos {
                         self.show_message("repository removal is available from r")?;
-                    } else if let Err(error) = self.archive_session(&mut runtime) {
+                    } else if let Err(error) = self.archive_session(runtime) {
                         self.show_error("archive failed", &error)?;
                     }
                 }
@@ -1101,7 +1380,7 @@ impl Tui {
                     pending_g = false;
                     if self.focused_panel != PanelFocus::Repos {
                         self.show_message("focus repos to unarchive a worktree")?;
-                    } else if let Err(error) = self.unarchive_session(&mut runtime) {
+                    } else if let Err(error) = self.unarchive_session(runtime) {
                         self.show_error("unarchive failed", &error)?;
                     }
                 }
@@ -1115,42 +1394,42 @@ impl Tui {
                         self.show_message(
                             "focus worktrees to permanently delete a worktree/session",
                         )?;
-                    } else if let Err(error) = self.delete_session(&mut runtime) {
+                    } else if let Err(error) = self.delete_session(runtime) {
                         self.show_error("delete failed", &error)?;
                     }
                 }
                 Key::EditWorktreeColumns => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if let Err(error) = self.edit_worktree_columns(&mut runtime) {
+                    if let Err(error) = self.edit_worktree_columns(runtime) {
                         self.show_error("edit worktree columns failed", &error)?;
                     }
                 }
                 Key::EditConfig => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if let Err(error) = self.edit_config(&mut runtime) {
+                    if let Err(error) = self.edit_config(runtime) {
                         self.show_error("edit config failed", &error)?;
                     }
                 }
                 Key::EditUserConfig => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if let Err(error) = self.edit_user_config(&mut runtime) {
+                    if let Err(error) = self.edit_user_config(runtime) {
                         self.show_error("edit user config failed", &error)?;
                     }
                 }
                 Key::SelectHarness => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if let Err(error) = self.select_default_harness(&mut runtime) {
+                    if let Err(error) = self.select_default_harness(runtime) {
                         self.show_error("select harness failed", &error)?;
                     }
                 }
                 Key::Search => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    self.search_sessions(&mut runtime)?;
+                    self.search_sessions(runtime)?;
                 }
                 Key::Other => {
                     self.clear_leader_hint();
@@ -1158,16 +1437,18 @@ impl Tui {
                 }
             }
             if should_quit {
-                break;
+                break ShutdownReason::UserQuit;
             }
-            self.draw(&mut runtime)?;
-        }
-        self.shutdown_owned_opencode_servers();
-        Ok(())
+            self.draw(runtime)?;
+        };
+        Ok(shutdown_reason)
     }
 
     fn tick_tui_action_jobs(&mut self) -> TuiBackgroundChanges {
+        self.tui_tick_active = true;
+        self.route_tui_job_messages();
         let changes = TuiBackgroundChanges {
+            sessions: self.poll_session_refresh(),
             tmux: self.poll_tmux_agent_warmup(),
             tmux_portal: self.poll_tmux_portal(),
             worktree_columns: self.poll_wt_columns(),
@@ -1183,6 +1464,8 @@ impl Tui {
         self.start_default_branch_status_poll(false);
         self.start_opencode_status_poll(false);
         self.start_opencode_event_listeners();
+        self.poll_workflow_maintenance();
+        self.tui_tick_active = false;
         changes
     }
 
@@ -1192,6 +1475,550 @@ impl Tui {
             return Ok(false);
         }
         Ok(true)
+    }
+
+    pub(crate) fn request_workflow_maintenance(&mut self) {
+        self.workflow_maintenance_due = true;
+    }
+
+    fn poll_workflow_maintenance(&mut self) {
+        while self.workflow_maintenance_rx.try_recv().is_ok() {}
+        let due = self.workflow_maintenance_due
+            || self.workflow_maintenance_last_started.elapsed() >= WORKFLOW_MAINTENANCE_INTERVAL;
+        if self.workflow_maintenance_in_flight || !due {
+            return;
+        }
+        let repos = self
+            .repos
+            .iter()
+            .map(|managed| managed.repo.clone())
+            .collect::<Vec<_>>();
+        self.workflow_maintenance_in_flight = true;
+        self.workflow_maintenance_due = false;
+        self.workflow_maintenance_last_started = Instant::now();
+        self.spawn_tui_job(
+            TuiJobKind::WorkflowMaintenance,
+            TuiJobKey::None,
+            0,
+            Some(TUI_ACTION_JOB_TIMEOUT),
+            "prism-tui-maintenance".to_string(),
+            move |_| {
+                for repo in &repos {
+                    if let Err(error) = maintain_workflow_storage(repo) {
+                        let _ = crate::observability::append_runtime_message(
+                            repo,
+                            &format!("workflow maintenance failed: {error}"),
+                        );
+                    }
+                }
+                Ok(Some(TuiJobPayload::WorkflowMaintenance))
+            },
+        );
+    }
+
+    pub(crate) fn spawn_tui_job<F>(
+        &mut self,
+        kind: TuiJobKind,
+        key: TuiJobKey,
+        generation: u64,
+        timeout: Option<Duration>,
+        name: String,
+        job: F,
+    ) where
+        F: FnOnce(
+                JobContext<TuiJobKind, TuiJobKey, TuiJobPayload>,
+            ) -> Result<Option<TuiJobPayload>, String>
+            + Send
+            + 'static,
+    {
+        if kind == TuiJobKind::DeleteSession {
+            self.jobs
+                .spawn_reliable(kind, key, generation, timeout, name, job);
+        } else {
+            self.jobs.spawn(kind, key, generation, timeout, name, job);
+        }
+    }
+
+    pub(crate) fn route_tui_job_messages(&mut self) {
+        if self.routing_tui_jobs {
+            return;
+        }
+        self.routing_tui_jobs = true;
+        let deadline = Instant::now() + TUI_TICK_TIME_BUDGET;
+        self.route_tui_job_messages_with_budget(TUI_TICK_ITEM_BUDGET, deadline);
+        self.routing_tui_jobs = false;
+    }
+
+    fn route_tui_job_messages_with_budget(&mut self, limit: usize, deadline: Instant) -> usize {
+        for metadata in self.jobs.active_metadata() {
+            if !self.job_generation_is_current(&metadata) {
+                self.jobs.cancel(metadata.id);
+            }
+        }
+        let mut processed = 0;
+        let mut restart_session_refresh = false;
+        while processed < limit && (processed == 0 || Instant::now() < deadline) {
+            let Some(message) = self.jobs.drain_terminals(1).into_iter().next() else {
+                break;
+            };
+            let JobMessage::Terminal { metadata, outcome } = message else {
+                unreachable!();
+            };
+            processed += 1;
+            self.clear_tui_job_in_flight(&metadata);
+            self.record_tui_job_terminal(&metadata, &outcome);
+            match outcome {
+                JobOutcome::Completed | JobOutcome::Canceled => {}
+                JobOutcome::Failed(_) | JobOutcome::SpawnFailed(_) => {
+                    self.recover_failed_tui_job(&metadata);
+                }
+                JobOutcome::Panicked(_) => {
+                    self.recover_failed_tui_job(&metadata);
+                }
+                JobOutcome::DeadlineExceeded => {
+                    self.recover_failed_tui_job(&metadata);
+                }
+            }
+            if metadata.kind == TuiJobKind::SessionRefresh && self.session_refresh_pending {
+                restart_session_refresh = true;
+                self.session_refresh_pending = false;
+            }
+        }
+
+        let selected = self.selected_worktree_context().and_then(|context| {
+            let session = self.sessions.get(context.session_index)?;
+            let repo = self.repos.get(session.repo_index)?;
+            Some(session.identity_key(&repo.identity))
+        });
+        let priority = |metadata: &JobMetadata<TuiJobKind, TuiJobKey>| {
+            if metadata.kind == TuiJobKind::DeleteSession {
+                return 0;
+            }
+            let selected_job = selected
+                .as_ref()
+                .is_some_and(|selected| match &metadata.key {
+                    TuiJobKey::Worktree(key) => key == selected,
+                    TuiJobKey::Tmux(key) => &key.slot.worktree == selected,
+                    TuiJobKey::Pr(key) => &key.worktree == selected,
+                    TuiJobKey::Opencode(key) => &key.worktree == selected,
+                    TuiJobKey::OpencodeListener(stream) => &stream.worktree == selected,
+                    TuiJobKey::None | TuiJobKey::Repository(_) | TuiJobKey::Delete(_) => false,
+                });
+            if selected_job { 1 } else { 3 }
+        };
+
+        while processed < limit
+            && Instant::now() < deadline
+            && self
+                .jobs
+                .latest_min_priority(priority)
+                .is_some_and(|value| value <= 1)
+        {
+            let Some(JobMessage::Payload { metadata, payload }) =
+                self.jobs.take_latest_by(priority)
+            else {
+                break;
+            };
+            processed += 1;
+            if self.job_generation_is_current(&metadata) {
+                self.route_tui_job_payload(payload);
+            }
+        }
+
+        while processed < limit && Instant::now() < deadline {
+            let Some(message) = self.jobs.take_stream_event() else {
+                break;
+            };
+            let JobMessage::Payload { metadata, payload } = message else {
+                unreachable!();
+            };
+            processed += 1;
+            if self.job_generation_is_current(&metadata)
+                && let TuiJobPayload::OpencodeEvent(result) = payload
+            {
+                self.opencode_events_changed |= self.apply_opencode_event_result(result);
+            }
+        }
+
+        while processed < limit && Instant::now() < deadline {
+            let Some(JobMessage::Payload { metadata, payload }) =
+                self.jobs.take_latest_by(priority)
+            else {
+                break;
+            };
+            processed += 1;
+            if self.job_generation_is_current(&metadata) {
+                self.route_tui_job_payload(payload);
+            }
+        }
+
+        for metadata in self.jobs.take_dirty_jobs() {
+            if self.job_generation_is_current(&metadata)
+                && let TuiJobKey::OpencodeListener(stream) = metadata.key
+            {
+                self.request_opencode_reconciliation_for(stream.worktree);
+            }
+        }
+        let stats = self.jobs.queue_stats();
+        if stats.overflow_delta > 0 || stats.coalesced_delta > 0 {
+            self.record_tui_queue_stats(stats);
+        }
+        if restart_session_refresh && !self.scheduling_stopped {
+            let _ = self.refresh_sessions_after_tmux();
+        }
+        processed
+    }
+
+    fn route_tui_job_payload(&self, payload: TuiJobPayload) {
+        match payload {
+            TuiJobPayload::SessionRefresh(result) => {
+                let _ = self.session_refresh_tx.send(result);
+            }
+            TuiJobPayload::WorkflowMaintenance => {
+                let _ = self.workflow_maintenance_tx.send(());
+            }
+            TuiJobPayload::PrPoll(result) => {
+                let _ = self.pr_poll_tx.send(result);
+            }
+            TuiJobPayload::DeleteSession(result) => {
+                let _ = self.delete_session_tx.send(result);
+            }
+            TuiJobPayload::TmuxWarmup(result) => {
+                let _ = self.tmux_warmup_tx.send(result);
+            }
+            TuiJobPayload::TmuxPortal(result) => {
+                let _ = self.tmux_portal_tx.send(result);
+            }
+            TuiJobPayload::WorktreeColumns(result) => {
+                let _ = self.wt_poll_tx.send(result);
+            }
+            TuiJobPayload::DefaultBranch(result) => {
+                let _ = self.default_branch_poll_tx.send(result);
+            }
+            TuiJobPayload::OpencodePoll(result) => {
+                let _ = self.opencode_poll_tx.send(result);
+            }
+            TuiJobPayload::OpencodeEvent(result) => {
+                #[cfg(test)]
+                let _ = self.opencode_event_tx.send(result);
+                #[cfg(not(test))]
+                let _ = result;
+            }
+        }
+    }
+
+    fn clear_tui_job_in_flight(&mut self, metadata: &JobMetadata<TuiJobKind, TuiJobKey>) {
+        match (&metadata.kind, &metadata.key) {
+            (TuiJobKind::SessionRefresh, _) => self.session_refresh_in_flight = false,
+            (TuiJobKind::WorkflowMaintenance, _) => self.workflow_maintenance_in_flight = false,
+            (TuiJobKind::PrSummary, TuiJobKey::Repository(repository)) => {
+                if let Some(repo) = self
+                    .repos
+                    .iter_mut()
+                    .find(|repo| &repo.identity == repository)
+                {
+                    repo.pr_summary_poll_in_flight = false;
+                }
+            }
+            (TuiJobKind::PrDetails, TuiJobKey::Pr(key)) => {
+                self.pr_polls_in_flight.remove(key);
+            }
+            (TuiJobKind::DeleteSession, TuiJobKey::Delete(key)) => {
+                self.delete_sessions_in_flight.remove(key);
+            }
+            (TuiJobKind::TmuxWarmup, TuiJobKey::Tmux(key)) => {
+                self.tmux_warmups_in_flight.remove(key);
+            }
+            (TuiJobKind::TmuxPortal, TuiJobKey::Tmux(key)) => {
+                self.tmux_portal_polls_in_flight.remove(key);
+            }
+            (TuiJobKind::WorktreeColumns, TuiJobKey::Repository(repository)) => {
+                if let Some(repo) = self
+                    .repos
+                    .iter_mut()
+                    .find(|repo| &repo.identity == repository)
+                {
+                    repo.wt_poll_in_flight = false;
+                }
+            }
+            (TuiJobKind::DefaultBranch, TuiJobKey::Worktree(key)) => {
+                if let Some(repo) = self
+                    .repos
+                    .iter_mut()
+                    .find(|repo| repo.identity == key.repository)
+                {
+                    repo.default_branch_poll_in_flight = false;
+                }
+            }
+            (TuiJobKind::OpencodePoll, TuiJobKey::Opencode(key)) => {
+                self.opencode_polls_in_flight.remove(key);
+            }
+            (TuiJobKind::OpencodeListener, TuiJobKey::OpencodeListener(stream)) => {
+                self.opencode_listeners.remove(stream);
+            }
+            _ => {}
+        }
+    }
+
+    fn job_generation_is_current(&self, metadata: &JobMetadata<TuiJobKind, TuiJobKey>) -> bool {
+        match &metadata.key {
+            TuiJobKey::None => {
+                metadata.kind == TuiJobKind::WorkflowMaintenance
+                    || metadata.generation == self.session_inventory_generation
+            }
+            TuiJobKey::Repository(_) => metadata.generation == self.session_inventory_generation,
+            TuiJobKey::Worktree(key) => {
+                self.worktree_generation_is_current(key, metadata.generation)
+            }
+            TuiJobKey::Pr(key) => {
+                key.generation == metadata.generation
+                    && self.worktree_generation_is_current(&key.worktree, metadata.generation)
+            }
+            TuiJobKey::Delete(key) => {
+                key.generation == metadata.generation
+                    && self.worktree_generation_is_current(&key.worktree, metadata.generation)
+            }
+            TuiJobKey::Tmux(key) => {
+                key.generation == metadata.generation
+                    && crate::agent_session::key_is_current(&self.tmux_generations, key)
+            }
+            TuiJobKey::Opencode(key) => {
+                key.generation == metadata.generation
+                    && self.worktree_generation_is_current(&key.worktree, metadata.generation)
+            }
+            TuiJobKey::OpencodeListener(stream) => self
+                .worktree_generations
+                .get(&stream.worktree)
+                .is_some_and(|generation| {
+                    *generation == metadata.generation
+                        && stream.generation == metadata.generation
+                        && self.sessions.iter().enumerate().any(|(index, session)| {
+                            self.visible_session_indices().contains(&index)
+                                && self.repos.get(session.repo_index).is_some_and(|managed| {
+                                    session.identity_key(&managed.identity) == stream.worktree
+                                })
+                                && session.opencode_status.as_ref().is_some_and(|status| {
+                                    status.server_url.as_deref() == Some(stream.server_url.as_str())
+                                        && status.session_id.as_deref()
+                                            == Some(stream.session_id.as_str())
+                                })
+                        })
+                }),
+        }
+    }
+
+    fn worktree_generation_is_current(
+        &self,
+        worktree: &WorktreeSessionKey,
+        generation: u64,
+    ) -> bool {
+        self.worktree_generations.get(worktree).copied() == Some(generation)
+    }
+
+    fn record_tui_job_terminal(
+        &self,
+        metadata: &JobMetadata<TuiJobKind, TuiJobKey>,
+        outcome: &JobOutcome,
+    ) {
+        let outcome_kind = outcome.kind();
+        let error = outcome.error_message();
+        let key = format!("{:?}", metadata.key);
+        let deadline_ms = metadata.deadline.map(|deadline| {
+            deadline
+                .saturating_duration_since(metadata.started_at)
+                .as_millis() as i64
+        });
+        crate::observability::emit_deferred(crate::observability::EventInput {
+            level: match outcome_kind {
+                crate::tui_jobs::JobOutcomeKind::Failed
+                | crate::tui_jobs::JobOutcomeKind::SpawnFailed
+                | crate::tui_jobs::JobOutcomeKind::Panicked
+                | crate::tui_jobs::JobOutcomeKind::DeadlineExceeded => {
+                    crate::observability::LogLevel::Error
+                }
+                crate::tui_jobs::JobOutcomeKind::Completed
+                | crate::tui_jobs::JobOutcomeKind::Canceled => {
+                    crate::observability::LogLevel::Debug
+                }
+            },
+            target: "tui_job",
+            action: "terminal",
+            operation_id: None,
+            parent_operation_id: None,
+            branch: None,
+            session: None,
+            message: format!(
+                "TUI job {} #{} finished with {}",
+                metadata.kind.label(),
+                metadata.id,
+                outcome_kind.label()
+            ),
+            data_json: Some(crate::observability::job_data_json(
+                crate::observability::JobObservation {
+                    job_id: metadata.id,
+                    kind: metadata.kind.label(),
+                    key: &key,
+                    generation: metadata.generation,
+                    outcome: outcome_kind.label(),
+                    elapsed_ms: metadata.started_at.elapsed().as_millis() as i64,
+                    deadline_ms,
+                    error: error.as_deref(),
+                },
+            )),
+        });
+    }
+
+    fn record_tui_queue_stats(&self, stats: crate::tui_jobs::QueueStats) {
+        crate::observability::emit_deferred(crate::observability::EventInput {
+            level: if stats.overflow_delta > 0 {
+                crate::observability::LogLevel::Warn
+            } else {
+                crate::observability::LogLevel::Debug
+            },
+            target: "tui",
+            action: "queue_pressure",
+            operation_id: None,
+            parent_operation_id: None,
+            branch: None,
+            session: None,
+            message: format!(
+                "TUI delivery pressure: {} overflowed, {} coalesced",
+                stats.overflow_delta, stats.coalesced_delta
+            ),
+            data_json: Some(format!(
+                "{{\"event_depth\":{},\"event_capacity\":{},\"coalesced_depth\":{},\"coalesced_capacity\":{},\"latest_depth\":{},\"terminal_depth\":{},\"overflow_count\":{},\"overflow_total\":{},\"coalesced_count\":{},\"coalesced_total\":{},\"stream_dirty\":{}}}",
+                stats.event_depth,
+                stats.event_capacity,
+                stats.coalesced_depth,
+                stats.coalesced_capacity,
+                stats.latest_depth,
+                stats.terminal_depth,
+                stats.overflow_delta,
+                stats.overflow_total,
+                stats.coalesced_delta,
+                stats.coalesced_total,
+                stats.dirty,
+            )),
+        });
+    }
+
+    fn recover_failed_tui_job(&mut self, metadata: &JobMetadata<TuiJobKind, TuiJobKey>) {
+        if let (TuiJobKind::DeleteSession, TuiJobKey::Delete(key)) = (&metadata.kind, &metadata.key)
+            && let Some(session) = self.sessions.iter_mut().find(|session| {
+                self.repos
+                    .get(session.repo_index)
+                    .is_some_and(|repo| session.identity_key(&repo.identity) == key.worktree)
+            })
+        {
+            session.hidden = false;
+            self.ensure_navigation_valid();
+        }
+    }
+
+    fn cleanup_tui_jobs(&mut self, reason: ShutdownReason) -> Result<(), String> {
+        let mut errors = Vec::new();
+        let started = Instant::now();
+        let active_jobs = self.jobs.active_metadata().len();
+        self.scheduling_stopped = true;
+        self.jobs.stop_accepting();
+        self.jobs.cancel_all();
+        if let Err(error) = self.shutdown_owned_opencode_servers() {
+            errors.push(error);
+        }
+        while self.jobs.has_jobs() && started.elapsed() < TUI_JOB_SHUTDOWN_GRACE {
+            self.route_tui_job_messages();
+            if self.jobs.has_jobs() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        self.route_tui_job_messages();
+        let unfinished = self.jobs.abandon_unfinished();
+        if unfinished > 0 {
+            errors.push(format!(
+                "detached {unfinished} uncooperative job(s) after shutdown grace period"
+            ));
+        }
+        crate::observability::emit_deferred(crate::observability::EventInput {
+            level: if errors.is_empty() {
+                crate::observability::LogLevel::Info
+            } else {
+                crate::observability::LogLevel::Warn
+            },
+            target: "tui",
+            action: "shutdown_cleanup",
+            operation_id: None,
+            parent_operation_id: None,
+            branch: None,
+            session: None,
+            message: format!(
+                "TUI shutdown cleanup finished: reason={}, active_jobs={}, unfinished_jobs={unfinished}",
+                reason.label(),
+                active_jobs
+            ),
+            data_json: Some(crate::observability::shutdown_data_json(
+                reason.label(),
+                active_jobs,
+                unfinished,
+                started.elapsed().as_millis() as i64,
+            )),
+        });
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
+    fn record_tui_cleanup_failure(&self, error: &str) {
+        let message = format!("TUI cleanup failed: {error}");
+        if crate::observability::append_runtime_message(&self.repo, &message).is_err() {
+            eprintln!("prism: {message}");
+        }
+    }
+
+    pub(crate) fn refresh_worktree_harness_configs(&mut self) {
+        let live = self
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                let managed = self.repos.get(session.repo_index)?;
+                Some(session.identity_key(&managed.identity))
+            })
+            .collect::<BTreeSet<_>>();
+        self.worktree_harness_configs
+            .retain(|key, _| live.contains(key));
+        for session in &self.sessions {
+            let Some(managed) = self.repos.get(session.repo_index) else {
+                continue;
+            };
+            let key = session.identity_key(&managed.identity);
+            if self.worktree_harness_configs.contains_key(&key) {
+                continue;
+            }
+            let Some(config) = crate::session::worktree_harness(&managed.repo, session)
+                .ok()
+                .and_then(|association| managed.config.for_harness(&association.harness_id).ok())
+            else {
+                continue;
+            };
+            self.worktree_harness_configs.insert(key, config);
+        }
+    }
+
+    pub(crate) fn reload_worktree_harness_config(&mut self, session_index: usize) {
+        let Some(session) = self.sessions.get(session_index) else {
+            return;
+        };
+        let Some(managed) = self.repos.get(session.repo_index) else {
+            return;
+        };
+        let key = session.identity_key(&managed.identity);
+        self.worktree_harness_configs.remove(&key);
+        self.refresh_worktree_harness_configs();
+        self.session_inventory_generation = self.session_inventory_generation.saturating_add(1);
+        if self.session_refresh_in_flight {
+            self.session_refresh_pending = true;
+        }
     }
 
     fn enter_agent_mode(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
@@ -1216,13 +2043,10 @@ impl Tui {
             index,
             (terminal_area.width, terminal_area.height.saturating_sub(1)),
         )?;
-        runtime.suspend()?;
-        let result = self.attach_tmux_session_for_index(index);
-        let resume_result = runtime.resume();
-        self.refresh_sessions()?;
+        let result = runtime.suspend_for(|| self.attach_tmux_session_for_index(index));
+        self.refresh_sessions_after_tmux()?;
         self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();
-        resume_result?;
         if let Err(error) = result {
             self.show_error("tmux session failed", &error)?;
         }
@@ -1278,6 +2102,7 @@ impl Tui {
                     );
                 }
                 crate::session::set_worktree_harness(&repo, &session, &target, false)?;
+                self.reload_worktree_harness_config(index);
                 crate::agent_session::rotate_generation(
                     &self.repos,
                     &mut self.tmux_generations,
@@ -1324,6 +2149,7 @@ impl Tui {
             use_.generation,
         );
         crate::session::set_worktree_harness(&repo, &session, &target, false)?;
+        self.reload_worktree_harness_config(index);
         crate::agent_session::rotate_generation(&self.repos, &mut self.tmux_generations, use_.slot);
         self.show_message(&format!("migrated worktree to harness '{target}'"))?;
         Ok(())
@@ -1338,13 +2164,10 @@ impl Tui {
             return Ok(());
         }
         let navigation = self.navigation_snapshot();
-        runtime.suspend()?;
-        let result = self.attach_selected_tmux_window(window);
-        let resume_result = runtime.resume();
-        self.refresh_sessions()?;
+        let result = runtime.suspend_for(|| self.attach_selected_tmux_window(window));
+        self.refresh_sessions_after_tmux()?;
         self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();
-        resume_result?;
         result
     }
 
@@ -2660,11 +3483,7 @@ impl Tui {
             .map(|managed| managed.repo.clone())
             .collect::<Vec<_>>();
         for repo in repos {
-            let loaded = crate::observability::with_writable_db(&repo, |conn| {
-                let _ = cleanup_stale_archived_plan_runs(
-                    conn,
-                    ARCHIVED_PLAN_RETENTION.as_millis() as u64,
-                );
+            let loaded = crate::observability::with_nonblocking_read_db(&repo, |conn| {
                 let runs = load_recent_plan_runs_for_repo(conn, &repo.root, 8)?;
                 Ok(runs)
             });
@@ -2682,9 +3501,9 @@ impl Tui {
         let repo = Repository {
             root: repo_root.to_path_buf(),
         };
-        if let Ok(Some(run)) =
-            crate::observability::with_writable_db(&repo, |conn| load_plan_run(conn, run_id))
-        {
+        if let Ok(Some(run)) = crate::observability::with_nonblocking_read_db(&repo, |conn| {
+            load_plan_run(conn, run_id)
+        }) {
             self.remember_plan_run(run);
         }
     }
@@ -2715,10 +3534,7 @@ impl Tui {
         let mut run = self.plan_runs.get(&run_id)?.clone();
         let run_scope_path = run.run.scope_path.clone();
         run.run.selected_step = self.resolved_plan_step_selection(&run);
-        let output_lines = crate::observability::with_writable_db(&repo, |conn| {
-            load_output_lines(conn, &run.run.id, run.run.selected_step)
-        })
-        .unwrap_or_default();
+        let output_lines = self.plan_output_snapshot(&repo, &run.run.id, run.run.selected_step);
         let mut output_state = self
             .plan_output_state_by_run
             .get(&run.run.id)
@@ -2831,6 +3647,13 @@ impl Tui {
     }
 
     fn poll_auto_runs(&mut self) -> bool {
+        if self
+            .last_auto_poll
+            .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
+        {
+            return false;
+        }
+        self.last_auto_poll = Some(Instant::now());
         self.refresh_auto_runs(false)
     }
 
@@ -2842,8 +3665,8 @@ impl Tui {
             .map(|managed| managed.repo.clone())
             .collect::<Vec<_>>();
         for repo in repos {
-            let loaded = crate::observability::with_writable_db(&repo, |conn| {
-                let runs = load_recent_active_runs_for_repo(conn, &repo.root, 8)?;
+            let loaded = crate::observability::with_nonblocking_read_db(&repo, |conn| {
+                let runs = load_recent_active_run_snapshots_for_repo(conn, &repo.root, 8)?;
                 let _ = reconcile_stale;
                 Ok(runs)
             });
@@ -2861,9 +3684,9 @@ impl Tui {
         let repo = Repository {
             root: repo_root.to_path_buf(),
         };
-        if let Ok(Some(run)) =
-            crate::observability::with_writable_db(&repo, |conn| load_auto_run(conn, run_id))
-        {
+        if let Ok(Some(run)) = crate::observability::with_nonblocking_read_db(&repo, |conn| {
+            load_auto_run_snapshot(conn, run_id)
+        }) {
             self.remember_auto_run(run);
         }
     }
@@ -2902,12 +3725,7 @@ impl Tui {
             .selected_step_run_id
             .or_else(|| run.steps.first().and_then(|step| step.id));
         let output_lines = selected_step_run_id
-            .and_then(|step_run_id| {
-                crate::observability::with_writable_db(&repo, |conn| {
-                    load_auto_output_lines(conn, step_run_id)
-                })
-                .ok()
-            })
+            .map(|step_run_id| self.auto_output_snapshot(&repo, step_run_id))
             .unwrap_or_default();
         let mut output_state = self
             .auto_output_state_by_run
@@ -2944,16 +3762,15 @@ impl Tui {
         plan_run_id: &str,
     ) -> Option<view::PlanDashboard> {
         let mut run = self.plan_runs.get(plan_run_id).cloned().or_else(|| {
-            crate::observability::with_writable_db(repo, |conn| load_plan_run(conn, plan_run_id))
-                .ok()
-                .flatten()
+            crate::observability::with_nonblocking_read_db(repo, |conn| {
+                load_plan_run(conn, plan_run_id)
+            })
+            .ok()
+            .flatten()
         })?;
         let run_scope_path = run.run.scope_path.clone();
         run.run.selected_step = self.resolved_plan_step_selection(&run);
-        let output_lines = crate::observability::with_writable_db(repo, |conn| {
-            load_output_lines(conn, &run.run.id, run.run.selected_step)
-        })
-        .unwrap_or_default();
+        let output_lines = self.plan_output_snapshot(repo, &run.run.id, run.run.selected_step);
         let mut output_state = self
             .plan_output_state_by_run
             .get(&run.run.id)
@@ -2976,6 +3793,51 @@ impl Tui {
             output_lines,
             output_state,
         })
+    }
+
+    fn plan_output_snapshot(
+        &self,
+        repo: &Repository,
+        run_id: &str,
+        step: usize,
+    ) -> Vec<PlanOutputLine> {
+        let key = (run_id.to_string(), step);
+        match crate::observability::with_nonblocking_read_db(repo, |conn| {
+            load_output_lines(conn, run_id, step)
+        }) {
+            Ok(lines) => {
+                self.plan_output_cache
+                    .borrow_mut()
+                    .insert(key, lines.clone());
+                lines
+            }
+            Err(_) => self
+                .plan_output_cache
+                .borrow()
+                .get(&key)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    fn auto_output_snapshot(&self, repo: &Repository, step_run_id: i64) -> Vec<AutoOutputLine> {
+        let key = (WorktreeRepositoryKey::new(repo.root.clone()), step_run_id);
+        match crate::observability::with_nonblocking_read_db(repo, |conn| {
+            load_auto_output_lines(conn, step_run_id)
+        }) {
+            Ok(lines) => {
+                self.auto_output_cache
+                    .borrow_mut()
+                    .insert(key.clone(), lines.clone());
+                lines
+            }
+            Err(_) => self
+                .auto_output_cache
+                .borrow()
+                .get(&key)
+                .cloned()
+                .unwrap_or_default(),
+        }
     }
 
     fn resolved_plan_step_selection(&self, run: &PersistedPlanRun) -> usize {
@@ -3211,7 +4073,7 @@ impl Tui {
             },
             Some(capture) => match &capture.result {
                 Ok(lines) => (
-                    &capture.key.slot.branch,
+                    &capture.key.slot.worktree.branch,
                     view::TmuxPortalState::Ready(lines),
                 ),
                 Err(_) => (&session.branch, view::TmuxPortalState::Loading),
@@ -3552,6 +4414,8 @@ fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -3564,18 +4428,21 @@ mod tests {
     };
     use crate::config::Config;
     use crate::github::{PrCache, PrDetails, PrReviewComment, PrSummary};
+    use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
     use crate::plan_run::{
-        PersistedPlanRun, PlanRun, PlanRunMode, PlanRunStatus, PlanStepRun, PlanStepStatus,
+        PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRun, PlanRunMode, PlanRunStatus,
+        PlanStepRun, PlanStepStatus,
     };
     use crate::repo::Repository;
     use crate::session::{Session, WorktreeRepositoryKey};
+    use crate::tui_jobs::{CoalescedFacet, JobRegistry};
     use crate::view::{ChoiceList, KeyChoice, OrderedToggleItem, RepoMainView, WorktreeMainView};
 
     use super::{
         GitAction, ManagedRepo, OpenTmuxSessionTarget, PanelFocus, PrPollKey, TmuxPortalCapture,
-        TmuxPortalResult, TmuxPortalSnapshot, Tui, WorktreeListMode, confirmation_result,
-        move_enabled_ordered_item, selectable_choice_key, toggle_item_in_place,
-        toggle_ordered_item,
+        TmuxPortalResult, TmuxPortalSnapshot, Tui, TuiJobKey, TuiJobKind, WorktreeListMode,
+        confirmation_result, move_enabled_ordered_item, selectable_choice_key,
+        toggle_item_in_place, toggle_ordered_item,
     };
 
     #[test]
@@ -3607,6 +4474,693 @@ mod tests {
 
         assert!(tui.confirm_quit().unwrap());
         assert!(tui.dialog.is_none());
+    }
+
+    #[test]
+    fn shutdown_notification_requests_the_matching_run_loop_exit_path() {
+        let notification = crate::tui_signal::ShutdownNotification::for_test();
+        assert_eq!(super::requested_shutdown(&notification), None);
+
+        notification.request_for_test(crate::tui_signal::ShutdownSignal::Sigterm);
+
+        assert_eq!(
+            super::requested_shutdown(&notification),
+            Some(super::ShutdownReason::Sigterm)
+        );
+    }
+
+    #[test]
+    fn opencode_in_flight_clears_after_panic_and_spawn_failure_then_restarts() {
+        let _ = crate::observability::take_captured_events();
+        let temp = unique_temp_dir("prism-tui-job-recovery-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+        let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+        let key = super::OpencodePollKey::for_repository_session(
+            &tui.repos[0].identity,
+            &tui.sessions[0],
+        );
+
+        tui.opencode_polls_in_flight.insert(key.clone());
+        tui.spawn_tui_job(
+            TuiJobKind::OpencodePoll,
+            TuiJobKey::Opencode(key.clone()),
+            key.generation,
+            Some(Duration::from_secs(1)),
+            "panic-before-result".to_string(),
+            |_| panic!("before result"),
+        );
+        wait_for_opencode_job(&mut tui, &key);
+        assert!(!tui.opencode_polls_in_flight.contains(&key));
+
+        tui.opencode_polls_in_flight.insert(key.clone());
+        tui.jobs.fail_next_spawn();
+        tui.spawn_tui_job(
+            TuiJobKind::OpencodePoll,
+            TuiJobKey::Opencode(key.clone()),
+            key.generation,
+            Some(Duration::from_secs(1)),
+            "spawn-failure".to_string(),
+            |_| Ok(None),
+        );
+        wait_for_opencode_job(&mut tui, &key);
+        assert!(!tui.opencode_polls_in_flight.contains(&key));
+
+        tui.opencode_polls_in_flight.insert(key.clone());
+        tui.spawn_tui_job(
+            TuiJobKind::OpencodePoll,
+            TuiJobKey::Opencode(key.clone()),
+            key.generation,
+            Some(Duration::from_secs(1)),
+            "restart-after-failure".to_string(),
+            |_| Ok(None),
+        );
+        wait_for_opencode_job(&mut tui, &key);
+        assert!(!tui.opencode_polls_in_flight.contains(&key));
+
+        let terminal_events = crate::observability::take_captured_events()
+            .into_iter()
+            .filter(|event| event.target == "tui_job" && event.action == "terminal")
+            .filter_map(|event| event.data_json)
+            .map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap())
+            .filter(|data| data["kind"] == "opencode_poll")
+            .filter(|data| {
+                data["key"]
+                    .as_str()
+                    .is_some_and(|key| key.contains(&temp.display().to_string()))
+            })
+            .collect::<Vec<_>>();
+        for (job_id, outcome) in [(1, "panicked"), (2, "spawn_failed"), (3, "completed")] {
+            let matching = terminal_events
+                .iter()
+                .filter(|data| data["job_id"] == job_id && data["outcome"] == outcome)
+                .count();
+            assert_eq!(matching, 1, "job {job_id} outcome {outcome}");
+        }
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn tui_tick_terminal_budget_retains_every_remaining_outcome() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let mut tui = Tui::new_single(repo, test_config(), Vec::new());
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(101));
+        let completed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for index in 0..100 {
+            let barrier = barrier.clone();
+            let completed = completed.clone();
+            tui.spawn_tui_job(
+                TuiJobKind::WorkflowMaintenance,
+                TuiJobKey::None,
+                0,
+                None,
+                format!("budget-{index}"),
+                move |_| {
+                    barrier.wait();
+                    completed.fetch_add(1, std::sync::atomic::Ordering::Release);
+                    Ok(None)
+                },
+            );
+        }
+        barrier.wait();
+        while completed.load(std::sync::atomic::Ordering::Acquire) != 100 {
+            std::thread::yield_now();
+        }
+        while !tui.jobs.active_metadata().is_empty() {
+            tui.jobs.collect_finished();
+            std::thread::yield_now();
+        }
+
+        tui.route_tui_job_messages();
+
+        assert_eq!(
+            tui.jobs.queue_stats().terminal_depth,
+            100 - super::TUI_TICK_ITEM_BUDGET
+        );
+    }
+
+    #[test]
+    fn opencode_snapshot_burst_converges_through_bounded_coalesced_slots() {
+        let temp = unique_temp_dir("prism-opencode-coalesced-burst-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+        session.agent_state = AgentState::Running;
+        session.opencode_status = Some(OpencodeStatus {
+            server_url: Some("http://127.0.0.1:1".to_string()),
+            session_id: Some("ses_1".to_string()),
+            title: None,
+            state: OpencodeState::Busy,
+            detail: None,
+            latest_message: None,
+            latest_user_message: None,
+            recent_messages: Vec::new(),
+            active_tool: None,
+            todos: Vec::new(),
+            last_updated_unix_ms: None,
+        });
+        let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+        tui.jobs = JobRegistry::with_event_capacity(2);
+        let worktree = tui.sessions[0].identity_key(&tui.repos[0].identity);
+        let stream = super::OpencodeListenerKey {
+            worktree: worktree.clone(),
+            generation: 0,
+            session_id: "ses_1".to_string(),
+            server_url: "http://127.0.0.1:1".to_string(),
+        };
+        tui.opencode_listeners.insert(stream.clone());
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let job_stream = stream.clone();
+        let job_id = tui.jobs.spawn(
+            TuiJobKind::OpencodeListener,
+            TuiJobKey::OpencodeListener(stream),
+            0,
+            None,
+            "coalesced-listener".to_string(),
+            move |context| {
+                let send = |context: &crate::tui_jobs::JobContext<_, _, _>, facet, event| {
+                    context.send_coalesced(
+                        facet,
+                        super::TuiJobPayload::OpencodeEvent(super::OpencodeEventResult {
+                            stream: job_stream.clone(),
+                            received_at: Instant::now(),
+                            event: Ok(event),
+                        }),
+                    )
+                };
+                send(
+                    &context,
+                    CoalescedFacet::Status,
+                    parse_event_payload(
+                        r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":"busy"}}"#,
+                    )
+                    .unwrap(),
+                )?;
+                send(
+                    &context,
+                    CoalescedFacet::Message,
+                    parse_event_payload(
+                        r#"{"type":"message.part.updated","properties":{"sessionID":"ses_1","role":"assistant","text":"initial"}}"#,
+                    )
+                    .unwrap(),
+                )?;
+                for index in 0..100 {
+                    let state = if index == 99 { "retry" } else { "busy" };
+                    send(
+                        &context,
+                        CoalescedFacet::Status,
+                        parse_event_payload(&format!(
+                            r#"{{"type":"session.status","properties":{{"sessionID":"ses_1","status":"{state}"}}}}"#
+                        ))
+                        .unwrap(),
+                    )?;
+                    send(
+                        &context,
+                        CoalescedFacet::Message,
+                        parse_event_payload(&format!(
+                            r#"{{"type":"message.part.updated","properties":{{"sessionID":"ses_1","role":"assistant","text":"message-{index}"}}}}"#
+                        ))
+                        .unwrap(),
+                    )?;
+                }
+                ready_tx.send(()).unwrap();
+                while !context.wait(Duration::from_secs(60)) {}
+                Ok(None)
+            },
+        );
+        ready_rx.recv().unwrap();
+
+        tui.route_tui_job_messages();
+
+        let status = tui.sessions[0].opencode_status.as_ref().unwrap();
+        assert_eq!(status.state, OpencodeState::Retry);
+        assert_eq!(status.latest_message.as_deref(), Some("message-99"));
+        assert!(tui.opencode_reconcile_requested.contains_key(&worktree));
+        let stats = tui.jobs.queue_stats();
+        assert_eq!(stats.event_capacity, 2);
+        assert_eq!(stats.event_depth, 0);
+        assert_eq!(stats.coalesced_depth, 0);
+        assert_eq!(stats.coalesced_capacity, 2);
+        assert_eq!(stats.overflow_total, 200);
+        assert_eq!(stats.coalesced_total, 198);
+
+        tui.jobs.cancel(job_id);
+        while tui.jobs.has_jobs() {
+            tui.route_tui_job_messages();
+            std::thread::yield_now();
+        }
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn opencode_overflow_requests_full_reconciliation_and_stale_events_cannot_regress_it() {
+        let temp = unique_temp_dir("prism-opencode-overflow-reconcile-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+        session.agent_state = AgentState::Running;
+        session.opencode_status = Some(OpencodeStatus {
+            server_url: Some("http://127.0.0.1:1".to_string()),
+            session_id: Some("ses_1".to_string()),
+            title: None,
+            state: OpencodeState::Busy,
+            detail: None,
+            latest_message: None,
+            latest_user_message: None,
+            recent_messages: Vec::new(),
+            active_tool: None,
+            todos: Vec::new(),
+            last_updated_unix_ms: None,
+        });
+        let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+        let worktree = tui.sessions[0].identity_key(&tui.repos[0].identity);
+        let stream = super::OpencodeListenerKey {
+            worktree: worktree.clone(),
+            generation: 0,
+            session_id: "ses_1".to_string(),
+            server_url: "http://127.0.0.1:1".to_string(),
+        };
+        tui.opencode_listeners.insert(stream.clone());
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let job_stream = stream.clone();
+        tui.spawn_tui_job(
+            TuiJobKind::OpencodeListener,
+            TuiJobKey::OpencodeListener(stream),
+            0,
+            None,
+            "overflow-listener".to_string(),
+            move |context| {
+                for _ in 0..1_000 {
+                    context.send(super::TuiJobPayload::OpencodeEvent(
+                        super::OpencodeEventResult {
+                            stream: job_stream.clone(),
+                            received_at: Instant::now(),
+                            event: Ok(parse_event_payload(
+                                r#"{"type":"todo.updated","properties":{"sessionID":"ses_1","todos":[{"content":"ordered","status":"pending"}]}}"#,
+                            )
+                            .unwrap()),
+                        },
+                    ))?;
+                }
+                context.send_coalesced(
+                    CoalescedFacet::Status,
+                    super::TuiJobPayload::OpencodeEvent(super::OpencodeEventResult {
+                        stream: job_stream.clone(),
+                        received_at: Instant::now(),
+                        event: Ok(parse_event_payload(
+                            r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":"error"}}"#,
+                        )
+                        .unwrap()),
+                    }),
+                )?;
+                context.send_coalesced(
+                    CoalescedFacet::Message,
+                    super::TuiJobPayload::OpencodeEvent(super::OpencodeEventResult {
+                        stream: job_stream.clone(),
+                        received_at: Instant::now(),
+                        event: Ok(parse_event_payload(
+                            r#"{"type":"message.part.updated","properties":{"sessionID":"ses_1","role":"assistant","text":"stale message"}}"#,
+                        )
+                        .unwrap()),
+                    }),
+                )?;
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Ok(None)
+            },
+        );
+        ready_rx.recv().unwrap();
+
+        tui.route_tui_job_messages();
+        let requested_at = *tui.opencode_reconcile_requested.get(&worktree).unwrap();
+        let stats = tui.jobs.queue_stats();
+        assert_eq!(stats.overflow_total, 1_002 - stats.event_capacity as u64);
+        assert!(stats.event_depth <= stats.event_capacity);
+        assert_eq!(stats.coalesced_depth, 2);
+
+        let poll_key = super::OpencodePollKey::for_repository_session(
+            &tui.repos[0].identity,
+            &tui.sessions[0],
+        );
+        tui.opencode_poll_tx
+            .send(super::OpencodePollResult {
+                key: poll_key,
+                started_at: requested_at + Duration::from_nanos(1),
+                status: Ok(OpencodeStatus {
+                    state: OpencodeState::Done,
+                    latest_message: Some("fresh poll message".to_string()),
+                    ..tui.sessions[0].opencode_status.clone().unwrap()
+                }),
+            })
+            .unwrap();
+        tui.poll_opencode_status();
+        assert!(!tui.opencode_reconcile_requested.contains_key(&worktree));
+
+        for _ in 0..16 {
+            tui.route_tui_job_messages();
+            tui.poll_opencode_events();
+        }
+        assert_eq!(
+            tui.sessions[0].opencode_status.as_ref().unwrap().state,
+            OpencodeState::Done
+        );
+        assert_eq!(
+            tui.sessions[0]
+                .opencode_status
+                .as_ref()
+                .unwrap()
+                .latest_message
+                .as_deref(),
+            Some("fresh poll message")
+        );
+        assert_eq!(tui.jobs.queue_stats().coalesced_depth, 0);
+
+        release_tx.send(()).unwrap();
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn stale_opencode_job_payload_is_rejected_after_generation_changes() {
+        let temp = unique_temp_dir("prism-tui-job-generation-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+        let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+        let session_key = tui.sessions[0].identity_key(&tui.repos[0].identity);
+        let key = super::OpencodePollKey::for_repository_session(
+            &tui.repos[0].identity,
+            &tui.sessions[0],
+        );
+        tui.opencode_polls_in_flight.insert(key.clone());
+        let payload_key = key.clone();
+        tui.spawn_tui_job(
+            TuiJobKind::OpencodePoll,
+            TuiJobKey::Opencode(key.clone()),
+            key.generation,
+            Some(Duration::from_secs(1)),
+            "stale-opencode-poll".to_string(),
+            move |_| {
+                Ok(Some(super::TuiJobPayload::OpencodePoll(
+                    super::OpencodePollResult {
+                        key: payload_key,
+                        started_at: Instant::now(),
+                        status: Ok(crate::opencode::OpencodeStatus {
+                            server_url: None,
+                            session_id: None,
+                            title: None,
+                            state: crate::opencode::OpencodeState::Busy,
+                            detail: None,
+                            latest_message: None,
+                            latest_user_message: None,
+                            recent_messages: Vec::new(),
+                            active_tool: None,
+                            todos: Vec::new(),
+                            last_updated_unix_ms: None,
+                        }),
+                    },
+                )))
+            },
+        );
+        *tui.worktree_generations.get_mut(&session_key).unwrap() = 1;
+
+        wait_for_opencode_job(&mut tui, &key);
+        tui.poll_opencode_status();
+
+        assert!(tui.sessions[0].opencode_status.is_none());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn cleanup_cancels_and_joins_listener_job() {
+        let _ = crate::observability::take_captured_events();
+        let (mut tui, stopped_rx) = tui_with_active_listener("user-quit");
+
+        tui.cleanup_tui_jobs(super::ShutdownReason::UserQuit)
+            .unwrap();
+
+        stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!tui.jobs.has_jobs());
+        assert!(tui.opencode_listeners.is_empty());
+        let cleanup = crate::observability::take_captured_events()
+            .into_iter()
+            .filter(|event| event.target == "tui" && event.action == "shutdown_cleanup")
+            .filter_map(|event| event.data_json)
+            .map(|data| serde_json::from_str::<serde_json::Value>(&data).unwrap())
+            .find(|data| data["reason"] == "user_quit" && data["active_jobs"] == 1)
+            .unwrap();
+        assert_eq!(cleanup["reason"], "user_quit");
+        assert_eq!(cleanup["active_jobs"], 1);
+        assert_eq!(cleanup["unfinished_jobs"], 0);
+    }
+
+    #[test]
+    fn run_error_path_cleans_up_active_listener() {
+        let (mut tui, stopped_rx) = tui_with_active_listener("run-error");
+
+        let error = tui
+            .finish_run(Ok(Err("injected draw error".to_string())), None)
+            .unwrap_err();
+
+        assert_eq!(error, "injected draw error");
+        stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!tui.jobs.has_jobs());
+        assert!(tui.opencode_listeners.is_empty());
+    }
+
+    #[test]
+    fn sigterm_exit_path_cleans_up_active_listener() {
+        let (mut tui, stopped_rx) = tui_with_active_listener("sigterm");
+        let notification = crate::tui_signal::ShutdownNotification::for_test();
+        notification.request_for_test(crate::tui_signal::ShutdownSignal::Sigterm);
+        assert_eq!(
+            super::requested_shutdown(&notification),
+            Some(super::ShutdownReason::Sigterm)
+        );
+
+        tui.finish_run(
+            Ok(Err("interactive subprocess canceled".to_string())),
+            notification.signal(),
+        )
+        .unwrap();
+
+        stopped_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!tui.jobs.has_jobs());
+        assert!(tui.opencode_listeners.is_empty());
+    }
+
+    fn tui_with_active_listener(label: &str) -> (Tui, std::sync::mpsc::Receiver<()>) {
+        let repo = Repository {
+            root: PathBuf::from(format!("/tmp/prism-cleanup-{label}")),
+        };
+        let session = test_session(
+            0,
+            &format!("/tmp/prism-cleanup-{label}/worktree"),
+            "feature",
+        );
+        let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+        let key = tui.sessions[0].identity_key(&tui.repos[0].identity);
+        let stream = super::OpencodeListenerKey {
+            worktree: key,
+            generation: 0,
+            session_id: "ses_1".to_string(),
+            server_url: "http://127.0.0.1:41000".to_string(),
+        };
+        let (stopped_tx, stopped_rx) = std::sync::mpsc::channel();
+        tui.opencode_listeners.insert(stream.clone());
+        tui.spawn_tui_job(
+            TuiJobKind::OpencodeListener,
+            TuiJobKey::OpencodeListener(stream),
+            0,
+            None,
+            "cleanup-listener".to_string(),
+            move |context| {
+                while !context.wait(Duration::from_secs(60)) {}
+                stopped_tx.send(()).unwrap();
+                Ok(None)
+            },
+        );
+
+        (tui, stopped_rx)
+    }
+
+    fn wait_for_opencode_job(tui: &mut Tui, key: &super::OpencodePollKey) {
+        let started = Instant::now();
+        while tui.opencode_polls_in_flight.contains(key) {
+            tui.route_tui_job_messages();
+            assert!(started.elapsed() < Duration::from_secs(1));
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn workflow_database_writer_does_not_block_input_loop() {
+        let temp = unique_temp_dir("prism-tui-database-poll-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        crate::observability::with_writable_db(&repo, |_| Ok(())).unwrap();
+        let blocker = rusqlite::Connection::open(crate::observability::db_path(&repo)).unwrap();
+        blocker
+            .execute_batch("begin exclusive transaction")
+            .unwrap();
+        let mut tui = Tui::new_single(repo, test_config(), Vec::new());
+        tui.last_plan_poll = Some(Instant::now());
+
+        let started = Instant::now();
+        tui.tick_tui_action_jobs();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "workflow polling blocked input for {elapsed:?}"
+        );
+
+        drop(tui);
+        drop(blocker);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn plan_database_writer_does_not_block_input_loop() {
+        let temp = unique_temp_dir("prism-tui-plan-database-poll-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        crate::observability::with_writable_db(&repo, |_| Ok(())).unwrap();
+        let blocker = rusqlite::Connection::open(crate::observability::db_path(&repo)).unwrap();
+        blocker
+            .execute_batch("begin exclusive transaction")
+            .unwrap();
+        let mut tui = Tui::new_single(repo, test_config(), Vec::new());
+        tui.last_auto_poll = Some(Instant::now());
+
+        let started = Instant::now();
+        tui.tick_tui_action_jobs();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "plan polling blocked input for {elapsed:?}"
+        );
+
+        drop(tui);
+        drop(blocker);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn workflow_database_writer_does_not_block_dashboard_rendering() {
+        let temp = unique_temp_dir("prism-tui-dashboard-database-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        crate::observability::with_writable_db(&repo, |_| Ok(())).unwrap();
+        let session = test_session(0, &temp.display().to_string(), "feature");
+        let scope_path = session.path.clone();
+        let mut run = test_plan_run_with_steps("plan", &scope_path.display().to_string(), 1);
+        run.run.repo_root = temp.display().to_string();
+        crate::observability::with_writable_db(&repo, |conn| {
+            crate::plan_run::save_plan_run(conn, &run)?;
+            crate::plan_run::append_output_line(
+                conn,
+                &PlanOutputLine {
+                    run_id: "plan".to_string(),
+                    step: 1,
+                    line_number: 1,
+                    time_unix_ms: 1,
+                    kind: PlanOutputKind::Assistant,
+                    text: "cached output".to_string(),
+                    block_id: None,
+                },
+                100,
+            )
+        })
+        .unwrap();
+        let mut tui = Tui::new_single(repo.clone(), test_config(), vec![session]);
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.remember_plan_run(run);
+        assert_eq!(
+            tui.current_plan_dashboard().unwrap().output_lines[0].text,
+            "cached output"
+        );
+        let blocker = rusqlite::Connection::open(crate::observability::db_path(&repo)).unwrap();
+        blocker
+            .execute_batch("begin exclusive transaction")
+            .unwrap();
+
+        let started = Instant::now();
+        let dashboard = tui.current_plan_dashboard();
+        let elapsed = started.elapsed();
+
+        assert_eq!(dashboard.unwrap().output_lines[0].text, "cached output");
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "dashboard rendering blocked for {elapsed:?}"
+        );
+
+        drop(blocker);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn returning_from_tmux_does_not_wait_for_worktree_refresh() {
+        let temp = unique_temp_dir("prism-tmux-return-refresh-test");
+        let worktree = temp.join("feature");
+        fs::create_dir_all(&worktree).unwrap();
+        fs::write(worktree.join(".git"), "gitdir: /tmp/gitdir\n").unwrap();
+        let git = temp.join("git");
+        fs::write(
+            &git,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  *"worktree list --porcelain"*)
+    sleep 1
+    printf 'worktree {}\nHEAD abc\nbranch refs/heads/feature\n\n'
+    ;;
+  *"status --short --branch"*) printf '## feature\n' ;;
+  *"remote get-url origin"*) printf 'git@github.com:owner/repo.git\n' ;;
+esac
+"#,
+                worktree.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&git).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&git, permissions).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        fs::create_dir_all(repo.prism_dir()).unwrap();
+        fs::write(
+            repo.prism_dir().join("config.toml"),
+            format!("[tools]\ngit = {:?}\n", git.display().to_string()),
+        )
+        .unwrap();
+        let config = Config::load(&repo);
+        let session = test_session(0, &temp.display().to_string(), "feature");
+        let mut tui = Tui::new_single(repo, config, vec![session]);
+
+        let started = Instant::now();
+        tui.refresh_sessions_after_tmux().unwrap();
+        tui.refresh_sessions_after_tmux().unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "returning from tmux waited for refresh for {elapsed:?}"
+        );
+
+        let wait_started = Instant::now();
+        while tui.session_refresh_in_flight && wait_started.elapsed() < Duration::from_secs(3) {
+            tui.poll_session_refresh();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!tui.session_refresh_in_flight);
+        assert!(!tui.session_refresh_pending);
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -3728,6 +5282,7 @@ mod tests {
         );
         tui.focused_panel = PanelFocus::Worktrees;
         tui.tmux_portal_size = Some((72, 18));
+        tui.refresh_worktree_harness_configs();
         let slot =
             AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
         let stale_key = AgentSessionWarmupKey::new(slot.clone(), 0);
@@ -3740,6 +5295,7 @@ mod tests {
                 key: stale_key,
                 started_at: Instant::now(),
                 capture: Ok(vec![Line::from("stale output")]),
+                resized_size: None,
             })
             .unwrap();
 
@@ -3768,6 +5324,7 @@ mod tests {
         );
         tui.focused_panel = PanelFocus::Worktrees;
         tui.tmux_portal_size = Some((72, 18));
+        tui.refresh_worktree_harness_configs();
         let slot =
             AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
         tui.tmux_generations.insert(slot, 0);
@@ -3777,6 +5334,103 @@ mod tests {
             !tui.tmux_portal_polls_in_flight.is_empty(),
             "selecting a worktree should immediately start an asynchronous tmux capture"
         );
+    }
+
+    #[test]
+    fn workflow_database_writer_does_not_block_tmux_portal_polling() {
+        let temp = unique_temp_dir("prism-tmux-portal-database-test");
+        fs::create_dir_all(&temp).unwrap();
+        let tmux = temp.join("tmux");
+        fs::write(&tmux, "#!/bin/sh\nexit 1\n").unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        let session = test_session(0, &temp.display().to_string(), "feature");
+        crate::session::worktree_harness(&repo, &session).unwrap();
+        let mut tui = Tui::new_single(repo.clone(), config, vec![session]);
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.tmux_portal_size = Some((72, 18));
+        tui.refresh_worktree_harness_configs();
+        let slot =
+            AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
+        tui.tmux_generations.insert(slot, 0);
+        let blocker = rusqlite::Connection::open(crate::observability::db_path(&repo)).unwrap();
+        blocker
+            .execute_batch("begin exclusive transaction")
+            .unwrap();
+
+        let started = Instant::now();
+        tui.tick_tui_action_jobs();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "worktree polling blocked input for {elapsed:?}"
+        );
+
+        drop(blocker);
+        let _ = tui.tmux_portal_rx.recv_timeout(Duration::from_secs(1));
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn tmux_portal_resizes_once_for_unchanged_target_and_size() {
+        let temp = unique_temp_dir("prism-tmux-portal-resize-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {:?}\nif [ \"$1\" = capture-pane ]; then printf 'output\\n'; fi\nexit 0\n",
+                log.display().to_string()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        let session = test_session(0, &temp.display().to_string(), "feature");
+        let mut tui = Tui::new_single(repo, config, vec![session]);
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.tmux_portal_size = Some((72, 18));
+        tui.refresh_worktree_harness_configs();
+        let slot =
+            AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
+        let key = AgentSessionWarmupKey::new(slot.clone(), 0);
+        tui.tmux_generations.insert(slot, 0);
+
+        tui.poll_tmux_portal();
+        wait_for_tmux_portal_job(&mut tui);
+        tui.tmux_portal_last_polled
+            .insert(key, Instant::now() - Duration::from_secs(1));
+        tui.poll_tmux_portal();
+        wait_for_tmux_portal_job(&mut tui);
+
+        let commands = fs::read_to_string(log).unwrap();
+        assert_eq!(commands.matches("resize-window").count(), 1);
+        assert_eq!(commands.matches("capture-pane").count(), 2);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    fn wait_for_tmux_portal_job(tui: &mut Tui) {
+        let started = Instant::now();
+        while !tui.tmux_portal_polls_in_flight.is_empty() {
+            tui.poll_tmux_portal();
+            assert!(started.elapsed() < Duration::from_secs(1));
+            std::thread::yield_now();
+        }
     }
 
     #[test]
@@ -3794,6 +5448,7 @@ mod tests {
         );
         tui.focused_panel = PanelFocus::Worktrees;
         tui.tmux_portal_size = Some((72, 18));
+        tui.refresh_worktree_harness_configs();
         let previous_slot =
             AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
         let selected_slot =
@@ -3835,7 +5490,41 @@ mod tests {
     }
 
     #[test]
-    fn tmux_portal_clears_in_flight_capture_when_inactive() {
+    fn tmux_portal_waits_for_running_capture_after_selection_changes() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let mut tui = Tui::new_single(
+            repo,
+            test_config(),
+            vec![
+                test_session(0, "/tmp/repo-a", "feature-a"),
+                test_session(0, "/tmp/repo-b", "feature-b"),
+            ],
+        );
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.tmux_portal_size = Some((72, 18));
+        tui.refresh_worktree_harness_configs();
+        let first_slot =
+            AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
+        let second_slot =
+            AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[1]);
+        let first_key = AgentSessionWarmupKey::new(first_slot.clone(), 0);
+        let second_key = AgentSessionWarmupKey::new(second_slot.clone(), 0);
+        tui.tmux_generations.insert(first_slot, 0);
+        tui.tmux_generations.insert(second_slot, 0);
+        tui.tmux_portal_polls_in_flight
+            .insert(first_key.clone(), Instant::now());
+        tui.select_worktree(1);
+
+        tui.poll_tmux_portal();
+
+        assert!(tui.tmux_portal_polls_in_flight.contains_key(&first_key));
+        assert!(!tui.tmux_portal_polls_in_flight.contains_key(&second_key));
+    }
+
+    #[test]
+    fn tmux_portal_tracks_in_flight_capture_when_inactive() {
         let repo = Repository {
             root: PathBuf::from("/tmp/repo"),
         };
@@ -3847,10 +5536,11 @@ mod tests {
         let slot =
             AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
         let key = AgentSessionWarmupKey::new(slot, 0);
-        tui.tmux_portal_polls_in_flight.insert(key, Instant::now());
+        tui.tmux_portal_polls_in_flight
+            .insert(key.clone(), Instant::now());
 
         assert!(!tui.poll_tmux_portal());
-        assert!(tui.tmux_portal_polls_in_flight.is_empty());
+        assert!(tui.tmux_portal_polls_in_flight.contains_key(&key));
     }
 
     #[test]
@@ -3865,6 +5555,7 @@ mod tests {
         );
         tui.focused_panel = PanelFocus::Worktrees;
         tui.tmux_portal_size = Some((72, 18));
+        tui.refresh_worktree_harness_configs();
         let slot =
             AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
         let key = AgentSessionWarmupKey::new(slot.clone(), 0);
@@ -3880,6 +5571,7 @@ mod tests {
                 key: key.clone(),
                 started_at: previous_started_at,
                 capture: Ok(vec![Line::from("superseded output")]),
+                resized_size: None,
             })
             .unwrap();
 
@@ -4030,7 +5722,7 @@ mod tests {
         crate::ui_state::save_to_path(&path, WorktreeListMode::Global).unwrap();
         let mut tui = test_tui();
 
-        tui.use_persisted_ui_state(path.clone());
+        tui.use_persisted_ui_state(path.clone()).unwrap();
 
         assert_eq!(tui.worktree_list_mode, WorktreeListMode::Global);
 
@@ -4039,11 +5731,34 @@ mod tests {
 
         assert_eq!(tui.worktree_list_mode, WorktreeListMode::Repo);
         assert_eq!(
-            crate::ui_state::load_from_path(&path),
+            crate::ui_state::load_from_path(&path).unwrap(),
             Some(WorktreeListMode::Repo)
         );
 
         let _ = std::fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn invalid_persisted_ui_state_keeps_current_mode_and_reports_error() {
+        let temp = unique_temp_dir("prism-tui-invalid-ui-state-test");
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("ui-state.toml");
+        fs::write(&path, "worktree_list_mode = 42\n").unwrap();
+        let mut tui = Tui::new(Vec::new(), 0, Vec::new());
+
+        tui.use_persisted_ui_state(path.clone()).unwrap();
+
+        assert_eq!(tui.worktree_list_mode, WorktreeListMode::Repo);
+        assert!(
+            tui.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains(&path.display().to_string()))
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "worktree_list_mode = 42\n"
+        );
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

@@ -5,9 +5,8 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -15,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::execution::{self, DispatchState, ExecutionClaim, WorkflowIdentity, WorkflowKind};
+use crate::process::DetachedProcessPolicy;
 use crate::repo::Repository;
 use crate::util::stable_hash;
 use crate::{observability, workspace};
@@ -31,21 +31,8 @@ pub fn ensure_running() -> Result<(), String> {
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve Prism worker executable: {error}"))?;
     let mut command = Command::new(executable);
-    command
-        .args(["worker", "serve"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    command
-        .spawn()
+    command.args(["worker", "serve"]);
+    crate::process::spawn_detached(&mut command, DetachedProcessPolicy::WorkerDaemon)
         .map_err(|error| format!("start Prism worker daemon: {error}"))?;
 
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -223,7 +210,8 @@ fn respond(
 }
 
 fn classify_abandoned(instance_id: &str) -> Result<(), String> {
-    for entry in workspace::discover_valid_entries(workspace::load_entries()) {
+    for entry in workspace::discover_valid_entries(workspace::load_entries()?) {
+        observability::attach_run_repo(&entry.repo)?;
         observability::with_writable_db(&entry.repo, |conn| {
             execution::mark_abandoned(conn, instance_id).map(|_| ())
         })?;
@@ -239,8 +227,22 @@ fn schedule_queued(instance_id: &str, active: Arc<Mutex<BTreeSet<PathBuf>>>) {
     if active_count >= GLOBAL_CONCURRENCY {
         return;
     }
-    for entry in workspace::discover_valid_entries(workspace::load_entries()) {
+    let entries = match workspace::load_entries() {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("Prism worker cannot load repositories: {error}");
+            return;
+        }
+    };
+    for entry in workspace::discover_valid_entries(entries) {
         let repo = entry.repo;
+        if let Err(error) = observability::attach_run_repo(&repo) {
+            eprintln!(
+                "Prism worker cannot attach repository {}: {error}",
+                repo.root.display()
+            );
+            continue;
+        }
         let _ = observability::with_writable_db(&repo, |conn| {
             execution::mark_abandoned(conn, instance_id).map(|_| ())
         });
@@ -305,27 +307,8 @@ pub fn legacy_worker_running(
         workflow.kind.label(),
         stable_hash(Path::new(&workflow.run_id))
     );
-    let output = Command::new(config.tool("tmux"))
-        .env_remove("TMUX")
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-        .map_err(|error| format!("inspect legacy tmux workers: {error}"))?;
-    if !output.status.success() {
-        let error = String::from_utf8_lossy(&output.stderr);
-        if tmux_list_means_no_server(&error) {
-            return Ok(false);
-        }
-        return Err(format!("inspect legacy tmux workers: {}", error.trim()));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .any(|name| name == expected))
-}
-
-fn tmux_list_means_no_server(error: &str) -> bool {
-    error.contains("no server running")
-        || error.contains("no sessions")
-        || error.contains("error connecting to")
+    crate::tmux::named_session_exists(config, &expected)
+        .map_err(|error| format!("inspect legacy tmux workers: {error}"))
 }
 
 fn workflow_worktree(repo: &Repository, workflow: &WorkflowIdentity) -> Result<PathBuf, String> {
@@ -574,7 +557,14 @@ fn mark_domain_failed(repo: &Repository, claim: &ExecutionClaim, error: &str) {
 }
 
 fn log_daemon_lifecycle(action: &str, instance_id: &str) {
-    for entry in workspace::discover_valid_entries(workspace::load_entries()) {
+    let entries = match workspace::load_entries() {
+        Ok(entries) => entries,
+        Err(error) => {
+            eprintln!("Prism worker cannot load repositories: {error}");
+            return;
+        }
+    };
+    for entry in workspace::discover_valid_entries(entries) {
         let data = format!("{{\"daemon_instance_id\":\"{instance_id}\"}}");
         log_worker_event(
             &entry.repo,
@@ -732,12 +722,5 @@ mod tests {
             ),
             PathBuf::from("/override")
         );
-    }
-
-    #[test]
-    fn isolated_tmux_connection_error_means_no_legacy_worker() {
-        assert!(tmux_list_means_no_server(
-            "error connecting to /tmp/prism/tmux-0/default (No such file or directory)"
-        ));
     }
 }

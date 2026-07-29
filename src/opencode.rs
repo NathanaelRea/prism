@@ -23,14 +23,15 @@ const HEALTH_TIMEOUT: Duration = Duration::from_millis(250);
 const API_TIMEOUT: Duration = Duration::from_secs(5);
 const SSE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const SSE_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const SSE_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_START_POLL: Duration = Duration::from_millis(100);
 
 static OWNED_SERVER_PROCESSES: OnceLock<Mutex<BTreeMap<u32, OwnedServerProcess>>> = OnceLock::new();
 
-#[derive(Clone, Copy, Debug)]
 struct OwnedServerProcess {
     start_time_ticks: Option<u64>,
+    child: crate::process::SupervisedChild,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -153,6 +154,12 @@ pub struct OpencodeEvent {
     pub todos: Option<Vec<OpencodeTodo>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpencodeSnapshotFacet {
+    Status,
+    Message,
+}
+
 impl OpencodeStatus {
     pub fn offline(server_url: Option<String>, session_id: Option<String>) -> Self {
         Self {
@@ -216,21 +223,19 @@ pub fn ensure_opencode_server_with_program(
     let server_pid = if check_health(&server_url) {
         existing.as_ref().and_then(|runtime| runtime.server_pid)
     } else {
-        let mut child = Command::new(program)
+        let mut command = Command::new(program);
+        command
             .arg("serve")
             .args(["--hostname", "127.0.0.1"])
             .args(["--port", &port.to_string()])
             .current_dir(worktree)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
+            .stderr(Stdio::null());
+        let mut child = crate::process::SupervisedChild::spawn(&mut command, None, None)
             .map_err(|error| format!("start opencode server: {error}"))?;
-        record_owned_server_process(child.id());
         if let Err(error) = wait_for_health(&server_url) {
-            let _ = child.kill();
-            let _ = child.wait();
-            forget_owned_server_process(child.id());
+            let _ = child.terminate();
             return Err(error);
         }
         let pid = child.id();
@@ -253,11 +258,12 @@ pub fn ensure_opencode_server_with_program(
     };
     if let Err(error) = save_runtime(repo, &runtime) {
         if let Some(mut child) = started_server {
-            let _ = child.kill();
-            let _ = child.wait();
-            forget_owned_server_process(child.id());
+            let _ = child.terminate();
         }
         return Err(error);
+    }
+    if let Some(child) = started_server {
+        record_owned_server_process(child);
     }
     Ok(runtime)
 }
@@ -406,38 +412,22 @@ pub fn shutdown_owned_server(runtime: &OpencodeRuntime) -> Result<(), String> {
     let Some(pid) = runtime.server_pid else {
         return Ok(());
     };
-    let Some(owned) = owned_server_process(pid) else {
+    let Some(mut owned) = take_owned_server_process(pid) else {
         return Ok(());
     };
-    if !process_matches_owned_start(pid, owned) {
-        forget_owned_server_process(pid);
+    if !process_matches_owned_start(pid, owned.start_time_ticks) {
+        let _ = owned.child.try_wait();
         return Ok(());
     }
-    #[cfg(unix)]
-    {
-        let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-        if result == 0 {
-            forget_owned_server_process(pid);
-            Ok(())
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                forget_owned_server_process(pid);
-                Ok(())
-            } else {
-                Err(format!("stop opencode server {pid}: {error}"))
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        Ok(())
-    }
+    owned
+        .child
+        .terminate()
+        .map(|_| ())
+        .map_err(|error| format!("stop opencode server {pid}: {error}"))
 }
 
 pub(crate) fn shutdown_stored_server(runtime: &OpencodeRuntime) -> Result<(), String> {
-    if runtime.server_pid.and_then(owned_server_process).is_some() {
+    if runtime.server_pid.is_some_and(owned_server_process) {
         return shutdown_owned_server(runtime);
     }
     let Some(pid) = runtime.server_pid else {
@@ -446,21 +436,20 @@ pub(crate) fn shutdown_stored_server(runtime: &OpencodeRuntime) -> Result<(), St
     if !stored_server_process_matches(pid, runtime.server_port) {
         return Ok(());
     }
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
-        let result = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-        if result == 0 {
-            Ok(())
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::ESRCH) {
-                Ok(())
-            } else {
-                Err(format!("stop opencode server {pid}: {error}"))
-            }
+        let Some(expected_start) = runtime.server_start_time_ticks else {
+            return Ok(());
+        };
+        match crate::harness::process_start_time_ticks(pid) {
+            None => return Ok(()),
+            Some(actual_start) if actual_start != expected_start => return Ok(()),
+            Some(_) => {}
         }
+        crate::harness::terminate_process(pid, Some(expected_start))
+            .map_err(|error| format!("stop opencode server {pid}: {error}"))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     {
         let _ = pid;
         Ok(())
@@ -523,29 +512,34 @@ fn owned_server_processes() -> &'static Mutex<BTreeMap<u32, OwnedServerProcess>>
     OWNED_SERVER_PROCESSES.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-fn record_owned_server_process(pid: u32) {
-    if let Ok(mut processes) = owned_server_processes().lock() {
-        processes.insert(
-            pid,
-            OwnedServerProcess {
-                start_time_ticks: process_start_time_ticks(pid),
-            },
-        );
-    }
+fn record_owned_server_process(child: crate::process::SupervisedChild) {
+    let pid = child.id();
+    let process = OwnedServerProcess {
+        start_time_ticks: process_start_time_ticks(pid),
+        child,
+    };
+    owned_server_processes()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(pid, process);
 }
 
-fn owned_server_process(pid: u32) -> Option<OwnedServerProcess> {
-    owned_server_processes().lock().ok()?.get(&pid).copied()
+fn owned_server_process(pid: u32) -> bool {
+    owned_server_processes()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains_key(&pid)
 }
 
-fn forget_owned_server_process(pid: u32) {
-    if let Ok(mut processes) = owned_server_processes().lock() {
-        processes.remove(&pid);
-    }
+fn take_owned_server_process(pid: u32) -> Option<OwnedServerProcess> {
+    owned_server_processes()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .remove(&pid)
 }
 
-fn process_matches_owned_start(pid: u32, owned: OwnedServerProcess) -> bool {
-    match (owned.start_time_ticks, process_start_time_ticks(pid)) {
+fn process_matches_owned_start(pid: u32, expected_start_time_ticks: Option<u64>) -> bool {
+    match (expected_start_time_ticks, process_start_time_ticks(pid)) {
         (Some(expected), Some(actual)) => expected == actual,
         (Some(_), None) => false,
         (None, _) => true,
@@ -684,9 +678,52 @@ pub fn listen_events(
     })
 }
 
+pub fn listen_events_until(
+    server_url: &str,
+    should_stop: impl FnMut() -> bool,
+    mut on_event: impl FnMut(OpencodeEvent) -> Result<(), String>,
+) -> Result<(), String> {
+    listen_classified_events_until(server_url, should_stop, |event, _| on_event(event))
+}
+
+pub(crate) fn listen_classified_events_until(
+    server_url: &str,
+    mut should_stop: impl FnMut() -> bool,
+    mut on_event: impl FnMut(OpencodeEvent, Option<OpencodeSnapshotFacet>) -> Result<(), String>,
+) -> Result<(), String> {
+    listen_event_payloads_with_stop(
+        server_url,
+        SSE_CANCEL_POLL_INTERVAL,
+        SSE_CANCEL_POLL_INTERVAL,
+        &mut should_stop,
+        &mut |payload| {
+            if let Some((event, facet)) = parse_event_payload_classified(&payload) {
+                on_event(event, facet)?;
+            }
+            Ok(())
+        },
+    )
+}
+
 pub fn listen_event_payloads(
     server_url: &str,
     mut on_payload: impl FnMut(String) -> Result<(), String>,
+) -> Result<(), String> {
+    listen_event_payloads_with_stop(
+        server_url,
+        SSE_CONNECT_TIMEOUT,
+        SSE_READ_TIMEOUT,
+        &mut || false,
+        &mut on_payload,
+    )
+}
+
+fn listen_event_payloads_with_stop(
+    server_url: &str,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    should_stop: &mut impl FnMut() -> bool,
+    on_payload: &mut impl FnMut(String) -> Result<(), String>,
 ) -> Result<(), String> {
     let (host, port) = parse_localhost_url(server_url)?;
     let mut stream = TcpStream::connect_timeout(
@@ -695,14 +732,14 @@ pub fn listen_event_payloads(
             .map_err(|error| format!("resolve {server_url}: {error}"))?
             .next()
             .ok_or_else(|| format!("resolve {server_url}: no address"))?,
-        SSE_CONNECT_TIMEOUT,
+        connect_timeout,
     )
     .map_err(|error| format!("connect {server_url}: {error}"))?;
     stream
-        .set_read_timeout(Some(SSE_READ_TIMEOUT))
+        .set_read_timeout(Some(read_timeout))
         .map_err(|error| format!("configure SSE read timeout: {error}"))?;
     stream
-        .set_write_timeout(Some(SSE_CONNECT_TIMEOUT))
+        .set_write_timeout(Some(connect_timeout))
         .map_err(|error| format!("configure SSE write timeout: {error}"))?;
     write!(
         stream,
@@ -712,9 +749,9 @@ pub fn listen_event_payloads(
 
     let mut reader = BufReader::new(stream);
     let mut status_line = String::new();
-    reader
-        .read_line(&mut status_line)
-        .map_err(|error| format!("read SSE status: {error}"))?;
+    if read_line_until(&mut reader, &mut status_line, should_stop)? == 0 {
+        return Ok(());
+    }
     let status_code = status_line
         .split_whitespace()
         .nth(1)
@@ -731,9 +768,10 @@ pub fn listen_event_payloads(
     let mut chunked = false;
     loop {
         line.clear();
-        let count = reader
-            .read_line(&mut line)
-            .map_err(|error| format!("read SSE headers: {error}"))?;
+        let count = read_line_until(&mut reader, &mut line, should_stop)?;
+        if (should_stop)() {
+            return Ok(());
+        }
         if count == 0 {
             return Err("opencode event stream closed before body".to_string());
         }
@@ -747,26 +785,32 @@ pub fn listen_event_payloads(
     }
 
     if chunked {
-        read_sse_payloads(
+        read_sse_payloads_until(
             BufReader::new(ChunkedBodyReader::new(reader)),
-            &mut on_payload,
+            on_payload,
+            should_stop,
         )
     } else {
-        read_sse_payloads(reader, &mut on_payload)
+        read_sse_payloads_until(reader, on_payload, should_stop)
     }
 }
 
-fn read_sse_payloads(
+fn read_sse_payloads_until(
     mut reader: impl BufRead,
     on_payload: &mut impl FnMut(String) -> Result<(), String>,
+    should_stop: &mut impl FnMut() -> bool,
 ) -> Result<(), String> {
     let mut line = String::new();
     let mut data = String::new();
     loop {
-        line.clear();
-        let count = reader
-            .read_line(&mut line)
-            .map_err(|error| format!("read opencode event stream: {error}"))?;
+        if (should_stop)() {
+            return Ok(());
+        }
+        let count = match reader.read_line(&mut line) {
+            Ok(count) => count,
+            Err(error) if is_timeout(&error) => continue,
+            Err(error) => return Err(format!("read opencode event stream: {error}")),
+        };
         if count == 0 {
             return Err("opencode event stream closed".to_string());
         }
@@ -776,6 +820,7 @@ fn read_sse_payloads(
                 on_payload(data.trim().to_string())?;
                 data.clear();
             }
+            line.clear();
             continue;
         }
         if let Some(value) = trimmed.strip_prefix("data:") {
@@ -784,7 +829,32 @@ fn read_sse_payloads(
             }
             data.push_str(value.trim_start());
         }
+        line.clear();
     }
+}
+
+fn read_line_until(
+    reader: &mut impl BufRead,
+    line: &mut String,
+    should_stop: &mut impl FnMut() -> bool,
+) -> Result<usize, String> {
+    loop {
+        if (should_stop)() {
+            return Ok(0);
+        }
+        match reader.read_line(line) {
+            Ok(count) => return Ok(count),
+            Err(error) if is_timeout(&error) => continue,
+            Err(error) => return Err(format!("read opencode event stream: {error}")),
+        }
+    }
+}
+
+fn is_timeout(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    )
 }
 
 struct ChunkedBodyReader<R> {
@@ -843,6 +913,12 @@ impl<R: BufRead> Read for ChunkedBodyReader<R> {
 }
 
 pub fn parse_event_payload(payload: &str) -> Option<OpencodeEvent> {
+    parse_event_payload_classified(payload).map(|(event, _)| event)
+}
+
+fn parse_event_payload_classified(
+    payload: &str,
+) -> Option<(OpencodeEvent, Option<OpencodeSnapshotFacet>)> {
     let value = serde_json::from_str::<Value>(payload).ok()?;
     let event_type = string_field(&value, &["type", "event"]).unwrap_or_default();
     let object = event_body(&value).unwrap_or(&value);
@@ -881,6 +957,25 @@ pub fn parse_event_payload(payload: &str) -> Option<OpencodeEvent> {
         None
     };
     let title = string_field(object, &["title"]).or_else(|| string_field(&value, &["title"]));
+    let snapshot_facet = match event_type.as_str() {
+        "session.status" | "session.idle" | "session.error" => Some(OpencodeSnapshotFacet::Status),
+        "message.updated"
+            if latest_message.is_none() && active_tool.is_none() && todos.is_none() =>
+        {
+            Some(OpencodeSnapshotFacet::Status)
+        }
+        event_type
+            if (event_type.contains("message") || event_type.contains("part"))
+                && latest_message.is_some()
+                && state.is_none()
+                && detail.is_none()
+                && active_tool.is_none()
+                && todos.is_none() =>
+        {
+            Some(OpencodeSnapshotFacet::Message)
+        }
+        _ => None,
+    };
 
     let event = OpencodeEvent {
         session_id,
@@ -898,7 +993,7 @@ pub fn parse_event_payload(payload: &str) -> Option<OpencodeEvent> {
         || event.latest_message.is_some()
         || event.active_tool.is_some()
         || event.todos.is_some())
-    .then_some(event)
+    .then_some((event, snapshot_facet))
 }
 
 fn prompt_async_body(prompt: &str) -> String {
@@ -1050,48 +1145,69 @@ pub fn load_runtime(
     branch: &str,
     worktree: &Path,
 ) -> Result<Option<OpencodeRuntime>, String> {
+    observability::with_writable_db(repo, |conn| {
+        load_runtime_with_conn(conn, repo, harness_id, branch, worktree)
+    })
+}
+
+pub fn load_runtime_snapshot(
+    repo: &Repository,
+    harness_id: &str,
+    branch: &str,
+    worktree: &Path,
+) -> Result<Option<OpencodeRuntime>, String> {
+    observability::with_nonblocking_read_db(repo, |conn| {
+        load_runtime_with_conn(conn, repo, harness_id, branch, worktree)
+    })
+}
+
+fn load_runtime_with_conn(
+    conn: &rusqlite::Connection,
+    repo: &Repository,
+    harness_id: &str,
+    branch: &str,
+    worktree: &Path,
+) -> Result<Option<OpencodeRuntime>, String> {
     let repo_root = repo.root.display().to_string();
     let worktree_path = worktree.display().to_string();
-    observability::with_writable_db(repo, |conn| {
-        conn.query_row(
-            "select repo_root, harness_id, branch, worktree_path, server_port, server_url, server_pid,
-                     opencode_session_id, generation, updated_unix_ms, server_start_time_ticks
-              from opencode_runtime
-              where repo_root = ?1 and harness_id = ?2 and branch = ?3 and worktree_path = ?4",
-            params![repo_root, harness_id, branch, worktree_path],
-            |row| {
-                let server_port = row.get::<_, i64>(4)?;
-                let server_pid = row
-                    .get::<_, Option<i64>>(6)?
-                    .and_then(|pid| u32::try_from(pid).ok());
-                Ok(OpencodeRuntime {
-                    repo_root: row.get(0)?,
-                    harness_id: row.get(1)?,
-                    branch: row.get(2)?,
-                    worktree_path: row.get(3)?,
-                    server_port: u16::try_from(server_port).unwrap_or_default(),
-                    server_url: row.get(5)?,
-                    server_pid,
-                    server_start_time_ticks: row
-                        .get::<_, Option<i64>>(10)?
-                        .map(|value| value.max(0) as u64),
-                    opencode_session_id: row.get(7)?,
-                    generation: row
-                        .get::<_, i64>(8)
-                        .ok()
-                        .and_then(|value| u64::try_from(value).ok())
-                        .unwrap_or_default(),
-                    updated_unix_ms: row
-                        .get::<_, i64>(9)
-                        .ok()
-                        .and_then(|value| u64::try_from(value).ok())
-                        .unwrap_or_default(),
-                })
-            },
-        )
-        .optional()
-        .map_err(|error| format!("read opencode runtime: {error}"))
-    })
+    conn.query_row(
+        "select repo_root, harness_id, branch, worktree_path, server_port, server_url, server_pid,
+                 opencode_session_id, generation, updated_unix_ms, server_start_time_ticks
+          from opencode_runtime
+          where repo_root = ?1 and harness_id = ?2 and branch = ?3 and worktree_path = ?4",
+        params![repo_root, harness_id, branch, worktree_path],
+        |row| {
+            let server_port = row.get::<_, i64>(4)?;
+            let server_pid = row
+                .get::<_, Option<i64>>(6)?
+                .and_then(|pid| u32::try_from(pid).ok());
+            Ok(OpencodeRuntime {
+                repo_root: row.get(0)?,
+                harness_id: row.get(1)?,
+                branch: row.get(2)?,
+                worktree_path: row.get(3)?,
+                server_port: u16::try_from(server_port).unwrap_or_default(),
+                server_url: row.get(5)?,
+                server_pid,
+                server_start_time_ticks: row
+                    .get::<_, Option<i64>>(10)?
+                    .map(|value| value.max(0) as u64),
+                opencode_session_id: row.get(7)?,
+                generation: row
+                    .get::<_, i64>(8)
+                    .ok()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or_default(),
+                updated_unix_ms: row
+                    .get::<_, i64>(9)
+                    .ok()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or_default(),
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| format!("read opencode runtime: {error}"))
 }
 
 pub(crate) fn load_runtimes_for_worktree_session(
@@ -2000,12 +2116,56 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
 
     use super::*;
 
     #[test]
     fn server_url_maps_port_to_local_http_url() {
         assert_eq!(server_url(41_234), "http://127.0.0.1:41234");
+    }
+
+    #[test]
+    fn event_listener_stops_when_canceled_while_receiver_is_idle() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            ready_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        let canceled = Arc::new(AtomicBool::new(false));
+        let listener_canceled = canceled.clone();
+        let (result_tx, result_rx) = mpsc::sync_channel(0);
+        std::thread::spawn(move || {
+            let result = listen_events_until(
+                &url,
+                || listener_canceled.load(Ordering::Acquire),
+                |_| Ok(()),
+            );
+            result_tx.send(result).unwrap();
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        canceled.store(true, Ordering::Release);
+        assert!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_ok()
+        );
+        release_tx.send(()).unwrap();
+        server.join().unwrap();
     }
 
     #[test]
@@ -2596,6 +2756,31 @@ mod tests {
     }
 
     #[test]
+    fn classifies_only_supersedable_status_and_text_snapshots() {
+        let (_, status_facet) = parse_event_payload_classified(
+            r#"{"type":"session.status","properties":{"sessionID":"ses_1","status":"busy"}}"#,
+        )
+        .unwrap();
+        let (_, message_facet) = parse_event_payload_classified(
+            r#"{"type":"message.part.updated","properties":{"sessionID":"ses_1","role":"assistant","text":"latest"}}"#,
+        )
+        .unwrap();
+        let (_, permission_facet) = parse_event_payload_classified(
+            r#"{"type":"permission.asked","properties":{"sessionID":"ses_1","permission":"bash"}}"#,
+        )
+        .unwrap();
+        let (_, tool_facet) = parse_event_payload_classified(
+            r#"{"type":"message.part.updated","properties":{"sessionID":"ses_1","type":"tool","name":"bash","status":"running"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(status_facet, Some(OpencodeSnapshotFacet::Status));
+        assert_eq!(message_facet, Some(OpencodeSnapshotFacet::Message));
+        assert_eq!(permission_facet, None);
+        assert_eq!(tool_facet, None);
+    }
+
+    #[test]
     fn ignores_malformed_opencode_events() {
         assert_eq!(parse_event_payload("not json"), None);
         assert_eq!(parse_event_payload(r#"{"type":"session.status"}"#), None);
@@ -2764,6 +2949,153 @@ mod tests {
 
         result.unwrap();
         shutdown.unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn owned_server_shutdown_kills_term_ignoring_descendant_and_reaps_leader() {
+        let temp = unique_temp_dir("prism-owned-opencode-process");
+        fs::create_dir_all(&temp).unwrap();
+        let descendant_path = temp.join("descendant.pid");
+        let script = r#"
+            trap '' TERM
+            (
+                trap '' TERM
+                while :; do sleep 1; done
+            ) &
+            descendant=$!
+            printf '%s\n' "$descendant" > "$1"
+            wait "$descendant"
+        "#;
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .arg("owned-opencode-fixture")
+            .arg(&descendant_path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = crate::process::SupervisedChild::spawn(&mut command, None, None).unwrap();
+        let process_id = child.id();
+        record_owned_server_process(child);
+        let runtime = OpencodeRuntime {
+            repo_root: "/repo".to_string(),
+            harness_id: "opencode".to_string(),
+            branch: "feature/test".to_string(),
+            worktree_path: "/repo/worktree".to_string(),
+            server_port: 41_000,
+            server_url: "http://127.0.0.1:41000".to_string(),
+            server_pid: Some(process_id),
+            server_start_time_ticks: process_start_time_ticks(process_id),
+            opencode_session_id: None,
+            generation: 0,
+            updated_unix_ms: 0,
+        };
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !descendant_path.exists() {
+            assert!(std::time::Instant::now() < ready_deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let descendant_id = fs::read_to_string(&descendant_path)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        shutdown_owned_server(&runtime).unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(!owned_server_process(process_id));
+        for pid in [process_id as libc::pid_t, descendant_id] {
+            let gone_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let result = unsafe { libc::kill(pid, 0) };
+                if result != 0
+                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < gone_deadline,
+                    "owned server process {pid} survived shutdown"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn stored_server_shutdown_uses_verified_bounded_process_group_recovery() {
+        use std::os::unix::process::CommandExt;
+
+        let temp = unique_temp_dir("prism-stored-opencode-process");
+        fs::create_dir_all(&temp).unwrap();
+        let descendant_path = temp.join("descendant.pid");
+        let script = r#"
+            trap '' TERM
+            (
+                trap '' TERM
+                while :; do sleep 1; done
+            ) &
+            descendant=$!
+            printf '%s\n' "$descendant" > "$1"
+            wait "$descendant"
+        "#;
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .arg("stored-opencode-fixture")
+            .arg(&descendant_path)
+            .args(["serve", "--hostname", "127.0.0.1", "--port", "41000"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        command.process_group(0);
+        let mut child = command.spawn().unwrap();
+        let process_id = child.id();
+        let runtime = OpencodeRuntime {
+            repo_root: "/repo".to_string(),
+            harness_id: "opencode".to_string(),
+            branch: "feature/test".to_string(),
+            worktree_path: "/repo/worktree".to_string(),
+            server_port: 41_000,
+            server_url: "http://127.0.0.1:41000".to_string(),
+            server_pid: Some(process_id),
+            server_start_time_ticks: process_start_time_ticks(process_id),
+            opencode_session_id: None,
+            generation: 0,
+            updated_unix_ms: 0,
+        };
+        let ready_deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while !descendant_path.exists() {
+            assert!(std::time::Instant::now() < ready_deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let descendant_id = fs::read_to_string(&descendant_path)
+            .unwrap()
+            .trim()
+            .parse::<libc::pid_t>()
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        shutdown_stored_server(&runtime).unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while child.try_wait().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let descendant_result = unsafe { libc::kill(descendant_id, 0) };
+        assert_eq!(descendant_result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        fs::remove_dir_all(temp).unwrap();
     }
 
     fn shell_quote_for_test(value: &str) -> String {

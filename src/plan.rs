@@ -2,7 +2,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 use crate::config::Config;
 #[cfg(test)]
@@ -423,27 +423,15 @@ fn choose_with_fzf(config: &Config, files: &[PathBuf]) -> Result<PathBuf, String
         .collect::<Vec<_>>()
         .join("\n")
         + "\n";
-    let mut child = Command::new(config.tool("fzf"))
-        .arg("--prompt")
-        .arg("Plan file> ")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("fzf: {error}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(input.as_bytes())
-            .map_err(|error| format!("write fzf input: {error}"))?;
-    } else {
-        return Err("open fzf stdin".to_string());
-    }
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("wait for fzf: {error}"))?;
-    if !output.status.success() {
-        return Err("no plan file selected".to_string());
-    }
-    let selected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let output = crate::process::run_capture_interactive(
+        Command::new(config.tool("fzf"))
+            .arg("--prompt")
+            .arg("Plan file> "),
+        input.as_bytes(),
+        64 * 1024,
+    )
+    .map_err(|error| format!("select plan file: {error}"))?;
+    let selected = output.trim().to_string();
     if selected.is_empty() {
         return Err("no plan file selected".to_string());
     }
@@ -582,6 +570,19 @@ mod tests {
         assert_eq!(error, "could not infer phases; add headings like 'Phase 1'");
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn plan_selection_preserves_fzf_execution_errors() {
+        let mut config = test_config();
+        config
+            .tools
+            .insert("fzf".to_string(), "/prism-test/nonexistent-fzf".to_string());
+
+        let error = choose_with_fzf(&config, &[PathBuf::from("plan.md")]).unwrap_err();
+
+        assert!(error.starts_with("select plan file: "), "{error}");
+        assert!(error.contains("/prism-test/nonexistent-fzf"), "{error}");
     }
 
     #[test]

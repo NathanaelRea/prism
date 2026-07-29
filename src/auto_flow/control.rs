@@ -442,7 +442,6 @@ pub(super) fn reconcile_linked_plan_runs(
     persisted: &mut PersistedAutoRun,
     max_output_lines_per_step: usize,
 ) -> Result<bool, String> {
-    crate::plan_run::migrate_schema(conn)?;
     let mut changed = false;
     for index in 0..persisted.steps.len() {
         if persisted.steps[index].step_key != AutoStepKey::RunPlan {

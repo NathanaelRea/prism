@@ -1,18 +1,19 @@
 use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
 use crate::agent::{PromptMode, builtin_prompt_mode, detected_agents};
+use crate::file_persistence::{self, BoxError, FileContents, UpdateOptions};
 use crate::harness::{
     BUILTIN_HARNESS_IDS, Harness, HarnessConfig, OutputFormat, PromptTransport, builtin_adapter,
 };
-use crate::process::{command_exists, command_version, run_capture};
+use crate::process::{ProcessPolicy, command_exists, command_version, run_capture};
 use crate::repo::Repository;
 use crate::session::discover_sessions;
 use crate::util::prism_config_dir;
@@ -263,7 +264,7 @@ pub struct Config {
     pub repo_config_path: PathBuf,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct RawConfig {
     default_harness: Option<String>,
     harnesses: Option<BTreeMap<String, RawHarnessConfig>>,
@@ -288,19 +289,19 @@ struct RawConfig {
     prompt_templates: Option<BTreeMap<String, String>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct RawUiConfig {
     icon_style: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct RawChecks {
     pre_pr: Option<Vec<String>>,
     pre_push: Option<Vec<String>>,
     review_fix: Option<Vec<String>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct RawAutoConfig {
     merge: Option<bool>,
     cleanup_after_merge: Option<bool>,
@@ -317,23 +318,23 @@ struct RawAutoConfig {
     ci_poll_interval_seconds: Option<u64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct RawLayoutConfig {
     sidebar_width: Option<u16>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct RawWorktrees {
     columns: Option<Vec<String>>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct RawAgentConfig {
     command: Option<String>,
     prompt_mode: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 struct RawHarnessConfig {
     adapter: Option<String>,
     program: Option<String>,
@@ -404,6 +405,144 @@ fn harness_config_from_raw(id: &str, raw: RawHarnessConfig) -> Result<HarnessCon
     };
     config.validate(id)?;
     Ok(config)
+}
+
+#[derive(Debug)]
+enum ConfigDocumentError {
+    Utf8(std::string::FromUtf8Error),
+    Toml(toml::de::Error),
+    Semantic(String),
+}
+
+impl fmt::Display for ConfigDocumentError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Utf8(error) => write!(formatter, "config is unreadable text: {error}"),
+            Self::Toml(error) => write!(formatter, "config has invalid TOML: {error}"),
+            Self::Semantic(error) => write!(formatter, "config is semantically invalid: {error}"),
+        }
+    }
+}
+
+impl Error for ConfigDocumentError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Utf8(error) => Some(error),
+            Self::Toml(error) => Some(error),
+            Self::Semantic(_) => None,
+        }
+    }
+}
+
+fn parse_and_validate_config(
+    text: &str,
+    is_user_config: bool,
+) -> Result<RawConfig, ConfigDocumentError> {
+    if text.trim().is_empty() {
+        return Ok(RawConfig::default());
+    }
+    let value = toml::from_str::<toml::Value>(text).map_err(ConfigDocumentError::Toml)?;
+    let raw = value
+        .try_into::<RawConfig>()
+        .map_err(|error| ConfigDocumentError::Semantic(error.to_string()))?;
+    validate_config_values(&raw, is_user_config).map_err(ConfigDocumentError::Semantic)?;
+    Ok(raw)
+}
+
+fn validate_config_values(raw: &RawConfig, is_user_config: bool) -> Result<(), String> {
+    if raw.opencode_port_span == Some(0) {
+        return Err("opencode_port_span must be greater than zero".to_string());
+    }
+    if let Some(value) = raw.merge_method.as_deref()
+        && MergeMethod::parse(value).is_none()
+    {
+        return Err(format!("merge_method has unsupported value '{value}'"));
+    }
+    if let Some(value) = raw.escape_key.as_deref()
+        && EscapeKey::parse(value).is_none()
+    {
+        return Err(format!("escape_key has unsupported value '{value}'"));
+    }
+    if let Some(value) = raw.ui.as_ref().and_then(|ui| ui.icon_style.as_deref())
+        && IconStyle::parse(value).is_none()
+    {
+        return Err(format!("ui.icon_style has unsupported value '{value}'"));
+    }
+    if let Some(harnesses) = &raw.harnesses {
+        for (id, harness) in harnesses {
+            harness_config_from_raw(id, harness.clone())?;
+        }
+    }
+    if !is_user_config && (raw.default_harness.is_some() || raw.harnesses.is_some()) {
+        return Err(
+            "repository config cannot contain default_harness or [harnesses.*]".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_config_for_mutation(raw: &RawConfig, is_user_config: bool) -> Result<(), String> {
+    if raw.default_agent.is_some() || raw.agents.is_some() {
+        return Err(
+            "obsolete default_agent/[agents.*] settings must be replaced before Prism can update this file"
+                .to_string(),
+        );
+    }
+    if raw
+        .tools
+        .as_ref()
+        .is_some_and(|tools| tools.contains_key("opencode"))
+    {
+        return Err(
+            "obsolete [tools].opencode must be replaced with [harnesses.opencode].program before Prism can update this file"
+                .to_string(),
+        );
+    }
+    if is_user_config
+        && let Some(default_harness) = raw.default_harness.as_deref()
+        && builtin_adapter(default_harness).is_none()
+        && !raw
+            .harnesses
+            .as_ref()
+            .is_some_and(|harnesses| harnesses.contains_key(default_harness))
+    {
+        return Err(format!(
+            "default_harness '{default_harness}' has no matching harness configuration"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn update_config_file(
+    path: &Path,
+    is_user_config: bool,
+    transform: impl FnOnce(&str, bool) -> Result<String, String>,
+) -> Result<(), String> {
+    file_persistence::update(path, UpdateOptions::important_toml(), |contents| {
+        let missing = matches!(contents, FileContents::Missing);
+        let text = match contents {
+            FileContents::Missing => String::new(),
+            FileContents::Present(bytes) => String::from_utf8(bytes)
+                .map_err(|error| Box::new(ConfigDocumentError::Utf8(error)) as BoxError)?,
+        };
+        if !text.trim().is_empty() {
+            let raw = parse_and_validate_config(&text, is_user_config)
+                .map_err(|error| Box::new(error) as BoxError)?;
+            validate_config_for_mutation(&raw, is_user_config)
+                .map_err(|error| Box::new(ConfigDocumentError::Semantic(error)) as BoxError)?;
+        }
+        let updated = transform(&text, missing)
+            .map_err(|error| Box::new(ConfigDocumentError::Semantic(error)) as BoxError)?;
+        if !updated.trim().is_empty() {
+            let raw = parse_and_validate_config(&updated, is_user_config)
+                .map_err(|error| Box::new(error) as BoxError)?;
+            validate_config_for_mutation(&raw, is_user_config)
+                .map_err(|error| Box::new(ConfigDocumentError::Semantic(error)) as BoxError)?;
+        }
+        let replacement = (updated != text).then(|| updated.into_bytes());
+        Ok(((), replacement))
+    })
+    .map_err(|error| error.to_string())
 }
 
 impl Config {
@@ -485,18 +624,24 @@ impl Config {
     }
 
     fn apply_file(&mut self, path: &Path) {
-        let Ok(text) = fs::read_to_string(path) else {
-            return;
-        };
-        let raw = match toml::from_str::<RawConfig>(&text) {
-            Ok(raw) => raw,
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
             Err(error) => {
                 self.config_errors
-                    .push(format!("parse {}: {error}", path.display()));
+                    .push(format!("read {}: {error}", path.display()));
                 return;
             }
         };
         let is_user_config = path == self.user_path;
+        let raw = match parse_and_validate_config(&text, is_user_config) {
+            Ok(raw) => raw,
+            Err(error) => {
+                self.config_errors
+                    .push(format!("load {}: {error}", path.display()));
+                return;
+            }
+        };
         if raw.default_agent.is_some() || raw.agents.is_some() {
             self.config_errors.push(format!(
                 "{} uses obsolete default_agent/[agents.*] settings; replace them with default_harness/[harnesses.*]",
@@ -854,58 +999,9 @@ fn update_user_harness_config(
     default_harness: &str,
     generic: Option<&HarnessConfig>,
 ) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("create config dir: {error}"))?;
-    }
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(format!("read config file: {error}")),
-    };
-    let updated = update_user_harness_config_text(&text, default_harness, generic)?;
-    let write_path = fs::symlink_metadata(path)
-        .ok()
-        .filter(|metadata| metadata.file_type().is_symlink())
-        .map(|_| fs::canonicalize(path).map_err(|error| format!("resolve config symlink: {error}")))
-        .transpose()?
-        .unwrap_or_else(|| path.to_path_buf());
-    write_config_atomically(&write_path, updated.as_bytes())
-}
-
-fn write_config_atomically(path: &Path, contents: &[u8]) -> Result<(), String> {
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-    let permissions = fs::metadata(path)
-        .ok()
-        .map(|metadata| metadata.permissions());
-    for _ in 0..100 {
-        let staging = path.with_extension(format!(
-            "tmp-{}-{}",
-            std::process::id(),
-            SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        let mut file = match options.open(&staging) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(format!("create staged config file: {error}")),
-        };
-        let result = file
-            .write_all(contents)
-            .and_then(|()| file.sync_all())
-            .and_then(|()| {
-                if let Some(permissions) = permissions.clone() {
-                    fs::set_permissions(&staging, permissions)?;
-                }
-                fs::rename(&staging, path)
-            });
-        if let Err(error) = result {
-            let _ = fs::remove_file(&staging);
-            return Err(format!("write config file: {error}"));
-        }
-        return Ok(());
-    }
-    Err("create unique staged config file".to_string())
+    update_config_file(path, true, |text, _| {
+        update_user_harness_config_text(text, default_harness, generic)
+    })
 }
 
 fn update_user_harness_config_text(
@@ -986,27 +1082,26 @@ fn string_array(items: &[String]) -> Array {
 }
 
 fn save_user_icon_style(path: &Path, style: IconStyle) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("create config dir: {error}"))?;
-    }
-    let mut text = fs::read_to_string(path).unwrap_or_default();
-    if text.contains("icon_style") {
-        return Ok(());
-    }
-    let setting = format!("icon_style = \"{}\"\n", style.label());
-    if let Some(index) = ui_table_insert_index(&text) {
-        text.insert_str(index, &setting);
-    } else {
-        if !text.is_empty() && !text.ends_with('\n') {
-            text.push('\n');
+    update_config_file(path, true, |text, _| {
+        let mut text = text.to_string();
+        if text.contains("icon_style") {
+            return Ok(text);
         }
-        if !text.is_empty() {
-            text.push('\n');
+        let setting = format!("icon_style = \"{}\"\n", style.label());
+        if let Some(index) = ui_table_insert_index(&text) {
+            text.insert_str(index, &setting);
+        } else {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            text.push_str("[ui]\n");
+            text.push_str(&setting);
         }
-        text.push_str("[ui]\n");
-        text.push_str(&setting);
-    }
-    fs::write(path, text).map_err(|error| format!("write user config: {error}"))
+        Ok(text)
+    })
 }
 
 fn ui_table_insert_index(text: &str) -> Option<usize> {
@@ -1230,7 +1325,10 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     println!();
 
     println!();
-    match run_capture(Command::new(config.tool("gh")).arg("auth").arg("status")) {
+    match run_capture(
+        Command::new(config.tool("gh")).arg("auth").arg("status"),
+        ProcessPolicy::NetworkQuery,
+    ) {
         Ok(_) => println!("gh auth: ok"),
         Err(error) => println!("gh auth: {error}"),
     }
@@ -1406,37 +1504,7 @@ fn ensure_configured_default_agent(config: &Config) -> Result<(), String> {
 }
 
 fn save_user_default_agent(config: &Config, selected: &str) -> Result<(), String> {
-    if let Some(parent) = config.user_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| format!("create config dir: {error}"))?;
-    }
-    let mut text = if config.user_path.exists() {
-        fs::read_to_string(&config.user_path).unwrap_or_default()
-    } else {
-        String::new()
-    };
-    if text
-        .lines()
-        .any(|line| line.trim_start().starts_with("default_agent"))
-    {
-        text = text
-            .lines()
-            .map(|line| {
-                if line.trim_start().starts_with("default_agent") {
-                    format!("default_agent = \"{selected}\"")
-                } else {
-                    line.to_string()
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        text.push('\n');
-    } else {
-        if !text.ends_with('\n') && !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&format!("default_agent = \"{selected}\"\n"));
-    }
-    fs::write(&config.user_path, text).map_err(|error| format!("write config: {error}"))
+    update_user_harness_config(&config.user_path, selected, None)
 }
 
 #[cfg(test)]
@@ -1671,6 +1739,54 @@ review = "fix\nreview"
         assert!(text.contains("[tools]"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn generated_mutation_does_not_overwrite_invalid_user_config() {
+        let directory = std::env::temp_dir().join(format!(
+            "prism-config-invalid-mutation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        let invalid = "default_harness = [\n";
+        fs::write(&path, invalid).unwrap();
+
+        let error = save_user_icon_style(&path, IconStyle::NerdFont).unwrap_err();
+
+        assert!(error.contains(&path.display().to_string()));
+        assert!(error.contains("invalid TOML"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn generated_mutation_does_not_overwrite_semantically_invalid_repo_config() {
+        let directory = std::env::temp_dir().join(format!(
+            "prism-repo-config-invalid-mutation-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.toml");
+        let invalid = "merge_method = 'explode'\n";
+        fs::write(&path, invalid).unwrap();
+
+        let error = update_config_file(&path, false, |text, _| {
+            Ok(format!("{text}[worktrees]\ncolumns = []\n"))
+        })
+        .unwrap_err();
+
+        assert!(error.contains("semantically invalid"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), invalid);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

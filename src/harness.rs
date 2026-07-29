@@ -384,32 +384,26 @@ impl Invocation {
         }
     }
 
-    pub fn spawn(&self, cwd: &Path) -> Result<std::process::Child, String> {
-        let mut child = self
-            .command(cwd)?
-            .spawn()
-            .map_err(|error| format!("start harness '{}': {error}", self.argv[0]))?;
-        if let Some(input) = self.stdin.as_deref() {
-            let result = child
-                .stdin
-                .take()
-                .ok_or_else(|| "open harness stdin".to_string())
-                .and_then(|mut stdin| {
-                    stdin
-                        .write_all(input.as_bytes())
-                        .map_err(|error| format!("write harness prompt to stdin: {error}"))
-                });
-            if let Err(error) = result {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(error);
-            }
-        }
-        Ok(child)
+    pub fn spawn(&self, cwd: &Path) -> Result<crate::process::SupervisedChild, String> {
+        self.spawn_with_policy(cwd, crate::process::ProcessPolicy::WorkflowStep)
+    }
+
+    fn spawn_with_policy(
+        &self,
+        cwd: &Path,
+        policy: crate::process::ProcessPolicy,
+    ) -> Result<crate::process::SupervisedChild, String> {
+        crate::process::SupervisedChild::spawn(
+            &mut self.command(cwd)?,
+            Some(policy),
+            self.stdin.as_ref().map(|input| input.as_bytes().to_vec()),
+        )
+        .map_err(|error| format!("start harness '{}': {error}", self.argv[0]))
     }
 }
 
 pub const MAX_OUTPUT_LINE_BYTES: usize = 1024 * 1024;
+pub(crate) const WORKFLOW_OUTPUT_CHANNEL_CAPACITY: usize = 16;
 
 pub fn read_bounded_lines(
     reader: impl Read,
@@ -758,6 +752,13 @@ pub fn process_start_time_ticks(process_id: u32) -> Option<u64> {
     }
 }
 
+pub fn terminate_active_process(child: &mut crate::process::SupervisedChild) -> Result<(), String> {
+    child
+        .terminate()
+        .map(|_| ())
+        .map_err(|error| format!("terminate harness process {}: {error}", child.id()))
+}
+
 #[cfg(unix)]
 pub fn terminate_process(
     process_id: u32,
@@ -773,12 +774,49 @@ pub fn terminate_process(
     }
     let process_group = -(process_id as libc::pid_t);
     let result = unsafe { libc::kill(process_group, libc::SIGTERM) };
-    if result == 0 {
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        return Err(format!("terminate harness process {process_id}: {error}"));
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while std::time::Instant::now() < deadline {
+        #[cfg(target_os = "linux")]
+        if process_start_time_ticks(process_id) != _expected_start_time_ticks {
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        if !process_group_is_signalable(process_id)? {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let result = unsafe { libc::kill(process_group, libc::SIGKILL) };
+    let error = std::io::Error::last_os_error();
+    if result == 0
+        || error.raw_os_error() == Some(libc::ESRCH)
+        || cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM)
+    {
         Ok(())
     } else {
+        Err(format!("kill harness process {process_id}: {error}"))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_group_is_signalable(process_id: u32) -> Result<bool, String> {
+    let result = unsafe { libc::kill(-(process_id as libc::pid_t), 0) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::EPERM)) {
+        Ok(false)
+    } else {
         Err(format!(
-            "terminate harness process {process_id}: {}",
-            std::io::Error::last_os_error()
+            "inspect harness process group {process_id}: {error}"
         ))
     }
 }
@@ -1174,6 +1212,52 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none());
         terminate_process(child.id(), Some(start)).unwrap();
         child.wait().unwrap();
+    }
+
+    #[test]
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn terminating_absent_process_group_is_successful() {
+        terminate_process(i32::MAX as u32, None).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn large_stdin_to_non_reading_term_ignoring_child_is_deadline_bounded() {
+        let invocation = Invocation {
+            argv: vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "trap '' TERM; while :; do sleep 1; done".to_string(),
+            ],
+            environment: BTreeMap::new(),
+            stdin: Some("x".repeat(8 * 1024 * 1024)),
+            prompt_file: None,
+            structured_events: false,
+            attach: false,
+        };
+        let started = std::time::Instant::now();
+        let mut child = invocation
+            .spawn_with_policy(Path::new("/tmp"), crate::process::ProcessPolicy::Test)
+            .unwrap();
+
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        while !child.deadline_exceeded() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let process_id = child.id();
+        let stage = child.terminate().unwrap();
+
+        assert_eq!(stage, crate::process::TerminationStage::Kill);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(
+            unsafe { libc::kill(process_id as libc::pid_t, 0) },
+            -1,
+            "child was not reaped"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[test]

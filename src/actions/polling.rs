@@ -20,6 +20,7 @@ pub(super) fn fetch_wt_columns(
             .arg("-C")
             .arg(&repo.root)
             .args(["list", "--format=json"]),
+        crate::process::ProcessPolicy::Metadata,
     )?;
     let mut by_path = BTreeMap::new();
     for object in json_top_level_objects(&raw) {
@@ -190,7 +191,6 @@ impl Tui {
                     .map(|session| session.identity_key(&repository))
                     .collect::<Vec<_>>();
                 let config = managed.config.clone();
-                let tx = self.pr_poll_tx.clone();
                 for session in self
                     .sessions
                     .iter_mut()
@@ -202,20 +202,29 @@ impl Tui {
                     managed.pr_summary_last_polled = Some(poll_started_at);
                     managed.pr_summary_poll_in_flight = true;
                 }
-                std::thread::spawn(move || {
-                    let _ = refresh_repo_policy_cache(
-                        &crate::repo::Repository { root: path.clone() },
-                        &path,
-                        &config,
-                    );
-                    let summaries = fetch_pr_summary_index(&path, &config);
-                    let _ = tx.send(PrPollResult::Summary {
-                        repository,
-                        sessions,
-                        summaries,
-                        poll_started_at,
-                    });
-                });
+                let generation = self.session_inventory_generation;
+                let job_repository = repository.clone();
+                self.spawn_tui_job(
+                    TuiJobKind::PrSummary,
+                    TuiJobKey::Repository(repository.clone()),
+                    generation,
+                    Some(TUI_ACTION_JOB_TIMEOUT),
+                    format!("prism-pr-summary-{repo_index}"),
+                    move |_| {
+                        let _ = refresh_repo_policy_cache(
+                            &crate::repo::Repository { root: path.clone() },
+                            &path,
+                            &config,
+                        );
+                        let summaries = fetch_pr_summary_index(&path, &config);
+                        Ok(Some(TuiJobPayload::PrPoll(PrPollResult::Summary {
+                            repository: job_repository,
+                            sessions,
+                            summaries,
+                            poll_started_at,
+                        })))
+                    },
+                );
             }
         }
 
@@ -241,21 +250,31 @@ impl Tui {
                 let branch = session.branch.clone();
                 let path = session.path.clone();
                 let mut cache = session.pr.begin_details_poll();
-                let tx = self.pr_poll_tx.clone();
                 self.pr_polls_in_flight.insert(key.clone());
-                std::thread::spawn(move || {
-                    refresh_pr_details_cache_state(&branch, &mut cache, &path, &config);
-                    let _ = tx.send(PrPollResult::Details {
-                        key,
-                        cache: Box::new(cache),
-                    });
-                });
+                let job_key = key.clone();
+                self.spawn_tui_job(
+                    TuiJobKind::PrDetails,
+                    TuiJobKey::Pr(key.clone()),
+                    generation,
+                    Some(TUI_ACTION_JOB_TIMEOUT),
+                    format!("prism-pr-details-{index}"),
+                    move |_| {
+                        refresh_pr_details_cache_state(&branch, &mut cache, &path, &config);
+                        Ok(Some(TuiJobPayload::PrPoll(PrPollResult::Details {
+                            key: job_key,
+                            cache: Box::new(cache),
+                        })))
+                    },
+                );
             }
         }
         changed
     }
 
     pub(super) fn drain_pr_poll_results(&mut self) -> bool {
+        if !self.tui_tick_active && !self.routing_tui_jobs {
+            self.route_tui_job_messages();
+        }
         let mut changed = false;
         let selected = self.selected_worktree_index();
         while let Ok(result) = self.pr_poll_rx.try_recv() {
@@ -273,9 +292,6 @@ impl Tui {
                     else {
                         continue;
                     };
-                    if let Some(repo) = self.repos.get_mut(repo_index) {
-                        repo.pr_summary_poll_in_flight = false;
-                    }
                     let target_indices = self
                         .sessions
                         .iter()
@@ -346,7 +362,6 @@ impl Tui {
                     changed |= before != after;
                 }
                 PrPollResult::Details { key, cache } => {
-                    self.pr_polls_in_flight.remove(&key);
                     let key_for_index = |index: usize| {
                         let session = self.sessions.get(index)?;
                         let repo = self.repos.get(session.repo_index)?;
@@ -365,7 +380,7 @@ impl Tui {
                         let repo = self
                             .repos
                             .iter()
-                            .find(|repo| repo.identity == key.repository)
+                            .find(|repo| repo.identity == key.worktree.repository)
                             .map(|repo| repo.repo.clone());
                         let session = &mut self.sessions[session_index];
                         let before = pr_cache_render_signature(&session.pr);
@@ -408,30 +423,41 @@ impl Tui {
                 .map(|session| session.identity_key(&repository))
                 .collect::<Vec<_>>();
             let config = managed.config.clone();
-            let tx = self.wt_poll_tx.clone();
             if let Some(managed) = self.repos.get_mut(repo_index) {
                 managed.wt_poll_in_flight = true;
             }
-            std::thread::spawn(move || {
-                let columns = fetch_wt_columns(&repo, &config);
-                let columns = columns.map(|columns| {
-                    requested
-                        .into_iter()
-                        .map(|key| {
-                            let values = columns.get(&key.path).cloned().unwrap_or_default();
-                            (key, values)
-                        })
-                        .collect()
-                });
-                let _ = tx.send(WtPollResult {
-                    repository,
-                    columns,
-                });
-            });
+            let generation = self.session_inventory_generation;
+            let job_repository = repository.clone();
+            self.spawn_tui_job(
+                TuiJobKind::WorktreeColumns,
+                TuiJobKey::Repository(repository.clone()),
+                generation,
+                Some(TUI_ACTION_JOB_TIMEOUT),
+                format!("prism-wt-columns-{repo_index}"),
+                move |_| {
+                    let columns = fetch_wt_columns(&repo, &config);
+                    let columns = columns.map(|columns| {
+                        requested
+                            .into_iter()
+                            .map(|key| {
+                                let values = columns.get(&key.path).cloned().unwrap_or_default();
+                                (key, values)
+                            })
+                            .collect()
+                    });
+                    Ok(Some(TuiJobPayload::WorktreeColumns(WtPollResult {
+                        repository: job_repository,
+                        columns,
+                    })))
+                },
+            );
         }
     }
 
     pub(crate) fn poll_wt_columns(&mut self) -> bool {
+        if !self.tui_tick_active && !self.routing_tui_jobs {
+            self.route_tui_job_messages();
+        }
         let mut changed = false;
         while let Ok(result) = self.wt_poll_rx.try_recv() {
             let Some(repo_index) = self
@@ -441,9 +467,6 @@ impl Tui {
             else {
                 continue;
             };
-            if let Some(repo) = self.repos.get_mut(repo_index) {
-                repo.wt_poll_in_flight = false;
-            }
             match result.columns {
                 Ok(columns_by_path) => {
                     for session in &mut self.sessions {
@@ -506,20 +529,40 @@ impl Tui {
                 continue;
             };
             let key = session.identity_key(&managed.identity);
+            let generation = self
+                .worktree_generations
+                .get(&key)
+                .copied()
+                .unwrap_or_default();
             let config = managed.config.clone();
-            let tx = self.default_branch_poll_tx.clone();
             if let Some(managed) = self.repos.get_mut(repo_index) {
                 managed.default_branch_poll_in_flight = true;
                 managed.default_branch_last_polled = Some(std::time::Instant::now());
             }
-            std::thread::spawn(move || {
-                let status_label = default_branch_status_label(&path, &branch, &config);
-                let _ = tx.send(DefaultBranchPollResult { key, status_label });
-            });
+            let job_key = key.clone();
+            self.spawn_tui_job(
+                TuiJobKind::DefaultBranch,
+                TuiJobKey::Worktree(key),
+                generation,
+                Some(TUI_ACTION_JOB_TIMEOUT),
+                format!("prism-default-branch-{repo_index}"),
+                move |_| {
+                    let status_label = default_branch_status_label(&path, &branch, &config);
+                    Ok(Some(TuiJobPayload::DefaultBranch(
+                        DefaultBranchPollResult {
+                            key: job_key,
+                            status_label,
+                        },
+                    )))
+                },
+            );
         }
     }
 
     pub(crate) fn poll_default_branch_status(&mut self) -> bool {
+        if !self.tui_tick_active && !self.routing_tui_jobs {
+            self.route_tui_job_messages();
+        }
         let mut changed = false;
         while let Ok(result) = self.default_branch_poll_rx.try_recv() {
             let Some(repo_index) = self
@@ -529,9 +572,6 @@ impl Tui {
             else {
                 continue;
             };
-            if let Some(repo) = self.repos.get_mut(repo_index) {
-                repo.default_branch_poll_in_flight = false;
-            }
             match result.status_label {
                 Ok(status_label) => {
                     if let Some(session) = self.sessions.iter_mut().find(|session| {

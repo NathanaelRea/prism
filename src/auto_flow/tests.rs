@@ -889,7 +889,6 @@ fn auto_control_rejects_step_from_another_run() {
 }
 
 #[test]
-#[cfg(unix)]
 fn auto_control_abort_warning_keeps_authoritative_state_persisted() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
@@ -900,7 +899,8 @@ fn auto_control_abort_warning_keeps_authoritative_state_persisted() {
             .create_run();
     persisted.run.status = AutoRunStatus::Running;
     persisted.steps[0].status = AutoStepStatus::Running;
-    persisted.steps[0].execution.process_id = Some(i32::MAX as u32);
+    persisted.steps[0].session.adapter_id = Some("opencode".to_string());
+    persisted.steps[0].session.id = Some("session-1".to_string());
     save_auto_run(&conn, &mut persisted).unwrap();
     let step_run_id = persisted.steps[0].id.unwrap();
 
@@ -912,7 +912,7 @@ fn auto_control_abort_warning_keeps_authoritative_state_persisted() {
     .unwrap();
 
     assert_eq!(outcome.warnings.len(), 1);
-    assert!(outcome.warnings[0].contains("terminate harness process"));
+    assert!(outcome.warnings[0].contains("OpenCode session has no endpoint"));
     assert_eq!(outcome.run.run.status, AutoRunStatus::Aborted);
     assert_eq!(outcome.run.steps[0].status, AutoStepStatus::Aborted);
     let loaded = load_auto_run(&conn, &persisted.run.id).unwrap().unwrap();

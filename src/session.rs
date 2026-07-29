@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 
 use crate::agent::AgentState;
 use crate::config::Config;
@@ -133,7 +133,7 @@ impl Session {
         self.repo_key = repo_key;
     }
 
-    fn preserve_refresh_state_from(&mut self, previous: Session, config: &Config) {
+    pub(crate) fn preserve_refresh_state_from(&mut self, previous: Session, config: &Config) {
         crate::agent_session::reconcile_session_refresh(
             &mut self.agent_state,
             previous.agent_state,
@@ -150,6 +150,31 @@ impl Session {
             self.unseen_comments = previous.unseen_comments;
         } else {
             self.unseen_comments = false;
+        }
+    }
+
+    pub(crate) fn preserve_concurrent_refresh_state_from(
+        &mut self,
+        current: &Session,
+        baseline: &Session,
+    ) {
+        if current.prompt_summary != baseline.prompt_summary {
+            self.prompt_summary = current.prompt_summary.clone();
+        }
+        if current.classification != baseline.classification {
+            self.classification = current.classification;
+        }
+        if current.visibility != baseline.visibility {
+            self.visibility = current.visibility;
+        }
+        if current.adopted != baseline.adopted {
+            self.adopted = current.adopted;
+        }
+        if current.hidden != baseline.hidden {
+            self.hidden = current.hidden;
+        }
+        if current.status_label != baseline.status_label {
+            self.status_label = current.status_label.clone();
         }
     }
 
@@ -982,7 +1007,6 @@ pub(crate) fn worktree_harness(
     session: &Session,
 ) -> Result<WorktreeHarnessAssociation, String> {
     observability::with_writable_db(repo, |conn| {
-        migrate_worktree_session_schema(conn)?;
         let stored = conn
             .query_row(
                 "select worktree_path, worktree_incarnation, harness_id, migration_policy
@@ -1024,7 +1048,6 @@ pub(crate) fn set_worktree_harness(
     keep: bool,
 ) -> Result<(), String> {
     observability::with_writable_db(repo, |conn| {
-        migrate_worktree_session_schema(conn)?;
         set_worktree_harness_with_conn(conn, session, harness_id, keep)
     })
 }
@@ -1144,11 +1167,7 @@ pub(crate) fn list_archived_worktrees(repo: &Repository) -> Result<Vec<ArchivedW
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let conn = Connection::open_with_flags(
-        &path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| format!("open {} read-only: {error}", path.display()))?;
+    let conn = crate::storage::open_readonly(&path).map_err(|error| error.to_string())?;
     let table_count = conn
         .query_row(
             "select count(*) from sqlite_master where type = 'table' and name = 'archived_worktree'",
@@ -1184,11 +1203,7 @@ fn hidden_session_exists(repo: &Repository, branch: &str) -> Result<bool, String
     if !path.exists() {
         return Ok(false);
     }
-    let conn = Connection::open_with_flags(
-        &path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| format!("open {} read-only: {error}", path.display()))?;
+    let conn = crate::storage::open_readonly(&path).map_err(|error| error.to_string())?;
     let table_count = conn
         .query_row(
             "select count(*) from sqlite_master where type = 'table' and name = 'hidden_session'",
@@ -1374,9 +1389,23 @@ mod tests {
                 params![branch],
             )
             .map_err(|error| error.to_string())?;
+            conn.execute(
+                "insert into archived_worktree (
+                    branch, repo_root, worktree_path, archived_unix_ms, classification
+                 ) values (?1, ?2, ?3, 0, 'work')",
+                params![
+                    branch,
+                    repo.root.display().to_string(),
+                    path.display().to_string()
+                ],
+            )
+            .map_err(|error| error.to_string())?;
             conn.execute_batch(
-                "drop table archived_worktree;
-                 create table archived_worktree (branch text primary key);",
+                "create trigger fail_archived_worktree_delete
+                 before delete on archived_worktree
+                 begin
+                   select raise(abort, 'injected archived worktree delete failure');
+                 end;",
             )
             .map_err(|error| error.to_string())?;
             Ok(())
@@ -2185,7 +2214,10 @@ exit 0
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
         let db = observability::db_path(&repo);
         fs::create_dir_all(db.parent().unwrap()).unwrap();
-        rusqlite::Connection::open(&db).unwrap();
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute_batch("create table unrelated (id integer primary key)")
+            .unwrap();
 
         assert!(!hidden_session_exists(&repo, "feature").unwrap());
 

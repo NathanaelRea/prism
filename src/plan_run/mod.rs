@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -31,9 +31,10 @@ mod tests;
 use executor::opencode_run_command;
 
 pub use control::{
-    abort_plan_run, abort_plan_step, archive_plan_run, cleanup_stale_archived_plan_runs,
-    prepare_plan_run_for_resume, reconcile_stale_plan_run, request_plan_run_pause,
-    resume_paused_plan_run, retry_failed_steps, retry_from_step, skip_plan_step,
+    ARCHIVED_PLAN_RETENTION_MS, abort_plan_run, abort_plan_step, archive_plan_run,
+    cleanup_stale_archived_plan_runs, prepare_plan_run_for_resume, reconcile_stale_plan_run,
+    request_plan_run_pause, resume_paused_plan_run, retry_failed_steps, retry_from_step,
+    skip_plan_step,
 };
 pub use events::{
     ingest_plan_sse_payload, parse_plan_agent_events, reconcile_plan_step_from_opencode_status,

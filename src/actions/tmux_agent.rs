@@ -157,6 +157,7 @@ impl Tui {
         )
         .is_ok()
         {
+            self.tmux_portal_resized = Some((use_.warmup_key.clone(), (width, height)));
             self.tmux_portal_last_polled
                 .insert(use_.warmup_key.clone(), Instant::now());
         }
@@ -164,9 +165,11 @@ impl Tui {
 
     pub(crate) fn start_tmux_agent_warmup(&mut self) {
         self.poll_tmux_agent_warmup();
+        self.refresh_worktree_harness_configs();
         let jobs = crate::agent_session::warmup_jobs_for_sessions(
             &self.repos,
             &self.sessions,
+            &self.worktree_harness_configs,
             &mut self.tmux_generations,
             &self.tmux_warmups_in_flight,
         );
@@ -181,9 +184,11 @@ impl Tui {
         delay: Duration,
     ) {
         self.poll_tmux_agent_warmup();
+        self.refresh_worktree_harness_configs();
         if let Some(job) = crate::agent_session::warmup_job_for_key(
             &self.repos,
             &self.sessions,
+            &self.worktree_harness_configs,
             &self.tmux_generations,
             &self.tmux_warmups_in_flight,
             key,
@@ -197,31 +202,41 @@ impl Tui {
         &mut self,
         job: crate::agent_session::AgentSessionWarmupJob,
     ) {
-        let tx = self.tmux_warmup_tx.clone();
         self.tmux_warmups_in_flight.insert(job.key.clone());
-        std::thread::spawn(move || {
-            if !job.delay.is_zero() {
-                std::thread::sleep(job.delay);
-            }
-            let result = crate::agent_session::ensure_session(
-                &job.repo,
-                &job.config,
-                &job.session,
-                job.key.generation,
-            );
-            let (running, error) = match result {
-                Ok(running) => (Some(running), None),
-                Err(error) => (None, Some(error)),
-            };
-            let _ = tx.send(AgentSessionWarmupResult {
-                key: job.key,
-                running,
-                error,
-            });
-        });
+        let key = job.key.clone();
+        self.spawn_tui_job(
+            TuiJobKind::TmuxWarmup,
+            TuiJobKey::Tmux(key.clone()),
+            key.generation,
+            Some(TUI_ACTION_JOB_TIMEOUT),
+            format!("prism-tmux-warmup-{}", job.key.slot.worktree.branch),
+            move |context| {
+                if !job.delay.is_zero() && context.wait(job.delay) {
+                    return Ok(None);
+                }
+                let result = crate::agent_session::ensure_session(
+                    &job.repo,
+                    &job.config,
+                    &job.session,
+                    job.key.generation,
+                );
+                let (running, error) = match result {
+                    Ok(running) => (Some(running), None),
+                    Err(error) => (None, Some(error)),
+                };
+                Ok(Some(TuiJobPayload::TmuxWarmup(AgentSessionWarmupResult {
+                    key,
+                    running,
+                    error,
+                })))
+            },
+        );
     }
 
     pub(crate) fn poll_tmux_agent_warmup(&mut self) -> bool {
+        if !self.tui_tick_active && !self.routing_tui_jobs {
+            self.route_tui_job_messages();
+        }
         let mut changed = false;
         while let Ok(result) = self.tmux_warmup_rx.try_recv() {
             changed |= self.apply_tmux_warmup_result(result);
@@ -232,11 +247,13 @@ impl Tui {
     pub(crate) fn finish_tmux_warmup_for_key(&mut self, key: &AgentSessionWarmupKey) -> bool {
         let mut changed = self.poll_tmux_agent_warmup();
         while self.tmux_warmups_in_flight.contains(key) {
-            let Ok(result) = self.tmux_warmup_rx.recv() else {
-                self.tmux_warmups_in_flight.remove(key);
-                break;
-            };
-            changed |= self.apply_tmux_warmup_result(result);
+            self.route_tui_job_messages();
+            while let Ok(result) = self.tmux_warmup_rx.try_recv() {
+                changed |= self.apply_tmux_warmup_result(result);
+            }
+            if self.tmux_warmups_in_flight.contains(key) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
         changed
     }

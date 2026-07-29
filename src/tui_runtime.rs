@@ -98,7 +98,6 @@ impl TerminalRuntime {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn suspend_for<T>(
         &mut self,
         f: impl FnOnce() -> Result<T, String>,

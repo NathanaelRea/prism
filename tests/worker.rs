@@ -225,8 +225,9 @@ fn real_worker_executes_a_queued_plan_and_persists_lifecycle() {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert!(events >= 4);
-            break;
+            if events >= 4 {
+                break;
+            }
         }
         assert!(
             Instant::now() < deadline,

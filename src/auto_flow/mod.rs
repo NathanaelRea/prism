@@ -2,7 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -58,7 +58,8 @@ pub use output::{
 };
 pub use runner::execute_auto_initial_step;
 pub use storage::{
-    load_auto_run, load_recent_active_runs_for_repo, migrate_schema, save_auto_run, submit_auto_run,
+    load_auto_run, load_auto_run_snapshot, load_recent_active_run_snapshots_for_repo,
+    load_recent_active_runs_for_repo, migrate_schema, save_auto_run, submit_auto_run,
 };
 
 pub(crate) use support::unix_ms;

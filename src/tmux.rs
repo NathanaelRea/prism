@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::opencode::{OpencodeRuntime, load_runtime};
 use crate::process::{
-    run_capture, run_output, run_output_allow_failure, run_output_allow_failure_with_timeout,
-    run_status_inherited, run_status_with_stdin, split_command_words,
+    ProcessPolicy, run_capture, run_output, run_output_allow_failure, run_status_inherited,
+    run_status_with_stdin, split_command_words,
 };
 use crate::repo::Repository;
 use crate::session::Session;
@@ -16,7 +16,6 @@ const EXISTING_SESSION_READY_WAIT: Duration = Duration::from_millis(250);
 const CREATED_SESSION_READY_WAIT: Duration = Duration::from_secs(2);
 const SESSION_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const AGENT_INPUT_READY_WAIT: Duration = Duration::from_secs(5);
-const PANE_CAPTURE_TIMEOUT: Duration = Duration::from_secs(4);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TmuxAgentSession {
@@ -340,13 +339,40 @@ pub fn latest_agent_session_generation(
         .max()
 }
 
-fn agent_session_names_with_prefix(config: &Config, prefix: &str) -> Result<Vec<String>, String> {
-    let output =
-        run_output_allow_failure(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+pub(crate) fn named_session_exists(config: &Config, expected: &str) -> Result<bool, String> {
+    let output = run_output_allow_failure(
+        Command::new(config.tool("tmux")).env_remove("TMUX").args([
             "list-sessions",
             "-F",
             "#{session_name}",
-        ]))?;
+        ]),
+        ProcessPolicy::TmuxPoll,
+    )?;
+    if output.status.success() {
+        return Ok(output.stdout.lines().any(|name| name == expected));
+    }
+    let error = output.stderr.trim();
+    if tmux_missing_session_error(error)
+        || error.contains("no sessions")
+        || error.contains("error connecting to")
+    {
+        Ok(false)
+    } else if error.is_empty() {
+        Err(format!("tmux exited with {}", output.status))
+    } else {
+        Err(error.to_string())
+    }
+}
+
+fn agent_session_names_with_prefix(config: &Config, prefix: &str) -> Result<Vec<String>, String> {
+    let output = run_output_allow_failure(
+        Command::new(config.tool("tmux")).env_remove("TMUX").args([
+            "list-sessions",
+            "-F",
+            "#{session_name}",
+        ]),
+        ProcessPolicy::TmuxPoll,
+    )?;
     if !output.status.success() {
         let stderr = output.stderr.trim();
         if tmux_missing_session_error(stderr) {
@@ -573,13 +599,16 @@ fn ensure_window(
 }
 
 fn window_exists(config: &Config, name: &str, window: TmuxWindow) -> Result<bool, String> {
-    run_output_allow_failure(Command::new(config.tool("tmux")).env_remove("TMUX").args([
-        "list-windows",
-        "-t",
-        name,
-        "-F",
-        "#{window_index}",
-    ]))
+    run_output_allow_failure(
+        Command::new(config.tool("tmux")).env_remove("TMUX").args([
+            "list-windows",
+            "-t",
+            name,
+            "-F",
+            "#{window_index}",
+        ]),
+        ProcessPolicy::TmuxPoll,
+    )
     .map(|output| {
         output.status.success()
             && output
@@ -606,11 +635,12 @@ fn kill_session(config: &Config, name: &str) -> Result<(), String> {
 }
 
 fn session_exists(config: &Config, name: &str) -> Result<bool, String> {
-    run_output_allow_failure(Command::new(config.tool("tmux")).env_remove("TMUX").args([
-        "has-session",
-        "-t",
-        name,
-    ]))
+    run_output_allow_failure(
+        Command::new(config.tool("tmux"))
+            .env_remove("TMUX")
+            .args(["has-session", "-t", name]),
+        ProcessPolicy::TmuxPoll,
+    )
     .map(|output| output.status.success())
 }
 
@@ -659,11 +689,9 @@ pub(crate) fn capture_agent_pane(
     config: &Config,
     branch: &str,
     generation: u64,
-    width: u16,
-    height: u16,
 ) -> Result<String, String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, branch, generation);
-    capture_portal_pane(config, &runtime.target(TmuxWindow::Agent), width, height)
+    capture_pane(config, &runtime.target(TmuxWindow::Agent), true)
 }
 
 pub(crate) fn resize_agent_pane(
@@ -675,7 +703,7 @@ pub(crate) fn resize_agent_pane(
     height: u16,
 ) -> Result<(), String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, branch, generation);
-    run_tmux_status(
+    let output = run_output_allow_failure(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
             .args(["resize-window", "-x"])
@@ -683,36 +711,9 @@ pub(crate) fn resize_agent_pane(
             .arg("-y")
             .arg(height.to_string())
             .args(["-t", &runtime.target(TmuxWindow::Agent)]),
-    )
-}
-
-fn capture_portal_pane(
-    config: &Config,
-    target: &str,
-    width: u16,
-    height: u16,
-) -> Result<String, String> {
-    let output = run_output_allow_failure_with_timeout(
-        Command::new(config.tool("tmux"))
-            .env_remove("TMUX")
-            .args(["resize-window", "-x"])
-            .arg(width.to_string())
-            .arg("-y")
-            .arg(height.to_string())
-            .args([
-                "-t",
-                target,
-                ";",
-                "capture-pane",
-                "-p",
-                "-e",
-                "-N",
-                "-t",
-                target,
-            ]),
-        PANE_CAPTURE_TIMEOUT,
+        ProcessPolicy::TmuxCapture,
     )?;
-    tmux_output_result(output)
+    tmux_output_result(output).map(|_| ())
 }
 
 fn pane_capture(config: &Config, name: &str) -> Option<String> {
@@ -727,9 +728,9 @@ fn capture_pane(config: &Config, target: &str, include_styles: bool) -> Result<S
     }
     command.args(["-t", target]);
     let output = if include_styles {
-        run_output_allow_failure_with_timeout(&mut command, PANE_CAPTURE_TIMEOUT)?
+        run_output_allow_failure(&mut command, ProcessPolicy::TmuxCapture)?
     } else {
-        run_output_allow_failure(&mut command)?
+        run_output_allow_failure(&mut command, ProcessPolicy::TmuxPoll)?
     };
     tmux_output_result(output)
 }
@@ -745,7 +746,7 @@ fn tmux_output_result(output: crate::process::ProcessOutput) -> Result<String, S
 }
 
 fn run_tmux_status(command: &mut Command) -> Result<(), String> {
-    let output = run_output(command)?;
+    let output = run_output(command, ProcessPolicy::TmuxPoll)?;
     if output.status.success() {
         return Ok(());
     }
@@ -758,7 +759,7 @@ fn run_tmux_status(command: &mut Command) -> Result<(), String> {
 }
 
 fn run_tmux_status_with_stdin(command: &mut Command, stdin: &str) -> Result<(), String> {
-    run_status_with_stdin(command, stdin)
+    run_status_with_stdin(command, stdin, ProcessPolicy::TmuxPoll)
 }
 
 fn tmux_missing_session_error(error: &str) -> bool {
@@ -881,6 +882,7 @@ fn pane_current_command(config: &Config, name: &str) -> Option<String> {
             .args(["display-message", "-p", "-t"])
             .arg(name)
             .arg("#{pane_current_command}"),
+        ProcessPolicy::TmuxPoll,
     )
     .ok()
     .map(|output| output.trim().to_string())
@@ -894,6 +896,7 @@ fn pane_start_command(config: &Config, name: &str) -> Option<String> {
             .args(["display-message", "-p", "-t"])
             .arg(name)
             .arg("#{pane_start_command}"),
+        ProcessPolicy::TmuxPoll,
     )
     .ok()
     .map(|output| output.trim().to_string())
@@ -1360,7 +1363,7 @@ exit 1
     }
 
     #[test]
-    fn capture_agent_pane_targets_agent_window() {
+    fn capture_agent_pane_does_not_resize_agent_window() {
         let temp = unique_temp_dir("prism-tmux-capture-pane-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -1388,15 +1391,12 @@ echo 'agent output'
         let runtime = TmuxAgentSession::for_worktree_session(&repo, "feature", 4);
 
         assert_eq!(
-            capture_agent_pane(&repo, &config, "feature", 4, 72, 18),
+            capture_agent_pane(&repo, &config, "feature", 4),
             Ok("agent output\n".to_string()),
         );
         assert_eq!(
             fs::read_to_string(&log).unwrap().trim(),
-            format!(
-                "resize-window -x 72 -y 18 -t {0}:1 ; capture-pane -p -e -N -t {0}:1",
-                runtime.name()
-            ),
+            format!("capture-pane -p -e -N -t {0}:1", runtime.name()),
         );
 
         let _ = fs::remove_dir_all(temp);

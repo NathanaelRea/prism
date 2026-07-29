@@ -5,7 +5,7 @@ use std::process::Command;
 #[cfg(test)]
 use std::sync::{Mutex, OnceLock};
 
-use crate::process::run_capture;
+use crate::process::{ProcessPolicy, run_capture};
 use crate::util::{prism_config_dir, safe_path_component, stable_hash};
 
 #[cfg(test)]
@@ -29,6 +29,7 @@ impl Repository {
                 .arg("-C")
                 .arg(&start)
                 .args(["rev-parse", "--show-toplevel"]),
+            ProcessPolicy::Metadata,
         )?;
         let root = PathBuf::from(output.trim());
         if root.as_os_str().is_empty() {

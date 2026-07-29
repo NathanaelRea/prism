@@ -98,11 +98,8 @@ impl Tui {
                 )
             }
             AutoStartupSource::ExistingPlan => {
-                raw.suspend()?;
-                let selected = select_plan_path(&session_path, &context.config);
-                let resume_result = raw.resume();
-                resume_result?;
-                let plan_path = selected?;
+                let plan_path =
+                    raw.suspend_for(|| select_plan_path(&session_path, &context.config))?;
                 validate_existing_auto_plan(&plan_path)?;
                 let Some(plan_run_mode) = self.prompt_auto_plan_run_mode(raw)? else {
                     return Ok(());
@@ -464,6 +461,13 @@ impl Tui {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
         let run_id = dashboard.run.run.id.clone();
+        let step_ids = dashboard
+            .run
+            .steps
+            .iter()
+            .filter_map(|step| step.id)
+            .collect::<BTreeSet<_>>();
+        let repository = crate::session::WorktreeRepositoryKey::new(repo.root.clone());
         crate::observability::with_writable_db(&repo, |conn| {
             let mut run = load_auto_run(conn, &run_id)?
                 .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
@@ -476,6 +480,11 @@ impl Tui {
         }
         self.selected_auto_step_by_run.remove(&run_id);
         self.auto_output_state_by_run.remove(&run_id);
+        self.auto_output_cache
+            .borrow_mut()
+            .retain(|(cached_repository, step_run_id), _| {
+                cached_repository != &repository || !step_ids.contains(step_run_id)
+            });
         self.show_message("dismissed Auto Flow run")?;
         Ok(true)
     }

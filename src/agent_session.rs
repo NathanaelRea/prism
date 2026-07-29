@@ -8,7 +8,7 @@ use crate::agent::AgentState;
 use crate::config::Config;
 use crate::opencode::{OpencodeRuntime, load_runtime};
 use crate::repo::Repository;
-use crate::session::{Session, WorktreeRepositoryKey, save_agent_state};
+use crate::session::{Session, WorktreeRepositoryKey, WorktreeSessionKey, save_agent_state};
 use crate::tmux;
 use crate::tui::ManagedRepo;
 
@@ -16,10 +16,7 @@ const DELAYED_REWARM_AFTER_ATTACH: Duration = Duration::from_millis(250);
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct AgentSessionSlot {
-    pub repository: WorktreeRepositoryKey,
-    pub branch: String,
-    pub path: PathBuf,
-    pub incarnation: String,
+    pub worktree: WorktreeSessionKey,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -78,10 +75,7 @@ impl AgentSessionSlot {
         session: &Session,
     ) -> Self {
         Self {
-            repository: repository.clone(),
-            branch: session.branch.clone(),
-            path: session.path.clone(),
-            incarnation: session.incarnation.clone(),
+            worktree: session.identity_key(repository),
         }
     }
 }
@@ -114,6 +108,7 @@ pub(crate) fn session_use(
 pub(crate) fn warmup_jobs_for_sessions(
     repos: &[ManagedRepo],
     sessions: &[Session],
+    harness_configs: &BTreeMap<WorktreeSessionKey, Config>,
     generations: &mut BTreeMap<AgentSessionSlot, u64>,
     in_flight: &BTreeSet<AgentSessionWarmupKey>,
 ) -> Vec<AgentSessionWarmupJob> {
@@ -125,9 +120,8 @@ pub(crate) fn warmup_jobs_for_sessions(
             (!in_flight.contains(&use_.warmup_key))
                 .then(|| {
                     repos.get(session.repo_index).and_then(|repo| {
-                        let association =
-                            crate::session::worktree_harness(&repo.repo, &session).ok()?;
-                        let config = repo.config.for_harness(&association.harness_id).ok()?;
+                        let session_key = session.identity_key(&repo.identity);
+                        let config = harness_configs.get(&session_key)?.clone();
                         Some(AgentSessionWarmupJob {
                             key: use_.warmup_key,
                             repo: repo.repo.clone(),
@@ -145,6 +139,7 @@ pub(crate) fn warmup_jobs_for_sessions(
 pub(crate) fn warmup_job_for_key(
     repos: &[ManagedRepo],
     sessions: &[Session],
+    harness_configs: &BTreeMap<WorktreeSessionKey, Config>,
     generations: &BTreeMap<AgentSessionSlot, u64>,
     in_flight: &BTreeSet<AgentSessionWarmupKey>,
     key: AgentSessionWarmupKey,
@@ -160,9 +155,9 @@ pub(crate) fn warmup_job_for_key(
     })?;
     let repo = repos
         .iter()
-        .find(|repo| repo.identity == key.slot.repository)?;
-    let association = crate::session::worktree_harness(&repo.repo, session).ok()?;
-    let config = repo.config.for_harness(&association.harness_id).ok()?;
+        .find(|repo| repo.identity == key.slot.worktree.repository)?;
+    let session_key = session.identity_key(&repo.identity);
+    let config = harness_configs.get(&session_key)?.clone();
     Some(AgentSessionWarmupJob {
         key,
         repo: repo.repo.clone(),
@@ -182,9 +177,9 @@ pub(crate) fn generation_for_slot(
     }
     let generation = repos
         .iter()
-        .find(|repo| repo.identity == slot.repository)
+        .find(|repo| repo.identity == slot.worktree.repository)
         .and_then(|repo| {
-            tmux::latest_agent_session_generation(&repo.repo, &repo.config, &slot.branch)
+            tmux::latest_agent_session_generation(&repo.repo, &repo.config, &slot.worktree.branch)
         })
         .unwrap_or(0);
     generations.insert(slot.clone(), generation);
@@ -196,7 +191,15 @@ pub(crate) fn rotate_generation(
     generations: &mut BTreeMap<AgentSessionSlot, u64>,
     slot: AgentSessionSlot,
 ) -> u64 {
-    let generation = generation_for_slot(repos, generations, &slot).saturating_add(1);
+    let cached = generation_for_slot(repos, generations, &slot);
+    let observed = repos
+        .iter()
+        .find(|repo| repo.identity == slot.worktree.repository)
+        .and_then(|repo| {
+            tmux::latest_agent_session_generation(&repo.repo, &repo.config, &slot.worktree.branch)
+        })
+        .unwrap_or(cached);
+    let generation = cached.max(observed).saturating_add(1);
     generations.insert(slot, generation);
     generation
 }
@@ -223,9 +226,33 @@ pub(crate) fn reconcile_worktree_sessions(
             ))
         })
         .collect::<BTreeSet<_>>();
-    for (slot, generation) in generations.iter_mut() {
-        if !live.contains(slot) {
-            *generation = generation.saturating_add(1);
+    let retired = generations
+        .keys()
+        .filter(|slot| !live.contains(*slot))
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut replacement_floors = BTreeMap::new();
+    for slot in retired {
+        let generation = generations
+            .remove(&slot)
+            .unwrap_or_default()
+            .saturating_add(1);
+        let namespace = (
+            slot.worktree.repository.clone(),
+            slot.worktree.branch.clone(),
+        );
+        replacement_floors
+            .entry(namespace)
+            .and_modify(|floor: &mut u64| *floor = (*floor).max(generation))
+            .or_insert(generation);
+    }
+    for slot in live {
+        let namespace = (
+            slot.worktree.repository.clone(),
+            slot.worktree.branch.clone(),
+        );
+        if let Some(floor) = replacement_floors.get(&namespace) {
+            generations.entry(slot).or_insert(*floor);
         }
     }
 }
@@ -379,14 +406,14 @@ pub(crate) fn apply_warmup_result(
     if let Some(error) = result.error {
         let repo = repos
             .iter()
-            .find(|repo| repo.identity == result.key.slot.repository)
+            .find(|repo| repo.identity == result.key.slot.worktree.repository)
             .map(|repo| repo.repo.clone())
             .unwrap_or_else(|| fallback_repo.clone());
         let _ = crate::observability::append_runtime_message(
             &repo,
             &format!(
                 "tmux warm-up failed for {}#{}: {error}",
-                result.key.slot.branch, result.key.generation
+                result.key.slot.worktree.branch, result.key.generation
             ),
         );
         return false;
@@ -533,6 +560,7 @@ mod tests {
             warmup_job_for_key(
                 &repos,
                 &sessions,
+                &BTreeMap::new(),
                 &generations,
                 &BTreeSet::new(),
                 AgentSessionWarmupKey::new(slot.clone(), 0),
@@ -547,6 +575,7 @@ mod tests {
             warmup_job_for_key(
                 &repos,
                 &sessions,
+                &BTreeMap::new(),
                 &generations,
                 &in_flight,
                 current,
@@ -566,8 +595,16 @@ mod tests {
         let sessions = vec![test_session("feature")];
         let slot = AgentSessionSlot::for_repository_session(&repos[0].identity, &sessions[0]);
         let mut generations = BTreeMap::from([(slot.clone(), 4)]);
+        let harness_configs =
+            BTreeMap::from([(sessions[0].identity_key(&repos[0].identity), test_config())]);
 
-        let jobs = warmup_jobs_for_sessions(&repos, &sessions, &mut generations, &BTreeSet::new());
+        let jobs = warmup_jobs_for_sessions(
+            &repos,
+            &sessions,
+            &harness_configs,
+            &mut generations,
+            &BTreeSet::new(),
+        );
 
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].key, AgentSessionWarmupKey::new(slot, 4));
@@ -623,6 +660,9 @@ mod tests {
             std::slice::from_ref(&recreated),
             &mut generations,
         );
+        let recreated_slot =
+            AgentSessionSlot::for_repository_session(&managed.identity, &recreated);
+        assert_eq!(generations.get(&recreated_slot), Some(&1));
         let changed = super::apply_warmup_result(
             std::slice::from_ref(&managed),
             &managed.repo,

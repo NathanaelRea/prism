@@ -166,7 +166,6 @@ pub(super) fn execute_run_plan_step(
     server_url: Option<String>,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
-    crate::plan_run::migrate_schema(conn)?;
     let step_id = persisted.steps[step_index]
         .id
         .ok_or_else(|| "auto run-plan step must be saved before output".to_string())?;

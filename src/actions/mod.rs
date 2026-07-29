@@ -1,8 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::thread;
+use std::process::Command;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -35,7 +33,7 @@ use crate::lifecycle::{
     push_branch, run_pre_pr_checks, run_pre_push_checks, run_worktrunk_approval_prompt,
 };
 use crate::observability::append_runtime_message;
-use crate::opencode::{self, OpencodeStatus, load_runtime};
+use crate::opencode::{self, OpencodeStatus, load_runtime, load_runtime_snapshot};
 use crate::plan::{PlanExecution, infer_total_phases, open_plan_mode, select_plan_path};
 use crate::plan_run::{
     DEFAULT_OUTPUT_LINES_PER_STEP, PlanRunMode, PlanRunStatus, PlanStepStatus, abort_plan_run,
@@ -43,7 +41,9 @@ use crate::plan_run::{
     prepare_plan_run_for_resume, request_plan_run_pause, resume_paused_plan_run,
     retry_failed_steps, retry_from_step, save_plan_run, skip_plan_step,
 };
-use crate::process::{command_exists, parse_command_words, run_capture};
+use crate::process::{
+    ProcessPolicy, command_exists, parse_command_words, run_capture, run_output_allow_failure,
+};
 use crate::repo::Repository;
 use crate::session::{
     CreateWorktreeOutcome, DeleteWorktreeOutcome, archive_worktree_session,
@@ -52,9 +52,11 @@ use crate::session::{
 use crate::tmux::TmuxWindow;
 use crate::tui::{
     DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, ManagedRepo,
-    OpencodeEventResult, OpencodePollKey, OpencodePollResult, PrPollKey, PrPollResult, Tui,
-    WtPollResult,
+    OpencodeEventResult, OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PrPollKey,
+    PrPollResult, SessionRefreshResult, SessionRefreshSnapshot, TUI_ACTION_JOB_TIMEOUT, Tui,
+    TuiJobKey, TuiJobKind, TuiJobPayload, WtPollResult,
 };
+use crate::tui_jobs::CoalescedFacet;
 
 use crate::util::status_count;
 

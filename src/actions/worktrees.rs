@@ -19,6 +19,159 @@ pub(super) fn archived_picker_overflow_message(
 }
 
 impl Tui {
+    pub(crate) fn refresh_sessions_after_tmux(&mut self) -> Result<(), String> {
+        self.route_tui_job_messages();
+        self.poll_session_refresh();
+        if self.session_refresh_in_flight {
+            self.session_refresh_pending = true;
+            return Ok(());
+        }
+        let base_generation = self.session_inventory_generation;
+        let mut repos = self.repos.clone();
+        let previous_repository_identities = self.session_repository_identities.clone();
+        let mut sessions = self
+            .sessions
+            .iter()
+            .map(crate::session::Session::background_job_snapshot)
+            .collect::<Vec<_>>();
+        self.session_refresh_in_flight = true;
+        self.spawn_tui_job(
+            TuiJobKind::SessionRefresh,
+            TuiJobKey::None,
+            base_generation,
+            Some(TUI_ACTION_JOB_TIMEOUT),
+            "prism-session-refresh".to_string(),
+            move |_| {
+                for managed in &mut repos {
+                    managed.config = crate::config::Config::load(&managed.repo);
+                }
+                let repositories = repos
+                    .iter()
+                    .enumerate()
+                    .map(
+                        |(repo_index, managed)| crate::session::WorktreeSessionRepository {
+                            repo_index,
+                            repo: &managed.repo,
+                            config: &managed.config,
+                            label: &managed.label,
+                            key: managed.key,
+                            identity: &managed.identity,
+                        },
+                    )
+                    .collect::<Vec<_>>();
+                let baseline_sessions = sessions
+                    .iter()
+                    .filter_map(|session| {
+                        let managed = repos.get(session.repo_index)?;
+                        Some((
+                            session.identity_key(&managed.identity),
+                            session.background_job_snapshot(),
+                        ))
+                    })
+                    .collect();
+                let result = crate::session::refresh_worktree_sessions(
+                    &repositories,
+                    &previous_repository_identities,
+                    &mut sessions,
+                )
+                .map(|()| SessionRefreshSnapshot {
+                    repository_identities: repos
+                        .iter()
+                        .enumerate()
+                        .map(|(index, repo)| (index, repo.identity.clone()))
+                        .collect(),
+                    configs: repos
+                        .iter()
+                        .map(|repo| (repo.identity.clone(), repo.config.clone()))
+                        .collect(),
+                    baseline_sessions,
+                    worktree_harness_configs: crate::tui::load_worktree_harness_configs(
+                        &repos, &sessions,
+                    ),
+                    sessions,
+                });
+                Ok(Some(TuiJobPayload::SessionRefresh(SessionRefreshResult {
+                    base_generation,
+                    result,
+                })))
+            },
+        );
+        Ok(())
+    }
+
+    pub(crate) fn poll_session_refresh(&mut self) -> bool {
+        if !self.tui_tick_active && !self.routing_tui_jobs {
+            self.route_tui_job_messages();
+        }
+        let mut changed = false;
+        let mut restart = false;
+        while let Ok(result) = self.session_refresh_rx.try_recv() {
+            if self.session_refresh_pending
+                || result.base_generation != self.session_inventory_generation
+            {
+                restart |= self.session_refresh_pending;
+                self.session_refresh_pending = false;
+                continue;
+            }
+            let snapshot = match result.result {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    let _ = append_runtime_message(
+                        &self.repo,
+                        &format!("background Worktree Session refresh failed: {error}"),
+                    );
+                    continue;
+                }
+            };
+            for managed in &mut self.repos {
+                if let Some(config) = snapshot.configs.get(&managed.identity) {
+                    managed.config = config.clone();
+                }
+            }
+            let mut previous = self
+                .sessions
+                .iter()
+                .filter_map(|session| {
+                    let managed = self.repos.get(session.repo_index)?;
+                    Some((
+                        session.identity_key(&managed.identity),
+                        session.background_job_snapshot(),
+                    ))
+                })
+                .collect::<BTreeMap<_, _>>();
+            let mut baseline = snapshot.baseline_sessions;
+            self.sessions = snapshot
+                .sessions
+                .into_iter()
+                .filter_map(|mut session| {
+                    let repository = snapshot.repository_identities.get(&session.repo_index)?;
+                    let repo_index = self
+                        .repos
+                        .iter()
+                        .position(|managed| &managed.identity == repository)?;
+                    let managed = &self.repos[repo_index];
+                    session.apply_repo_identity(repo_index, managed.label.clone(), managed.key);
+                    let identity = session.identity_key(&managed.identity);
+                    if let Some(old) = previous.remove(&identity) {
+                        if let Some(baseline) = baseline.remove(&identity) {
+                            session.preserve_concurrent_refresh_state_from(&old, &baseline);
+                        }
+                        session.preserve_refresh_state_from(old, &managed.config);
+                    }
+                    Some(session)
+                })
+                .collect();
+            self.worktree_harness_configs = snapshot.worktree_harness_configs;
+            self.reconcile_session_inventory();
+            self.session_inventory_generation = self.session_inventory_generation.saturating_add(1);
+            changed = true;
+        }
+        if restart {
+            let _ = self.refresh_sessions_after_tmux();
+        }
+        changed
+    }
+
     pub(crate) fn refresh_sessions(&mut self) -> Result<(), String> {
         for managed in &mut self.repos {
             managed.config = crate::config::Config::load(&managed.repo);
@@ -43,6 +196,15 @@ impl Tui {
             &self.session_repository_identities,
             &mut self.sessions,
         )?;
+        self.session_inventory_generation = self.session_inventory_generation.saturating_add(1);
+        self.reconcile_session_inventory();
+        self.worktree_harness_configs =
+            crate::tui::load_worktree_harness_configs(&self.repos, &self.sessions);
+        self.request_workflow_maintenance();
+        Ok(())
+    }
+
+    fn reconcile_session_inventory(&mut self) {
         let live = self
             .sessions
             .iter()
@@ -71,7 +233,6 @@ impl Tui {
             &mut self.tmux_generations,
         );
         self.ensure_navigation_valid();
-        Ok(())
     }
 
     pub(crate) fn create_session(
@@ -159,6 +320,7 @@ impl Tui {
             &context.config.default_harness,
             false,
         )?;
+        self.reload_worktree_harness_config(index);
         let adoption = crate::session::adopt_worktree_session(
             &context.repo,
             &mut self.sessions[index],
@@ -406,38 +568,25 @@ impl Tui {
         path: PathBuf,
         branch: String,
     ) -> Result<(), String> {
+        let repository = self
+            .repos
+            .iter()
+            .find(|managed| managed.repo.root == repo.root)
+            .map(|managed| managed.identity.clone())
+            .ok_or_else(|| "repository identity was not found".to_string())?;
+        let worktree = self
+            .sessions
+            .iter()
+            .find(|session| session.path == path && session.branch == branch)
+            .map(|session| session.identity_key(&repository))
+            .ok_or_else(|| "worktree session identity was not found".to_string())?;
         let key = DeleteSessionKey {
-            repository: self
-                .repos
-                .iter()
-                .find(|managed| managed.repo.root == repo.root)
-                .map(|managed| managed.identity.clone())
-                .ok_or_else(|| "repository identity was not found".to_string())?,
-            path: path.clone(),
-            branch: branch.clone(),
-            incarnation: self
-                .sessions
-                .iter()
-                .find(|session| session.path == path && session.branch == branch)
-                .map(|session| session.incarnation.clone())
-                .unwrap_or_default(),
             generation: self
                 .worktree_generations
-                .get(
-                    &self
-                        .repos
-                        .iter()
-                        .find(|managed| managed.repo.root == repo.root)
-                        .and_then(|managed| {
-                            self.sessions
-                                .iter()
-                                .find(|session| session.path == path && session.branch == branch)
-                                .map(|session| session.identity_key(&managed.identity))
-                        })
-                        .ok_or_else(|| "worktree session identity was not found".to_string())?,
-                )
+                .get(&worktree)
                 .copied()
                 .unwrap_or_default(),
+            worktree,
         };
         if !self.delete_sessions_in_flight.insert(key.clone()) {
             self.show_message("delete already in progress")?;
@@ -457,36 +606,40 @@ impl Tui {
         if selected_path.as_ref() == Some(&path) {
             self.ensure_navigation_valid();
         }
-        let tx = self.delete_session_tx.clone();
         let branch_for_job = branch.clone();
-        thread::spawn(move || {
-            let result = crate::session::delete_worktree_session_if_current(
-                &repo,
-                &config,
-                &path,
-                &branch_for_job,
-                Some(&key.incarnation),
-            );
-            let _ = tx.send(DeleteSessionResult { key, result });
-        });
+        let job_key = key.clone();
+        self.spawn_tui_job(
+            TuiJobKind::DeleteSession,
+            TuiJobKey::Delete(key.clone()),
+            key.generation,
+            Some(TUI_ACTION_JOB_TIMEOUT),
+            format!("prism-delete-{}", branch),
+            move |context| {
+                let result = crate::session::delete_worktree_session_if_current(
+                    &repo,
+                    &config,
+                    &path,
+                    &branch_for_job,
+                    Some(&key.worktree.incarnation),
+                );
+                Ok(Some(TuiJobPayload::DeleteSession(DeleteSessionResult {
+                    key: job_key,
+                    delivery_id: context.id(),
+                    result,
+                })))
+            },
+        );
         self.show_message(&format!("deleting {branch}..."))
     }
 
     pub(crate) fn poll_delete_sessions(&mut self) -> bool {
+        if !self.tui_tick_active && !self.routing_tui_jobs {
+            self.route_tui_job_messages();
+        }
         let mut changed = false;
         while let Ok(result) = self.delete_session_rx.try_recv() {
-            self.delete_sessions_in_flight.remove(&result.key);
-            let Some(current_generation) = self
-                .worktree_generations
-                .iter()
-                .find_map(|(key, generation)| {
-                    (key.repository == result.key.repository
-                        && key.path == result.key.path
-                        && key.branch == result.key.branch
-                        && key.incarnation == result.key.incarnation)
-                        .then_some(generation)
-                })
-                .copied()
+            let Some(current_generation) =
+                self.worktree_generations.get(&result.key.worktree).copied()
             else {
                 continue;
             };
@@ -497,15 +650,16 @@ impl Tui {
             match result.result {
                 Ok(DeleteWorktreeOutcome::Deleted) => {
                     self.sessions.retain(|session| {
-                        session.path != result.key.path || session.branch != result.key.branch
+                        session.path != result.key.worktree.path
+                            || session.branch != result.key.worktree.branch
                     });
                     if self
                         .selected_worktree_by_repo
-                        .get(&result.key.repository.root)
-                        == Some(&result.key.path)
+                        .get(&result.key.worktree.repository.root)
+                        == Some(&result.key.worktree.path)
                     {
                         self.selected_worktree_by_repo
-                            .remove(&result.key.repository.root);
+                            .remove(&result.key.worktree.repository.root);
                     }
                     self.ensure_navigation_valid();
                     match self.refresh_sessions() {
@@ -524,15 +678,16 @@ impl Tui {
                 }
                 Ok(DeleteWorktreeOutcome::BranchRetained { error }) => {
                     self.sessions.retain(|session| {
-                        session.path != result.key.path || session.branch != result.key.branch
+                        session.path != result.key.worktree.path
+                            || session.branch != result.key.worktree.branch
                     });
                     if self
                         .selected_worktree_by_repo
-                        .get(&result.key.repository.root)
-                        == Some(&result.key.path)
+                        .get(&result.key.worktree.repository.root)
+                        == Some(&result.key.worktree.path)
                     {
                         self.selected_worktree_by_repo
-                            .remove(&result.key.repository.root);
+                            .remove(&result.key.worktree.repository.root);
                     }
                     self.ensure_navigation_valid();
                     let _ = self.refresh_sessions();
@@ -542,7 +697,8 @@ impl Tui {
                 }
                 Ok(DeleteWorktreeOutcome::DeletedWithWarnings { errors }) => {
                     self.sessions.retain(|session| {
-                        session.path != result.key.path || session.branch != result.key.branch
+                        session.path != result.key.worktree.path
+                            || session.branch != result.key.worktree.branch
                     });
                     self.ensure_navigation_valid();
                     let _ = self.refresh_sessions();
@@ -553,7 +709,8 @@ impl Tui {
                 }
                 Err(error) => {
                     if let Some(session) = self.sessions.iter_mut().find(|session| {
-                        session.path == result.key.path && session.branch == result.key.branch
+                        session.path == result.key.worktree.path
+                            && session.branch == result.key.worktree.branch
                     }) {
                         session.hidden = false;
                     }

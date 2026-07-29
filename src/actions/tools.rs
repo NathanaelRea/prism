@@ -8,16 +8,11 @@ impl Tui {
         let context = self
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
-        raw.suspend()?;
-        let result = Command::new(context.config.tool("lazygit"))
-            .current_dir(&context.repo.root)
-            .status();
-        let resume_result = raw.resume();
-        resume_result?;
-        let status = result.map_err(|error| format!("lazygit: {error}"))?;
-        if !status.success() {
-            return Err(format!("lazygit exited with {status}"));
-        }
+        raw.suspend_for(|| {
+            crate::process::run_status_inherited(
+                Command::new(context.config.tool("lazygit")).current_dir(&context.repo.root),
+            )
+        })?;
         self.show_message("returned from repository lazygit")?;
         Ok(())
     }
@@ -33,16 +28,11 @@ impl Tui {
             .ok()
             .filter(|shell| !shell.trim().is_empty())
             .unwrap_or_else(|| "/bin/sh".to_string());
-        raw.suspend()?;
-        let result = Command::new(&shell)
-            .current_dir(&context.repo.root)
-            .status();
-        let resume_result = raw.resume();
-        resume_result?;
-        let status = result.map_err(|error| format!("{shell}: {error}"))?;
-        if !status.success() {
-            return Err(format!("{shell} exited with {status}"));
-        }
+        raw.suspend_for(|| {
+            crate::process::run_status_inherited(
+                Command::new(&shell).current_dir(&context.repo.root),
+            )
+        })?;
         self.show_message("returned from repository terminal")?;
         Ok(())
     }
@@ -58,14 +48,11 @@ impl Tui {
         let root = context.repo.root.clone();
         let config = context.config.clone();
         let navigation = self.navigation_snapshot();
-        raw.suspend()?;
-        let result = open_plan_mode(&config, &root);
-        let resume_result = raw.resume();
-        self.refresh_sessions()?;
+        let result = raw.suspend_for(|| open_plan_mode(&config, &root));
+        self.refresh_sessions_after_tmux()?;
         self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
-        resume_result?;
         result?;
         self.show_message("returned from plan mode")?;
         Ok(())
@@ -82,14 +69,11 @@ impl Tui {
         let path = self.sessions[context.session_index].path.clone();
         let config = context.config.clone();
         let navigation = self.navigation_snapshot();
-        raw.suspend()?;
-        let result = open_plan_mode(&config, &path);
-        let resume_result = raw.resume();
-        self.refresh_sessions()?;
+        let result = raw.suspend_for(|| open_plan_mode(&config, &path));
+        self.refresh_sessions_after_tmux()?;
         self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();
         self.start_wt_column_poll();
-        resume_result?;
         result?;
         self.show_message("returned from plan mode")?;
         Ok(())

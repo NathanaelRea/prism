@@ -6,12 +6,16 @@ use ratatui::text::Line;
 
 use crate::tui::{TmuxPortalCapture, TmuxPortalResult, TmuxPortalSnapshot, TmuxPortalTarget};
 
-const TMUX_PORTAL_POLL_INTERVAL: Duration = Duration::from_millis(150);
+const TMUX_PORTAL_POLL_INTERVAL: Duration = Duration::from_millis(300);
 const TMUX_PORTAL_RETRY_INTERVAL: Duration = Duration::from_secs(2);
-const TMUX_PORTAL_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
+// A resize and capture can each consume the tmux command timeout.
+const TMUX_PORTAL_CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl Tui {
     pub(crate) fn poll_tmux_portal(&mut self) -> bool {
+        if !self.tui_tick_active && !self.routing_tui_jobs {
+            self.route_tui_job_messages();
+        }
         let target = self.selected_tmux_portal_target();
         let target_key = target.as_ref().map(|target| match target {
             Ok(target) => &target.key,
@@ -20,10 +24,16 @@ impl Tui {
         let mut changed = false;
 
         while let Ok(result) = self.tmux_portal_rx.try_recv() {
-            let is_current =
-                self.tmux_portal_polls_in_flight.get(&result.key) == Some(&result.started_at);
-            if is_current {
+            let is_current = self
+                .tmux_portal_polls_in_flight
+                .get(&result.key)
+                .map(|started_at| *started_at == result.started_at)
+                .unwrap_or_else(|| target_key == Some(&result.key));
+            if self.tmux_portal_polls_in_flight.contains_key(&result.key) && is_current {
                 self.tmux_portal_polls_in_flight.remove(&result.key);
+            }
+            if is_current && let Some(size) = result.resized_size {
+                self.tmux_portal_resized = Some((result.key.clone(), size));
             }
             if is_current && target_key == Some(&result.key) {
                 let key = result.key;
@@ -40,10 +50,8 @@ impl Tui {
                 }
             }
         }
-
         let Some(target) = target else {
             self.tmux_portal_last_polled.clear();
-            self.tmux_portal_polls_in_flight.clear();
             if self.tmux_portal.take().is_some() {
                 changed = true;
             }
@@ -53,7 +61,6 @@ impl Tui {
             Ok(target) => target,
             Err(key) => {
                 self.tmux_portal_last_polled.clear();
-                self.tmux_portal_polls_in_flight.clear();
                 let snapshot = TmuxPortalSnapshot {
                     key: key.clone(),
                     capture: Some(TmuxPortalCapture {
@@ -70,9 +77,6 @@ impl Tui {
         };
         self.tmux_portal_last_polled
             .retain(|key, _| key == &target.key);
-        self.tmux_portal_polls_in_flight.retain(|key, started_at| {
-            key == &target.key && started_at.elapsed() < TMUX_PORTAL_CAPTURE_TIMEOUT
-        });
         let target_changed =
             self.tmux_portal.as_ref().map(|portal| &portal.key) != Some(&target.key);
         if target_changed {
@@ -107,29 +111,53 @@ impl Tui {
             .tmux_portal_last_polled
             .get(&target.key)
             .is_none_or(|last| last.elapsed() >= interval);
-        if due && !self.tmux_portal_polls_in_flight.contains_key(&target.key) {
+        if due && self.tmux_portal_polls_in_flight.is_empty() {
             let started_at = Instant::now();
             self.tmux_portal_last_polled
                 .insert(target.key.clone(), started_at);
             self.tmux_portal_polls_in_flight
                 .insert(target.key.clone(), started_at);
-            let tx = self.tmux_portal_tx.clone();
-            std::thread::spawn(move || {
-                let capture = crate::tmux::capture_agent_pane(
-                    &target.repo,
-                    &target.config,
-                    &target.key.slot.branch,
-                    target.key.generation,
-                    target.size.0,
-                    target.size.1,
-                )
-                .map(normalize_capture);
-                let _ = tx.send(TmuxPortalResult {
-                    key: target.key,
-                    started_at,
-                    capture,
-                });
-            });
+            let resize =
+                self.tmux_portal_resized.as_ref() != Some(&(target.key.clone(), target.size));
+            let key = target.key.clone();
+            self.spawn_tui_job(
+                TuiJobKind::TmuxPortal,
+                TuiJobKey::Tmux(key.clone()),
+                key.generation,
+                Some(TMUX_PORTAL_CAPTURE_TIMEOUT),
+                format!("prism-tmux-portal-{}", key.slot.worktree.branch),
+                move |_| {
+                    let (capture, resized_size) = (|| {
+                        if resize {
+                            crate::tmux::resize_agent_pane(
+                                &target.repo,
+                                &target.config,
+                                &target.key.slot.worktree.branch,
+                                target.key.generation,
+                                target.size.0,
+                                target.size.1,
+                            )?;
+                        }
+                        Ok((
+                            crate::tmux::capture_agent_pane(
+                                &target.repo,
+                                &target.config,
+                                &target.key.slot.worktree.branch,
+                                target.key.generation,
+                            )
+                            .map(normalize_capture),
+                            resize.then_some(target.size),
+                        ))
+                    })()
+                    .unwrap_or_else(|error| (Err(error), None));
+                    Ok(Some(TuiJobPayload::TmuxPortal(TmuxPortalResult {
+                        key,
+                        started_at,
+                        capture,
+                        resized_size,
+                    })))
+                },
+            );
         }
         changed
     }
@@ -151,13 +179,9 @@ impl Tui {
         let use_ =
             crate::agent_session::session_use(&self.repos, &mut self.tmux_generations, &session);
         let key = use_.warmup_key;
-        let association = match crate::session::worktree_harness(&managed.repo, &session) {
-            Ok(association) => association,
-            Err(_) => return Some(Err(key)),
-        };
-        let config = match managed.config.for_harness(&association.harness_id) {
-            Ok(config) => config,
-            Err(_) => return Some(Err(key)),
+        let session_key = session.identity_key(&managed.identity);
+        let Some(config) = self.worktree_harness_configs.get(&session_key).cloned() else {
+            return Some(Err(key));
         };
         Some(Ok(TmuxPortalTarget {
             key,

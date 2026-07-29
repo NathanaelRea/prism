@@ -105,7 +105,10 @@ pub fn safe_path_component(value: &str) -> String {
 }
 
 pub fn timestamp_label() -> String {
-    match crate::process::run_capture(std::process::Command::new("date").arg("+%H:%M:%S")) {
+    match crate::process::run_capture(
+        std::process::Command::new("date").arg("+%H:%M:%S"),
+        crate::process::ProcessPolicy::Metadata,
+    ) {
         Ok(value) => value.trim().to_string(),
         Err(_) => "now".to_string(),
     }
