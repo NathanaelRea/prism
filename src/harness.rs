@@ -786,15 +786,36 @@ pub fn terminate_process(
         if process_start_time_ticks(process_id) != _expected_start_time_ticks {
             return Ok(());
         }
+        #[cfg(not(target_os = "linux"))]
+        if !process_group_is_signalable(process_id)? {
+            return Ok(());
+        }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let result = unsafe { libc::kill(process_group, libc::SIGKILL) };
-    if result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
+    let error = std::io::Error::last_os_error();
+    if result == 0
+        || error.raw_os_error() == Some(libc::ESRCH)
+        || cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM)
+    {
         Ok(())
     } else {
+        Err(format!("kill harness process {process_id}: {error}"))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_group_is_signalable(process_id: u32) -> Result<bool, String> {
+    let result = unsafe { libc::kill(-(process_id as libc::pid_t), 0) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = std::io::Error::last_os_error();
+    if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::EPERM)) {
+        Ok(false)
+    } else {
         Err(format!(
-            "kill harness process {process_id}: {}",
-            std::io::Error::last_os_error()
+            "inspect harness process group {process_id}: {error}"
         ))
     }
 }

@@ -3,7 +3,7 @@ use std::error::Error;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -17,8 +17,9 @@ static WAL_WARNING_BUCKETS: OnceLock<Mutex<BTreeMap<std::path::PathBuf, u64>>> =
 
 const WAL_WARNING_BYTES: u64 = 64 * 1024 * 1024;
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct DatabaseIdentity {
+    path: PathBuf,
     device: u64,
     inode: u64,
 }
@@ -261,8 +262,8 @@ fn open_writable_inner(path: &Path) -> Result<Connection, StorageError> {
     }
     if version == CURRENT_SCHEMA_VERSION {
         let identity = database_identity(path)?;
-        if let Some(identity) = identity
-            && database_identity_is_validated(&identity)?
+        if let Some(identity) = identity.as_ref()
+            && database_identity_is_validated(identity)?
         {
             return Ok(conn);
         }
@@ -464,6 +465,7 @@ fn database_identity(path: &Path) -> Result<Option<DatabaseIdentity>, StorageErr
             StorageError::from_io(format!("identify database {}", path.display()), error)
         })?;
         Ok(Some(DatabaseIdentity {
+            path: path.to_path_buf(),
             device: metadata.dev(),
             inode: metadata.ino(),
         }))
@@ -1445,6 +1447,23 @@ mod tests {
         assert!(error.to_string().contains("primary key"));
         assert_eq!(fs::read(&path).unwrap(), before);
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn validation_cache_does_not_alias_reused_inodes_at_different_paths() {
+        let first = DatabaseIdentity {
+            path: PathBuf::from("first.db"),
+            device: 1,
+            inode: 2,
+        };
+        let second = DatabaseIdentity {
+            path: PathBuf::from("second.db"),
+            device: 1,
+            inode: 2,
+        };
+
+        assert_ne!(first, second);
     }
 
     #[test]
