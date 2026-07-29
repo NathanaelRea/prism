@@ -713,7 +713,11 @@ pub(crate) fn resize_agent_pane(
             .args(["-t", &runtime.target(TmuxWindow::Agent)]),
         ProcessPolicy::TmuxCapture,
     )?;
-    tmux_output_result(output).map(|_| ())
+    match tmux_output_result(output) {
+        Ok(_) => Ok(()),
+        Err(error) if tmux_missing_session_error(&error) => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 fn pane_capture(config: &Config, name: &str) -> Option<String> {

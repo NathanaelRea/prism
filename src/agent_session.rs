@@ -485,7 +485,9 @@ pub(crate) fn shutdown(repo: &Repository, config: &Config, branch: &str) -> Resu
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
+    use std::fs;
     use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         AgentSessionAttachCompletion, AgentSessionSlot, AgentSessionWarmupKey, apply_attach_result,
@@ -495,7 +497,7 @@ mod tests {
     use crate::config::Config;
     use crate::github::PrCache;
     use crate::repo::Repository;
-    use crate::session::Session;
+    use crate::session::{Session, worktree_incarnation};
     use crate::tui::ManagedRepo;
 
     #[test]
@@ -677,6 +679,42 @@ mod tests {
 
         assert!(!changed);
         assert_eq!(recreated.agent_state, AgentState::Idle);
+    }
+
+    #[test]
+    fn git_directory_activity_does_not_rotate_default_branch_generation() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp = std::env::temp_dir().join(format!(
+            "prism-agent-session-git-activity-{}-{unique}",
+            std::process::id()
+        ));
+        let worktree = temp.join("worktree");
+        let git_dir = worktree.join(".git");
+        fs::create_dir_all(&git_dir).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        let repos = vec![ManagedRepo::new(repo, test_config(), None)];
+        let mut session = test_session("main");
+        session.path = worktree.clone();
+        session.path_display = worktree.display().to_string();
+        session.incarnation = worktree_incarnation(&worktree);
+        let slot = AgentSessionSlot::for_repository_session(&repos[0].identity, &session);
+        let mut generations = BTreeMap::from([(slot, 0)]);
+
+        fs::write(git_dir.join("FETCH_HEAD"), "refreshed\n").unwrap();
+        session.incarnation = worktree_incarnation(&worktree);
+        super::reconcile_worktree_sessions(
+            &repos,
+            std::slice::from_ref(&session),
+            &mut generations,
+        );
+
+        let use_ = session_use(&repos, &mut generations, &session);
+        assert_eq!(use_.generation, 0);
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     fn test_session(branch: &str) -> Session {
