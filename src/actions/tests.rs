@@ -10,10 +10,11 @@ use crate::github::{PrCache, PrComment, PrDetails, PrSummary, pr_summary_or_erro
 use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
 use crate::plan_run::PlanRunMode;
 use crate::repo::Repository;
-use crate::session::Session;
+use crate::session::{DeleteWorktreeOutcome, Session};
 use crate::tui::{
-    DefaultBranchPollResult, OpencodeEventResult, OpencodeListenerKey, OpencodePollKey,
-    OpencodePollResult, PanelFocus, Tui, TuiJobKey, TuiJobKind, WtPollResult,
+    DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, OpencodeEventResult,
+    OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PanelFocus, PrPollKey, Tui,
+    TuiJobKey, TuiJobKind, WtPollResult,
 };
 
 use super::{
@@ -1247,6 +1248,56 @@ exit 0
 }
 
 #[test]
+fn completed_delete_schedules_inventory_refresh_without_tui_thread_io() {
+    let temp = unique_temp_dir("prism-delete-refresh-boundary-test");
+    fs::create_dir_all(&temp).unwrap();
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let cache = PrCache::observed(phase_1_pr_summary("abc123"), None);
+    crate::github::save_pr_cache(&repo, "feature/delete", &cache).unwrap();
+    let mut session = test_session(temp.join("worktree"), "feature/delete");
+    session.pr = cache;
+    let mut tui = Tui::new_single(repo.clone(), test_config(), vec![session]);
+    let worktree = tui.sessions[0].identity_key(&tui.repos[0].identity);
+    let pr_key = PrPollKey::for_repository_session_generation(
+        &tui.repos[0].identity,
+        &tui.sessions[0],
+        tui.worktree_generations[&worktree],
+    );
+    tui.pr_persistence_in_flight.insert(pr_key.clone());
+    let key = DeleteSessionKey {
+        generation: tui.worktree_generations[&worktree],
+        worktree: worktree.clone(),
+    };
+    tui.delete_session_tx
+        .send(DeleteSessionResult {
+            key,
+            delivery_id: 1,
+            result: Ok(DeleteWorktreeOutcome::Deleted),
+        })
+        .unwrap();
+
+    let changed = crate::flight_recorder::deny_external_calls_on_current_thread(|| {
+        crate::observability::deny_database_access_on_current_thread(|| tui.poll_delete_sessions())
+    });
+
+    assert!(changed);
+    assert!(tui.sessions.is_empty());
+    assert!(tui.session_refresh_in_flight);
+    assert!(tui.pr_persistence_pending.contains_key(&pr_key));
+
+    tui.pr_persistence_in_flight.remove(&pr_key);
+    wait_for_pr_persistence(&mut tui);
+    assert!(
+        crate::github::load_pr_cache(&repo, "feature/delete")
+            .summary()
+            .is_none()
+    );
+
+    drop(tui);
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
 fn failed_async_delete_restores_hidden_worktree() {
     let temp = unique_temp_dir("prism-delete-restore-test");
     fs::create_dir_all(&temp).unwrap();
@@ -1440,6 +1491,7 @@ fn phase_1_missing_github_remote_clears_live_and_persisted_pr_cache_state() {
     assert!(tui.sessions[0].pr.summary().is_none());
     assert!(tui.sessions[0].pr.details().is_none());
     assert!(!tui.sessions[0].unseen_comments);
+    wait_for_pr_persistence(&mut tui);
     let persisted = crate::github::load_pr_cache(&repo, "feature");
     assert!(persisted.summary().is_none());
     assert!(persisted.details().is_none());
@@ -1471,12 +1523,25 @@ fn missing_github_remote_clears_hidden_non_pollable_pr_cache_state() {
     assert!(tui.poll_pull_requests(true));
 
     assert!(tui.sessions[0].pr.summary().is_none());
+    wait_for_pr_persistence(&mut tui);
     assert!(
         crate::github::load_pr_cache(&repo, "feature")
             .summary()
             .is_none()
     );
     let _ = fs::remove_dir_all(temp);
+}
+
+fn wait_for_pr_persistence(tui: &mut Tui) {
+    let started = Instant::now();
+    while !tui.pr_persistence_in_flight.is_empty() || !tui.pr_persistence_pending.is_empty() {
+        tui.poll_pull_requests(false);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "PR cache persistence did not finish"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 #[test]

@@ -50,6 +50,8 @@ pub struct Tui {
     pub(crate) session_refresh_in_flight: bool,
     pub(crate) session_refresh_pending: bool,
     pub(crate) session_inventory_generation: u64,
+    agent_state_persistence_in_flight: BTreeSet<WorktreeSessionKey>,
+    agent_state_persistence_pending: BTreeMap<WorktreeSessionKey, AgentStatePersistenceRequest>,
     workflow_maintenance_tx: LatestSender<(), ()>,
     workflow_maintenance_rx: LatestReceiver<(), ()>,
     workflow_maintenance_in_flight: bool,
@@ -70,6 +72,9 @@ pub struct Tui {
     pub(crate) pr_poll_tx: LatestSender<PrDeliveryKey, PrPollResult>,
     pub(crate) pr_poll_rx: LatestReceiver<PrDeliveryKey, PrPollResult>,
     pub(crate) pr_polls_in_flight: BTreeSet<PrPollKey>,
+    pub(crate) pr_persistence_in_flight: BTreeSet<PrPollKey>,
+    pub(crate) pr_persistence_pending: BTreeMap<PrPollKey, PrPersistenceRequest>,
+    pub(crate) pr_persistence_versions: BTreeMap<PrPollKey, u64>,
     pub(crate) delete_session_tx: LatestSender<(DeleteSessionKey, u64), DeleteSessionResult>,
     pub(crate) delete_session_rx: LatestReceiver<(DeleteSessionKey, u64), DeleteSessionResult>,
     pub(crate) delete_sessions_in_flight: BTreeSet<DeleteSessionKey>,
@@ -120,8 +125,16 @@ pub struct Tui {
     pub(crate) auto_output_state_by_run: BTreeMap<String, view::AutoOutputViewerState>,
     pub(crate) auto_output_cache:
         RefCell<BTreeMap<(WorktreeRepositoryKey, i64), Vec<AutoOutputLine>>>,
-    pub(crate) last_plan_poll: Option<Instant>,
-    pub(crate) last_auto_poll: Option<Instant>,
+    workflow_poll_tx: LatestSender<WorktreeRepositoryKey, WorkflowPollResult>,
+    workflow_poll_rx: LatestReceiver<WorktreeRepositoryKey, WorkflowPollResult>,
+    workflow_polls_in_flight: BTreeSet<WorktreeRepositoryKey>,
+    workflow_last_polled: BTreeMap<WorktreeRepositoryKey, Instant>,
+    workflow_revision: u64,
+    linked_plan_runs: BTreeMap<String, PersistedPlanRun>,
+    dashboard_output_tx: LatestSender<DashboardOutputKey, DashboardOutputResult>,
+    dashboard_output_rx: LatestReceiver<DashboardOutputKey, DashboardOutputResult>,
+    dashboard_outputs_in_flight: BTreeSet<DashboardOutputKey>,
+    dashboard_output_last_polled: BTreeMap<DashboardOutputKey, Instant>,
     pub(crate) repo_filter: String,
     pub(crate) worktree_filter: String,
     pub(crate) leader_hint: Option<LeaderHint>,
@@ -250,18 +263,77 @@ pub(crate) enum PrPollResult {
         sessions: Vec<WorktreeSessionKey>,
         github_remote_configured: bool,
         summaries: Result<Vec<PrSummary>, String>,
+        observations: Result<Vec<PrSummarySessionResult>, String>,
+        refreshed: String,
         poll_started_at: Instant,
     },
     Details {
         key: PrPollKey,
         cache: Box<PrCache>,
     },
+    Persistence {
+        key: PrPollKey,
+        version: u64,
+        details: bool,
+        result: Result<(), String>,
+    },
+}
+
+pub(crate) struct PrSummarySessionResult {
+    pub key: WorktreeSessionKey,
+    pub summary: Option<PrSummary>,
+}
+
+pub(crate) struct PrPersistenceRequest {
+    pub(crate) key: PrPollKey,
+    pub(crate) version: u64,
+    pub(crate) details: bool,
+    pub(crate) repo: Repository,
+    pub(crate) branch: String,
+    pub(crate) cache: PrCache,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PrDeliveryKey {
     Summary(WorktreeRepositoryKey),
     Details(PrPollKey),
+    Persistence(PrPollKey),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum DashboardOutputKey {
+    Plan {
+        repository: WorktreeRepositoryKey,
+        run_id: String,
+        step: usize,
+    },
+    Auto {
+        repository: WorktreeRepositoryKey,
+        step_run_id: i64,
+    },
+}
+
+pub(crate) struct WorkflowPollSnapshot {
+    plan_runs: Result<Vec<PersistedPlanRun>, String>,
+    auto_runs: Result<Vec<PersistedAutoRun>, String>,
+    linked_plan_runs: Result<Vec<PersistedPlanRun>, String>,
+}
+
+pub(crate) struct WorkflowPollResult {
+    repository: WorktreeRepositoryKey,
+    revision: u64,
+    snapshot: Result<WorkflowPollSnapshot, String>,
+}
+
+pub(crate) enum DashboardOutputLines {
+    Plan(Vec<PlanOutputLine>),
+    Auto(Vec<AutoOutputLine>),
+}
+
+pub(crate) struct DashboardOutputResult {
+    key: DashboardOutputKey,
+    revision: u64,
+    lines: Result<DashboardOutputLines, String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -361,6 +433,14 @@ pub(crate) struct SessionRefreshSnapshot {
     pub baseline_sessions: BTreeMap<WorktreeSessionKey, Session>,
     pub sessions: Vec<Session>,
     pub worktree_harness_configs: BTreeMap<WorktreeSessionKey, Config>,
+    pub tmux_generations: BTreeMap<AgentSessionSlot, u64>,
+}
+
+struct AgentStatePersistenceRequest {
+    generation: u64,
+    repo: Repository,
+    branch: String,
+    state: Option<AgentState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -392,9 +472,13 @@ pub(crate) struct OpencodeListenerKey {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum TuiJobKind {
     SessionRefresh,
+    AgentStatePersistence,
     WorkflowMaintenance,
     PrSummary,
     PrDetails,
+    PrPersistence,
+    WorkflowPoll,
+    DashboardOutput,
     DeleteSession,
     TmuxWarmup,
     TmuxPortal,
@@ -408,9 +492,13 @@ impl TuiJobKind {
     const fn label(&self) -> &'static str {
         match self {
             Self::SessionRefresh => "session_refresh",
+            Self::AgentStatePersistence => "agent_state_persistence",
             Self::WorkflowMaintenance => "workflow_maintenance",
             Self::PrSummary => "pr_summary",
             Self::PrDetails => "pr_details",
+            Self::PrPersistence => "pr_persistence",
+            Self::WorkflowPoll => "workflow_poll",
+            Self::DashboardOutput => "dashboard_output",
             Self::DeleteSession => "delete_session",
             Self::TmuxWarmup => "tmux_warmup",
             Self::TmuxPortal => "tmux_portal",
@@ -426,8 +514,12 @@ impl TuiJobKind {
 pub(crate) enum TuiJobKey {
     None,
     Repository(WorktreeRepositoryKey),
+    WorkflowRepository(WorktreeRepositoryKey),
+    DashboardOutput(DashboardOutputKey),
     Worktree(WorktreeSessionKey),
+    AgentStatePersistence(WorktreeSessionKey),
     Pr(PrPollKey),
+    PrPersistence(PrPollKey),
     Delete(DeleteSessionKey),
     Tmux(AgentSessionWarmupKey),
     Opencode(OpencodePollKey),
@@ -459,6 +551,8 @@ pub(crate) enum TuiJobPayload {
     SessionRefresh(SessionRefreshResult),
     WorkflowMaintenance,
     PrPoll(PrPollResult),
+    WorkflowPoll(WorkflowPollResult),
+    DashboardOutput(DashboardOutputResult),
     DeleteSession(DeleteSessionResult),
     TmuxWarmup(AgentSessionWarmupResult),
     TmuxPortal(TmuxPortalResult),
@@ -493,6 +587,7 @@ fn pr_delivery_key(result: &PrPollResult) -> PrDeliveryKey {
     match result {
         PrPollResult::Summary { repository, .. } => PrDeliveryKey::Summary(repository.clone()),
         PrPollResult::Details { key, .. } => PrDeliveryKey::Details(key.clone()),
+        PrPollResult::Persistence { key, .. } => PrDeliveryKey::Persistence(key.clone()),
     }
 }
 
@@ -565,8 +660,8 @@ struct TuiBackgroundChanges {
     default_branch: bool,
     opencode_status: bool,
     opencode_events: bool,
-    plan_runs: bool,
-    auto_runs: bool,
+    workflows: bool,
+    dashboard_output: bool,
     pull_requests: bool,
     delete_sessions: bool,
     status_message: bool,
@@ -581,8 +676,8 @@ impl TuiBackgroundChanges {
             || self.default_branch
             || self.opencode_status
             || self.opencode_events
-            || self.plan_runs
-            || self.auto_runs
+            || self.workflows
+            || self.dashboard_output
             || self.pull_requests
             || self.delete_sessions
             || self.status_message
@@ -669,6 +764,10 @@ fn move_enabled_ordered_item(
 impl Tui {
     pub fn new(repos: Vec<ManagedRepo>, current_repo: usize, sessions: Vec<Session>) -> Self {
         let (pr_poll_tx, pr_poll_rx) = latest_channel(pr_delivery_key);
+        let (workflow_poll_tx, workflow_poll_rx) =
+            latest_channel(|result: &WorkflowPollResult| result.repository.clone());
+        let (dashboard_output_tx, dashboard_output_rx) =
+            latest_channel(|result: &DashboardOutputResult| result.key.clone());
         let (session_refresh_tx, session_refresh_rx) =
             latest_channel(|result: &SessionRefreshResult| result.base_generation);
         let (workflow_maintenance_tx, workflow_maintenance_rx) = latest_channel(|_| ());
@@ -725,6 +824,8 @@ impl Tui {
             session_refresh_in_flight: false,
             session_refresh_pending: false,
             session_inventory_generation: 0,
+            agent_state_persistence_in_flight: BTreeSet::new(),
+            agent_state_persistence_pending: BTreeMap::new(),
             workflow_maintenance_tx,
             workflow_maintenance_rx,
             workflow_maintenance_in_flight: false,
@@ -745,6 +846,9 @@ impl Tui {
             pr_poll_tx,
             pr_poll_rx,
             pr_polls_in_flight: BTreeSet::new(),
+            pr_persistence_in_flight: BTreeSet::new(),
+            pr_persistence_pending: BTreeMap::new(),
+            pr_persistence_versions: BTreeMap::new(),
             delete_session_tx,
             delete_session_rx,
             delete_sessions_in_flight: BTreeSet::new(),
@@ -794,8 +898,16 @@ impl Tui {
             selected_auto_step_by_run: BTreeMap::new(),
             auto_output_state_by_run: BTreeMap::new(),
             auto_output_cache: RefCell::new(BTreeMap::new()),
-            last_plan_poll: None,
-            last_auto_poll: None,
+            workflow_poll_tx,
+            workflow_poll_rx,
+            workflow_polls_in_flight: BTreeSet::new(),
+            workflow_last_polled: BTreeMap::new(),
+            workflow_revision: 0,
+            linked_plan_runs: BTreeMap::new(),
+            dashboard_output_tx,
+            dashboard_output_rx,
+            dashboard_outputs_in_flight: BTreeSet::new(),
+            dashboard_output_last_polled: BTreeMap::new(),
             repo_filter: String::new(),
             worktree_filter: String::new(),
             leader_hint: None,
@@ -1008,15 +1120,8 @@ impl Tui {
     ) -> Result<ShutdownReason, String> {
         crate::worker::ensure_running()?;
         self.offer_interrupted_run_recovery(runtime)?;
-        self.refresh_worktree_harness_configs();
-        self.start_tmux_agent_warmup();
+        self.refresh_sessions_after_tmux()?;
         self.poll_tmux_portal();
-        self.start_wt_column_poll();
-        self.start_default_branch_status_poll(true);
-        self.start_opencode_status_poll(true);
-        self.start_opencode_event_listeners();
-        self.refresh_plan_runs();
-        self.refresh_auto_runs(false);
         self.draw(runtime)?;
         if self.repos.is_empty() {
             match self.add_repository(runtime) {
@@ -1264,15 +1369,7 @@ impl Tui {
                             self.show_error("reorder repositories failed", &error)?;
                         }
                     } else {
-                        self.refresh_sessions()?;
-                        self.start_tmux_agent_warmup();
-                        self.start_wt_column_poll();
-                        self.start_default_branch_status_poll(true);
-                        self.start_opencode_status_poll(true);
-                        self.start_opencode_event_listeners();
-                        self.refresh_plan_runs();
-                        self.refresh_auto_runs(false);
-                        self.poll_pull_requests(true);
+                        self.refresh_sessions_after_tmux()?;
                     }
                 }
                 Key::VisibilityUp => {
@@ -1505,8 +1602,8 @@ impl Tui {
             default_branch: self.poll_default_branch_status(),
             opencode_status: self.poll_opencode_status(),
             opencode_events: self.poll_opencode_events(),
-            plan_runs: self.poll_plan_runs(),
-            auto_runs: self.poll_auto_runs(),
+            workflows: self.poll_workflow_runs(),
+            dashboard_output: self.poll_dashboard_outputs(),
             pull_requests: self.poll_pull_requests(false),
             delete_sessions: self.poll_delete_sessions(),
             status_message: self.expire_status_message(),
@@ -1515,6 +1612,7 @@ impl Tui {
         self.start_opencode_status_poll(false);
         self.start_opencode_event_listeners();
         self.poll_workflow_maintenance();
+        self.start_agent_state_persistence_jobs();
         self.tui_tick_active = false;
         crate::flight_recorder::record(
             "tui",
@@ -1685,11 +1783,17 @@ impl Tui {
                 .as_ref()
                 .is_some_and(|selected| match &metadata.key {
                     TuiJobKey::Worktree(key) => key == selected,
+                    TuiJobKey::AgentStatePersistence(key) => key == selected,
                     TuiJobKey::Tmux(key) => &key.slot.worktree == selected,
                     TuiJobKey::Pr(key) => &key.worktree == selected,
+                    TuiJobKey::PrPersistence(key) => &key.worktree == selected,
                     TuiJobKey::Opencode(key) => &key.worktree == selected,
                     TuiJobKey::OpencodeListener(stream) => &stream.worktree == selected,
-                    TuiJobKey::None | TuiJobKey::Repository(_) | TuiJobKey::Delete(_) => false,
+                    TuiJobKey::None
+                    | TuiJobKey::Repository(_)
+                    | TuiJobKey::WorkflowRepository(_)
+                    | TuiJobKey::DashboardOutput(_)
+                    | TuiJobKey::Delete(_) => false,
                 });
             if selected_job { 1 } else { 3 }
         };
@@ -1797,6 +1901,12 @@ impl Tui {
             TuiJobPayload::PrPoll(result) => {
                 let _ = self.pr_poll_tx.send(result);
             }
+            TuiJobPayload::WorkflowPoll(result) => {
+                let _ = self.workflow_poll_tx.send(result);
+            }
+            TuiJobPayload::DashboardOutput(result) => {
+                let _ = self.dashboard_output_tx.send(result);
+            }
             TuiJobPayload::DeleteSession(result) => {
                 let _ = self.delete_session_tx.send(result);
             }
@@ -1827,6 +1937,9 @@ impl Tui {
     fn clear_tui_job_in_flight(&mut self, metadata: &JobMetadata<TuiJobKind, TuiJobKey>) {
         match (&metadata.kind, &metadata.key) {
             (TuiJobKind::SessionRefresh, _) => self.session_refresh_in_flight = false,
+            (TuiJobKind::AgentStatePersistence, TuiJobKey::AgentStatePersistence(key)) => {
+                self.agent_state_persistence_in_flight.remove(key);
+            }
             (TuiJobKind::WorkflowMaintenance, _) => self.workflow_maintenance_in_flight = false,
             (TuiJobKind::PrSummary, TuiJobKey::Repository(repository)) => {
                 if let Some(repo) = self
@@ -1839,6 +1952,15 @@ impl Tui {
             }
             (TuiJobKind::PrDetails, TuiJobKey::Pr(key)) => {
                 self.pr_polls_in_flight.remove(key);
+            }
+            (TuiJobKind::PrPersistence, TuiJobKey::PrPersistence(key)) => {
+                self.pr_persistence_in_flight.remove(key);
+            }
+            (TuiJobKind::WorkflowPoll, TuiJobKey::WorkflowRepository(repository)) => {
+                self.workflow_polls_in_flight.remove(repository);
+            }
+            (TuiJobKind::DashboardOutput, TuiJobKey::DashboardOutput(key)) => {
+                self.dashboard_outputs_in_flight.remove(key);
             }
             (TuiJobKind::DeleteSession, TuiJobKey::Delete(key)) => {
                 self.delete_sessions_in_flight.remove(key);
@@ -1884,12 +2006,22 @@ impl Tui {
                     || metadata.generation == self.session_inventory_generation
             }
             TuiJobKey::Repository(_) => metadata.generation == self.session_inventory_generation,
+            TuiJobKey::WorkflowRepository(_) | TuiJobKey::DashboardOutput(_) => {
+                metadata.generation == self.workflow_revision
+            }
             TuiJobKey::Worktree(key) => {
                 self.worktree_generation_is_current(key, metadata.generation)
+            }
+            TuiJobKey::AgentStatePersistence(key) => {
+                self.agent_state_persistence_in_flight.contains(key)
             }
             TuiJobKey::Pr(key) => {
                 key.generation == metadata.generation
                     && self.worktree_generation_is_current(&key.worktree, metadata.generation)
+            }
+            TuiJobKey::PrPersistence(key) => {
+                key.generation == metadata.generation
+                    && self.pr_persistence_versions.contains_key(key)
             }
             TuiJobKey::Delete(key) => {
                 key.generation == metadata.generation
@@ -1930,6 +2062,97 @@ impl Tui {
         generation: u64,
     ) -> bool {
         self.worktree_generations.get(worktree).copied() == Some(generation)
+    }
+
+    pub(crate) fn queue_agent_state_persistence(&mut self, session_index: usize) {
+        let Some(session) = self.sessions.get(session_index) else {
+            return;
+        };
+        let Some(managed) = self.repos.get(session.repo_index) else {
+            return;
+        };
+        let worktree = session.identity_key(&managed.identity);
+        let generation = self
+            .worktree_generations
+            .get(&worktree)
+            .copied()
+            .unwrap_or_default();
+        self.agent_state_persistence_pending.insert(
+            worktree.clone(),
+            AgentStatePersistenceRequest {
+                generation,
+                repo: managed.repo.clone(),
+                branch: session.branch.clone(),
+                state: Some(session.agent_state),
+            },
+        );
+        self.start_agent_state_persistence_jobs();
+    }
+
+    pub(crate) fn queue_agent_state_removal(&mut self, session_index: usize) {
+        let Some(session) = self.sessions.get(session_index) else {
+            return;
+        };
+        let Some(managed) = self.repos.get(session.repo_index) else {
+            return;
+        };
+        let worktree = session.identity_key(&managed.identity);
+        let generation = self
+            .worktree_generations
+            .get(&worktree)
+            .copied()
+            .unwrap_or_default();
+        self.agent_state_persistence_pending.insert(
+            worktree,
+            AgentStatePersistenceRequest {
+                generation,
+                repo: managed.repo.clone(),
+                branch: session.branch.clone(),
+                state: None,
+            },
+        );
+        self.start_agent_state_persistence_jobs();
+    }
+
+    pub(crate) fn retain_agent_state_persistence_for(
+        &mut self,
+        live: &BTreeSet<WorktreeSessionKey>,
+    ) {
+        self.agent_state_persistence_pending
+            .retain(|key, request| live.contains(key) || request.state.is_none());
+    }
+
+    fn start_agent_state_persistence_jobs(&mut self) {
+        let keys = self
+            .agent_state_persistence_pending
+            .keys()
+            .filter(|key| !self.agent_state_persistence_in_flight.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            let Some(request) = self.agent_state_persistence_pending.remove(&key) else {
+                continue;
+            };
+            self.agent_state_persistence_in_flight.insert(key.clone());
+            self.spawn_tui_job(
+                TuiJobKind::AgentStatePersistence,
+                TuiJobKey::AgentStatePersistence(key),
+                request.generation,
+                Some(TUI_ACTION_JOB_TIMEOUT),
+                "prism-agent-state-persistence".to_string(),
+                move |_| {
+                    match request.state {
+                        Some(state) => {
+                            crate::session::save_agent_state(&request.repo, &request.branch, state)?
+                        }
+                        None => crate::observability::with_writable_db(&request.repo, |conn| {
+                            crate::agent_session::remove_state_with_conn(conn, &request.branch)
+                        })?,
+                    }
+                    Ok(None)
+                },
+            );
+        }
     }
 
     fn record_tui_job_terminal(
@@ -2020,6 +2243,9 @@ impl Tui {
     }
 
     fn recover_failed_tui_job(&mut self, metadata: &JobMetadata<TuiJobKind, TuiJobKey>) {
+        if metadata.kind == TuiJobKind::SessionRefresh {
+            self.session_refresh_pending = true;
+        }
         if let (TuiJobKind::DeleteSession, TuiJobKey::Delete(key)) = (&metadata.kind, &metadata.key)
             && let Some(session) = self.sessions.iter_mut().find(|session| {
                 self.repos
@@ -2035,14 +2261,26 @@ impl Tui {
     fn cleanup_tui_jobs(&mut self, reason: ShutdownReason) -> Result<(), String> {
         let mut errors = Vec::new();
         let started = Instant::now();
+        while (!self.pr_persistence_in_flight.is_empty()
+            || !self.pr_persistence_pending.is_empty()
+            || !self.agent_state_persistence_in_flight.is_empty()
+            || !self.agent_state_persistence_pending.is_empty())
+            && started.elapsed() < TUI_JOB_SHUTDOWN_GRACE
+        {
+            self.route_tui_job_messages();
+            self.drain_pr_poll_results();
+            self.start_agent_state_persistence_jobs();
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let active_jobs = self.jobs.active_metadata().len();
+        let shutdown_started = Instant::now();
         self.scheduling_stopped = true;
         self.jobs.stop_accepting();
         self.jobs.cancel_all();
         if let Err(error) = self.shutdown_owned_opencode_servers() {
             errors.push(error);
         }
-        while self.jobs.has_jobs() && started.elapsed() < TUI_JOB_SHUTDOWN_GRACE {
+        while self.jobs.has_jobs() && shutdown_started.elapsed() < TUI_JOB_SHUTDOWN_GRACE {
             self.route_tui_job_messages();
             if self.jobs.has_jobs() {
                 std::thread::sleep(Duration::from_millis(10));
@@ -3060,10 +3298,15 @@ impl Tui {
         if self.focused_panel != PanelFocus::Worktrees || self.worktree_list_mode == mode {
             return;
         }
+        let selected = self.selected_worktree_index();
         self.worktree_list_mode = mode;
         self.persist_worktree_list_mode();
         if mode == WorktreeListMode::Repo {
-            self.restore_selected_worktree_for_repo();
+            if let Some(index) = selected {
+                self.select_worktree(index);
+            } else {
+                self.restore_selected_worktree_for_repo();
+            }
         }
     }
 
@@ -3696,42 +3939,102 @@ impl Tui {
         Ok(())
     }
 
-    fn poll_plan_runs(&mut self) -> bool {
+    fn poll_workflow_runs(&mut self) -> bool {
         let mut changed = false;
-        let should_poll = self
-            .last_plan_poll
-            .is_none_or(|last| last.elapsed() >= Duration::from_secs(1));
-        if should_poll {
-            changed |= self.refresh_plan_runs();
-            self.last_plan_poll = Some(Instant::now());
+        while let Ok(result) = self.workflow_poll_rx.try_recv() {
+            if result.revision != self.workflow_revision {
+                continue;
+            }
+            let Ok(snapshot) = result.snapshot else {
+                continue;
+            };
+            if let Ok(runs) = snapshot.plan_runs {
+                for run in runs {
+                    changed |= self.remember_plan_run_snapshot(run);
+                }
+            }
+            if let Ok(runs) = snapshot.auto_runs {
+                for run in runs {
+                    changed |= self.remember_auto_run_snapshot(run);
+                }
+            }
+            if let Ok(runs) = snapshot.linked_plan_runs {
+                for run in runs {
+                    let run_id = run.run.id.clone();
+                    changed |= self.linked_plan_runs.get(&run_id) != Some(&run);
+                    self.linked_plan_runs.insert(run_id, run);
+                }
+            }
         }
+        self.start_workflow_polls(false);
         changed
     }
 
-    fn refresh_plan_runs(&mut self) -> bool {
-        let mut changed = false;
-        let repos = self
+    pub(crate) fn start_workflow_polls(&mut self, force: bool) {
+        let revision = self.workflow_revision;
+        let requests = self
             .repos
             .iter()
-            .map(|managed| managed.repo.clone())
+            .filter(|managed| {
+                !self.workflow_polls_in_flight.contains(&managed.identity)
+                    && (force
+                        || self
+                            .workflow_last_polled
+                            .get(&managed.identity)
+                            .is_none_or(|last| last.elapsed() >= Duration::from_secs(1)))
+            })
+            .map(|managed| (managed.repo.clone(), managed.identity.clone()))
             .collect::<Vec<_>>();
-        for repo in repos {
-            let loaded = crate::observability::with_nonblocking_read_db_named(
-                &repo,
-                "tui.plan_runs.refresh",
-                |conn| {
-                    let runs = load_recent_plan_runs_for_repo(conn, &repo.root, 8)?;
-                    Ok(runs)
+        for (repo, repository) in requests {
+            self.workflow_polls_in_flight.insert(repository.clone());
+            self.workflow_last_polled
+                .insert(repository.clone(), Instant::now());
+            let job_repository = repository.clone();
+            self.spawn_tui_job(
+                TuiJobKind::WorkflowPoll,
+                TuiJobKey::WorkflowRepository(repository),
+                revision,
+                Some(TUI_ACTION_JOB_TIMEOUT),
+                "prism-workflow-poll".to_string(),
+                move |_| {
+                    let snapshot = crate::observability::with_nonblocking_read_db_named(
+                        &repo,
+                        "tui.workflow.refresh",
+                        |conn| {
+                            let plan_runs = load_recent_plan_runs_for_repo(conn, &repo.root, 8);
+                            let auto_runs =
+                                load_recent_active_run_snapshots_for_repo(conn, &repo.root, 8);
+                            let linked_plan_runs = match &auto_runs {
+                                Ok(runs) => {
+                                    let plan_ids = runs
+                                        .iter()
+                                        .flat_map(|run| &run.steps)
+                                        .filter_map(|step| step.plan_run_id.as_ref())
+                                        .collect::<BTreeSet<_>>();
+                                    plan_ids
+                                        .into_iter()
+                                        .filter_map(|run_id| {
+                                            load_plan_run(conn, run_id).transpose()
+                                        })
+                                        .collect::<Result<Vec<_>, _>>()
+                                }
+                                Err(_) => Ok(Vec::new()),
+                            };
+                            Ok(WorkflowPollSnapshot {
+                                plan_runs,
+                                auto_runs,
+                                linked_plan_runs,
+                            })
+                        },
+                    );
+                    Ok(Some(TuiJobPayload::WorkflowPoll(WorkflowPollResult {
+                        repository: job_repository,
+                        revision,
+                        snapshot,
+                    })))
                 },
             );
-            let Ok(runs) = loaded else {
-                continue;
-            };
-            for run in runs {
-                changed |= self.remember_plan_run(run);
-            }
         }
-        changed
     }
 
     pub(crate) fn load_plan_run_snapshot(&mut self, repo_root: &Path, run_id: &str) {
@@ -3748,6 +4051,18 @@ impl Tui {
     }
 
     pub(crate) fn remember_plan_run(&mut self, run: PersistedPlanRun) -> bool {
+        let changed = self.remember_plan_run_snapshot(run);
+        if changed {
+            self.workflow_revision = self.workflow_revision.saturating_add(1);
+        }
+        changed
+    }
+
+    pub(crate) fn invalidate_workflow_snapshots(&mut self) {
+        self.workflow_revision = self.workflow_revision.saturating_add(1);
+    }
+
+    fn remember_plan_run_snapshot(&mut self, run: PersistedPlanRun) -> bool {
         let run_id = run.run.id.clone();
         let scope_path = run.run.scope_path.clone();
         let selected_step = self.resolved_plan_step_selection(&run);
@@ -3885,44 +4200,6 @@ impl Tui {
         true
     }
 
-    fn poll_auto_runs(&mut self) -> bool {
-        if self
-            .last_auto_poll
-            .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
-        {
-            return false;
-        }
-        self.last_auto_poll = Some(Instant::now());
-        self.refresh_auto_runs(false)
-    }
-
-    fn refresh_auto_runs(&mut self, reconcile_stale: bool) -> bool {
-        let mut changed = false;
-        let repos = self
-            .repos
-            .iter()
-            .map(|managed| managed.repo.clone())
-            .collect::<Vec<_>>();
-        for repo in repos {
-            let loaded = crate::observability::with_nonblocking_read_db_named(
-                &repo,
-                "tui.auto_runs.refresh",
-                |conn| {
-                    let runs = load_recent_active_run_snapshots_for_repo(conn, &repo.root, 8)?;
-                    let _ = reconcile_stale;
-                    Ok(runs)
-                },
-            );
-            let Ok(runs) = loaded else {
-                continue;
-            };
-            for run in runs {
-                changed |= self.remember_auto_run(run);
-            }
-        }
-        changed
-    }
-
     pub(crate) fn load_auto_run_snapshot(&mut self, repo_root: &Path, run_id: &str) {
         let repo = Repository {
             root: repo_root.to_path_buf(),
@@ -3937,6 +4214,14 @@ impl Tui {
     }
 
     pub(crate) fn remember_auto_run(&mut self, run: PersistedAutoRun) -> bool {
+        let changed = self.remember_auto_run_snapshot(run);
+        if changed {
+            self.workflow_revision = self.workflow_revision.saturating_add(1);
+        }
+        changed
+    }
+
+    fn remember_auto_run_snapshot(&mut self, run: PersistedAutoRun) -> bool {
         let run_id = run.run.id.clone();
         let selected_step = self
             .selected_auto_step_by_run
@@ -3956,6 +4241,145 @@ impl Tui {
         let changed = self.auto_runs.get(&run_id) != Some(&run);
         self.auto_runs.insert(run_id, run);
         changed
+    }
+
+    fn poll_dashboard_outputs(&mut self) -> bool {
+        let mut changed = false;
+        while let Ok(result) = self.dashboard_output_rx.try_recv() {
+            if result.revision != self.workflow_revision {
+                continue;
+            }
+            let Ok(lines) = result.lines else {
+                continue;
+            };
+            match (&result.key, lines) {
+                (
+                    DashboardOutputKey::Plan { run_id, step, .. },
+                    DashboardOutputLines::Plan(lines),
+                ) => {
+                    let key = (run_id.clone(), *step);
+                    changed |= self.plan_output_cache.borrow().get(&key) != Some(&lines);
+                    self.plan_output_cache.borrow_mut().insert(key, lines);
+                }
+                (
+                    DashboardOutputKey::Auto {
+                        repository,
+                        step_run_id,
+                    },
+                    DashboardOutputLines::Auto(lines),
+                ) => {
+                    let key = (repository.clone(), *step_run_id);
+                    changed |= self.auto_output_cache.borrow().get(&key) != Some(&lines);
+                    self.auto_output_cache.borrow_mut().insert(key, lines);
+                }
+                _ => {}
+            }
+        }
+
+        let revision = self.workflow_revision;
+        let requests = self.dashboard_output_requests();
+        for (key, repo) in requests {
+            if self.dashboard_outputs_in_flight.contains(&key)
+                || self
+                    .dashboard_output_last_polled
+                    .get(&key)
+                    .is_some_and(|last| last.elapsed() < Duration::from_secs(1))
+            {
+                continue;
+            }
+            self.dashboard_outputs_in_flight.insert(key.clone());
+            self.dashboard_output_last_polled
+                .insert(key.clone(), Instant::now());
+            let job_key = key.clone();
+            self.spawn_tui_job(
+                TuiJobKind::DashboardOutput,
+                TuiJobKey::DashboardOutput(key),
+                revision,
+                Some(TUI_ACTION_JOB_TIMEOUT),
+                "prism-dashboard-output".to_string(),
+                move |_| {
+                    let lines = crate::observability::with_nonblocking_read_db_named(
+                        &repo,
+                        "tui.dashboard_output.refresh",
+                        |conn| match &job_key {
+                            DashboardOutputKey::Plan { run_id, step, .. } => {
+                                load_output_lines(conn, run_id, *step)
+                                    .map(DashboardOutputLines::Plan)
+                            }
+                            DashboardOutputKey::Auto { step_run_id, .. } => {
+                                load_auto_output_lines(conn, *step_run_id)
+                                    .map(DashboardOutputLines::Auto)
+                            }
+                        },
+                    );
+                    Ok(Some(TuiJobPayload::DashboardOutput(
+                        DashboardOutputResult {
+                            key: job_key,
+                            revision,
+                            lines,
+                        },
+                    )))
+                },
+            );
+        }
+        changed
+    }
+
+    fn dashboard_output_requests(&self) -> BTreeMap<DashboardOutputKey, Repository> {
+        let mut requests = BTreeMap::new();
+        if let Some((repo, run_id)) = self.selected_plan_run_id()
+            && let Some(run) = self.plan_runs.get(&run_id)
+        {
+            requests.insert(
+                DashboardOutputKey::Plan {
+                    repository: WorktreeRepositoryKey::new(repo.root.clone()),
+                    run_id,
+                    step: self.resolved_plan_step_selection(run),
+                },
+                repo,
+            );
+        }
+        if let Some((repo, worktree_path)) = self.selected_auto_scope()
+            && let Some(run_id) = self.active_auto_runs.get(&worktree_path)
+            && let Some(run) = self.auto_runs.get(run_id)
+        {
+            let selected_step_run_id = self
+                .selected_auto_step_by_run
+                .get(run_id)
+                .copied()
+                .or(run.run.selected_step_run_id)
+                .or_else(|| run.steps.first().and_then(|step| step.id));
+            if let Some(step_run_id) = selected_step_run_id {
+                let repository = WorktreeRepositoryKey::new(repo.root.clone());
+                requests.insert(
+                    DashboardOutputKey::Auto {
+                        repository: repository.clone(),
+                        step_run_id,
+                    },
+                    repo.clone(),
+                );
+                if let Some(plan_run_id) = run
+                    .steps
+                    .iter()
+                    .find(|step| step.id == Some(step_run_id))
+                    .and_then(|step| step.plan_run_id.as_ref())
+                    && let Some(plan_run) = self
+                        .plan_runs
+                        .get(plan_run_id)
+                        .or_else(|| self.linked_plan_runs.get(plan_run_id))
+                {
+                    requests.insert(
+                        DashboardOutputKey::Plan {
+                            repository,
+                            run_id: plan_run_id.clone(),
+                            step: self.resolved_plan_step_selection(plan_run),
+                        },
+                        repo,
+                    );
+                }
+            }
+        }
+        requests
     }
 
     pub(crate) fn current_auto_dashboard(&self) -> Option<view::AutoDashboard> {
@@ -4006,15 +4430,11 @@ impl Tui {
         repo: &Repository,
         plan_run_id: &str,
     ) -> Option<view::PlanDashboard> {
-        let mut run = self.plan_runs.get(plan_run_id).cloned().or_else(|| {
-            crate::observability::with_nonblocking_read_db_named(
-                repo,
-                "tui.linked_plan.snapshot",
-                |conn| load_plan_run(conn, plan_run_id),
-            )
-            .ok()
-            .flatten()
-        })?;
+        let mut run = self
+            .plan_runs
+            .get(plan_run_id)
+            .or_else(|| self.linked_plan_runs.get(plan_run_id))?
+            .clone();
         let run_scope_path = run.run.scope_path.clone();
         run.run.selected_step = self.resolved_plan_step_selection(&run);
         let output_lines = self.plan_output_snapshot(repo, &run.run.id, run.run.selected_step);
@@ -4044,51 +4464,25 @@ impl Tui {
 
     fn plan_output_snapshot(
         &self,
-        repo: &Repository,
+        _repo: &Repository,
         run_id: &str,
         step: usize,
     ) -> Vec<PlanOutputLine> {
         let key = (run_id.to_string(), step);
-        match crate::observability::with_nonblocking_read_db_named(
-            repo,
-            "tui.plan_output.load",
-            |conn| load_output_lines(conn, run_id, step),
-        ) {
-            Ok(lines) => {
-                self.plan_output_cache
-                    .borrow_mut()
-                    .insert(key, lines.clone());
-                lines
-            }
-            Err(_) => self
-                .plan_output_cache
-                .borrow()
-                .get(&key)
-                .cloned()
-                .unwrap_or_default(),
-        }
+        self.plan_output_cache
+            .borrow()
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn auto_output_snapshot(&self, repo: &Repository, step_run_id: i64) -> Vec<AutoOutputLine> {
         let key = (WorktreeRepositoryKey::new(repo.root.clone()), step_run_id);
-        match crate::observability::with_nonblocking_read_db_named(
-            repo,
-            "tui.auto_output.load",
-            |conn| load_auto_output_lines(conn, step_run_id),
-        ) {
-            Ok(lines) => {
-                self.auto_output_cache
-                    .borrow_mut()
-                    .insert(key.clone(), lines.clone());
-                lines
-            }
-            Err(_) => self
-                .auto_output_cache
-                .borrow()
-                .get(&key)
-                .cloned()
-                .unwrap_or_default(),
-        }
+        self.auto_output_cache
+            .borrow()
+            .get(&key)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn resolved_plan_step_selection(&self, run: &PersistedPlanRun) -> usize {
@@ -4612,8 +5006,8 @@ impl Tui {
                 choices: vec![
                     view::KeyChoice::new("a", "auto flow"),
                     self.git_choice(GitAction::LazyGit, "g", "lazygit"),
-                    self.git_choice(GitAction::OpenPr, "o", "open PR"),
                     self.git_choice(GitAction::Push, "P", "push/create PR"),
+                    self.git_choice(GitAction::OpenPr, "o", "open PR"),
                     self.git_choice(GitAction::Merge, "M", "merge"),
                     self.git_choice(GitAction::CiFix, "c", "CI repair"),
                     self.git_choice(GitAction::ReviewFix, "f", "review repair"),
@@ -4699,7 +5093,7 @@ mod tests {
     use ratatui::text::Line;
 
     use crate::agent::AgentState;
-    use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey};
+    use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
     use crate::auto_flow::{
         AutoImplementationSource, AutoRun, AutoRunMode, AutoRunStatus, PersistedAutoRun,
     };
@@ -4716,7 +5110,8 @@ mod tests {
     use crate::view::{ChoiceList, KeyChoice, OrderedToggleItem, RepoMainView, WorktreeMainView};
 
     use super::{
-        GitAction, ManagedRepo, OpenTmuxSessionTarget, PanelFocus, PrPollKey, TmuxPortalCapture,
+        GitAction, ManagedRepo, OpenTmuxSessionTarget, OpencodePollKey, OpencodePollResult,
+        PanelFocus, PrPollKey, PrPollResult, PrSummarySessionResult, TmuxPortalCapture,
         TmuxPortalResult, TmuxPortalSnapshot, Tui, TuiJobKey, TuiJobKind, WorktreeListMode,
         confirmation_result, move_enabled_ordered_item, selectable_choice_key,
         toggle_item_in_place, toggle_ordered_item,
@@ -5275,61 +5670,143 @@ mod tests {
     }
 
     #[test]
-    fn workflow_database_writer_does_not_block_input_loop() {
+    fn workflow_polling_does_not_access_database_on_tui_thread() {
         let temp = unique_temp_dir("prism-tui-database-poll-test");
         fs::create_dir_all(&temp).unwrap();
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         crate::observability::with_writable_db(&repo, |_| Ok(())).unwrap();
-        let blocker = rusqlite::Connection::open(crate::observability::db_path(&repo)).unwrap();
-        blocker
-            .execute_batch("begin exclusive transaction")
-            .unwrap();
         let mut tui = Tui::new_single(repo, test_config(), Vec::new());
-        tui.last_plan_poll = Some(Instant::now());
 
-        let started = Instant::now();
-        tui.tick_tui_action_jobs();
-        let elapsed = started.elapsed();
+        crate::observability::deny_database_access_on_current_thread(|| {
+            tui.tick_tui_action_jobs();
+        });
 
-        assert!(
-            elapsed < Duration::from_millis(250),
-            "workflow polling blocked input for {elapsed:?}"
-        );
+        assert_eq!(tui.workflow_polls_in_flight.len(), 1);
 
         drop(tui);
-        drop(blocker);
         let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
-    fn plan_database_writer_does_not_block_input_loop() {
-        let temp = unique_temp_dir("prism-tui-plan-database-poll-test");
+    fn applying_pr_poll_result_does_no_io_on_tui_thread() {
+        let temp = unique_temp_dir("prism-tui-pr-result-test");
         fs::create_dir_all(&temp).unwrap();
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         crate::observability::with_writable_db(&repo, |_| Ok(())).unwrap();
-        let blocker = rusqlite::Connection::open(crate::observability::db_path(&repo)).unwrap();
-        blocker
-            .execute_batch("begin exclusive transaction")
+        let session = test_session(0, &temp.display().to_string(), "feature");
+        let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+        let repository = tui.repos[0].identity.clone();
+        let session_key = tui.sessions[0].identity_key(&repository);
+        let poll_started_at = Instant::now();
+        tui.sessions[0].pr.begin_summary_poll(poll_started_at);
+        tui.repos[0].pr_summary_last_polled = Some(poll_started_at);
+        tui.repos[0].pr_summary_poll_in_flight = true;
+        tui.pr_poll_tx
+            .send(PrPollResult::Summary {
+                repository: repository.clone(),
+                sessions: vec![session_key.clone()],
+                github_remote_configured: true,
+                summaries: Ok(vec![test_pr_summary(false)]),
+                observations: Ok(vec![PrSummarySessionResult {
+                    key: session_key,
+                    summary: Some(test_pr_summary(false)),
+                }]),
+                refreshed: "now".to_string(),
+                poll_started_at,
+            })
             .unwrap();
-        let mut tui = Tui::new_single(repo, test_config(), Vec::new());
-        tui.last_auto_poll = Some(Instant::now());
+        let tmux_slot = AgentSessionSlot::for_repository_session(&repository, &tui.sessions[0]);
+        tui.tmux_generations.insert(tmux_slot.clone(), 0);
+        tui.tmux_warmup_tx
+            .send(AgentSessionWarmupResult {
+                key: AgentSessionWarmupKey::new(tmux_slot, 0),
+                running: Some(true),
+                error: None,
+            })
+            .unwrap();
+        let opencode_key =
+            OpencodePollKey::for_repository_session_generation(&repository, &tui.sessions[0], 0);
+        tui.opencode_poll_tx
+            .send(OpencodePollResult {
+                key: opencode_key,
+                started_at: Instant::now(),
+                status: Ok(OpencodeStatus {
+                    server_url: Some("http://127.0.0.1:41000".to_string()),
+                    session_id: Some("ses_1".to_string()),
+                    title: None,
+                    state: OpencodeState::Busy,
+                    detail: None,
+                    latest_message: None,
+                    latest_user_message: None,
+                    recent_messages: Vec::new(),
+                    active_tool: None,
+                    todos: Vec::new(),
+                    last_updated_unix_ms: Some(1),
+                }),
+            })
+            .unwrap();
 
-        let started = Instant::now();
-        tui.tick_tui_action_jobs();
-        let elapsed = started.elapsed();
+        let changes = crate::flight_recorder::deny_external_calls_on_current_thread(|| {
+            crate::observability::deny_database_access_on_current_thread(|| {
+                tui.tick_tui_action_jobs()
+            })
+        });
 
-        assert!(
-            elapsed < Duration::from_millis(250),
-            "plan polling blocked input for {elapsed:?}"
-        );
+        assert!(changes.pull_requests);
+        assert_eq!(tui.sessions[0].pr.summary().unwrap().number, 1);
+        assert_eq!(tui.sessions[0].agent_state, AgentState::Running);
 
         drop(tui);
-        drop(blocker);
         let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
-    fn workflow_database_writer_does_not_block_dashboard_rendering() {
+    fn failed_pr_details_respect_retry_backoff_on_tui_tick() {
+        let temp = unique_temp_dir("prism-tui-pr-details-backoff-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut tui = Tui::new_single(
+            repo,
+            test_config(),
+            vec![test_session(0, &temp.display().to_string(), "feature")],
+        );
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.sessions[0].pr = PrCache::observed(test_pr_summary(false), None);
+        let mut failed_poll = tui.sessions[0].pr.begin_details_poll();
+        crate::github::refresh_pr_details_cache_state(
+            "feature",
+            &mut failed_poll,
+            &tui.sessions[0].path,
+            &tui.repos[0].config,
+        );
+        let repository = tui.repos[0].identity.clone();
+        let generation = tui.worktree_generations[&tui.sessions[0].identity_key(&repository)];
+        let key =
+            PrPollKey::for_repository_session_generation(&repository, &tui.sessions[0], generation);
+        tui.repos[0].pr_summary_last_polled = Some(Instant::now());
+        tui.repos[0].pr_summary_poll_in_flight = true;
+        tui.pr_poll_tx
+            .send(PrPollResult::Details {
+                key,
+                cache: Box::new(failed_poll),
+            })
+            .unwrap();
+
+        crate::flight_recorder::deny_external_calls_on_current_thread(|| {
+            crate::observability::deny_database_access_on_current_thread(|| {
+                tui.tick_tui_action_jobs();
+            });
+        });
+
+        assert!(tui.pr_polls_in_flight.is_empty());
+        assert!(tui.sessions[0].pr.details().is_none());
+
+        drop(tui);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn repeated_dashboard_rendering_uses_only_cached_output() {
         let temp = unique_temp_dir("prism-tui-dashboard-database-test");
         fs::create_dir_all(&temp).unwrap();
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -5358,26 +5835,29 @@ mod tests {
         let mut tui = Tui::new_single(repo.clone(), test_config(), vec![session]);
         tui.focused_panel = PanelFocus::Worktrees;
         tui.remember_plan_run(run);
-        assert_eq!(
-            tui.current_plan_dashboard().unwrap().output_lines[0].text,
-            "cached output"
-        );
-        let blocker = rusqlite::Connection::open(crate::observability::db_path(&repo)).unwrap();
-        blocker
-            .execute_batch("begin exclusive transaction")
-            .unwrap();
-
-        let started = Instant::now();
-        let dashboard = tui.current_plan_dashboard();
-        let elapsed = started.elapsed();
-
-        assert_eq!(dashboard.unwrap().output_lines[0].text, "cached output");
-        assert!(
-            elapsed < Duration::from_millis(250),
-            "dashboard rendering blocked for {elapsed:?}"
+        tui.plan_output_cache.borrow_mut().insert(
+            ("plan".to_string(), 1),
+            vec![PlanOutputLine {
+                run_id: "plan".to_string(),
+                step: 1,
+                line_number: 1,
+                time_unix_ms: 1,
+                kind: PlanOutputKind::Assistant,
+                text: "cached output".to_string(),
+                block_id: None,
+            }],
         );
 
-        drop(blocker);
+        let dashboards = crate::observability::deny_database_access_on_current_thread(|| {
+            (0..3)
+                .map(|_| tui.current_plan_dashboard())
+                .collect::<Vec<_>>()
+        });
+
+        assert!(dashboards.iter().all(|dashboard| {
+            dashboard.as_ref().unwrap().output_lines[0].text == "cached output"
+        }));
+
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -5420,10 +5900,17 @@ esac
         let config = Config::load(&repo);
         let session = test_session(0, &temp.display().to_string(), "feature");
         let mut tui = Tui::new_single(repo, config, vec![session]);
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.tmux_portal_size = Some((72, 18));
 
         let started = Instant::now();
-        tui.refresh_sessions_after_tmux().unwrap();
-        tui.refresh_sessions_after_tmux().unwrap();
+        crate::flight_recorder::deny_external_calls_on_current_thread(|| {
+            crate::observability::deny_database_access_on_current_thread(|| {
+                tui.refresh_sessions_after_tmux().unwrap();
+                tui.refresh_sessions_after_tmux().unwrap();
+                tui.poll_tmux_portal();
+            });
+        });
         let elapsed = started.elapsed();
 
         assert!(
@@ -5434,7 +5921,11 @@ esac
         fs::write(refresh_gate, "").unwrap();
         let wait_started = Instant::now();
         while tui.session_refresh_in_flight && wait_started.elapsed() < Duration::from_secs(3) {
-            tui.poll_session_refresh();
+            crate::flight_recorder::deny_external_calls_on_current_thread(|| {
+                crate::observability::deny_database_access_on_current_thread(|| {
+                    tui.poll_session_refresh();
+                });
+            });
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(!tui.session_refresh_in_flight);
@@ -5993,6 +6484,21 @@ esac
 
         assert_eq!(tui.worktree_list_mode, WorktreeListMode::Repo);
         assert_eq!(tui.visible_session_indices(), vec![1]);
+    }
+
+    #[test]
+    fn switching_from_global_to_repo_mode_preserves_selected_worktree() {
+        let mut tui = test_tui();
+        tui.worktree_list_mode = WorktreeListMode::Global;
+        tui.focus_worktrees();
+        tui.select_worktree(1);
+        tui.select_repo(1);
+        tui.sessions[3].hidden = true;
+
+        tui.switch_worktree_list_mode(WorktreeListMode::Repo);
+
+        assert_eq!(tui.current_repo, 0);
+        assert_eq!(tui.selected_worktree_index(), Some(1));
     }
 
     #[test]

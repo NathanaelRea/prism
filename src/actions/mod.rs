@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::agent::AgentState;
-use crate::agent_session::{AgentSessionWarmupKey, AgentSessionWarmupResult};
+use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{
     AutoExecutorDecision, AutoImplementationSource, AutoLaunch, AutoLaunchOptions,
     AutoRunControlIntent, AutoRunMode, AutoRunStatus, AutoStepKey, AutoStepStatus,
@@ -19,12 +19,12 @@ use crate::git::{
     selected_dirty,
 };
 use crate::github::{
-    PR_SUMMARY_POLL_INTERVAL, PrCacheRepository, create_pull_request, fetch_pr_summary_index,
-    github_remote_repo, pr_cache_comment_count, pr_cache_pollable_for_session,
-    pr_cache_render_signature, pr_details_pollable, pr_summary_or_error,
-    record_pr_details_poll_result, record_pr_merged, record_pr_summary, record_pr_summary_failure,
+    PR_SUMMARY_POLL_INTERVAL, apply_pr_details_poll_result, apply_pr_summary_poll_result,
+    create_pull_request, fetch_pr_summary_index, github_remote_repo, persist_pr_cache_snapshot,
+    pr_cache_comment_count, pr_cache_pollable_for_session, pr_cache_render_signature,
+    pr_details_pollable, pr_summary_or_error, record_pr_merged, record_pr_summary,
     refresh_pr_cache, refresh_pr_details_cache_state, refresh_repo_policy_cache,
-    wait_for_pr_merged,
+    resolve_pr_summary_for_session, wait_for_pr_merged,
 };
 use crate::harness::{HarnessConfig, OutputFormat, PromptTransport};
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
@@ -33,7 +33,7 @@ use crate::lifecycle::{
     push_branch, run_pre_pr_checks, run_pre_push_checks, run_worktrunk_approval_prompt,
 };
 use crate::observability::append_runtime_message;
-use crate::opencode::{self, OpencodeStatus, load_runtime, load_runtime_snapshot};
+use crate::opencode::{self, OpencodeStatus, load_runtime};
 use crate::plan::{PlanExecution, infer_total_phases, open_plan_mode, select_plan_path};
 use crate::plan_run::{
     DEFAULT_OUTPUT_LINES_PER_STEP, PlanRunMode, PlanRunStatus, PlanStepStatus, abort_plan_run,
@@ -47,14 +47,15 @@ use crate::process::{
 use crate::repo::Repository;
 use crate::session::{
     CreateWorktreeOutcome, DeleteWorktreeOutcome, archive_worktree_session,
-    checkout_worktree_session, create_worktree_session, list_archived_worktrees, save_agent_state,
+    checkout_worktree_session, create_worktree_session, list_archived_worktrees,
 };
 use crate::tmux::TmuxWindow;
 use crate::tui::{
     DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, ManagedRepo,
-    OpencodeEventResult, OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PrPollKey,
-    PrPollResult, SessionRefreshResult, SessionRefreshSnapshot, TUI_ACTION_JOB_TIMEOUT, Tui,
-    TuiJobKey, TuiJobKind, TuiJobPayload, WtPollResult,
+    OpencodeEventResult, OpencodeListenerKey, OpencodePollKey, OpencodePollResult,
+    PrPersistenceRequest, PrPollKey, PrPollResult, PrSummarySessionResult, SessionRefreshResult,
+    SessionRefreshSnapshot, TUI_ACTION_JOB_TIMEOUT, Tui, TuiJobKey, TuiJobKind, TuiJobPayload,
+    WtPollResult,
 };
 use crate::tui_jobs::CoalescedFacet;
 

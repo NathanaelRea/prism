@@ -1221,12 +1221,12 @@ pub(super) fn execute_cleanup_step(
             "deleted local session data, worktree, and branch".to_string(),
             None,
         ),
-        crate::session::DeleteWorktreeOutcome::BranchRetained { error } => (
+        crate::session::DeleteWorktreeOutcome::BranchRetained { error, .. } => (
             AutoStepStatus::Failed,
             format!("worktree removed, but branch was retained: {error}"),
             Some(error),
         ),
-        crate::session::DeleteWorktreeOutcome::DeletedWithWarnings { errors } => {
+        crate::session::DeleteWorktreeOutcome::DeletedWithWarnings { errors, .. } => {
             let error = errors.join("; ");
             (
                 AutoStepStatus::Failed,

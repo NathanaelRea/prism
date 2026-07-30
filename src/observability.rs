@@ -1,5 +1,5 @@
 #[cfg(test)]
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -132,7 +132,36 @@ pub(crate) struct CapturedEvent {
 #[cfg(test)]
 thread_local! {
     static CAPTURED_EVENTS: RefCell<Vec<CapturedEvent>> = const { RefCell::new(Vec::new()) };
+    static DATABASE_ACCESS_FORBIDDEN: Cell<bool> = const { Cell::new(false) };
 }
+
+#[cfg(test)]
+pub(crate) fn deny_database_access_on_current_thread<T>(operation: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DATABASE_ACCESS_FORBIDDEN.with(|forbidden| forbidden.set(self.0));
+        }
+    }
+
+    let previous = DATABASE_ACCESS_FORBIDDEN.with(|forbidden| forbidden.replace(true));
+    let _reset = Reset(previous);
+    operation()
+}
+
+#[cfg(test)]
+fn assert_database_access_allowed() {
+    DATABASE_ACCESS_FORBIDDEN.with(|forbidden| {
+        assert!(
+            !forbidden.get(),
+            "database access is forbidden on this thread"
+        );
+    });
+}
+
+#[cfg(not(test))]
+fn assert_database_access_allowed() {}
 
 #[derive(Clone, Debug)]
 pub struct Operation {
@@ -770,6 +799,7 @@ pub fn with_writable_db_mut<T>(
     repo: &Repository,
     run: impl FnOnce(&mut Connection) -> Result<T, String>,
 ) -> Result<T, String> {
+    assert_database_access_allowed();
     let caller = std::panic::Location::caller();
     let operation = format!("{}:{}", caller.file(), caller.line());
     let started = Instant::now();
@@ -827,6 +857,7 @@ fn with_nonblocking_read_db_observed<T>(
     operation: &str,
     run: impl FnOnce(&Connection) -> Result<T, String>,
 ) -> Result<T, String> {
+    assert_database_access_allowed();
     let started = Instant::now();
     let open_started = Instant::now();
     let path = db_path(repo);
@@ -878,6 +909,7 @@ impl WritableDb {
         operation: &str,
         run: impl FnOnce(&Connection) -> Result<T, String>,
     ) -> Result<T, String> {
+        assert_database_access_allowed();
         let started = Instant::now();
         let open_started = Instant::now();
         let opened = open_observed_writable_db_path(&self.path);

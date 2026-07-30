@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
@@ -36,6 +38,23 @@ static UI_LAST_INPUT_US: AtomicU64 = AtomicU64::new(0);
 thread_local! {
     static PENDING_INPUT: RefCell<Option<InputTrace>> = const { RefCell::new(None) };
     static CURRENT_JOB_CONTEXT: RefCell<Option<JobDiagnosticContext>> = const { RefCell::new(None) };
+    #[cfg(test)]
+    static EXTERNAL_CALLS_FORBIDDEN: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn deny_external_calls_on_current_thread<T>(operation: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            EXTERNAL_CALLS_FORBIDDEN.with(|forbidden| forbidden.set(self.0));
+        }
+    }
+
+    let previous = EXTERNAL_CALLS_FORBIDDEN.with(|forbidden| forbidden.replace(true));
+    let _reset = Reset(previous);
+    operation()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,6 +175,13 @@ impl ExternalCallTrace {
         name: &'static str,
         terminal_base_fields: Vec<Field>,
     ) -> Self {
+        #[cfg(test)]
+        EXTERNAL_CALLS_FORBIDDEN.with(|forbidden| {
+            assert!(
+                !forbidden.get(),
+                "external calls are forbidden on this thread"
+            );
+        });
         let trace = Self {
             call_id: NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed),
             category,

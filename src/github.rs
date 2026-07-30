@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::BTreeSet;
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -395,7 +396,6 @@ impl PrCache {
 
     pub(crate) fn enforce_structural_eligibility(
         &mut self,
-        repo: &Repository,
         branch: &str,
         config: &Config,
         hidden: bool,
@@ -403,26 +403,38 @@ impl PrCache {
         if Self::structurally_eligible(branch, config, hidden) {
             return false;
         }
-        self.clear_if_present(repo, branch)
+        self.clear_if_present()
     }
 
-    pub(crate) fn clear_for_missing_github_remote(
-        &mut self,
-        repo: &Repository,
-        branch: &str,
-    ) -> bool {
-        self.clear_if_present(repo, branch)
+    pub(crate) fn clear_for_missing_github_remote(&mut self) -> bool {
+        self.clear_if_present()
     }
 
-    fn clear_if_present(&mut self, repo: &Repository, branch: &str) -> bool {
-        let changed = self.summary.is_some()
-            || self.details.is_some()
-            || self.error.is_some()
-            || self.last_refreshed.is_some();
+    fn clear_if_present(&mut self) -> bool {
+        let changed = self.summary.is_some() || self.details.is_some() || self.error.is_some();
         if changed {
-            clear_pr_cache(repo, branch, self);
+            let started_at = Instant::now();
+            self.begin_summary_poll(started_at);
+            self.finish_summary_poll(started_at);
+            self.record_summary_observation(None, timestamp_label());
         }
         changed
+    }
+
+    pub(crate) fn record_background_persistence_result(
+        &mut self,
+        details: bool,
+        result: Result<(), String>,
+    ) {
+        match result {
+            Ok(()) => {
+                self.persistence_error = None;
+                self.details_persistence_error = None;
+            }
+            Err(error) if details => self.details_persistence_error = Some(error),
+            Err(error) => self.persistence_error = Some(error),
+        }
+        self.rebuild_error();
     }
 }
 
@@ -439,6 +451,7 @@ pub(crate) struct RepoPolicyCache {
     pub error: Option<String>,
 }
 
+#[cfg(test)]
 pub(crate) struct PrCacheRepository<'a> {
     pub repo: &'a Repository,
     pub config: &'a Config,
@@ -1320,12 +1333,23 @@ pub(crate) fn refresh_pr_details_cache_state(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn record_pr_details_poll_result(
     repo: &Repository,
     branch: &str,
     cache: &mut PrCache,
     poll_result: PrCache,
 ) -> bool {
+    if !apply_pr_details_poll_result(cache, poll_result) {
+        return false;
+    }
+    let persistence = persist_pr_cache_snapshot(repo, branch, cache);
+    cache.details_persistence_error = persistence.err();
+    cache.rebuild_error();
+    true
+}
+
+pub(crate) fn apply_pr_details_poll_result(cache: &mut PrCache, poll_result: PrCache) -> bool {
     if !cache.accepts_details_poll(&poll_result) {
         return false;
     }
@@ -1342,30 +1366,6 @@ pub(crate) fn record_pr_details_poll_result(
     cache.details_association = result_identity;
     cache.details_quality = poll_result.details_quality;
     cache.details_errors = poll_result.details_errors;
-    let persistence = if let Some(association) = &cache.details_association {
-        if let Some(details) = &cache.details {
-            save_pr_details_cache_for_association(
-                repo,
-                branch,
-                details,
-                association,
-                &cache.details_errors,
-            )
-        } else if !cache.details_errors.is_empty() {
-            save_pr_details_cache_for_association(
-                repo,
-                branch,
-                &PrDetails::default(),
-                association,
-                &cache.details_errors,
-            )
-        } else {
-            Ok(())
-        }
-    } else {
-        Ok(())
-    };
-    cache.details_persistence_error = persistence.err();
     cache.pending_details = None;
     cache.rebuild_error();
     true
@@ -1405,6 +1405,7 @@ pub(crate) fn refresh_pr_summary_index_for_sessions(
     );
 }
 
+#[cfg(test)]
 pub(crate) fn refresh_pr_summary_index_for_target_sessions(
     repos: &[PrCacheRepository<'_>],
     sessions: &mut [Session],
@@ -1423,27 +1424,7 @@ pub(crate) fn refresh_pr_summary_index_for_target_sessions(
         if !session.pr.finish_summary_poll(poll_started_at) {
             continue;
         }
-        let summary =
-            if !PrCacheEligibility::for_successful_index(session, managed.config).can_observe() {
-                None
-            } else {
-                summaries
-                    .iter()
-                    .find(|summary| {
-                        pr_summary_matches_worktree(
-                            summary,
-                            &session.branch,
-                            &session.path,
-                            managed.config,
-                            session
-                                .pr
-                                .summary_observed_in_process
-                                .then_some(session.pr.summary.as_ref())
-                                .flatten(),
-                        )
-                    })
-                    .cloned()
-            };
+        let summary = resolve_pr_summary_for_session(session, managed.config, &summaries);
         let mutation = session
             .pr
             .record_summary_observation(summary, refreshed.clone());
@@ -1468,12 +1449,53 @@ fn pr_summary_matches_worktree(
     current_head_sha(path, config).is_ok_and(|head| head == summary.head_sha)
 }
 
+pub(crate) fn resolve_pr_summary_for_session(
+    session: &Session,
+    config: &Config,
+    summaries: &[PrSummary],
+) -> Option<PrSummary> {
+    if !PrCacheEligibility::for_successful_index(session, config).can_observe() {
+        return None;
+    }
+    summaries
+        .iter()
+        .find(|summary| {
+            pr_summary_matches_worktree(
+                summary,
+                &session.branch,
+                &session.path,
+                config,
+                session
+                    .pr
+                    .summary_observed_in_process
+                    .then_some(session.pr.summary.as_ref())
+                    .flatten(),
+            )
+        })
+        .cloned()
+}
+
+pub(crate) fn apply_pr_summary_poll_result(
+    cache: &mut PrCache,
+    poll_started_at: Instant,
+    observation: Result<Option<PrSummary>, String>,
+    refreshed: &str,
+) -> bool {
+    if !cache.finish_summary_poll(poll_started_at) {
+        return false;
+    }
+    match observation {
+        Ok(summary) => {
+            cache.record_summary_observation(summary, refreshed.to_string());
+        }
+        Err(error) => cache.record_summary_failure(error),
+    }
+    true
+}
+
 pub fn pr_details_due(cache: &PrCache) -> bool {
     if cache.summary.is_none() {
         return false;
-    }
-    if cache.details.is_none() {
-        return true;
     }
     cache
         .details_last_polled
@@ -1488,29 +1510,6 @@ pub(crate) fn pr_cache_pollable_for_session(session: &Session, config: &Config) 
             .summary
             .as_ref()
             .is_some_and(|summary| summary.merged)
-}
-
-pub(crate) fn clear_pr_cache(repo: &Repository, branch: &str, cache: &mut PrCache) {
-    let started_at = Instant::now();
-    cache.begin_summary_poll(started_at);
-    cache.finish_summary_poll(started_at);
-    let mutation = cache.record_summary_observation(None, timestamp_label());
-    persist_pr_summary_mutation(repo, branch, cache, mutation);
-}
-
-pub(crate) fn record_pr_summary_failure(
-    repo: &Repository,
-    branch: &str,
-    cache: &mut PrCache,
-    error: String,
-    poll_started_at: Instant,
-) -> bool {
-    if !cache.finish_summary_poll(poll_started_at) {
-        return false;
-    }
-    cache.record_summary_failure(error);
-    persist_observation_errors(repo, branch, cache);
-    true
 }
 
 pub(crate) fn record_pr_summary(
@@ -1551,6 +1550,36 @@ pub(crate) fn github_remote_configured(path: &std::path::Path, config: &Config) 
     .filter(|output| output.status.success())
     .and_then(|output| parse_github_remote(output.stdout.trim()))
     .is_some()
+}
+
+pub(crate) fn persist_pr_cache_snapshot(
+    repo: &Repository,
+    branch: &str,
+    cache: &PrCache,
+) -> Result<(), String> {
+    if cache.summary.is_none() {
+        return remove_pr_cache(repo, branch);
+    }
+    save_pr_cache(repo, branch, cache)?;
+    match (&cache.details, &cache.details_association) {
+        (Some(details), Some(association)) => save_pr_details_cache_for_association(
+            repo,
+            branch,
+            details,
+            association,
+            &cache.details_errors,
+        ),
+        (None, Some(association)) if !cache.details_errors.is_empty() => {
+            save_pr_details_cache_for_association(
+                repo,
+                branch,
+                &PrDetails::default(),
+                association,
+                &cache.details_errors,
+            )
+        }
+        _ => remove_pr_details_cache(repo, branch),
+    }
 }
 
 pub(crate) fn github_remote_repo(
@@ -4116,6 +4145,16 @@ exit 0
             .can_observe()
         );
         assert!(!pr_cache_pollable_for_session(&merged, &test_config()));
+    }
+
+    #[test]
+    fn missing_pr_details_obey_poll_interval_after_an_attempt_starts() {
+        let mut cache = PrCache::observed(test_summary("feature", "abc123", 0), None);
+
+        assert!(pr_details_due(&cache));
+        let _poll = cache.begin_details_poll();
+
+        assert!(!pr_details_due(&cache));
     }
 
     #[test]
