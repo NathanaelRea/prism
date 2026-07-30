@@ -141,11 +141,11 @@ pub(crate) fn deny_database_access_on_current_thread<T>(operation: impl FnOnce()
 
     impl Drop for Reset {
         fn drop(&mut self) {
-            DATABASE_ACCESS_FORBIDDEN.set(self.0);
+            DATABASE_ACCESS_FORBIDDEN.with(|forbidden| forbidden.set(self.0));
         }
     }
 
-    let previous = DATABASE_ACCESS_FORBIDDEN.replace(true);
+    let previous = DATABASE_ACCESS_FORBIDDEN.with(|forbidden| forbidden.replace(true));
     let _reset = Reset(previous);
     operation()
 }

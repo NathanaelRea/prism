@@ -48,11 +48,11 @@ pub(crate) fn deny_external_calls_on_current_thread<T>(operation: impl FnOnce() 
 
     impl Drop for Reset {
         fn drop(&mut self) {
-            EXTERNAL_CALLS_FORBIDDEN.set(self.0);
+            EXTERNAL_CALLS_FORBIDDEN.with(|forbidden| forbidden.set(self.0));
         }
     }
 
-    let previous = EXTERNAL_CALLS_FORBIDDEN.replace(true);
+    let previous = EXTERNAL_CALLS_FORBIDDEN.with(|forbidden| forbidden.replace(true));
     let _reset = Reset(previous);
     operation()
 }
