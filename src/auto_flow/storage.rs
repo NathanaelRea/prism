@@ -213,12 +213,14 @@ pub fn save_auto_run(
     conn: &rusqlite::Connection,
     persisted: &mut PersistedAutoRun,
 ) -> Result<(), String> {
+    let transaction = crate::flight_recorder::TransactionTrace::begin("auto_run.save");
     let tx = conn
         .unchecked_transaction()
         .map_err(|error| format!("begin auto run transaction: {error}"))?;
     save_persisted_auto_run_with_conn(&tx, persisted)?;
     tx.commit()
         .map_err(|error| format!("commit auto run transaction: {error}"))?;
+    transaction.committed();
     Ok(())
 }
 
@@ -226,6 +228,7 @@ pub fn submit_auto_run(
     conn: &rusqlite::Connection,
     persisted: &mut PersistedAutoRun,
 ) -> Result<(), String> {
+    let transaction = crate::flight_recorder::TransactionTrace::begin("auto_run.submit");
     let tx = conn
         .unchecked_transaction()
         .map_err(|error| format!("begin managed Auto Flow submission: {error}"))?;
@@ -238,7 +241,9 @@ pub fn submit_auto_run(
         ),
     )?;
     tx.commit()
-        .map_err(|error| format!("commit managed Auto Flow submission: {error}"))
+        .map_err(|error| format!("commit managed Auto Flow submission: {error}"))?;
+    transaction.committed();
+    Ok(())
 }
 
 pub(super) fn save_persisted_auto_run_with_conn(

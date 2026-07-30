@@ -19,6 +19,10 @@ pub fn run() -> Result<(), String> {
     let args = Args::parse(std::env::args_os().skip(1))?;
     if let CommandKind::Debug(DebugCommand::Record(options)) = &args.command {
         let repo = load_integrity_repo_context(args.repo.as_deref())?;
+        eprintln!(
+            "capturing the previous {}s and next {}s from the running Prism TUI...",
+            options.before_seconds, options.after_seconds
+        );
         let path = crate::flight_recorder::trigger(&repo, *options)?;
         println!("{}", path.display());
         return Ok(());
@@ -353,9 +357,6 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
         })?;
         let sessions =
             observability::phase("discover_sessions", || discover_workspace_sessions(&repos))?;
-        let _flight_recorder = crate::flight_recorder::serve_repositories(
-            repos.iter().map(|managed| &managed.repo),
-        );
         let mut tui = observability::phase("initialize_tui", || {
             Ok(tui::Tui::new(repos, selected_repo, sessions))
         })?;
@@ -586,6 +587,14 @@ fn run_debug_command(
             println!("user_config = {}", config.user_path.display());
             println!("repo_config = {}", config.repo_config_path.display());
             println!("logs_dir = {}", repo.prism_dir().join("logs").display());
+            println!(
+                "recordings_dir = {}",
+                repo.prism_dir().join("recordings").display()
+            );
+            println!(
+                "flight_recorder_socket = {}",
+                crate::flight_recorder::control_socket_path(repo).display()
+            );
             println!(
                 "worker_runtime_dir = {}",
                 crate::worker::runtime_dir().display()

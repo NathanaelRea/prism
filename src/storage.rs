@@ -253,6 +253,7 @@ fn open_writable_inner(path: &Path) -> Result<Connection, StorageError> {
     .map_err(|error| {
         StorageError::from_sqlite(format!("open {}", path.display()), error, started.elapsed())
     })?;
+    install_flight_recorder_trace(&conn);
     configure_writer(&conn)?;
 
     if !journal_mode(&conn)?.eq_ignore_ascii_case("wal") {
@@ -282,25 +283,24 @@ fn open_writable_inner(path: &Path) -> Result<Connection, StorageError> {
 
 pub fn open_readonly(path: &Path) -> Result<Connection, StorageError> {
     let started = Instant::now();
-    let result = open_readonly_inner(path).map_err(|error| diagnose_corruption(path, error));
+    let result = open_readonly_inner(path, true).map_err(|error| diagnose_corruption(path, error));
     record_open("readonly", started.elapsed(), &result);
     result
 }
 
-fn record_open(
-    access: &'static str,
-    elapsed: Duration,
-    result: &Result<Connection, StorageError>,
-) {
+fn record_open(access: &'static str, elapsed: Duration, result: &Result<Connection, StorageError>) {
     let mut fields = vec![
         crate::flight_recorder::text("access", access),
         crate::flight_recorder::boolean("success", result.is_ok()),
     ];
     if let Err(error) = result {
-        fields.push(crate::flight_recorder::text("error_kind", error.kind.label()));
+        fields.push(crate::flight_recorder::text(
+            "error_kind",
+            error.kind.label(),
+        ));
         if let Some(busy) = error.busy_elapsed {
             fields.push(crate::flight_recorder::unsigned(
-                "busy_wait_us",
+                "busy_wait_upper_bound_us",
                 busy.as_micros(),
             ));
         }
@@ -308,7 +308,81 @@ fn record_open(
     crate::flight_recorder::record("sqlite", "open", Some(elapsed), fields);
 }
 
-fn open_readonly_inner(path: &Path) -> Result<Connection, StorageError> {
+fn install_flight_recorder_trace(conn: &Connection) {
+    conn.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE,
+        Some(record_sqlite_profile),
+    );
+}
+
+fn record_sqlite_profile(event: rusqlite::trace::TraceEvent<'_>) {
+    let rusqlite::trace::TraceEvent::Profile(statement, elapsed) = event else {
+        return;
+    };
+    let sql = statement.sql();
+    let (statement_type, name) = sqlite_statement_name(&sql);
+    crate::flight_recorder::record(
+        "sqlite",
+        "statement",
+        Some(elapsed),
+        vec![
+            crate::flight_recorder::text("statement_type", statement_type),
+            crate::flight_recorder::text("name", &name),
+        ],
+    );
+}
+
+fn sqlite_statement_name(sql: &str) -> (&'static str, String) {
+    let tokens = sql
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                .to_ascii_lowercase()
+        })
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let statement_type = match tokens.first().map(String::as_str) {
+        Some("select" | "with") => "query",
+        Some("insert" | "update" | "delete" | "replace") => "write",
+        Some("begin" | "commit" | "rollback" | "savepoint" | "release") => "transaction",
+        Some("pragma") => "pragma",
+        Some("create" | "alter" | "drop") => "schema",
+        _ => "other",
+    };
+    let target = match tokens.first().map(String::as_str) {
+        Some("select" | "delete") => token_after(&tokens, "from"),
+        Some("insert" | "replace") => token_after(&tokens, "into"),
+        Some("update" | "pragma") => tokens.get(1).map(String::as_str),
+        Some("create" | "alter" | "drop") => schema_target(&tokens),
+        _ => None,
+    };
+    let verb = tokens.first().map(String::as_str).unwrap_or("unknown");
+    (
+        statement_type,
+        target.map_or_else(|| verb.to_string(), |target| format!("{verb}.{target}")),
+    )
+}
+
+fn schema_target(tokens: &[String]) -> Option<&str> {
+    let kind = tokens
+        .iter()
+        .position(|token| matches!(token.as_str(), "table" | "index" | "trigger"))?;
+    tokens[kind + 1..]
+        .iter()
+        .find(|token| !matches!(token.as_str(), "if" | "not" | "exists"))
+        .map(String::as_str)
+}
+
+fn token_after<'a>(tokens: &'a [String], needle: &str) -> Option<&'a str> {
+    tokens
+        .iter()
+        .position(|token| token == needle)
+        .and_then(|index| tokens.get(index + 1))
+        .map(String::as_str)
+}
+
+fn open_readonly_inner(path: &Path, observed: bool) -> Result<Connection, StorageError> {
     if !path.exists() {
         return Err(StorageError::policy(
             format!("database {} does not exist", path.display()),
@@ -328,6 +402,9 @@ fn open_readonly_inner(path: &Path) -> Result<Connection, StorageError> {
             started.elapsed(),
         )
     })?;
+    if observed {
+        install_flight_recorder_trace(&conn);
+    }
     configure_readonly(&conn)?;
     Ok(conn)
 }
@@ -584,6 +661,8 @@ fn migrate(
 ) -> Result<(), StorageError> {
     let identity = database_identity(path)?;
     loop {
+        let transaction =
+            crate::flight_recorder::TransactionTrace::begin("storage.schema_migration");
         execute_batch(
             conn,
             "begin immediate",
@@ -597,8 +676,9 @@ fn migrate(
             if version == CURRENT_SCHEMA_VERSION {
                 validate_complete_schema(conn)?;
                 validate_foreign_keys(conn)?;
-                return execute_batch(conn, "commit", "commit schema validation transaction")
-                    .map(|()| None);
+                execute_batch(conn, "commit", "commit schema validation transaction")?;
+                transaction.committed();
+                return Ok(None);
             }
 
             let next = version + 1;
@@ -615,6 +695,7 @@ fn migrate(
                 &format!("record schema migration {next}"),
             )?;
             execute_batch(conn, "commit", &format!("commit schema migration {next}"))?;
+            transaction.committed();
             Ok((next < CURRENT_SCHEMA_VERSION).then_some(next))
         })();
         match result {
@@ -1063,7 +1144,7 @@ fn validate_foreign_keys(conn: &Connection) -> Result<(), StorageError> {
 }
 
 pub fn quick_check_readonly(path: &Path) -> Result<StorageCheckReport, StorageError> {
-    let conn = open_readonly_inner(path)?;
+    let conn = open_readonly_inner(path, true)?;
     Ok(StorageCheckReport {
         quick_check: quick_check(&conn)?,
         foreign_key_check: foreign_key_check(&conn)?,
@@ -1152,7 +1233,7 @@ pub(crate) fn print_integrity(path: &Path) -> Result<(), StorageError> {
             println!("shm_bytes = unavailable");
         }
     }
-    let conn = match open_readonly(path) {
+    let conn = match open_readonly_inner(path, false) {
         Ok(conn) => conn,
         Err(error) => {
             println!("user_version = unavailable");
@@ -1345,6 +1426,26 @@ mod tests {
             std::thread::current().name().unwrap_or("test"),
             TEST_PATH_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn sqlite_statement_names_expose_operations_without_bound_values() {
+        assert_eq!(
+            sqlite_statement_name("select text from plan_output_line where run_id = ?1"),
+            ("query", "select.plan_output_line".to_string())
+        );
+        assert_eq!(
+            sqlite_statement_name("BEGIN IMMEDIATE"),
+            ("transaction", "begin".to_string())
+        );
+        assert_eq!(
+            sqlite_statement_name("insert into event (message) values (?1)"),
+            ("write", "insert.event".to_string())
+        );
+        assert_eq!(
+            sqlite_statement_name("create table if not exists metadata (key text)"),
+            ("schema", "create.metadata".to_string())
+        );
     }
 
     #[test]

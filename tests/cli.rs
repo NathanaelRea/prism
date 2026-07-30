@@ -81,6 +81,17 @@ fn init_repo(path: &Path) {
     );
 }
 
+fn contains_file_named(path: &Path, name: &str) -> bool {
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry.file_name() == OsStr::new(name)
+            || entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && contains_file_named(&entry.path(), name)
+    })
+}
+
 #[test]
 fn help_prints_usage_without_repo() {
     let temp = TempDir::new("help");
@@ -102,8 +113,27 @@ fn debug_help_prints_without_repo() {
     let stdout = stdout(&output);
     assert!(stdout.contains("Usage:\n  prism [--repo <path>] debug paths"));
     assert!(stdout.contains("debug logs"));
+    assert!(stdout.contains("debug record"));
     assert!(stdout.contains("--log-level trace"));
     assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn debug_record_requires_a_running_tui_without_touching_sqlite() {
+    let temp = TempDir::new("debug-record-no-tui");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+
+    let output = run(
+        ["debug", "record", "--before", "0", "--after", "0"],
+        &repo,
+        &config_home,
+    );
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("no running Prism TUI recorder found"));
+    assert!(!contains_file_named(&config_home, "prism.db"));
 }
 
 #[test]

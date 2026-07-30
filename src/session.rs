@@ -702,6 +702,8 @@ fn remove_worktree_owned_state(
     let runtimes = crate::opencode::load_runtimes_for_worktree_session(repo, branch, path)?;
     shutdown_worktree_session_resources(repo, config, branch, &runtimes)?;
     observability::with_writable_db(repo, |conn| {
+        let transaction =
+            crate::flight_recorder::TransactionTrace::begin("session.remove_owned_state");
         conn.execute_batch("begin immediate transaction")
             .map_err(|error| format!("begin worktree session cleanup transaction: {error}"))?;
         let result = (|| {
@@ -732,6 +734,7 @@ fn remove_worktree_owned_state(
                 conn.execute_batch("commit").map_err(|error| {
                     format!("commit worktree session cleanup transaction: {error}")
                 })?;
+                transaction.committed();
                 Ok(())
             }
             Err(error) => {
@@ -1123,6 +1126,7 @@ fn set_worktree_harness_with_conn(
 
 pub(crate) fn archive_worktree_session(repo: &Repository, session: &Session) -> Result<(), String> {
     observability::with_writable_db(repo, |conn| {
+        let transaction = crate::flight_recorder::TransactionTrace::begin("session.archive");
         conn.execute_batch("begin transaction")
             .map_err(|error| format!("begin archive transaction: {error}"))?;
         let result = (|| -> Result<(), String> {
@@ -1154,9 +1158,12 @@ pub(crate) fn archive_worktree_session(repo: &Repository, session: &Session) -> 
             Ok(())
         })();
         match result {
-            Ok(()) => conn
-                .execute_batch("commit")
-                .map_err(|error| format!("commit archive transaction: {error}")),
+            Ok(()) => {
+                conn.execute_batch("commit")
+                    .map_err(|error| format!("commit archive transaction: {error}"))?;
+                transaction.committed();
+                Ok(())
+            }
             Err(error) => {
                 let _ = conn.execute_batch("rollback");
                 Err(error)
@@ -1179,6 +1186,7 @@ fn clear_hidden_session_marker_with_conn(
 
 fn unarchive_worktree_session(repo: &Repository, branch: &str) -> Result<(), String> {
     observability::with_writable_db(repo, |conn| {
+        let transaction = crate::flight_recorder::TransactionTrace::begin("session.unarchive");
         conn.execute_batch("begin transaction")
             .map_err(|error| format!("begin unarchive transaction: {error}"))?;
         let result = (|| -> Result<(), String> {
@@ -1191,9 +1199,12 @@ fn unarchive_worktree_session(repo: &Repository, branch: &str) -> Result<(), Str
             Ok(())
         })();
         match result {
-            Ok(()) => conn
-                .execute_batch("commit")
-                .map_err(|error| format!("commit unarchive transaction: {error}")),
+            Ok(()) => {
+                conn.execute_batch("commit")
+                    .map_err(|error| format!("commit unarchive transaction: {error}"))?;
+                transaction.committed();
+                Ok(())
+            }
             Err(error) => {
                 let _ = conn.execute_batch("rollback");
                 Err(error)

@@ -141,6 +141,7 @@ fn begin_new(repo: &Repository, version: &str) -> Result<NewRun, String> {
     })?;
 
     let started = now_ms();
+    let transaction = crate::flight_recorder::TransactionTrace::begin("run_marker.begin");
     let transaction_result = (|| -> rusqlite::Result<()> {
         conn.execute_batch("begin immediate")?;
         for stale_marker in &stale {
@@ -168,6 +169,7 @@ fn begin_new(repo: &Repository, version: &str) -> Result<NewRun, String> {
         let _ = fs::remove_file(&marker_path);
         return Err(format!("record repository run {run_id}: {error}"));
     }
+    transaction.committed();
     drop(conn);
 
     for existing in markers {

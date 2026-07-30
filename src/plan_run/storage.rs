@@ -138,6 +138,7 @@ pub fn save_plan_run(
     conn: &rusqlite::Connection,
     persisted: &PersistedPlanRun,
 ) -> Result<(), String> {
+    let transaction = crate::flight_recorder::TransactionTrace::begin("plan_run.save");
     let tx = conn
         .unchecked_transaction()
         .map_err(|error| format!("begin plan run transaction: {error}"))?;
@@ -147,6 +148,7 @@ pub fn save_plan_run(
     }
     tx.commit()
         .map_err(|error| format!("commit plan run transaction: {error}"))?;
+    transaction.committed();
     Ok(())
 }
 
@@ -154,6 +156,7 @@ pub fn submit_plan_run(
     conn: &rusqlite::Connection,
     persisted: &PersistedPlanRun,
 ) -> Result<(), String> {
+    let transaction = crate::flight_recorder::TransactionTrace::begin("plan_run.submit");
     let tx = conn
         .unchecked_transaction()
         .map_err(|error| format!("begin managed plan submission: {error}"))?;
@@ -169,7 +172,9 @@ pub fn submit_plan_run(
         ),
     )?;
     tx.commit()
-        .map_err(|error| format!("commit managed plan submission: {error}"))
+        .map_err(|error| format!("commit managed plan submission: {error}"))?;
+    transaction.committed();
+    Ok(())
 }
 
 pub fn load_plan_run(

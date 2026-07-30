@@ -19,6 +19,7 @@ impl Tui {
         session_index: usize,
         terminal_size: (u16, u16),
     ) -> Result<(), String> {
+        let started = Instant::now();
         let Some(session) = self.sessions.get(session_index) else {
             return Ok(());
         };
@@ -31,18 +32,38 @@ impl Tui {
         let config = managed.config.for_harness(&association.harness_id)?;
         let use_ =
             crate::agent_session::session_use(&self.repos, &mut self.tmux_generations, &session);
+        let target_session = crate::tmux::TmuxAgentSession::for_worktree_session(
+            &repo,
+            &session.branch,
+            use_.generation,
+        )
+        .name()
+        .to_string();
         self.finish_tmux_warmup_for_key(&use_.warmup_key);
         let (width, height) = terminal_size;
-        crate::tmux::resize_agent_pane(
+        let result = crate::tmux::resize_agent_pane(
             &repo,
             &config,
             &session.branch,
             use_.generation,
             width.max(1),
             height.max(1),
-        )?;
-        std::thread::sleep(TMUX_ATTACH_RESIZE_SETTLE);
-        Ok(())
+        );
+        if result.is_ok() {
+            std::thread::sleep(TMUX_ATTACH_RESIZE_SETTLE);
+        }
+        crate::flight_recorder::record(
+            "attach",
+            "prepare",
+            Some(started.elapsed()),
+            vec![
+                crate::flight_recorder::text("target_session", target_session),
+                crate::flight_recorder::text("window", "agent"),
+                crate::flight_recorder::unsigned("generation", use_.generation),
+                crate::flight_recorder::boolean("success", result.is_ok()),
+            ],
+        );
+        result
     }
 
     pub(crate) fn attach_tmux_session_for_index(
@@ -61,10 +82,42 @@ impl Tui {
         let config = managed.config.for_harness(&association.harness_id)?;
         let use_ =
             crate::agent_session::session_use(&self.repos, &mut self.tmux_generations, &session);
+        let target_session = crate::tmux::TmuxAgentSession::for_worktree_session(
+            &repo,
+            &session.branch,
+            use_.generation,
+        )
+        .name()
+        .to_string();
         self.finish_tmux_warmup_for_key(&use_.warmup_key);
-        let running =
-            crate::agent_session::attach_session(&repo, &config, &session, use_.generation)?;
+        let attach_started = Instant::now();
+        let attach_result =
+            crate::agent_session::attach_session(&repo, &config, &session, use_.generation);
+        crate::flight_recorder::record(
+            "attach",
+            "interactive",
+            Some(attach_started.elapsed()),
+            vec![
+                crate::flight_recorder::text("target_session", target_session),
+                crate::flight_recorder::text("window", "agent"),
+                crate::flight_recorder::unsigned("generation", use_.generation),
+                crate::flight_recorder::boolean("success", attach_result.is_ok()),
+            ],
+        );
+        let running = attach_result?;
+        let detach_started = Instant::now();
         self.resize_tmux_portal_after_detach(&repo, &config, &session, &use_);
+        crate::flight_recorder::record(
+            "attach",
+            "detach_resize",
+            Some(detach_started.elapsed()),
+            vec![
+                crate::flight_recorder::text("target", &session.branch),
+                crate::flight_recorder::unsigned("generation", use_.generation),
+            ],
+        );
+        let apply_started = Instant::now();
+        let generation = use_.generation;
         let outcome = crate::agent_session::apply_attach_result(
             &self.repos,
             &mut self.sessions,
@@ -80,6 +133,16 @@ impl Tui {
         if let Some(warmup) = outcome.delayed_warmup {
             self.start_tmux_agent_warmup_for_key(warmup.key, warmup.delay);
         }
+        crate::flight_recorder::record(
+            "attach",
+            "apply_result",
+            Some(apply_started.elapsed()),
+            vec![
+                crate::flight_recorder::text("target", &session.branch),
+                crate::flight_recorder::unsigned("generation", generation),
+                crate::flight_recorder::boolean("running", running),
+            ],
+        );
         Ok(())
     }
 
@@ -119,15 +182,56 @@ impl Tui {
                 use_.generation,
             );
         }
+        let target_session = crate::tmux::TmuxAgentSession::for_worktree_session(
+            &repo,
+            &session.branch,
+            use_.generation,
+        )
+        .name()
+        .to_string();
         self.finish_tmux_warmup_for_key(&use_.warmup_key);
-        let running =
-            crate::agent_session::attach_window(&repo, &config, &session, use_.generation, window)?;
+        let attach_started = Instant::now();
+        let attach_result =
+            crate::agent_session::attach_window(&repo, &config, &session, use_.generation, window);
+        crate::flight_recorder::record(
+            "attach",
+            "interactive",
+            Some(attach_started.elapsed()),
+            vec![
+                crate::flight_recorder::text("target_session", target_session),
+                crate::flight_recorder::text("window", window.label()),
+                crate::flight_recorder::unsigned("generation", use_.generation),
+                crate::flight_recorder::boolean("success", attach_result.is_ok()),
+            ],
+        );
+        let running = attach_result?;
+        let detach_started = Instant::now();
         self.resize_tmux_portal_after_detach(&repo, &config, &session, &use_);
+        crate::flight_recorder::record(
+            "attach",
+            "detach_resize",
+            Some(detach_started.elapsed()),
+            vec![
+                crate::flight_recorder::text("window", window.label()),
+                crate::flight_recorder::unsigned("generation", use_.generation),
+            ],
+        );
+        let apply_started = Instant::now();
         crate::agent_session::apply_running_result(
             &self.repos,
             &mut self.sessions,
             &use_.slot,
             running,
+        );
+        crate::flight_recorder::record(
+            "attach",
+            "apply_result",
+            Some(apply_started.elapsed()),
+            vec![
+                crate::flight_recorder::text("window", window.label()),
+                crate::flight_recorder::unsigned("generation", use_.generation),
+                crate::flight_recorder::boolean("running", running),
+            ],
         );
         self.start_opencode_status_poll(true);
         self.start_opencode_event_listeners();

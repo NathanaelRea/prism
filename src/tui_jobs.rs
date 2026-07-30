@@ -15,6 +15,7 @@ pub(crate) struct JobMetadata<K, Q> {
     pub generation: u64,
     pub started_at: Instant,
     pub deadline: Option<Instant>,
+    diagnostic_kind: Option<&'static str>,
 }
 
 #[derive(Debug)]
@@ -259,25 +260,31 @@ impl<K: Clone, Q: Clone, P> JobContext<K, Q, P> {
                         Ok(slots) => slots,
                         Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
                         Err(std::sync::TryLockError::WouldBlock) => {
+                            self.record_delivery_pressure("dropped", Some(facet), false);
                             return Ok(());
                         }
                     };
                     if self.is_canceled() {
                         return Err("job canceled".to_string());
                     }
-                    match slots.entry((message.metadata.id, facet)) {
+                    let operation = match slots.entry((message.metadata.id, facet)) {
                         std::collections::btree_map::Entry::Vacant(entry) => {
                             entry.insert(message);
+                            "overflow_retained"
                         }
                         std::collections::btree_map::Entry::Occupied(mut entry) => {
                             if message.sequence > entry.get().sequence {
                                 entry.insert(message);
                             }
                             self.delivery.coalesced_total.fetch_add(1, Ordering::AcqRel);
+                            "coalesced"
                         }
-                    }
+                    };
+                    drop(slots);
+                    self.record_delivery_pressure(operation, Some(facet), true);
                     return Ok(());
                 }
+                self.record_delivery_pressure("dropped", None, false);
                 Ok(())
             }
             Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -285,6 +292,37 @@ impl<K: Clone, Q: Clone, P> JobContext<K, Q, P> {
                 Err("job delivery receiver disconnected".to_string())
             }
         }
+    }
+
+    fn record_delivery_pressure(
+        &self,
+        operation: &'static str,
+        facet: Option<CoalescedFacet>,
+        retained: bool,
+    ) {
+        let mut fields = vec![
+            crate::flight_recorder::unsigned("job_id", self.metadata.id),
+            crate::flight_recorder::text(
+                "job_type",
+                self.metadata.diagnostic_kind.unwrap_or("unknown"),
+            ),
+            crate::flight_recorder::unsigned(
+                "queue_depth",
+                self.delivery.depth.load(Ordering::Acquire),
+            ),
+            crate::flight_recorder::unsigned("queue_capacity", self.delivery.capacity),
+            crate::flight_recorder::boolean("retained", retained),
+        ];
+        if let Some(facet) = facet {
+            fields.push(crate::flight_recorder::text(
+                "facet",
+                match facet {
+                    CoalescedFacet::Status => "status",
+                    CoalescedFacet::Message => "message",
+                },
+            ));
+        }
+        crate::flight_recorder::record("queue", operation, None, fields);
     }
 
     pub(crate) fn wait(&self, duration: Duration) -> bool {
@@ -321,6 +359,12 @@ struct JobCompletion<P> {
 struct JobDelivery {
     timeout: Option<Duration>,
     coalesce_payload: bool,
+    diagnostic_kind: Option<&'static str>,
+}
+
+pub(crate) struct JobDiagnostic {
+    pub timeout: Option<Duration>,
+    pub kind: &'static str,
 }
 
 enum JobState<P> {
@@ -397,6 +441,7 @@ where
     Q: Clone + Ord + Send + 'static,
     P: Send + 'static,
 {
+    #[cfg(test)]
     pub(crate) fn spawn<F>(
         &mut self,
         kind: K,
@@ -417,11 +462,13 @@ where
             JobDelivery {
                 timeout,
                 coalesce_payload: true,
+                diagnostic_kind: None,
             },
             job,
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn spawn_reliable<F>(
         &mut self,
         kind: K,
@@ -442,6 +489,59 @@ where
             JobDelivery {
                 timeout,
                 coalesce_payload: false,
+                diagnostic_kind: None,
+            },
+            job,
+        )
+    }
+
+    pub(crate) fn spawn_diagnostic<F>(
+        &mut self,
+        kind: K,
+        key: Q,
+        generation: u64,
+        name: String,
+        diagnostic: JobDiagnostic,
+        job: F,
+    ) -> JobId
+    where
+        F: FnOnce(JobContext<K, Q, P>) -> Result<Option<P>, String> + Send + 'static,
+    {
+        self.spawn_with_delivery(
+            kind,
+            key,
+            generation,
+            name,
+            JobDelivery {
+                timeout: diagnostic.timeout,
+                coalesce_payload: true,
+                diagnostic_kind: Some(diagnostic.kind),
+            },
+            job,
+        )
+    }
+
+    pub(crate) fn spawn_reliable_diagnostic<F>(
+        &mut self,
+        kind: K,
+        key: Q,
+        generation: u64,
+        name: String,
+        diagnostic: JobDiagnostic,
+        job: F,
+    ) -> JobId
+    where
+        F: FnOnce(JobContext<K, Q, P>) -> Result<Option<P>, String> + Send + 'static,
+    {
+        self.spawn_with_delivery(
+            kind,
+            key,
+            generation,
+            name,
+            JobDelivery {
+                timeout: diagnostic.timeout,
+                coalesce_payload: false,
+                diagnostic_kind: Some(diagnostic.kind),
             },
             job,
         )
@@ -469,6 +569,7 @@ where
             generation,
             started_at,
             deadline: delivery.timeout.map(|timeout| started_at + timeout),
+            diagnostic_kind: delivery.diagnostic_kind,
         };
         let cancellation = Arc::new(CancellationState {
             canceled: Arc::new(AtomicBool::new(false)),
@@ -614,6 +715,20 @@ where
                     .flatten();
                 if let Some(current_key) = current_key {
                     self.delivery.coalesced_total.fetch_add(1, Ordering::AcqRel);
+                    crate::flight_recorder::record(
+                        "queue",
+                        "coalesced",
+                        None,
+                        vec![
+                            crate::flight_recorder::unsigned("job_id", entry.metadata.id),
+                            crate::flight_recorder::text(
+                                "job_type",
+                                entry.metadata.diagnostic_kind.unwrap_or("unknown"),
+                            ),
+                            crate::flight_recorder::text("facet", "completion"),
+                            crate::flight_recorder::boolean("retained", true),
+                        ],
+                    );
                     if current_key.3 > entry.metadata.id {
                         self.jobs.insert(
                             id,

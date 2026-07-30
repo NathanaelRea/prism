@@ -756,6 +756,8 @@ fn queue_wait_repair(
     }
     let original = persisted.clone();
     let result = (|| {
+        let transaction =
+            crate::flight_recorder::TransactionTrace::begin("auto_run.queue_wait_repair");
         let tx =
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
                 .map_err(|error| format!("begin wait repair transaction: {error}"))?;
@@ -776,6 +778,7 @@ fn queue_wait_repair(
         )?;
         tx.commit()
             .map_err(|error| format!("commit wait repair transaction: {error}"))?;
+        transaction.committed();
         Ok(WaitProgress::RepairQueued)
     })();
     if result.is_err() {

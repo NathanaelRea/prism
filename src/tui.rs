@@ -105,6 +105,7 @@ pub struct Tui {
     pub(crate) tui_tick_active: bool,
     pub(crate) routing_tui_jobs: bool,
     scheduling_stopped: bool,
+    flight_recorder_servers: Vec<crate::flight_recorder::ServerGuard>,
     pub(crate) plan_runs: BTreeMap<String, PersistedPlanRun>,
     pub(crate) active_plan_runs: BTreeMap<PathBuf, String>,
     pub(crate) selected_plan_step_by_run: BTreeMap<String, usize>,
@@ -206,7 +207,7 @@ pub(crate) fn load_worktree_harness_configs(
 }
 
 pub(crate) fn maintain_workflow_storage(repo: &Repository) -> Result<(), String> {
-    crate::observability::with_writable_db(repo, |conn| {
+    crate::observability::with_writable_db_named(repo, "workflow.maintenance", |conn| {
         crate::plan_run::cleanup_stale_archived_plan_runs(
             conn,
             crate::plan_run::ARCHIVED_PLAN_RETENTION_MS,
@@ -773,6 +774,7 @@ impl Tui {
             tui_tick_active: false,
             routing_tui_jobs: false,
             scheduling_stopped: false,
+            flight_recorder_servers: Vec::new(),
             plan_runs: BTreeMap::new(),
             active_plan_runs: BTreeMap::new(),
             selected_plan_step_by_run: BTreeMap::new(),
@@ -923,6 +925,8 @@ impl Tui {
             return Err("TUI requires an interactive terminal".to_string());
         }
 
+        crate::flight_recorder::mark_ui_thread();
+        self.start_flight_recorder_servers();
         let shutdown = ShutdownNotification::install()?;
         let mut runtime = TerminalRuntime::enter()?;
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -930,7 +934,11 @@ impl Tui {
                 self.run_inner(&mut runtime, &shutdown)
             })
         }));
-        self.finish_run(outcome, shutdown.signal())
+        let result = self.finish_run(outcome, shutdown.signal());
+        crate::flight_recorder::finish_pending_input_without_frame();
+        crate::flight_recorder::end_idle("tui_exit");
+        crate::flight_recorder::stop_all_servers();
+        result
     }
 
     fn finish_run(
@@ -969,6 +977,15 @@ impl Tui {
                 }
                 std::panic::resume_unwind(payload)
             }
+        }
+    }
+
+    fn start_flight_recorder_servers(&mut self) {
+        let server = crate::flight_recorder::serve_repositories(
+            self.repos.iter().map(|managed| &managed.repo),
+        );
+        if !server.is_empty() {
+            self.flight_recorder_servers.push(server);
         }
     }
 
@@ -1015,6 +1032,8 @@ impl Tui {
                         let area = runtime.area()?;
                         self.handle_mouse_click(event.column, event.row, area);
                         self.draw(runtime)?;
+                    } else {
+                        crate::flight_recorder::finish_pending_input_without_frame();
                     }
                     continue;
                 }
@@ -1028,8 +1047,13 @@ impl Tui {
                     self.draw(runtime)?;
                     continue;
                 }
+                RuntimeEvent::FocusLost => {
+                    crate::flight_recorder::finish_pending_input_without_frame();
+                    continue;
+                }
             };
             let Some(key) = key else {
+                crate::flight_recorder::finish_pending_input_without_frame();
                 continue;
             };
 
@@ -1437,6 +1461,7 @@ impl Tui {
                 }
             }
             if should_quit {
+                crate::flight_recorder::finish_pending_input_without_frame();
                 break ShutdownReason::UserQuit;
             }
             self.draw(runtime)?;
@@ -1445,8 +1470,9 @@ impl Tui {
     }
 
     fn tick_tui_action_jobs(&mut self) -> TuiBackgroundChanges {
+        let started = Instant::now();
         self.tui_tick_active = true;
-        self.route_tui_job_messages();
+        let routed = self.route_tui_job_messages();
         let changes = TuiBackgroundChanges {
             sessions: self.poll_session_refresh(),
             tmux: self.poll_tmux_agent_warmup(),
@@ -1466,6 +1492,21 @@ impl Tui {
         self.start_opencode_event_listeners();
         self.poll_workflow_maintenance();
         self.tui_tick_active = false;
+        crate::flight_recorder::record(
+            "tui",
+            "tick",
+            Some(started.elapsed()),
+            vec![
+                crate::flight_recorder::unsigned("routed_jobs", routed),
+                crate::flight_recorder::boolean("changed", changes.any()),
+                crate::flight_recorder::unsigned(
+                    "idle_us",
+                    crate::flight_recorder::idle_for()
+                        .unwrap_or_default()
+                        .as_micros(),
+                ),
+            ],
+        );
         changes
     }
 
@@ -1532,21 +1573,43 @@ impl Tui {
             + 'static,
     {
         if kind == TuiJobKind::DeleteSession {
-            self.jobs
-                .spawn_reliable(kind, key, generation, timeout, name, job);
+            let label = kind.label();
+            self.jobs.spawn_reliable_diagnostic(
+                kind,
+                key,
+                generation,
+                name,
+                crate::tui_jobs::JobDiagnostic {
+                    timeout,
+                    kind: label,
+                },
+                job,
+            );
         } else {
-            self.jobs.spawn(kind, key, generation, timeout, name, job);
+            let label = kind.label();
+            self.jobs.spawn_diagnostic(
+                kind,
+                key,
+                generation,
+                name,
+                crate::tui_jobs::JobDiagnostic {
+                    timeout,
+                    kind: label,
+                },
+                job,
+            );
         }
     }
 
-    pub(crate) fn route_tui_job_messages(&mut self) {
+    pub(crate) fn route_tui_job_messages(&mut self) -> usize {
         if self.routing_tui_jobs {
-            return;
+            return 0;
         }
         self.routing_tui_jobs = true;
         let deadline = Instant::now() + TUI_TICK_TIME_BUDGET;
-        self.route_tui_job_messages_with_budget(TUI_TICK_ITEM_BUDGET, deadline);
+        let processed = self.route_tui_job_messages_with_budget(TUI_TICK_ITEM_BUDGET, deadline);
         self.routing_tui_jobs = false;
+        processed
     }
 
     fn route_tui_job_messages_with_budget(&mut self, limit: usize, deadline: Instant) -> usize {
@@ -1660,6 +1723,36 @@ impl Tui {
             }
         }
         let stats = self.jobs.queue_stats();
+        let idle = crate::flight_recorder::idle_for();
+        crate::flight_recorder::record(
+            "queue",
+            "snapshot",
+            None,
+            vec![
+                crate::flight_recorder::unsigned("processed", processed),
+                crate::flight_recorder::unsigned("event_depth", stats.event_depth),
+                crate::flight_recorder::unsigned("event_capacity", stats.event_capacity),
+                crate::flight_recorder::unsigned("coalesced_depth", stats.coalesced_depth),
+                crate::flight_recorder::unsigned("latest_depth", stats.latest_depth),
+                crate::flight_recorder::unsigned("terminal_depth", stats.terminal_depth),
+                crate::flight_recorder::unsigned("overflow_delta", stats.overflow_delta),
+                crate::flight_recorder::unsigned("overflow_total", stats.overflow_total),
+                crate::flight_recorder::unsigned("coalesced_delta", stats.coalesced_delta),
+                crate::flight_recorder::unsigned("coalesced_total", stats.coalesced_total),
+                crate::flight_recorder::boolean("dirty", stats.dirty),
+                crate::flight_recorder::unsigned("idle_us", idle.unwrap_or_default().as_micros()),
+            ],
+        );
+        if processed > 0
+            && let Some(idle) = idle
+        {
+            crate::flight_recorder::record(
+                "jobs",
+                "completion_burst_after_idle",
+                Some(idle),
+                vec![crate::flight_recorder::unsigned("processed", processed)],
+            );
+        }
         if stats.overflow_delta > 0 || stats.coalesced_delta > 0 {
             self.record_tui_queue_stats(stats);
         }
@@ -2044,7 +2137,14 @@ impl Tui {
             (terminal_area.width, terminal_area.height.saturating_sub(1)),
         )?;
         let result = runtime.suspend_for(|| self.attach_tmux_session_for_index(index));
+        let refresh_started = Instant::now();
         self.refresh_sessions_after_tmux()?;
+        crate::flight_recorder::record(
+            "attach",
+            "post_resume_refresh",
+            Some(refresh_started.elapsed()),
+            Vec::new(),
+        );
         self.restore_navigation_snapshot(navigation);
         self.start_tmux_agent_warmup();
         if let Err(error) = result {
@@ -3457,10 +3557,39 @@ impl Tui {
     }
 
     pub(crate) fn draw(&mut self, runtime: &mut TerminalRuntime) -> Result<(), String> {
+        let input = crate::flight_recorder::take_input_for_frame();
+        let started = Instant::now();
         self.tmux_portal_size =
             view::tmux_portal_size(runtime.area()?, self.config.layout.sidebar_width);
+        let model_started = Instant::now();
         let model = self.frame_model();
-        runtime.draw(&model)
+        let model_elapsed = model_started.elapsed();
+        let timing = runtime.draw(&model)?;
+        let total = started.elapsed();
+        let mut fields = vec![
+            crate::flight_recorder::unsigned("model_us", model_elapsed.as_micros()),
+            crate::flight_recorder::unsigned("render_us", timing.render.as_micros()),
+            crate::flight_recorder::unsigned("terminal_us", timing.terminal.as_micros()),
+            crate::flight_recorder::unsigned(
+                "backend_us",
+                timing.terminal.saturating_sub(timing.render).as_micros(),
+            ),
+        ];
+        if let Some(input) = input.as_ref() {
+            fields.push(crate::flight_recorder::unsigned("input_id", input.id()));
+            fields.push(crate::flight_recorder::unsigned(
+                "input_to_frame_us",
+                input.elapsed().as_micros(),
+            ));
+            crate::flight_recorder::record(
+                "input",
+                "frame",
+                Some(input.elapsed()),
+                vec![crate::flight_recorder::unsigned("input_id", input.id())],
+            );
+        }
+        crate::flight_recorder::record("tui", "frame", Some(total), fields);
+        Ok(())
     }
 
     fn poll_plan_runs(&mut self) -> bool {
@@ -3483,10 +3612,14 @@ impl Tui {
             .map(|managed| managed.repo.clone())
             .collect::<Vec<_>>();
         for repo in repos {
-            let loaded = crate::observability::with_nonblocking_read_db(&repo, |conn| {
-                let runs = load_recent_plan_runs_for_repo(conn, &repo.root, 8)?;
-                Ok(runs)
-            });
+            let loaded = crate::observability::with_nonblocking_read_db_named(
+                &repo,
+                "tui.plan_runs.refresh",
+                |conn| {
+                    let runs = load_recent_plan_runs_for_repo(conn, &repo.root, 8)?;
+                    Ok(runs)
+                },
+            );
             let Ok(runs) = loaded else {
                 continue;
             };
@@ -3501,9 +3634,11 @@ impl Tui {
         let repo = Repository {
             root: repo_root.to_path_buf(),
         };
-        if let Ok(Some(run)) = crate::observability::with_nonblocking_read_db(&repo, |conn| {
-            load_plan_run(conn, run_id)
-        }) {
+        if let Ok(Some(run)) = crate::observability::with_nonblocking_read_db_named(
+            &repo,
+            "tui.plan_run.snapshot",
+            |conn| load_plan_run(conn, run_id),
+        ) {
             self.remember_plan_run(run);
         }
     }
@@ -3665,11 +3800,15 @@ impl Tui {
             .map(|managed| managed.repo.clone())
             .collect::<Vec<_>>();
         for repo in repos {
-            let loaded = crate::observability::with_nonblocking_read_db(&repo, |conn| {
-                let runs = load_recent_active_run_snapshots_for_repo(conn, &repo.root, 8)?;
-                let _ = reconcile_stale;
-                Ok(runs)
-            });
+            let loaded = crate::observability::with_nonblocking_read_db_named(
+                &repo,
+                "tui.auto_runs.refresh",
+                |conn| {
+                    let runs = load_recent_active_run_snapshots_for_repo(conn, &repo.root, 8)?;
+                    let _ = reconcile_stale;
+                    Ok(runs)
+                },
+            );
             let Ok(runs) = loaded else {
                 continue;
             };
@@ -3684,9 +3823,11 @@ impl Tui {
         let repo = Repository {
             root: repo_root.to_path_buf(),
         };
-        if let Ok(Some(run)) = crate::observability::with_nonblocking_read_db(&repo, |conn| {
-            load_auto_run_snapshot(conn, run_id)
-        }) {
+        if let Ok(Some(run)) = crate::observability::with_nonblocking_read_db_named(
+            &repo,
+            "tui.auto_run.snapshot",
+            |conn| load_auto_run_snapshot(conn, run_id),
+        ) {
             self.remember_auto_run(run);
         }
     }
@@ -3762,9 +3903,11 @@ impl Tui {
         plan_run_id: &str,
     ) -> Option<view::PlanDashboard> {
         let mut run = self.plan_runs.get(plan_run_id).cloned().or_else(|| {
-            crate::observability::with_nonblocking_read_db(repo, |conn| {
-                load_plan_run(conn, plan_run_id)
-            })
+            crate::observability::with_nonblocking_read_db_named(
+                repo,
+                "tui.linked_plan.snapshot",
+                |conn| load_plan_run(conn, plan_run_id),
+            )
             .ok()
             .flatten()
         })?;
@@ -3802,9 +3945,11 @@ impl Tui {
         step: usize,
     ) -> Vec<PlanOutputLine> {
         let key = (run_id.to_string(), step);
-        match crate::observability::with_nonblocking_read_db(repo, |conn| {
-            load_output_lines(conn, run_id, step)
-        }) {
+        match crate::observability::with_nonblocking_read_db_named(
+            repo,
+            "tui.plan_output.load",
+            |conn| load_output_lines(conn, run_id, step),
+        ) {
             Ok(lines) => {
                 self.plan_output_cache
                     .borrow_mut()
@@ -3822,9 +3967,11 @@ impl Tui {
 
     fn auto_output_snapshot(&self, repo: &Repository, step_run_id: i64) -> Vec<AutoOutputLine> {
         let key = (WorktreeRepositoryKey::new(repo.root.clone()), step_run_id);
-        match crate::observability::with_nonblocking_read_db(repo, |conn| {
-            load_auto_output_lines(conn, step_run_id)
-        }) {
+        match crate::observability::with_nonblocking_read_db_named(
+            repo,
+            "tui.auto_output.load",
+            |conn| load_auto_output_lines(conn, step_run_id),
+        ) {
             Ok(lines) => {
                 self.auto_output_cache
                     .borrow_mut()

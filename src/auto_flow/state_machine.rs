@@ -32,6 +32,8 @@ pub(super) fn append_step_run_with_work_guard(
 ) -> Result<i64, String> {
     let original = persisted.clone();
     let result = (|| {
+        let transaction =
+            crate::flight_recorder::TransactionTrace::begin("auto_run.append_guarded_step");
         let tx =
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
                 .map_err(|error| format!("begin guarded auto step transaction: {error}"))?;
@@ -40,6 +42,7 @@ pub(super) fn append_step_run_with_work_guard(
         )?;
         tx.commit()
             .map_err(|error| format!("commit guarded auto step transaction: {error}"))?;
+        transaction.committed();
         Ok(id)
     })();
     if result.is_err() {

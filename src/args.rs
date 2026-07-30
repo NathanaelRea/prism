@@ -217,9 +217,9 @@ impl Args {
                                     return Err(format!("unknown debug record argument: {other}"));
                                 }
                             };
-                            let value = iter.next().ok_or_else(|| {
-                                format!("{flag} requires a duration in seconds")
-                            })?;
+                            let value = iter
+                                .next()
+                                .ok_or_else(|| format!("{flag} requires a duration in seconds"))?;
                             *target = value.to_string_lossy().parse::<u64>().map_err(|_| {
                                 format!("{flag} requires a whole number of seconds")
                             })?;
@@ -296,7 +296,7 @@ pub fn help_text() -> &'static str {
 }
 
 pub fn debug_help_text() -> &'static str {
-    "Usage:\n  prism [--repo <path>] debug paths\n  prism [--repo <path>] debug info\n  prism [--repo <path>] debug logs\n  prism [--repo <path>] debug startup\n  prism [--repo <path>] debug integrity\n  prism [--repo <path>] debug record [--before <seconds>] [--after <seconds>]\n\nDebug commands:\n  paths      print repo root, Prism state directory, database path, runtime log path, and config paths\n  info       print resolved runtime/config facts and startup setup facts\n  logs       tail the repo runtime log from Prism state\n  startup    run startup checks and print startup timing/debug output\n  integrity  inspect SQLite integrity and foreign keys without migrating or writing\n  record     capture the running TUI's flight recorder (default: previous 60s plus next 30s)\n\nRecord options:\n  --before <seconds>     history to include, from 0 to 60 (default: 60)\n  --after <seconds>      time to continue recording, from 0 to 120 (default: 30)\n\nLogging flags:\n  --print-logs           print runtime logs to stderr while Prism runs\n  --log-level trace      include detailed subprocess argv/status logs"
+    "Usage:\n  prism [--repo <path>] debug paths\n  prism [--repo <path>] debug info\n  prism [--repo <path>] debug logs\n  prism [--repo <path>] debug startup\n  prism [--repo <path>] debug integrity\n  prism [--repo <path>] debug record [--before <seconds>] [--after <seconds>]\n\nDebug commands:\n  paths      print repo root, Prism state directory, database path, runtime log path, and config paths\n  info       print resolved runtime/config facts and startup setup facts\n  logs       tail the repo runtime log from Prism state\n  startup    run startup checks and print startup timing/debug output\n  integrity  inspect SQLite integrity and foreign keys without migrating or writing\n  record     capture the running TUI's flight recorder (default: previous 60s plus next 30s)\n\nRecord options:\n  --before <seconds>     history to include, from 0 to 60 (default: 60)\n  --after <seconds>      time to continue recording, from 0 to 30 (default: 30)\n\nLogging flags:\n  --print-logs           print runtime logs to stderr while Prism runs\n  --log-level trace      include detailed subprocess argv/status logs"
 }
 
 pub fn db_help_text() -> &'static str {

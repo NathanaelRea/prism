@@ -50,6 +50,14 @@ pub enum TmuxWindow {
 }
 
 impl TmuxWindow {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            TmuxWindow::Agent => "agent",
+            TmuxWindow::LazyGit => "lazygit",
+            TmuxWindow::Terminal => "terminal",
+        }
+    }
+
     fn index(self) -> u8 {
         match self {
             TmuxWindow::Agent => 1,
@@ -331,12 +339,27 @@ pub fn latest_agent_session_generation(
     config: &Config,
     branch: &str,
 ) -> Option<u64> {
+    let started = std::time::Instant::now();
     let prefix = agent_session_prefix(repo, branch);
-    agent_session_names_with_prefix(config, &prefix)
-        .ok()?
-        .into_iter()
-        .filter_map(|name| name.strip_prefix(&prefix)?.parse::<u64>().ok())
-        .max()
+    let sessions = agent_session_names_with_prefix(config, &prefix);
+    let generation = sessions.as_ref().ok().and_then(|sessions| {
+        sessions
+            .iter()
+            .map(String::as_str)
+            .filter_map(|name| name.strip_prefix(&prefix)?.parse::<u64>().ok())
+            .max()
+    });
+    crate::flight_recorder::record(
+        "tmux",
+        "generation_discovery",
+        Some(started.elapsed()),
+        vec![
+            crate::flight_recorder::text("target", branch),
+            crate::flight_recorder::boolean("success", sessions.is_ok()),
+            crate::flight_recorder::unsigned("generation", generation.unwrap_or_default()),
+        ],
+    );
+    generation
 }
 
 pub(crate) fn named_session_exists(config: &Config, expected: &str) -> Result<bool, String> {

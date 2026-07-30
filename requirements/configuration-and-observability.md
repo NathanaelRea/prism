@@ -74,6 +74,25 @@
 - **Behavior**: `prism debug integrity` reports full SQLite integrity and foreign
   key checks through a read-only path that never initializes, migrates, repairs,
   or records observability data.
+- **Behavior**: The interactive TUI maintains an always-on, bounded in-memory
+  flight recorder for the previous 60 seconds. `prism debug record` asks the
+  running TUI to retain that history, capture 30 more seconds by default, and
+  atomically write a JSONL artifact under the repository's `recordings`
+  directory. The command supports bounded before/after overrides.
+- **Invariant**: Flight-recorder producers never write SQLite or runtime logs,
+  wait for recorder storage, or take ownership of the diagnostic ring. They use
+  a bounded nonblocking channel and drop diagnostics under pressure; one
+  dedicated thread owns the fixed-size ring, capture window, percentile
+  summaries, and artifact writes.
+- **Behavior**: Flight recordings use monotonic process-relative timestamps and
+  include input-to-handled and input-to-frame latency; TUI tick, model, render,
+  and terminal-write duration; queue depth and job-attributed drop/coalescing;
+  attach, detach, focus, idle, suspend, and resume phases; SQLite open and
+  operation timing with UI-thread attribution and an explicit upper bound for
+  busy/locked failures; tmux target, generation, poll
+  interval, and retry reason; post-idle completion bursts; and output query row
+  and byte counts. Capture summaries report count, p50, p95, and max duration by
+  operation.
 - **Behavior**: Corruption-class SQLite failures trigger best-effort read-only
   `quick_check` and foreign-key diagnostics without replacing the original error
   or modifying the database.

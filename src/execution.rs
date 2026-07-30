@@ -281,6 +281,7 @@ fn claim_with_lease(
     lease_ms: i64,
 ) -> Result<Option<ExecutionClaim>, String> {
     let now = now_ms();
+    let transaction = crate::flight_recorder::TransactionTrace::begin("execution.claim");
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| format!("begin workflow claim: {error}"))?;
@@ -308,6 +309,7 @@ fn claim_with_lease(
     if changed == 0 {
         tx.commit()
             .map_err(|error| format!("commit empty workflow claim: {error}"))?;
+        transaction.committed();
         return Ok(None);
     }
     let token = tx
@@ -320,6 +322,7 @@ fn claim_with_lease(
         .map_err(|error| format!("load workflow fencing token: {error}"))?;
     tx.commit()
         .map_err(|error| format!("commit workflow claim: {error}"))?;
+    transaction.committed();
     Ok(Some(ExecutionClaim {
         workflow: workflow.clone(),
         worker_id: worker_id.to_string(),
@@ -644,6 +647,7 @@ pub fn apply_recovery_decision(
     conn: &mut Connection,
     decisions: &[(WorkflowIdentity, i64, bool)],
 ) -> Result<(), String> {
+    let transaction = crate::flight_recorder::TransactionTrace::begin("execution.recovery");
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| format!("begin recovery decision: {error}"))?;
@@ -741,7 +745,9 @@ pub fn apply_recovery_decision(
         }
     }
     tx.commit()
-        .map_err(|error| format!("commit recovery decision: {error}"))
+        .map_err(|error| format!("commit recovery decision: {error}"))?;
+    transaction.committed();
+    Ok(())
 }
 
 fn terminate_recorded_processes(

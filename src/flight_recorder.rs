@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -10,28 +11,35 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::repo::Repository;
-use crate::util::{single_line, stable_hash, truncate};
+use crate::util::stable_hash;
 
 const EVENT_CHANNEL_CAPACITY: usize = 16_384;
 const CONTROL_CHANNEL_CAPACITY: usize = 8;
 const RING_EVENT_CAPACITY: usize = 65_536;
 const RETENTION: Duration = Duration::from_secs(60);
 const MAX_BEFORE_SECONDS: u64 = 60;
-const MAX_AFTER_SECONDS: u64 = 120;
+const MAX_AFTER_SECONDS: u64 = 30;
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(5);
 const RESPONSE_GRACE: Duration = Duration::from_secs(10);
 const SCHEMA_VERSION: u32 = 1;
+const MAX_CONTROL_BATCH: usize = 8;
+const MAX_EVENT_BATCH: usize = 1_024;
+const MAX_REQUEST_BATCH: usize = 64;
 
 static RECORDER: OnceLock<Recorder> = OnceLock::new();
 static UI_THREAD: OnceLock<ThreadId> = OnceLock::new();
 static NEXT_INPUT_ID: AtomicU64 = AtomicU64::new(1);
 static UI_IDLE_STARTED_US: AtomicU64 = AtomicU64::new(0);
+static UI_LAST_INPUT_US: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static PENDING_INPUT: RefCell<Option<InputTrace>> = const { RefCell::new(None) };
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 pub(crate) enum FieldValue {
     Unsigned(u64),
-    Signed(i64),
     Bool(bool),
     Text(String),
 }
@@ -49,13 +57,6 @@ pub(crate) fn unsigned(name: &'static str, value: impl TryInto<u64>) -> Field {
     }
 }
 
-pub(crate) fn signed(name: &'static str, value: i64) -> Field {
-    Field {
-        name,
-        value: FieldValue::Signed(value),
-    }
-}
-
 pub(crate) fn boolean(name: &'static str, value: bool) -> Field {
     Field {
         name,
@@ -66,7 +67,7 @@ pub(crate) fn boolean(name: &'static str, value: bool) -> Field {
 pub(crate) fn text(name: &'static str, value: impl AsRef<str>) -> Field {
     Field {
         name,
-        value: FieldValue::Text(truncate(&single_line(value.as_ref()), 256)),
+        value: FieldValue::Text(crate::observability::redact_freeform(value.as_ref(), 256)),
     }
 }
 
@@ -116,6 +117,10 @@ pub(crate) fn record(
 
 pub(crate) fn mark_ui_thread() {
     let _ = UI_THREAD.set(thread::current().id());
+    UI_LAST_INPUT_US.store(
+        duration_us(recorder().origin.elapsed()).saturating_add(1),
+        Ordering::Release,
+    );
 }
 
 pub(crate) fn is_ui_thread() -> bool {
@@ -158,11 +163,86 @@ pub(crate) fn end_idle(reason: &'static str) {
     );
 }
 
+pub(crate) fn terminal_input(kind: &'static str) {
+    end_idle("terminal_event");
+    UI_LAST_INPUT_US.store(
+        duration_us(recorder().origin.elapsed()).saturating_add(1),
+        Ordering::Release,
+    );
+    let previous = PENDING_INPUT.with(|pending| pending.replace(Some(InputTrace::begin(kind))));
+    if let Some(previous) = previous {
+        previous.handled();
+    }
+}
+
+pub(crate) fn terminal_poll_timed_out() {
+    let last_input = UI_LAST_INPUT_US.load(Ordering::Acquire);
+    if last_input == 0 {
+        return;
+    }
+    let now = duration_us(recorder().origin.elapsed()).saturating_add(1);
+    if now.saturating_sub(last_input) >= duration_us(Duration::from_secs(1)) {
+        start_idle();
+    }
+}
+
+pub(crate) fn finish_pending_input_without_frame() {
+    if let Some(input) = PENDING_INPUT.with(|pending| pending.take()) {
+        input.handled();
+    }
+}
+
+pub(crate) fn take_input_for_frame() -> Option<InputTrace> {
+    let input = PENDING_INPUT.with(|pending| pending.take());
+    if let Some(input) = &input {
+        input.handled();
+    }
+    input
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct InputTrace {
     id: u64,
     kind: &'static str,
     started: Instant,
+}
+
+pub(crate) struct TransactionTrace {
+    name: &'static str,
+    started: Instant,
+    finished: bool,
+}
+
+impl TransactionTrace {
+    pub(crate) fn begin(name: &'static str) -> Self {
+        Self {
+            name,
+            started: Instant::now(),
+            finished: false,
+        }
+    }
+
+    pub(crate) fn committed(mut self) {
+        self.record(true);
+        self.finished = true;
+    }
+
+    fn record(&self, committed: bool) {
+        record(
+            "sqlite",
+            "transaction",
+            Some(self.started.elapsed()),
+            vec![text("name", self.name), boolean("committed", committed)],
+        );
+    }
+}
+
+impl Drop for TransactionTrace {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.record(false);
+        }
+    }
 }
 
 impl InputTrace {
@@ -240,9 +320,13 @@ enum Control {
         endpoints: Vec<ServerEndpoint>,
         reply: mpsc::SyncSender<Vec<PathBuf>>,
     },
+    Register {
+        endpoints: Vec<ServerEndpoint>,
+    },
     Stop {
         paths: Vec<PathBuf>,
     },
+    StopAll,
 }
 
 struct ServerEndpoint {
@@ -255,6 +339,7 @@ struct ServerSocket {
     socket: std::os::unix::net::UnixDatagram,
     socket_path: PathBuf,
     output_dir: PathBuf,
+    _lock: File,
 }
 
 #[cfg(not(unix))]
@@ -264,12 +349,18 @@ pub(crate) struct ServerGuard {
     paths: Vec<PathBuf>,
 }
 
+impl ServerGuard {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.paths.is_empty()
+    }
+}
+
 impl Drop for ServerGuard {
     fn drop(&mut self) {
         if self.paths.is_empty() {
             return;
         }
-        let _ = recorder().control_tx.send(Control::Stop {
+        let _ = recorder().control_tx.try_send(Control::Stop {
             paths: std::mem::take(&mut self.paths),
         });
     }
@@ -278,13 +369,7 @@ impl Drop for ServerGuard {
 pub(crate) fn serve_repositories<'a>(
     repos: impl IntoIterator<Item = &'a Repository>,
 ) -> ServerGuard {
-    let endpoints = repos
-        .into_iter()
-        .map(|repo| ServerEndpoint {
-            socket_path: control_socket_path(repo),
-            output_dir: repo.prism_dir().join("recordings"),
-        })
-        .collect::<Vec<_>>();
+    let endpoints = server_endpoints(repos);
     if endpoints.is_empty() {
         return ServerGuard { paths: Vec::new() };
     }
@@ -304,6 +389,30 @@ pub(crate) fn serve_repositories<'a>(
             .recv_timeout(Duration::from_secs(1))
             .unwrap_or_default(),
     }
+}
+
+pub(crate) fn register_repositories<'a>(repos: impl IntoIterator<Item = &'a Repository>) {
+    let endpoints = server_endpoints(repos);
+    if endpoints.is_empty() {
+        return;
+    }
+    let _ = recorder()
+        .control_tx
+        .try_send(Control::Register { endpoints });
+}
+
+pub(crate) fn stop_all_servers() {
+    let _ = recorder().control_tx.try_send(Control::StopAll);
+}
+
+fn server_endpoints<'a>(repos: impl IntoIterator<Item = &'a Repository>) -> Vec<ServerEndpoint> {
+    repos
+        .into_iter()
+        .map(|repo| ServerEndpoint {
+            socket_path: control_socket_path(repo),
+            output_dir: repo.prism_dir().join("recordings"),
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -358,6 +467,7 @@ pub(crate) fn trigger(repo: &Repository, options: RecordOptions) -> Result<PathB
 
 #[cfg(unix)]
 fn trigger_unix(repo: &Repository, options: RecordOptions) -> Result<PathBuf, String> {
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixDatagram;
 
     let server_path = control_socket_path(repo);
@@ -367,11 +477,13 @@ fn trigger_unix(repo: &Repository, options: RecordOptions) -> Result<PathBuf, St
             repo.root.display()
         ));
     }
-    let client_path = client_socket_path();
+    let client_path = client_socket_path()?;
     remove_socket_if_present(&client_path)?;
     let socket = UnixDatagram::bind(&client_path)
         .map_err(|error| format!("bind debug recorder response socket: {error}"))?;
     let _cleanup = SocketPathGuard(client_path.clone());
+    fs::set_permissions(&client_path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("secure debug recorder response socket: {error}"))?;
     socket
         .set_read_timeout(Some(
             Duration::from_secs(options.after_seconds).saturating_add(RESPONSE_GRACE),
@@ -461,14 +573,21 @@ impl RecorderState {
 
     fn run(&mut self) {
         loop {
-            while let Ok(control) = self.control_rx.try_recv() {
+            self.finish_capture_if_due();
+            for _ in 0..MAX_CONTROL_BATCH {
+                let Ok(control) = self.control_rx.try_recv() else {
+                    break;
+                };
                 self.handle_control(control);
             }
             self.poll_servers();
             match self.event_rx.recv_timeout(CONTROL_POLL_INTERVAL) {
                 Ok(event) => {
                     self.push(event);
-                    while let Ok(event) = self.event_rx.try_recv() {
+                    for _ in 1..MAX_EVENT_BATCH {
+                        let Ok(event) = self.event_rx.try_recv() else {
+                            break;
+                        };
                         self.push(event);
                     }
                 }
@@ -522,21 +641,10 @@ impl RecorderState {
     fn handle_control(&mut self, control: Control) {
         match control {
             Control::Serve { endpoints, reply } => {
-                let mut paths = Vec::new();
-                for endpoint in endpoints {
-                    if self
-                        .servers
-                        .iter()
-                        .any(|server| server.socket_path == endpoint.socket_path)
-                    {
-                        continue;
-                    }
-                    if let Ok(server) = bind_server(endpoint) {
-                        paths.push(server.socket_path.clone());
-                        self.servers.push(server);
-                    }
-                }
-                let _ = reply.send(paths);
+                let _ = reply.send(self.add_servers(endpoints));
+            }
+            Control::Register { endpoints } => {
+                self.add_servers(endpoints);
             }
             Control::Stop { paths } => {
                 let mut retained = Vec::new();
@@ -549,21 +657,47 @@ impl RecorderState {
                 }
                 self.servers = retained;
             }
+            Control::StopAll => self.remove_all_servers(),
         }
+    }
+
+    #[cfg(unix)]
+    fn add_servers(&mut self, endpoints: Vec<ServerEndpoint>) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        for endpoint in endpoints {
+            if self
+                .servers
+                .iter()
+                .any(|server| server.socket_path == endpoint.socket_path)
+            {
+                continue;
+            }
+            if let Ok(server) = bind_server(endpoint) {
+                paths.push(server.socket_path.clone());
+                self.servers.push(server);
+            }
+        }
+        paths
     }
 
     #[cfg(not(unix))]
     fn handle_control(&mut self, control: Control) {
-        if let Control::Serve { reply, .. } = control {
-            let _ = reply.send(Vec::new());
+        match control {
+            Control::Serve { reply, .. } => {
+                let _ = reply.send(Vec::new());
+            }
+            Control::Register { .. } | Control::Stop { .. } | Control::StopAll => {}
         }
     }
 
     #[cfg(unix)]
     fn poll_servers(&mut self) {
         let mut requests = Vec::new();
-        for server in &self.servers {
+        'servers: for server in &self.servers {
             loop {
+                if requests.len() == MAX_REQUEST_BATCH {
+                    break 'servers;
+                }
                 let mut bytes = [0_u8; 1024];
                 match server.socket.recv_from(&mut bytes) {
                     Ok((size, source)) => {
@@ -631,6 +765,12 @@ impl RecorderState {
         if latest_us < deadline_us && !capture.after.is_zero() {
             return;
         }
+        for _ in 0..EVENT_CHANNEL_CAPACITY {
+            let Ok(event) = self.event_rx.try_recv() else {
+                break;
+            };
+            self.push(event);
+        }
         let capture = self.capture.take().expect("capture was checked above");
         let result = self.write_capture(&capture);
         send_response(&capture.response_path, result);
@@ -656,8 +796,9 @@ impl RecorderState {
             )
         })?;
         let path = capture.output_dir.join(format!(
-            "prism-recording-{}-{}.jsonl",
+            "prism-recording-{}-{}-{}.jsonl",
             capture.trigger_unix_ms,
+            capture.trigger_us,
             std::process::id()
         ));
         let temporary = path.with_extension(format!("jsonl.tmp-{}", std::process::id()));
@@ -691,12 +832,8 @@ impl RecorderState {
             .get_ref()
             .sync_all()
             .map_err(|error| format!("sync {}: {error}", temporary.display()))?;
-        fs::rename(&temporary, &path).map_err(|error| {
-            format!(
-                "commit debug recording {}: {error}",
-                path.display()
-            )
-        })?;
+        fs::rename(&temporary, &path)
+            .map_err(|error| format!("commit debug recording {}: {error}", path.display()))?;
         Ok(path)
     }
 
@@ -732,8 +869,8 @@ struct CaptureHeader {
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
 struct MetricSummary {
-    category: &'static str,
-    operation: &'static str,
+    category: String,
+    operation: String,
     count: usize,
     p50_us: u64,
     p95_us: u64,
@@ -748,13 +885,38 @@ struct CaptureSummary {
 }
 
 fn capture_summary(events: &[StoredEvent]) -> CaptureSummary {
-    let mut durations = BTreeMap::<(&'static str, &'static str), Vec<u64>>::new();
+    let mut durations = BTreeMap::<(String, String), Vec<u64>>::new();
     for event in events {
+        let operation = event
+            .fields
+            .iter()
+            .find_map(|field| match (field.name, &field.value) {
+                ("name", FieldValue::Text(name)) if event.category == "sqlite" => {
+                    Some(format!("{}:{name}", event.operation))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| event.operation.to_string());
         if let Some(duration_us) = event.duration_us {
             durations
-                .entry((event.category, event.operation))
+                .entry((event.category.to_string(), operation.clone()))
                 .or_default()
                 .push(duration_us);
+        }
+        for field in &event.fields {
+            if !field.name.ends_with("_us") {
+                continue;
+            }
+            let FieldValue::Unsigned(duration_us) = &field.value else {
+                continue;
+            };
+            durations
+                .entry((
+                    event.category.to_string(),
+                    format!("{}.{}", operation, field.name.trim_end_matches("_us")),
+                ))
+                .or_default()
+                .push(*duration_us);
         }
     }
     let metrics = durations
@@ -794,26 +956,44 @@ fn write_json_line(writer: &mut impl Write, value: &impl Serialize) -> Result<()
 }
 
 fn create_recording_file(path: &Path) -> Result<File, String> {
-    OpenOptions::new()
-        .create_new(true)
-        .write(true)
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
         .open(path)
         .map_err(|error| format!("create debug recording {}: {error}", path.display()))
 }
 
 #[cfg(unix)]
 fn bind_server(endpoint: ServerEndpoint) -> Result<ServerSocket, String> {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::UnixDatagram;
 
-    if endpoint.socket_path.exists() {
-        let probe = UnixDatagram::unbound()
-            .map_err(|error| format!("create recorder socket probe: {error}"))?;
-        if probe.send_to(b"ping", &endpoint.socket_path).is_ok() {
-            return Err("another recorder already owns the control socket".to_string());
-        }
-        remove_socket_if_present(&endpoint.socket_path)?;
+    let runtime_dir = ensure_control_runtime_dir()?;
+    if endpoint.socket_path.parent() != Some(runtime_dir.as_path()) {
+        return Err("recorder socket is outside its private runtime directory".to_string());
     }
+    let lock_path = endpoint.socket_path.with_extension("lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|error| format!("open recorder lock {}: {error}", lock_path.display()))?;
+    fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| format!("secure recorder lock {}: {error}", lock_path.display()))?;
+    let locked = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if locked != 0 {
+        return Err("another recorder already owns the control socket".to_string());
+    }
+    remove_socket_if_present(&endpoint.socket_path)?;
     let socket = UnixDatagram::bind(&endpoint.socket_path).map_err(|error| {
         format!(
             "bind recorder control socket {}: {error}",
@@ -835,6 +1015,7 @@ fn bind_server(endpoint: ServerEndpoint) -> Result<ServerSocket, String> {
         socket,
         socket_path: endpoint.socket_path,
         output_dir: endpoint.output_dir,
+        _lock: lock,
     })
 }
 
@@ -863,17 +1044,64 @@ fn send_response(path: &Path, result: Result<PathBuf, String>) {
     }
 }
 
-fn control_socket_path(repo: &Repository) -> PathBuf {
+pub(crate) fn control_socket_path(repo: &Repository) -> PathBuf {
     let hash = stable_hash(&repo.prism_dir());
-    PathBuf::from("/tmp").join(format!("prism-flight-{hash:016x}.sock"))
+    control_runtime_dir().join(format!("repo-{hash:016x}.sock"))
 }
 
-fn client_socket_path() -> PathBuf {
-    PathBuf::from("/tmp").join(format!(
+fn client_socket_path() -> Result<PathBuf, String> {
+    Ok(ensure_control_runtime_dir()?.join(format!(
         "prism-flight-client-{}-{}.sock",
         std::process::id(),
         unix_ms()
-    ))
+    )))
+}
+
+fn control_runtime_dir() -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from("/tmp").join(format!("prism-flight-{}", unsafe { libc::geteuid() }))
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join("prism-flight")
+    }
+}
+
+#[cfg(unix)]
+fn ensure_control_runtime_dir() -> Result<PathBuf, String> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+    let path = control_runtime_dir();
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(format!(
+                "create recorder runtime directory {}: {error}",
+                path.display()
+            ));
+        }
+    }
+    let metadata = fs::symlink_metadata(&path)
+        .map_err(|error| format!("inspect recorder runtime directory: {error}"))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(format!(
+            "recorder runtime path is not a directory: {}",
+            path.display()
+        ));
+    }
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(format!(
+            "recorder runtime directory is owned by another user: {}",
+            path.display()
+        ));
+    }
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("secure recorder runtime directory: {error}"))?;
+    Ok(path)
 }
 
 fn remove_socket_if_present(path: &Path) -> Result<(), String> {
@@ -919,14 +1147,38 @@ mod tests {
         assert_eq!(
             capture_summary(&events).metrics,
             vec![MetricSummary {
-                category: "tui",
-                operation: "frame",
+                category: "tui".to_string(),
+                operation: "frame".to_string(),
                 count: 100,
                 p50_us: 50,
                 p95_us: 95,
                 max_us: 100,
             }]
         );
+    }
+
+    #[test]
+    fn capture_summary_includes_named_duration_fields() {
+        let mut event = stored(100);
+        event.fields.push(unsigned("render_us", 25_u64));
+
+        let summary = capture_summary(&[event]);
+
+        assert!(summary.metrics.contains(&MetricSummary {
+            category: "tui".to_string(),
+            operation: "frame.render".to_string(),
+            count: 1,
+            p50_us: 25,
+            p95_us: 25,
+            max_us: 25,
+        }));
+    }
+
+    #[test]
+    fn text_fields_apply_observability_redaction() {
+        let field = text("value", "token=ghp_not-a-real-token");
+
+        assert!(matches!(field.value, FieldValue::Text(value) if !value.contains("ghp_")));
     }
 
     #[test]
@@ -942,11 +1194,88 @@ mod tests {
         assert!(
             RecordOptions {
                 before_seconds: 60,
-                after_seconds: 121,
+                after_seconds: 31,
             }
             .validate()
             .is_err()
         );
-        assert_eq!(RecordOptions::default().validate(), Ok(RecordOptions::default()));
+        assert_eq!(
+            RecordOptions::default().validate(),
+            Ok(RecordOptions::default())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trigger_writes_an_atomic_jsonl_capture_without_sqlite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "prism-flight-test-{}-{}",
+            std::process::id(),
+            unix_ms()
+        ));
+        let repo = Repository::with_config_dir_for_test(base.join("repo"), base.join("config"));
+        let server = serve_repositories([&repo]);
+        record(
+            "test",
+            "probe",
+            Some(Duration::from_micros(42)),
+            vec![unsigned("value", 7_u64)],
+        );
+
+        let path = trigger(
+            &repo,
+            RecordOptions {
+                before_seconds: 60,
+                after_seconds: 0,
+            },
+        )
+        .unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+
+        assert!(
+            contents
+                .lines()
+                .next()
+                .unwrap()
+                .contains("\"type\":\"capture\"")
+        );
+        assert!(contents.contains("\"category\":\"test\""));
+        assert!(contents.contains("\"operation\":\"probe\""));
+        assert!(
+            contents
+                .lines()
+                .last()
+                .unwrap()
+                .contains("\"type\":\"summary\"")
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(server);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_lock_prevents_socket_ownership_races() {
+        let socket_path = ensure_control_runtime_dir().unwrap().join(format!(
+            "lock-test-{}-{}.sock",
+            std::process::id(),
+            unix_ms()
+        ));
+        let endpoint = || ServerEndpoint {
+            socket_path: socket_path.clone(),
+            output_dir: std::env::temp_dir(),
+        };
+        let server = bind_server(endpoint()).unwrap();
+
+        assert!(bind_server(endpoint()).is_err());
+
+        drop(server);
+        let _ = fs::remove_file(&socket_path);
+        let _ = fs::remove_file(socket_path.with_extension("lock"));
     }
 }
