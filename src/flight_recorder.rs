@@ -1202,7 +1202,7 @@ fn send_response(path: &Path, result: Result<PathBuf, String>) {
 }
 
 pub(crate) fn control_socket_path(repo: &Repository) -> PathBuf {
-    let hash = stable_hash(&repo.prism_dir());
+    let hash = stable_hash(&repo.root);
     control_runtime_dir().join(format!("repo-{hash:016x}.sock"))
 }
 
@@ -1421,6 +1421,18 @@ mod tests {
         assert_eq!(
             RecordOptions::default().validate(),
             Ok(RecordOptions::default())
+        );
+    }
+
+    #[test]
+    fn control_socket_identity_uses_repository_root() {
+        let repo = Repository {
+            root: PathBuf::from("/work/example"),
+        };
+
+        assert_eq!(
+            control_socket_path(&repo),
+            control_runtime_dir().join(format!("repo-{:016x}.sock", stable_hash(&repo.root)))
         );
     }
 
