@@ -989,7 +989,10 @@ impl Tui {
             return program.is_some_and(|program| crate::process::command_exists(&program));
         }
         if action == GitAction::SubmitReview {
-            return self.focused_panel == PanelFocus::Repos
+            return self
+                .selected_repo_context()
+                .is_some_and(|context| crate::process::command_exists(&context.config.tool("gh")))
+                && self.focused_panel == PanelFocus::Repos
                 && self.main_focused
                 && self.selected_repo_pr_summary().is_some();
         }
@@ -5980,6 +5983,26 @@ esac
         assert!(tui.git_action_enabled(GitAction::OpenPr));
         assert!(!tui.git_action_enabled(GitAction::Merge));
         assert!(!tui.git_action_enabled(GitAction::CiFix));
+    }
+
+    #[test]
+    fn submit_review_requires_the_configured_gh_executable() {
+        let temp = unique_temp_dir("prism-tui-submit-review-test");
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut config = test_config();
+        let mut tui = Tui::new_single(repo, config.clone(), Vec::new());
+        tui.focused_panel = PanelFocus::Repos;
+        tui.main_focused = true;
+        tui.repos[0].pr_summaries = vec![test_pr_summary(false)];
+
+        assert!(!tui.git_action_enabled(GitAction::SubmitReview));
+
+        crate::test_support::install_tool(&mut config, &temp, "gh", "#!/bin/sh\nexit 0\n");
+        tui.repos[0].config = config;
+
+        assert!(tui.git_action_enabled(GitAction::SubmitReview));
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]

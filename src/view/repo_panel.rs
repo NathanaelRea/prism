@@ -124,7 +124,7 @@ pub(super) fn repo_pr_table_lines(
         .filter(|pr| !pr.merged && pr.state.eq_ignore_ascii_case("OPEN"))
         .collect::<Vec<_>>();
     let mut lines = vec![Line::from(vec![
-        Span::styled(format!("{:<7}", "PR"), muted_style()),
+        Span::styled(format!("{:<8}", "PR"), muted_style()),
         Span::styled(format!("{:<13}", "repo"), muted_style()),
         Span::styled(format!("{:<9}", "ci"), muted_style()),
         Span::styled(format!("{:<10}", "review"), muted_style()),
@@ -155,7 +155,7 @@ pub(super) fn repo_pr_table_lines(
         let wt = if pr.has_worktree { "yes" } else { "no" };
         lines.push(Line::from(vec![
             Span::styled(
-                fixed_cell(&pr_cell, 7),
+                fixed_cell(&pr_cell, 8),
                 if pr.selected {
                     title_style(true)
                 } else {

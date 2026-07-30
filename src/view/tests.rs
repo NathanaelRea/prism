@@ -643,7 +643,7 @@ fn repo_main_panel_lists_indexed_pr_without_worktree() {
     let sessions = vec![test_session("feature", AgentState::Running)];
     let mut model = test_model(&config, &sessions, PanelFocus::Repos, None, None);
     let mut remote = test_pr_summary();
-    remote.number = 24;
+    remote.number = 12345;
     remote.title = "Remote only".to_string();
     remote.author = "octocat".to_string();
     remote.requested_reviewers = vec!["alice".to_string(), "backend".to_string()];
@@ -659,7 +659,7 @@ fn repo_main_panel_lists_indexed_pr_without_worktree() {
 
     let buffer = render_to_string(&model, 120, 30);
 
-    assert!(buffer.contains("#24"));
+    assert!(buffer.contains("#12345"));
     assert!(buffer.contains("Remote only"));
     assert!(buffer.contains("octocat"));
     assert!(buffer.contains("alice,backend"));
