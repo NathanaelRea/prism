@@ -33,29 +33,52 @@ pub fn load_output_lines(
     conn: &rusqlite::Connection,
     step_run_id: i64,
 ) -> Result<Vec<AutoOutputLine>, String> {
-    let mut statement = conn
-        .prepare(
-            "select step_run_id, line_number, time_unix_ms, kind, text, block_id
-             from auto_output_line
-             where step_run_id = ?1
-             order by line_number",
-        )
-        .map_err(|error| format!("prepare auto output load: {error}"))?;
-    let rows = statement
-        .query_map(params![step_run_id], |row| {
-            let kind: String = row.get(3)?;
-            Ok(AutoOutputLine {
-                step_run_id: row.get(0)?,
-                line_number: i64_to_u64(row.get(1)?, 1),
-                time_unix_ms: i64_to_u64(row.get(2)?, 2),
-                kind: AutoOutputKind::parse(&kind).map_err(from_string_error)?,
-                text: row.get(4)?,
-                block_id: row.get(5)?,
+    let started = std::time::Instant::now();
+    let result = (|| {
+        let mut statement = conn
+            .prepare(
+                "select step_run_id, line_number, time_unix_ms, kind, text, block_id
+                 from auto_output_line
+                 where step_run_id = ?1
+                 order by line_number",
+            )
+            .map_err(|error| format!("prepare auto output load: {error}"))?;
+        let rows = statement
+            .query_map(params![step_run_id], |row| {
+                let kind: String = row.get(3)?;
+                Ok(AutoOutputLine {
+                    step_run_id: row.get(0)?,
+                    line_number: i64_to_u64(row.get(1)?, 1),
+                    time_unix_ms: i64_to_u64(row.get(2)?, 2),
+                    kind: AutoOutputKind::parse(&kind).map_err(from_string_error)?,
+                    text: row.get(4)?,
+                    block_id: row.get(5)?,
+                })
             })
+            .map_err(|error| format!("load auto output lines: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read auto output lines: {error}"))
+    })();
+    let (row_count, text_bytes) = result
+        .as_ref()
+        .map(|lines| {
+            (
+                lines.len(),
+                lines.iter().map(|line| line.text.len()).sum::<usize>(),
+            )
         })
-        .map_err(|error| format!("load auto output lines: {error}"))?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("read auto output lines: {error}"))
+        .unwrap_or_default();
+    crate::flight_recorder::record(
+        "output",
+        "load_auto",
+        Some(started.elapsed()),
+        vec![
+            crate::flight_recorder::unsigned("row_count", row_count),
+            crate::flight_recorder::unsigned("text_bytes", text_bytes),
+            crate::flight_recorder::boolean("success", result.is_ok()),
+        ],
+    );
+    result
 }
 
 pub fn append_auto_event(conn: &rusqlite::Connection, event: &AutoEvent) -> Result<i64, String> {

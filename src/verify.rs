@@ -5,7 +5,8 @@ use std::process::Command;
 
 use crate::config::Config;
 use crate::process::{
-    ProcessPolicy, run_configured_commands, run_output_allow_failure, run_status,
+    ProcessDescriptor, ProcessPolicy, run_configured_commands, run_output_allow_failure,
+    run_status, run_status_named,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,12 +104,13 @@ pub(crate) fn run_merge_conflict_check_against(
         };
     }
 
-    let fetch = run_status(
+    let fetch = run_status_named(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(path)
             .args(["fetch", "origin", base]),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("git.fetch"),
     );
     if let Err(error) = fetch {
         return VerifyCheckResult {

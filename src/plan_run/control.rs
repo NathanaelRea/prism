@@ -463,11 +463,13 @@ pub(super) fn process_is_running(process_id: u32) -> bool {
 
 #[cfg(not(unix))]
 pub(super) fn process_is_running(process_id: u32) -> bool {
-    Command::new("tasklist")
-        .args(["/FI", &format!("PID eq {process_id}")])
-        .output()
-        .map(|output| String::from_utf8_lossy(&output.stdout).contains(&process_id.to_string()))
-        .unwrap_or(false)
+    crate::process::run_output_allow_failure_named(
+        Command::new("tasklist").args(["/FI", &format!("PID eq {process_id}")]),
+        crate::process::ProcessPolicy::Metadata,
+        crate::process::ProcessDescriptor::new("harness.process.inspect"),
+    )
+    .map(|output| output.stdout.contains(&process_id.to_string()))
+    .unwrap_or(false)
 }
 
 pub(super) fn reset_step_for_retry(step: &mut PlanStepRun) {

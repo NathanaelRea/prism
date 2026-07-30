@@ -24,6 +24,17 @@ impl Tui {
         let mut changed = false;
 
         while let Ok(result) = self.tmux_portal_rx.try_recv() {
+            crate::flight_recorder::record(
+                "tmux",
+                "portal_result",
+                Some(result.started_at.elapsed()),
+                vec![
+                    crate::flight_recorder::text("target", &result.key.slot.worktree.branch),
+                    crate::flight_recorder::text("window", "agent"),
+                    crate::flight_recorder::unsigned("generation", result.key.generation),
+                    crate::flight_recorder::boolean("success", result.capture.is_ok()),
+                ],
+            );
             let is_current = self
                 .tmux_portal_polls_in_flight
                 .get(&result.key)
@@ -112,6 +123,31 @@ impl Tui {
             .get(&target.key)
             .is_none_or(|last| last.elapsed() >= interval);
         if due && self.tmux_portal_polls_in_flight.is_empty() {
+            let reason = match (target_changed, capture) {
+                (true, _) => "target_changed",
+                (false, None) => "initial",
+                (false, Some(Err(_))) => "capture_error",
+                (false, Some(Ok(_))) => "periodic",
+            };
+            let target_session = crate::tmux::TmuxAgentSession::for_worktree_session(
+                &target.repo,
+                &target.key.slot.worktree.branch,
+                target.key.generation,
+            )
+            .name()
+            .to_string();
+            crate::flight_recorder::record(
+                "tmux",
+                "portal_poll",
+                None,
+                vec![
+                    crate::flight_recorder::text("target_session", target_session),
+                    crate::flight_recorder::text("window", "agent"),
+                    crate::flight_recorder::unsigned("generation", target.key.generation),
+                    crate::flight_recorder::unsigned("poll_interval_ms", interval.as_millis()),
+                    crate::flight_recorder::text("retry_reason", reason),
+                ],
+            );
             let started_at = Instant::now();
             self.tmux_portal_last_polled
                 .insert(target.key.clone(), started_at);

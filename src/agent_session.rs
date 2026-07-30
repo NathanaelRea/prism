@@ -173,8 +173,19 @@ pub(crate) fn generation_for_slot(
     slot: &AgentSessionSlot,
 ) -> u64 {
     if let Some(generation) = generations.get(slot).copied() {
+        crate::flight_recorder::record(
+            "tmux",
+            "generation",
+            None,
+            vec![
+                crate::flight_recorder::text("target", &slot.worktree.branch),
+                crate::flight_recorder::unsigned("generation", generation),
+                crate::flight_recorder::boolean("cached", true),
+            ],
+        );
         return generation;
     }
+    let started = std::time::Instant::now();
     let generation = repos
         .iter()
         .find(|repo| repo.identity == slot.worktree.repository)
@@ -183,6 +194,16 @@ pub(crate) fn generation_for_slot(
         })
         .unwrap_or(0);
     generations.insert(slot.clone(), generation);
+    crate::flight_recorder::record(
+        "tmux",
+        "generation",
+        Some(started.elapsed()),
+        vec![
+            crate::flight_recorder::text("target", &slot.worktree.branch),
+            crate::flight_recorder::unsigned("generation", generation),
+            crate::flight_recorder::boolean("cached", false),
+        ],
+    );
     generation
 }
 
@@ -191,6 +212,7 @@ pub(crate) fn rotate_generation(
     generations: &mut BTreeMap<AgentSessionSlot, u64>,
     slot: AgentSessionSlot,
 ) -> u64 {
+    let started = std::time::Instant::now();
     let cached = generation_for_slot(repos, generations, &slot);
     let observed = repos
         .iter()
@@ -200,7 +222,17 @@ pub(crate) fn rotate_generation(
         })
         .unwrap_or(cached);
     let generation = cached.max(observed).saturating_add(1);
+    let target = slot.worktree.branch.clone();
     generations.insert(slot, generation);
+    crate::flight_recorder::record(
+        "tmux",
+        "generation_rotate",
+        Some(started.elapsed()),
+        vec![
+            crate::flight_recorder::text("target", target),
+            crate::flight_recorder::unsigned("generation", generation),
+        ],
+    );
     generation
 }
 

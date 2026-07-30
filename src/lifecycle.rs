@@ -5,8 +5,9 @@ use std::sync::LazyLock;
 use crate::config::Config;
 use crate::observability;
 use crate::process::{
-    ProcessOutput, ProcessPolicy, run_capture, run_configured_commands, run_output,
-    run_output_allow_failure, run_status, run_status_inherited,
+    ProcessDescriptor, ProcessOutput, ProcessPolicy, run_capture, run_capture_named,
+    run_configured_commands, run_output, run_output_allow_failure, run_status,
+    run_status_inherited,
 };
 use crate::repo::Repository;
 
@@ -214,12 +215,13 @@ pub(crate) fn push_branch(
     } else {
         vec!["push".to_string()]
     };
-    run_capture(
+    run_capture_named(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(path)
             .args(args),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("git.push"),
     )?;
     Ok(())
 }

@@ -9,6 +9,7 @@ mod config;
 mod durability;
 mod execution;
 pub mod file_persistence;
+mod flight_recorder;
 mod git;
 mod github;
 mod harness;

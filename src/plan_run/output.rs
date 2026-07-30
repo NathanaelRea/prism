@@ -77,30 +77,53 @@ pub fn load_output_lines(
     run_id: &str,
     step: usize,
 ) -> Result<Vec<PlanOutputLine>, String> {
-    let mut statement = conn
-        .prepare(
-            "select run_id, step, line_number, time_unix_ms, kind, text, block_id
-             from plan_output_line
-             where run_id = ?1 and step = ?2
-             order by line_number",
-        )
-        .map_err(|error| format!("prepare plan output load: {error}"))?;
-    let rows = statement
-        .query_map(params![run_id, usize_to_i64(step)], |row| {
-            let kind: String = row.get(4)?;
-            Ok(PlanOutputLine {
-                run_id: row.get(0)?,
-                step: i64_to_usize(row.get(1)?, 1),
-                line_number: i64_to_u64(row.get(2)?, 2),
-                time_unix_ms: i64_to_u64(row.get(3)?, 3),
-                kind: PlanOutputKind::parse(&kind).map_err(from_string_error)?,
-                text: row.get(5)?,
-                block_id: row.get(6)?,
+    let started = std::time::Instant::now();
+    let result = (|| {
+        let mut statement = conn
+            .prepare(
+                "select run_id, step, line_number, time_unix_ms, kind, text, block_id
+                 from plan_output_line
+                 where run_id = ?1 and step = ?2
+                 order by line_number",
+            )
+            .map_err(|error| format!("prepare plan output load: {error}"))?;
+        let rows = statement
+            .query_map(params![run_id, usize_to_i64(step)], |row| {
+                let kind: String = row.get(4)?;
+                Ok(PlanOutputLine {
+                    run_id: row.get(0)?,
+                    step: i64_to_usize(row.get(1)?, 1),
+                    line_number: i64_to_u64(row.get(2)?, 2),
+                    time_unix_ms: i64_to_u64(row.get(3)?, 3),
+                    kind: PlanOutputKind::parse(&kind).map_err(from_string_error)?,
+                    text: row.get(5)?,
+                    block_id: row.get(6)?,
+                })
             })
+            .map_err(|error| format!("load plan output lines: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read plan output lines: {error}"))
+    })();
+    let (row_count, text_bytes) = result
+        .as_ref()
+        .map(|lines| {
+            (
+                lines.len(),
+                lines.iter().map(|line| line.text.len()).sum::<usize>(),
+            )
         })
-        .map_err(|error| format!("load plan output lines: {error}"))?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("read plan output lines: {error}"))
+        .unwrap_or_default();
+    crate::flight_recorder::record(
+        "output",
+        "load_plan",
+        Some(started.elapsed()),
+        vec![
+            crate::flight_recorder::unsigned("row_count", row_count),
+            crate::flight_recorder::unsigned("text_bytes", text_bytes),
+            crate::flight_recorder::boolean("success", result.is_ok()),
+        ],
+    );
+    result
 }
 
 pub(super) fn trim_output_lines(

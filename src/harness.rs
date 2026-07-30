@@ -393,10 +393,11 @@ impl Invocation {
         cwd: &Path,
         policy: crate::process::ProcessPolicy,
     ) -> Result<crate::process::SupervisedChild, String> {
-        crate::process::SupervisedChild::spawn(
+        crate::process::SupervisedChild::spawn_named(
             &mut self.command(cwd)?,
             Some(policy),
             self.stdin.as_ref().map(|input| input.as_bytes().to_vec()),
+            crate::process::ProcessDescriptor::new("harness.run"),
         )
         .map_err(|error| format!("start harness '{}': {error}", self.argv[0]))
     }
@@ -826,17 +827,12 @@ pub fn terminate_process(
     process_id: u32,
     _expected_start_time_ticks: Option<u64>,
 ) -> Result<(), String> {
-    Command::new("taskkill")
-        .args(["/PID", &process_id.to_string(), "/T", "/F"])
-        .status()
-        .map_err(|error| format!("terminate harness process {process_id}: {error}"))
-        .and_then(|status| {
-            if status.success() {
-                Ok(())
-            } else {
-                Err(format!("terminate harness process {process_id}: {status}"))
-            }
-        })
+    crate::process::run_status_named(
+        Command::new("taskkill").args(["/PID", &process_id.to_string(), "/T", "/F"]),
+        crate::process::ProcessPolicy::Metadata,
+        crate::process::ProcessDescriptor::new("harness.process.terminate"),
+    )
+    .map_err(|error| format!("terminate harness process {process_id}: {error}"))
 }
 
 fn invocation_from_template(

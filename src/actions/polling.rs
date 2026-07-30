@@ -164,10 +164,9 @@ impl Tui {
                 .iter_mut()
                 .filter(|session| session.repo_index == repo_index)
             {
-                if session.pr.enforce_eligibility(
+                if session.pr.enforce_structural_eligibility(
                     &repo,
                     &session.branch,
-                    &session.path,
                     &config,
                     session.hidden,
                 ) {
@@ -211,15 +210,22 @@ impl Tui {
                     Some(TUI_ACTION_JOB_TIMEOUT),
                     format!("prism-pr-summary-{repo_index}"),
                     move |_| {
-                        let _ = refresh_repo_policy_cache(
-                            &crate::repo::Repository { root: path.clone() },
-                            &path,
-                            &config,
-                        );
-                        let summaries = fetch_pr_summary_index(&path, &config);
+                        let github_remote_configured =
+                            crate::github::github_remote_configured(&path, &config);
+                        let summaries = if github_remote_configured {
+                            let _ = refresh_repo_policy_cache(
+                                &crate::repo::Repository { root: path.clone() },
+                                &path,
+                                &config,
+                            );
+                            fetch_pr_summary_index(&path, &config)
+                        } else {
+                            Ok(Vec::new())
+                        };
                         Ok(Some(TuiJobPayload::PrPoll(PrPollResult::Summary {
                             repository: job_repository,
                             sessions,
+                            github_remote_configured,
                             summaries,
                             poll_started_at,
                         })))
@@ -282,6 +288,7 @@ impl Tui {
                 PrPollResult::Summary {
                     repository,
                     sessions,
+                    github_remote_configured,
                     summaries,
                     poll_started_at,
                 } => {
@@ -312,36 +319,53 @@ impl Tui {
                         .iter()
                         .map(|session| pr_cache_comment_count(&session.pr))
                         .collect::<Vec<_>>();
-                    match summaries {
-                        Ok(summaries) => {
-                            let repos = self
-                                .repos
-                                .iter()
-                                .map(|managed| PrCacheRepository {
-                                    repo: &managed.repo,
-                                    config: &managed.config,
-                                })
-                                .collect::<Vec<_>>();
-                            crate::github::refresh_pr_summary_index_for_target_sessions(
-                                &repos,
-                                &mut self.sessions,
-                                repo_index,
-                                &target_indices,
-                                summaries,
-                                poll_started_at,
-                            );
+                    if !github_remote_configured {
+                        if let Some(repo) = self.repos.get(repo_index) {
+                            for session in self
+                                .sessions
+                                .iter_mut()
+                                .filter(|session| session.repo_index == repo_index)
+                            {
+                                if session
+                                    .pr
+                                    .clear_for_missing_github_remote(&repo.repo, &session.branch)
+                                {
+                                    session.unseen_comments = false;
+                                }
+                            }
                         }
-                        Err(error) => {
-                            if let Some(repo) = self.repos.get(repo_index) {
-                                for (index, session) in self.sessions.iter_mut().enumerate() {
-                                    if target_indices.contains(&index) && !session.hidden {
-                                        record_pr_summary_failure(
-                                            &repo.repo,
-                                            &session.branch,
-                                            &mut session.pr,
-                                            error.clone(),
-                                            poll_started_at,
-                                        );
+                    } else {
+                        match summaries {
+                            Ok(summaries) => {
+                                let repos = self
+                                    .repos
+                                    .iter()
+                                    .map(|managed| PrCacheRepository {
+                                        repo: &managed.repo,
+                                        config: &managed.config,
+                                    })
+                                    .collect::<Vec<_>>();
+                                crate::github::refresh_pr_summary_index_for_target_sessions(
+                                    &repos,
+                                    &mut self.sessions,
+                                    repo_index,
+                                    &target_indices,
+                                    summaries,
+                                    poll_started_at,
+                                );
+                            }
+                            Err(error) => {
+                                if let Some(repo) = self.repos.get(repo_index) {
+                                    for (index, session) in self.sessions.iter_mut().enumerate() {
+                                        if target_indices.contains(&index) && !session.hidden {
+                                            record_pr_summary_failure(
+                                                &repo.repo,
+                                                &session.branch,
+                                                &mut session.pr,
+                                                error.clone(),
+                                                poll_started_at,
+                                            );
+                                        }
                                     }
                                 }
                             }

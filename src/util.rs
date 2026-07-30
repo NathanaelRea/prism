@@ -105,12 +105,30 @@ pub fn safe_path_component(value: &str) -> String {
 }
 
 pub fn timestamp_label() -> String {
-    match crate::process::run_capture(
-        std::process::Command::new("date").arg("+%H:%M:%S"),
-        crate::process::ProcessPolicy::Metadata,
-    ) {
-        Ok(value) => value.trim().to_string(),
-        Err(_) => "now".to_string(),
+    #[cfg(unix)]
+    {
+        let Ok(elapsed) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+            return "now".to_string();
+        };
+        let Ok(timestamp) = libc::time_t::try_from(elapsed.as_secs()) else {
+            return "now".to_string();
+        };
+        let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+        // SAFETY: localtime_r initializes `local` when it returns a non-null pointer.
+        if unsafe { libc::localtime_r(&timestamp, local.as_mut_ptr()) }.is_null() {
+            return "now".to_string();
+        }
+        // SAFETY: the successful localtime_r call above initialized `local`.
+        let local = unsafe { local.assume_init() };
+        format!(
+            "{:02}:{:02}:{:02}",
+            local.tm_hour, local.tm_min, local.tm_sec
+        )
+    }
+
+    #[cfg(not(unix))]
+    {
+        "now".to_string()
     }
 }
 

@@ -17,6 +17,16 @@ use std::process::Command as ProcessCommand;
 
 pub fn run() -> Result<(), String> {
     let args = Args::parse(std::env::args_os().skip(1))?;
+    if let CommandKind::Debug(DebugCommand::Record(options)) = &args.command {
+        let repo = load_integrity_repo_context(args.repo.as_deref())?;
+        eprintln!(
+            "capturing the previous {}s and next {}s from the running Prism TUI...",
+            options.before_seconds, options.after_seconds
+        );
+        let path = crate::flight_recorder::trigger(&repo, *options)?;
+        println!("{}", path.display());
+        return Ok(());
+    }
     if matches!(args.command, CommandKind::Debug(DebugCommand::Integrity)) {
         let repo = load_integrity_repo_context(args.repo.as_deref())?;
         return crate::storage::print_integrity(&observability::db_path(&repo))
@@ -578,6 +588,14 @@ fn run_debug_command(
             println!("repo_config = {}", config.repo_config_path.display());
             println!("logs_dir = {}", repo.prism_dir().join("logs").display());
             println!(
+                "recordings_dir = {}",
+                repo.prism_dir().join("recordings").display()
+            );
+            println!(
+                "flight_recorder_socket = {}",
+                crate::flight_recorder::control_socket_path(repo).display()
+            );
+            println!(
                 "worker_runtime_dir = {}",
                 crate::worker::runtime_dir().display()
             );
@@ -664,6 +682,9 @@ fn run_debug_command(
         DebugCommand::Startup => run_debug_startup(repo, config),
         DebugCommand::Integrity => {
             unreachable!("integrity runs before observability initialization")
+        }
+        DebugCommand::Record(_) => {
+            unreachable!("record runs before observability initialization")
         }
     }
 }

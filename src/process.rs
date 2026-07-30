@@ -6,11 +6,12 @@ use std::io::{self, Read, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
+use crate::flight_recorder::{self, ExternalCallCategory, ExternalCallOutcome, ExternalCallTrace};
 use crate::observability::{self, LogLevel};
 
 thread_local! {
@@ -45,6 +46,25 @@ pub struct ProcessOutput {
     pub stdout_truncated: bool,
     pub stderr_total_bytes: u64,
     pub stderr_truncated: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessDescriptor {
+    name: &'static str,
+}
+
+impl ProcessDescriptor {
+    pub const fn new(name: &'static str) -> Self {
+        Self { name }
+    }
+
+    pub fn for_tmux(command: &Command) -> Self {
+        let args = command
+            .get_args()
+            .filter_map(|argument| argument.to_str())
+            .collect::<Vec<_>>();
+        Self::new(infer_tmux_name(&args))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +124,155 @@ impl ProcessPolicy {
     }
 }
 
+fn process_trace(
+    descriptor: ProcessDescriptor,
+    policy: Option<ProcessPolicy>,
+) -> ExternalCallTrace {
+    let mut fields = Vec::new();
+    if let Some(policy) = policy {
+        fields.push(flight_recorder::text("policy", policy.label()));
+        fields.push(flight_recorder::unsigned(
+            "deadline_ms",
+            policy.deadline().as_millis(),
+        ));
+    }
+    ExternalCallTrace::begin(ExternalCallCategory::Process, descriptor.name, fields)
+}
+
+fn process_outcome(
+    status: Option<ExitStatus>,
+    completion: ProcessCompletion,
+) -> ExternalCallOutcome {
+    match completion {
+        ProcessCompletion::DeadlineExceeded => ExternalCallOutcome::TimedOut,
+        ProcessCompletion::Canceled => ExternalCallOutcome::Canceled,
+        ProcessCompletion::Exited | ProcessCompletion::Signaled => {
+            if status.is_some_and(|status| status.success()) {
+                ExternalCallOutcome::Success
+            } else {
+                ExternalCallOutcome::Failed
+            }
+        }
+    }
+}
+
+fn process_error_fields(kind: ProcessErrorKind) -> Vec<flight_recorder::Field> {
+    vec![
+        flight_recorder::text("completion", "supervision_error"),
+        flight_recorder::text("error_kind", kind.label()),
+        flight_recorder::text("termination_stage", "none"),
+    ]
+}
+
+fn append_status_fields(fields: &mut Vec<flight_recorder::Field>, status: ExitStatus) {
+    if let Some(code) = status.code() {
+        fields.push(flight_recorder::unsigned("exit_code", code));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            fields.push(flight_recorder::unsigned("signal", signal));
+        }
+    }
+}
+
+fn infer_descriptor(command: &Command) -> ProcessDescriptor {
+    let program = Path::new(command.get_program())
+        .file_name()
+        .and_then(|program| program.to_str())
+        .unwrap_or_default();
+    let args = command
+        .get_args()
+        .filter_map(|argument| argument.to_str())
+        .collect::<Vec<_>>();
+    let name = match program {
+        "gh" => match args.as_slice() {
+            ["pr", "create", ..] => "gh.pr.create",
+            ["pr", "merge", ..] => "gh.pr.merge",
+            ["pr", "view", ..] => "gh.pr.view",
+            ["pr", "list", ..] => "gh.pr.list",
+            ["api", "graphql", ..] => "gh.api.graphql",
+            ["run", "list", ..] => "gh.run.list",
+            ["run", "view", ..] => "gh.run.view",
+            ["auth", "status", ..] => "gh.auth.status",
+            _ => "process.other",
+        },
+        "git" => infer_git_name(&args),
+        "tmux" => infer_tmux_name(&args),
+        "fzf" => "fzf.select",
+        "lazygit" => "lazygit.open",
+        "sqlite3" => "sqlite.shell",
+        "date" => "system.time.format",
+        "open" | "xdg-open" | "cmd.exe" => "browser.open",
+        _ => "process.other",
+    };
+    ProcessDescriptor::new(name)
+}
+
+fn infer_git_name(args: &[&str]) -> &'static str {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "-C" | "--git-dir" | "--work-tree" | "-c" => index += 2,
+            argument if argument.starts_with('-') => index += 1,
+            operation => {
+                return match (operation, args.get(index + 1).copied()) {
+                    ("fetch", _) => "git.fetch",
+                    ("push", _) => "git.push",
+                    ("pull", _) => "git.pull",
+                    ("ls-remote", _) => "git.ls_remote",
+                    ("remote", Some("update")) => "git.remote.update",
+                    ("remote", Some("get-url")) => "git.remote.get_url",
+                    ("status", _) => "git.status",
+                    ("show-ref", _) => "git.show_ref",
+                    ("worktree", Some("list")) => "git.worktree.list",
+                    ("worktree", Some("add")) => "git.worktree.add",
+                    ("worktree", Some("remove")) => "git.worktree.remove",
+                    ("worktree", Some("prune")) => "git.worktree.prune",
+                    ("switch", _) => "git.switch",
+                    ("rev-list", _) => "git.rev_list",
+                    ("rev-parse", _) => "git.rev_parse",
+                    ("add", _) => "git.add",
+                    ("commit", _) => "git.commit",
+                    ("branch", _) => "git.branch",
+                    ("merge-tree", _) => "git.merge_tree",
+                    ("merge", _) => "git.merge",
+                    _ => "process.other",
+                };
+            }
+        }
+    }
+    "process.other"
+}
+
+fn infer_tmux_name(args: &[&str]) -> &'static str {
+    args.iter()
+        .find_map(|argument| match *argument {
+            "load-buffer" => Some("tmux.buffer.load"),
+            "paste-buffer" => Some("tmux.buffer.paste"),
+            "list-sessions" => Some("tmux.session.list"),
+            "has-session" => Some("tmux.session.exists"),
+            "new-session" => Some("tmux.session.create"),
+            "attach-session" => Some("tmux.session.attach"),
+            "kill-session" => Some("tmux.session.kill"),
+            "set-option" => Some("tmux.option.set"),
+            "list-windows" => Some("tmux.window.list"),
+            "new-window" => Some("tmux.window.create"),
+            "move-window" => Some("tmux.window.move"),
+            "rename-window" => Some("tmux.window.rename"),
+            "resize-window" => Some("tmux.window.resize"),
+            "capture-pane" => Some("tmux.pane.capture"),
+            "display-message" if args.contains(&"#{pane_start_command}") => {
+                Some("tmux.pane.start_command")
+            }
+            "display-message" => Some("tmux.pane.current_command"),
+            "send-keys" => Some("tmux.pane.start_command"),
+            _ => None,
+        })
+        .unwrap_or("process.other")
+}
+
 #[derive(Clone, Copy)]
 struct PolicySettings {
     deadline: Duration,
@@ -118,6 +287,26 @@ pub struct SupervisedChild {
     deadline: Option<Duration>,
     termination_grace: Duration,
     terminate_on_drop: bool,
+    trace: Option<ExternalCallTrace>,
+    observed_status: Option<ExitStatus>,
+    pending_completion: Option<(ProcessCompletion, TerminationStage)>,
+    stdout_bytes: Arc<AtomicU64>,
+    stderr_bytes: Arc<AtomicU64>,
+    stdout_counted: bool,
+    stderr_counted: bool,
+}
+
+pub struct CountingReader<R> {
+    inner: R,
+    bytes: Arc<AtomicU64>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        self.bytes.fetch_add(count as u64, Ordering::Relaxed);
+        Ok(count)
+    }
 }
 
 impl SupervisedChild {
@@ -126,6 +315,17 @@ impl SupervisedChild {
         policy: Option<ProcessPolicy>,
         input: Option<Vec<u8>>,
     ) -> Result<Self, ProcessError> {
+        let descriptor = infer_descriptor(command);
+        Self::spawn_named(command, policy, input, descriptor)
+    }
+
+    pub fn spawn_named(
+        command: &mut Command,
+        policy: Option<ProcessPolicy>,
+        input: Option<Vec<u8>>,
+        descriptor: ProcessDescriptor,
+    ) -> Result<Self, ProcessError> {
+        let mut trace = process_trace(descriptor, policy);
         command.stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -138,10 +338,25 @@ impl SupervisedChild {
         }
 
         let started = Instant::now();
-        let mut child = command.spawn().map_err(ProcessError::Spawn)?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                trace.finish(
+                    ExternalCallOutcome::SpawnFailed,
+                    process_error_fields(ProcessErrorKind::Spawn),
+                );
+                return Err(ProcessError::Spawn(error));
+            }
+        };
+        let stdout_counted = child.stdout.is_some();
+        let stderr_counted = child.stderr.is_some();
         let stdin_writer = if let Some(bytes) = input {
             let Some(mut stdin) = child.stdin.take() else {
                 let _ = terminate_active_child(&mut child, Duration::from_secs(1));
+                trace.finish(
+                    ExternalCallOutcome::Failed,
+                    process_error_fields(ProcessErrorKind::MissingPipe),
+                );
                 return Err(ProcessError::MissingPipe("stdin"));
             };
             Some(std::thread::spawn(move || stdin.write_all(&bytes)))
@@ -158,6 +373,13 @@ impl SupervisedChild {
                 .map(|settings| settings.termination_grace)
                 .unwrap_or(Duration::from_secs(1)),
             terminate_on_drop: policy.is_some(),
+            trace: Some(trace),
+            observed_status: None,
+            pending_completion: None,
+            stdout_bytes: Arc::new(AtomicU64::new(0)),
+            stderr_bytes: Arc::new(AtomicU64::new(0)),
+            stdout_counted,
+            stderr_counted,
         })
     }
 
@@ -174,11 +396,114 @@ impl SupervisedChild {
         join_stdin(self.stdin_writer.take())
     }
 
+    pub fn take_stdout(&mut self) -> Option<CountingReader<std::process::ChildStdout>> {
+        self.child.stdout.take().map(|inner| CountingReader {
+            inner,
+            bytes: Arc::clone(&self.stdout_bytes),
+        })
+    }
+
+    pub fn take_stderr(&mut self) -> Option<CountingReader<std::process::ChildStderr>> {
+        self.child.stderr.take().map(|inner| CountingReader {
+            inner,
+            bytes: Arc::clone(&self.stderr_bytes),
+        })
+    }
+
     pub fn terminate(&mut self) -> Result<TerminationStage, ProcessError> {
         let termination = terminate_active_child(&mut self.child, self.termination_grace);
         // Closing the process group releases a writer blocked on a full stdin pipe.
         let _ = self.finish_stdin();
-        termination
+        match termination {
+            Ok(stage) => {
+                let completion = if self.deadline_exceeded() {
+                    ProcessCompletion::DeadlineExceeded
+                } else {
+                    ProcessCompletion::Canceled
+                };
+                let status = self.child.try_wait().ok().flatten();
+                self.observed_status = status;
+                self.pending_completion = Some((completion, stage));
+                Ok(stage)
+            }
+            Err(error) => {
+                self.finish_trace_error(error.kind());
+                Err(error)
+            }
+        }
+    }
+
+    pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        let status = self.child.try_wait();
+        match status {
+            Ok(Some(status)) => {
+                self.observed_status = Some(status);
+                self.pending_completion =
+                    Some((completion_from_status(status), TerminationStage::None));
+                Ok(Some(status))
+            }
+            Ok(None) => Ok(None),
+            Err(error) => {
+                self.finish_trace_error(ProcessErrorKind::Wait);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn wait(&mut self) -> io::Result<ExitStatus> {
+        let status = self.child.wait();
+        match status {
+            Ok(status) => {
+                self.observed_status = Some(status);
+                self.pending_completion =
+                    Some((completion_from_status(status), TerminationStage::None));
+                Ok(status)
+            }
+            Err(error) => {
+                self.finish_trace_error(ProcessErrorKind::Wait);
+                Err(error)
+            }
+        }
+    }
+
+    fn finish_trace(
+        &mut self,
+        status: Option<ExitStatus>,
+        completion: ProcessCompletion,
+        termination_stage: TerminationStage,
+    ) {
+        let Some(trace) = self.trace.as_mut() else {
+            return;
+        };
+        let outcome = process_outcome(status, completion);
+        let mut fields = vec![
+            flight_recorder::text("completion", completion.label()),
+            flight_recorder::text("termination_stage", termination_stage.label()),
+        ];
+        if let Some(status) = status {
+            append_status_fields(&mut fields, status);
+        }
+        if self.stdout_counted {
+            fields.push(flight_recorder::unsigned(
+                "stdout_bytes",
+                self.stdout_bytes.load(Ordering::Relaxed),
+            ));
+            fields.push(flight_recorder::boolean("stdout_truncated", false));
+        }
+        if self.stderr_counted {
+            fields.push(flight_recorder::unsigned(
+                "stderr_bytes",
+                self.stderr_bytes.load(Ordering::Relaxed),
+            ));
+            fields.push(flight_recorder::boolean("stderr_truncated", false));
+        }
+        trace.finish(outcome, fields);
+    }
+
+    fn finish_trace_error(&mut self, kind: ProcessErrorKind) {
+        if let Some(trace) = self.trace.as_mut() {
+            trace.finish(ExternalCallOutcome::Failed, process_error_fields(kind));
+        }
     }
 }
 
@@ -198,7 +523,12 @@ impl DerefMut for SupervisedChild {
 
 impl Drop for SupervisedChild {
     fn drop(&mut self) {
-        let child_running = !matches!(self.child.try_wait(), Ok(Some(_)));
+        let status = if let Some(status) = self.observed_status {
+            Ok(Some(status))
+        } else {
+            self.child.try_wait()
+        };
+        let child_running = !matches!(status, Ok(Some(_)));
         if child_running
             && (self.terminate_on_drop
                 || self
@@ -206,7 +536,17 @@ impl Drop for SupervisedChild {
                     .as_ref()
                     .is_some_and(|writer| !writer.is_finished()))
         {
-            let _ = terminate_active_child(&mut self.child, self.termination_grace);
+            match terminate_active_child(&mut self.child, self.termination_grace) {
+                Ok(stage) => self.finish_trace(None, ProcessCompletion::Canceled, stage),
+                Err(error) => self.finish_trace_error(error.kind()),
+            }
+        } else if let Ok(Some(status)) = status {
+            let (completion, stage) = self
+                .pending_completion
+                .unwrap_or((completion_from_status(status), TerminationStage::None));
+            self.finish_trace(Some(status), completion, stage);
+        } else if status.is_err() {
+            self.finish_trace_error(ProcessErrorKind::Wait);
         }
         let _ = self.finish_stdin();
     }
@@ -391,10 +731,25 @@ impl Error for ProcessError {
     }
 }
 
+#[allow(dead_code)]
 pub fn spawn_detached(
     command: &mut Command,
     policy: DetachedProcessPolicy,
 ) -> Result<u32, ProcessError> {
+    let descriptor = infer_descriptor(command);
+    spawn_detached_named(command, policy, descriptor)
+}
+
+pub fn spawn_detached_named(
+    command: &mut Command,
+    policy: DetachedProcessPolicy,
+    descriptor: ProcessDescriptor,
+) -> Result<u32, ProcessError> {
+    let mut trace = ExternalCallTrace::begin(
+        ExternalCallCategory::Process,
+        descriptor.name,
+        vec![flight_recorder::text("policy", "detached")],
+    );
     match policy {
         DetachedProcessPolicy::WorkerDaemon => {
             command
@@ -416,7 +771,16 @@ pub fn spawn_detached(
         }
     }
 
-    let child = command.spawn().map_err(ProcessError::Spawn)?;
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            trace.finish(
+                ExternalCallOutcome::SpawnFailed,
+                process_error_fields(ProcessErrorKind::Spawn),
+            );
+            return Err(ProcessError::Spawn(error));
+        }
+    };
     let child_pid = child.id();
     let child = Arc::new(Mutex::new(Some(child)));
     let reaper_child = Arc::clone(&child);
@@ -433,17 +797,34 @@ pub fn spawn_detached(
         if let Some(mut child) = child.lock().ok().and_then(|mut child| child.take()) {
             let _ = terminate_active_child(&mut child, Duration::from_secs(1));
         }
+        trace.finish(
+            ExternalCallOutcome::Failed,
+            process_error_fields(ProcessErrorKind::ThreadSpawn),
+        );
         return Err(ProcessError::ThreadSpawn {
             thread: "detached reaper",
             source,
         });
     }
+    trace.finish(
+        ExternalCallOutcome::Success,
+        vec![flight_recorder::text("completion", "spawned")],
+    );
     Ok(child_pid)
 }
 
 pub fn run_capture(command: &mut Command, policy: ProcessPolicy) -> Result<String, String> {
+    let descriptor = infer_descriptor(command);
+    run_capture_named(command, policy, descriptor)
+}
+
+pub fn run_capture_named(
+    command: &mut Command,
+    policy: ProcessPolicy,
+    descriptor: ProcessDescriptor,
+) -> Result<String, String> {
     let command_display = observability::command_display(command);
-    let output = run_output(command, policy)?;
+    let output = run_output_named(command, policy, descriptor)?;
     if output.status.success() && !output.stdout_truncated {
         Ok(output.stdout)
     } else if output.status.success() {
@@ -460,8 +841,17 @@ pub fn run_capture(command: &mut Command, policy: ProcessPolicy) -> Result<Strin
 }
 
 pub fn run_status(command: &mut Command, policy: ProcessPolicy) -> Result<(), String> {
+    let descriptor = infer_descriptor(command);
+    run_status_named(command, policy, descriptor)
+}
+
+pub fn run_status_named(
+    command: &mut Command,
+    policy: ProcessPolicy,
+    descriptor: ProcessDescriptor,
+) -> Result<(), String> {
     let command_display = observability::command_display(command);
-    let output = run_output(command, policy)?;
+    let output = run_output_named(command, policy, descriptor)?;
     if output.status.success() {
         Ok(())
     } else {
@@ -473,22 +863,47 @@ pub fn run_status(command: &mut Command, policy: ProcessPolicy) -> Result<(), St
 }
 
 pub fn run_output(command: &mut Command, policy: ProcessPolicy) -> Result<ProcessOutput, String> {
-    run_output_with_failure_level(command, policy, LogLevel::Error)
+    let descriptor = infer_descriptor(command);
+    run_output_named(command, policy, descriptor)
+}
+
+pub fn run_output_named(
+    command: &mut Command,
+    policy: ProcessPolicy,
+    descriptor: ProcessDescriptor,
+) -> Result<ProcessOutput, String> {
+    run_output_with_failure_level(command, policy, LogLevel::Error, descriptor)
 }
 
 pub fn run_output_allow_failure(
     command: &mut Command,
     policy: ProcessPolicy,
 ) -> Result<ProcessOutput, String> {
-    run_output_with_failure_level(command, policy, LogLevel::Debug)
+    let descriptor = infer_descriptor(command);
+    run_output_allow_failure_named(command, policy, descriptor)
+}
+
+pub fn run_output_allow_failure_named(
+    command: &mut Command,
+    policy: ProcessPolicy,
+    descriptor: ProcessDescriptor,
+) -> Result<ProcessOutput, String> {
+    run_output_with_failure_level(command, policy, LogLevel::Debug, descriptor)
 }
 
 fn run_output_with_failure_level(
     command: &mut Command,
     policy: ProcessPolicy,
     failure_level: LogLevel,
+    descriptor: ProcessDescriptor,
 ) -> Result<ProcessOutput, String> {
-    run_output_with_settings(command, policy, failure_level, ProcessInput::Null)
+    run_output_with_settings(
+        command,
+        policy,
+        failure_level,
+        ProcessInput::Null,
+        descriptor,
+    )
 }
 
 fn run_output_with_settings(
@@ -496,8 +911,10 @@ fn run_output_with_settings(
     policy: ProcessPolicy,
     failure_level: LogLevel,
     input: ProcessInput<'_>,
+    descriptor: ProcessDescriptor,
 ) -> Result<ProcessOutput, String> {
     let settings = policy.settings();
+    let mut trace = process_trace(descriptor, Some(policy));
     let include_argv = observability::enabled(LogLevel::Trace);
     let command_display = observability::command_display(command);
     let operation = observability::begin_operation(
@@ -515,6 +932,12 @@ fn run_output_with_settings(
     let started = Instant::now();
     let canceled = current_cancellation();
     let outcome = supervise(command, policy, input, canceled.as_deref()).map_err(|error| {
+        let trace_outcome = if error.kind() == ProcessErrorKind::Spawn {
+            ExternalCallOutcome::SpawnFailed
+        } else {
+            ExternalCallOutcome::Failed
+        };
+        trace.finish(trace_outcome, process_error_fields(error.kind()));
         let elapsed_ms = started.elapsed().as_millis() as i64;
         operation.finish(
             LogLevel::Error,
@@ -549,6 +972,17 @@ fn run_output_with_settings(
         stderr_total_bytes: outcome.stderr.total_bytes,
         stderr_truncated: outcome.stderr.truncated,
     };
+    let trace_outcome = process_outcome(Some(status), outcome.completion);
+    let mut trace_fields = vec![
+        flight_recorder::text("completion", outcome.completion.label()),
+        flight_recorder::text("termination_stage", outcome.termination_stage.label()),
+        flight_recorder::unsigned("stdout_bytes", process_output.stdout_total_bytes),
+        flight_recorder::unsigned("stderr_bytes", process_output.stderr_total_bytes),
+        flight_recorder::boolean("stdout_truncated", process_output.stdout_truncated),
+        flight_recorder::boolean("stderr_truncated", process_output.stderr_truncated),
+    ];
+    append_status_fields(&mut trace_fields, status);
+    trace.finish(trace_outcome, trace_fields);
     let deadline_error = (outcome.completion == ProcessCompletion::DeadlineExceeded).then(|| {
         format!(
             "subprocess timed out after {} ms",
@@ -607,10 +1041,21 @@ fn run_output_with_settings(
     }
 }
 
+#[allow(dead_code)]
 pub fn run_status_with_stdin(
     command: &mut Command,
     stdin: &str,
     policy: ProcessPolicy,
+) -> Result<(), String> {
+    let descriptor = infer_descriptor(command);
+    run_status_with_stdin_named(command, stdin, policy, descriptor)
+}
+
+pub fn run_status_with_stdin_named(
+    command: &mut Command,
+    stdin: &str,
+    policy: ProcessPolicy,
+    descriptor: ProcessDescriptor,
 ) -> Result<(), String> {
     let command_display = observability::command_display(command);
     let output = run_output_with_settings(
@@ -618,6 +1063,7 @@ pub fn run_status_with_stdin(
         policy,
         LogLevel::Error,
         ProcessInput::Bytes(stdin.as_bytes()),
+        descriptor,
     )?;
     output
         .status
@@ -1110,6 +1556,7 @@ struct InteractiveProcessOutput {
     status: ExitStatus,
     stdout: Option<CapturedTail>,
     canceled: bool,
+    termination_stage: TerminationStage,
 }
 
 enum InteractiveIo<'a> {
@@ -1120,8 +1567,16 @@ enum InteractiveIo<'a> {
 // This is the explicit interactive exception: normal execution is unbounded, while
 // signal cancellation still terminates the child group and reaps its leader.
 pub fn run_status_inherited(command: &mut Command) -> Result<(), String> {
+    let descriptor = infer_descriptor(command);
+    run_status_inherited_named(command, descriptor)
+}
+
+pub fn run_status_inherited_named(
+    command: &mut Command,
+    descriptor: ProcessDescriptor,
+) -> Result<(), String> {
     let command_display = observability::command_display(command);
-    let output = run_interactive(command, InteractiveIo::Inherited)?;
+    let output = run_interactive(command, InteractiveIo::Inherited, descriptor)?;
     if output.canceled {
         return Err(format!(
             "{command_display}: interactive subprocess canceled"
@@ -1139,8 +1594,22 @@ pub fn run_capture_interactive(
     input: &[u8],
     max_bytes: usize,
 ) -> Result<String, String> {
+    let descriptor = infer_descriptor(command);
+    run_capture_interactive_named(command, input, max_bytes, descriptor)
+}
+
+pub fn run_capture_interactive_named(
+    command: &mut Command,
+    input: &[u8],
+    max_bytes: usize,
+    descriptor: ProcessDescriptor,
+) -> Result<String, String> {
     let command_display = observability::command_display(command);
-    let output = run_interactive(command, InteractiveIo::CaptureStdout { input, max_bytes })?;
+    let output = run_interactive(
+        command,
+        InteractiveIo::CaptureStdout { input, max_bytes },
+        descriptor,
+    )?;
     if output.canceled {
         return Err(format!(
             "{command_display}: interactive subprocess canceled"
@@ -1162,6 +1631,54 @@ pub fn run_capture_interactive(
 fn run_interactive(
     command: &mut Command,
     io_mode: InteractiveIo<'_>,
+    descriptor: ProcessDescriptor,
+) -> Result<InteractiveProcessOutput, String> {
+    let mut trace = ExternalCallTrace::begin(
+        ExternalCallCategory::Process,
+        descriptor.name,
+        vec![flight_recorder::text("policy", "interactive")],
+    );
+    let result = run_interactive_inner(command, io_mode, &mut trace);
+    match &result {
+        Ok(output) => {
+            let completion = if output.canceled {
+                ProcessCompletion::Canceled
+            } else {
+                completion_from_status(output.status)
+            };
+            let mut fields = vec![
+                flight_recorder::text("completion", completion.label()),
+                flight_recorder::text("termination_stage", output.termination_stage.label()),
+            ];
+            append_status_fields(&mut fields, output.status);
+            if let Some(stdout) = output.stdout.as_ref() {
+                fields.push(flight_recorder::unsigned(
+                    "stdout_bytes",
+                    stdout.total_bytes,
+                ));
+                fields.push(flight_recorder::boolean(
+                    "stdout_truncated",
+                    stdout.truncated,
+                ));
+            }
+            trace.finish(process_outcome(Some(output.status), completion), fields);
+        }
+        Err(_) => trace.finish(
+            ExternalCallOutcome::Failed,
+            vec![
+                flight_recorder::text("completion", "supervision_error"),
+                flight_recorder::text("error_kind", "interactive"),
+                flight_recorder::text("termination_stage", "none"),
+            ],
+        ),
+    }
+    result
+}
+
+fn run_interactive_inner(
+    command: &mut Command,
+    io_mode: InteractiveIo<'_>,
+    trace: &mut ExternalCallTrace,
 ) -> Result<InteractiveProcessOutput, String> {
     let include_argv = observability::enabled(LogLevel::Trace);
     let command_display = observability::command_display(command);
@@ -1211,6 +1728,10 @@ fn run_interactive(
         command.process_group(0);
     }
     let mut child = command.spawn().map_err(|error| {
+        trace.finish(
+            ExternalCallOutcome::SpawnFailed,
+            process_error_fields(ProcessErrorKind::Spawn),
+        );
         let elapsed_ms = started.elapsed().as_millis() as i64;
         operation.finish(
             LogLevel::Error,
@@ -1325,6 +1846,7 @@ fn run_interactive(
             status,
             stdout,
             canceled: false,
+            termination_stage,
         })
     } else {
         let message = if was_canceled {
@@ -1349,6 +1871,7 @@ fn run_interactive(
             status,
             stdout,
             canceled: was_canceled,
+            termination_stage,
         })
     }
 }
@@ -1607,6 +2130,46 @@ pub fn run_configured_commands(commands: &[String], cwd: &Path, label: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_descriptors_use_only_finite_known_command_labels() {
+        assert_eq!(
+            infer_descriptor(
+                Command::new("git")
+                    .arg("-C")
+                    .arg("/secret/repo")
+                    .args(["fetch", "origin"])
+            ),
+            ProcessDescriptor::new("git.fetch")
+        );
+        assert_eq!(
+            infer_descriptor(Command::new("gh").args(["api", "graphql", "-f", "query=secret"])),
+            ProcessDescriptor::new("gh.api.graphql")
+        );
+        assert_eq!(
+            infer_descriptor(Command::new("/tmp/custom-tool").args(["fetch", "secret"])),
+            ProcessDescriptor::new("process.other")
+        );
+        assert_eq!(
+            ProcessDescriptor::for_tmux(Command::new("/tmp/custom-tmux").args([
+                "display-message",
+                "-p",
+                "#{pane_start_command}"
+            ])),
+            ProcessDescriptor::new("tmux.pane.start_command")
+        );
+    }
+
+    #[test]
+    fn explicit_descriptor_attributes_a_configured_executable_logically() {
+        let mut command = Command::new("/tmp/company-github-wrapper");
+        command.args(["pr", "view", "42"]);
+        let inferred = infer_descriptor(&command);
+        let configured = ProcessDescriptor::new("gh.pr.view");
+
+        assert_eq!(inferred, ProcessDescriptor::new("process.other"));
+        assert_eq!(configured.name, "gh.pr.view");
+    }
 
     #[test]
     fn split_command_words_handles_quotes() {

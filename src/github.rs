@@ -9,7 +9,10 @@ use crate::config::Config;
 use crate::config::MergeMethod;
 use crate::git::current_head_sha;
 use crate::observability;
-use crate::process::{ProcessPolicy, run_capture, run_output_allow_failure};
+use crate::process::{
+    ProcessDescriptor, ProcessPolicy, run_capture, run_capture_named, run_output_allow_failure,
+    run_output_allow_failure_named,
+};
 use crate::repo::Repository;
 use crate::session::Session;
 use crate::util::{strip_ansi, timestamp_label};
@@ -311,10 +314,6 @@ impl PrCache {
             .is_some_and(|summary| summary.number == number)
     }
 
-    fn pollable(&self, eligibility: PrCacheEligibility) -> bool {
-        eligibility.can_observe() && !self.summary.as_ref().is_some_and(|summary| summary.merged)
-    }
-
     pub(crate) fn details_observation_quality(&self) -> PrObservationQuality {
         self.details_quality
     }
@@ -390,30 +389,32 @@ impl PrCache {
         }
     }
 
-    pub(crate) fn eligible_for_worktree(
-        branch: &str,
-        path: &std::path::Path,
-        config: &Config,
-        hidden: bool,
-    ) -> bool {
-        !hidden && PrCacheEligibility::for_worktree(branch, path, config).can_observe()
-    }
-
     pub(crate) fn structurally_eligible(branch: &str, config: &Config, hidden: bool) -> bool {
         !hidden && branch != "(detached)" && !config.is_default_branch(branch)
     }
 
-    pub(crate) fn enforce_eligibility(
+    pub(crate) fn enforce_structural_eligibility(
         &mut self,
         repo: &Repository,
         branch: &str,
-        path: &std::path::Path,
         config: &Config,
         hidden: bool,
     ) -> bool {
-        if Self::eligible_for_worktree(branch, path, config, hidden) {
+        if Self::structurally_eligible(branch, config, hidden) {
             return false;
         }
+        self.clear_if_present(repo, branch)
+    }
+
+    pub(crate) fn clear_for_missing_github_remote(
+        &mut self,
+        repo: &Repository,
+        branch: &str,
+    ) -> bool {
+        self.clear_if_present(repo, branch)
+    }
+
+    fn clear_if_present(&mut self, repo: &Repository, branch: &str) -> bool {
         let changed = self.summary.is_some()
             || self.details.is_some()
             || self.error.is_some()
@@ -457,10 +458,6 @@ impl PrCacheEligibility {
             is_detached: branch == "(detached)",
             has_github_remote: github_remote_configured(path, config),
         }
-    }
-
-    fn for_session(session: &Session, config: &Config) -> Self {
-        Self::for_worktree(&session.branch, &session.path, config)
     }
 
     fn for_successful_index(session: &Session, config: &Config) -> Self {
@@ -1147,7 +1144,7 @@ pub(crate) fn create_pull_request(
     target_repo: Option<&str>,
     cache: &mut PrCache,
 ) -> Result<(), String> {
-    run_capture(
+    run_capture_named(
         Command::new(config.tool("gh"))
             .args(create_pr_args(
                 config.default_base.as_deref(),
@@ -1156,6 +1153,7 @@ pub(crate) fn create_pull_request(
             ))
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.pr.create"),
     )?;
     refresh_pr_cache(repo, branch, cache, path, config, true)
 }
@@ -1166,7 +1164,7 @@ pub(crate) fn merge_pull_request(
     pr_number: u64,
     expected_head_sha: &str,
 ) -> Result<(), String> {
-    run_capture(
+    run_capture_named(
         Command::new(config.tool("gh"))
             .args(merge_pr_args(
                 &pr_number.to_string(),
@@ -1175,6 +1173,7 @@ pub(crate) fn merge_pull_request(
             ))
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.pr.merge"),
     )?;
     Ok(())
 }
@@ -1218,7 +1217,7 @@ fn fetch_pr_merged_status(
     pr_number: u64,
     config: &Config,
 ) -> Result<bool, String> {
-    let output = run_output_allow_failure(
+    let output = run_output_allow_failure_named(
         Command::new(config.tool("gh"))
             .arg("pr")
             .arg("view")
@@ -1227,6 +1226,7 @@ fn fetch_pr_merged_status(
             .arg("state,mergedAt")
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.pr.view"),
     )?;
     if !output.status.success() {
         let stderr = output.stderr.trim().to_string();
@@ -1477,9 +1477,12 @@ pub fn pr_details_due(cache: &PrCache) -> bool {
 }
 
 pub(crate) fn pr_cache_pollable_for_session(session: &Session, config: &Config) -> bool {
-    session
-        .pr
-        .pollable(PrCacheEligibility::for_session(session, config))
+    PrCache::structurally_eligible(&session.branch, config, session.hidden)
+        && !session
+            .pr
+            .summary
+            .as_ref()
+            .is_some_and(|summary| summary.merged)
 }
 
 pub(crate) fn clear_pr_cache(repo: &Repository, branch: &str, cache: &mut PrCache) {
@@ -1630,7 +1633,7 @@ pub fn fetch_pr_summary_index(
     config: &Config,
 ) -> Result<Vec<PrSummary>, String> {
     let (owner, name) = github_owner_repo(path, config)?;
-    let raw = run_capture(
+    let raw = run_capture_named(
         Command::new(config.tool("gh"))
             .arg("api")
             .arg("graphql")
@@ -1642,6 +1645,7 @@ pub fn fetch_pr_summary_index(
             .arg(format!("query={PR_SUMMARY_INDEX_QUERY}"))
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.api.graphql"),
     )?;
     try_parse_pr_summary_index(&raw)
 }
@@ -1673,11 +1677,12 @@ pub(crate) fn resolve_review_thread(
     config: &Config,
     thread_id: &str,
 ) -> Result<(), String> {
-    let raw = run_capture(
+    let raw = run_capture_named(
         Command::new(config.tool("gh"))
             .args(resolve_review_thread_args(thread_id))
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.api.graphql"),
     )?;
     let value = serde_json::from_str::<serde_json::Value>(&raw)
         .map_err(|error| format!("parse review thread resolution: {error}"))?;
@@ -1758,7 +1763,7 @@ pub(crate) fn load_repo_policy_cache(
 
 fn fetch_repo_policy(path: &std::path::Path, config: &Config) -> Result<RepoPolicyCache, String> {
     let (owner, name) = github_owner_repo(path, config)?;
-    let raw = run_capture(
+    let raw = run_capture_named(
         Command::new(config.tool("gh"))
             .arg("api")
             .arg("graphql")
@@ -1770,6 +1775,7 @@ fn fetch_repo_policy(path: &std::path::Path, config: &Config) -> Result<RepoPoli
             .arg(format!("query={REPO_POLICY_QUERY}"))
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.api.graphql"),
     )?;
     parse_repo_policy(&format!("{owner}/{name}"), &raw).ok_or_else(|| {
         "GitHub repository policy response did not include repository data".to_string()
@@ -2038,7 +2044,7 @@ fn fetch_pr_summary(
         "isDraft",
     ]
     .join(",");
-    let output = run_output_allow_failure(
+    let output = run_output_allow_failure_named(
         Command::new(config.tool("gh"))
             .arg("pr")
             .arg("view")
@@ -2047,6 +2053,7 @@ fn fetch_pr_summary(
             .arg(fields)
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.pr.view"),
     )?;
     if !output.status.success() {
         let stderr = output.stderr.trim().to_string();
@@ -2079,7 +2086,7 @@ fn fetch_pr_details(
     config: &Config,
 ) -> Result<PrDetailsObservation, String> {
     let fields = ["comments", "reviews", "files", "statusCheckRollup"].join(",");
-    let raw = run_capture(
+    let raw = run_capture_named(
         Command::new(config.tool("gh"))
             .arg("pr")
             .arg("view")
@@ -2088,6 +2095,7 @@ fn fetch_pr_details(
             .arg(fields)
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.pr.view"),
     )?;
     let details = try_parse_pr_details(&raw)?;
     let review_comments = fetch_inline_review_comments(path, pr_number, config);
@@ -2156,7 +2164,7 @@ fn fetch_ci_failures(
     head_sha: &str,
     config: &Config,
 ) -> Result<Vec<CiFailure>, String> {
-    let output = run_output_allow_failure(
+    let output = run_output_allow_failure_named(
         Command::new(config.tool("gh"))
             .arg("run")
             .arg("list")
@@ -2170,6 +2178,7 @@ fn fetch_ci_failures(
             .arg("databaseId,workflowName,displayTitle,name,conclusion,status,headSha,url")
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.run.list"),
     )?;
     if !output.status.success() {
         let message = output.stderr.trim();
@@ -2214,7 +2223,7 @@ fn fetch_failed_run_log_tail(
     if run_id == "0" {
         return Ok(String::new());
     }
-    let output = run_output_allow_failure(
+    let output = run_output_allow_failure_named(
         Command::new(config.tool("gh"))
             .arg("run")
             .arg("view")
@@ -2222,6 +2231,7 @@ fn fetch_failed_run_log_tail(
             .arg("--log-failed")
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.run.view"),
     )?;
     if !output.status.success() {
         let message = output.stderr.trim();
@@ -2253,7 +2263,7 @@ fn fetch_inline_review_comments(
     config: &Config,
 ) -> Result<Vec<PrReviewComment>, String> {
     let (owner, name) = github_owner_repo(path, config)?;
-    let raw = run_capture(
+    let raw = run_capture_named(
         Command::new(config.tool("gh"))
             .arg("api")
             .arg("graphql")
@@ -2269,6 +2279,7 @@ fn fetch_inline_review_comments(
             .arg("--slurp")
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.api.graphql"),
     )?;
     try_parse_review_thread_comments(&raw)
 }
@@ -4083,11 +4094,7 @@ exit 0
             }
             .can_observe()
         );
-        assert!(!merged.pr.pollable(PrCacheEligibility {
-            is_default_branch: false,
-            is_detached: false,
-            has_github_remote: true,
-        }));
+        assert!(!pr_cache_pollable_for_session(&merged, &test_config()));
     }
 
     #[test]

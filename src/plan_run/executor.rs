@@ -570,12 +570,10 @@ pub(super) fn collect_child_output(
     output: &mut dyn Write,
 ) -> Result<i32, String> {
     let stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| "open harness stdout".to_string())?;
     let stderr = child
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| "open harness stderr".to_string())?;
     let (tx, rx) = mpsc::sync_channel::<Result<ChildLine, String>>(
         crate::harness::WORKFLOW_OUTPUT_CHANNEL_CAPACITY,
@@ -726,12 +724,10 @@ pub(super) fn spawn_parallel_child(
     tx: mpsc::SyncSender<Result<ParallelChildEvent, String>>,
 ) -> Result<(), String> {
     let stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| "open harness stdout".to_string())?;
     let stderr = child
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| "open harness stderr".to_string())?;
     let stdout_reader = spawn_parallel_reader(step_index, StreamKind::Stdout, stdout, tx.clone());
     let stderr_reader = spawn_parallel_reader(step_index, StreamKind::Stderr, stderr, tx.clone());

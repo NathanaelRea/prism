@@ -13,7 +13,7 @@ use crate::file_persistence::{self, BoxError, FileContents, UpdateOptions};
 use crate::harness::{
     BUILTIN_HARNESS_IDS, Harness, HarnessConfig, OutputFormat, PromptTransport, builtin_adapter,
 };
-use crate::process::{ProcessPolicy, command_exists, command_version, run_capture};
+use crate::process::{ProcessPolicy, command_exists, command_version};
 use crate::repo::Repository;
 use crate::session::discover_sessions;
 use crate::util::prism_config_dir;
@@ -1325,9 +1325,10 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     println!();
 
     println!();
-    match run_capture(
+    match crate::process::run_capture_named(
         Command::new(config.tool("gh")).arg("auth").arg("status"),
         ProcessPolicy::NetworkQuery,
+        crate::process::ProcessDescriptor::new("gh.auth.status"),
     ) {
         Ok(_) => println!("gh auth: ok"),
         Err(error) => println!("gh auth: {error}"),

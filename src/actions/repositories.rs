@@ -579,6 +579,9 @@ impl Tui {
             repos.push(managed);
         }
         self.repos = repos;
+        crate::flight_recorder::register_repositories(
+            self.repos.iter().map(|managed| &managed.repo),
+        );
         self.current_repo = self.current_repo.min(self.repos.len().saturating_sub(1));
         self.selected_repo_root = self
             .repos
