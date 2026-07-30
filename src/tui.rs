@@ -4493,8 +4493,8 @@ impl Tui {
                 choices: vec![
                     view::KeyChoice::new("a", "auto flow"),
                     self.git_choice(GitAction::LazyGit, "g", "lazygit"),
-                    self.git_choice(GitAction::OpenPr, "o", "open PR"),
                     self.git_choice(GitAction::Push, "P", "push/create PR"),
+                    self.git_choice(GitAction::OpenPr, "o", "open PR"),
                     self.git_choice(GitAction::Merge, "M", "merge"),
                     self.git_choice(GitAction::CiFix, "c", "CI repair"),
                     self.git_choice(GitAction::ReviewFix, "f", "review repair"),
