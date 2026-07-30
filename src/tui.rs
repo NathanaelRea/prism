@@ -3032,10 +3032,15 @@ impl Tui {
         if self.focused_panel != PanelFocus::Worktrees || self.worktree_list_mode == mode {
             return;
         }
+        let selected = self.selected_worktree_index();
         self.worktree_list_mode = mode;
         self.persist_worktree_list_mode();
         if mode == WorktreeListMode::Repo {
-            self.restore_selected_worktree_for_repo();
+            if let Some(index) = selected {
+                self.select_worktree(index);
+            } else {
+                self.restore_selected_worktree_for_repo();
+            }
         }
     }
 
@@ -5864,6 +5869,21 @@ esac
 
         assert_eq!(tui.worktree_list_mode, WorktreeListMode::Repo);
         assert_eq!(tui.visible_session_indices(), vec![1]);
+    }
+
+    #[test]
+    fn switching_from_global_to_repo_mode_preserves_selected_worktree() {
+        let mut tui = test_tui();
+        tui.worktree_list_mode = WorktreeListMode::Global;
+        tui.focus_worktrees();
+        tui.select_worktree(1);
+        tui.select_repo(1);
+        tui.sessions[3].hidden = true;
+
+        tui.switch_worktree_list_mode(WorktreeListMode::Repo);
+
+        assert_eq!(tui.current_repo, 0);
+        assert_eq!(tui.selected_worktree_index(), Some(1));
     }
 
     #[test]
