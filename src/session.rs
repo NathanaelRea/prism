@@ -312,8 +312,14 @@ fn create_or_checkout_worktree_session(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DeleteWorktreeOutcome {
     Deleted,
-    BranchRetained { error: String },
-    DeletedWithWarnings { errors: Vec<String> },
+    BranchRetained {
+        error: String,
+        owned_state_removed: bool,
+    },
+    DeletedWithWarnings {
+        errors: Vec<String>,
+        owned_state_removed: bool,
+    },
 }
 
 pub(crate) fn delete_worktree_session_if_current(
@@ -358,6 +364,7 @@ pub(crate) fn delete_worktree_session_if_current(
     {
         return Ok(DeleteWorktreeOutcome::BranchRetained {
             error: format!("branch {branch} is attached to a new worktree and was retained"),
+            owned_state_removed: false,
         });
     }
     if let Some(expected_oid) = branch_incarnation.as_deref() {
@@ -368,6 +375,7 @@ pub(crate) fn delete_worktree_session_if_current(
                     error: format!(
                         "branch {branch} changed while deletion was in progress; retained its Prism state"
                     ),
+                    owned_state_removed: false,
                 });
             }
             Err(error) => {
@@ -375,6 +383,7 @@ pub(crate) fn delete_worktree_session_if_current(
                     error: format!(
                         "could not verify branch {branch} after worktree removal; retained its Prism state: {error}"
                     ),
+                    owned_state_removed: false,
                 });
             }
         }
@@ -398,14 +407,20 @@ pub(crate) fn delete_worktree_session_if_current(
         branch_incarnation.as_deref(),
     ) {
         if errors.is_empty() {
-            return Ok(DeleteWorktreeOutcome::BranchRetained { error });
+            return Ok(DeleteWorktreeOutcome::BranchRetained {
+                error,
+                owned_state_removed: true,
+            });
         }
         errors.push(error);
     }
     if errors.is_empty() {
         Ok(DeleteWorktreeOutcome::Deleted)
     } else {
-        Ok(DeleteWorktreeOutcome::DeletedWithWarnings { errors })
+        Ok(DeleteWorktreeOutcome::DeletedWithWarnings {
+            errors,
+            owned_state_removed: false,
+        })
     }
 }
 
@@ -1975,7 +1990,7 @@ exit 0
 
         assert!(matches!(
             outcome,
-            DeleteWorktreeOutcome::DeletedWithWarnings { ref errors } if !errors.is_empty()
+            DeleteWorktreeOutcome::DeletedWithWarnings { ref errors, .. } if !errors.is_empty()
         ));
         for table in ["task_metadata", "agent_state", "opencode_runtime"] {
             assert_eq!(

@@ -473,6 +473,7 @@ impl Tui {
                 .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
             archive_auto_run(conn, &mut run)
         })?;
+        self.invalidate_workflow_snapshots();
         self.auto_runs.remove(&run_id);
         self.active_auto_runs.retain(|_, active| active != &run_id);
         if self.selected_auto_run.as_deref() == Some(run_id.as_str()) {

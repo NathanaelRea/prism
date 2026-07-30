@@ -212,9 +212,12 @@ impl Tui {
             .background_job_snapshot();
         let managed = self.repos.get(session.repo_index)?;
         let repo = managed.repo.clone();
-        let use_ =
-            crate::agent_session::session_use(&self.repos, &mut self.tmux_generations, &session);
-        let key = use_.warmup_key;
+        let slot = crate::agent_session::AgentSessionSlot::for_repository_session(
+            &managed.identity,
+            &session,
+        );
+        let generation = self.tmux_generations.get(&slot).copied()?;
+        let key = AgentSessionWarmupKey::new(slot, generation);
         let session_key = session.identity_key(&managed.identity);
         let Some(config) = self.worktree_harness_configs.get(&session_key).cloned() else {
             return Some(Err(key));
