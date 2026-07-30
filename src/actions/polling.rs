@@ -237,21 +237,23 @@ impl Tui {
                         } else {
                             Ok(Vec::new())
                         };
-                        let observations = summaries.map(|summaries| {
-                            session_snapshots
+                        let observations = match &summaries {
+                            Ok(summaries) => Ok(session_snapshots
                                 .into_iter()
                                 .map(|(key, session)| PrSummarySessionResult {
                                     key,
                                     summary: resolve_pr_summary_for_session(
-                                        &session, &config, &summaries,
+                                        &session, &config, summaries,
                                     ),
                                 })
-                                .collect()
-                        });
+                                .collect()),
+                            Err(error) => Err(error.clone()),
+                        };
                         Ok(Some(TuiJobPayload::PrPoll(PrPollResult::Summary {
                             repository: job_repository,
                             sessions,
                             github_remote_configured,
+                            summaries,
                             observations,
                             refreshed: crate::util::timestamp_label(),
                             poll_started_at,
@@ -317,6 +319,7 @@ impl Tui {
                     repository,
                     sessions,
                     github_remote_configured,
+                    summaries,
                     observations,
                     refreshed,
                     poll_started_at,
@@ -351,7 +354,15 @@ impl Tui {
                                 persistence.push(index);
                             }
                         }
+                        if let Some(repo) = self.repos.get_mut(repo_index) {
+                            repo.pr_summaries.clear();
+                        }
                     } else {
+                        if let Ok(summaries) = summaries
+                            && let Some(repo) = self.repos.get_mut(repo_index)
+                        {
+                            repo.pr_summaries = summaries;
+                        }
                         let observations = match observations {
                             Ok(observations) => observations
                                 .into_iter()

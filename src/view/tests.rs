@@ -24,8 +24,8 @@ use crate::{
     session::Session,
     view::{
         AutoDashboard, AutoOutputViewerState, ChoiceList, DialogLine, DialogModel, FrameModel,
-        KeyChoice, PlanDashboard, PlanOutputViewerState, RepoMainView, RepoRow, StatusRow,
-        WorktreeKind, WorktreeMainView, WorktreeRow,
+        KeyChoice, PlanDashboard, PlanOutputViewerState, RepoMainView, RepoPrRow, RepoRow,
+        StatusRow, WorktreeKind, WorktreeMainView, WorktreeRow,
     },
 };
 
@@ -629,10 +629,43 @@ fn main_panel_switches_by_focus() {
     let repo_buffer = render_to_buffer(&repo_model, 120, 30);
     let worktree_buffer = render_to_buffer(&worktree_model, 120, 30);
 
-    assert_region_contains(&status_buffer, 56..120, 0..29, "Documentation");
+    assert_region_contains(&status_buffer, 56..120, 0..29, "version");
+    assert_region_contains(&status_buffer, 56..120, 0..29, "selected repo repo");
+    assert!(!region_text(&status_buffer, 56..120, 0..29).contains("Documentation"));
     assert_region_contains(&repo_buffer, 56..120, 0..29, "view github");
     assert!(!region_text(&repo_buffer, 56..120, 0..29).contains("Preview"));
     assert_region_contains(&worktree_buffer, 56..120, 0..29, "prompt implement feature");
+}
+
+#[test]
+fn repo_main_panel_lists_indexed_pr_without_worktree() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Running)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Repos, None, None);
+    let mut remote = test_pr_summary();
+    remote.number = 12345;
+    remote.title = "Remote only".to_string();
+    remote.author = "octocat".to_string();
+    remote.requested_reviewers = vec!["alice".to_string(), "backend".to_string()];
+    remote.head_ref = "contributor:remote".to_string();
+    let mut closed = remote.clone();
+    closed.number = 25;
+    closed.title = "Closed PR".to_string();
+    closed.state = "CLOSED".to_string();
+    model.repo_prs = vec![
+        RepoPrRow::from_summary("repo".to_string(), &remote, false, false),
+        RepoPrRow::from_summary("repo".to_string(), &closed, false, false),
+    ];
+
+    let buffer = render_to_string(&model, 120, 30);
+
+    assert!(buffer.contains("#12345"));
+    assert!(buffer.contains("Remote only"));
+    assert!(buffer.contains("octocat"));
+    assert!(buffer.contains("alice,backend"));
+    assert!(buffer.contains("no"));
+    assert!(!buffer.contains("#25"));
+    assert!(!buffer.contains("Closed PR"));
 }
 
 #[test]
@@ -1427,9 +1460,9 @@ fn main_panel_scrolls_wrapped_content_above_tmux_portal() {
         state: crate::view::TmuxPortalState::Loading,
     });
 
-    let unscrolled = render_to_string(&model, 120, 60);
+    let unscrolled = render_to_string(&model, 120, 18);
     model.main_scroll = 2;
-    let scrolled = render_to_string(&model, 120, 60);
+    let scrolled = render_to_string(&model, 120, 18);
 
     assert_ne!(
         unscrolled, scrolled,
@@ -1565,6 +1598,7 @@ fn test_pr_summary() -> PrSummary {
     PrSummary {
         number: 42,
         title: "Feature PR".to_string(),
+        author: "author".to_string(),
         body: String::new(),
         url: "https://example.test/pr/42".to_string(),
         state: "OPEN".to_string(),
@@ -1626,6 +1660,15 @@ fn test_model<'a>(
                 prompt_summary: session.prompt_summary.clone(),
                 classification: session.classification,
                 selected: index == 0,
+            })
+            .collect(),
+        repo_prs: sessions
+            .iter()
+            .filter_map(|session| {
+                session
+                    .pr
+                    .summary()
+                    .map(|summary| RepoPrRow::from_summary("repo".to_string(), summary, true, true))
             })
             .collect(),
         current_repo_index: 0,

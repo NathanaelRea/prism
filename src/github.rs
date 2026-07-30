@@ -496,6 +496,7 @@ enum PrCacheSummaryMutation {
 pub struct PrSummary {
     pub number: u64,
     pub title: String,
+    pub author: String,
     pub body: String,
     pub url: String,
     pub state: String,
@@ -515,8 +516,9 @@ pub struct PrSummary {
 impl PrSummary {
     pub fn signature(&self) -> String {
         format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.number,
+            self.author,
             self.state,
             self.review_decision,
             self.requested_reviewers.join(","),
@@ -699,6 +701,8 @@ struct GithubPullRequest {
     number: Option<u64>,
     #[serde(default)]
     title: String,
+    #[serde(default)]
+    author: GithubLogin,
     #[serde(default)]
     body: String,
     #[serde(default)]
@@ -969,7 +973,7 @@ pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
     let loaded = observability::with_writable_db(repo, |conn| {
         conn.query_row(
             "select
-                number, title, body, url, state, review_decision, requested_reviewers,
+                number, title, author, body, url, state, review_decision, requested_reviewers,
                 head_ref, base_ref, head_sha, updated_at, check_status, merge_state_status,
                 comment_count, merged, draft, last_refreshed, observation_error
               from pr_cache
@@ -980,23 +984,24 @@ pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
                     PrSummary {
                         number: row_u64(row, 0)?,
                         title: row.get(1)?,
-                        body: row.get(2)?,
-                        url: row.get(3)?,
-                        state: row.get(4)?,
-                        review_decision: row.get(5)?,
-                        requested_reviewers: decode_requested_reviewers(&row.get::<_, String>(6)?),
-                        head_ref: row.get(7)?,
-                        base_ref: row.get(8)?,
-                        head_sha: row.get(9)?,
-                        updated_at: row.get(10)?,
-                        check_status: row.get(11)?,
-                        merge_state_status: row.get(12)?,
-                        comment_count: row_u64(row, 13)?,
-                        merged: row.get(14)?,
-                        draft: row.get(15)?,
+                        author: row.get(2)?,
+                        body: row.get(3)?,
+                        url: row.get(4)?,
+                        state: row.get(5)?,
+                        review_decision: row.get(6)?,
+                        requested_reviewers: decode_requested_reviewers(&row.get::<_, String>(7)?),
+                        head_ref: row.get(8)?,
+                        base_ref: row.get(9)?,
+                        head_sha: row.get(10)?,
+                        updated_at: row.get(11)?,
+                        check_status: row.get(12)?,
+                        merge_state_status: row.get(13)?,
+                        comment_count: row_u64(row, 14)?,
+                        merged: row.get(15)?,
+                        draft: row.get(16)?,
                     },
-                    row.get::<_, String>(16)?,
-                    row.get::<_, Option<String>>(17)?,
+                    row.get::<_, String>(17)?,
+                    row.get::<_, Option<String>>(18)?,
                 ))
             },
         )
@@ -1837,6 +1842,9 @@ query($owner: String!, $name: String!) {
       nodes {
         number
         title
+        author {
+          login
+        }
         body
         url
         state
@@ -2025,6 +2033,7 @@ fn pr_summary_from_node(node: &GithubPullRequest) -> Option<PrSummary> {
     Some(PrSummary {
         number,
         title: node.title.clone(),
+        author: node.author.login.clone(),
         body: node.body.clone(),
         url: node.url.clone(),
         state: node.state.clone(),
@@ -2058,6 +2067,7 @@ fn fetch_pr_summary(
     let fields = [
         "number",
         "title",
+        "author",
         "body",
         "url",
         "state",
@@ -2747,6 +2757,7 @@ pub(crate) fn migrate_pr_cache_schema(conn: &rusqlite::Connection) -> Result<(),
           branch text primary key,
           number integer not null,
           title text not null,
+          author text not null default '',
           body text not null default '',
           url text not null,
           state text not null,
@@ -2801,6 +2812,13 @@ pub(crate) fn migrate_pr_cache_schema(conn: &rusqlite::Connection) -> Result<(),
             [],
         )
         .map_err(|error| format!("migrate pr_cache body column: {error}"))?;
+    }
+    if !table_has_column(conn, "pr_cache", "author")? {
+        conn.execute(
+            "alter table pr_cache add column author text not null default ''",
+            [],
+        )
+        .map_err(|error| format!("migrate pr_cache author column: {error}"))?;
     }
     if !table_has_column(conn, "pr_cache", "comment_count")? {
         conn.execute(
@@ -3064,14 +3082,15 @@ pub fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result
     observability::with_writable_db(repo, |conn| {
         conn.execute(
             "insert into pr_cache (
-                branch, number, title, body, url, state, review_decision, requested_reviewers,
+                branch, number, title, author, body, url, state, review_decision, requested_reviewers,
                 head_ref, base_ref, head_sha, updated_at, check_status, merge_state_status,
                 comment_count, merged, draft, last_refreshed, refreshed_unix_ms,
                 observation_error
-             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
               on conflict(branch) do update set
                 number = excluded.number,
                 title = excluded.title,
+                author = excluded.author,
                 body = excluded.body,
                 url = excluded.url,
                 state = excluded.state,
@@ -3093,6 +3112,7 @@ pub fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result
                 branch,
                 number,
                 summary.title.as_str(),
+                summary.author.as_str(),
                 summary.body.as_str(),
                 summary.url.as_str(),
                 summary.state.as_str(),
@@ -3636,6 +3656,7 @@ exit 0
         let summary = PrSummary {
             number: 42,
             title: "Fix review".to_string(),
+            author: "author".to_string(),
             body: "Body with \"quotes\"".to_string(),
             url: "https://github.com/example/repo/pull/42".to_string(),
             state: "OPEN".to_string(),
@@ -4443,6 +4464,7 @@ exit 0
                   {
                     "number": 9,
                     "title": "Batch polling",
+                    "author": {"login": "octocat"},
                     "body": "summary",
                     "url": "https://github.com/example/repo/pull/9",
                     "state": "OPEN",
@@ -4492,6 +4514,7 @@ exit 0
 
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].number, 9);
+        assert_eq!(summaries[0].author, "octocat");
         assert_eq!(summaries[0].head_ref, "feature");
         assert_eq!(summaries[0].review_decision, "UNKNOWN");
         assert_eq!(summaries[0].requested_reviewers, vec!["alice", "backend"]);
@@ -4831,6 +4854,7 @@ JSON
         PrSummary {
             number: 42,
             title: "Fix review".to_string(),
+            author: "author".to_string(),
             body: "Body".to_string(),
             url: "https://github.com/example/repo/pull/42".to_string(),
             state: "OPEN".to_string(),

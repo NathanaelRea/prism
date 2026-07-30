@@ -2694,6 +2694,7 @@ fn seed_pr_cache(repo: &Repository, branch: &str, head_sha: &str) {
         crate::github::PrSummary {
             number: 42,
             title: "Auto".to_string(),
+            author: "author".to_string(),
             body: String::new(),
             url: "https://example.com/pr/42".to_string(),
             state: "OPEN".to_string(),
@@ -2753,6 +2754,7 @@ fn test_pr_summary(branch: &str, head_sha: &str, updated_at: &str) -> crate::git
     crate::github::PrSummary {
         number: 42,
         title: "Auto".to_string(),
+        author: "author".to_string(),
         body: String::new(),
         url: "https://example.com/pr/42".to_string(),
         state: "OPEN".to_string(),

@@ -276,6 +276,7 @@ esac
         PrSummary {
             number: 42,
             title: "Stale review".to_string(),
+            author: "author".to_string(),
             body: String::new(),
             url: "https://github.com/example/repo/pull/42".to_string(),
             state: "OPEN".to_string(),
@@ -436,6 +437,7 @@ esac
         PrSummary {
             number: 42,
             title: "Guarded repair".to_string(),
+            author: "author".to_string(),
             body: String::new(),
             url: "https://github.com/example/repo/pull/42".to_string(),
             state: "OPEN".to_string(),
@@ -2096,6 +2098,7 @@ fn phase_1_pr_summary(head_sha: &str) -> PrSummary {
     PrSummary {
         number: 42,
         title: "Phase 1 safety".to_string(),
+        author: "author".to_string(),
         body: String::new(),
         url: "https://github.com/example/repo/pull/42".to_string(),
         state: "OPEN".to_string(),

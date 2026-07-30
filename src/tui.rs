@@ -68,6 +68,7 @@ pub struct Tui {
     ui_state_path: Option<PathBuf>,
     pub(crate) selected_comment: usize,
     pub(crate) selected_worktree_by_repo: BTreeMap<PathBuf, PathBuf>,
+    pub(crate) selected_pr_by_repo: BTreeMap<PathBuf, u64>,
     pub(crate) pr_poll_tx: LatestSender<PrDeliveryKey, PrPollResult>,
     pub(crate) pr_poll_rx: LatestReceiver<PrDeliveryKey, PrPollResult>,
     pub(crate) pr_polls_in_flight: BTreeSet<PrPollKey>,
@@ -159,6 +160,7 @@ pub(crate) struct ManagedRepo {
     pub identity: WorktreeRepositoryKey,
     pub pr_summary_poll_in_flight: bool,
     pub pr_summary_last_polled: Option<std::time::Instant>,
+    pub pr_summaries: Vec<PrSummary>,
     pub wt_poll_in_flight: bool,
     pub default_branch_poll_in_flight: bool,
     pub default_branch_last_polled: Option<std::time::Instant>,
@@ -241,6 +243,7 @@ impl ManagedRepo {
             key,
             pr_summary_poll_in_flight: false,
             pr_summary_last_polled: None,
+            pr_summaries: Vec::new(),
             wt_poll_in_flight: false,
             default_branch_poll_in_flight: false,
             default_branch_last_polled: None,
@@ -259,6 +262,7 @@ pub(crate) enum PrPollResult {
         repository: WorktreeRepositoryKey,
         sessions: Vec<WorktreeSessionKey>,
         github_remote_configured: bool,
+        summaries: Result<Vec<PrSummary>, String>,
         observations: Result<Vec<PrSummarySessionResult>, String>,
         refreshed: String,
         poll_started_at: Instant,
@@ -367,6 +371,7 @@ pub(crate) enum LeaderHint {
 enum GitAction {
     LazyGit,
     OpenPr,
+    SubmitReview,
     Push,
     Merge,
     CiFix,
@@ -391,6 +396,7 @@ pub(crate) enum WorktreeListMode {
 enum OpenTmuxSessionTarget {
     PlanPhaseAgent,
     WorktreeAgent,
+    RepoPr,
     RepoDefaultAgent(usize),
     Blocked(&'static str),
 }
@@ -836,6 +842,7 @@ impl Tui {
             ui_state_path: None,
             selected_comment: 0,
             selected_worktree_by_repo: BTreeMap::new(),
+            selected_pr_by_repo: BTreeMap::new(),
             pr_poll_tx,
             pr_poll_rx,
             pr_polls_in_flight: BTreeSet::new(),
@@ -980,6 +987,14 @@ impl Tui {
                     .map(|context| context.config.tool("lazygit")),
             };
             return program.is_some_and(|program| crate::process::command_exists(&program));
+        }
+        if action == GitAction::SubmitReview {
+            return self
+                .selected_repo_context()
+                .is_some_and(|context| crate::process::command_exists(&context.config.tool("gh")))
+                && self.focused_panel == PanelFocus::Repos
+                && self.main_focused
+                && self.selected_repo_pr_summary().is_some();
         }
         if self.focused_panel != PanelFocus::Worktrees {
             return false;
@@ -1274,6 +1289,9 @@ impl Tui {
                             }
                         }
                         OpenTmuxSessionTarget::WorktreeAgent => self.enter_agent_mode(runtime)?,
+                        OpenTmuxSessionTarget::RepoPr => {
+                            self.open_selected_repo_pr_agent(runtime)?
+                        }
                         OpenTmuxSessionTarget::Blocked(message) => self.show_message(message)?,
                     }
                 }
@@ -1309,6 +1327,15 @@ impl Tui {
                         && let Err(error) = self.open_selected_pr(runtime)
                     {
                         self.show_error("open PR failed", &error)?;
+                    }
+                }
+                Key::SubmitReview => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if self.git_action_enabled(GitAction::SubmitReview)
+                        && let Err(error) = self.submit_selected_repo_pr_review(runtime)
+                    {
+                        self.show_error("submit review failed", &error)?;
                     }
                 }
                 Key::Terminal => {
@@ -2326,12 +2353,11 @@ impl Tui {
             if self.worktree_harness_configs.contains_key(&key) {
                 continue;
             }
-            let Some(config) = crate::session::worktree_harness(&managed.repo, session)
+            let config = crate::session::worktree_harness(&managed.repo, session)
                 .ok()
                 .and_then(|association| managed.config.for_harness(&association.harness_id).ok())
-            else {
-                continue;
-            };
+                .or_else(|| test_default_worktree_harness_config(&managed.config));
+            let Some(config) = config else { continue };
             self.worktree_harness_configs.insert(key, config);
         }
     }
@@ -2362,7 +2388,7 @@ impl Tui {
         self.enter_agent_mode_for_index(runtime, index)
     }
 
-    fn enter_agent_mode_for_index(
+    pub(crate) fn enter_agent_mode_for_index(
         &mut self,
         runtime: &mut TerminalRuntime,
         index: usize,
@@ -3164,6 +3190,9 @@ impl Tui {
 
     fn move_down(&mut self) {
         if self.main_focused {
+            if self.move_repo_pr_selection(1) {
+                return;
+            }
             let moved_comment = self.move_comment_selection(1);
             self.main_scroll = self.main_scroll.saturating_add(1);
             if !moved_comment {
@@ -3180,6 +3209,9 @@ impl Tui {
 
     fn move_up(&mut self) {
         if self.main_focused {
+            if self.move_repo_pr_selection(-1) {
+                return;
+            }
             let moved_comment = self.move_comment_selection(-1);
             self.main_scroll = self.main_scroll.saturating_sub(1);
             if !moved_comment {
@@ -3295,12 +3327,16 @@ impl Tui {
 
     fn focus_main(&mut self) {
         self.main_focused = true;
+        self.ensure_selected_repo_pr();
     }
 
     fn open_tmux_session_target(&self) -> OpenTmuxSessionTarget {
         match self.focused_panel {
             PanelFocus::Status => OpenTmuxSessionTarget::Blocked("status has no Enter action"),
             PanelFocus::Repos => {
+                if self.main_focused && self.selected_repo_pr_summary().is_some() {
+                    return OpenTmuxSessionTarget::RepoPr;
+                }
                 if let Some(index) = self.selected_repo_default_session_index() {
                     OpenTmuxSessionTarget::RepoDefaultAgent(index)
                 } else {
@@ -3348,6 +3384,75 @@ impl Tui {
         }
         if let Some(next) = indices.get(next as usize).copied() {
             self.select_worktree(next);
+        }
+    }
+
+    fn move_repo_pr_selection(&mut self, direction: isize) -> bool {
+        if self.focused_panel != PanelFocus::Repos
+            || self.repo_main_view != view::RepoMainView::Github
+        {
+            return false;
+        }
+        let prs = self.current_repo_open_pr_summaries();
+        if prs.is_empty() {
+            return false;
+        }
+        let current_number = self.selected_repo_pr_number();
+        let current = current_number
+            .and_then(|number| prs.iter().position(|summary| summary.number == number))
+            .unwrap_or(0);
+        let next = current as isize + direction;
+        if next < 0 {
+            return true;
+        }
+        if let Some(summary) = prs.get(next as usize)
+            && let Some(repo) = self.repos.get(self.current_repo)
+        {
+            self.selected_pr_by_repo
+                .insert(repo.repo.root.clone(), summary.number);
+        }
+        true
+    }
+
+    fn current_repo_open_pr_summaries(&self) -> Vec<crate::github::PrSummary> {
+        self.repos
+            .get(self.current_repo)
+            .map(|managed| {
+                managed
+                    .pr_summaries
+                    .iter()
+                    .filter(|summary| !summary.merged && summary.state.eq_ignore_ascii_case("OPEN"))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn selected_repo_pr_number(&self) -> Option<u64> {
+        let root = &self.repos.get(self.current_repo)?.repo.root;
+        self.selected_pr_by_repo.get(root).copied()
+    }
+
+    pub(crate) fn selected_repo_pr_summary(&self) -> Option<crate::github::PrSummary> {
+        let prs = self.current_repo_open_pr_summaries();
+        let selected = self.selected_repo_pr_number();
+        selected
+            .and_then(|number| prs.iter().find(|summary| summary.number == number).cloned())
+            .or_else(|| prs.first().cloned())
+    }
+
+    fn ensure_selected_repo_pr(&mut self) {
+        let prs = self.current_repo_open_pr_summaries();
+        let Some(first) = prs.first() else {
+            return;
+        };
+        let selected = self.selected_repo_pr_number();
+        if selected.is_some_and(|number| prs.iter().any(|summary| summary.number == number)) {
+            return;
+        }
+        if let Some(repo) = self.repos.get(self.current_repo) {
+            self.selected_pr_by_repo
+                .insert(repo.repo.root.clone(), first.number);
         }
     }
 
@@ -3660,6 +3765,7 @@ impl Tui {
             .get(self.current_repo)
             .map(|repo| repo.repo.root.clone());
         self.sync_selected_repo_context();
+        self.ensure_selected_repo_pr();
         self.restore_selected_worktree_for_repo();
     }
 
@@ -3713,6 +3819,7 @@ impl Tui {
             .get(self.current_repo)
             .map(|repo| repo.repo.root.clone());
         self.sync_selected_repo_context();
+        self.ensure_selected_repo_pr();
     }
 
     fn clear_leader_hint(&mut self) {
@@ -4555,6 +4662,33 @@ impl Tui {
                 })
             })
             .collect::<Vec<_>>();
+        let selected_pr_number = self.selected_repo_pr_number();
+        let repo_prs = self
+            .repos
+            .get(self.current_repo)
+            .map(|managed| {
+                managed
+                    .pr_summaries
+                    .iter()
+                    .filter(|summary| !summary.merged && summary.state.eq_ignore_ascii_case("OPEN"))
+                    .map(|summary| {
+                        let has_worktree = self.sessions.iter().any(|session| {
+                            session.repo_index == self.current_repo
+                                && session
+                                    .pr
+                                    .summary()
+                                    .is_some_and(|pr| pr.number == summary.number)
+                        });
+                        view::RepoPrRow::from_summary(
+                            managed.label.clone(),
+                            summary,
+                            has_worktree,
+                            selected_pr_number == Some(summary.number),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let selected_repo_label = self
             .repos
             .get(self.current_repo)
@@ -4571,6 +4705,7 @@ impl Tui {
             status: self.status_rows(),
             repos,
             worktrees,
+            repo_prs,
             current_repo_index: self.current_repo,
             selected_repo_label,
             selected_repo_root,
@@ -4625,8 +4760,6 @@ impl Tui {
     }
 
     fn repo_health_label(&self, repo_index: usize) -> String {
-        let mut dirty = 0;
-        let mut running = 0;
         let mut attention = 0;
         let mut prs = 0;
         let mut ci_failed = 0;
@@ -4637,15 +4770,6 @@ impl Tui {
             .iter()
             .filter(|session| session.repo_index == repo_index)
         {
-            if status_count(&session.status_label, "dirty").is_some() {
-                dirty += 1;
-            }
-            if matches!(
-                session.agent_state,
-                AgentState::Attached | AgentState::Running
-            ) {
-                running += 1;
-            }
             if matches!(
                 session.agent_state,
                 AgentState::NeedsInput | AgentState::NeedsRestart | AgentState::ExitedError
@@ -4675,8 +4799,6 @@ impl Tui {
         }
 
         let parts = [
-            (view::RepoHealthKind::Dirty, dirty),
-            (view::RepoHealthKind::Agents, running),
             (view::RepoHealthKind::Attention, attention),
             (view::RepoHealthKind::PullRequests, prs),
             (view::RepoHealthKind::CiFailed, ci_failed),
@@ -4878,6 +5000,7 @@ impl Tui {
                 title: "Git Actions".to_string(),
                 choices: vec![
                     self.git_choice(GitAction::LazyGit, "g", "lazygit"),
+                    self.git_choice(GitAction::SubmitReview, "v", "review selected PR"),
                     view::KeyChoice::new("p", "pull default branch"),
                 ],
             }),
@@ -4943,6 +5066,16 @@ fn worktree_updated_label(session: &Session) -> String {
         return summary.updated_at.chars().take(10).collect();
     }
     "-".to_string()
+}
+
+#[cfg(test)]
+fn test_default_worktree_harness_config(config: &Config) -> Option<Config> {
+    config.for_harness("opencode").ok()
+}
+
+#[cfg(not(test))]
+fn test_default_worktree_harness_config(_config: &Config) -> Option<Config> {
+    None
 }
 
 fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
@@ -5576,6 +5709,7 @@ mod tests {
                 repository: repository.clone(),
                 sessions: vec![session_key.clone()],
                 github_remote_configured: true,
+                summaries: Ok(vec![test_pr_summary(false)]),
                 observations: Ok(vec![PrSummarySessionResult {
                     key: session_key,
                     summary: Some(test_pr_summary(false)),
@@ -5849,6 +5983,26 @@ esac
         assert!(tui.git_action_enabled(GitAction::OpenPr));
         assert!(!tui.git_action_enabled(GitAction::Merge));
         assert!(!tui.git_action_enabled(GitAction::CiFix));
+    }
+
+    #[test]
+    fn submit_review_requires_the_configured_gh_executable() {
+        let temp = unique_temp_dir("prism-tui-submit-review-test");
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut config = test_config();
+        let mut tui = Tui::new_single(repo, config.clone(), Vec::new());
+        tui.focused_panel = PanelFocus::Repos;
+        tui.main_focused = true;
+        tui.repos[0].pr_summaries = vec![test_pr_summary(false)];
+
+        assert!(!tui.git_action_enabled(GitAction::SubmitReview));
+
+        crate::test_support::install_tool(&mut config, &temp, "gh", "#!/bin/sh\nexit 0\n");
+        tui.repos[0].config = config;
+
+        assert!(tui.git_action_enabled(GitAction::SubmitReview));
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -6891,13 +7045,15 @@ esac
     }
 
     fn test_session(repo_index: usize, root: &str, branch: &str) -> Session {
+        let path = PathBuf::from(format!("{root}/{branch}"));
+        let _ = fs::create_dir_all(&path);
         Session {
             repo_index,
             repo_label: format!("repo-{repo_index}"),
             repo_key: None,
-            path: PathBuf::from(format!("{root}/{branch}")),
+            path: path.clone(),
             incarnation: String::new(),
-            path_display: format!("{root}/{branch}"),
+            path_display: path.display().to_string(),
             branch: branch.to_string(),
             prompt_summary: String::new(),
             classification: crate::session::SessionClassification::Work,
@@ -6924,6 +7080,7 @@ esac
         PrSummary {
             number: 1,
             title: "PR".to_string(),
+            author: "author".to_string(),
             body: String::new(),
             url: "https://example.test/pr/1".to_string(),
             state: if merged { "MERGED" } else { "OPEN" }.to_string(),
