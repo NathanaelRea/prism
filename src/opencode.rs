@@ -2713,11 +2713,11 @@ mod tests {
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                let mut chunk = [0_u8; 512];
-                let count = stream.read(&mut chunk).unwrap();
-                assert!(count > 0, "client closed before sending HTTP headers");
-                request.extend_from_slice(&chunk[..count]);
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0_u8; 256];
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "client closed before completing request headers");
+                request.extend_from_slice(&buffer[..count]);
             }
             stream
                 .write_all(

@@ -8,7 +8,7 @@ use crate::agent::AgentState;
 use crate::config::Config;
 use crate::opencode::{OpencodeRuntime, load_runtime};
 use crate::repo::Repository;
-use crate::session::{Session, WorktreeRepositoryKey, WorktreeSessionKey, save_agent_state};
+use crate::session::{Session, WorktreeRepositoryKey, WorktreeSessionKey};
 use crate::tmux;
 use crate::tui::ManagedRepo;
 
@@ -422,7 +422,7 @@ fn update_observed_state(
     }) else {
         return false;
     };
-    persist_observed_state(repos, session, running)
+    update_session_state(session, running)
 }
 
 pub(crate) fn apply_warmup_result(
@@ -456,7 +456,7 @@ pub(crate) fn apply_warmup_result(
     update_observed_state(repos, sessions, &result.key.slot, running)
 }
 
-fn persist_observed_state(repos: &[ManagedRepo], session: &mut Session, running: bool) -> bool {
+fn update_session_state(session: &mut Session, running: bool) -> bool {
     let Some(state) = observed_agent_state(session.agent_state, running) else {
         return false;
     };
@@ -464,9 +464,6 @@ fn persist_observed_state(repos: &[ManagedRepo], session: &mut Session, running:
         return false;
     }
     session.agent_state = state;
-    if let Some(repo) = repos.get(session.repo_index) {
-        let _ = save_agent_state(&repo.repo, &session.branch, state);
-    }
     true
 }
 

@@ -29,6 +29,11 @@ impl Tui {
         let base_generation = self.session_inventory_generation;
         let mut repos = self.repos.clone();
         let previous_repository_identities = self.session_repository_identities.clone();
+        let known_tmux_slots = self
+            .tmux_generations
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
         let mut sessions = self
             .sessions
             .iter()
@@ -41,7 +46,7 @@ impl Tui {
             base_generation,
             Some(TUI_ACTION_JOB_TIMEOUT),
             "prism-session-refresh".to_string(),
-            move |_| {
+            move |context| {
                 for managed in &mut repos {
                     managed.config = crate::config::Config::load(&managed.repo);
                 }
@@ -74,22 +79,48 @@ impl Tui {
                     &previous_repository_identities,
                     &mut sessions,
                 )
-                .map(|()| SessionRefreshSnapshot {
-                    repository_identities: repos
+                .map(|()| {
+                    let tmux_generations = sessions
                         .iter()
-                        .enumerate()
-                        .map(|(index, repo)| (index, repo.identity.clone()))
-                        .collect(),
-                    configs: repos
-                        .iter()
-                        .map(|repo| (repo.identity.clone(), repo.config.clone()))
-                        .collect(),
-                    baseline_sessions,
-                    worktree_harness_configs: crate::tui::load_worktree_harness_configs(
-                        &repos, &sessions,
-                    ),
-                    sessions,
+                        .filter_map(|session| {
+                            let managed = repos.get(session.repo_index)?;
+                            let slot = AgentSessionSlot::for_repository_session(
+                                &managed.identity,
+                                session,
+                            );
+                            if known_tmux_slots.contains(&slot) {
+                                return None;
+                            }
+                            let generation = crate::tmux::latest_agent_session_generation(
+                                &managed.repo,
+                                &managed.config,
+                                &session.branch,
+                            )
+                            .unwrap_or_default();
+                            Some((slot, generation))
+                        })
+                        .collect();
+                    SessionRefreshSnapshot {
+                        repository_identities: repos
+                            .iter()
+                            .enumerate()
+                            .map(|(index, repo)| (index, repo.identity.clone()))
+                            .collect(),
+                        configs: repos
+                            .iter()
+                            .map(|repo| (repo.identity.clone(), repo.config.clone()))
+                            .collect(),
+                        baseline_sessions,
+                        worktree_harness_configs: crate::tui::load_worktree_harness_configs(
+                            &repos, &sessions,
+                        ),
+                        tmux_generations,
+                        sessions,
+                    }
                 });
+                if result.is_err() && context.wait(Duration::from_secs(1)) {
+                    return Ok(None);
+                }
                 Ok(Some(TuiJobPayload::SessionRefresh(SessionRefreshResult {
                     base_generation,
                     result,
@@ -120,6 +151,7 @@ impl Tui {
                         &self.repo,
                         &format!("background Worktree Session refresh failed: {error}"),
                     );
+                    restart = true;
                     continue;
                 }
             };
@@ -163,11 +195,24 @@ impl Tui {
                 .collect();
             self.worktree_harness_configs = snapshot.worktree_harness_configs;
             self.reconcile_session_inventory();
+            for (slot, generation) in snapshot.tmux_generations {
+                self.tmux_generations.entry(slot).or_insert(generation);
+            }
             self.session_inventory_generation = self.session_inventory_generation.saturating_add(1);
+            self.request_workflow_maintenance();
             changed = true;
         }
         if restart {
             let _ = self.refresh_sessions_after_tmux();
+        }
+        if changed {
+            self.start_tmux_agent_warmup();
+            self.start_wt_column_poll();
+            self.start_default_branch_status_poll(true);
+            self.start_opencode_status_poll(true);
+            self.start_opencode_event_listeners();
+            self.start_workflow_polls(true);
+            self.poll_pull_requests(true);
         }
         changed
     }
@@ -218,9 +263,20 @@ impl Tui {
                 *generation = generation.saturating_add(1);
             }
         }
-        for identity in live {
-            self.worktree_generations.entry(identity).or_default();
+        for identity in &live {
+            self.worktree_generations
+                .entry(identity.clone())
+                .or_default();
         }
+        self.pr_persistence_pending.retain(|key, request| {
+            live.contains(&key.worktree) || request.cache.summary().is_none()
+        });
+        self.pr_persistence_versions.retain(|key, _| {
+            live.contains(&key.worktree)
+                || self.pr_persistence_pending.contains_key(key)
+                || self.pr_persistence_in_flight.contains(key)
+        });
+        self.retain_agent_state_persistence_for(&live);
         self.session_repository_identities = self
             .repos
             .iter()
@@ -647,6 +703,21 @@ impl Tui {
                 continue;
             }
             changed = true;
+            if matches!(
+                &result.result,
+                Ok(DeleteWorktreeOutcome::Deleted)
+                    | Ok(DeleteWorktreeOutcome::BranchRetained {
+                        owned_state_removed: true,
+                        ..
+                    })
+            ) && let Some(index) = self.sessions.iter().position(|session| {
+                self.repos
+                    .get(session.repo_index)
+                    .is_some_and(|repo| session.identity_key(&repo.identity) == result.key.worktree)
+            }) {
+                self.queue_pr_cache_removal(index);
+                self.queue_agent_state_removal(index);
+            }
             match result.result {
                 Ok(DeleteWorktreeOutcome::Deleted) => {
                     self.sessions.retain(|session| {
@@ -662,21 +733,13 @@ impl Tui {
                             .remove(&result.key.worktree.repository.root);
                     }
                     self.ensure_navigation_valid();
-                    match self.refresh_sessions() {
-                        Ok(()) => {
-                            self.start_tmux_agent_warmup();
-                            self.start_wt_column_poll();
-                            self.start_default_branch_status_poll(true);
-                            let _ = self
-                                .show_message("deleted local session data, worktree, and branch");
-                        }
-                        Err(error) => {
-                            let _ = self
-                                .show_message(&format!("delete complete; refresh failed: {error}"));
-                        }
-                    }
+                    self.session_inventory_generation =
+                        self.session_inventory_generation.saturating_add(1);
+                    self.reconcile_session_inventory();
+                    let _ = self.refresh_sessions_after_tmux();
+                    let _ = self.show_message("deleted local session data, worktree, and branch");
                 }
-                Ok(DeleteWorktreeOutcome::BranchRetained { error }) => {
+                Ok(DeleteWorktreeOutcome::BranchRetained { error, .. }) => {
                     self.sessions.retain(|session| {
                         session.path != result.key.worktree.path
                             || session.branch != result.key.worktree.branch
@@ -690,18 +753,24 @@ impl Tui {
                             .remove(&result.key.worktree.repository.root);
                     }
                     self.ensure_navigation_valid();
-                    let _ = self.refresh_sessions();
+                    self.session_inventory_generation =
+                        self.session_inventory_generation.saturating_add(1);
+                    self.reconcile_session_inventory();
+                    let _ = self.refresh_sessions_after_tmux();
                     let _ = self.show_message(&format!(
                         "worktree removed, but branch deletion failed: {error}"
                     ));
                 }
-                Ok(DeleteWorktreeOutcome::DeletedWithWarnings { errors }) => {
+                Ok(DeleteWorktreeOutcome::DeletedWithWarnings { errors, .. }) => {
                     self.sessions.retain(|session| {
                         session.path != result.key.worktree.path
                             || session.branch != result.key.worktree.branch
                     });
                     self.ensure_navigation_valid();
-                    let _ = self.refresh_sessions();
+                    self.session_inventory_generation =
+                        self.session_inventory_generation.saturating_add(1);
+                    self.reconcile_session_inventory();
+                    let _ = self.refresh_sessions_after_tmux();
                     let _ = self.show_message(&format!(
                         "worktree removed with cleanup warnings: {}",
                         errors.join("; ")

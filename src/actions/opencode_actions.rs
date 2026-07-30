@@ -133,53 +133,15 @@ impl Tui {
             {
                 continue;
             }
-            let harness_id = harness_config.default_harness.clone();
-            let Ok(Some(runtime)) =
-                load_runtime_snapshot(&managed.repo, &harness_id, &session.branch, &session.path)
-            else {
+            let Some(status) = session.opencode_status.as_ref() else {
                 continue;
             };
-            let Some(session_id) = runtime.opencode_session_id.clone() else {
+            let Some(session_id) = status.session_id.clone() else {
                 continue;
             };
-            if let Some(session) = self.sessions.get_mut(session_index) {
-                let current = session.opencode_status.clone();
-                if current
-                    .as_ref()
-                    .and_then(|status| status.server_url.as_deref())
-                    != Some(runtime.server_url.as_str())
-                    || current
-                        .as_ref()
-                        .and_then(|status| status.session_id.as_deref())
-                        != Some(session_id.as_str())
-                {
-                    session.opencode_status = Some(OpencodeStatus {
-                        server_url: Some(runtime.server_url.clone()),
-                        session_id: Some(session_id.clone()),
-                        title: current.as_ref().and_then(|status| status.title.clone()),
-                        state: opencode::OpencodeState::Unknown,
-                        detail: current.as_ref().and_then(|status| status.detail.clone()),
-                        latest_message: current
-                            .as_ref()
-                            .and_then(|status| status.latest_message.clone()),
-                        latest_user_message: current
-                            .as_ref()
-                            .and_then(|status| status.latest_user_message.clone()),
-                        recent_messages: current
-                            .as_ref()
-                            .map(|status| status.recent_messages.clone())
-                            .unwrap_or_default(),
-                        active_tool: current
-                            .as_ref()
-                            .and_then(|status| status.active_tool.clone()),
-                        todos: current
-                            .as_ref()
-                            .map(|status| status.todos.clone())
-                            .unwrap_or_default(),
-                        last_updated_unix_ms: None,
-                    });
-                }
-            }
+            let Some(server_url) = status.server_url.clone() else {
+                continue;
+            };
             let generation = self
                 .worktree_generations
                 .get(&key)
@@ -191,7 +153,7 @@ impl Tui {
                     worktree: key,
                     generation,
                     session_id,
-                    server_url: runtime.server_url,
+                    server_url,
                 },
             });
         }
@@ -526,21 +488,25 @@ impl Tui {
     }
 
     pub(super) fn apply_opencode_status(&mut self, index: usize, status: OpencodeStatus) -> bool {
-        let Some(session) = self.sessions.get_mut(index) else {
-            return false;
-        };
-        let mut changed = false;
-        let agent_state = status.state.agent_state();
-        if session.opencode_status.as_ref() != Some(&status) {
-            session.opencode_status = Some(status);
-            changed = true;
-        }
-        if session.agent_state != agent_state {
-            session.agent_state = agent_state;
-            if let Some(repo) = self.repos.get(session.repo_index) {
-                let _ = save_agent_state(&repo.repo, &session.branch, agent_state);
+        let (changed, agent_state_changed) = {
+            let Some(session) = self.sessions.get_mut(index) else {
+                return false;
+            };
+            let mut changed = false;
+            let agent_state = status.state.agent_state();
+            if session.opencode_status.as_ref() != Some(&status) {
+                session.opencode_status = Some(status);
+                changed = true;
             }
-            changed = true;
+            let agent_state_changed = session.agent_state != agent_state;
+            if agent_state_changed {
+                session.agent_state = agent_state;
+                changed = true;
+            }
+            (changed, agent_state_changed)
+        };
+        if agent_state_changed {
+            self.queue_agent_state_persistence(index);
         }
         changed
     }
@@ -621,11 +587,7 @@ impl Tui {
             last_updated_unix_ms: Some(current_unix_ms()),
         });
         self.sessions[selected].agent_state = AgentState::NeedsInput;
-        let _ = save_agent_state(
-            &context.repo,
-            &self.sessions[selected].branch,
-            AgentState::NeedsInput,
-        );
+        self.queue_agent_state_persistence(selected);
         self.start_opencode_status_poll(true);
         self.show_message("agent session abort requested")?;
         Ok(())

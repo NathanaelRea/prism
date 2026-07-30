@@ -118,6 +118,7 @@ impl Tui {
         );
         let apply_started = Instant::now();
         let generation = use_.generation;
+        let previous_agent_state = self.sessions[session_index].agent_state;
         let outcome = crate::agent_session::apply_attach_result(
             &self.repos,
             &mut self.sessions,
@@ -130,6 +131,9 @@ impl Tui {
                 running,
             },
         );
+        if self.sessions[session_index].agent_state != previous_agent_state {
+            self.queue_agent_state_persistence(session_index);
+        }
         if let Some(warmup) = outcome.delayed_warmup {
             self.start_tmux_agent_warmup_for_key(warmup.key, warmup.delay);
         }
@@ -217,12 +221,14 @@ impl Tui {
             ],
         );
         let apply_started = Instant::now();
-        crate::agent_session::apply_running_result(
+        if crate::agent_session::apply_running_result(
             &self.repos,
             &mut self.sessions,
             &use_.slot,
             running,
-        );
+        ) {
+            self.queue_agent_state_persistence(session_index);
+        }
         crate::flight_recorder::record(
             "attach",
             "apply_result",
@@ -364,13 +370,24 @@ impl Tui {
 
     pub(super) fn apply_tmux_warmup_result(&mut self, result: AgentSessionWarmupResult) -> bool {
         self.tmux_warmups_in_flight.remove(&result.key);
-        crate::agent_session::apply_warmup_result(
+        let worktree = result.key.slot.worktree.clone();
+        let changed = crate::agent_session::apply_warmup_result(
             &self.repos,
             &self.repo,
             &mut self.sessions,
             &self.tmux_generations,
             result,
-        )
+        );
+        if changed
+            && let Some(index) = self.sessions.iter().position(|session| {
+                self.repos
+                    .get(session.repo_index)
+                    .is_some_and(|repo| session.identity_key(&repo.identity) == worktree)
+            })
+        {
+            self.queue_agent_state_persistence(index);
+        }
+        changed
     }
 
     pub(super) fn paste_prompt_into_tmux_agent(
@@ -415,12 +432,14 @@ impl Tui {
         self.finish_tmux_warmup_for_key(&use_.warmup_key);
         let running =
             crate::agent_session::submit_prompt(&repo, &config, &session, use_.generation, prompt)?;
-        crate::agent_session::apply_running_result(
+        if crate::agent_session::apply_running_result(
             &self.repos,
             &mut self.sessions,
             &use_.slot,
             running,
-        );
+        ) {
+            self.queue_agent_state_persistence(index);
+        }
         self.mark_opencode_prompt_submitted(index, &config);
         Ok(())
     }
@@ -438,12 +457,6 @@ impl Tui {
             status.last_updated_unix_ms = Some(super::opencode_actions::current_unix_ms());
         }
         self.sessions[index].agent_state = AgentState::Running;
-        if let Some(repo) = self.repos.get(self.sessions[index].repo_index) {
-            let _ = save_agent_state(
-                &repo.repo,
-                &self.sessions[index].branch,
-                AgentState::Running,
-            );
-        }
+        self.queue_agent_state_persistence(index);
     }
 }
