@@ -2712,8 +2712,13 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 512];
-            let _ = stream.read(&mut request).unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut buffer = [0_u8; 256];
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0, "client closed before completing request headers");
+                request.extend_from_slice(&buffer[..count]);
+            }
             stream
                 .write_all(
                     b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {}\r\n\r\n",
