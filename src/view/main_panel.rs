@@ -89,7 +89,7 @@ fn render_tmux_portal(frame: &mut Frame<'_>, area: Rect, portal: &TmuxPortalMode
 }
 
 pub(super) fn status_dashboard_lines(model: &crate::view::FrameModel<'_>) -> Vec<Line<'static>> {
-    let mut lines = vec![
+    vec![
         Line::from(Span::styled("░▒▓█▓▒░ P ◤◥◣◢◤◥◣", logo_style())),
         Line::from(Span::styled("▒▓█▓▒░▒ R ◥◣◢◤◥◣◢", logo_style())),
         Line::from(Span::styled("▓█▓▒░▒▓ I ◣◢◤◥◣◢◤", logo_style())),
@@ -102,40 +102,5 @@ pub(super) fn status_dashboard_lines(model: &crate::view::FrameModel<'_>) -> Vec
             model.selected_repo_root.clone(),
             muted_style(),
         )),
-        Line::from(""),
-        heading_line("Navigation"),
-        Line::from("1 status  2 repos  3 worktrees"),
-        Line::from("Enter opens selected repo/worktree; Tab cycles focus"),
-        Line::from("repos h/l switches views"),
-        Line::from("e edits repo config; E edits user config"),
-        Line::from(""),
-        heading_line("Documentation"),
-        Line::from("GitHub repository  https://github.com/NathanaelRea/prism"),
-        Line::from("Keybindings         docs/keybindings.md"),
-        Line::from("Configuration       docs/config.md"),
-        Line::from("README              README.md"),
-        Line::from(""),
-        Line::from(Span::styled("Status", title_style(true))),
-        Line::from(Span::styled(
-            "Local board for repository worktrees and agents",
-            muted_style(),
-        )),
-        Line::from(""),
-        Line::from(format!("Repositories: {}", model.repos.len())),
-        Line::from(format!("Worktrees: {}", model.worktrees.len())),
-    ];
-    for row in &model.status {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{}: ", row.label), muted_style()),
-            Span::styled(
-                row.value.clone(),
-                if row.attention {
-                    attention_style()
-                } else {
-                    Style::default()
-                },
-            ),
-        ]));
-    }
-    lines
+    ]
 }

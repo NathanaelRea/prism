@@ -13,7 +13,7 @@ pub(super) fn repo_overview_lines(
             (session.repo_index == model.current_repo_index).then_some(index)
         })
         .collect::<Vec<_>>();
-    let summary = repo_github_summary(model.config, model.sessions, &indices);
+    let summary = repo_github_summary(model.config, model.sessions, &indices, &model.repo_prs);
     let mut lines = vec![
         Line::from(Span::styled(
             model.selected_repo_label.clone(),
@@ -46,10 +46,7 @@ pub(super) fn repo_overview_lines(
     match model.repo_main_view {
         crate::view::RepoMainView::Github => lines.extend(repo_github_panel_lines(
             model.config,
-            model.sessions,
-            &indices,
-            model.selected_session,
-            width,
+            &model.repo_prs,
             remaining_rows,
         )),
         crate::view::RepoMainView::Kanban => lines.extend(kanban_panel_lines(
@@ -76,8 +73,23 @@ pub(super) fn repo_github_summary(
     config: &crate::config::Config,
     sessions: &[Session],
     session_indices: &[usize],
+    repo_prs: &[crate::view::RepoPrRow],
 ) -> RepoGithubSummary {
-    let mut summary = RepoGithubSummary::default();
+    let mut summary = RepoGithubSummary {
+        open_prs: repo_prs
+            .iter()
+            .filter(|pr| !pr.merged && pr.state.eq_ignore_ascii_case("OPEN"))
+            .count(),
+        review_needed: repo_prs
+            .iter()
+            .filter(|pr| pr.review_decision == "REVIEW_REQUIRED")
+            .count(),
+        ci_failed: repo_prs
+            .iter()
+            .filter(|pr| pr.check_status == "failed")
+            .count(),
+        ..RepoGithubSummary::default()
+    };
     for index in session_indices {
         let Some(session) = sessions.get(*index) else {
             continue;
@@ -85,19 +97,8 @@ pub(super) fn repo_github_summary(
         if session.is_default_branch(config) {
             continue;
         }
-        match session.pr.summary() {
-            Some(pr) => {
-                if !pr.merged && pr.state == "OPEN" {
-                    summary.open_prs += 1;
-                }
-                if review_decision_for_display(pr, session.pr.details()) == "REVIEW_REQUIRED" {
-                    summary.review_needed += 1;
-                }
-                if pr.check_status == "failed" {
-                    summary.ci_failed += 1;
-                }
-            }
-            None => summary.local_branches += 1,
+        if session.pr.summary().is_none() {
+            summary.local_branches += 1;
         }
     }
     summary
@@ -105,15 +106,131 @@ pub(super) fn repo_github_summary(
 
 pub(super) fn repo_github_panel_lines(
     config: &crate::config::Config,
-    sessions: &[Session],
-    session_indices: &[usize],
-    selected: Option<usize>,
-    _width: usize,
+    repo_prs: &[crate::view::RepoPrRow],
     visible_rows: usize,
 ) -> Vec<Line<'static>> {
-    let mut lines = repo_work_list_lines(config, sessions, session_indices, selected, visible_rows);
+    let mut lines = repo_pr_table_lines(config, repo_prs, visible_rows);
     lines.truncate(visible_rows);
     lines
+}
+
+pub(super) fn repo_pr_table_lines(
+    _config: &crate::config::Config,
+    repo_prs: &[crate::view::RepoPrRow],
+    visible_rows: usize,
+) -> Vec<Line<'static>> {
+    let open_prs = repo_prs
+        .iter()
+        .filter(|pr| !pr.merged && pr.state.eq_ignore_ascii_case("OPEN"))
+        .collect::<Vec<_>>();
+    let mut lines = vec![Line::from(vec![
+        Span::styled(format!("{:<7}", "PR"), muted_style()),
+        Span::styled(format!("{:<13}", "repo"), muted_style()),
+        Span::styled(format!("{:<9}", "ci"), muted_style()),
+        Span::styled(format!("{:<10}", "review"), muted_style()),
+        Span::styled(format!("{:<13}", "author"), muted_style()),
+        Span::styled(format!("{:<16}", "requested"), muted_style()),
+        Span::styled(format!("{:<4}", "wt"), muted_style()),
+        Span::styled("title", muted_style()),
+    ])];
+    if open_prs.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No open pull requests discovered",
+            muted_style(),
+        )));
+        lines.truncate(visible_rows);
+        return lines;
+    }
+    for pr in open_prs {
+        if lines.len() >= visible_rows {
+            break;
+        }
+        let pr_cell = format!("{}#{}", if pr.selected { ">" } else { " " }, pr.number);
+        let review = repo_pr_review_label(pr);
+        let requested = if pr.requested_reviewers.is_empty() {
+            "-".to_string()
+        } else {
+            pr.requested_reviewers.join(",")
+        };
+        let wt = if pr.has_worktree { "yes" } else { "no" };
+        lines.push(Line::from(vec![
+            Span::styled(
+                fixed_cell(&pr_cell, 7),
+                if pr.selected {
+                    title_style(true)
+                } else {
+                    muted_style()
+                },
+            ),
+            Span::styled(fixed_cell(&pr.repo_label, 13), muted_style()),
+            Span::styled(
+                fixed_cell(&pr.check_status, 9),
+                pr_check_style(&pr.check_status),
+            ),
+            Span::styled(
+                fixed_cell(&review, 10),
+                review_color_style(&pr.review_decision),
+            ),
+            Span::styled(fixed_cell(&empty_label(&pr.author), 13), muted_style()),
+            Span::styled(
+                fixed_cell(&requested, 16),
+                if pr.requested_reviewers.is_empty() {
+                    muted_style()
+                } else {
+                    attention_style()
+                },
+            ),
+            Span::styled(fixed_cell(wt, 4), muted_style()),
+            Span::styled(
+                pr.title.clone(),
+                if pr.selected {
+                    selected_text_style()
+                } else {
+                    Style::default()
+                },
+            ),
+            Span::styled(
+                format!(
+                    "  {} -> {}  #{}",
+                    pr.head_ref, pr.base_ref, pr.comment_count
+                ),
+                muted_style(),
+            ),
+        ]));
+    }
+    lines
+}
+
+fn fixed_cell(value: &str, width: usize) -> String {
+    format!("{:<width$}", truncate(value, width.saturating_sub(1)))
+}
+
+fn empty_label(value: &str) -> String {
+    if value.trim().is_empty() {
+        "-".to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+fn repo_pr_review_label(pr: &crate::view::RepoPrRow) -> String {
+    if pr.draft {
+        return "draft".to_string();
+    }
+    if pr.review_decision.trim().is_empty() {
+        "-".to_string()
+    } else {
+        review_label(&pr.review_decision).to_string()
+    }
+}
+
+fn review_color_style(decision: &str) -> Style {
+    Style::default().fg(match decision {
+        "APPROVED" => Color::Green,
+        "CHANGES_REQUESTED" => Color::Red,
+        "REVIEW_REQUIRED" => Color::Yellow,
+        _ => Color::DarkGray,
+    })
 }
 
 pub(super) fn repo_work_list_lines(

@@ -18,7 +18,7 @@ use crate::{
         stabilization_model::{StabilizationBlocker, StabilizationWorkKind},
     },
     config::{Config, IconStyle},
-    github::PrCache,
+    github::{PrCache, PrSummary},
     opencode::OpencodeState,
     plan_run::{
         PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRunMode, PlanRunStatus, PlanStepRun,
@@ -35,6 +35,7 @@ pub(crate) struct FrameModel<'a> {
     pub status: Vec<StatusRow>,
     pub repos: Vec<RepoRow>,
     pub worktrees: Vec<WorktreeRow>,
+    pub repo_prs: Vec<RepoPrRow>,
     pub current_repo_index: usize,
     pub selected_repo_label: String,
     pub selected_repo_root: String,
@@ -192,6 +193,51 @@ pub(crate) struct WorktreeRow {
     pub selected: bool,
 }
 
+pub(crate) struct RepoPrRow {
+    pub repo_label: String,
+    pub number: u64,
+    pub title: String,
+    pub author: String,
+    pub state: String,
+    pub review_decision: String,
+    pub requested_reviewers: Vec<String>,
+    pub head_ref: String,
+    pub base_ref: String,
+    pub check_status: String,
+    pub comment_count: u64,
+    pub merged: bool,
+    pub draft: bool,
+    pub has_worktree: bool,
+    pub selected: bool,
+}
+
+impl RepoPrRow {
+    pub(crate) fn from_summary(
+        repo_label: String,
+        summary: &PrSummary,
+        has_worktree: bool,
+        selected: bool,
+    ) -> Self {
+        Self {
+            repo_label,
+            number: summary.number,
+            title: summary.title.clone(),
+            author: summary.author.clone(),
+            state: summary.state.clone(),
+            review_decision: summary.review_decision.clone(),
+            requested_reviewers: summary.requested_reviewers.clone(),
+            head_ref: summary.head_ref.clone(),
+            base_ref: summary.base_ref.clone(),
+            check_status: summary.check_status.clone(),
+            comment_count: summary.comment_count,
+            merged: summary.merged,
+            draft: summary.draft,
+            has_worktree,
+            selected,
+        }
+    }
+}
+
 pub(crate) struct PlanDashboard {
     pub run: PersistedPlanRun,
     pub runs: Vec<PlanRunSummary>,
@@ -298,23 +344,11 @@ pub(crate) fn keybinding_info_lines(
         PanelFocus::Status => Vec::new(),
         PanelFocus::Repos => vec![
             Line::from(Span::styled("Repository columns", title_style(true))),
-            info_columns_row(&[
-                repo_info_cell(
-                    repo_health_icon(RepoHealthKind::Dirty, icon_style),
-                    health_style("dirty"),
-                    "dirty",
-                ),
-                repo_info_cell(
-                    repo_health_icon(RepoHealthKind::Agents, icon_style),
-                    Style::default().fg(Color::Green),
-                    "agents",
-                ),
-                repo_info_cell(
-                    repo_health_icon(RepoHealthKind::Attention, icon_style),
-                    attention_style(),
-                    "attention",
-                ),
-            ]),
+            info_columns_row(&[repo_info_cell(
+                repo_health_icon(RepoHealthKind::Attention, icon_style),
+                attention_style(),
+                "attention",
+            )]),
             info_columns_row(&[
                 repo_info_cell(
                     repo_health_icon(RepoHealthKind::PullRequests, icon_style),

@@ -212,8 +212,40 @@ impl Tui {
             return Ok(());
         };
 
-        if self.select_existing_pr_worktree(context.repo_index, &summary)? {
+        self.open_repo_pr_worktree(raw, &context, summary)?;
+        Ok(())
+    }
+
+    pub(crate) fn open_selected_repo_pr_agent(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let context = self
+            .selected_repo_context()
+            .ok_or_else(|| "no selected repository".to_string())?;
+        let summary = self
+            .selected_repo_pr_summary()
+            .ok_or_else(|| "selected repository has no open pull requests".to_string())?;
+        let Some(index) = self.open_repo_pr_worktree(raw, &context, summary)? else {
             return Ok(());
+        };
+        self.enter_agent_mode_for_index(raw, index)
+    }
+
+    fn open_repo_pr_worktree(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+        context: &crate::tui::SelectedRepoContext,
+        summary: crate::github::PrSummary,
+    ) -> Result<Option<usize>, String> {
+        if let Some(index) = self.existing_pr_worktree_index(context.repo_index, &summary) {
+            self.select_worktree(index);
+            self.focus_worktrees();
+            self.show_message(&format!(
+                "selected existing worktree for PR #{}",
+                summary.number
+            ))?;
+            return Ok(Some(index));
         }
 
         let branch = remote_pr_worktree_branch(summary.number);
@@ -249,7 +281,7 @@ impl Tui {
             self.show_message(&format!(
                 "worktree opened, but restoring Prism metadata failed: {error}"
             ))?;
-            return Ok(());
+            return Ok(None);
         }
 
         self.refresh_sessions()?;
@@ -258,47 +290,33 @@ impl Tui {
         self.select_pr_worktree_by_branch(context.repo_index, &branch, Some(summary.clone()));
         self.focus_worktrees();
         self.show_message(&format!("opened worktree for PR #{}", summary.number))?;
-        Ok(())
+        Ok(self.selected_worktree_index())
     }
 
-    fn select_existing_pr_worktree(
+    fn existing_pr_worktree_index(
         &mut self,
         repo_index: usize,
         summary: &crate::github::PrSummary,
-    ) -> Result<bool, String> {
+    ) -> Option<usize> {
         if let Some(index) = self.sessions.iter().position(|session| {
             !session.hidden
                 && session.repo_index == repo_index
                 && session.pr.is_for_pr(summary.number)
         }) {
-            self.select_worktree(index);
-            self.focus_worktrees();
-            self.show_message(&format!(
-                "selected existing worktree for PR #{}",
-                summary.number
-            ))?;
-            return Ok(true);
+            return Some(index);
         }
         let branch = remote_pr_worktree_branch(summary.number);
-        if let Some(index) = self.sessions.iter().position(|session| {
+        let index = self.sessions.iter().position(|session| {
             !session.hidden && session.repo_index == repo_index && session.branch == branch
-        }) {
-            let repo = self
-                .repos
-                .get(repo_index)
-                .map(|managed| managed.repo.clone());
-            if let (Some(repo), Some(session)) = (repo, self.sessions.get_mut(index)) {
-                record_pr_summary(&repo, &session.branch, &mut session.pr, summary.clone());
-            }
-            self.select_worktree(index);
-            self.focus_worktrees();
-            self.show_message(&format!(
-                "selected existing worktree for PR #{}",
-                summary.number
-            ))?;
-            return Ok(true);
+        })?;
+        let repo = self
+            .repos
+            .get(repo_index)
+            .map(|managed| managed.repo.clone());
+        if let (Some(repo), Some(session)) = (repo, self.sessions.get_mut(index)) {
+            record_pr_summary(&repo, &session.branch, &mut session.pr, summary.clone());
         }
-        Ok(false)
+        Some(index)
     }
 
     fn select_pr_worktree_by_branch(
@@ -327,6 +345,77 @@ impl Tui {
             }
             self.select_worktree(index);
         }
+    }
+
+    pub(crate) fn submit_selected_repo_pr_review(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let context = self
+            .selected_repo_context()
+            .ok_or_else(|| "no selected repository".to_string())?;
+        let summary = self
+            .selected_repo_pr_summary()
+            .ok_or_else(|| "selected repository has no open pull requests".to_string())?;
+        let Some(choice) = self.prompt_choice_dialog(
+            raw,
+            crate::view::ChoiceList {
+                title: format!("Review PR #{}", summary.number),
+                choices: vec![
+                    crate::view::KeyChoice::new("a", "approve"),
+                    crate::view::KeyChoice::new("c", "comment"),
+                    crate::view::KeyChoice::new("r", "request changes"),
+                ],
+            },
+        )?
+        else {
+            return Ok(());
+        };
+        let (flag, label, body_required) = match choice.as_str() {
+            "a" => ("--approve", "approved", false),
+            "c" => ("--comment", "commented on", true),
+            "r" => ("--request-changes", "requested changes on", true),
+            _ => return Ok(()),
+        };
+        let prompt = if body_required {
+            "Review body: "
+        } else {
+            "Review body (optional): "
+        };
+        let Some(body) = self.prompt_line_dialog(raw, "Submit Review", prompt, "")? else {
+            return Ok(());
+        };
+        if body_required && body.trim().is_empty() {
+            self.show_message("review body is required for this review type")?;
+            return Ok(());
+        }
+
+        self.show_loading_dialog(
+            raw,
+            "Submit Review",
+            &format!("Submitting review for PR #{}", summary.number),
+        )?;
+        let mut command = Command::new(context.config.tool("gh"));
+        command
+            .arg("pr")
+            .arg("review")
+            .arg(summary.number.to_string())
+            .arg(flag)
+            .current_dir(&context.repo.root);
+        if !body.trim().is_empty() {
+            command.arg("--body").arg(body.trim());
+        }
+        let output = run_output_allow_failure(&mut command, ProcessPolicy::NetworkQuery)?;
+        if !output.status.success() {
+            let stderr = output.stderr.trim();
+            let message = if stderr.is_empty() {
+                format!("gh pr review exited with {}", output.status)
+            } else {
+                stderr.to_string()
+            };
+            return Err(message);
+        }
+        self.show_message(&format!("{label} PR #{}", summary.number))
     }
 
     pub(crate) fn start_review_fix(

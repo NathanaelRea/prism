@@ -268,11 +268,13 @@ fn open_writable_inner(path: &Path) -> Result<Connection, StorageError> {
         let identity = database_identity(path)?;
         if let Some(identity) = identity.as_ref()
             && database_identity_is_validated(identity)?
+            && additive_schema_current(&conn)?
         {
             return Ok(conn);
         }
         validate_complete_schema(&conn)?;
         validate_foreign_keys(&conn)?;
+        apply_additive_schema_migrations(&conn)?;
         mark_database_validated_if_unchanged(path, identity)?;
         return Ok(conn);
     }
@@ -676,6 +678,7 @@ fn migrate(
             if version == CURRENT_SCHEMA_VERSION {
                 validate_complete_schema(conn)?;
                 validate_foreign_keys(conn)?;
+                apply_additive_schema_migrations(conn)?;
                 execute_batch(conn, "commit", "commit schema validation transaction")?;
                 transaction.committed();
                 return Ok(None);
@@ -743,6 +746,11 @@ fn apply_complete_schema_baseline(conn: &Connection) -> Result<(), StorageError>
     .map_err(|error| {
         StorageError::from_sqlite("create observability schema", error, Duration::ZERO)
     })?;
+    apply_additive_schema_migrations(conn)?;
+    Ok(())
+}
+
+fn apply_additive_schema_migrations(conn: &Connection) -> Result<(), StorageError> {
     crate::session::migrate_worktree_session_schema(conn).map_err(migration_error)?;
     crate::opencode::migrate_runtime_schema(conn).map_err(migration_error)?;
     crate::plan_run::migrate_schema(conn).map_err(migration_error)?;
@@ -750,6 +758,30 @@ fn apply_complete_schema_baseline(conn: &Connection) -> Result<(), StorageError>
     crate::execution::migrate_schema(conn).map_err(migration_error)?;
     crate::github::migrate_pr_cache_schema(conn).map_err(migration_error)?;
     Ok(())
+}
+
+fn additive_schema_current(conn: &Connection) -> Result<bool, StorageError> {
+    table_has_column(conn, "pr_cache", "author")
+}
+
+fn table_has_column(
+    conn: &Connection,
+    table: &'static str,
+    column: &'static str,
+) -> Result<bool, StorageError> {
+    let started = Instant::now();
+    conn.query_row(
+        &format!("select count(*) from pragma_table_info('{table}') where name = ?1"),
+        [column],
+        |row| Ok(row.get::<_, i64>(0)? > 0),
+    )
+    .map_err(|error| {
+        StorageError::from_sqlite(
+            format!("inspect SQLite column {table}.{column}"),
+            error,
+            started.elapsed(),
+        )
+    })
 }
 
 fn migration_error(message: String) -> StorageError {
@@ -1485,6 +1517,58 @@ mod tests {
 
         second.execute("insert into startup_phase (run_id, phase, time_started_unix_ms, status) values ('missing', 'x', 1, 'x')", []).unwrap_err();
         drop(second);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn current_schema_reopen_applies_additive_pr_cache_migrations_before_validation() {
+        let path = test_path("current-additive-pr-cache");
+        {
+            let conn = open_writable(&path).unwrap();
+            conn.execute("alter table pr_cache rename to pr_cache_old", [])
+                .unwrap();
+            conn.execute_batch(
+                "
+                create table pr_cache (
+                  branch text primary key,
+                  number integer not null,
+                  title text not null,
+                  body text not null default '',
+                  url text not null,
+                  state text not null,
+                  review_decision text not null,
+                  requested_reviewers text not null default '',
+                  head_ref text not null,
+                  base_ref text not null,
+                  head_sha text not null,
+                  updated_at text not null,
+                  check_status text not null,
+                  merge_state_status text not null default '',
+                  comment_count integer not null default 0,
+                  merged integer not null,
+                  draft integer not null,
+                  last_refreshed text not null,
+                  refreshed_unix_ms integer not null,
+                  observation_error text
+                );
+                drop table pr_cache_old;
+                pragma user_version = 1;
+                ",
+            )
+            .unwrap();
+        }
+
+        let conn = open_writable(&path).unwrap();
+        let has_author: bool = conn
+            .query_row(
+                "select count(*) from pragma_table_info('pr_cache') where name = 'author'",
+                [],
+                |row| Ok(row.get::<_, i64>(0)? > 0),
+            )
+            .unwrap();
+
+        assert!(has_author);
+        drop(conn);
         let _ = fs::remove_file(path);
     }
 

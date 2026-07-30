@@ -1122,6 +1122,7 @@ exit 1
         PrSummary {
             number: 123,
             title: "Title".to_string(),
+            author: "author".to_string(),
             body: String::new(),
             url: "https://example.test/pr/123".to_string(),
             state: "OPEN".to_string(),

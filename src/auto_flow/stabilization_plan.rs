@@ -1026,6 +1026,7 @@ mod tests {
                 PrSummary {
                     number: 42,
                     title: "Ready".to_string(),
+                    author: "author".to_string(),
                     body: String::new(),
                     url: "https://example.test/pr/42".to_string(),
                     state: "OPEN".to_string(),

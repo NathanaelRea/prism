@@ -334,9 +334,15 @@ impl Tui {
                                 }
                             }
                         }
+                        if let Some(repo) = self.repos.get_mut(repo_index) {
+                            repo.pr_summaries.clear();
+                        }
                     } else {
                         match summaries {
                             Ok(summaries) => {
+                                if let Some(repo) = self.repos.get_mut(repo_index) {
+                                    repo.pr_summaries = summaries.clone();
+                                }
                                 let repos = self
                                     .repos
                                     .iter()
