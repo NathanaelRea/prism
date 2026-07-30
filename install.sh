@@ -9,7 +9,11 @@ target_path="$install_dir/$link_name"
 cargo build --manifest-path "$script_dir/Cargo.toml" --release --locked
 
 mkdir -p "$install_dir"
-install -m 755 "$script_dir/target/release/prism" "$target_path"
+temporary_path="$(mktemp "$install_dir/.${link_name}.XXXXXX")"
+trap 'rm -f "$temporary_path"' EXIT
+install -m 755 "$script_dir/target/release/prism" "$temporary_path"
+mv -f "$temporary_path" "$target_path"
+trap - EXIT
 
 echo "Installed $target_path"
 echo "Make sure $install_dir is on your PATH."
