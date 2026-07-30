@@ -145,51 +145,66 @@ impl Tui {
     pub(crate) fn poll_pull_requests(&mut self, force: bool) -> bool {
         let mut changed = self.drain_pr_poll_results();
         for repo_index in 0..self.repos.len() {
-            let Some(managed) = self.repos.get(repo_index) else {
-                continue;
-            };
             let interval = if repo_index == self.current_repo {
                 PR_SUMMARY_POLL_INTERVAL
             } else {
                 BACKGROUND_PR_SUMMARY_POLL_INTERVAL
             };
-            let summaries_due = managed
-                .pr_summary_last_polled
-                .map(|last| last.elapsed() >= interval)
-                .unwrap_or(true);
-            let repo = managed.repo.clone();
-            let config = managed.config.clone();
-            for session in self
+            let (summaries_due, summary_in_flight, config) = {
+                let managed = &self.repos[repo_index];
+                (
+                    managed
+                        .pr_summary_last_polled
+                        .map(|last| last.elapsed() >= interval)
+                        .unwrap_or(true),
+                    managed.pr_summary_poll_in_flight,
+                    managed.config.clone(),
+                )
+            };
+            let cleared = self
                 .sessions
                 .iter_mut()
-                .filter(|session| session.repo_index == repo_index)
-            {
-                if session.pr.enforce_structural_eligibility(
-                    &repo,
-                    &session.branch,
-                    &config,
-                    session.hidden,
-                ) {
-                    session.unseen_comments = false;
-                    changed = true;
-                }
+                .enumerate()
+                .filter(|(_, session)| session.repo_index == repo_index)
+                .filter_map(|(index, session)| {
+                    session
+                        .pr
+                        .enforce_structural_eligibility(&session.branch, &config, session.hidden)
+                        .then(|| {
+                            session.unseen_comments = false;
+                            index
+                        })
+                })
+                .collect::<Vec<_>>();
+            for index in cleared {
+                self.queue_pr_persistence(index, false);
+                changed = true;
             }
             let has_pr_branches = self.sessions.iter().any(|session| {
                 session.repo_index == repo_index
                     && !session.hidden
-                    && pr_cache_pollable_for_session(session, &managed.config)
+                    && pr_cache_pollable_for_session(session, &config)
             });
-            if has_pr_branches && (force || summaries_due) && !managed.pr_summary_poll_in_flight {
+            if has_pr_branches && (force || summaries_due) && !summary_in_flight {
                 let poll_started_at = std::time::Instant::now();
-                let path = managed.repo.root.clone();
-                let repository = managed.identity.clone();
-                let sessions = self
+                let path = self.repos[repo_index].repo.root.clone();
+                let repository = self.repos[repo_index].identity.clone();
+                let session_snapshots = self
                     .sessions
                     .iter()
                     .filter(|session| session.repo_index == repo_index && !session.hidden)
-                    .map(|session| session.identity_key(&repository))
+                    .map(|session| {
+                        (
+                            session.identity_key(&repository),
+                            session.background_job_snapshot(),
+                        )
+                    })
                     .collect::<Vec<_>>();
-                let config = managed.config.clone();
+                let sessions = session_snapshots
+                    .iter()
+                    .map(|(key, _)| key.clone())
+                    .collect::<Vec<_>>();
+                let config = self.repos[repo_index].config.clone();
                 for session in self
                     .sessions
                     .iter_mut()
@@ -222,11 +237,23 @@ impl Tui {
                         } else {
                             Ok(Vec::new())
                         };
+                        let observations = summaries.map(|summaries| {
+                            session_snapshots
+                                .into_iter()
+                                .map(|(key, session)| PrSummarySessionResult {
+                                    key,
+                                    summary: resolve_pr_summary_for_session(
+                                        &session, &config, &summaries,
+                                    ),
+                                })
+                                .collect()
+                        });
                         Ok(Some(TuiJobPayload::PrPoll(PrPollResult::Summary {
                             repository: job_repository,
                             sessions,
                             github_remote_configured,
-                            summaries,
+                            observations,
+                            refreshed: crate::util::timestamp_label(),
                             poll_started_at,
                         })))
                     },
@@ -274,10 +301,11 @@ impl Tui {
                 );
             }
         }
+        self.start_pr_persistence_jobs();
         changed
     }
 
-    pub(super) fn drain_pr_poll_results(&mut self) -> bool {
+    pub(crate) fn drain_pr_poll_results(&mut self) -> bool {
         if !self.tui_tick_active && !self.routing_tui_jobs {
             self.route_tui_job_messages();
         }
@@ -289,7 +317,8 @@ impl Tui {
                     repository,
                     sessions,
                     github_remote_configured,
-                    summaries,
+                    observations,
+                    refreshed,
                     poll_started_at,
                 } => {
                     let Some(repo_index) = self
@@ -299,16 +328,6 @@ impl Tui {
                     else {
                         continue;
                     };
-                    let target_indices = self
-                        .sessions
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, session)| {
-                            sessions
-                                .contains(&session.identity_key(&repository))
-                                .then_some(index)
-                        })
-                        .collect::<BTreeSet<_>>();
                     let before = self
                         .sessions
                         .iter()
@@ -319,57 +338,50 @@ impl Tui {
                         .iter()
                         .map(|session| pr_cache_comment_count(&session.pr))
                         .collect::<Vec<_>>();
+                    let mut persistence = Vec::new();
                     if !github_remote_configured {
-                        if let Some(repo) = self.repos.get(repo_index) {
-                            for session in self
-                                .sessions
-                                .iter_mut()
-                                .filter(|session| session.repo_index == repo_index)
-                            {
-                                if session
-                                    .pr
-                                    .clear_for_missing_github_remote(&repo.repo, &session.branch)
-                                {
-                                    session.unseen_comments = false;
-                                }
+                        for (index, session) in self
+                            .sessions
+                            .iter_mut()
+                            .enumerate()
+                            .filter(|(_, session)| session.repo_index == repo_index)
+                        {
+                            if session.pr.clear_for_missing_github_remote() {
+                                session.unseen_comments = false;
+                                persistence.push(index);
                             }
                         }
                     } else {
-                        match summaries {
-                            Ok(summaries) => {
-                                let repos = self
-                                    .repos
-                                    .iter()
-                                    .map(|managed| PrCacheRepository {
-                                        repo: &managed.repo,
-                                        config: &managed.config,
-                                    })
-                                    .collect::<Vec<_>>();
-                                crate::github::refresh_pr_summary_index_for_target_sessions(
-                                    &repos,
-                                    &mut self.sessions,
-                                    repo_index,
-                                    &target_indices,
-                                    summaries,
-                                    poll_started_at,
-                                );
-                            }
-                            Err(error) => {
-                                if let Some(repo) = self.repos.get(repo_index) {
-                                    for (index, session) in self.sessions.iter_mut().enumerate() {
-                                        if target_indices.contains(&index) && !session.hidden {
-                                            record_pr_summary_failure(
-                                                &repo.repo,
-                                                &session.branch,
-                                                &mut session.pr,
-                                                error.clone(),
-                                                poll_started_at,
-                                            );
-                                        }
-                                    }
-                                }
+                        let observations = match observations {
+                            Ok(observations) => observations
+                                .into_iter()
+                                .map(|observation| (observation.key, Ok(observation.summary)))
+                                .collect::<Vec<_>>(),
+                            Err(error) => sessions
+                                .into_iter()
+                                .map(|key| (key, Err(error.clone())))
+                                .collect::<Vec<_>>(),
+                        };
+                        for (key, observation) in observations {
+                            let Some(index) = self.sessions.iter().position(|session| {
+                                self.repos.get(session.repo_index).is_some_and(|managed| {
+                                    session.identity_key(&managed.identity) == key
+                                })
+                            }) else {
+                                continue;
+                            };
+                            if apply_pr_summary_poll_result(
+                                &mut self.sessions[index].pr,
+                                poll_started_at,
+                                observation,
+                                &refreshed,
+                            ) {
+                                persistence.push(index);
                             }
                         }
+                    }
+                    for index in persistence {
+                        self.queue_pr_persistence(index, false);
                     }
                     let after = self
                         .sessions
@@ -401,32 +413,148 @@ impl Tui {
                     let session_index = (0..self.sessions.len())
                         .find(|index| key_for_index(*index).as_ref() == Some(&key));
                     if let Some(session_index) = session_index {
-                        let repo = self
-                            .repos
-                            .iter()
-                            .find(|repo| repo.identity == key.worktree.repository)
-                            .map(|repo| repo.repo.clone());
-                        let session = &mut self.sessions[session_index];
-                        let before = pr_cache_render_signature(&session.pr);
-                        let before_comments = pr_cache_comment_count(&session.pr);
-                        if let Some(repo) = repo
-                            && record_pr_details_poll_result(
-                                &repo,
-                                &session.branch,
-                                &mut session.pr,
-                                *cache,
-                            )
-                            && pr_cache_comment_count(&session.pr) > before_comments
-                            && selected_key.as_ref() != Some(&key)
-                        {
-                            session.unseen_comments = true;
+                        let applied = {
+                            let session = &mut self.sessions[session_index];
+                            let before = pr_cache_render_signature(&session.pr);
+                            let before_comments = pr_cache_comment_count(&session.pr);
+                            let applied = apply_pr_details_poll_result(&mut session.pr, *cache);
+                            if applied
+                                && pr_cache_comment_count(&session.pr) > before_comments
+                                && selected_key.as_ref() != Some(&key)
+                            {
+                                session.unseen_comments = true;
+                            }
+                            changed |= before != pr_cache_render_signature(&session.pr);
+                            applied
+                        };
+                        if applied {
+                            self.queue_pr_persistence(session_index, true);
                         }
-                        changed |= before != pr_cache_render_signature(&session.pr);
+                    }
+                }
+                PrPollResult::Persistence {
+                    key,
+                    version,
+                    details,
+                    result,
+                } => {
+                    if self.pr_persistence_versions.get(&key).copied() != Some(version) {
+                        continue;
+                    }
+                    let session_index = self.sessions.iter().position(|session| {
+                        self.repos.get(session.repo_index).is_some_and(|managed| {
+                            session.identity_key(&managed.identity) == key.worktree
+                        })
+                    });
+                    if let Some(index) = session_index {
+                        let before = pr_cache_render_signature(&self.sessions[index].pr);
+                        self.sessions[index]
+                            .pr
+                            .record_background_persistence_result(details, result);
+                        changed |= before != pr_cache_render_signature(&self.sessions[index].pr);
+                    } else if !self.pr_persistence_pending.contains_key(&key) {
+                        self.pr_persistence_versions.remove(&key);
                     }
                 }
             }
         }
+        self.start_pr_persistence_jobs();
         changed
+    }
+
+    fn queue_pr_persistence(&mut self, session_index: usize, details: bool) {
+        let Some(session) = self.sessions.get(session_index) else {
+            return;
+        };
+        let Some(managed) = self.repos.get(session.repo_index) else {
+            return;
+        };
+        let identity = session.identity_key(&managed.identity);
+        let generation = self
+            .worktree_generations
+            .get(&identity)
+            .copied()
+            .unwrap_or_default();
+        let key = pr_poll_key(&managed.identity, generation, session);
+        let version = self
+            .pr_persistence_versions
+            .entry(key.clone())
+            .and_modify(|version| *version = version.saturating_add(1))
+            .or_insert(1);
+        self.pr_persistence_pending.insert(
+            key.clone(),
+            PrPersistenceRequest {
+                key,
+                version: *version,
+                details,
+                repo: managed.repo.clone(),
+                branch: session.branch.clone(),
+                cache: session.pr.clone(),
+            },
+        );
+    }
+
+    pub(crate) fn supersede_pr_persistence(&mut self, session_index: usize, details: bool) {
+        let Some(session) = self.sessions.get(session_index) else {
+            return;
+        };
+        let Some(managed) = self.repos.get(session.repo_index) else {
+            return;
+        };
+        let identity = session.identity_key(&managed.identity);
+        let generation = self
+            .worktree_generations
+            .get(&identity)
+            .copied()
+            .unwrap_or_default();
+        let key = pr_poll_key(&managed.identity, generation, session);
+        if self.pr_persistence_versions.contains_key(&key) {
+            self.queue_pr_persistence(session_index, details);
+            self.start_pr_persistence_jobs();
+        }
+    }
+
+    pub(crate) fn queue_pr_cache_removal(&mut self, session_index: usize) {
+        let Some(session) = self.sessions.get_mut(session_index) else {
+            return;
+        };
+        session.pr = crate::github::PrCache::default();
+        session.unseen_comments = false;
+        self.queue_pr_persistence(session_index, false);
+        self.start_pr_persistence_jobs();
+    }
+
+    fn start_pr_persistence_jobs(&mut self) {
+        let keys = self
+            .pr_persistence_pending
+            .keys()
+            .filter(|key| !self.pr_persistence_in_flight.contains(*key))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            let Some(request) = self.pr_persistence_pending.remove(&key) else {
+                continue;
+            };
+            self.pr_persistence_in_flight.insert(key.clone());
+            let generation = key.generation;
+            self.spawn_tui_job(
+                TuiJobKind::PrPersistence,
+                TuiJobKey::PrPersistence(key),
+                generation,
+                Some(TUI_ACTION_JOB_TIMEOUT),
+                "prism-pr-persistence".to_string(),
+                move |_| {
+                    let result =
+                        persist_pr_cache_snapshot(&request.repo, &request.branch, &request.cache);
+                    Ok(Some(TuiJobPayload::PrPoll(PrPollResult::Persistence {
+                        key: request.key,
+                        version: request.version,
+                        details: request.details,
+                        result,
+                    })))
+                },
+            );
+        }
     }
 
     pub(crate) fn start_wt_column_poll(&mut self) {

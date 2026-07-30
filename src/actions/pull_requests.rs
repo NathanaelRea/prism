@@ -164,6 +164,7 @@ impl Tui {
         };
         let count = resolution?;
         refresh?;
+        self.supersede_pr_persistence(context.session_index, true);
         self.show_message(&format!(
             "resolved {count} review conversation{}",
             if count == 1 { "" } else { "s" }
@@ -290,6 +291,7 @@ impl Tui {
             if let (Some(repo), Some(session)) = (repo, self.sessions.get_mut(index)) {
                 record_pr_summary(&repo, &session.branch, &mut session.pr, summary.clone());
             }
+            self.supersede_pr_persistence(index, false);
             self.select_worktree(index);
             self.focus_worktrees();
             self.show_message(&format!(
@@ -322,6 +324,7 @@ impl Tui {
             {
                 record_pr_summary(&repo, &session.branch, &mut session.pr, summary);
             }
+            self.supersede_pr_persistence(index, false);
             if !self.visible_session_indices().contains(&index) {
                 self.worktree_filter.clear();
             }
@@ -357,6 +360,7 @@ impl Tui {
                 true,
             )?;
         }
+        self.supersede_pr_persistence(selected, true);
         let repair = crate::auto_flow::stabilization_execute::prepare_standalone_repair(
             &self.sessions[selected],
             &context.config,
@@ -403,6 +407,7 @@ impl Tui {
                 true,
             )?;
         }
+        self.supersede_pr_persistence(selected, true);
         let repair = crate::auto_flow::stabilization_execute::prepare_standalone_repair(
             &self.sessions[selected],
             &context.config,
@@ -515,6 +520,7 @@ impl Tui {
                 &context.config,
                 false,
             )?;
+            self.supersede_pr_persistence(selected, false);
         }
         let Some(summary) = pr_summary_or_error(&self.sessions[selected].pr)? else {
             self.show_message("no pull request found for selected branch")?;
@@ -570,6 +576,7 @@ impl Tui {
                 true,
             )?;
         }
+        self.supersede_pr_persistence(selected, true);
         if !self.sessions[selected].pr.has_summary() {
             run_pre_pr_checks(&context.config, &path)?;
             let target_repo =
@@ -602,6 +609,7 @@ impl Tui {
                 target_repo.as_deref(),
                 &mut session.pr,
             )?;
+            self.supersede_pr_persistence(selected, false);
             self.show_message("push complete; pull request created")?;
         } else {
             self.show_message("push complete")?;
@@ -692,6 +700,7 @@ impl Tui {
                 true,
             )?;
         }
+        self.supersede_pr_persistence(selected, true);
         let feedback = crate::auto_flow::stabilization_observe::stabilization_review_feedback(
             self.sessions[selected]
                 .pr
@@ -758,6 +767,7 @@ impl Tui {
         self.remember_auto_run(persisted);
         let resolved = resolution?;
         refresh?;
+        self.supersede_pr_persistence(selected, true);
         observation?;
         self.show_message(&format!(
             "resolved {resolved} review conversation(s); reobserved PR Stabilization"
@@ -886,6 +896,7 @@ impl Tui {
         }
 
         record_pr_merged(&context.repo, &branch, &mut self.sessions[selected].pr);
+        self.supersede_pr_persistence(selected, false);
         let path_display = self.sessions[selected].path_display.clone();
         let warnings = self.sessions[selected].deletion_warnings();
         if self.confirm_delete_dialog(raw, &branch, &path_display, &warnings, true)? {

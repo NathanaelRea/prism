@@ -762,6 +762,7 @@ impl Tui {
             );
             Ok(())
         })?;
+        self.invalidate_workflow_snapshots();
         self.plan_runs.remove(&run_id);
         self.active_plan_runs.retain(|_, active| active != &run_id);
         self.selected_plan_step_by_run.remove(&run_id);
