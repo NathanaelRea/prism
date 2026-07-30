@@ -314,10 +314,6 @@ impl PrCache {
             .is_some_and(|summary| summary.number == number)
     }
 
-    fn pollable(&self, eligibility: PrCacheEligibility) -> bool {
-        eligibility.can_observe() && !self.summary.as_ref().is_some_and(|summary| summary.merged)
-    }
-
     pub(crate) fn details_observation_quality(&self) -> PrObservationQuality {
         self.details_quality
     }
@@ -393,30 +389,32 @@ impl PrCache {
         }
     }
 
-    pub(crate) fn eligible_for_worktree(
-        branch: &str,
-        path: &std::path::Path,
-        config: &Config,
-        hidden: bool,
-    ) -> bool {
-        !hidden && PrCacheEligibility::for_worktree(branch, path, config).can_observe()
-    }
-
     pub(crate) fn structurally_eligible(branch: &str, config: &Config, hidden: bool) -> bool {
         !hidden && branch != "(detached)" && !config.is_default_branch(branch)
     }
 
-    pub(crate) fn enforce_eligibility(
+    pub(crate) fn enforce_structural_eligibility(
         &mut self,
         repo: &Repository,
         branch: &str,
-        path: &std::path::Path,
         config: &Config,
         hidden: bool,
     ) -> bool {
-        if Self::eligible_for_worktree(branch, path, config, hidden) {
+        if Self::structurally_eligible(branch, config, hidden) {
             return false;
         }
+        self.clear_if_present(repo, branch)
+    }
+
+    pub(crate) fn clear_for_missing_github_remote(
+        &mut self,
+        repo: &Repository,
+        branch: &str,
+    ) -> bool {
+        self.clear_if_present(repo, branch)
+    }
+
+    fn clear_if_present(&mut self, repo: &Repository, branch: &str) -> bool {
         let changed = self.summary.is_some()
             || self.details.is_some()
             || self.error.is_some()
@@ -460,10 +458,6 @@ impl PrCacheEligibility {
             is_detached: branch == "(detached)",
             has_github_remote: github_remote_configured(path, config),
         }
-    }
-
-    fn for_session(session: &Session, config: &Config) -> Self {
-        Self::for_worktree(&session.branch, &session.path, config)
     }
 
     fn for_successful_index(session: &Session, config: &Config) -> Self {
@@ -1483,9 +1477,12 @@ pub fn pr_details_due(cache: &PrCache) -> bool {
 }
 
 pub(crate) fn pr_cache_pollable_for_session(session: &Session, config: &Config) -> bool {
-    session
-        .pr
-        .pollable(PrCacheEligibility::for_session(session, config))
+    PrCache::structurally_eligible(&session.branch, config, session.hidden)
+        && !session
+            .pr
+            .summary
+            .as_ref()
+            .is_some_and(|summary| summary.merged)
 }
 
 pub(crate) fn clear_pr_cache(repo: &Repository, branch: &str, cache: &mut PrCache) {
@@ -4097,11 +4094,7 @@ exit 0
             }
             .can_observe()
         );
-        assert!(!merged.pr.pollable(PrCacheEligibility {
-            is_default_branch: false,
-            is_detached: false,
-            has_github_remote: true,
-        }));
+        assert!(!pr_cache_pollable_for_session(&merged, &test_config()));
     }
 
     #[test]

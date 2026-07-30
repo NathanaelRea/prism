@@ -245,6 +245,7 @@ pub(crate) enum PrPollResult {
     Summary {
         repository: WorktreeRepositoryKey,
         sessions: Vec<WorktreeSessionKey>,
+        github_remote_configured: bool,
         summaries: Result<Vec<PrSummary>, String>,
         poll_started_at: Instant,
     },

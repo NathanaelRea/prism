@@ -1114,6 +1114,44 @@ exit 1
 }
 
 #[test]
+fn idle_pr_polling_does_not_launch_git_for_worktree_sessions() {
+    let temp = unique_temp_dir("prism-idle-pr-poll-test");
+    fs::create_dir_all(&temp).unwrap();
+    let git_log = temp.join("git.log");
+    let git = temp.join("git");
+    fs::write(
+        &git,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf 'git@github.com:owner/repo.git\\n'\n",
+            git_log.display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&git).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&git, permissions).unwrap();
+
+    let mut config = test_config();
+    config.default_base = Some("main".to_string());
+    config
+        .tools
+        .insert("git".to_string(), git.display().to_string());
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let sessions = vec![
+        test_session(temp.join("main"), "main"),
+        test_session(temp.join("feature-a"), "feature-a"),
+        test_session(temp.join("feature-b"), "feature-b"),
+    ];
+    let mut tui = Tui::new_single(repo, config, sessions);
+    tui.repos[0].pr_summary_last_polled = Some(Instant::now());
+
+    assert!(!tui.poll_pull_requests(false));
+
+    assert_eq!(fs::read_to_string(&git_log).unwrap_or_default(), "");
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
 fn delete_session_does_not_block_input_loop() {
     let temp = unique_temp_dir("prism-delete-nonblocking-test");
     fs::create_dir_all(&temp).unwrap();
@@ -1384,8 +1422,19 @@ fn phase_1_missing_github_remote_clears_live_and_persisted_pr_cache_state() {
     session.unseen_comments = true;
     let mut tui = Tui::new_single(repo.clone(), config, vec![session]);
 
-    assert!(tui.poll_pull_requests(true));
+    assert!(!tui.poll_pull_requests(true));
+    let started = Instant::now();
+    let mut changed = false;
+    while tui.sessions[0].pr.summary().is_some() {
+        changed |= tui.poll_pull_requests(false);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "missing GitHub remote was not observed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 
+    assert!(changed);
     assert!(tui.sessions[0].pr.summary().is_none());
     assert!(tui.sessions[0].pr.details().is_none());
     assert!(!tui.sessions[0].unseen_comments);
