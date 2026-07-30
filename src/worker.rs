@@ -32,8 +32,12 @@ pub fn ensure_running() -> Result<(), String> {
         .map_err(|error| format!("resolve Prism worker executable: {error}"))?;
     let mut command = Command::new(executable);
     command.args(["worker", "serve"]);
-    crate::process::spawn_detached(&mut command, DetachedProcessPolicy::WorkerDaemon)
-        .map_err(|error| format!("start Prism worker daemon: {error}"))?;
+    crate::process::spawn_detached_named(
+        &mut command,
+        DetachedProcessPolicy::WorkerDaemon,
+        crate::process::ProcessDescriptor::new("prism.worker.serve"),
+    )
+    .map_err(|error| format!("start Prism worker daemon: {error}"))?;
 
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut last_error = "worker did not become ready".to_string();

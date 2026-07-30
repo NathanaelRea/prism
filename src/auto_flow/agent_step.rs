@@ -297,12 +297,10 @@ pub(super) fn collect_child_output(
     output: &mut dyn Write,
 ) -> Result<i32, String> {
     let stdout = child
-        .stdout
-        .take()
+        .take_stdout()
         .ok_or_else(|| "open harness stdout".to_string())?;
     let stderr = child
-        .stderr
-        .take()
+        .take_stderr()
         .ok_or_else(|| "open harness stderr".to_string())?;
     let (tx, rx) = mpsc::sync_channel::<Result<ChildLine, String>>(
         crate::harness::WORKFLOW_OUTPUT_CHANNEL_CAPACITY,

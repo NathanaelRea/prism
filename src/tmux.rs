@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::opencode::{OpencodeRuntime, load_runtime};
 use crate::process::{
-    ProcessPolicy, run_capture, run_output, run_output_allow_failure, run_status_inherited,
-    run_status_with_stdin, split_command_words,
+    ProcessDescriptor, ProcessPolicy, run_capture_named, run_output_allow_failure_named,
+    run_output_named, run_status_inherited_named, run_status_with_stdin_named, split_command_words,
 };
 use crate::repo::Repository;
 use crate::session::Session;
@@ -363,7 +363,7 @@ pub fn latest_agent_session_generation(
 }
 
 pub(crate) fn named_session_exists(config: &Config, expected: &str) -> Result<bool, String> {
-    let output = run_output_allow_failure(
+    let output = run_tmux_output_allow_failure(
         Command::new(config.tool("tmux")).env_remove("TMUX").args([
             "list-sessions",
             "-F",
@@ -388,7 +388,7 @@ pub(crate) fn named_session_exists(config: &Config, expected: &str) -> Result<bo
 }
 
 fn agent_session_names_with_prefix(config: &Config, prefix: &str) -> Result<Vec<String>, String> {
-    let output = run_output_allow_failure(
+    let output = run_tmux_output_allow_failure(
         Command::new(config.tool("tmux")).env_remove("TMUX").args([
             "list-sessions",
             "-F",
@@ -443,11 +443,12 @@ fn attach_target(config: &Config, size_target: &str, attach_target: &str) -> Res
         "window-size",
         "latest",
     ]))?;
-    run_status_inherited(Command::new(config.tool("tmux")).env_remove("TMUX").args([
-        "attach-session",
-        "-t",
-        attach_target,
-    ]))
+    let mut command = Command::new(config.tool("tmux"));
+    command
+        .env_remove("TMUX")
+        .args(["attach-session", "-t", attach_target]);
+    let descriptor = ProcessDescriptor::for_tmux(&command);
+    run_status_inherited_named(&mut command, descriptor)
 }
 
 fn create_detached_agent_session(
@@ -622,7 +623,7 @@ fn ensure_window(
 }
 
 fn window_exists(config: &Config, name: &str, window: TmuxWindow) -> Result<bool, String> {
-    run_output_allow_failure(
+    run_tmux_output_allow_failure(
         Command::new(config.tool("tmux")).env_remove("TMUX").args([
             "list-windows",
             "-t",
@@ -658,7 +659,7 @@ fn kill_session(config: &Config, name: &str) -> Result<(), String> {
 }
 
 fn session_exists(config: &Config, name: &str) -> Result<bool, String> {
-    run_output_allow_failure(
+    run_tmux_output_allow_failure(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
             .args(["has-session", "-t", name]),
@@ -726,7 +727,7 @@ pub(crate) fn resize_agent_pane(
     height: u16,
 ) -> Result<(), String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, branch, generation);
-    let output = run_output_allow_failure(
+    let output = run_tmux_output_allow_failure(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
             .args(["resize-window", "-x"])
@@ -755,9 +756,9 @@ fn capture_pane(config: &Config, target: &str, include_styles: bool) -> Result<S
     }
     command.args(["-t", target]);
     let output = if include_styles {
-        run_output_allow_failure(&mut command, ProcessPolicy::TmuxCapture)?
+        run_tmux_output_allow_failure(&mut command, ProcessPolicy::TmuxCapture)?
     } else {
-        run_output_allow_failure(&mut command, ProcessPolicy::TmuxPoll)?
+        run_tmux_output_allow_failure(&mut command, ProcessPolicy::TmuxPoll)?
     };
     tmux_output_result(output)
 }
@@ -773,7 +774,8 @@ fn tmux_output_result(output: crate::process::ProcessOutput) -> Result<String, S
 }
 
 fn run_tmux_status(command: &mut Command) -> Result<(), String> {
-    let output = run_output(command, ProcessPolicy::TmuxPoll)?;
+    let descriptor = ProcessDescriptor::for_tmux(command);
+    let output = run_output_named(command, ProcessPolicy::TmuxPoll, descriptor)?;
     if output.status.success() {
         return Ok(());
     }
@@ -786,7 +788,21 @@ fn run_tmux_status(command: &mut Command) -> Result<(), String> {
 }
 
 fn run_tmux_status_with_stdin(command: &mut Command, stdin: &str) -> Result<(), String> {
-    run_status_with_stdin(command, stdin, ProcessPolicy::TmuxPoll)
+    let descriptor = ProcessDescriptor::for_tmux(command);
+    run_status_with_stdin_named(command, stdin, ProcessPolicy::TmuxPoll, descriptor)
+}
+
+fn run_tmux_output_allow_failure(
+    command: &mut Command,
+    policy: ProcessPolicy,
+) -> Result<crate::process::ProcessOutput, String> {
+    let descriptor = ProcessDescriptor::for_tmux(command);
+    run_output_allow_failure_named(command, policy, descriptor)
+}
+
+fn run_tmux_capture(command: &mut Command, policy: ProcessPolicy) -> Result<String, String> {
+    let descriptor = ProcessDescriptor::for_tmux(command);
+    run_capture_named(command, policy, descriptor)
 }
 
 fn tmux_missing_session_error(error: &str) -> bool {
@@ -903,7 +919,7 @@ fn opencode_runtime_for_session(
 }
 
 fn pane_current_command(config: &Config, name: &str) -> Option<String> {
-    run_capture(
+    run_tmux_capture(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
             .args(["display-message", "-p", "-t"])
@@ -917,7 +933,7 @@ fn pane_current_command(config: &Config, name: &str) -> Option<String> {
 }
 
 fn pane_start_command(config: &Config, name: &str) -> Option<String> {
-    run_capture(
+    run_tmux_capture(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
             .args(["display-message", "-p", "-t"])

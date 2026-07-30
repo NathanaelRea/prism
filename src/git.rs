@@ -1,7 +1,10 @@
 use std::process::Command;
 
 use crate::config::Config;
-use crate::process::{ProcessPolicy, run_capture, run_output_allow_failure, run_status};
+use crate::process::{
+    ProcessDescriptor, ProcessPolicy, run_capture, run_output_allow_failure, run_status,
+    run_status_named,
+};
 use crate::repo::Repository;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -163,14 +166,15 @@ pub fn branch_behind(
 
 pub fn pull_branch(path: &std::path::Path, branch: &str, config: &Config) -> Result<(), String> {
     fetch_origin(path, config)?;
-    crate::process::run_status(
+    run_status_named(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(path)
             .args(["switch", branch]),
         ProcessPolicy::LocalMutation,
+        ProcessDescriptor::new("git.switch"),
     )?;
-    crate::process::run_status(
+    run_status_named(
         Command::new(config.tool("git")).arg("-C").arg(path).args([
             "pull",
             "--ff-only",
@@ -178,16 +182,18 @@ pub fn pull_branch(path: &std::path::Path, branch: &str, config: &Config) -> Res
             branch,
         ]),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("git.pull"),
     )
 }
 
 pub(crate) fn fetch_origin(path: &std::path::Path, config: &Config) -> Result<(), String> {
-    crate::process::run_status(
+    run_status_named(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(path)
             .args(["fetch", "origin"]),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("git.fetch"),
     )
 }
 
@@ -200,13 +206,14 @@ pub(crate) fn fetch_pull_request_branch(
     if branch.trim().is_empty() || branch == "(detached)" {
         return Err("cannot fetch pull request into an empty or detached branch name".to_string());
     }
-    crate::process::run_status(
+    run_status_named(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(path)
             .args(["fetch", "origin"])
             .arg(format!("+pull/{number}/head:refs/heads/{branch}")),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("git.fetch"),
     )
 }
 
@@ -333,12 +340,13 @@ pub(crate) fn push_current_branch(
     if set_upstream {
         args.extend(["-u".to_string(), "origin".to_string(), branch.clone()]);
     }
-    run_status(
+    run_status_named(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(path)
             .args(args),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("git.push"),
     )?;
     Ok(GitPushResult {
         branch,

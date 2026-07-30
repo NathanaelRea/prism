@@ -9,7 +9,10 @@ use crate::config::Config;
 use crate::config::MergeMethod;
 use crate::git::current_head_sha;
 use crate::observability;
-use crate::process::{ProcessPolicy, run_capture, run_output_allow_failure};
+use crate::process::{
+    ProcessDescriptor, ProcessPolicy, run_capture, run_capture_named, run_output_allow_failure,
+    run_output_allow_failure_named,
+};
 use crate::repo::Repository;
 use crate::session::Session;
 use crate::util::{strip_ansi, timestamp_label};
@@ -1147,7 +1150,7 @@ pub(crate) fn create_pull_request(
     target_repo: Option<&str>,
     cache: &mut PrCache,
 ) -> Result<(), String> {
-    run_capture(
+    run_capture_named(
         Command::new(config.tool("gh"))
             .args(create_pr_args(
                 config.default_base.as_deref(),
@@ -1156,6 +1159,7 @@ pub(crate) fn create_pull_request(
             ))
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.pr.create"),
     )?;
     refresh_pr_cache(repo, branch, cache, path, config, true)
 }
@@ -1166,7 +1170,7 @@ pub(crate) fn merge_pull_request(
     pr_number: u64,
     expected_head_sha: &str,
 ) -> Result<(), String> {
-    run_capture(
+    run_capture_named(
         Command::new(config.tool("gh"))
             .args(merge_pr_args(
                 &pr_number.to_string(),
@@ -1175,6 +1179,7 @@ pub(crate) fn merge_pull_request(
             ))
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.pr.merge"),
     )?;
     Ok(())
 }
@@ -1218,7 +1223,7 @@ fn fetch_pr_merged_status(
     pr_number: u64,
     config: &Config,
 ) -> Result<bool, String> {
-    let output = run_output_allow_failure(
+    let output = run_output_allow_failure_named(
         Command::new(config.tool("gh"))
             .arg("pr")
             .arg("view")
@@ -1227,6 +1232,7 @@ fn fetch_pr_merged_status(
             .arg("state,mergedAt")
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.pr.view"),
     )?;
     if !output.status.success() {
         let stderr = output.stderr.trim().to_string();
@@ -1630,7 +1636,7 @@ pub fn fetch_pr_summary_index(
     config: &Config,
 ) -> Result<Vec<PrSummary>, String> {
     let (owner, name) = github_owner_repo(path, config)?;
-    let raw = run_capture(
+    let raw = run_capture_named(
         Command::new(config.tool("gh"))
             .arg("api")
             .arg("graphql")
@@ -1642,6 +1648,7 @@ pub fn fetch_pr_summary_index(
             .arg(format!("query={PR_SUMMARY_INDEX_QUERY}"))
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.api.graphql"),
     )?;
     try_parse_pr_summary_index(&raw)
 }
@@ -1673,11 +1680,12 @@ pub(crate) fn resolve_review_thread(
     config: &Config,
     thread_id: &str,
 ) -> Result<(), String> {
-    let raw = run_capture(
+    let raw = run_capture_named(
         Command::new(config.tool("gh"))
             .args(resolve_review_thread_args(thread_id))
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.api.graphql"),
     )?;
     let value = serde_json::from_str::<serde_json::Value>(&raw)
         .map_err(|error| format!("parse review thread resolution: {error}"))?;
@@ -1758,7 +1766,7 @@ pub(crate) fn load_repo_policy_cache(
 
 fn fetch_repo_policy(path: &std::path::Path, config: &Config) -> Result<RepoPolicyCache, String> {
     let (owner, name) = github_owner_repo(path, config)?;
-    let raw = run_capture(
+    let raw = run_capture_named(
         Command::new(config.tool("gh"))
             .arg("api")
             .arg("graphql")
@@ -1770,6 +1778,7 @@ fn fetch_repo_policy(path: &std::path::Path, config: &Config) -> Result<RepoPoli
             .arg(format!("query={REPO_POLICY_QUERY}"))
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.api.graphql"),
     )?;
     parse_repo_policy(&format!("{owner}/{name}"), &raw).ok_or_else(|| {
         "GitHub repository policy response did not include repository data".to_string()
@@ -2038,7 +2047,7 @@ fn fetch_pr_summary(
         "isDraft",
     ]
     .join(",");
-    let output = run_output_allow_failure(
+    let output = run_output_allow_failure_named(
         Command::new(config.tool("gh"))
             .arg("pr")
             .arg("view")
@@ -2047,6 +2056,7 @@ fn fetch_pr_summary(
             .arg(fields)
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.pr.view"),
     )?;
     if !output.status.success() {
         let stderr = output.stderr.trim().to_string();
@@ -2079,7 +2089,7 @@ fn fetch_pr_details(
     config: &Config,
 ) -> Result<PrDetailsObservation, String> {
     let fields = ["comments", "reviews", "files", "statusCheckRollup"].join(",");
-    let raw = run_capture(
+    let raw = run_capture_named(
         Command::new(config.tool("gh"))
             .arg("pr")
             .arg("view")
@@ -2088,6 +2098,7 @@ fn fetch_pr_details(
             .arg(fields)
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.pr.view"),
     )?;
     let details = try_parse_pr_details(&raw)?;
     let review_comments = fetch_inline_review_comments(path, pr_number, config);
@@ -2156,7 +2167,7 @@ fn fetch_ci_failures(
     head_sha: &str,
     config: &Config,
 ) -> Result<Vec<CiFailure>, String> {
-    let output = run_output_allow_failure(
+    let output = run_output_allow_failure_named(
         Command::new(config.tool("gh"))
             .arg("run")
             .arg("list")
@@ -2170,6 +2181,7 @@ fn fetch_ci_failures(
             .arg("databaseId,workflowName,displayTitle,name,conclusion,status,headSha,url")
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.run.list"),
     )?;
     if !output.status.success() {
         let message = output.stderr.trim();
@@ -2214,7 +2226,7 @@ fn fetch_failed_run_log_tail(
     if run_id == "0" {
         return Ok(String::new());
     }
-    let output = run_output_allow_failure(
+    let output = run_output_allow_failure_named(
         Command::new(config.tool("gh"))
             .arg("run")
             .arg("view")
@@ -2222,6 +2234,7 @@ fn fetch_failed_run_log_tail(
             .arg("--log-failed")
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.run.view"),
     )?;
     if !output.status.success() {
         let message = output.stderr.trim();
@@ -2253,7 +2266,7 @@ fn fetch_inline_review_comments(
     config: &Config,
 ) -> Result<Vec<PrReviewComment>, String> {
     let (owner, name) = github_owner_repo(path, config)?;
-    let raw = run_capture(
+    let raw = run_capture_named(
         Command::new(config.tool("gh"))
             .arg("api")
             .arg("graphql")
@@ -2269,6 +2282,7 @@ fn fetch_inline_review_comments(
             .arg("--slurp")
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.api.graphql"),
     )?;
     try_parse_review_thread_comments(&raw)
 }

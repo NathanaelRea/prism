@@ -609,9 +609,16 @@ where
         let terminal_metadata = metadata.clone();
         let thread = thread::Builder::new().name(name).spawn(move || {
             let result = catch_unwind(AssertUnwindSafe(|| {
-                crate::process::with_cancellation(context.cancellation.canceled.clone(), || {
-                    job(context.clone())
-                })
+                let run = || {
+                    crate::process::with_cancellation(context.cancellation.canceled.clone(), || {
+                        job(context.clone())
+                    })
+                };
+                if let Some(job_type) = context.metadata.diagnostic_kind {
+                    crate::flight_recorder::with_job_context(context.metadata.id, job_type, run)
+                } else {
+                    run()
+                }
             }));
             match result {
                 Err(payload) => JobCompletion {

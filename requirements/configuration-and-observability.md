@@ -93,6 +93,22 @@
   interval, and retry reason; post-idle completion bursts; and output query row
   and byte counts. Capture summaries report count, p50, p95, and max duration by
   operation.
+- **Behavior**: Flight recordings include external subprocess start and terminal
+  timing with safe logical tool and operation names, outcome, deadline and
+  termination classification, and bounded output byte counts where Prism owns
+  capture. Calls made inside TUI jobs include the job ID and static job type.
+- **Behavior**: Direct local OpenCode HTTP calls include total, resolution,
+  connection, write, first-byte, and read timing where each phase completes,
+  together with method, status, timeout, and byte counts. OpenCode SSE records
+  one connection lifecycle summary with handshake and stream timing, aggregate
+  payload count and bytes, and a bounded terminal reason; it does not emit one
+  flight event per payload.
+- **Constraint**: GitHub CLI operations are opaque subprocesses. Flight recordings
+  report whole-`gh` process timing and never claim DNS, HTTP, retry, or endpoint
+  timing for requests made internally by `gh`.
+- **Invariant**: External-call flight events never contain argv, dynamic URLs,
+  query values, bodies, headers, environment values, repository paths, session
+  IDs, branch names, or raw stderr.
 - **Behavior**: Corruption-class SQLite failures trigger best-effort read-only
   `quick_check` and foreign-key diagnostics without replacing the original error
   or modifying the database.

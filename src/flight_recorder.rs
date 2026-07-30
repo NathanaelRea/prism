@@ -29,11 +29,42 @@ const MAX_REQUEST_BATCH: usize = 64;
 static RECORDER: OnceLock<Recorder> = OnceLock::new();
 static UI_THREAD: OnceLock<ThreadId> = OnceLock::new();
 static NEXT_INPUT_ID: AtomicU64 = AtomicU64::new(1);
+static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
 static UI_IDLE_STARTED_US: AtomicU64 = AtomicU64::new(0);
 static UI_LAST_INPUT_US: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static PENDING_INPUT: RefCell<Option<InputTrace>> = const { RefCell::new(None) };
+    static CURRENT_JOB_CONTEXT: RefCell<Option<JobDiagnosticContext>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct JobDiagnosticContext {
+    job_id: u64,
+    job_type: &'static str,
+}
+
+pub(crate) fn with_job_context<T>(
+    job_id: u64,
+    job_type: &'static str,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct ResetJobContext(Option<JobDiagnosticContext>);
+
+    impl Drop for ResetJobContext {
+        fn drop(&mut self) {
+            CURRENT_JOB_CONTEXT.with(|current| current.replace(self.0.take()));
+        }
+    }
+
+    let context = JobDiagnosticContext { job_id, job_type };
+    let previous = CURRENT_JOB_CONTEXT.with(|current| current.replace(Some(context)));
+    let _reset = ResetJobContext(previous);
+    operation()
+}
+
+fn current_job_context() -> Option<JobDiagnosticContext> {
+    CURRENT_JOB_CONTEXT.with(|current| *current.borrow())
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -68,6 +99,126 @@ pub(crate) fn text(name: &'static str, value: impl AsRef<str>) -> Field {
     Field {
         name,
         value: FieldValue::Text(crate::observability::redact_freeform(value.as_ref(), 256)),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExternalCallCategory {
+    Process,
+    Http,
+}
+
+impl ExternalCallCategory {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Process => "process",
+            Self::Http => "http",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExternalCallOutcome {
+    Success,
+    Failed,
+    TimedOut,
+    Canceled,
+    SpawnFailed,
+    Closed,
+}
+
+impl ExternalCallOutcome {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::TimedOut => "timed_out",
+            Self::Canceled => "canceled",
+            Self::SpawnFailed => "spawn_failed",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+pub(crate) struct ExternalCallTrace {
+    call_id: u64,
+    category: ExternalCallCategory,
+    name: &'static str,
+    started: Instant,
+    terminal_base_fields: Vec<Field>,
+    job_context: Option<JobDiagnosticContext>,
+    finished: bool,
+}
+
+impl ExternalCallTrace {
+    pub(crate) fn begin(
+        category: ExternalCallCategory,
+        name: &'static str,
+        terminal_base_fields: Vec<Field>,
+    ) -> Self {
+        let trace = Self {
+            call_id: NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed),
+            category,
+            name,
+            started: Instant::now(),
+            terminal_base_fields,
+            job_context: current_job_context(),
+            finished: false,
+        };
+        trace.emit("start", None, None, Vec::new());
+        trace
+    }
+
+    pub(crate) fn finish(&mut self, outcome: ExternalCallOutcome, terminal_fields: Vec<Field>) {
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        self.emit(
+            "complete",
+            Some(outcome.label()),
+            Some(self.started.elapsed()),
+            terminal_fields,
+        );
+    }
+
+    fn emit(
+        &self,
+        phase: &'static str,
+        outcome: Option<&'static str>,
+        duration: Option<Duration>,
+        mut fields: Vec<Field>,
+    ) {
+        let mut common = Vec::with_capacity(
+            3 + self.terminal_base_fields.len() + fields.len() + usize::from(outcome.is_some()),
+        );
+        common.push(unsigned("call_id", self.call_id));
+        common.push(text("name", self.name));
+        common.push(text("phase", phase));
+        if let Some(outcome) = outcome {
+            common.push(text("outcome", outcome));
+            common.extend(self.terminal_base_fields.iter().cloned());
+        }
+        if let Some(context) = self.job_context {
+            common.push(unsigned("job_id", context.job_id));
+            common.push(text("job_type", context.job_type));
+        }
+        common.append(&mut fields);
+        record(self.category.label(), "call", duration, common);
+    }
+}
+
+impl Drop for ExternalCallTrace {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finished = true;
+            self.emit(
+                "complete",
+                Some("abandoned"),
+                Some(self.started.elapsed()),
+                Vec::new(),
+            );
+        }
     }
 }
 
@@ -891,7 +1042,13 @@ fn capture_summary(events: &[StoredEvent]) -> CaptureSummary {
             .fields
             .iter()
             .find_map(|field| match (field.name, &field.value) {
-                ("name", FieldValue::Text(name)) if event.category == "sqlite" => {
+                ("name", FieldValue::Text(name))
+                    if event.category == "sqlite"
+                        || matches!(
+                            (event.category, event.operation),
+                            ("process", "call") | ("http", "call")
+                        ) =>
+                {
                     Some(format!("{}:{name}", event.operation))
                 }
                 _ => None,
@@ -1175,6 +1332,68 @@ mod tests {
     }
 
     #[test]
+    fn capture_summary_separates_stable_external_call_names() {
+        let mut process = stored(100);
+        process.category = "process";
+        process.operation = "call";
+        process.fields.push(text("name", "gh.pr.view"));
+        let mut http = stored(200);
+        http.category = "http";
+        http.operation = "call";
+        http.fields.push(text("name", "opencode.session.status"));
+        http.fields.push(unsigned("connect_us", 25_u64));
+
+        let summary = capture_summary(&[process, http]);
+
+        assert!(summary.metrics.contains(&MetricSummary {
+            category: "process".to_string(),
+            operation: "call:gh.pr.view".to_string(),
+            count: 1,
+            p50_us: 100,
+            p95_us: 100,
+            max_us: 100,
+        }));
+        assert!(summary.metrics.contains(&MetricSummary {
+            category: "http".to_string(),
+            operation: "call:opencode.session.status.connect".to_string(),
+            count: 1,
+            p50_us: 25,
+            p95_us: 25,
+            max_us: 25,
+        }));
+    }
+
+    #[test]
+    fn external_call_job_context_is_nested_and_panic_safe() {
+        assert_eq!(current_job_context(), None);
+        with_job_context(1, "outer", || {
+            assert_eq!(
+                current_job_context(),
+                Some(JobDiagnosticContext {
+                    job_id: 1,
+                    job_type: "outer"
+                })
+            );
+            with_job_context(2, "inner", || {
+                assert_eq!(
+                    current_job_context(),
+                    Some(JobDiagnosticContext {
+                        job_id: 2,
+                        job_type: "inner"
+                    })
+                );
+            });
+            assert_eq!(current_job_context().map(|context| context.job_id), Some(1));
+        });
+        assert_eq!(current_job_context(), None);
+
+        let _ = std::panic::catch_unwind(|| {
+            with_job_context(3, "panic", || panic!("injected panic"));
+        });
+        assert_eq!(current_job_context(), None);
+    }
+
+    #[test]
     fn text_fields_apply_observability_redaction() {
         let field = text("value", "token=ghp_not-a-real-token");
 
@@ -1217,6 +1436,11 @@ mod tests {
         ));
         let repo = Repository::with_config_dir_for_test(base.join("repo"), base.join("config"));
         let server = serve_repositories([&repo]);
+        let mut in_flight = ExternalCallTrace::begin(
+            ExternalCallCategory::Process,
+            "test.external.in_flight",
+            vec![text("policy", "test")],
+        );
         record(
             "test",
             "probe",
@@ -1243,6 +1467,14 @@ mod tests {
         );
         assert!(contents.contains("\"category\":\"test\""));
         assert!(contents.contains("\"operation\":\"probe\""));
+        assert!(contents.lines().any(|line| {
+            line.contains("test.external.in_flight")
+                && line.contains("\"phase\",\"value\":\"start\"")
+        }));
+        assert!(!contents.lines().any(|line| {
+            line.contains("test.external.in_flight")
+                && line.contains("\"phase\",\"value\":\"complete\"")
+        }));
         assert!(
             contents
                 .lines()
@@ -1254,6 +1486,95 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+
+        in_flight.finish(ExternalCallOutcome::Success, Vec::new());
+        let secret = "flight-secret-argv-env-output-stderr";
+        let mut command = std::process::Command::new("sh");
+        command
+            .args([
+                "-c",
+                "printf '%s' \"$FLIGHT_SECRET\"; printf '%s' \"$1\" >&2",
+                "sh",
+                secret,
+            ])
+            .env("FLIGHT_SECRET", secret);
+        with_job_context(77, "test_job", || {
+            crate::process::run_output_named(
+                &mut command,
+                crate::process::ProcessPolicy::Test,
+                crate::process::ProcessDescriptor::new("test.external.private"),
+            )
+        })
+        .unwrap();
+        let mut missing = std::process::Command::new("/prism-test/missing-executable");
+        assert!(
+            crate::process::run_output_named(
+                &mut missing,
+                crate::process::ProcessPolicy::Test,
+                crate::process::ProcessDescriptor::new("test.external.spawn_failed"),
+            )
+            .is_err()
+        );
+        let mut timed_out = std::process::Command::new("sh");
+        timed_out.args(["-c", "exec sleep 2"]);
+        assert!(
+            crate::process::run_output_named(
+                &mut timed_out,
+                crate::process::ProcessPolicy::Test,
+                crate::process::ProcessDescriptor::new("test.external.timed_out"),
+            )
+            .is_err()
+        );
+        let mut canceled = std::process::Command::new("sh");
+        canceled.args(["-c", "exec sleep 2"]);
+        let canceled_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        assert!(
+            crate::process::with_cancellation(canceled_flag, || {
+                crate::process::run_output_named(
+                    &mut canceled,
+                    crate::process::ProcessPolicy::Test,
+                    crate::process::ProcessDescriptor::new("test.external.canceled"),
+                )
+            })
+            .is_err()
+        );
+        let completed_path = trigger(
+            &repo,
+            RecordOptions {
+                before_seconds: 60,
+                after_seconds: 0,
+            },
+        )
+        .unwrap();
+        let completed = fs::read_to_string(completed_path).unwrap();
+        assert_eq!(
+            completed
+                .lines()
+                .filter(|line| {
+                    line.contains("test.external.in_flight")
+                        && line.contains("\"phase\",\"value\":\"complete\"")
+                })
+                .count(),
+            1
+        );
+        assert!(completed.lines().any(|line| {
+            line.contains("test.external.spawn_failed")
+                && line.contains("\"outcome\",\"value\":\"spawn_failed\"")
+        }));
+        assert!(completed.lines().any(|line| {
+            line.contains("test.external.timed_out")
+                && line.contains("\"outcome\",\"value\":\"timed_out\"")
+        }));
+        assert!(completed.lines().any(|line| {
+            line.contains("test.external.canceled")
+                && line.contains("\"outcome\",\"value\":\"canceled\"")
+        }));
+        assert!(completed.lines().any(|line| {
+            line.contains("test.external.private")
+                && line.contains("\"job_id\",\"value\":77")
+                && line.contains("\"job_type\",\"value\":\"test_job\"")
+        }));
+        assert!(!completed.contains(secret));
         drop(server);
         let _ = fs::remove_dir_all(base);
     }

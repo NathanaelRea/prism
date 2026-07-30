@@ -8,7 +8,7 @@ use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{OptionalExtension, params};
 
@@ -232,8 +232,13 @@ pub fn ensure_opencode_server_with_program(
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let mut child = crate::process::SupervisedChild::spawn(&mut command, None, None)
-            .map_err(|error| format!("start opencode server: {error}"))?;
+        let mut child = crate::process::SupervisedChild::spawn_named(
+            &mut command,
+            None,
+            None,
+            crate::process::ProcessDescriptor::new("opencode.server.serve"),
+        )
+        .map_err(|error| format!("start opencode server: {error}"))?;
         if let Err(error) = wait_for_health(&server_url) {
             let _ = child.terminate();
             return Err(error);
@@ -313,7 +318,7 @@ pub fn refresh_opencode_session(
 }
 
 pub fn list_sessions(server_url: &str) -> Result<Vec<OpencodeSession>, String> {
-    let response = get(server_url, "/session", API_TIMEOUT)?;
+    let response = get("opencode.session.list", server_url, "/session", API_TIMEOUT)?;
     if response.status_code != 200 {
         return Err(format!(
             "list opencode sessions failed with HTTP {}",
@@ -325,6 +330,7 @@ pub fn list_sessions(server_url: &str) -> Result<Vec<OpencodeSession>, String> {
 
 pub fn get_session(server_url: &str, session_id: &str) -> Result<Option<OpencodeSession>, String> {
     let response = get(
+        "opencode.session.get",
         server_url,
         &format!("/session/{}", url_path_segment(session_id)),
         API_TIMEOUT,
@@ -346,14 +352,32 @@ pub fn create_session(
     let directory = worktree.display().to_string();
     let path = format!("/session?directory={}", url_path_segment(&directory));
     let body = format!(r#"{{"title":"{}"}}"#, json_escape(title));
-    match post(server_url, &path, &body, API_TIMEOUT) {
+    match post(
+        "opencode.session.create",
+        server_url,
+        &path,
+        &body,
+        API_TIMEOUT,
+    ) {
         Ok(response) if response.status_code == 200 || response.status_code == 201 => {
             parse_session(&response.body).ok_or_else(|| "created opencode session had no id".into())
         }
         Ok(response) if response.status_code == 400 || response.status_code == 415 => {
-            let mut fallback = post(server_url, &path, "{}", API_TIMEOUT)?;
+            let mut fallback = post(
+                "opencode.session.create",
+                server_url,
+                &path,
+                "{}",
+                API_TIMEOUT,
+            )?;
             if fallback.status_code == 400 || fallback.status_code == 415 {
-                fallback = post(server_url, "/session", "{}", API_TIMEOUT)?;
+                fallback = post(
+                    "opencode.session.create",
+                    server_url,
+                    "/session",
+                    "{}",
+                    API_TIMEOUT,
+                )?;
             }
             if fallback.status_code != 200 && fallback.status_code != 201 {
                 return Err(format!(
@@ -374,6 +398,7 @@ pub fn create_session(
 pub fn submit_prompt(server_url: &str, session_id: &str, prompt: &str) -> Result<(), String> {
     let body = prompt_async_body(prompt);
     let response = post(
+        "opencode.session.prompt",
         server_url,
         &format!("/session/{}/prompt_async", url_path_segment(session_id)),
         &body,
@@ -392,6 +417,7 @@ pub fn submit_prompt(server_url: &str, session_id: &str, prompt: &str) -> Result
 
 pub fn abort_session(server_url: &str, session_id: &str) -> Result<(), String> {
     let response = post(
+        "opencode.session.abort",
         server_url,
         &format!("/session/{}/abort", url_path_segment(session_id)),
         "{}",
@@ -695,6 +721,7 @@ pub(crate) fn listen_classified_events_until(
         server_url,
         SSE_CANCEL_POLL_INTERVAL,
         SSE_CANCEL_POLL_INTERVAL,
+        SSE_READ_TIMEOUT,
         &mut should_stop,
         &mut |payload| {
             if let Some((event, facet)) = parse_event_payload_classified(&payload) {
@@ -713,6 +740,7 @@ pub fn listen_event_payloads(
         server_url,
         SSE_CONNECT_TIMEOUT,
         SSE_READ_TIMEOUT,
+        SSE_READ_TIMEOUT,
         &mut || false,
         &mut on_payload,
     )
@@ -721,46 +749,252 @@ pub fn listen_event_payloads(
 fn listen_event_payloads_with_stop(
     server_url: &str,
     connect_timeout: Duration,
-    read_timeout: Duration,
+    read_poll_interval: Duration,
+    inactivity_timeout: Duration,
     should_stop: &mut impl FnMut() -> bool,
     on_payload: &mut impl FnMut(String) -> Result<(), String>,
 ) -> Result<(), String> {
-    let (host, port) = parse_localhost_url(server_url)?;
-    let mut stream = TcpStream::connect_timeout(
-        &(host.as_str(), port)
-            .to_socket_addrs()
-            .map_err(|error| format!("resolve {server_url}: {error}"))?
-            .next()
-            .ok_or_else(|| format!("resolve {server_url}: no address"))?,
+    let mut trace = crate::flight_recorder::ExternalCallTrace::begin(
+        crate::flight_recorder::ExternalCallCategory::Http,
+        "opencode.events",
+        vec![
+            crate::flight_recorder::text("method", "GET"),
+            crate::flight_recorder::unsigned("timeout_ms", inactivity_timeout.as_millis()),
+        ],
+    );
+    let mut metrics = SseMetrics::default();
+    let result = listen_event_payloads_with_stop_inner(
+        server_url,
         connect_timeout,
-    )
-    .map_err(|error| format!("connect {server_url}: {error}"))?;
+        read_poll_interval,
+        inactivity_timeout,
+        should_stop,
+        on_payload,
+        &mut metrics,
+    );
+    if let Some(started) = metrics.stream_started {
+        metrics.stream_lifetime_us = Some(started.elapsed().as_micros());
+    }
+    let mut fields = metrics.fields();
+    match &result {
+        Ok(()) => {
+            fields.push(crate::flight_recorder::text(
+                "terminal_reason",
+                "stop_request",
+            ));
+            trace.finish(
+                crate::flight_recorder::ExternalCallOutcome::Canceled,
+                fields,
+            );
+        }
+        Err(failure) => {
+            fields.push(crate::flight_recorder::text(
+                "terminal_reason",
+                failure.kind.terminal_reason(),
+            ));
+            if let Some(error_kind) = failure.kind.error_kind() {
+                fields.push(crate::flight_recorder::text("error_kind", error_kind));
+            }
+            trace.finish(failure.kind.outcome(), fields);
+        }
+    }
+    result.map_err(|failure| failure.message)
+}
+
+#[derive(Default)]
+struct SseMetrics {
+    resolve_us: Option<u128>,
+    connect_us: Option<u128>,
+    write_us: Option<u128>,
+    handshake_us: Option<u128>,
+    stream_started: Option<Instant>,
+    stream_lifetime_us: Option<u128>,
+    status_code: Option<u16>,
+    payload_count: u64,
+    payload_bytes: u64,
+}
+
+impl SseMetrics {
+    fn fields(&self) -> Vec<crate::flight_recorder::Field> {
+        let mut fields = vec![
+            crate::flight_recorder::unsigned("payload_count", self.payload_count),
+            crate::flight_recorder::unsigned("payload_bytes", self.payload_bytes),
+        ];
+        for (name, value) in [
+            ("resolve_us", self.resolve_us),
+            ("connect_us", self.connect_us),
+            ("write_us", self.write_us),
+            ("handshake_us", self.handshake_us),
+            ("stream_lifetime_us", self.stream_lifetime_us),
+        ] {
+            if let Some(value) = value {
+                fields.push(crate::flight_recorder::unsigned(name, value));
+            }
+        }
+        if let Some(status_code) = self.status_code {
+            fields.push(crate::flight_recorder::unsigned("status_code", status_code));
+        }
+        fields
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SseFailureKind {
+    Resolve,
+    Connect,
+    Write,
+    Read,
+    Protocol,
+    HttpStatus,
+    Timeout,
+    Closed,
+    Callback,
+}
+
+impl SseFailureKind {
+    const fn outcome(self) -> crate::flight_recorder::ExternalCallOutcome {
+        match self {
+            Self::Timeout => crate::flight_recorder::ExternalCallOutcome::TimedOut,
+            Self::Closed => crate::flight_recorder::ExternalCallOutcome::Closed,
+            _ => crate::flight_recorder::ExternalCallOutcome::Failed,
+        }
+    }
+
+    const fn terminal_reason(self) -> &'static str {
+        match self {
+            Self::HttpStatus => "http_status",
+            Self::Protocol => "protocol_error",
+            Self::Timeout => "timeout",
+            Self::Closed => "peer_close",
+            Self::Callback => "callback_error",
+            Self::Resolve | Self::Connect | Self::Write | Self::Read => "io_error",
+        }
+    }
+
+    const fn error_kind(self) -> Option<&'static str> {
+        match self {
+            Self::Resolve => Some("resolve"),
+            Self::Connect => Some("connect"),
+            Self::Write => Some("write"),
+            Self::Read => Some("read"),
+            Self::Protocol => Some("parse"),
+            Self::HttpStatus => Some("http_status"),
+            Self::Timeout => Some("timeout"),
+            Self::Closed => Some("closed"),
+            Self::Callback => None,
+        }
+    }
+}
+
+struct SseFailure {
+    kind: SseFailureKind,
+    message: String,
+}
+
+impl SseFailure {
+    fn new(kind: SseFailureKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+fn sse_io_failure(
+    kind: SseFailureKind,
+    context: &'static str,
+    error: std::io::Error,
+) -> SseFailure {
+    let kind = if is_timeout(&error) {
+        SseFailureKind::Timeout
+    } else if error.kind() == std::io::ErrorKind::InvalidData {
+        SseFailureKind::Protocol
+    } else {
+        kind
+    };
+    SseFailure::new(kind, format!("{context}: {error}"))
+}
+
+fn listen_event_payloads_with_stop_inner(
+    server_url: &str,
+    connect_timeout: Duration,
+    read_poll_interval: Duration,
+    inactivity_timeout: Duration,
+    should_stop: &mut impl FnMut() -> bool,
+    on_payload: &mut impl FnMut(String) -> Result<(), String>,
+    metrics: &mut SseMetrics,
+) -> Result<(), SseFailure> {
+    let resolve_started = Instant::now();
+    let (host, port) = parse_localhost_url(server_url)
+        .map_err(|message| SseFailure::new(SseFailureKind::Protocol, message))?;
+    let address = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|error| sse_io_failure(SseFailureKind::Resolve, "resolve SSE host", error))?
+        .next()
+        .ok_or_else(|| SseFailure::new(SseFailureKind::Resolve, "resolve SSE host: no address"))?;
+    metrics.resolve_us = Some(resolve_started.elapsed().as_micros());
+    let connect_started = Instant::now();
+    let mut stream = TcpStream::connect_timeout(&address, connect_timeout)
+        .map_err(|error| sse_io_failure(SseFailureKind::Connect, "connect SSE stream", error))?;
+    metrics.connect_us = Some(connect_started.elapsed().as_micros());
     stream
-        .set_read_timeout(Some(read_timeout))
-        .map_err(|error| format!("configure SSE read timeout: {error}"))?;
+        .set_read_timeout(Some(read_poll_interval))
+        .map_err(|error| {
+            sse_io_failure(SseFailureKind::Read, "configure SSE read timeout", error)
+        })?;
     stream
         .set_write_timeout(Some(connect_timeout))
-        .map_err(|error| format!("configure SSE write timeout: {error}"))?;
+        .map_err(|error| {
+            sse_io_failure(SseFailureKind::Write, "configure SSE write timeout", error)
+        })?;
+    let write_started = Instant::now();
     write!(
         stream,
         "GET /event HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
     )
-    .map_err(|error| format!("write SSE request: {error}"))?;
+    .map_err(|error| sse_io_failure(SseFailureKind::Write, "write SSE request", error))?;
+    metrics.write_us = Some(write_started.elapsed().as_micros());
 
     let mut reader = BufReader::new(stream);
+    let handshake_started = Instant::now();
     let mut status_line = String::new();
-    if read_line_until(&mut reader, &mut status_line, should_stop)? == 0 {
-        return Ok(());
+    if read_line_until(
+        &mut reader,
+        &mut status_line,
+        should_stop,
+        inactivity_timeout,
+    )? == 0
+    {
+        return if (should_stop)() {
+            Ok(())
+        } else {
+            Err(SseFailure::new(
+                SseFailureKind::Closed,
+                "opencode event stream closed before status",
+            ))
+        };
     }
     let status_code = status_line
         .split_whitespace()
         .nth(1)
-        .ok_or_else(|| format!("invalid SSE status line: {}", status_line.trim_end()))?
+        .ok_or_else(|| {
+            SseFailure::new(
+                SseFailureKind::Protocol,
+                format!("invalid SSE status line: {}", status_line.trim_end()),
+            )
+        })?
         .parse::<u16>()
-        .map_err(|error| format!("parse SSE status: {error}"))?;
+        .map_err(|error| {
+            SseFailure::new(
+                SseFailureKind::Protocol,
+                format!("parse SSE status: {error}"),
+            )
+        })?;
+    metrics.status_code = Some(status_code);
     if !success_status(status_code) {
-        return Err(format!(
-            "open opencode event stream failed with HTTP {status_code}"
+        return Err(SseFailure::new(
+            SseFailureKind::HttpStatus,
+            format!("open opencode event stream failed with HTTP {status_code}"),
         ));
     }
 
@@ -768,12 +1002,15 @@ fn listen_event_payloads_with_stop(
     let mut chunked = false;
     loop {
         line.clear();
-        let count = read_line_until(&mut reader, &mut line, should_stop)?;
+        let count = read_line_until(&mut reader, &mut line, should_stop, inactivity_timeout)?;
         if (should_stop)() {
             return Ok(());
         }
         if count == 0 {
-            return Err("opencode event stream closed before body".to_string());
+            return Err(SseFailure::new(
+                SseFailureKind::Closed,
+                "opencode event stream closed before body",
+            ));
         }
         if line == "\r\n" || line == "\n" {
             break;
@@ -783,15 +1020,19 @@ fn listen_event_payloads_with_stop(
             chunked = true;
         }
     }
+    metrics.handshake_us = Some(handshake_started.elapsed().as_micros());
+    metrics.stream_started = Some(Instant::now());
 
     if chunked {
         read_sse_payloads_until(
             BufReader::new(ChunkedBodyReader::new(reader)),
             on_payload,
             should_stop,
+            metrics,
+            inactivity_timeout,
         )
     } else {
-        read_sse_payloads_until(reader, on_payload, should_stop)
+        read_sse_payloads_until(reader, on_payload, should_stop, metrics, inactivity_timeout)
     }
 }
 
@@ -799,25 +1040,50 @@ fn read_sse_payloads_until(
     mut reader: impl BufRead,
     on_payload: &mut impl FnMut(String) -> Result<(), String>,
     should_stop: &mut impl FnMut() -> bool,
-) -> Result<(), String> {
+    metrics: &mut SseMetrics,
+    inactivity_timeout: Duration,
+) -> Result<(), SseFailure> {
     let mut line = String::new();
     let mut data = String::new();
+    let mut last_activity = Instant::now();
     loop {
         if (should_stop)() {
             return Ok(());
         }
         let count = match reader.read_line(&mut line) {
             Ok(count) => count,
-            Err(error) if is_timeout(&error) => continue,
-            Err(error) => return Err(format!("read opencode event stream: {error}")),
+            Err(error) if is_timeout(&error) && last_activity.elapsed() < inactivity_timeout => {
+                continue;
+            }
+            Err(error) if is_timeout(&error) => {
+                return Err(SseFailure::new(
+                    SseFailureKind::Timeout,
+                    "opencode event stream timed out",
+                ));
+            }
+            Err(error) => {
+                return Err(sse_io_failure(
+                    SseFailureKind::Read,
+                    "read opencode event stream",
+                    error,
+                ));
+            }
         };
         if count == 0 {
-            return Err("opencode event stream closed".to_string());
+            return Err(SseFailure::new(
+                SseFailureKind::Closed,
+                "opencode event stream closed",
+            ));
         }
+        last_activity = Instant::now();
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
             if !data.trim().is_empty() {
-                on_payload(data.trim().to_string())?;
+                let payload = data.trim().to_string();
+                metrics.payload_count = metrics.payload_count.saturating_add(1);
+                metrics.payload_bytes = metrics.payload_bytes.saturating_add(payload.len() as u64);
+                on_payload(payload)
+                    .map_err(|message| SseFailure::new(SseFailureKind::Callback, message))?;
                 data.clear();
             }
             line.clear();
@@ -837,15 +1103,31 @@ fn read_line_until(
     reader: &mut impl BufRead,
     line: &mut String,
     should_stop: &mut impl FnMut() -> bool,
-) -> Result<usize, String> {
+    inactivity_timeout: Duration,
+) -> Result<usize, SseFailure> {
+    let last_activity = Instant::now();
     loop {
         if (should_stop)() {
             return Ok(0);
         }
         match reader.read_line(line) {
             Ok(count) => return Ok(count),
-            Err(error) if is_timeout(&error) => continue,
-            Err(error) => return Err(format!("read opencode event stream: {error}")),
+            Err(error) if is_timeout(&error) && last_activity.elapsed() < inactivity_timeout => {
+                continue;
+            }
+            Err(error) if is_timeout(&error) => {
+                return Err(SseFailure::new(
+                    SseFailureKind::Timeout,
+                    "opencode event stream handshake timed out",
+                ));
+            }
+            Err(error) => {
+                return Err(sse_io_failure(
+                    SseFailureKind::Read,
+                    "read opencode event stream",
+                    error,
+                ));
+            }
         }
     }
 }
@@ -1014,7 +1296,12 @@ struct MessageSummary {
 }
 
 fn fetch_session_state(server_url: &str, session_id: &str) -> Result<OpencodeState, String> {
-    let response = get(server_url, "/session/status", API_TIMEOUT)?;
+    let response = get(
+        "opencode.session.status",
+        server_url,
+        "/session/status",
+        API_TIMEOUT,
+    )?;
     if !success_status(response.status_code) {
         return Err(http_error_message(
             "read opencode session status",
@@ -1030,7 +1317,12 @@ fn session_state_from_status_body(body: &str, session_id: &str) -> OpencodeState
 }
 
 fn fetch_pending_permission(server_url: &str, session_id: &str) -> Result<bool, String> {
-    let response = get(server_url, "/permission", API_TIMEOUT)?;
+    let response = get(
+        "opencode.permission.list",
+        server_url,
+        "/permission",
+        API_TIMEOUT,
+    )?;
     if !success_status(response.status_code) {
         return Err(http_error_message(
             "read opencode permissions",
@@ -1043,6 +1335,7 @@ fn fetch_pending_permission(server_url: &str, session_id: &str) -> Result<bool, 
 
 fn fetch_message_summary(server_url: &str, session_id: &str) -> Result<MessageSummary, String> {
     let response = get(
+        "opencode.session.messages",
         server_url,
         &format!("/session/{}/message?limit=10", url_path_segment(session_id)),
         API_TIMEOUT,
@@ -1059,6 +1352,7 @@ fn fetch_message_summary(server_url: &str, session_id: &str) -> Result<MessageSu
 
 fn fetch_todos(server_url: &str, session_id: &str) -> Result<Vec<OpencodeTodo>, String> {
     let response = get(
+        "opencode.session.todos",
         server_url,
         &format!("/session/{}/todo", url_path_segment(session_id)),
         API_TIMEOUT,
@@ -1115,7 +1409,7 @@ fn list_sessions_for_worktree(
         "/session?directory={}&limit=100",
         url_path_segment(worktree_path)
     );
-    let response = get(server_url, &path, API_TIMEOUT)?;
+    let response = get("opencode.session.list", server_url, &path, API_TIMEOUT)?;
     if response.status_code != 200 {
         return Err(format!(
             "list opencode sessions failed with HTTP {}",
@@ -1509,9 +1803,14 @@ pub fn server_url(port: u16) -> String {
 }
 
 pub fn check_health(server_url: &str) -> bool {
-    get(server_url, "/global/health", HEALTH_TIMEOUT)
-        .map(|response| response.status_code == 200)
-        .unwrap_or(false)
+    get(
+        "opencode.health",
+        server_url,
+        "/global/health",
+        HEALTH_TIMEOUT,
+    )
+    .map(|response| response.status_code == 200)
+    .unwrap_or(false)
 }
 
 pub fn port_status(port: u16) -> PortStatus {
@@ -1549,17 +1848,23 @@ fn tcp_connects(port: u16, timeout: Duration) -> bool {
     TcpStream::connect_timeout(&address, timeout).is_ok()
 }
 
-fn get(server_url: &str, path: &str, timeout: Duration) -> Result<HttpResponse, String> {
-    request(server_url, "GET", path, None, timeout)
+fn get(
+    name: &'static str,
+    server_url: &str,
+    path: &str,
+    timeout: Duration,
+) -> Result<HttpResponse, String> {
+    request(name, server_url, "GET", path, None, timeout)
 }
 
 fn post(
+    name: &'static str,
     server_url: &str,
     path: &str,
     body: &str,
     timeout: Duration,
 ) -> Result<HttpResponse, String> {
-    request(server_url, "POST", path, Some(body), timeout)
+    request(name, server_url, "POST", path, Some(body), timeout)
 }
 
 fn success_status(status_code: u16) -> bool {
@@ -1580,57 +1885,259 @@ fn http_error_message(operation: &str, status_code: u16, body: &str) -> String {
 }
 
 fn request(
+    name: &'static str,
     server_url: &str,
-    method: &str,
+    method: &'static str,
     path: &str,
     body: Option<&str>,
     timeout: Duration,
 ) -> Result<HttpResponse, String> {
-    let (host, port) = parse_localhost_url(server_url)?;
-    let mut stream = TcpStream::connect_timeout(
-        &(host.as_str(), port)
-            .to_socket_addrs()
-            .map_err(|error| format!("resolve {server_url}: {error}"))?
-            .next()
-            .ok_or_else(|| format!("resolve {server_url}: no address"))?,
-        timeout,
-    )
-    .map_err(|error| format!("connect {server_url}: {error}"))?;
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|error| format!("configure read timeout: {error}"))?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|error| format!("configure write timeout: {error}"))?;
-    match body {
-        Some(body) => write!(
-            stream,
+    let mut trace = crate::flight_recorder::ExternalCallTrace::begin(
+        crate::flight_recorder::ExternalCallCategory::Http,
+        name,
+        vec![
+            crate::flight_recorder::text("method", method),
+            crate::flight_recorder::unsigned("timeout_ms", timeout.as_millis()),
+        ],
+    );
+    let result = request_inner(server_url, method, path, body, timeout);
+    match result {
+        Ok((response, metrics)) => {
+            let outcome = if success_status(response.status_code) {
+                crate::flight_recorder::ExternalCallOutcome::Success
+            } else {
+                crate::flight_recorder::ExternalCallOutcome::Failed
+            };
+            let mut fields = metrics.fields();
+            fields.push(crate::flight_recorder::unsigned(
+                "status_code",
+                response.status_code,
+            ));
+            if !success_status(response.status_code) {
+                fields.push(crate::flight_recorder::text("error_kind", "http_status"));
+            }
+            trace.finish(outcome, fields);
+            Ok(response)
+        }
+        Err(failure) => {
+            let outcome = if failure.timed_out {
+                crate::flight_recorder::ExternalCallOutcome::TimedOut
+            } else {
+                crate::flight_recorder::ExternalCallOutcome::Failed
+            };
+            let mut fields = failure.metrics.fields();
+            fields.push(crate::flight_recorder::text(
+                "error_kind",
+                failure.error_kind,
+            ));
+            if let Some(status_code) = failure.status_code {
+                fields.push(crate::flight_recorder::unsigned("status_code", status_code));
+            }
+            trace.finish(outcome, fields);
+            Err(failure.message)
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct HttpMetrics {
+    resolve_us: Option<u128>,
+    connect_us: Option<u128>,
+    write_us: Option<u128>,
+    first_byte_us: Option<u128>,
+    read_us: Option<u128>,
+    request_bytes: usize,
+    response_bytes: usize,
+}
+
+impl HttpMetrics {
+    fn fields(&self) -> Vec<crate::flight_recorder::Field> {
+        let mut fields = vec![
+            crate::flight_recorder::unsigned("request_bytes", self.request_bytes),
+            crate::flight_recorder::unsigned("response_bytes", self.response_bytes),
+        ];
+        for (name, value) in [
+            ("resolve_us", self.resolve_us),
+            ("connect_us", self.connect_us),
+            ("write_us", self.write_us),
+            ("first_byte_us", self.first_byte_us),
+            ("read_us", self.read_us),
+        ] {
+            if let Some(value) = value {
+                fields.push(crate::flight_recorder::unsigned(name, value));
+            }
+        }
+        fields
+    }
+}
+
+struct HttpFailure {
+    message: String,
+    error_kind: &'static str,
+    timed_out: bool,
+    status_code: Option<u16>,
+    metrics: HttpMetrics,
+}
+
+fn http_failure(
+    message: String,
+    error_kind: &'static str,
+    error: Option<&std::io::Error>,
+    status_code: Option<u16>,
+    metrics: &HttpMetrics,
+) -> Box<HttpFailure> {
+    let timed_out = error.is_some_and(is_timeout);
+    Box::new(HttpFailure {
+        message,
+        error_kind: if timed_out { "timeout" } else { error_kind },
+        timed_out,
+        status_code,
+        metrics: metrics.clone(),
+    })
+}
+
+fn request_inner(
+    server_url: &str,
+    method: &'static str,
+    path: &str,
+    body: Option<&str>,
+    timeout: Duration,
+) -> Result<(HttpResponse, HttpMetrics), Box<HttpFailure>> {
+    let mut metrics = HttpMetrics::default();
+    let resolve_started = Instant::now();
+    let (host, port) = parse_localhost_url(server_url)
+        .map_err(|message| http_failure(message, "parse", None, None, &metrics))?;
+    let address = (host.as_str(), port)
+        .to_socket_addrs()
+        .map_err(|error| {
+            http_failure(
+                format!("resolve {server_url}: {error}"),
+                "resolve",
+                Some(&error),
+                None,
+                &metrics,
+            )
+        })?
+        .next()
+        .ok_or_else(|| {
+            http_failure(
+                format!("resolve {server_url}: no address"),
+                "resolve",
+                None,
+                None,
+                &metrics,
+            )
+        })?;
+    metrics.resolve_us = Some(resolve_started.elapsed().as_micros());
+
+    let connect_started = Instant::now();
+    let mut stream = TcpStream::connect_timeout(&address, timeout).map_err(|error| {
+        http_failure(
+            format!("connect {server_url}: {error}"),
+            "connect",
+            Some(&error),
+            None,
+            &metrics,
+        )
+    })?;
+    metrics.connect_us = Some(connect_started.elapsed().as_micros());
+    stream.set_read_timeout(Some(timeout)).map_err(|error| {
+        http_failure(
+            format!("configure read timeout: {error}"),
+            "read",
+            Some(&error),
+            None,
+            &metrics,
+        )
+    })?;
+    stream.set_write_timeout(Some(timeout)).map_err(|error| {
+        http_failure(
+            format!("configure write timeout: {error}"),
+            "write",
+            Some(&error),
+            None,
+            &metrics,
+        )
+    })?;
+
+    let request = match body {
+        Some(body) => format!(
             "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         ),
-        None => write!(
-            stream,
-            "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n"
-        ),
-    }
-    .map_err(|error| format!("write HTTP request: {error}"))?;
+        None => {
+            format!("{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n")
+        }
+    };
+    metrics.request_bytes = request.len();
+    let write_started = Instant::now();
+    stream.write_all(request.as_bytes()).map_err(|error| {
+        http_failure(
+            format!("write HTTP request: {error}"),
+            "write",
+            Some(&error),
+            None,
+            &metrics,
+        )
+    })?;
+    metrics.write_us = Some(write_started.elapsed().as_micros());
+
+    let read_started = Instant::now();
+    let mut first_byte_at = None;
     let mut response = Vec::new();
     loop {
         let mut buffer = [0_u8; 8192];
         match stream.read(&mut buffer) {
             Ok(0) => break,
             Ok(count) => {
+                if first_byte_at.is_none() {
+                    let now = Instant::now();
+                    metrics.first_byte_us = Some(read_started.elapsed().as_micros());
+                    first_byte_at = Some(now);
+                }
                 response.extend_from_slice(&buffer[..count]);
+                metrics.response_bytes = response.len();
                 if http_response_is_complete(&response) {
                     break;
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(format!("read HTTP response: {error}")),
+            Err(error) => {
+                metrics.response_bytes = response.len();
+                metrics.read_us = first_byte_at.map(|started| started.elapsed().as_micros());
+                let status_code = response_status_code(&response);
+                return Err(http_failure(
+                    format!("read HTTP response: {error}"),
+                    "read",
+                    Some(&error),
+                    status_code,
+                    &metrics,
+                ));
+            }
         }
     }
-    let response = String::from_utf8_lossy(&response);
-    parse_response(&response)
+    metrics.read_us = first_byte_at.map(|started| started.elapsed().as_micros());
+    let response_text = String::from_utf8_lossy(&response);
+    let parsed = parse_response(&response_text).map_err(|message| {
+        http_failure(
+            message,
+            "parse",
+            None,
+            response_status_code(&response),
+            &metrics,
+        )
+    })?;
+    Ok((parsed, metrics))
+}
+
+fn response_status_code(response: &[u8]) -> Option<u16> {
+    let line_end = response.windows(2).position(|window| window == b"\r\n")?;
+    std::str::from_utf8(&response[..line_end])
+        .ok()?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
 }
 
 fn http_response_is_complete(response: &[u8]) -> bool {
@@ -2165,6 +2672,70 @@ mod tests {
                 .is_ok()
         );
         release_tx.send(()).unwrap();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn event_listener_reports_an_idle_stream_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .unwrap();
+            stream.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(250));
+        });
+
+        let started = Instant::now();
+        let error = listen_event_payloads_with_stop(
+            &url,
+            Duration::from_millis(100),
+            Duration::from_millis(20),
+            Duration::from_millis(80),
+            &mut || false,
+            &mut |_| Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn event_listener_keeps_callback_errors_distinct_from_transport_errors() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 512];
+            let _ = stream.read(&mut request).unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\ndata: {}\r\n\r\n",
+                )
+                .unwrap();
+        });
+        let mut metrics = SseMetrics::default();
+
+        let failure = listen_event_payloads_with_stop_inner(
+            &url,
+            Duration::from_millis(100),
+            Duration::from_millis(20),
+            Duration::from_millis(100),
+            &mut || false,
+            &mut |_| Err("HTTP invalid closed application error".to_string()),
+            &mut metrics,
+        )
+        .unwrap_err();
+
+        assert_eq!(failure.kind, SseFailureKind::Callback);
+        assert_eq!(failure.kind.error_kind(), None);
+        assert_eq!(metrics.payload_count, 1);
         server.join().unwrap();
     }
 
