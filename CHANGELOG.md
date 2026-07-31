@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4](https://github.com/NathanaelRea/prism/compare/v0.1.3...v0.1.4) - 2026-07-31
+
+### Added
+
+- PR table ([#105](https://github.com/NathanaelRea/prism/pull/105))
+
+### Fixed
+
+- pr <C> branch name ([#106](https://github.com/NathanaelRea/prism/pull/106))
+- wt mode switch ([#102](https://github.com/NathanaelRea/prism/pull/102))
+- switch keybind order ([#103](https://github.com/NathanaelRea/prism/pull/103))
+- tui latency ([#101](https://github.com/NathanaelRea/prism/pull/101))
+
 ## [0.1.3](https://github.com/NathanaelRea/prism/compare/v0.1.2...v0.1.3) - 2026-07-30
 
 ### Fixed
