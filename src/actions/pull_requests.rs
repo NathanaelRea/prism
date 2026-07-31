@@ -60,8 +60,8 @@ pub(super) fn remote_pr_choice_keys() -> Vec<String> {
         .collect()
 }
 
-pub(super) fn remote_pr_worktree_branch(number: u64) -> String {
-    format!("pr/{number}")
+pub(super) fn remote_pr_worktree_branch(head_ref: &str) -> String {
+    head_ref.to_string()
 }
 
 fn remote_pr_choice_label(summary: &crate::github::PrSummary) -> String {
@@ -249,7 +249,7 @@ impl Tui {
             return Ok(Some(index));
         }
 
-        let branch = remote_pr_worktree_branch(summary.number);
+        let branch = remote_pr_worktree_branch(&summary.head_ref);
         self.show_loading_dialog(
             raw,
             "Remote Pull Requests",
@@ -306,7 +306,7 @@ impl Tui {
         }) {
             return Some(index);
         }
-        let branch = remote_pr_worktree_branch(summary.number);
+        let branch = remote_pr_worktree_branch(&summary.head_ref);
         let index = self.sessions.iter().position(|session| {
             !session.hidden && session.repo_index == repo_index && session.branch == branch
         })?;

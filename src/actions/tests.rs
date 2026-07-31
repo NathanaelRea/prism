@@ -204,13 +204,16 @@ fn pr_target_choices_offer_upstream_and_origin() {
 }
 
 #[test]
-fn remote_pr_picker_uses_stable_keys_and_branch_names() {
+fn remote_pr_picker_uses_stable_keys_and_preserves_branch_names() {
     let keys = remote_pr_choice_keys();
 
     assert_eq!(keys.first().map(String::as_str), Some("1"));
     assert_eq!(keys.get(8).map(String::as_str), Some("9"));
     assert_eq!(keys.get(9).map(String::as_str), Some("a"));
-    assert_eq!(remote_pr_worktree_branch(42), "pr/42");
+    assert_eq!(
+        remote_pr_worktree_branch("feature/exact-name"),
+        "feature/exact-name"
+    );
 }
 
 #[test]
