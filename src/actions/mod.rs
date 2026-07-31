@@ -14,7 +14,7 @@ use crate::auto_flow::{
     prepare_auto_run_for_resume,
 };
 use crate::config::Config;
-use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
+use crate::git::{branch_behind, git_status_label, pull_branch, selected_dirty};
 use crate::harness::{HarnessConfig, OutputFormat, PromptTransport};
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::lifecycle::{
@@ -40,7 +40,7 @@ use crate::remote::dispatcher::{
     refresh_change_request_cache as refresh_pr_cache,
     refresh_change_request_details_state as refresh_pr_details_cache_state,
     refresh_repository_policy as refresh_repo_policy_cache,
-    repository_project as github_remote_repo, wait_for_change_request_merged as wait_for_pr_merged,
+    wait_for_change_request_merged as wait_for_pr_merged,
 };
 use crate::remote::{
     PR_SUMMARY_POLL_INTERVAL, PrCache, apply_pr_details_poll_result, apply_pr_summary_poll_result,
@@ -102,9 +102,9 @@ use plans::plan_run_mode_from_parallel_confirmation;
 use polling::{discover_wt_columns, status_label_with_behind};
 #[cfg(test)]
 use pull_requests::{
-    apply_bulk_review_resolution, pr_target_choice_list, pr_target_repo_for_choice,
-    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
-    should_prompt_pr_target_choice, unresolved_review_thread_ids,
+    apply_bulk_review_resolution, pr_target_choice_list, remote_pr_choice_keys,
+    remote_pr_worktree_branch, run_browser_opener, unresolved_review_thread_ids,
+    validate_push_target_after_checks,
 };
 #[cfg(test)]
 use worktrees::archived_picker_overflow_message;

@@ -37,22 +37,6 @@ pub(super) fn pr_target_choice_list(origin: &str, upstream: &str) -> crate::view
     }
 }
 
-pub(super) fn should_prompt_pr_target_choice(origin: &str, upstream: &str) -> bool {
-    origin != upstream
-}
-
-pub(super) fn pr_target_repo_for_choice(
-    choice: &str,
-    origin: &str,
-    upstream: &str,
-) -> Option<String> {
-    match choice {
-        "u" => Some(upstream.to_string()),
-        "o" => Some(origin.to_string()),
-        _ => None,
-    }
-}
-
 pub(super) fn remote_pr_choice_keys() -> Vec<String> {
     ('1'..='9')
         .chain('a'..='z')
@@ -106,57 +90,50 @@ fn session_for_remote_action(session: &crate::session::Session) -> crate::sessio
 }
 
 fn remote_create_mutation_target(
-    path: &Path,
-    config: &Config,
-    branch: &str,
-) -> Result<crate::tui::RemoteMutationTarget, String> {
-    let source = crate::remote::discover_git_remote(
-        path,
-        config,
-        "origin",
-        crate::remote::RemoteUrlKind::Push,
-    )
-    .map_err(|error| error.to_string())?
-    .repository
-    .id;
-    Ok(crate::tui::RemoteMutationTarget::Create {
-        source_provider: source.provider(),
-        source_host: source.host().to_string(),
-        source_project: source.project_path().to_string(),
-        source_branch: branch.to_string(),
-        expected_head_sha: crate::git::current_head_sha(path, config)?,
-    })
+    guard: &crate::remote::dispatcher::CreateChangeRequestGuard,
+) -> crate::tui::RemoteMutationTarget {
+    crate::tui::RemoteMutationTarget::Create {
+        source_provider: guard.source_repository.provider(),
+        source_host: guard.source_repository.host().to_string(),
+        source_project: guard.source_repository.project_path().to_string(),
+        source_branch: guard.source_branch.clone(),
+        expected_head_sha: guard.expected_head_sha.clone(),
+        target_provider: Some(guard.target_repository.provider()),
+        target_host: guard.target_repository.host().to_string(),
+        target_project: guard.target_repository.project_path().to_string(),
+        target_branch: guard.target_branch.clone(),
+        expected_base_sha: guard.expected_base_sha.clone(),
+    }
 }
 
 fn remote_push_mutation_target(
-    path: &Path,
-    config: &Config,
-    branch: &str,
-    force_origin: bool,
-) -> Result<crate::tui::RemoteMutationTarget, String> {
-    let (remote, remote_branch) = if !force_origin && has_upstream(path, config)? {
-        let upstream = run_capture(
-            Command::new(config.tool("git")).arg("-C").arg(path).args([
-                "rev-parse",
-                "--abbrev-ref",
-                "--symbolic-full-name",
-                "@{upstream}",
-            ]),
-            ProcessPolicy::Metadata,
-        )?;
-        upstream
-            .trim()
-            .split_once('/')
-            .map(|(remote, branch)| (remote.to_string(), branch.to_string()))
-            .ok_or_else(|| "upstream branch is missing its remote name".to_string())?
-    } else {
-        ("origin".to_string(), branch.to_string())
-    };
-    Ok(crate::tui::RemoteMutationTarget::Push {
-        remote,
-        branch: remote_branch,
-        expected_head_sha: crate::git::current_head_sha(path, config)?,
-    })
+    guard: &crate::remote::dispatcher::PushGuard,
+) -> crate::tui::RemoteMutationTarget {
+    crate::tui::RemoteMutationTarget::Push {
+        remote: guard.remote.clone(),
+        branch: guard.remote_branch.clone(),
+        expected_head_sha: guard.expected_head_sha.clone(),
+        repository_provider: Some(guard.repository.provider()),
+        repository_host: guard.repository.host().to_string(),
+        repository_project: guard.repository.project_path().to_string(),
+    }
+}
+
+pub(super) fn validate_push_target_after_checks(
+    selected_branch: &str,
+    current_branch: &str,
+    expected: &crate::tui::RemoteMutationTarget,
+    current: &crate::tui::RemoteMutationTarget,
+) -> Result<(), String> {
+    if current_branch != selected_branch {
+        return Err(format!(
+            "selected branch changed from {selected_branch} to {current_branch} during pre-push checks"
+        ));
+    }
+    if current != expected {
+        return Err("push remote, branch, or HEAD changed during pre-push checks".to_string());
+    }
+    Ok(())
 }
 
 pub(super) fn open_url_in_browser(url: &str) -> Result<(), String> {
@@ -942,6 +919,10 @@ impl Tui {
             .unwrap_or_default();
         let job_path = path.clone();
         let job_branch = branch.clone();
+        let expected_push_guard =
+            crate::remote::dispatcher::prepare_push(&path, &context.config, &branch)?;
+        let expected_push_target = remote_push_mutation_target(&expected_push_guard);
+        let reconciliation_target = expected_push_target.clone();
         let RemoteActionValue::PushPrepared(prepared) = self.run_remote_action(
             raw,
             crate::tui::RemoteActionRequest {
@@ -951,31 +932,54 @@ impl Tui {
                 title: "Push Branch",
                 message: "Pushing selected branch",
                 abandon_cancelable: false,
-                mutation: Some(remote_push_mutation_target(
-                    &path,
-                    &context.config,
-                    &branch,
-                    false,
-                )?),
+                mutation: Some(reconciliation_target),
             },
             move || {
                 run_pre_push_checks(&config, &job_path)?;
-                let set_upstream = !has_upstream(&job_path, &config)?;
-                push_branch(&config, &job_path, &job_branch, set_upstream)?;
+                let current_branch = crate::git::current_branch_name(&job_path, &config)?
+                    .ok_or_else(|| "cannot push detached HEAD".to_string())?;
+                let current_push_guard =
+                    crate::remote::dispatcher::prepare_push(&job_path, &config, &job_branch)?;
+                let current_push_target = remote_push_mutation_target(&current_push_guard);
+                validate_push_target_after_checks(
+                    &job_branch,
+                    &current_branch,
+                    &expected_push_target,
+                    &current_push_target,
+                )?;
+                push_branch(
+                    &config,
+                    &job_path,
+                    &job_branch,
+                    current_push_guard.set_upstream,
+                )?;
+                let pushed_source_guard =
+                    crate::remote::dispatcher::prepare_push(&job_path, &config, &job_branch)?;
+                if !crate::remote::dispatcher::same_push_target(
+                    &current_push_guard,
+                    &pushed_source_guard,
+                ) {
+                    return Err("push destination changed while pushing".to_string());
+                }
                 refresh_pr_cache(&repo, &job_branch, &mut cache, &job_path, &config, true)?;
-                let (origin_project, upstream_project) = if cache.has_summary() {
+                let (origin_repository, upstream_repository) = if cache.has_summary() {
                     (None, None)
                 } else {
-                    run_pre_pr_checks(&config, &job_path)?;
-                    let origin = github_remote_repo(&job_path, &config, "origin")?;
-                    let upstream = github_remote_repo(&job_path, &config, "upstream").ok();
+                    let (origin, upstream) =
+                        crate::remote::dispatcher::create_change_request_targets(
+                            &job_path, &config,
+                        )?;
                     (Some(origin), upstream)
                 };
+                let push_guard = origin_repository
+                    .as_ref()
+                    .map(|_| pushed_source_guard.clone());
                 Ok(RemoteActionValue::PushPrepared(Box::new(
                     RemotePushPrepared {
                         cache,
-                        origin_project,
-                        upstream_project,
+                        origin_repository,
+                        upstream_repository,
+                        push_guard,
                     },
                 )))
             },
@@ -985,22 +989,29 @@ impl Tui {
         };
         self.apply_remote_cache_result(selected, prepared.cache);
         if !self.sessions[selected].pr.has_summary() {
-            let target_repo = if let (Some(origin), Some(upstream)) = (
-                prepared.origin_project.as_deref(),
-                prepared.upstream_project.as_deref(),
-            ) {
-                if !should_prompt_pr_target_choice(origin, upstream) {
-                    None
-                } else {
-                    let Some(choice) =
-                        self.prompt_choice_dialog(raw, pr_target_choice_list(origin, upstream))?
+            let source_push = prepared
+                .push_guard
+                .ok_or_else(|| "change request push source is unavailable".to_string())?;
+            let target_repository = match (prepared.origin_repository, prepared.upstream_repository)
+            {
+                (Some(origin), Some(upstream)) => {
+                    let origin_project = origin.project_path();
+                    let upstream_project = upstream.project_path();
+                    let Some(choice) = self.prompt_choice_dialog(
+                        raw,
+                        pr_target_choice_list(origin_project, upstream_project),
+                    )?
                     else {
                         return Ok(());
                     };
-                    pr_target_repo_for_choice(&choice, origin, upstream)
+                    match choice.as_str() {
+                        "u" => upstream,
+                        "o" => origin,
+                        _ => return Ok(()),
+                    }
                 }
-            } else {
-                None
+                (Some(origin), None) => origin,
+                _ => return Err("change request target is unavailable".to_string()),
             };
             let Some(pr_body) = self.prompt_pr_description(raw)? else {
                 return Ok(());
@@ -1010,6 +1021,35 @@ impl Tui {
             let branch = self.sessions[selected].branch.clone();
             let path = self.sessions[selected].path.clone();
             let mut cache = self.sessions[selected].pr.clone();
+            let prepare_path = path.clone();
+            let prepare_config = config.clone();
+            let RemoteActionValue::CreatePrepared(create_guard) = self.run_remote_action(
+                raw,
+                crate::tui::RemoteActionRequest {
+                    key: TuiJobKey::Worktree(worktree.clone()),
+                    generation,
+                    name: "prism-prepare-change-request",
+                    title: "Create Pull Request",
+                    message: "Running pre-PR checks",
+                    abandon_cancelable: true,
+                    mutation: None,
+                },
+                move || {
+                    run_pre_pr_checks(&prepare_config, &prepare_path)?;
+                    let guard = crate::remote::dispatcher::prepare_create_change_request(
+                        &prepare_path,
+                        &prepare_config,
+                        &branch,
+                        &target_repository,
+                        &source_push,
+                    )?;
+                    Ok(RemoteActionValue::CreatePrepared(Box::new(guard)))
+                },
+            )?
+            else {
+                return Err("pull request preparation returned an unexpected result".to_string());
+            };
+            let create_mutation = remote_create_mutation_target(&create_guard);
             let RemoteActionValue::Cache(cache) = self.run_remote_action(
                 raw,
                 crate::tui::RemoteActionRequest {
@@ -1019,16 +1059,15 @@ impl Tui {
                     title: "Create Pull Request",
                     message: "Creating pull request",
                     abandon_cancelable: false,
-                    mutation: Some(remote_create_mutation_target(&path, &config, &branch)?),
+                    mutation: Some(create_mutation),
                 },
                 move || {
                     create_pull_request(
                         &repo,
                         &config,
-                        &branch,
                         &path,
                         &pr_body,
-                        target_repo.as_deref(),
+                        &create_guard,
                         &mut cache,
                     )?;
                     Ok(RemoteActionValue::Cache(Box::new(cache)))
@@ -1081,11 +1120,12 @@ impl Tui {
                 message: "Reobserving guarded repair push",
                 abandon_cancelable: false,
                 mutation: Some(remote_push_mutation_target(
-                    &self.sessions[selected].path,
-                    &config,
-                    &self.sessions[selected].branch,
-                    true,
-                )?),
+                    &crate::remote::dispatcher::prepare_push(
+                        &self.sessions[selected].path,
+                        &config,
+                        &self.sessions[selected].branch,
+                    )?,
+                )),
             },
             move || {
                 let mut persisted = crate::observability::with_writable_db(&repo, |conn| {
@@ -1100,7 +1140,7 @@ impl Tui {
                             &config,
                             &mut persisted,
                             &mut cache,
-                            || run_pre_push_checks(&config, &path),
+                            || Ok(()),
                         )
                     })?)
                 } else {

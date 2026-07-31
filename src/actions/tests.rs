@@ -19,9 +19,9 @@ use crate::tui::{
 
 use super::{
     apply_bulk_review_resolution, archived_picker_overflow_message, discover_wt_columns,
-    plan_run_mode_from_parallel_confirmation, pr_target_choice_list, pr_target_repo_for_choice,
-    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
-    should_prompt_pr_target_choice, status_label_with_behind, unresolved_review_thread_ids,
+    plan_run_mode_from_parallel_confirmation, pr_target_choice_list, remote_pr_choice_keys,
+    remote_pr_worktree_branch, run_browser_opener, status_label_with_behind,
+    unresolved_review_thread_ids, validate_push_target_after_checks,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -190,17 +190,38 @@ fn pr_target_choices_offer_upstream_and_origin() {
     assert_eq!(choices.choices[0].label, "upstream (org/repo)");
     assert_eq!(choices.choices[1].key, "o");
     assert_eq!(choices.choices[1].label, "origin (me/repo)");
-    assert_eq!(
-        pr_target_repo_for_choice("u", "me/repo", "org/repo"),
-        Some("org/repo".to_string())
+}
+
+#[test]
+fn push_checks_must_preserve_selected_branch_remote_and_head() {
+    let expected = crate::tui::RemoteMutationTarget::Push {
+        remote: "origin".to_string(),
+        branch: "feature".to_string(),
+        expected_head_sha: "head-a".to_string(),
+        repository_provider: None,
+        repository_host: String::new(),
+        repository_project: String::new(),
+    };
+
+    assert!(validate_push_target_after_checks("feature", "feature", &expected, &expected).is_ok());
+    assert!(
+        validate_push_target_after_checks("feature", "other", &expected, &expected)
+            .unwrap_err()
+            .contains("selected branch changed")
     );
-    assert_eq!(
-        pr_target_repo_for_choice("o", "me/repo", "org/repo"),
-        Some("me/repo".to_string())
+    let changed = crate::tui::RemoteMutationTarget::Push {
+        remote: "upstream".to_string(),
+        branch: "feature".to_string(),
+        expected_head_sha: "head-b".to_string(),
+        repository_provider: None,
+        repository_host: String::new(),
+        repository_project: String::new(),
+    };
+    assert!(
+        validate_push_target_after_checks("feature", "feature", &expected, &changed)
+            .unwrap_err()
+            .contains("remote, branch, or HEAD changed")
     );
-    assert_eq!(pr_target_repo_for_choice("x", "me/repo", "org/repo"), None);
-    assert!(should_prompt_pr_target_choice("me/repo", "org/repo"));
-    assert!(!should_prompt_pr_target_choice("me/repo", "me/repo"));
 }
 
 #[test]

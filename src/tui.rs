@@ -608,6 +608,12 @@ pub(crate) enum RemoteMutationTarget {
         remote: String,
         branch: String,
         expected_head_sha: String,
+        #[serde(default)]
+        repository_provider: Option<crate::remote::ProviderKind>,
+        #[serde(default)]
+        repository_host: String,
+        #[serde(default)]
+        repository_project: String,
     },
     Create {
         source_provider: crate::remote::ProviderKind,
@@ -615,6 +621,16 @@ pub(crate) enum RemoteMutationTarget {
         source_project: String,
         source_branch: String,
         expected_head_sha: String,
+        #[serde(default)]
+        target_provider: Option<crate::remote::ProviderKind>,
+        #[serde(default)]
+        target_host: String,
+        #[serde(default)]
+        target_project: String,
+        #[serde(default)]
+        target_branch: String,
+        #[serde(default)]
+        expected_base_sha: String,
     },
     Review {
         change_request: crate::remote::CanonicalChangeRequestIdentity,
@@ -664,6 +680,7 @@ pub(crate) enum RemoteActionValue {
         count: usize,
     },
     PushPrepared(Box<RemotePushPrepared>),
+    CreatePrepared(Box<crate::remote::dispatcher::CreateChangeRequestGuard>),
     GuardedPush {
         persisted: Box<PersistedAutoRun>,
         cache: Box<PrCache>,
@@ -694,13 +711,114 @@ pub(crate) enum RemoteActionValue {
 
 pub(crate) struct RemotePushPrepared {
     pub cache: PrCache,
-    pub origin_project: Option<String>,
-    pub upstream_project: Option<String>,
+    pub origin_repository: Option<crate::remote::RemoteRepositoryId>,
+    pub upstream_repository: Option<crate::remote::RemoteRepositoryId>,
+    pub push_guard: Option<crate::remote::dispatcher::PushGuard>,
 }
 
 pub(crate) struct RemoteMergeOutcome {
     pub execution: crate::auto_flow::stabilization_execute::ManualMergeExecution,
     pub verification: Option<Result<bool, String>>,
+}
+
+fn remote_mutation_targets_overlap(
+    existing: &RemoteMutationTarget,
+    requested: &RemoteMutationTarget,
+) -> bool {
+    match (existing, requested) {
+        (
+            RemoteMutationTarget::Push {
+                remote: existing_remote,
+                branch: existing_branch,
+                expected_head_sha: existing_head,
+                repository_provider: existing_provider,
+                repository_host: existing_host,
+                repository_project: existing_project,
+            },
+            RemoteMutationTarget::Push {
+                remote: requested_remote,
+                branch: requested_branch,
+                expected_head_sha: requested_head,
+                repository_provider: requested_provider,
+                repository_host: requested_host,
+                repository_project: requested_project,
+            },
+        ) => {
+            existing_remote == requested_remote
+                && existing_branch == requested_branch
+                && existing_head == requested_head
+                && optional_repository_fields_match(
+                    *existing_provider,
+                    existing_host,
+                    existing_project,
+                    *requested_provider,
+                    requested_host,
+                    requested_project,
+                )
+        }
+        (
+            RemoteMutationTarget::Create {
+                source_provider: existing_source_provider,
+                source_host: existing_source_host,
+                source_project: existing_source_project,
+                source_branch: existing_source_branch,
+                expected_head_sha: existing_head,
+                target_provider: existing_target_provider,
+                target_host: existing_target_host,
+                target_project: existing_target_project,
+                target_branch: existing_target_branch,
+                expected_base_sha: existing_base,
+            },
+            RemoteMutationTarget::Create {
+                source_provider: requested_source_provider,
+                source_host: requested_source_host,
+                source_project: requested_source_project,
+                source_branch: requested_source_branch,
+                expected_head_sha: requested_head,
+                target_provider: requested_target_provider,
+                target_host: requested_target_host,
+                target_project: requested_target_project,
+                target_branch: requested_target_branch,
+                expected_base_sha: requested_base,
+            },
+        ) => {
+            existing_source_provider == requested_source_provider
+                && existing_source_host == requested_source_host
+                && existing_source_project == requested_source_project
+                && existing_source_branch == requested_source_branch
+                && existing_head == requested_head
+                && optional_repository_fields_match(
+                    *existing_target_provider,
+                    existing_target_host,
+                    existing_target_project,
+                    *requested_target_provider,
+                    requested_target_host,
+                    requested_target_project,
+                )
+                && (existing_target_branch.is_empty()
+                    || requested_target_branch.is_empty()
+                    || existing_target_branch == requested_target_branch)
+                && (existing_base.is_empty()
+                    || requested_base.is_empty()
+                    || existing_base == requested_base)
+        }
+        _ => existing == requested,
+    }
+}
+
+fn optional_repository_fields_match(
+    left_provider: Option<crate::remote::ProviderKind>,
+    left_host: &str,
+    left_project: &str,
+    right_provider: Option<crate::remote::ProviderKind>,
+    right_host: &str,
+    right_project: &str,
+) -> bool {
+    left_provider.is_none()
+        || right_provider.is_none()
+        || (left_provider == right_provider
+            && left_host == right_host
+            && left_project == right_project)
 }
 
 fn uncertain_remote_mutation_error(result: &Result<RemoteActionValue, String>) -> Option<&str> {
@@ -2241,6 +2359,7 @@ impl Tui {
                 remote,
                 branch,
                 expected_head_sha,
+                ..
             } => {
                 remote_branch_heads.get(&(remote.clone(), branch.clone()))
                     != Some(expected_head_sha)
@@ -2251,9 +2370,15 @@ impl Tui {
                 source_project,
                 source_branch,
                 expected_head_sha,
+                target_provider,
+                target_host,
+                target_project,
+                target_branch,
+                ..
             } => !summaries.iter().any(|summary| {
                 summary.head_ref == *source_branch
                     && summary.head_sha == *expected_head_sha
+                    && (target_branch.is_empty() || summary.base_ref == *target_branch)
                     && summary
                         .change_request_identity
                         .as_ref()
@@ -2261,6 +2386,11 @@ impl Tui {
                             identity.source_provider() == *source_provider
                                 && identity.source_canonical_host() == source_host
                                 && identity.source_project_path() == source_project
+                                && target_provider.is_none_or(|provider| {
+                                    identity.target_provider() == provider
+                                        && identity.target_canonical_host() == target_host
+                                        && identity.target_project_path() == target_project
+                                })
                         })
             }),
             RemoteMutationTarget::Merge {
@@ -2372,7 +2502,7 @@ impl Tui {
                 .is_some_and(|markers| {
                     markers.iter().any(|marker| {
                         matches!(marker.target, RemoteMutationTarget::Unknown { .. })
-                            || &marker.target == target
+                            || remote_mutation_targets_overlap(&marker.target, target)
                     })
                 })
         })
@@ -2801,6 +2931,7 @@ impl Tui {
                 Ok(())
             }
             RemoteActionValue::ChangeRequests(_)
+            | RemoteActionValue::CreatePrepared(_)
             | RemoteActionValue::MergeAuthorization { .. }
             | RemoteActionValue::NotApplicable
             | RemoteActionValue::Complete => Ok(()),
@@ -6200,7 +6331,8 @@ mod tests {
         RemoteMutationTarget, RemotePushPrepared, TmuxPortalCapture, TmuxPortalResult,
         TmuxPortalSnapshot, Tui, TuiJobKey, TuiJobKind, TuiJobPayload, WorktreeListMode,
         confirmation_result, move_enabled_ordered_item, remote_action_abandon_requested,
-        remote_action_timeout, selectable_choice_key, toggle_item_in_place, toggle_ordered_item,
+        remote_action_timeout, remote_mutation_targets_overlap, selectable_choice_key,
+        toggle_item_in_place, toggle_ordered_item,
     };
 
     #[test]
@@ -6722,8 +6854,9 @@ mod tests {
                         },
                         "push" => RemoteActionValue::PushPrepared(Box::new(RemotePushPrepared {
                             cache,
-                            origin_project: None,
-                            upstream_project: None,
+                            origin_repository: None,
+                            upstream_repository: None,
+                            push_guard: None,
                         })),
                         "merge" => RemoteActionValue::MergeExecution {
                             session: Box::new(payload_session.unwrap()),
@@ -6809,7 +6942,25 @@ mod tests {
             source_project: "example/repo".to_string(),
             source_branch: "feature".to_string(),
             expected_head_sha: "abc123".to_string(),
+            target_provider: Some(crate::remote::ProviderKind::GitHub),
+            target_host: "github.com".to_string(),
+            target_project: "example/repo".to_string(),
+            target_branch: "main".to_string(),
+            expected_base_sha: "base123".to_string(),
         };
+        let legacy_target = RemoteMutationTarget::Create {
+            source_provider: crate::remote::ProviderKind::GitHub,
+            source_host: "github.com".to_string(),
+            source_project: "example/repo".to_string(),
+            source_branch: "feature".to_string(),
+            expected_head_sha: "abc123".to_string(),
+            target_provider: None,
+            target_host: String::new(),
+            target_project: String::new(),
+            target_branch: String::new(),
+            expected_base_sha: String::new(),
+        };
+        assert!(remote_mutation_targets_overlap(&legacy_target, &target));
         tui.record_remote_mutation_reconciliation(
             &TuiJobKey::Worktree(worktree),
             7,
@@ -6833,6 +6984,11 @@ mod tests {
         assert!(restarted.sessions[0].pr.trusted_summary().is_err());
 
         restarted.reconcile_remote_mutation_summaries(&repository, &[], &BTreeMap::new());
+        assert!(restarted.remote_action_reconciliation_blocked(&key, &target));
+
+        let mut wrong_base = observed.clone();
+        wrong_base.base_ref = "release".to_string();
+        restarted.reconcile_remote_mutation_summaries(&repository, &[wrong_base], &BTreeMap::new());
         assert!(restarted.remote_action_reconciliation_blocked(&key, &target));
 
         restarted.reconcile_remote_mutation_summaries(&repository, &[observed], &BTreeMap::new());
@@ -6906,6 +7062,9 @@ mod tests {
                 remote: "origin".to_string(),
                 branch: "feature".to_string(),
                 expected_head_sha: "abc123".to_string(),
+                repository_provider: None,
+                repository_host: String::new(),
+                repository_project: String::new(),
             },
             RemoteMutationTarget::Create {
                 source_provider: crate::remote::ProviderKind::GitHub,
@@ -6913,6 +7072,11 @@ mod tests {
                 source_project: "example/repo".to_string(),
                 source_branch: "feature".to_string(),
                 expected_head_sha: "abc123".to_string(),
+                target_provider: None,
+                target_host: String::new(),
+                target_project: String::new(),
+                target_branch: String::new(),
+                expected_base_sha: String::new(),
             },
             RemoteMutationTarget::Review {
                 change_request: identity.clone(),
@@ -7002,6 +7166,9 @@ mod tests {
             remote: "origin".to_string(),
             branch: branch.to_string(),
             expected_head_sha: "abc123".to_string(),
+            repository_provider: None,
+            repository_host: String::new(),
+            repository_project: String::new(),
         };
         let mut summary = test_pr_summary(false);
         summary.number = 42;

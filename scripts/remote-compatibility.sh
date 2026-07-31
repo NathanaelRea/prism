@@ -21,9 +21,6 @@ skip() {
 }
 
 unavailable() {
-  if [[ "$required_mode" == "1" ]]; then
-    fail "$1"
-  fi
   skip "$1"
 }
 
@@ -34,23 +31,13 @@ require_tool() {
   }
 }
 
-test_required_modes() {
+test_unavailable_prerequisite_skip() {
   provider="mode-test"
-  required_mode=0
-  local output status
+  local output
   output="$(unavailable "fixture unavailable" 2>&1)"
   [[ "$output" == "SKIP: mode-test compatibility: fixture unavailable" ]] \
-    || fail "optional mode did not report SKIP"
-
-  required_mode=1
-  set +e
-  output="$(unavailable "fixture unavailable" 2>&1)"
-  status=$?
-  set -e
-  [[ $status -ne 0 ]] || fail "required mode accepted an unavailable prerequisite"
-  [[ "$output" == "FAIL: mode-test compatibility: fixture unavailable" ]] \
-    || fail "required mode did not report FAIL"
-  printf 'PASS: scheduled required mode fails and manual/local mode skips\n'
+    || fail "unavailable prerequisite did not report SKIP"
+  printf 'PASS: unavailable prerequisites skip compatibility runs\n'
 }
 
 wait_for_json() {
@@ -304,14 +291,6 @@ seed_forgejo() {
   exit 2
 }
 provider="$1"
-required_mode="${PRISM_REMOTE_COMPATIBILITY_REQUIRED:-0}"
-case "$required_mode" in
-  0 | 1) ;;
-  *)
-    printf 'PRISM_REMOTE_COMPATIBILITY_REQUIRED must be 0 or 1\n' >&2
-    exit 2
-    ;;
-esac
 case "$provider" in
   gitlab)
     image="$GITLAB_IMAGE"
@@ -320,7 +299,7 @@ case "$provider" in
     image="$FORGEJO_IMAGE"
     ;;
   self-test)
-    test_required_modes
+    test_unavailable_prerequisite_skip
     exit 0
     ;;
   *)

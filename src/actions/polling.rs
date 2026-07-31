@@ -810,18 +810,5 @@ fn remote_branch_head(
     remote: &str,
     branch: &str,
 ) -> Result<Option<String>, String> {
-    let reference = format!("refs/heads/{branch}");
-    let output = run_capture(
-        Command::new(config.tool("git")).arg("-C").arg(path).args([
-            "ls-remote",
-            "--heads",
-            remote,
-            &reference,
-        ]),
-        crate::process::ProcessPolicy::NetworkQuery,
-    )?;
-    Ok(output.lines().find_map(|line| {
-        let (sha, observed_ref) = line.split_once(char::is_whitespace)?;
-        (observed_ref.trim() == reference && !sha.trim().is_empty()).then(|| sha.trim().to_string())
-    }))
+    crate::git::push_remote_branch_head_sha(path, remote, branch, config)
 }

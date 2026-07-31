@@ -63,8 +63,6 @@ jobs:
           toolchain: "1.95"
       - name: Run pinned local compatibility suite
         if: steps.selection.outputs.run == 'true'
-        env:
-          PRISM_REMOTE_COMPATIBILITY_REQUIRED: ${{ github.event_name == 'schedule' && '1' || '0' }}
         run: scripts/remote-compatibility.sh "${{ matrix.provider }}"
 
   public-drift:

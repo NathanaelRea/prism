@@ -527,6 +527,56 @@ impl ConfiguredRemoteRepositories {
         }
         Ok(())
     }
+
+    fn fetch_remote_name(&self, repository: &RemoteRepositoryId) -> Result<&'static str, String> {
+        if &self.origin_fetch == repository {
+            return Ok("origin");
+        }
+        if self.upstream_fetch.as_ref() == Some(repository) {
+            return Ok("upstream");
+        }
+        Err("target repository is no longer configured for fetch".to_string())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CreateChangeRequestGuard {
+    pub(crate) source_push: PushGuard,
+    pub(crate) source_repository: RemoteRepositoryId,
+    pub(crate) target_repository: RemoteRepositoryId,
+    pub(crate) local_branch: String,
+    pub(crate) source_branch: String,
+    pub(crate) target_branch: String,
+    pub(crate) expected_head_sha: String,
+    pub(crate) expected_base_sha: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PushGuard {
+    pub(crate) repository: RemoteRepositoryId,
+    pub(crate) remote: String,
+    pub(crate) remote_branch: String,
+    pub(crate) local_branch: String,
+    pub(crate) expected_head_sha: String,
+    pub(crate) set_upstream: bool,
+}
+
+pub(crate) fn same_push_target(left: &PushGuard, right: &PushGuard) -> bool {
+    left.repository == right.repository
+        && left.remote == right.remote
+        && left.remote_branch == right.remote_branch
+        && left.local_branch == right.local_branch
+        && left.expected_head_sha == right.expected_head_sha
+}
+
+fn validate_create_change_request_guard(
+    expected: &CreateChangeRequestGuard,
+    fresh: &CreateChangeRequestGuard,
+) -> Result<(), String> {
+    if fresh != expected {
+        return Err("change request source, target, or base changed before creation".to_string());
+    }
+    Ok(())
 }
 
 fn configured_remote_repositories(
@@ -563,6 +613,168 @@ fn configured_remote_repositories(
         upstream_fetch,
         upstream_push,
         fetch_repositories,
+    })
+}
+
+pub(crate) fn create_change_request_targets(
+    path: &Path,
+    config: &Config,
+) -> Result<(RemoteRepositoryId, Option<RemoteRepositoryId>), String> {
+    let remotes = configured_remote_repositories(path, config)?;
+    let upstream = remotes
+        .upstream_fetch
+        .filter(|repository| repository != &remotes.origin_fetch);
+    Ok((remotes.origin_fetch, upstream))
+}
+
+pub(crate) fn fetch_remote_name_for_repository(
+    path: &Path,
+    config: &Config,
+    repository: &RemoteRepositoryId,
+) -> Result<String, String> {
+    configured_remote_repositories(path, config)?
+        .fetch_remote_name(repository)
+        .map(str::to_string)
+}
+
+pub(crate) fn fetch_repository_branch_head_sha(
+    path: &Path,
+    config: &Config,
+    repository: &RemoteRepositoryId,
+    branch: &str,
+) -> Result<Option<String>, String> {
+    let remote = fetch_remote_name_for_repository(path, config, repository)?;
+    crate::git::fetch_remote_branch(path, &remote, branch, config)?;
+    crate::git::remote_branch_head_sha_on(path, &remote, branch, config)
+}
+
+pub(crate) fn fetch_change_request_base_head_sha(
+    path: &Path,
+    config: &Config,
+    summary: &PrSummary,
+) -> Result<Option<String>, String> {
+    let identity = summary
+        .change_request_identity
+        .as_ref()
+        .ok_or_else(|| "change request has no canonical identity".to_string())?;
+    let target = identity
+        .target_repository()
+        .map_err(|error| error.to_string())?;
+    fetch_repository_branch_head_sha(path, config, &target, &summary.base_ref)
+}
+
+pub(crate) fn prepare_create_change_request(
+    path: &Path,
+    config: &Config,
+    branch: &str,
+    target_repository: &RemoteRepositoryId,
+    source_push: &PushGuard,
+) -> Result<CreateChangeRequestGuard, String> {
+    let current_branch = crate::git::current_branch_name(path, config)?
+        .ok_or_else(|| "cannot create a change request from detached HEAD".to_string())?;
+    if current_branch != branch {
+        return Err(format!(
+            "selected branch changed from {branch} to {current_branch} before change request creation"
+        ));
+    }
+
+    let fresh_push = prepare_push(path, config, branch)?;
+    if &fresh_push != source_push {
+        return Err("change request push source changed before creation".to_string());
+    }
+    let remotes = configured_remote_repositories(path, config)?;
+    remotes.validate_target_repository(target_repository)?;
+    if source_push.repository.provider() != target_repository.provider() {
+        return Err("change request source and target use different providers".to_string());
+    }
+    let target_remote = remotes.fetch_remote_name(target_repository)?;
+    let target_branch = config
+        .default_base
+        .as_deref()
+        .map(str::trim)
+        .filter(|branch| !branch.is_empty())
+        .unwrap_or("main")
+        .to_string();
+    crate::git::fetch_remote_branch(path, target_remote, &target_branch, config)?;
+    let expected_base_sha =
+        crate::git::remote_branch_head_sha_on(path, target_remote, &target_branch, config)?
+            .ok_or_else(|| {
+                format!(
+                    "change request target branch {target_remote}/{target_branch} does not exist"
+                )
+            })?;
+
+    let expected_head_sha = crate::git::current_head_sha(path, config)?;
+    let source_head_sha = crate::git::push_remote_branch_head_sha(
+        path,
+        &source_push.remote,
+        &source_push.remote_branch,
+        config,
+    )?
+    .ok_or_else(|| "change request source branch does not exist on the push remote".to_string())?;
+    if source_head_sha != expected_head_sha {
+        return Err("change request source branch does not match the expected HEAD".to_string());
+    }
+
+    Ok(CreateChangeRequestGuard {
+        source_push: source_push.clone(),
+        source_repository: source_push.repository.clone(),
+        target_repository: target_repository.clone(),
+        local_branch: branch.to_string(),
+        source_branch: source_push.remote_branch.clone(),
+        target_branch,
+        expected_head_sha,
+        expected_base_sha,
+    })
+}
+
+pub(crate) fn prepare_push(
+    path: &Path,
+    config: &Config,
+    selected_branch: &str,
+) -> Result<PushGuard, String> {
+    let local_branch = crate::git::current_branch_name(path, config)?
+        .ok_or_else(|| "cannot push detached HEAD".to_string())?;
+    if local_branch != selected_branch {
+        return Err(format!(
+            "selected branch changed from {selected_branch} to {local_branch} before push"
+        ));
+    }
+    let push_destination = crate::process::run_capture(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .arg("for-each-ref")
+            .arg("--format=%(push:remotename)%00%(push)")
+            .arg(format!("refs/heads/{selected_branch}")),
+        crate::process::ProcessPolicy::Metadata,
+    )?;
+    let (remote, remote_branch, set_upstream) = match push_destination.trim().split_once('\0') {
+        Some((remote, push_ref)) if !remote.is_empty() && !push_ref.is_empty() => {
+            let prefix = format!("refs/remotes/{remote}/");
+            (
+                remote.to_string(),
+                push_ref
+                    .strip_prefix(&prefix)
+                    .ok_or_else(|| "push destination is not a remote-tracking branch".to_string())?
+                    .to_string(),
+                false,
+            )
+        }
+        _ => ("origin".to_string(), selected_branch.to_string(), true),
+    };
+    crate::git::single_push_remote_url(path, &remote, config)?;
+    let repository = discover_git_remote(path, config, &remote, RemoteUrlKind::Push)
+        .map_err(|error| error.to_string())?
+        .repository
+        .id;
+    Ok(PushGuard {
+        repository,
+        remote,
+        remote_branch,
+        local_branch,
+        expected_head_sha: crate::git::current_head_sha(path, config)?,
+        set_upstream,
     })
 }
 
@@ -883,23 +1095,46 @@ fn policy_fact<T: Default>(
 pub(crate) fn create_change_request(
     repo: &Repository,
     config: &Config,
-    branch: &str,
     path: &Path,
     body: &str,
-    target_project: Option<&str>,
+    guard: &CreateChangeRequestGuard,
     cache: &mut PrCache,
 ) -> Result<(), String> {
-    let remotes = configured_remote_repositories(path, config)?;
-    let source = remotes.origin_push.clone();
-    let target = remotes.create_target(target_project)?;
-    remotes.validate_source_mutation(&source, &target)?;
+    let fresh = prepare_create_change_request(
+        path,
+        config,
+        &guard.local_branch,
+        &guard.target_repository,
+        &guard.source_push,
+    )?;
+    validate_create_change_request_guard(guard, &fresh)?;
+    let source = guard.source_repository.clone();
+    let target = guard.target_repository.clone();
     let adapter = Adapter::for_repository(config, &target)?;
     if matches!(adapter, Adapter::GitHub) {
-        github::run_create_pull_request(config, path, body, Some(target.project_path()))?;
+        let github_head = if guard.source_repository == guard.target_repository {
+            guard.source_branch.clone()
+        } else {
+            let owner = guard
+                .source_repository
+                .project_path()
+                .split('/')
+                .next()
+                .ok_or_else(|| "GitHub source repository has no owner".to_string())?;
+            format!("{owner}:{}", guard.source_branch)
+        };
+        github::run_create_pull_request(
+            config,
+            path,
+            body,
+            Some(target.project_path()),
+            Some(&guard.target_branch),
+            Some(&github_head),
+        )?;
         let summary = github::fetch_pr_summary_index_for_repository(path, config, &target)?
             .into_iter()
             .find(|summary| {
-                summary.head_ref == branch
+                summary.head_ref == guard.source_branch
                     && summary
                         .change_request_identity
                         .as_ref()
@@ -908,20 +1143,16 @@ pub(crate) fn create_change_request(
                         == Some(&source)
             })
             .ok_or_else(|| "created pull request was not returned by GitHub".to_string())?;
-        github::record_pr_summary(repo, branch, cache, summary);
-        return refresh_change_request_cache(repo, branch, cache, path, config, true);
+        github::record_pr_summary(repo, &guard.local_branch, cache, summary);
+        return refresh_change_request_cache(repo, &guard.local_branch, cache, path, config, true);
     }
-    let head_sha = crate::git::current_head_sha(path, config)?;
     let request = CreateChangeRequest {
         source_repository: source,
         target_repository: target.clone(),
-        source_branch: branch.to_string(),
-        target_branch: config
-            .default_base
-            .clone()
-            .unwrap_or_else(|| "main".to_string()),
-        expected_head_sha: head_sha,
-        title: branch.replace(['-', '_'], " "),
+        source_branch: guard.source_branch.clone(),
+        target_branch: guard.target_branch.clone(),
+        expected_head_sha: guard.expected_head_sha.clone(),
+        title: guard.local_branch.replace(['-', '_'], " "),
         body: body.to_string(),
         draft: false,
     };
@@ -935,8 +1166,13 @@ pub(crate) fn create_change_request(
             .map_err(|error| error.to_string())?,
         Adapter::GitHub => unreachable!(),
     };
-    github::record_pr_summary(repo, branch, cache, to_legacy_summary(summary)?);
-    refresh_change_request_cache(repo, branch, cache, path, config, true)
+    github::record_pr_summary(
+        repo,
+        &guard.local_branch,
+        cache,
+        to_legacy_summary(summary)?,
+    );
+    refresh_change_request_cache(repo, &guard.local_branch, cache, path, config, true)
 }
 
 pub(crate) fn merge_change_request(
@@ -1498,6 +1734,85 @@ mod tests {
         RemoteRepositoryId::new(provider, HostIdentity::parse(host).unwrap(), project).unwrap()
     }
 
+    #[test]
+    fn create_guard_rejects_target_or_base_drift() {
+        let source_repository = repository(ProviderKind::GitHub, "contributor/widget");
+        let expected = CreateChangeRequestGuard {
+            source_push: PushGuard {
+                repository: source_repository.clone(),
+                remote: "origin".to_string(),
+                remote_branch: "feature".to_string(),
+                local_branch: "feature".to_string(),
+                expected_head_sha: "head-a".to_string(),
+                set_upstream: false,
+            },
+            source_repository,
+            target_repository: repository(ProviderKind::GitHub, "acme/widget"),
+            local_branch: "feature".to_string(),
+            source_branch: "feature".to_string(),
+            target_branch: "main".to_string(),
+            expected_head_sha: "head-a".to_string(),
+            expected_base_sha: "base-a".to_string(),
+        };
+        assert!(validate_create_change_request_guard(&expected, &expected).is_ok());
+
+        let changed_target = CreateChangeRequestGuard {
+            target_repository: repository(ProviderKind::GitHub, "other/widget"),
+            ..expected.clone()
+        };
+        assert!(
+            validate_create_change_request_guard(&expected, &changed_target)
+                .unwrap_err()
+                .contains("target")
+        );
+        let changed_base = CreateChangeRequestGuard {
+            expected_base_sha: "base-b".to_string(),
+            ..expected.clone()
+        };
+        assert!(validate_create_change_request_guard(&expected, &changed_base).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_guard_uses_git_push_destination_and_canonical_push_url() {
+        let directory = std::env::temp_dir().join(format!(
+            "prism-push-guard-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut config = crate::test_support::test_config();
+        crate::test_support::install_tool(
+            &mut config,
+            &directory,
+            "git",
+            r#"#!/bin/sh
+case "$*" in
+  *"branch --show-current"*) printf '%s\n' 'feature' ;;
+  *"for-each-ref --format=%(push:remotename)%00%(push) refs/heads/feature"*) printf 'publish\000refs/remotes/publish/review/feature\n' ;;
+  *"remote get-url --push --all publish"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
+  *"remote get-url publish --push"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
+  *"rev-parse HEAD"*) printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ;;
+  *) exit 1 ;;
+esac
+"#,
+        );
+
+        let guard = prepare_push(&directory, &config, "feature").unwrap();
+
+        assert_eq!(guard.remote, "publish");
+        assert_eq!(guard.remote_branch, "review/feature");
+        assert_eq!(
+            guard.repository,
+            repository(ProviderKind::GitHub, "contributor/widget")
+        );
+        assert!(!guard.set_upstream);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     fn legacy_summary() -> PrSummary {
         PrSummary {
             number: 42,
@@ -1563,6 +1878,7 @@ mod tests {
             "git",
             r#"#!/bin/sh
 case "$*" in
+  *"remote get-url --push --all origin"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
   *"remote get-url origin --push"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
   *"remote get-url origin"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
   *"remote get-url upstream"*) printf '%s\n' 'https://github.com/acme/widget.git' ;;
@@ -1615,6 +1931,7 @@ esac
             "git",
             r#"#!/bin/sh
 case "$*" in
+  *"remote get-url --push --all origin"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
   *"remote get-url origin --push"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
   *"remote get-url origin"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
   *"remote get-url upstream"*) printf '%s\n' 'https://github.com/acme/widget.git' ;;
@@ -1851,9 +2168,16 @@ esac
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> '{}'
 case "$*" in
+  *"remote get-url --push --all origin"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
   *"remote get-url origin --push"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
   *"remote get-url origin"*) printf '%s\n' 'https://github.com/acme/widget.git' ;;
   *"remote get-url upstream"*) exit 2 ;;
+  *"branch --show-current"*) printf '%s\n' 'topic' ;;
+  *"for-each-ref --format=%(push:remotename)%00%(push) refs/heads/topic"*) printf 'origin\000refs/remotes/origin/topic\n' ;;
+  *"fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main"*) exit 0 ;;
+  *"rev-parse --verify --quiet refs/remotes/origin/main"*) printf '%s\n' 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' ;;
+  *"rev-parse HEAD"*) printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ;;
+  *"ls-remote --exit-code --heads https://github.com/contributor/widget.git refs/heads/topic"*) printf '%s\t%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' 'refs/heads/topic' ;;
   *) exit 1 ;;
 esac
 "#,
@@ -1878,11 +2202,13 @@ esac
         let repo =
             Repository::with_config_dir_for_test(directory.clone(), directory.join("config"));
         let mut cache = PrCache::default();
+        let target = repository(ProviderKind::GitHub, "acme/widget");
+        let source_push = prepare_push(&directory, &config, "topic").unwrap();
+        let guard =
+            prepare_create_change_request(&directory, &config, "topic", &target, &source_push)
+                .unwrap();
 
-        create_change_request(
-            &repo, &config, "topic", &directory, "body", None, &mut cache,
-        )
-        .unwrap();
+        create_change_request(&repo, &config, &directory, "body", &guard, &mut cache).unwrap();
 
         let identity = cache
             .summary()
@@ -1899,7 +2225,9 @@ esac
             repository(ProviderKind::GitHub, "acme/widget")
         );
         let commands = std::fs::read_to_string(&gh_log).unwrap();
-        assert!(commands.contains("pr create --fill --body body --repo acme/widget"));
+        assert!(commands.contains(
+            "pr create --fill --body body --repo acme/widget --base main --head contributor:topic"
+        ));
         let commands = std::fs::read_to_string(&git_log).unwrap();
         assert!(commands.contains("remote get-url origin"));
         assert!(commands.contains("remote get-url origin --push"));

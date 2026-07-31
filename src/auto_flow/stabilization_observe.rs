@@ -8,7 +8,7 @@ use crate::remote::{PrCache, PrDetails, PrReview, PrReviewComment, PrSummary, Re
 use crate::repo::Repository;
 use crate::review::{ReviewFeedback, ReviewFeedbackFilter, actionable_review_feedback};
 use crate::session::Session;
-use crate::verify::run_merge_conflict_check_against;
+use crate::verify::{VerifyCheckKind, VerifyCheckResult, run_merge_conflict_check_against_remote};
 
 use super::stabilization_model::*;
 
@@ -22,11 +22,6 @@ pub(crate) fn build_stabilization_snapshot(
     let remote_head_sha = git::remote_branch_head_sha(&session.path, &session.branch, config)
         .ok()
         .flatten();
-    let base_sha = session.pr.summary().and_then(|summary| {
-        git::remote_branch_head_sha(&session.path, &summary.base_ref, config)
-            .ok()
-            .flatten()
-    });
     let remote = crate::remote::discover_git_remote(
         &session.path,
         config,
@@ -46,9 +41,28 @@ pub(crate) fn build_stabilization_snapshot(
     let policy_cache = target_repository.as_ref().and_then(|repository| {
         crate::remote::load_repo_policy_cache_for_repository(repo, repository)
     });
+    let target_remote = target_remote_name(&session.path, config, target_repository.as_ref());
     let merge_conflict = session.pr.summary().and_then(|summary| {
-        (!session.is_default_branch(config) && !session.is_detached())
-            .then(|| run_merge_conflict_check_against(config, &session.path, &summary.base_ref))
+        (!session.is_default_branch(config) && !session.is_detached()).then(|| {
+            target_remote.as_deref().map_or_else(
+                |error| target_remote_check_error(error),
+                |remote| {
+                    run_merge_conflict_check_against_remote(
+                        config,
+                        &session.path,
+                        remote,
+                        &summary.base_ref,
+                    )
+                },
+            )
+        })
+    });
+    let base_sha = session.pr.summary().and_then(|summary| {
+        target_remote.as_ref().ok().and_then(|remote| {
+            git::remote_branch_head_sha_on(&session.path, remote, &summary.base_ref, config)
+                .ok()
+                .flatten()
+        })
     });
     let (worktree_dirty, worktree_observation_error) =
         observe_worktree_dirty(&session.path, config);
@@ -133,11 +147,6 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
     let remote_head_sha = git::remote_branch_head_sha(&run.worktree_path, &run.branch, config)
         .ok()
         .flatten();
-    let base_sha = cache.summary().and_then(|summary| {
-        git::remote_branch_head_sha(&run.worktree_path, &summary.base_ref, config)
-            .ok()
-            .flatten()
-    });
     let remote = crate::remote::discover_git_remote(
         &run.worktree_path,
         config,
@@ -159,9 +168,27 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
             .and_then(|policy| policy.default_branch.as_deref())
             == Some(run.branch.as_str());
     let detached = run.branch == "(detached)";
+    let target_remote = target_remote_name(&run.worktree_path, config, target_repository.as_ref());
     let merge_conflict = cache.summary().and_then(|summary| {
         (!is_default_branch && !detached).then(|| {
-            run_merge_conflict_check_against(config, &run.worktree_path, &summary.base_ref)
+            target_remote.as_deref().map_or_else(
+                |error| target_remote_check_error(error),
+                |remote| {
+                    run_merge_conflict_check_against_remote(
+                        config,
+                        &run.worktree_path,
+                        remote,
+                        &summary.base_ref,
+                    )
+                },
+            )
+        })
+    });
+    let base_sha = cache.summary().and_then(|summary| {
+        target_remote.as_ref().ok().and_then(|remote| {
+            git::remote_branch_head_sha_on(&run.worktree_path, remote, &summary.base_ref, config)
+                .ok()
+                .flatten()
         })
     });
     let (worktree_dirty, worktree_observation_error) =
@@ -216,6 +243,28 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
             cleanup_after_merge: config.auto.cleanup_after_merge,
         },
         pending_push: run.pending_push.clone(),
+    }
+}
+
+fn target_remote_name(
+    path: &std::path::Path,
+    config: &Config,
+    target_repository: Option<&crate::remote::RemoteRepositoryId>,
+) -> Result<String, String> {
+    match target_repository {
+        Some(repository) => {
+            crate::remote::dispatcher::fetch_remote_name_for_repository(path, config, repository)
+        }
+        None => Ok("origin".to_string()),
+    }
+}
+
+fn target_remote_check_error(error: &str) -> VerifyCheckResult {
+    VerifyCheckResult {
+        kind: VerifyCheckKind::MergeConflict,
+        label: "merge conflict".to_string(),
+        passed: false,
+        message: format!("change request target remote is unavailable: {error}"),
     }
 }
 
@@ -1049,7 +1098,7 @@ case "$*" in
   *"rev-parse --verify --quiet refs/remotes/origin/feature"*) printf '%s\n' 'remote123'; exit 0 ;;
   *"rev-parse --verify --quiet refs/remotes/origin/main"*) printf '%s\n' 'base123'; exit 0 ;;
   *"status --short"*) exit 0 ;;
-  *"fetch origin main"*) exit 0 ;;
+  *"fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main"*) exit 0 ;;
   *"merge-tree --write-tree HEAD origin/main"*) printf '%s\n' 'tree123'; exit 0 ;;
 esac
 exit 1

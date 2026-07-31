@@ -463,10 +463,6 @@ pub(super) fn execute_push_pr_step(
         return save_run_with_conn(conn, &persisted.run);
     }
 
-    let head_sha = crate::git::current_head_sha(&persisted.run.worktree_path, config)?;
-    crate::execution::validate_installed_claim(conn)?;
-    crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
-
     let mut cache = crate::remote::load_pr_cache(repo, &persisted.run.branch);
     let _ = crate::remote::dispatcher::refresh_change_request_cache(
         repo,
@@ -476,16 +472,85 @@ pub(super) fn execute_push_pr_step(
         config,
         true,
     );
+    let create_target = if cache.trusted_summary()?.is_none() {
+        let (origin, _) = crate::remote::dispatcher::create_change_request_targets(
+            &persisted.run.worktree_path,
+            config,
+        )?;
+        Some(origin)
+    } else {
+        None
+    };
+    let expected_push = crate::remote::dispatcher::prepare_push(
+        &persisted.run.worktree_path,
+        config,
+        &persisted.run.branch,
+    )?;
+    run_initial_push_checks(
+        config,
+        &persisted.run.worktree_path,
+        create_target.is_some(),
+    )?;
+    let current_push = crate::remote::dispatcher::prepare_push(
+        &persisted.run.worktree_path,
+        config,
+        &persisted.run.branch,
+    )?;
+    if current_push != expected_push {
+        return Err(
+            "Auto Flow push remote, branch, or HEAD changed during configured checks".to_string(),
+        );
+    }
+    let head_sha = crate::git::current_head_sha(&persisted.run.worktree_path, config)?;
+    crate::execution::validate_installed_claim(conn)?;
+    crate::lifecycle::push_branch(
+        config,
+        &persisted.run.worktree_path,
+        &persisted.run.branch,
+        current_push.set_upstream,
+    )?;
+    let pushed_source = crate::remote::dispatcher::prepare_push(
+        &persisted.run.worktree_path,
+        config,
+        &persisted.run.branch,
+    )?;
+    if !crate::remote::dispatcher::same_push_target(&current_push, &pushed_source) {
+        return Err("Auto Flow push destination changed while pushing".to_string());
+    }
+
+    crate::remote::dispatcher::refresh_change_request_cache(
+        repo,
+        &persisted.run.branch,
+        &mut cache,
+        &persisted.run.worktree_path,
+        config,
+        true,
+    )?;
     if cache.trusted_summary()?.is_none() {
+        let target = create_target.ok_or_else(|| {
+            "existing change request disappeared after the initial push".to_string()
+        })?;
+        run_create_checks_after_push(
+            config,
+            &persisted.run.worktree_path,
+            &persisted.run.branch,
+            &head_sha,
+        )?;
+        let guard = crate::remote::dispatcher::prepare_create_change_request(
+            &persisted.run.worktree_path,
+            config,
+            &persisted.run.branch,
+            &target,
+            &pushed_source,
+        )?;
         let body = auto_pr_body(config, &persisted.run);
         crate::execution::validate_installed_claim(conn)?;
         crate::remote::dispatcher::create_change_request(
             repo,
             config,
-            &persisted.run.branch,
             &persisted.run.worktree_path,
             &body,
-            None,
+            &guard,
             &mut cache,
         )?;
     }
@@ -532,6 +597,33 @@ pub(super) fn execute_push_pr_step(
     finish_non_agent_step(conn, step, AutoStepStatus::Done, Some(message), None)?;
     persisted.run.updated_unix_ms = unix_ms();
     save_run_with_conn(conn, &persisted.run)
+}
+
+pub(super) fn run_initial_push_checks(
+    config: &Config,
+    path: &std::path::Path,
+    creating_change_request: bool,
+) -> Result<(), String> {
+    if creating_change_request {
+        crate::lifecycle::run_pre_pr_checks(config, path)?;
+    }
+    crate::lifecycle::run_pre_push_checks(config, path)
+}
+
+fn run_create_checks_after_push(
+    config: &Config,
+    path: &std::path::Path,
+    branch: &str,
+    pushed_head_sha: &str,
+) -> Result<(), String> {
+    crate::lifecycle::run_pre_pr_checks(config, path)?;
+    let current_branch = crate::git::current_branch_name(path, config)?
+        .ok_or_else(|| "cannot create a change request from detached HEAD".to_string())?;
+    let current_head = crate::git::current_head_sha(path, config)?;
+    if current_branch != branch || current_head != pushed_head_sha {
+        return Err("branch or HEAD changed during pre-PR checks after push".to_string());
+    }
+    Ok(())
 }
 
 pub(super) fn execute_wait_review_step(
@@ -2037,10 +2129,10 @@ fn current_work_guard(
         config,
     )?;
     let base_sha = match summary {
-        Some(summary) => crate::git::remote_branch_head_sha(
+        Some(summary) => crate::remote::dispatcher::fetch_change_request_base_head_sha(
             &persisted.run.worktree_path,
-            &summary.base_ref,
             config,
+            summary,
         )?,
         None => None,
     };

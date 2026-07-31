@@ -360,6 +360,15 @@ pub(crate) fn remote_branch_head_sha(
     branch: &str,
     config: &Config,
 ) -> Result<Option<String>, String> {
+    remote_branch_head_sha_on(path, "origin", branch, config)
+}
+
+pub(crate) fn remote_branch_head_sha_on(
+    path: &std::path::Path,
+    remote: &str,
+    branch: &str,
+    config: &Config,
+) -> Result<Option<String>, String> {
     if branch.trim().is_empty() || branch == "(detached)" {
         return Ok(None);
     }
@@ -368,14 +377,14 @@ pub(crate) fn remote_branch_head_sha(
             .arg("-C")
             .arg(path)
             .args(["rev-parse", "--verify", "--quiet"])
-            .arg(format!("refs/remotes/origin/{branch}")),
+            .arg(format!("refs/remotes/{remote}/{branch}")),
         ProcessPolicy::Metadata,
     )?;
     if !output.status.success() {
         return match output.status.code() {
             Some(1) => Ok(None),
             _ => Err(format!(
-                "inspect remote branch {branch}: {}",
+                "inspect remote branch {remote}/{branch}: {}",
                 output.stderr.trim()
             )),
         };
@@ -386,6 +395,85 @@ pub(crate) fn remote_branch_head_sha(
     } else {
         Ok(Some(sha.to_string()))
     }
+}
+
+pub(crate) fn fetch_remote_branch(
+    path: &std::path::Path,
+    remote: &str,
+    branch: &str,
+    config: &Config,
+) -> Result<(), String> {
+    run_status_named(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["fetch", "--no-tags", remote])
+            .arg(format!(
+                "+refs/heads/{branch}:refs/remotes/{remote}/{branch}"
+            )),
+        ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("git.fetch"),
+    )
+}
+
+pub(crate) fn push_remote_branch_head_sha(
+    path: &std::path::Path,
+    remote: &str,
+    branch: &str,
+    config: &Config,
+) -> Result<Option<String>, String> {
+    let push_url = single_push_remote_url(path, remote, config)?;
+    let output = run_output_allow_failure(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["ls-remote", "--exit-code", "--heads"])
+            .arg(&push_url)
+            .arg(format!("refs/heads/{branch}")),
+        ProcessPolicy::NetworkQuery,
+    )?;
+    if !output.status.success() {
+        return match output.status.code() {
+            Some(2) => Ok(None),
+            _ => Err(format!(
+                "inspect push branch {remote}/{branch}: {}",
+                output.stderr.trim()
+            )),
+        };
+    }
+    let sha = output
+        .stdout
+        .split_whitespace()
+        .next()
+        .filter(|sha| !sha.is_empty())
+        .ok_or_else(|| format!("push branch {remote}/{branch} returned no object ID"))?;
+    Ok(Some(sha.to_string()))
+}
+
+pub(crate) fn single_push_remote_url(
+    path: &std::path::Path,
+    remote: &str,
+    config: &Config,
+) -> Result<String, String> {
+    let push_urls = run_capture(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["remote", "get-url", "--push", "--all", remote]),
+        ProcessPolicy::Metadata,
+    )?;
+    let urls = push_urls
+        .lines()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .collect::<Vec<_>>();
+    if urls.len() != 1 {
+        return Err(format!(
+            "push remote {remote} must have exactly one push URL, found {}",
+            urls.len()
+        ));
+    }
+    Ok(urls[0].to_string())
 }
 
 #[cfg(test)]

@@ -2129,6 +2129,8 @@ fn transient_base_lookup_failure_retains_pending_push_for_retry() {
     let mut config = test_config();
     configure_pr_observation(&temp, &mut config, "feat/auto", &remote_head);
     let marker = temp.path().join("base-lookup-failed");
+    let pre_push_marker = temp.path().join("pre-push-ran");
+    config.checks.pre_push = vec![format!("touch {}", pre_push_marker.display())];
     let git = temp.path().join("git");
     write_executable(
         &git,
@@ -2194,7 +2196,23 @@ fn transient_base_lookup_failure_retains_pending_push_for_retry() {
 
     assert_eq!(retry_error, "stop test before push");
     assert!(retried_push.get());
+    assert!(pre_push_marker.exists());
     assert!(persisted.run.pending_push.is_some());
+}
+
+#[test]
+fn initial_change_request_push_runs_pre_pr_then_pre_push_checks() {
+    let temp = TempDir::new("initial-push-checks");
+    let pre_pr = temp.path().join("pre-pr-ran");
+    let pre_push = temp.path().join("pre-push-ran");
+    let mut config = test_config();
+    config.checks.pre_pr = vec![format!("touch {}", pre_pr.display())];
+    config.checks.pre_push = vec![format!("touch {}", pre_push.display())];
+
+    non_agent::run_initial_push_checks(&config, temp.path(), true).unwrap();
+
+    assert!(pre_pr.exists());
+    assert!(pre_push.exists());
 }
 
 #[test]

@@ -517,9 +517,11 @@ pub(crate) fn prepare_standalone_repair(
         crate::git::remote_branch_head_sha(&session.path, &session.branch, config)?;
     let pr_head_sha = summary.map(|summary| summary.head_sha.clone());
     let base_sha = match summary {
-        Some(summary) => {
-            crate::git::remote_branch_head_sha(&session.path, &summary.base_ref, config)?
-        }
+        Some(summary) => crate::remote::dispatcher::fetch_change_request_base_head_sha(
+            &session.path,
+            config,
+            summary,
+        )?,
         None => None,
     };
     let current_guard = WorkGuard {
@@ -1222,49 +1224,12 @@ pub(crate) fn progress_pending_push(
         observe_plan_and_save(conn, repo, config, persisted)?;
         return Ok(GuardedPushProgress::Invalidated { reason });
     }
-    crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
-    crate::remote::dispatcher::refresh_change_request_cache(
-        repo,
-        &persisted.run.branch,
-        cache,
-        &persisted.run.worktree_path,
-        config,
-        true,
-    )?;
     let guard = persisted
         .run
         .pending_push
         .clone()
         .ok_or_else(|| "repair push is missing its persisted guard".to_string())?;
-    let summary = cache.trusted_summary()?;
-    super::save_observed_change_request_identity(
-        conn,
-        &persisted.run.id,
-        summary.and_then(|summary| summary.change_request_identity.as_ref()),
-    )?;
-    let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
-    let remote_head = crate::git::remote_branch_head_sha(
-        &persisted.run.worktree_path,
-        &persisted.run.branch,
-        config,
-    )?;
-    let base_sha = match summary {
-        Some(summary) => crate::git::remote_branch_head_sha(
-            &persisted.run.worktree_path,
-            &summary.base_ref,
-            config,
-        )?,
-        None => None,
-    };
-    let decision = decide_guarded_push(
-        &guard,
-        summary.and_then(|summary| summary.change_request_identity.as_ref()),
-        local_head.as_deref(),
-        remote_head.as_deref(),
-        summary.map(|summary| summary.number),
-        summary.map(|summary| summary.head_sha.as_str()),
-        base_sha.as_deref(),
-    );
+    let decision = observe_guarded_push_decision(conn, repo, config, persisted, cache, &guard)?;
     let progress = match decision {
         GuardedPushDecision::Invalidated { reason } => {
             invalidate_pending_push(conn, repo, config, persisted, &reason)?;
@@ -1272,10 +1237,59 @@ pub(crate) fn progress_pending_push(
         }
         GuardedPushDecision::AlreadySatisfied => GuardedPushProgress::AlreadySatisfied,
         GuardedPushDecision::ValidToPush => {
+            let expected_push = crate::remote::dispatcher::prepare_push(
+                &persisted.run.worktree_path,
+                config,
+                &persisted.run.branch,
+            )?;
+            crate::lifecycle::run_pre_push_checks(config, &persisted.run.worktree_path)?;
             before_push()?;
             crate::execution::validate_installed_claim(conn)?;
-            crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
-            GuardedPushProgress::Pushed
+            match observe_guarded_push_decision(conn, repo, config, persisted, cache, &guard)? {
+                GuardedPushDecision::Invalidated { reason } => {
+                    invalidate_pending_push(conn, repo, config, persisted, &reason)?;
+                    return Ok(GuardedPushProgress::Invalidated { reason });
+                }
+                GuardedPushDecision::AlreadySatisfied => GuardedPushProgress::AlreadySatisfied,
+                GuardedPushDecision::ValidToPush => {
+                    let current_push = crate::remote::dispatcher::prepare_push(
+                        &persisted.run.worktree_path,
+                        config,
+                        &persisted.run.branch,
+                    );
+                    let summary = cache.trusted_summary()?.ok_or_else(|| {
+                        "pull request disappeared before guarded push".to_string()
+                    })?;
+                    let source_repository = summary
+                        .change_request_identity
+                        .as_ref()
+                        .ok_or_else(|| "pull request has no canonical identity".to_string())?
+                        .source_repository()
+                        .map_err(|error| error.to_string())?;
+                    let current_push = match current_push {
+                        Ok(target)
+                            if target == expected_push
+                                && target.repository == source_repository
+                                && target.remote_branch == summary.head_ref =>
+                        {
+                            target
+                        }
+                        Ok(_) | Err(_) => {
+                            let reason =
+                                "the guarded push source changed before mutation".to_string();
+                            invalidate_pending_push(conn, repo, config, persisted, &reason)?;
+                            return Ok(GuardedPushProgress::Invalidated { reason });
+                        }
+                    };
+                    crate::lifecycle::push_branch(
+                        config,
+                        &persisted.run.worktree_path,
+                        &persisted.run.branch,
+                        current_push.set_upstream,
+                    )?;
+                    GuardedPushProgress::Pushed
+                }
+            }
         }
     };
 
@@ -1308,10 +1322,10 @@ pub(crate) fn progress_pending_push(
         let summary = cache
             .trusted_summary()?
             .ok_or_else(|| "pull request disappeared while resolving review threads".to_string())?;
-        let base_sha = crate::git::remote_branch_head_sha(
+        let base_sha = crate::remote::dispatcher::fetch_change_request_base_head_sha(
             &persisted.run.worktree_path,
-            &summary.base_ref,
             config,
+            summary,
         )?;
         let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config)?;
         let remote_head = crate::git::remote_branch_head_sha(
@@ -1362,6 +1376,54 @@ pub(crate) fn progress_pending_push(
         return Err(error);
     }
     Ok(progress)
+}
+
+fn observe_guarded_push_decision(
+    conn: &rusqlite::Connection,
+    repo: &Repository,
+    config: &Config,
+    persisted: &PersistedAutoRun,
+    cache: &mut crate::remote::PrCache,
+    guard: &PendingPushGuard,
+) -> Result<GuardedPushDecision, String> {
+    crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
+    crate::remote::dispatcher::refresh_change_request_cache(
+        repo,
+        &persisted.run.branch,
+        cache,
+        &persisted.run.worktree_path,
+        config,
+        true,
+    )?;
+    let summary = cache.trusted_summary()?;
+    super::save_observed_change_request_identity(
+        conn,
+        &persisted.run.id,
+        summary.and_then(|summary| summary.change_request_identity.as_ref()),
+    )?;
+    let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
+    let remote_head = crate::git::remote_branch_head_sha(
+        &persisted.run.worktree_path,
+        &persisted.run.branch,
+        config,
+    )?;
+    let base_sha = match summary {
+        Some(summary) => crate::remote::dispatcher::fetch_change_request_base_head_sha(
+            &persisted.run.worktree_path,
+            config,
+            summary,
+        )?,
+        None => None,
+    };
+    Ok(decide_guarded_push(
+        guard,
+        summary.and_then(|summary| summary.change_request_identity.as_ref()),
+        local_head.as_deref(),
+        remote_head.as_deref(),
+        summary.map(|summary| summary.number),
+        summary.map(|summary| summary.head_sha.as_str()),
+        base_sha.as_deref(),
+    ))
 }
 
 fn refresh_after_guarded_effect(
