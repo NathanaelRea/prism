@@ -111,21 +111,18 @@ fn default_base(repo: &Repository, config: &Config) -> Option<String> {
     config
         .default_base
         .clone()
-        .or_else(|| local_branch_exists(repo, config, "main").then(|| "main".to_string()))
-        .or_else(|| local_branch_exists(repo, config, "master").then(|| "master".to_string()))
+        .or_else(|| local_branch_exists(&repo.root, config, "main").then(|| "main".to_string()))
+        .or_else(|| local_branch_exists(&repo.root, config, "master").then(|| "master".to_string()))
 }
 
-fn local_branch_exists(repo: &Repository, config: &Config, branch: &str) -> bool {
+fn local_branch_exists(path: &std::path::Path, config: &Config, branch: &str) -> bool {
     run_output_allow_failure(
-        Command::new(config.tool("git"))
-            .arg("-C")
-            .arg(&repo.root)
-            .args([
-                "show-ref",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ]),
+        Command::new(config.tool("git")).arg("-C").arg(path).args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ]),
         ProcessPolicy::Metadata,
     )
     .map(|output| output.status.success())
@@ -206,12 +203,15 @@ pub(crate) fn fetch_pull_request_branch(
     if branch.trim().is_empty() || branch == "(detached)" {
         return Err("cannot fetch pull request into an empty or detached branch name".to_string());
     }
+    if local_branch_exists(path, config, branch) {
+        return Ok(());
+    }
     run_status_named(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(path)
             .args(["fetch", "origin"])
-            .arg(format!("+pull/{number}/head:refs/heads/{branch}")),
+            .arg(format!("pull/{number}/head:refs/heads/{branch}")),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("git.fetch"),
     )
@@ -470,6 +470,52 @@ mod tests {
         run_git(&remote, &["push", "origin", "main"]);
 
         assert_eq!(branch_behind(&work, "main", &config).unwrap(), 1);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn fetch_pull_request_branch_preserves_an_existing_local_branch() {
+        let temp = unique_temp_dir("prism-pr-branch-collision-test");
+        let origin = temp.join("origin.git");
+        let seed = temp.join("seed");
+        let work = temp.join("work");
+        fs::create_dir_all(&temp).unwrap();
+
+        run(Command::new("git").args(["init", "--bare"]).arg(&origin));
+        run(Command::new("git").arg("clone").arg(&origin).arg(&seed));
+        configure_user(&seed);
+        fs::write(seed.join("tracked.txt"), "base\n").unwrap();
+        run_git(&seed, &["add", "tracked.txt"]);
+        run_git(&seed, &["commit", "-m", "initial"]);
+        run_git(&seed, &["branch", "-M", "main"]);
+        run_git(&seed, &["push", "-u", "origin", "main"]);
+        run(Command::new("git").arg("clone").arg(&origin).arg(&work));
+        configure_user(&work);
+
+        run_git(&seed, &["switch", "-c", "incoming"]);
+        fs::write(seed.join("incoming.txt"), "incoming\n").unwrap();
+        run_git(&seed, &["add", "incoming.txt"]);
+        run_git(&seed, &["commit", "-m", "incoming"]);
+        run_git(&seed, &["push", "origin", "incoming:refs/pull/42/head"]);
+
+        run_git(&work, &["switch", "-c", "feature/exact-name"]);
+        fs::write(work.join("local.txt"), "local\n").unwrap();
+        run_git(&work, &["add", "local.txt"]);
+        run_git(&work, &["commit", "-m", "local"]);
+        let local = current_head_sha(&work, &test_config()).unwrap();
+        run_git(&work, &["switch", "main"]);
+
+        fetch_pull_request_branch(&work, &test_config(), 42, "feature/exact-name").unwrap();
+        let preserved = run_capture(
+            Command::new("git")
+                .arg("-C")
+                .arg(&work)
+                .args(["rev-parse", "refs/heads/feature/exact-name"]),
+            ProcessPolicy::Metadata,
+        )
+        .unwrap();
+        assert_eq!(preserved.trim(), local);
 
         let _ = fs::remove_dir_all(temp);
     }
