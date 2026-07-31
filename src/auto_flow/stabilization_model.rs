@@ -47,7 +47,7 @@ pub(crate) struct AutoRunRef {
 pub(crate) struct RepositoryFacts {
     pub root: PathBuf,
     pub default_base: Option<String>,
-    pub github_remote: Option<String>,
+    pub remote_project: Option<String>,
     pub policy_refreshed_unix_ms: Option<u64>,
     pub policy_error: Option<String>,
 }
@@ -66,6 +66,7 @@ pub(crate) struct WorktreeFacts {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PullRequestFacts {
     pub number: u64,
+    pub change_request_identity: Option<crate::remote::CanonicalChangeRequestIdentity>,
     pub url: String,
     pub state: PullRequestState,
     pub draft: bool,
@@ -165,6 +166,8 @@ pub(crate) enum PolicyBlocker {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PendingPushGuard {
+    #[serde(default)]
+    pub(crate) change_request_identity: Option<crate::remote::CanonicalChangeRequestIdentity>,
     pub repair_kind: RepairKind,
     pub commit_sha: String,
     pub expected_local_head_sha: String,
@@ -245,6 +248,8 @@ pub enum StabilizationWorkKind {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkGuard {
+    #[serde(default)]
+    pub(crate) change_request_identity: Option<crate::remote::CanonicalChangeRequestIdentity>,
     pub local_head_sha: Option<String>,
     pub remote_head_sha: Option<String>,
     pub pr_head_sha: Option<String>,

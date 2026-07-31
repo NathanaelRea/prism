@@ -8,7 +8,7 @@
 ▓▒░▒▓█▓ M ◤◥◣◢◤◥◣
 ```
 
-Prism is a meta-harness for managing agents in parallel on separate worktrees with tmux. It integrates with github (or other remote), so you don't need to switch between worktrees, terminals, browsers, or repos.
+Prism is a meta-harness for managing agents in parallel on separate worktrees with tmux. It integrates with GitHub, GitLab, Forgejo, and Codeberg, so you don't need to switch between worktrees, terminals, browsers, or repositories.
 
 ## Overview
 
@@ -27,9 +27,14 @@ It's a local dashboard to manage code change lifecycles. From planning, implemen
 Core runtime requirements:
 
 - `git`
-- GitHub CLI (`gh`)
 - `tmux`
 - WorkTrunk (`wt`)
+
+Install the transport required by each repository:
+
+- GitHub CLI (`gh`) for GitHub
+- GitLab CLI (`glab`) for GitLab
+- No provider CLI for Forgejo or Codeberg; configure a token environment variable when private access is needed
 
 Agent harnesses are optional individually. Install and select whichever harness you want Prism to manage:
 

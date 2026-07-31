@@ -169,7 +169,7 @@ pub(crate) fn conservative_cached_state(
         repository: RepositoryFacts {
             root: session.path.clone(),
             default_base: config.default_base.clone(),
-            github_remote: None,
+            remote_project: None,
             policy_refreshed_unix_ms: None,
             policy_error: None,
         },
@@ -415,6 +415,10 @@ fn required_check_reason(
 
 fn work_guard(snapshot: &StabilizationSnapshot) -> WorkGuard {
     WorkGuard {
+        change_request_identity: snapshot
+            .pull_request
+            .as_ref()
+            .and_then(|pull_request| pull_request.change_request_identity.clone()),
         local_head_sha: snapshot.worktree.local_head_sha.clone(),
         remote_head_sha: snapshot.worktree.remote_head_sha.clone(),
         pr_head_sha: snapshot
@@ -495,6 +499,7 @@ mod tests {
         let mut snapshot = snapshot(Some(pr));
         snapshot.worktree.dirty = true;
         snapshot.pending_push = Some(PendingPushGuard {
+            change_request_identity: None,
             repair_kind: RepairKind::Review,
             commit_sha: "repair".to_string(),
             expected_local_head_sha: "repair".to_string(),
@@ -940,7 +945,7 @@ mod tests {
             repository: RepositoryFacts {
                 root: PathBuf::from("/repo"),
                 default_base: Some("main".to_string()),
-                github_remote: Some("owner/repo".to_string()),
+                remote_project: Some("owner/repo".to_string()),
                 policy_refreshed_unix_ms: Some(1),
                 policy_error: None,
             },
@@ -966,6 +971,7 @@ mod tests {
     fn clean_pr() -> PullRequestFacts {
         PullRequestFacts {
             number: 1,
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             url: "https://example.test/pr/1".to_string(),
             state: PullRequestState::Open,
             draft: false,
@@ -1025,6 +1031,7 @@ mod tests {
             pr: PrCache::observed(
                 PrSummary {
                     number: 42,
+                    change_request_identity: None,
                     title: "Ready".to_string(),
                     author: "author".to_string(),
                     body: String::new(),

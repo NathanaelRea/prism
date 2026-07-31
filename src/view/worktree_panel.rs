@@ -3,6 +3,7 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StabilizationPanelModel {
     pub icon_style: IconStyle,
+    pub provider_noun: &'static str,
     pub pr_number: String,
     pub pr_merged: bool,
     pub pr_name: String,
@@ -151,6 +152,7 @@ pub(crate) fn stabilization_panel_model(
     if summary.is_none() {
         return StabilizationPanelModel {
             icon_style: model.config.icon_style,
+            provider_noun: "CR",
             pr_number: String::new(),
             pr_merged: false,
             pr_name: String::new(),
@@ -165,6 +167,9 @@ pub(crate) fn stabilization_panel_model(
 
     StabilizationPanelModel {
         icon_style: model.config.icon_style,
+        provider_noun: summary
+            .map(|summary| summary.provider_noun())
+            .unwrap_or("CR"),
         pr_number: summary
             .map(|summary| summary.number.to_string())
             .unwrap_or_default(),
@@ -197,7 +202,7 @@ pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<
     }
 
     let mut lines = vec![
-        heading_line("PR"),
+        heading_line(model.provider_noun),
         pr_number_line(model),
         stabilization_value_line("name", &model.pr_name, selected_text_style()),
     ];

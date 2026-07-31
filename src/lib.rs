@@ -21,6 +21,7 @@ mod opencode;
 mod plan;
 pub mod plan_run;
 mod process;
+mod remote;
 mod repo;
 mod review;
 mod run_marker;

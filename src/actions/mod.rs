@@ -14,17 +14,12 @@ use crate::auto_flow::{
     prepare_auto_run_for_resume,
 };
 use crate::config::Config;
-use crate::git::{
-    branch_behind, fetch_pull_request_branch, git_status_label, has_upstream, pull_branch,
-    selected_dirty,
-};
+use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
 use crate::github::{
     PR_SUMMARY_POLL_INTERVAL, apply_pr_details_poll_result, apply_pr_summary_poll_result,
-    create_pull_request, fetch_pr_summary_index, github_remote_repo, persist_pr_cache_snapshot,
-    pr_cache_comment_count, pr_cache_pollable_for_session, pr_cache_render_signature,
-    pr_details_pollable, pr_summary_or_error, record_pr_merged, record_pr_summary,
-    refresh_pr_cache, refresh_pr_details_cache_state, refresh_repo_policy_cache,
-    resolve_pr_summary_for_session, wait_for_pr_merged,
+    persist_pr_cache_snapshot, pr_cache_comment_count, pr_cache_pollable_for_session,
+    pr_cache_render_signature, pr_details_pollable, pr_summary_or_error, record_pr_merged,
+    record_pr_summary, resolve_pr_summary_for_session,
 };
 use crate::harness::{HarnessConfig, OutputFormat, PromptTransport};
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
@@ -43,6 +38,15 @@ use crate::plan_run::{
 };
 use crate::process::{
     ProcessPolicy, command_exists, parse_command_words, run_capture, run_output_allow_failure,
+};
+use crate::remote::dispatcher::{
+    create_change_request as create_pull_request,
+    fetch_change_request_branch as fetch_pull_request_branch,
+    list_change_requests as fetch_pr_summary_index,
+    refresh_change_request_cache as refresh_pr_cache,
+    refresh_change_request_details_state as refresh_pr_details_cache_state,
+    refresh_repository_policy as refresh_repo_policy_cache,
+    repository_project as github_remote_repo, wait_for_change_request_merged as wait_for_pr_merged,
 };
 use crate::repo::Repository;
 use crate::session::{

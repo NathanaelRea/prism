@@ -3,7 +3,6 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde::Deserialize;
 use toml_edit::{Array, DocumentMut, Item, Table, value};
@@ -13,7 +12,8 @@ use crate::file_persistence::{self, BoxError, FileContents, UpdateOptions};
 use crate::harness::{
     BUILTIN_HARNESS_IDS, Harness, HarnessConfig, OutputFormat, PromptTransport, builtin_adapter,
 };
-use crate::process::{ProcessPolicy, command_exists, command_version};
+use crate::process::{command_exists, command_version};
+use crate::remote::{HostIdentity, HostProfile, ProviderKind, RemoteBase, RemoteDiscovery};
 use crate::repo::Repository;
 use crate::session::discover_sessions;
 use crate::util::prism_config_dir;
@@ -50,11 +50,18 @@ program = "opencode"
 
 [tools]
 gh = "gh"
+glab = "glab"
 git = "git"
 tmux = "tmux"
 wt = "wt"
 lazygit = "lazygit"
 fzf = "fzf"
+
+# Self-hosted remotes must be mapped explicitly. github.com, gitlab.com, and
+# codeberg.org have built-in profiles.
+# [remote_hosts."git.example.com"]
+# provider = "forgejo"
+# credential_env = "FORGEJO_TOKEN" # variable name only; never put a token here
 
 [checks]
 pre_pr = []
@@ -257,6 +264,7 @@ pub struct Config {
     pub checks: Checks,
     pub worktree_columns: Vec<String>,
     pub tools: BTreeMap<String, String>,
+    pub(crate) remote_hosts: BTreeMap<String, RemoteHostConfig>,
     pub agent_commands: BTreeMap<String, String>,
     pub agent_prompt_modes: BTreeMap<String, PromptMode>,
     pub prompt_templates: BTreeMap<String, String>,
@@ -285,8 +293,28 @@ struct RawConfig {
     layout: Option<RawLayoutConfig>,
     worktrees: Option<RawWorktrees>,
     tools: Option<BTreeMap<String, String>>,
+    remote_hosts: Option<BTreeMap<String, RawRemoteHostConfig>>,
     agents: Option<BTreeMap<String, RawAgentConfig>>,
     prompt_templates: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteHostConfig {
+    pub(crate) provider: ProviderKind,
+    pub(crate) web_url: Option<String>,
+    pub(crate) api_url: Option<String>,
+    pub(crate) credential_env: Option<String>,
+    pub(crate) allow_http: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRemoteHostConfig {
+    provider: String,
+    web_url: Option<String>,
+    api_url: Option<String>,
+    credential_env: Option<String>,
+    allow_http: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -473,6 +501,11 @@ fn validate_config_values(raw: &RawConfig, is_user_config: bool) -> Result<(), S
             harness_config_from_raw(id, harness.clone())?;
         }
     }
+    if let Some(hosts) = &raw.remote_hosts {
+        for (hostname, host) in hosts {
+            remote_host_from_raw(hostname, host.clone())?;
+        }
+    }
     if !is_user_config && (raw.default_harness.is_some() || raw.harnesses.is_some()) {
         return Err(
             "repository config cannot contain default_harness or [harnesses.*]".to_string(),
@@ -574,6 +607,7 @@ impl Config {
         let tools = [
             ("wt", "wt"),
             ("gh", "gh"),
+            ("glab", "glab"),
             ("git", "git"),
             ("tmux", "tmux"),
             ("lazygit", "lazygit"),
@@ -615,6 +649,7 @@ impl Config {
             checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools,
+            remote_hosts: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
             prompt_templates: BTreeMap::new(),
@@ -791,6 +826,16 @@ impl Config {
         if let Some(tools) = raw.tools {
             self.tools.extend(tools);
         }
+        if let Some(hosts) = raw.remote_hosts {
+            for (hostname, host) in hosts {
+                match remote_host_from_raw(&hostname, host) {
+                    Ok(host) => {
+                        self.remote_hosts.insert(hostname, host);
+                    }
+                    Err(error) => self.config_errors.push(error),
+                }
+            }
+        }
         if let Some(templates) = raw.prompt_templates {
             self.prompt_templates.extend(templates);
         }
@@ -963,6 +1008,73 @@ impl Config {
 
     pub fn save_user_icon_style(&self, style: IconStyle) -> Result<(), String> {
         save_user_icon_style(&self.user_path, style)
+    }
+
+    pub(crate) fn remote_discovery(&self) -> Result<RemoteDiscovery, String> {
+        let profiles = self
+            .remote_hosts
+            .iter()
+            .map(|(hostname, host)| host.profile(hostname))
+            .collect::<Result<Vec<_>, _>>()?;
+        RemoteDiscovery::new(profiles).map_err(|error| error.to_string())
+    }
+}
+
+fn remote_host_from_raw(
+    hostname: &str,
+    raw: RawRemoteHostConfig,
+) -> Result<RemoteHostConfig, String> {
+    HostIdentity::new(hostname, None)
+        .map_err(|error| format!("remote host '{hostname}': {error}"))?;
+    let provider = ProviderKind::parse(&raw.provider).ok_or_else(|| {
+        format!(
+            "remote host '{hostname}' has unsupported provider '{}'; expected github, gitlab, or forgejo",
+            raw.provider
+        )
+    })?;
+    let config = RemoteHostConfig {
+        provider,
+        web_url: raw.web_url,
+        api_url: raw.api_url,
+        credential_env: raw.credential_env,
+        allow_http: raw.allow_http.unwrap_or(false),
+    };
+    if config.credential_env.is_some() && provider != ProviderKind::Forgejo {
+        return Err(format!(
+            "remote host '{hostname}' credential_env is supported only by the Forgejo adapter"
+        ));
+    }
+    config.profile(hostname)?;
+    Ok(config)
+}
+
+impl RemoteHostConfig {
+    fn profile(&self, hostname: &str) -> Result<HostProfile, String> {
+        let host = HostIdentity::new(hostname, None).map_err(|error| error.to_string())?;
+        let mut profile = HostProfile::new(host, self.provider)
+            .map_err(|error| error.to_string())?
+            .with_http_allowed(self.allow_http);
+        let web_base = self
+            .web_url
+            .as_deref()
+            .map(|url| RemoteBase::parse(url, self.allow_http))
+            .transpose()
+            .map_err(|error| format!("remote host '{hostname}' web_url: {error}"))?
+            .unwrap_or_else(|| profile.web_base.clone());
+        let api_base = self
+            .api_url
+            .as_deref()
+            .map(|url| RemoteBase::parse(url, self.allow_http))
+            .transpose()
+            .map_err(|error| format!("remote host '{hostname}' api_url: {error}"))?
+            .unwrap_or_else(|| profile.api_base.clone());
+        profile = profile.with_bases(web_base, api_base);
+        if let Some(name) = &self.credential_env {
+            profile = profile
+                .with_credential_environment(name)
+                .map_err(|error| format!("remote host '{hostname}' credential_env: {error}"))?;
+        }
+        Ok(profile)
     }
 }
 
@@ -1201,6 +1313,20 @@ pub fn print_config(repo: &Repository, config: &Config) {
     for (key, value) in &config.tools {
         println!("{key} = {value}");
     }
+    println!("[remote_hosts]");
+    for (hostname, host) in &config.remote_hosts {
+        println!("{hostname}.provider = {}", host.provider.config_label());
+        println!("{hostname}.allow_http = {}", host.allow_http);
+        if let Some(web_url) = &host.web_url {
+            println!("{hostname}.web_url = {web_url}");
+        }
+        if let Some(api_url) = &host.api_url {
+            println!("{hostname}.api_url = {api_url}");
+        }
+        if let Some(environment) = &host.credential_env {
+            println!("{hostname}.credential_env = {environment}");
+        }
+    }
     println!("[checks]");
     println!("pre_pr = {:?}", config.checks.pre_pr);
     println!("pre_push = {:?}", config.checks.pre_push);
@@ -1314,7 +1440,8 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     println!();
 
     print_tool_status("git", &config.tool("git"), true);
-    print_tool_status("gh", &config.tool("gh"), true);
+    print_tool_status("gh", &config.tool("gh"), false);
+    print_tool_status("glab", &config.tool("glab"), false);
     print_tool_status("tmux", &config.tool("tmux"), true);
     print_tool_status(
         &config.worktree_command,
@@ -1325,14 +1452,7 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     println!();
 
     println!();
-    match crate::process::run_capture_named(
-        Command::new(config.tool("gh")).arg("auth").arg("status"),
-        ProcessPolicy::NetworkQuery,
-        crate::process::ProcessDescriptor::new("gh.auth.status"),
-    ) {
-        Ok(_) => println!("gh auth: ok"),
-        Err(error) => println!("gh auth: {error}"),
-    }
+    print_remote_doctor(repo, config);
 
     println!();
     println!(
@@ -1388,16 +1508,27 @@ fn resolve_executable(program: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-pub fn ensure_required_tools(config: &Config) -> Result<(), String> {
-    let required = [
+pub fn ensure_required_tools(repo: &Repository, config: &Config) -> Result<(), String> {
+    let mut required = vec![
         ("git", config.tool("git")),
-        ("gh", config.tool("gh")),
         ("tmux", config.tool("tmux")),
         (
             config.worktree_command.as_str(),
             config.tool(&config.worktree_command),
         ),
     ];
+    if let Ok(remote) = crate::remote::discover_git_remote(
+        &repo.root,
+        config,
+        "origin",
+        crate::remote::RemoteUrlKind::Fetch,
+    ) {
+        match remote.repository.id.provider() {
+            ProviderKind::GitHub => required.push(("gh", config.tool("gh"))),
+            ProviderKind::GitLab => required.push(("glab", config.tool("glab"))),
+            ProviderKind::Forgejo => {}
+        }
+    }
     let missing = required
         .into_iter()
         .filter(|(_, command)| !command_exists(command))
@@ -1413,6 +1544,56 @@ pub fn ensure_required_tools(config: &Config) -> Result<(), String> {
             config.repo_config_path.display()
         ))
     }
+}
+
+fn print_remote_doctor(repo: &Repository, config: &Config) {
+    let remote = crate::remote::discover_git_remote(
+        &repo.root,
+        config,
+        "origin",
+        crate::remote::RemoteUrlKind::Fetch,
+    );
+    let Ok(remote) = remote else {
+        println!("remote: unavailable: {}", remote.unwrap_err());
+        return;
+    };
+    let repository = &remote.repository;
+    let provider = repository.id.provider();
+    println!("remote provider: {provider}");
+    println!("remote host: {}", repository.id.host());
+    println!("remote project: {}", repository.id.project_path());
+    println!(
+        "remote transport: {}",
+        match provider {
+            ProviderKind::GitHub => "gh",
+            ProviderKind::GitLab => "glab",
+            ProviderKind::Forgejo => "https",
+        }
+    );
+    let capabilities = crate::remote::Capabilities::for_provider(provider);
+    println!(
+        "remote capabilities: list={} details={} policy={} create={} resolve={} merge={} ci_logs={} queue={}",
+        capabilities.list_change_requests.label(),
+        capabilities.change_request_details.label(),
+        capabilities.repository_policy.label(),
+        capabilities.create_change_request.label(),
+        capabilities.resolve_review_thread.label(),
+        capabilities.guarded_merge.label(),
+        capabilities.ci_logs.label(),
+        capabilities.merge_queue.label(),
+    );
+    println!(
+        "remote authentication: {}",
+        crate::remote::dispatcher::authentication_status(&repo.root, config)
+            .unwrap_or_else(|error| error)
+    );
+    println!(
+        "remote server version: {}",
+        crate::remote::dispatcher::server_version(&repo.root, config)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "not loaded".to_string())
+    );
 }
 
 fn print_tool_status(label: &str, command: &str, required: bool) {
@@ -2046,5 +2227,66 @@ review = "fix\nreview"
         assert!(error.contains("default_harness/[harnesses.*]"));
         assert!(error.contains("[harnesses.opencode].program"));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn remote_host_configuration_is_typed_and_inherited_by_hostname() {
+        let mut config = Config::defaults(
+            PathBuf::from("/tmp/user.toml"),
+            PathBuf::from("/tmp/repo.toml"),
+        );
+        let user = parse_and_validate_config(
+            r#"
+[remote_hosts."git.example.com"]
+provider = "forgejo"
+credential_env = "FORGEJO_TOKEN"
+"#,
+            true,
+        )
+        .unwrap();
+        config.apply_raw_config(user, true);
+
+        let repository = config
+            .remote_discovery()
+            .unwrap()
+            .discover("git@git.example.com:Team/Project.git")
+            .unwrap()
+            .repository;
+
+        assert_eq!(repository.id.provider(), ProviderKind::Forgejo);
+        assert_eq!(repository.id.project_path(), "Team/Project");
+        assert_eq!(
+            config.remote_hosts["git.example.com"]
+                .credential_env
+                .as_deref(),
+            Some("FORGEJO_TOKEN")
+        );
+    }
+
+    #[test]
+    fn remote_host_configuration_rejects_secrets_and_insecure_bases_by_shape() {
+        let token_error = parse_and_validate_config(
+            r#"
+[remote_hosts."git.example.com"]
+provider = "forgejo"
+credential_env = "actual token value"
+"#,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(token_error.contains("credential_env"), "{token_error}");
+
+        let http_error = parse_and_validate_config(
+            r#"
+[remote_hosts."git.example.com"]
+provider = "gitlab"
+web_url = "http://git.example.com"
+"#,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(http_error.contains("allow_http"), "{http_error}");
     }
 }

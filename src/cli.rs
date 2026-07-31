@@ -322,7 +322,9 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
         for entry in discovered_entries {
             let repo = entry.repo;
             let mut config = Config::load(&repo);
-            observability::phase("ensure_tools", || config::ensure_required_tools(&config))?;
+            observability::phase("ensure_tools", || {
+                config::ensure_required_tools(&repo, &config)
+            })?;
             if observability::phase("initial_harness_setup", || {
                 setup::maybe_prompt_harness(&config)
             })?
@@ -691,7 +693,9 @@ fn run_debug_command(
 
 fn run_debug_startup(repo: &Repository, config: &mut Config) -> Result<(), String> {
     let result: Result<(), String> = (|| {
-        observability::phase("ensure_tools", || config::ensure_required_tools(config))?;
+        observability::phase("ensure_tools", || {
+            config::ensure_required_tools(repo, config)
+        })?;
         observability::phase("ensure_default_agent", || {
             config::ensure_default_agent_noninteractive(config)
         })?;

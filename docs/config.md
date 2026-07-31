@@ -44,6 +44,10 @@ columns = []
 
 [tools]
 
+[remote_hosts."git.example.com"]
+provider = "forgejo"
+credential_env = "FORGEJO_TOKEN" # variable name only, never the token
+
 [prompt_templates]
 auto_implement = "Implement this task in the current worktree, then stop without committing: {{task}}"
 review_fix = "Here are review comments on PR {pr_number}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n{comments}"
@@ -60,6 +64,37 @@ The `review_fix` template supports `{inline_comments}`, `{review_bodies}`, and `
 Prism treats `main` as the default branch by default. The default branch is not polled or shown as a pull request branch.
 
 Prism uses squash merges for pull requests by default. Set `merge_method` to `merge` or `rebase` if a repository requires a different GitHub merge method.
+
+## Remote Hosts
+
+Prism recognizes `github.com`, `gitlab.com`, and `codeberg.org` without configuration. Codeberg uses the Forgejo adapter. Other hostnames are never probed until they are explicitly mapped:
+
+```toml
+[remote_hosts."git.example.com"]
+provider = "forgejo" # github, gitlab, or forgejo
+web_url = "https://git.example.com"
+api_url = "https://git.example.com/api/v1" # optional
+credential_env = "FORGEJO_TOKEN" # environment variable name, not its value
+```
+
+Mappings inherit from the user config into repository config; a repository mapping with the same hostname replaces the inherited mapping. HTTPS is required by default. For a trusted development host only, set `allow_http = true` and use explicit `http://` base URLs.
+
+GitHub uses `gh` for authentication and transport. GitLab uses `glab`. Forgejo reads a token only from the configured environment variable. Prism does not store token values in TOML or SQLite and does not probe unknown hosts.
+
+`prism doctor` reports the resolved provider, canonical host/project, transport,
+authentication availability, capabilities, and Forgejo version when reachable.
+Current capability exceptions are intentional:
+
+- GitHub review submission remains available through `gh`; GitLab and Forgejo
+  review submission is not exposed as a generic operation.
+- GitLab CI traces and policy depend on project permissions and product tier.
+  Rebase cannot be selected through GitLab's merge-request merge operation.
+- Forgejo and Codeberg review-conversation resolution and merge queues are
+  unsupported. Actions logs are conditional on repository Actions availability;
+  external status providers do not imply log access.
+- Prism discovers Forgejo's API version and paging settings at runtime. Read
+  observations retain unknown states, while create and merge are currently
+  qualified for Forgejo majors 9 through 16; other majors fail closed.
 
 ## Harnesses
 

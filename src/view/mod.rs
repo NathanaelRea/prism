@@ -194,6 +194,7 @@ pub(crate) struct WorktreeRow {
 }
 
 pub(crate) struct RepoPrRow {
+    pub provider_noun: &'static str,
     pub repo_label: String,
     pub number: u64,
     pub title: String,
@@ -219,6 +220,7 @@ impl RepoPrRow {
         selected: bool,
     ) -> Self {
         Self {
+            provider_noun: summary.provider_noun(),
             repo_label,
             number: summary.number,
             title: summary.title.clone(),
@@ -276,7 +278,7 @@ pub(crate) struct PlanOutputViewerState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RepoMainView {
-    Github,
+    ChangeRequests,
     Kanban,
 }
 
@@ -289,7 +291,7 @@ pub(crate) enum WorktreeMainView {
 impl RepoMainView {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Github => "github",
+            Self::ChangeRequests => "requests",
             Self::Kanban => "kanban",
         }
     }

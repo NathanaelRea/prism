@@ -34,7 +34,7 @@ pub(crate) fn with_cancellation<T>(canceled: Arc<AtomicBool>, operation: impl Fn
     operation()
 }
 
-fn current_cancellation() -> Option<Arc<AtomicBool>> {
+pub(crate) fn current_cancellation() -> Option<Arc<AtomicBool>> {
     CURRENT_CANCELLATION.with(|current| current.borrow().clone())
 }
 

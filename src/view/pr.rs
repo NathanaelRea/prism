@@ -41,7 +41,12 @@ pub(super) fn pr_panel_lines(
                 pr_state_style(summary),
             ),
             Span::styled(
-                format!(" PR #{} {}", summary.number, pr_state_label(summary)),
+                format!(
+                    " {} #{} {}",
+                    summary.provider_noun(),
+                    summary.number,
+                    pr_state_label(summary)
+                ),
                 pr_state_style(summary),
             ),
         ]),

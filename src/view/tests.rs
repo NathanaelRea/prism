@@ -632,7 +632,7 @@ fn main_panel_switches_by_focus() {
     assert_region_contains(&status_buffer, 56..120, 0..29, "version");
     assert_region_contains(&status_buffer, 56..120, 0..29, "selected repo repo");
     assert!(!region_text(&status_buffer, 56..120, 0..29).contains("Documentation"));
-    assert_region_contains(&repo_buffer, 56..120, 0..29, "view github");
+    assert_region_contains(&repo_buffer, 56..120, 0..29, "view requests");
     assert!(!region_text(&repo_buffer, 56..120, 0..29).contains("Preview"));
     assert_region_contains(&worktree_buffer, 56..120, 0..29, "prompt implement feature");
 }
@@ -1597,6 +1597,7 @@ fn test_session(branch: &str, agent_state: AgentState) -> Session {
 fn test_pr_summary() -> PrSummary {
     PrSummary {
         number: 42,
+        change_request_identity: None,
         title: "Feature PR".to_string(),
         author: "author".to_string(),
         body: String::new(),
@@ -1679,7 +1680,7 @@ fn test_model<'a>(
         focus,
         main_focused: false,
         main_scroll: 0,
-        repo_main_view: RepoMainView::Github,
+        repo_main_view: RepoMainView::ChangeRequests,
         worktree_main_view: WorktreeMainView::Details,
         worktree_list_mode: WorktreeListMode::Repo,
         mode_label: "normal",
@@ -1899,6 +1900,7 @@ fn stabilization_dashboard(
 
 fn test_pending_push_guard() -> PendingPushGuard {
     PendingPushGuard {
+        change_request_identity: None,
         repair_kind: RepairKind::Ci,
         commit_sha: "fedcba9876543210".to_string(),
         expected_local_head_sha: "abc1234567890000".to_string(),

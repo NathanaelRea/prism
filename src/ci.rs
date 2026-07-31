@@ -186,6 +186,7 @@ mod tests {
             pr: PrCache::observed(
                 PrSummary {
                     number: 123,
+                    change_request_identity: None,
                     title: "Title".to_string(),
                     author: "author".to_string(),
                     body: String::new(),

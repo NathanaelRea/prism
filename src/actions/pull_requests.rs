@@ -64,6 +64,17 @@ pub(super) fn remote_pr_worktree_branch(number: u64) -> String {
     format!("pr/{number}")
 }
 
+fn remote_pr_worktree_branch_for_summary(summary: &crate::github::PrSummary) -> String {
+    let Some(identity) = summary.change_request_identity.as_ref() else {
+        return remote_pr_worktree_branch(summary.number);
+    };
+    format!(
+        "pr/{}-{:08x}",
+        summary.number,
+        identity.stable_hash() as u32
+    )
+}
+
 fn remote_pr_choice_label(summary: &crate::github::PrSummary) -> String {
     format!(
         "#{}  {}  {} -> {}",
@@ -132,6 +143,11 @@ impl Tui {
             .selected_worktree_context()
             .ok_or_else(|| "no worktree selected".to_string())?;
         let path = self.sessions[context.session_index].path.clone();
+        let summary = self.sessions[context.session_index]
+            .pr
+            .trusted_summary()?
+            .cloned()
+            .ok_or_else(|| "pull request summary is unavailable".to_string())?;
         let details = self.sessions[context.session_index]
             .pr
             .trusted_details()?
@@ -149,7 +165,7 @@ impl Tui {
         let repo = context.repo;
         let config = context.config;
         let resolution = apply_bulk_review_resolution(true, &thread_ids, |thread_id| {
-            crate::github::resolve_review_thread(&path, &config, thread_id)
+            crate::remote::dispatcher::resolve_review_thread(&path, &config, &summary, thread_id)
         });
         let refresh = {
             let session = &mut self.sessions[context.session_index];
@@ -249,13 +265,13 @@ impl Tui {
             return Ok(Some(index));
         }
 
-        let branch = remote_pr_worktree_branch(summary.number);
+        let branch = remote_pr_worktree_branch_for_summary(&summary);
         self.show_loading_dialog(
             raw,
             "Remote Pull Requests",
             &format!("Fetching PR #{}", summary.number),
         )?;
-        fetch_pull_request_branch(&context.repo.root, &context.config, summary.number, &branch)?;
+        fetch_pull_request_branch(&context.repo.root, &context.config, &summary, &branch)?;
         self.show_loading_dialog(
             raw,
             "Remote Pull Requests",
@@ -302,11 +318,19 @@ impl Tui {
         if let Some(index) = self.sessions.iter().position(|session| {
             !session.hidden
                 && session.repo_index == repo_index
-                && session.pr.is_for_pr(summary.number)
+                && session.pr.summary().is_some_and(|existing| {
+                    match (
+                        existing.change_request_identity.as_ref(),
+                        summary.change_request_identity.as_ref(),
+                    ) {
+                        (Some(existing), Some(selected)) => existing == selected,
+                        _ => existing.number == summary.number,
+                    }
+                })
         }) {
             return Some(index);
         }
-        let branch = remote_pr_worktree_branch(summary.number);
+        let branch = remote_pr_worktree_branch_for_summary(summary);
         let index = self.sessions.iter().position(|session| {
             !session.hidden && session.repo_index == repo_index && session.branch == branch
         })?;
@@ -398,26 +422,13 @@ impl Tui {
             "Submit Review",
             &format!("Submitting review for PR #{}", summary.number),
         )?;
-        let mut command = Command::new(context.config.tool("gh"));
-        command
-            .arg("pr")
-            .arg("review")
-            .arg(summary.number.to_string())
-            .arg(flag)
-            .current_dir(&context.repo.root);
-        if !body.trim().is_empty() {
-            command.arg("--body").arg(body.trim());
-        }
-        let output = run_output_allow_failure(&mut command, ProcessPolicy::NetworkQuery)?;
-        if !output.status.success() {
-            let stderr = output.stderr.trim();
-            let message = if stderr.is_empty() {
-                format!("gh pr review exited with {}", output.status)
-            } else {
-                stderr.to_string()
-            };
-            return Err(message);
-        }
+        crate::remote::dispatcher::submit_review(
+            &context.repo.root,
+            &context.config,
+            summary.number,
+            flag,
+            body.trim(),
+        )?;
         self.show_message(&format!("{label} PR #{}", summary.number))
     }
 
@@ -798,6 +809,11 @@ impl Tui {
             persisted.run.review_baseline_json.as_deref(),
         );
         let thread_ids = crate::review::review_thread_ids(&feedback);
+        let summary = self.sessions[selected]
+            .pr
+            .trusted_summary()?
+            .cloned()
+            .ok_or_else(|| "pull request summary is unavailable".to_string())?;
         if thread_ids.is_empty() {
             crate::observability::with_writable_db(repo, |conn| {
                 crate::auto_flow::stabilization_execute::observe_plan_and_save(
@@ -832,7 +848,7 @@ impl Tui {
             "Resolving review conversations",
         )?;
         let resolution = apply_bulk_review_resolution(true, &thread_ids, |thread_id| {
-            crate::github::resolve_review_thread(&path, config, thread_id)
+            crate::remote::dispatcher::resolve_review_thread(&path, config, &summary, thread_id)
         });
         let refresh = {
             let session = &mut self.sessions[selected];
@@ -919,6 +935,11 @@ impl Tui {
                 return Ok(());
             }
         };
+        let initially_observed_summary = self.sessions[selected]
+            .pr
+            .trusted_summary()?
+            .cloned()
+            .ok_or_else(|| "pull request summary is unavailable".to_string())?;
         let execution = if review_thread_ids.is_empty() {
             self.show_loading_dialog(
                 raw,
@@ -937,7 +958,12 @@ impl Tui {
                 "Resolving observed review conversations",
             )?;
             apply_bulk_review_resolution(true, &review_thread_ids, |thread_id| {
-                crate::github::resolve_review_thread(&path, &context.config, thread_id)
+                crate::remote::dispatcher::resolve_review_thread(
+                    &path,
+                    &context.config,
+                    &initially_observed_summary,
+                    thread_id,
+                )
             })?;
             self.show_loading_dialog(
                 raw,

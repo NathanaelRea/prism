@@ -51,6 +51,37 @@
           "additionalProperties": { "type": "string" }
         }
       }
+    },
+    "remoteHost": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider"],
+      "properties": {
+        "provider": {
+          "type": "string",
+          "enum": ["github", "gitlab", "forgejo"]
+        },
+        "web_url": {
+          "type": "string",
+          "pattern": "^https?://",
+          "description": "Optional browser base URL. Plain HTTP also requires allow_http."
+        },
+        "api_url": {
+          "type": "string",
+          "pattern": "^https?://",
+          "description": "Optional provider API base URL. Plain HTTP also requires allow_http."
+        },
+        "credential_env": {
+          "type": "string",
+          "pattern": "^[A-Za-z_][A-Za-z0-9_]*$",
+          "description": "Name of the environment variable containing a Forgejo token. Never put the token here."
+        },
+        "allow_http": {
+          "type": "boolean",
+          "default": false,
+          "description": "Explicitly allow insecure HTTP for this host."
+        }
+      }
     }
   },
   "properties": {
@@ -113,7 +144,7 @@
       "type": "string",
       "enum": ["squash", "merge", "rebase"],
       "default": "squash",
-      "description": "GitHub merge method Prism uses for pull requests."
+      "description": "Merge method Prism requests for supported change requests."
     },
     "ui": {
       "type": "object",
@@ -252,6 +283,11 @@
       "type": "object",
       "additionalProperties": { "type": "string" },
       "description": "Command overrides for external tools."
+    },
+    "remote_hosts": {
+      "type": "object",
+      "description": "Explicit provider mappings for self-hosted Git remotes. github.com, gitlab.com, and codeberg.org are built in.",
+      "additionalProperties": { "$ref": "#/$defs/remoteHost" }
     },
     "harnesses": {
       "type": "object",

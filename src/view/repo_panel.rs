@@ -44,7 +44,7 @@ pub(super) fn repo_overview_lines(
     lines.push(Line::from(""));
     let remaining_rows = visible_rows.saturating_sub(lines.len());
     match model.repo_main_view {
-        crate::view::RepoMainView::Github => lines.extend(repo_github_panel_lines(
+        crate::view::RepoMainView::ChangeRequests => lines.extend(repo_change_request_panel_lines(
             model.config,
             &model.repo_prs,
             remaining_rows,
@@ -104,7 +104,7 @@ pub(super) fn repo_github_summary(
     summary
 }
 
-pub(super) fn repo_github_panel_lines(
+pub(super) fn repo_change_request_panel_lines(
     config: &crate::config::Config,
     repo_prs: &[crate::view::RepoPrRow],
     visible_rows: usize,
@@ -124,7 +124,16 @@ pub(super) fn repo_pr_table_lines(
         .filter(|pr| !pr.merged && pr.state.eq_ignore_ascii_case("OPEN"))
         .collect::<Vec<_>>();
     let mut lines = vec![Line::from(vec![
-        Span::styled(format!("{:<8}", "PR"), muted_style()),
+        Span::styled(
+            format!(
+                "{:<8}",
+                repo_prs
+                    .first()
+                    .map(|summary| summary.provider_noun)
+                    .unwrap_or("CR")
+            ),
+            muted_style(),
+        ),
         Span::styled(format!("{:<13}", "repo"), muted_style()),
         Span::styled(format!("{:<9}", "ci"), muted_style()),
         Span::styled(format!("{:<10}", "review"), muted_style()),
@@ -135,7 +144,7 @@ pub(super) fn repo_pr_table_lines(
     ])];
     if open_prs.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No open pull requests discovered",
+            "No open change requests discovered",
             muted_style(),
         )));
         lines.truncate(visible_rows);

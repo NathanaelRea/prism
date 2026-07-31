@@ -275,6 +275,7 @@ esac
     session.pr = PrCache::observed(
         PrSummary {
             number: 42,
+            change_request_identity: None,
             title: "Stale review".to_string(),
             author: "author".to_string(),
             body: String::new(),
@@ -373,7 +374,7 @@ case "$*" in
     ;;
   *)
     if [ -f '{}' ]; then decision=APPROVED; else decision=CHANGES_REQUESTED; fi
-    echo "{{\"number\":42,\"title\":\"Guarded repair\",\"body\":\"\",\"url\":\"https://github.com/example/repo/pull/42\",\"state\":\"OPEN\",\"reviewDecision\":\"$decision\",\"reviewRequests\":{{\"nodes\":[]}},\"headRefName\":\"feature\",\"baseRefName\":\"main\",\"headRefOid\":\"repair-sha\",\"updatedAt\":\"2026-07-13T12:02:00Z\",\"comments\":{{\"totalCount\":0}},\"statusCheckRollup\":{{\"contexts\":{{\"nodes\":[]}}}},\"mergeStateStatus\":\"CLEAN\",\"isDraft\":false}}"
+    echo "{{\"id\":\"PR_test\",\"number\":42,\"title\":\"Guarded repair\",\"body\":\"\",\"url\":\"https://github.com/example/repo/pull/42\",\"state\":\"OPEN\",\"reviewDecision\":\"$decision\",\"reviewRequests\":{{\"nodes\":[]}},\"headRefName\":\"feature\",\"baseRefName\":\"main\",\"headRefOid\":\"repair-sha\",\"headRepository\":{{\"nameWithOwner\":\"example/repo\"}},\"updatedAt\":\"2026-07-13T12:02:00Z\",\"comments\":{{\"totalCount\":0}},\"statusCheckRollup\":{{\"contexts\":{{\"nodes\":[]}}}},\"mergeStateStatus\":\"CLEAN\",\"isDraft\":false}}"
     ;;
 esac
 "#,
@@ -420,6 +421,7 @@ esac
         .create_run();
     persisted.run.pr_number = Some(42);
     persisted.run.pending_push = Some(PendingPushGuard {
+        change_request_identity: Some(crate::remote::test_change_request_identity()),
         repair_kind: RepairKind::Review,
         commit_sha: "repair-sha".to_string(),
         expected_local_head_sha: "repair-sha".to_string(),
@@ -436,6 +438,7 @@ esac
     session.pr = PrCache::observed(
         PrSummary {
             number: 42,
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             title: "Guarded repair".to_string(),
             author: "author".to_string(),
             body: String::new(),
@@ -554,16 +557,16 @@ case "$*" in
       echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
     fi
     ;;
-  pr\ view\ feature\ --json\ number,title,*)
+  pr\ view\ feature\ --json\ id,number,title,*)
     if [ -f '{}' ] && [ ! -f '{}' ]; then
       echo 'transient refresh failure' >&2
       exit 1
     fi
-    echo '{{"number":42,"title":"Repair","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"","reviewRequests":{{"nodes":[]}},"headRefName":"feature","baseRefName":"main","headRefOid":"repair-sha","updatedAt":"2026-07-13T12:02:00Z","comments":{{"totalCount":0}},"statusCheckRollup":{{"contexts":{{"nodes":[]}}}},"mergeStateStatus":"CLEAN","isDraft":false}}'
+    echo '{{"id":"PR_test","number":42,"title":"Repair","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"","reviewRequests":{{"nodes":[]}},"headRefName":"feature","baseRefName":"main","headRefOid":"repair-sha","headRepository":{{"nameWithOwner":"example/repo"}},"updatedAt":"2026-07-13T12:02:00Z","comments":{{"totalCount":0}},"statusCheckRollup":{{"contexts":{{"nodes":[]}}}},"mergeStateStatus":"CLEAN","isDraft":false}}'
     ;;
   "run list "*) echo '[]' ;;
   *)
-    echo '{{"number":42,"title":"Repair","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"","reviewRequests":{{"nodes":[]}},"headRefName":"feature","baseRefName":"main","headRefOid":"repair-sha","updatedAt":"2026-07-13T12:02:00Z","comments":{{"totalCount":0}},"statusCheckRollup":{{"contexts":{{"nodes":[]}}}},"mergeStateStatus":"CLEAN","isDraft":false}}'
+    echo '{{"id":"PR_test","number":42,"title":"Repair","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"","reviewRequests":{{"nodes":[]}},"headRefName":"feature","baseRefName":"main","headRefOid":"repair-sha","headRepository":{{"nameWithOwner":"example/repo"}},"updatedAt":"2026-07-13T12:02:00Z","comments":{{"totalCount":0}},"statusCheckRollup":{{"contexts":{{"nodes":[]}}}},"mergeStateStatus":"CLEAN","isDraft":false}}'
     ;;
 esac
 "#,
@@ -610,6 +613,7 @@ esac
         .create_run();
     persisted.run.pr_number = Some(42);
     persisted.run.pending_push = Some(PendingPushGuard {
+        change_request_identity: Some(crate::remote::test_change_request_identity()),
         repair_kind: RepairKind::Review,
         commit_sha: "repair-sha".to_string(),
         expected_local_head_sha: "repair-sha".to_string(),
@@ -1446,7 +1450,7 @@ exit 0
 }
 
 #[test]
-fn phase_1_missing_github_remote_clears_live_and_persisted_pr_cache_state() {
+fn unavailable_remote_preserves_stale_live_and_persisted_display_state() {
     let temp = unique_temp_dir("prism-phase-1-removed-remote-poll-test");
     fs::create_dir_all(&temp).unwrap();
     let git = temp.join("git");
@@ -1478,23 +1482,25 @@ fn phase_1_missing_github_remote_clears_live_and_persisted_pr_cache_state() {
     assert!(!tui.poll_pull_requests(true));
     let started = Instant::now();
     let mut changed = false;
-    while tui.sessions[0].pr.summary().is_some() {
+    while tui.sessions[0].pr.display_error().is_none() {
         changed |= tui.poll_pull_requests(false);
         assert!(
             started.elapsed() < Duration::from_secs(1),
-            "missing GitHub remote was not observed"
+            "unavailable remote was not observed"
         );
         std::thread::sleep(Duration::from_millis(10));
     }
 
     assert!(changed);
-    assert!(tui.sessions[0].pr.summary().is_none());
-    assert!(tui.sessions[0].pr.details().is_none());
-    assert!(!tui.sessions[0].unseen_comments);
+    assert!(tui.sessions[0].pr.summary().is_some());
+    assert!(tui.sessions[0].pr.details().is_some());
+    assert!(tui.sessions[0].pr.trusted_summary().is_err());
+    assert!(tui.sessions[0].unseen_comments);
     wait_for_pr_persistence(&mut tui);
     let persisted = crate::github::load_pr_cache(&repo, "feature");
-    assert!(persisted.summary().is_none());
-    assert!(persisted.details().is_none());
+    assert!(persisted.summary().is_some());
+    assert!(persisted.details().is_some());
+    assert!(persisted.trusted_summary().is_err());
 
     let _ = fs::remove_dir_all(temp);
 }
@@ -2097,6 +2103,7 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
 fn phase_1_pr_summary(head_sha: &str) -> PrSummary {
     PrSummary {
         number: 42,
+        change_request_identity: None,
         title: "Phase 1 safety".to_string(),
         author: "author".to_string(),
         body: String::new(),

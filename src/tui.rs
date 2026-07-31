@@ -836,7 +836,7 @@ impl Tui {
             focused_panel: PanelFocus::Repos,
             main_focused: false,
             main_scroll: 0,
-            repo_main_view: view::RepoMainView::Github,
+            repo_main_view: view::RepoMainView::ChangeRequests,
             worktree_main_view: view::WorktreeMainView::Details,
             worktree_list_mode: WorktreeListMode::Repo,
             ui_state_path: None,
@@ -994,7 +994,14 @@ impl Tui {
                 .is_some_and(|context| crate::process::command_exists(&context.config.tool("gh")))
                 && self.focused_panel == PanelFocus::Repos
                 && self.main_focused
-                && self.selected_repo_pr_summary().is_some();
+                && self.selected_repo_pr_summary().is_some_and(|summary| {
+                    summary
+                        .change_request_identity
+                        .as_ref()
+                        .is_none_or(|identity| {
+                            identity.provider() == crate::remote::ProviderKind::GitHub
+                        })
+                });
         }
         if self.focused_panel != PanelFocus::Worktrees {
             return false;
@@ -1014,14 +1021,16 @@ impl Tui {
         let Some(summary) = session.pr.summary() else {
             return false;
         };
+        let capabilities = crate::remote::dispatcher::capabilities_for_summary(summary);
         if action == GitAction::OpenPr {
-            return true;
+            return capabilities.fetch_change_request != crate::remote::SupportLevel::Unsupported;
         }
         if summary.merged || !summary.state.eq_ignore_ascii_case("OPEN") {
             return false;
         }
         if action == GitAction::ResolveAllComments {
-            return self.main_focused
+            return capabilities.resolve_review_thread == crate::remote::SupportLevel::Supported
+                && self.main_focused
                 && session.pr.trusted_details().is_ok_and(|details| {
                     details.is_some_and(|details| {
                         details.review_comments.iter().any(|comment| {
@@ -1031,10 +1040,29 @@ impl Tui {
                 });
         }
         if matches!(action, GitAction::CiFix | GitAction::ReviewFix) {
-            return context
-                .config
-                .selected_harness()
-                .is_ok_and(|harness| harness.describe().headless);
+            let supported = match action {
+                GitAction::CiFix => capabilities.ci_logs,
+                GitAction::ReviewFix => capabilities.review_threads,
+                _ => unreachable!(),
+            };
+            let has_input = session.pr.trusted_details().is_ok_and(|details| {
+                details.is_some_and(|details| match action {
+                    GitAction::CiFix => !details.ci_failures.is_empty(),
+                    GitAction::ReviewFix => {
+                        !details.reviews.is_empty() || !details.review_comments.is_empty()
+                    }
+                    _ => unreachable!(),
+                })
+            });
+            return supported != crate::remote::SupportLevel::Unsupported
+                && has_input
+                && context
+                    .config
+                    .selected_harness()
+                    .is_ok_and(|harness| harness.describe().headless);
+        }
+        if action == GitAction::Merge {
+            return capabilities.guarded_merge != crate::remote::SupportLevel::Unsupported;
         }
         true
     }
@@ -3235,7 +3263,7 @@ impl Tui {
                 self.move_plan_step_selection(-1);
             }
             PanelFocus::Repos => {
-                self.repo_main_view = view::RepoMainView::Github;
+                self.repo_main_view = view::RepoMainView::ChangeRequests;
             }
             PanelFocus::Worktrees => {}
         }
@@ -3389,7 +3417,7 @@ impl Tui {
 
     fn move_repo_pr_selection(&mut self, direction: isize) -> bool {
         if self.focused_panel != PanelFocus::Repos
-            || self.repo_main_view != view::RepoMainView::Github
+            || self.repo_main_view != view::RepoMainView::ChangeRequests
         {
             return false;
         }
@@ -5776,7 +5804,7 @@ mod tests {
         tui.focused_panel = PanelFocus::Worktrees;
         tui.sessions[0].pr = PrCache::observed(test_pr_summary(false), None);
         let mut failed_poll = tui.sessions[0].pr.begin_details_poll();
-        crate::github::refresh_pr_details_cache_state(
+        crate::remote::dispatcher::refresh_change_request_details_state(
             "feature",
             &mut failed_poll,
             &tui.sessions[0].path,
@@ -5970,6 +5998,17 @@ esac
         tui.sessions[0].pr = PrCache::observed(test_pr_summary(false), None);
         assert!(tui.git_action_enabled(GitAction::OpenPr));
         assert!(tui.git_action_enabled(GitAction::Merge));
+        assert!(!tui.git_action_enabled(GitAction::CiFix));
+        tui.sessions[0].pr = PrCache::observed(
+            test_pr_summary(false),
+            Some(PrDetails {
+                ci_failures: vec![crate::github::CiFailure {
+                    name: "failed".to_string(),
+                    ..crate::github::CiFailure::default()
+                }],
+                ..PrDetails::default()
+            }),
+        );
         assert!(tui.git_action_enabled(GitAction::CiFix));
 
         tui.sessions[0].pr = PrCache::observed(test_pr_summary(true), None);
@@ -6604,7 +6643,7 @@ esac
         tui.move_right();
 
         assert_eq!(tui.focused_panel, PanelFocus::Repos);
-        assert_eq!(tui.repo_main_view, RepoMainView::Github);
+        assert_eq!(tui.repo_main_view, RepoMainView::ChangeRequests);
 
         tui.focus_main();
         tui.move_right();
@@ -6615,14 +6654,14 @@ esac
         tui.move_left();
 
         assert_eq!(tui.focused_panel, PanelFocus::Repos);
-        assert_eq!(tui.repo_main_view, RepoMainView::Github);
+        assert_eq!(tui.repo_main_view, RepoMainView::ChangeRequests);
 
         tui.focused_panel = PanelFocus::Worktrees;
         tui.main_focused = false;
         tui.move_left();
 
         assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
-        assert_eq!(tui.repo_main_view, RepoMainView::Github);
+        assert_eq!(tui.repo_main_view, RepoMainView::ChangeRequests);
     }
 
     #[test]
@@ -7079,6 +7118,7 @@ esac
     fn test_pr_summary(merged: bool) -> PrSummary {
         PrSummary {
             number: 1,
+            change_request_identity: None,
             title: "PR".to_string(),
             author: "author".to_string(),
             body: String::new(),

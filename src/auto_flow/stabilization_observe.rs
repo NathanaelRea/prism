@@ -25,10 +25,25 @@ pub(crate) fn build_stabilization_snapshot(
             .ok()
             .flatten()
     });
-    let github_remote = crate::github::github_remote_repo(&session.path, config, "origin").ok();
-    let policy_cache = github_remote
-        .as_deref()
-        .and_then(|remote| crate::github::load_repo_policy_cache(repo, remote));
+    let remote = crate::remote::discover_git_remote(
+        &session.path,
+        config,
+        "origin",
+        crate::remote::RemoteUrlKind::Fetch,
+    )
+    .ok();
+    let target_repository = session
+        .pr
+        .summary()
+        .and_then(|summary| summary.change_request_identity.as_ref())
+        .and_then(|identity| identity.target_repository().ok())
+        .or_else(|| remote.as_ref().map(|remote| remote.repository.id.clone()));
+    let remote_project = target_repository
+        .as_ref()
+        .map(|repository| repository.project_path().to_string());
+    let policy_cache = target_repository.as_ref().and_then(|repository| {
+        crate::github::load_repo_policy_cache_for_repository(repo, repository)
+    });
     let merge_conflict = session.pr.summary().and_then(|summary| {
         (!session.is_default_branch(config) && !session.is_detached())
             .then(|| run_merge_conflict_check_against(config, &session.path, &summary.base_ref))
@@ -62,7 +77,7 @@ pub(crate) fn build_stabilization_snapshot(
         repository: RepositoryFacts {
             root: repo.root.clone(),
             default_base,
-            github_remote,
+            remote_project,
             policy_refreshed_unix_ms: policy_cache.as_ref().map(|policy| policy.refreshed_unix_ms),
             policy_error: policy_cache
                 .as_ref()
@@ -93,13 +108,8 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
     run: &super::AutoRun,
     config: &Config,
 ) -> StabilizationSnapshot {
-    let policy_refresh_error = if config.auto.merge {
-        crate::github::refresh_repo_policy_cache(repo, &run.worktree_path, config).err()
-    } else {
-        None
-    };
     let mut cache = crate::github::load_pr_cache(repo, &run.branch);
-    let _ = crate::github::refresh_pr_cache(
+    let _ = crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &run.branch,
         &mut cache,
@@ -107,6 +117,21 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
         config,
         true,
     );
+    let target_repository = cache
+        .summary()
+        .and_then(|summary| summary.change_request_identity.as_ref())
+        .and_then(|identity| identity.target_repository().ok());
+    let policy_refresh_error = if config.auto.merge {
+        crate::remote::dispatcher::refresh_repository_policy_for(
+            repo,
+            &run.worktree_path,
+            config,
+            target_repository.as_ref(),
+        )
+        .err()
+    } else {
+        None
+    };
     let local_head_sha = git::current_head_sha(&run.worktree_path, config).ok();
     let remote_head_sha = git::remote_branch_head_sha(&run.worktree_path, &run.branch, config)
         .ok()
@@ -116,11 +141,21 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
             .ok()
             .flatten()
     });
-    let github_remote =
-        crate::github::github_remote_repo(&run.worktree_path, config, "origin").ok();
-    let policy_cache = github_remote
-        .as_deref()
-        .and_then(|remote| crate::github::load_repo_policy_cache(repo, remote));
+    let remote = crate::remote::discover_git_remote(
+        &run.worktree_path,
+        config,
+        "origin",
+        crate::remote::RemoteUrlKind::Fetch,
+    )
+    .ok();
+    let target_repository =
+        target_repository.or_else(|| remote.as_ref().map(|remote| remote.repository.id.clone()));
+    let remote_project = target_repository
+        .as_ref()
+        .map(|repository| repository.project_path().to_string());
+    let policy_cache = target_repository.as_ref().and_then(|repository| {
+        crate::github::load_repo_policy_cache_for_repository(repo, repository)
+    });
     let is_default_branch = config.is_default_branch(&run.branch)
         || policy_cache
             .as_ref()
@@ -164,7 +199,7 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
         repository: RepositoryFacts {
             root: repo.root.clone(),
             default_base,
-            github_remote,
+            remote_project,
             policy_refreshed_unix_ms: policy_cache.as_ref().map(|policy| policy.refreshed_unix_ms),
             policy_error: policy_refresh_error.or_else(|| {
                 policy_cache
@@ -286,6 +321,7 @@ fn pull_request_facts_from_cache_with_baseline(
     };
     Some(PullRequestFacts {
         number: summary.number,
+        change_request_identity: summary.change_request_identity.clone(),
         url: summary.url.clone(),
         state: pull_request_state(summary),
         draft: summary.draft,
@@ -886,7 +922,7 @@ exit 1
         );
         assert_eq!(snapshot.repository.root, repo.root);
         assert_eq!(
-            snapshot.repository.github_remote.as_deref(),
+            snapshot.repository.remote_project.as_deref(),
             Some("owner/repo")
         );
         assert_eq!(
@@ -942,6 +978,11 @@ exit 1
             &repo,
             &RepoPolicyCache {
                 repo_remote: "owner/repo".to_string(),
+                provider: Some(crate::remote::ProviderKind::GitHub),
+                canonical_host: Some("github.com".to_string()),
+                project_path: Some("owner/repo".to_string()),
+                target_branch: Some("main".to_string()),
+                identity_complete: true,
                 default_branch: Some("main".to_string()),
                 required_approvals: 1,
                 refreshed_unix_ms: 123,
@@ -1014,6 +1055,11 @@ exit 1
             &repo,
             &RepoPolicyCache {
                 repo_remote: "owner/repo".to_string(),
+                provider: Some(crate::remote::ProviderKind::GitHub),
+                canonical_host: Some("github.com".to_string()),
+                project_path: Some("owner/repo".to_string()),
+                target_branch: Some("main".to_string()),
+                identity_complete: true,
                 default_branch: Some("main".to_string()),
                 refreshed_unix_ms: 123,
                 ..RepoPolicyCache::default()
@@ -1121,6 +1167,7 @@ exit 1
     fn test_summary() -> PrSummary {
         PrSummary {
             number: 123,
+            change_request_identity: None,
             title: "Title".to_string(),
             author: "author".to_string(),
             body: String::new(),

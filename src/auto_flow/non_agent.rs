@@ -468,7 +468,7 @@ pub(super) fn execute_push_pr_step(
     crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
 
     let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
-    let _ = crate::github::refresh_pr_cache(
+    let _ = crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &persisted.run.branch,
         &mut cache,
@@ -479,7 +479,7 @@ pub(super) fn execute_push_pr_step(
     if cache.trusted_summary()?.is_none() {
         let body = auto_pr_body(config, &persisted.run);
         crate::execution::validate_installed_claim(conn)?;
-        crate::github::create_pull_request(
+        crate::remote::dispatcher::create_change_request(
             repo,
             config,
             &persisted.run.branch,
@@ -490,7 +490,7 @@ pub(super) fn execute_push_pr_step(
         )?;
     }
     if cache.trusted_summary()?.is_none() {
-        crate::github::refresh_pr_cache(
+        crate::remote::dispatcher::refresh_change_request_cache(
             repo,
             &persisted.run.branch,
             &mut cache,
@@ -696,7 +696,7 @@ pub(super) fn execute_commit_review_fix_step(
 ) -> Result<(), String> {
     let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
     crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
-    crate::github::refresh_pr_cache(
+    crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &persisted.run.branch,
         &mut cache,
@@ -936,7 +936,7 @@ pub(super) fn execute_commit_ci_fix_step(
 ) -> Result<(), String> {
     let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
     crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
-    crate::github::refresh_pr_cache(
+    crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &persisted.run.branch,
         &mut cache,
@@ -1107,8 +1107,11 @@ pub(super) fn execute_merge_step(
         None,
         max_output_lines_per_step,
     )?;
-    let merged =
-        crate::github::wait_for_pr_merged(&persisted.run.worktree_path, pr_number, config)?;
+    let merged = crate::remote::dispatcher::wait_for_change_request_merged(
+        &persisted.run.worktree_path,
+        pr_number,
+        config,
+    )?;
     if !merged {
         let error = format!(
             "PR #{} merge command completed, but GitHub has not marked it merged yet",
@@ -1124,7 +1127,7 @@ pub(super) fn execute_merge_step(
         return Err(error);
     }
     let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
-    crate::github::refresh_pr_cache(
+    crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &persisted.run.branch,
         &mut cache,
@@ -1320,7 +1323,7 @@ pub(super) fn poll_ci_status(
     persisted: &mut PersistedAutoRun,
 ) -> Result<CiPollOutcome, String> {
     let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
-    crate::github::refresh_pr_cache(
+    crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &persisted.run.branch,
         &mut cache,
@@ -1403,7 +1406,7 @@ pub(super) fn poll_review_feedback(
     persisted: &mut PersistedAutoRun,
 ) -> Result<ReviewPollOutcome, String> {
     let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
-    crate::github::refresh_pr_cache(
+    crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &persisted.run.branch,
         &mut cache,
@@ -1669,6 +1672,8 @@ fn current_work_guard(
         })
         .unwrap_or_default();
     Ok(stabilization_model::WorkGuard {
+        change_request_identity: summary
+            .and_then(|summary| summary.change_request_identity.clone()),
         local_head_sha: Some(crate::git::current_head_sha(
             &persisted.run.worktree_path,
             config,

@@ -1118,6 +1118,7 @@ fn schema_round_trips_stabilization_guards_and_planner_state() {
     persisted.run.stabilization_next_work =
         Some(stabilization_model::StabilizationWorkKind::PushPendingRepair);
     persisted.run.pending_push = Some(stabilization_model::PendingPushGuard {
+        change_request_identity: Some(crate::remote::test_change_request_identity()),
         repair_kind: stabilization_model::RepairKind::Review,
         commit_sha: "repair-sha".to_string(),
         expected_local_head_sha: "repair-sha".to_string(),
@@ -1128,6 +1129,7 @@ fn schema_round_trips_stabilization_guards_and_planner_state() {
         guarded_review_thread_ids: vec!["thread-1".to_string(), "thread-2".to_string()],
     });
     persisted.steps[0].work_guard = Some(stabilization_model::WorkGuard {
+        change_request_identity: Some(crate::remote::test_change_request_identity()),
         local_head_sha: Some("local-sha".to_string()),
         remote_head_sha: Some("remote-sha".to_string()),
         pr_head_sha: Some("pr-sha".to_string()),
@@ -1226,6 +1228,7 @@ fn review_repair_commit_enters_pending_push_with_guard_data() {
         Some("commit review repair".to_string()),
     ));
     persisted.steps[0].work_guard = Some(stabilization_model::WorkGuard {
+        change_request_identity: Some(crate::remote::test_change_request_identity()),
         local_head_sha: Some(remote_head.clone()),
         remote_head_sha: None,
         pr_head_sha: Some(remote_head.clone()),
@@ -1281,6 +1284,7 @@ fn invalidated_repair_guard_replans_without_creating_a_commit() {
         Some("commit stale repair".to_string()),
     ));
     persisted.steps[0].work_guard = Some(stabilization_model::WorkGuard {
+        change_request_identity: Some(crate::remote::test_change_request_identity()),
         local_head_sha: Some(original_head.clone()),
         remote_head_sha: None,
         pr_head_sha: Some("superseded-head".to_string()),
@@ -1335,6 +1339,7 @@ fn ci_repair_commit_enters_pending_push_with_guard_data() {
         Some("commit CI repair".to_string()),
     ));
     persisted.steps[0].work_guard = Some(stabilization_model::WorkGuard {
+        change_request_identity: Some(crate::remote::test_change_request_identity()),
         local_head_sha: Some(remote_head.clone()),
         remote_head_sha: Some(remote_head.clone()),
         pr_head_sha: Some(remote_head.clone()),
@@ -1769,6 +1774,7 @@ fn phase_1_done_run_with_pending_push_is_discoverable_after_restart() {
             .create_run();
         persisted.run.status = AutoRunStatus::Done;
         persisted.run.pending_push = Some(stabilization_model::PendingPushGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             repair_kind: stabilization_model::RepairKind::Review,
             commit_sha: "repair-sha".to_string(),
             expected_local_head_sha: "repair-sha".to_string(),
@@ -1810,6 +1816,7 @@ fn restart_after_unrelated_commit_does_not_adopt_it_as_the_repair_commit() {
             .unwrap()
             .create_run();
         persisted.run.pending_push = Some(stabilization_model::PendingPushGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             repair_kind: stabilization_model::RepairKind::Review,
             commit_sha: String::new(),
             expected_local_head_sha: head.clone(),
@@ -1890,6 +1897,7 @@ fn transient_base_lookup_failure_retains_pending_push_for_retry() {
         .unwrap()
         .create_run();
     persisted.run.pending_push = Some(stabilization_model::PendingPushGuard {
+        change_request_identity: Some(crate::remote::test_change_request_identity()),
         repair_kind: stabilization_model::RepairKind::Ci,
         commit_sha: repair_head.clone(),
         expected_local_head_sha: repair_head,
@@ -2427,13 +2435,17 @@ if [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'branc
   printf '%s\n' '{{"data":{{"repository":{{"defaultBranchRef":{{"name":"main"}},"branchProtectionRules":{{"nodes":[]}}}}}}}}'
   exit 0
 fi
+if [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'pullRequests(first: 100'; then
+  printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_test","number":42,"title":"Auto","author":{{"login":"example"}},"body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"APPROVED","reviewRequests":{{"nodes":[]}},"headRefName":"feat/auto","baseRefName":"main","headRefOid":"{}","headRepository":{{"nameWithOwner":"example/repo"}},"baseRepository":{{"nameWithOwner":"example/repo"}},"updatedAt":"2026-01-01T00:00:00Z","mergeStateStatus":"CLEAN","merged":false,"isDraft":false,"comments":{{"totalCount":0}},"reviewThreads":{{"totalCount":0}},"commits":{{"nodes":[]}}}}]}}}}}}}}'
+  exit 0
+fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ] && [ "$5" = "comments,reviews,files,statusCheckRollup" ]; then
   printf '%s\n' '{{"comments":[],"reviews":[],"files":[],"statusCheckRollup":{{"contexts":{{"nodes":[]}}}}}}'
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ] && [ "$3" = "feat/auto" ]; then
   cat <<'JSON'
-{{"number":42,"title":"Auto","body":"","url":"https://example.com/pr/42","state":"OPEN","reviewDecision":"APPROVED","reviewRequests":[],"headRefName":"feat/auto","baseRefName":"main","headRefOid":"{}","updatedAt":"2026-01-01T00:00:00Z","statusCheckRollup":{{"contexts":{{"nodes":[{{"__typename":"StatusContext","context":"ci","state":"SUCCESS"}}]}}}},"mergeStateStatus":"CLEAN","mergedAt":null,"isDraft":false}}
+{{"id":"PR_test","number":42,"title":"Auto","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"APPROVED","reviewRequests":[],"headRefName":"feat/auto","baseRefName":"main","headRefOid":"{}","headRepository":{{"nameWithOwner":"example/repo"}},"baseRepository":{{"nameWithOwner":"example/repo"}},"updatedAt":"2026-01-01T00:00:00Z","statusCheckRollup":{{"contexts":{{"nodes":[{{"__typename":"StatusContext","context":"ci","state":"SUCCESS"}}]}}}},"mergeStateStatus":"CLEAN","mergedAt":null,"isDraft":false}}
 JSON
   exit 0
 fi
@@ -2451,6 +2463,7 @@ fi
 exit 1
 "#,
             gh_log.display(),
+            head,
             head
         ),
     );
@@ -2475,6 +2488,7 @@ exit 1
     ));
     persisted.run.pr_number = Some(42);
     persisted.steps[0].work_guard = Some(stabilization_model::WorkGuard {
+        change_request_identity: Some(crate::remote::test_change_request_identity()),
         local_head_sha: Some(head.clone()),
         remote_head_sha: Some(head.clone()),
         pr_head_sha: Some(head.clone()),
@@ -2693,6 +2707,7 @@ fn seed_pr_cache(repo: &Repository, branch: &str, head_sha: &str) {
     let cache = crate::github::PrCache::observed(
         crate::github::PrSummary {
             number: 42,
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             title: "Auto".to_string(),
             author: "author".to_string(),
             body: String::new(),
@@ -2736,7 +2751,7 @@ case "$*" in
     printf '[]\n'
     ;;
   *)
-    printf '%s\n' '{{"number":42,"title":"Auto","body":"","url":"https://example.com/pr/42","state":"OPEN","reviewDecision":"","reviewRequests":{{"nodes":[]}},"headRefName":"{branch}","baseRefName":"main","headRefOid":"{head_sha}","updatedAt":"2026-01-01T00:00:00Z","comments":{{"totalCount":0}},"statusCheckRollup":{{"contexts":{{"nodes":[]}}}},"mergeStateStatus":"CLEAN","isDraft":false}}'
+    printf '%s\n' '{{"id":"PR_test","number":42,"title":"Auto","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"","reviewRequests":{{"nodes":[]}},"headRefName":"{branch}","baseRefName":"main","headRefOid":"{head_sha}","headRepository":{{"nameWithOwner":"example/repo"}},"baseRepository":{{"nameWithOwner":"example/repo"}},"updatedAt":"2026-01-01T00:00:00Z","comments":{{"totalCount":0}},"statusCheckRollup":{{"contexts":{{"nodes":[]}}}},"mergeStateStatus":"CLEAN","isDraft":false}}'
     ;;
 esac
 "#
@@ -2753,6 +2768,7 @@ esac
 fn test_pr_summary(branch: &str, head_sha: &str, updated_at: &str) -> crate::github::PrSummary {
     crate::github::PrSummary {
         number: 42,
+        change_request_identity: Some(crate::remote::test_change_request_identity()),
         title: "Auto".to_string(),
         author: "author".to_string(),
         body: String::new(),

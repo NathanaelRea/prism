@@ -92,7 +92,7 @@ pub(crate) fn observe_manual_merge_authorization(
     config: &Config,
     session: &mut crate::session::Session,
 ) -> MergeAuthorization {
-    let pr_refresh = crate::github::refresh_pr_cache(
+    let pr_refresh = crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &session.branch,
         &mut session.pr,
@@ -100,7 +100,17 @@ pub(crate) fn observe_manual_merge_authorization(
         config,
         true,
     );
-    let policy_refresh = crate::github::refresh_repo_policy_cache(repo, &session.path, config);
+    let target_repository = session
+        .pr
+        .summary()
+        .and_then(|summary| summary.change_request_identity.as_ref())
+        .and_then(|identity| identity.target_repository().ok());
+    let policy_refresh = crate::remote::dispatcher::refresh_repository_policy_for(
+        repo,
+        &session.path,
+        config,
+        target_repository.as_ref(),
+    );
     let remote_refresh = crate::git::fetch_origin(&session.path, config);
     let worktree_refresh = crate::git::selected_dirty(&session.path, config);
     let snapshot = stabilization_observe::build_stabilization_snapshot(repo, session, None, config);
@@ -237,10 +247,19 @@ pub(crate) fn execute_merge_authorization(
 ) -> Result<ManualMergeExecution, String> {
     match authorization {
         MergeAuthorization::Authorized(AuthorizedMerge { pr_number, guard }) => {
+            let identity = guard.change_request_identity.as_ref().ok_or_else(|| {
+                "authorized merge is missing the canonical change request identity".to_string()
+            })?;
             let expected_head_sha = guard.pr_head_sha.as_deref().ok_or_else(|| {
                 "authorized merge is missing the observed pull request head".to_string()
             })?;
-            crate::github::merge_pull_request(config, path, pr_number, expected_head_sha)?;
+            crate::remote::dispatcher::merge_change_request(
+                config,
+                path,
+                identity,
+                pr_number,
+                expected_head_sha,
+            )?;
             Ok(ManualMergeExecution::Merged { pr_number })
         }
         MergeAuthorization::ReviewResolutionRequired { state, .. }
@@ -477,6 +496,8 @@ pub(crate) fn prepare_standalone_repair(
         None => None,
     };
     let current_guard = WorkGuard {
+        change_request_identity: summary
+            .and_then(|summary| summary.change_request_identity.clone()),
         local_head_sha,
         remote_head_sha,
         pr_head_sha,
@@ -511,6 +532,17 @@ pub(crate) fn decide_work_guard(
     guard: &WorkGuard,
     current: &WorkGuard,
 ) -> WorkGuardDecision {
+    let Some(expected_identity) = guard.change_request_identity.as_ref() else {
+        return WorkGuardDecision::Invalidated {
+            reason: "persisted work guard has no canonical change request identity".to_string(),
+        };
+    };
+    if current.change_request_identity.as_ref() != Some(expected_identity) {
+        return WorkGuardDecision::Invalidated {
+            reason: "canonical change request identity changed while the repair was in progress"
+                .to_string(),
+        };
+    }
     for (label, expected, actual) in [
         ("local HEAD", &guard.local_head_sha, &current.local_head_sha),
         (
@@ -905,6 +937,7 @@ pub(crate) fn validate_and_begin_repair_commit(
         .clone()
         .ok_or_else(|| "repair commit observation is missing local HEAD".to_string())?;
     persisted.run.pending_push = Some(PendingPushGuard {
+        change_request_identity: observation.guard.change_request_identity,
         repair_kind: kind.clone(),
         commit_sha: String::new(),
         expected_local_head_sha,
@@ -1035,12 +1068,23 @@ fn repair_label(kind: &super::stabilization_model::RepairKind) -> &'static str {
 
 pub(crate) fn decide_guarded_push(
     guard: &PendingPushGuard,
+    change_request_identity: Option<&crate::remote::CanonicalChangeRequestIdentity>,
     local_head_sha: Option<&str>,
     remote_head_sha: Option<&str>,
     pr_number: Option<u64>,
     pr_head_sha: Option<&str>,
     base_sha: Option<&str>,
 ) -> GuardedPushDecision {
+    let Some(expected_identity) = guard.change_request_identity.as_ref() else {
+        return GuardedPushDecision::Invalidated {
+            reason: "the persisted push guard has no canonical change request identity".to_string(),
+        };
+    };
+    if change_request_identity != Some(expected_identity) {
+        return GuardedPushDecision::Invalidated {
+            reason: "the guarded canonical change request identity changed".to_string(),
+        };
+    }
     if guard.pr_number.is_some() && pr_number != guard.pr_number {
         return GuardedPushDecision::Invalidated {
             reason: "the guarded pull request identity changed".to_string(),
@@ -1130,7 +1174,7 @@ pub(crate) fn progress_pending_push(
         return Ok(GuardedPushProgress::Invalidated { reason });
     }
     crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
-    crate::github::refresh_pr_cache(
+    crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &persisted.run.branch,
         cache,
@@ -1160,6 +1204,7 @@ pub(crate) fn progress_pending_push(
     };
     let decision = decide_guarded_push(
         &guard,
+        summary.and_then(|summary| summary.change_request_identity.as_ref()),
         local_head.as_deref(),
         remote_head.as_deref(),
         summary.map(|summary| summary.number),
@@ -1222,6 +1267,7 @@ pub(crate) fn progress_pending_push(
         )?;
         if let GuardedPushDecision::Invalidated { reason } = decide_guarded_push(
             guard,
+            summary.change_request_identity.as_ref(),
             Some(local_head.as_str()),
             remote_head.as_deref(),
             Some(summary.number),
@@ -1239,7 +1285,12 @@ pub(crate) fn progress_pending_push(
         });
         if unresolved {
             crate::execution::validate_installed_claim(conn)?;
-            crate::github::resolve_review_thread(&persisted.run.worktree_path, config, &thread_id)?;
+            crate::remote::dispatcher::resolve_review_thread(
+                &persisted.run.worktree_path,
+                config,
+                summary,
+                &thread_id,
+            )?;
         }
         if let Some(guard) = persisted.run.pending_push.as_mut() {
             guard
@@ -1265,7 +1316,7 @@ fn refresh_after_guarded_effect(
     persisted: &PersistedAutoRun,
     cache: &mut crate::github::PrCache,
 ) -> Result<(), String> {
-    crate::github::refresh_pr_cache(
+    crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &persisted.run.branch,
         cache,
@@ -1440,8 +1491,36 @@ mod tests {
     }
 
     #[test]
+    fn final_merge_rejects_a_changed_remote_with_the_same_number_and_head() {
+        let (temp, mut config, log) = manual_merge_test_config();
+        crate::test_support::install_tool(
+            &mut config,
+            &temp,
+            "git",
+            "#!/bin/sh\nif [ \"$3\" = remote ] && [ \"$4\" = get-url ]; then printf '%s\\n' 'https://github.com/other/repo.git'; exit 0; fi\nexit 1\n",
+        );
+        let snapshot = ready_manual_merge_snapshot();
+        let work = stabilization_plan::manual_merge_authorization(&snapshot).unwrap();
+
+        let error = execute_merge_authorization(
+            &config,
+            &temp,
+            MergeAuthorization::Authorized(AuthorizedMerge {
+                pr_number: 42,
+                guard: work.guard,
+            }),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("repository changed"), "{error}");
+        assert!(!log.exists(), "changed repository must not invoke gh");
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn manual_merge_authorization_cannot_switch_pr_or_guard_after_checks() {
         let guard = WorkGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             local_head_sha: Some("head".to_string()),
             remote_head_sha: Some("head".to_string()),
             pr_head_sha: Some("head".to_string()),
@@ -1591,6 +1670,7 @@ mod tests {
 
         let decision = decide_guarded_push(
             &guard,
+            guard.change_request_identity.as_ref(),
             Some("repair"),
             Some("remote"),
             Some(42),
@@ -1602,11 +1682,111 @@ mod tests {
     }
 
     #[test]
+    fn legacy_persisted_guards_load_but_cannot_authorize_mutations() {
+        let pending: PendingPushGuard = serde_json::from_str(
+            r#"{
+                "repair_kind":"Review",
+                "commit_sha":"repair",
+                "expected_local_head_sha":"repair",
+                "expected_remote_head_sha":"remote",
+                "pr_number":42,
+                "expected_pr_head_sha":"remote",
+                "expected_base_sha":"base",
+                "guarded_review_thread_ids":[]
+            }"#,
+        )
+        .unwrap();
+        let current_identity = crate::remote::test_change_request_identity();
+        assert!(matches!(
+            decide_guarded_push(
+                &pending,
+                Some(&current_identity),
+                Some("repair"),
+                Some("remote"),
+                Some(42),
+                Some("remote"),
+                Some("base"),
+            ),
+            GuardedPushDecision::Invalidated { .. }
+        ));
+
+        let persisted: WorkGuard = serde_json::from_str(
+            r#"{
+                "local_head_sha":"head",
+                "remote_head_sha":"head",
+                "pr_head_sha":"head",
+                "base_sha":"base",
+                "review_thread_ids":[]
+            }"#,
+        )
+        .unwrap();
+        let fresh = WorkGuard {
+            change_request_identity: Some(current_identity),
+            local_head_sha: Some("head".to_string()),
+            remote_head_sha: Some("head".to_string()),
+            pr_head_sha: Some("head".to_string()),
+            base_sha: Some("base".to_string()),
+            review_thread_ids: Vec::new(),
+        };
+        assert!(matches!(
+            decide_work_guard(&RepairKind::Merge, &persisted, &fresh),
+            WorkGuardDecision::Invalidated { .. }
+        ));
+    }
+
+    #[test]
+    fn canonical_identity_change_invalidates_work_and_push_guards() {
+        let expected = crate::remote::test_change_request_identity();
+        let changed_repository = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.example.com", None).unwrap(),
+            "example/repo",
+        )
+        .unwrap();
+        let changed = crate::remote::CanonicalChangeRequestIdentity::new(
+            &changed_repository,
+            &crate::remote::NativeChangeRequestId::new("PR_test").unwrap(),
+            &changed_repository,
+            &changed_repository,
+        );
+        let work = WorkGuard {
+            change_request_identity: Some(expected.clone()),
+            ..WorkGuard::default()
+        };
+        let current = WorkGuard {
+            change_request_identity: Some(changed.clone()),
+            ..WorkGuard::default()
+        };
+        assert!(matches!(
+            decide_work_guard(&RepairKind::Ci, &work, &current),
+            WorkGuardDecision::Invalidated { .. }
+        ));
+
+        let pending = PendingPushGuard {
+            change_request_identity: Some(expected),
+            ..guard()
+        };
+        assert!(matches!(
+            decide_guarded_push(
+                &pending,
+                Some(&changed),
+                Some("repair"),
+                Some("remote"),
+                Some(42),
+                Some("remote"),
+                Some("base"),
+            ),
+            GuardedPushDecision::Invalidated { .. }
+        ));
+    }
+
+    #[test]
     fn already_pushed_commit_is_satisfied() {
         let guard = guard();
 
         let decision = decide_guarded_push(
             &guard,
+            guard.change_request_identity.as_ref(),
             Some("repair"),
             Some("repair"),
             Some(42),
@@ -1623,6 +1803,7 @@ mod tests {
 
         let decision = decide_guarded_push(
             &guard,
+            guard.change_request_identity.as_ref(),
             Some("other"),
             Some("remote"),
             Some(42),
@@ -1639,6 +1820,7 @@ mod tests {
 
         let decision = decide_guarded_push(
             &guard,
+            guard.change_request_identity.as_ref(),
             Some("repair"),
             Some("other"),
             Some(42),
@@ -1655,6 +1837,7 @@ mod tests {
 
         let decision = decide_guarded_push(
             &guard,
+            guard.change_request_identity.as_ref(),
             Some("repair"),
             Some("remote"),
             Some(42),
@@ -1668,6 +1851,7 @@ mod tests {
     #[test]
     fn changed_original_work_guard_is_invalidated_before_commit() {
         let original = WorkGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             local_head_sha: Some("head-a".to_string()),
             remote_head_sha: Some("head-a".to_string()),
             pr_head_sha: Some("head-a".to_string()),
@@ -1686,10 +1870,12 @@ mod tests {
     #[test]
     fn changed_actionable_review_thread_invalidates_commit_guard() {
         let original = WorkGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             review_thread_ids: vec!["thread-1".to_string()],
             ..WorkGuard::default()
         };
         let current = WorkGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             review_thread_ids: vec!["thread-2".to_string()],
             ..WorkGuard::default()
         };
@@ -1703,10 +1889,12 @@ mod tests {
     #[test]
     fn ci_work_guard_ignores_review_thread_changes() {
         let original = WorkGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             review_thread_ids: Vec::new(),
             ..WorkGuard::default()
         };
         let current = WorkGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             review_thread_ids: vec!["unresolved-thread".to_string()],
             ..WorkGuard::default()
         };
@@ -1988,7 +2176,7 @@ mod tests {
             repository: RepositoryFacts {
                 root: PathBuf::from("/repo"),
                 default_base: Some("main".to_string()),
-                github_remote: Some("owner/repo".to_string()),
+                remote_project: Some("owner/repo".to_string()),
                 policy_refreshed_unix_ms: Some(1),
                 policy_error: None,
             },
@@ -2003,6 +2191,7 @@ mod tests {
             },
             pull_request: Some(PullRequestFacts {
                 number: 42,
+                change_request_identity: Some(crate::remote::test_change_request_identity()),
                 url: "https://example.test/pr/42".to_string(),
                 state: PullRequestState::Open,
                 draft: false,
@@ -2053,13 +2242,23 @@ mod tests {
             &mut config,
             &temp,
             "gh",
-            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = api ]; then printf '%s\\n' '{{\"data\":{{\"repository\":{{\"pullRequests\":{{\"nodes\":[{{\"id\":\"PR_test\",\"number\":42,\"headRefName\":\"feature\",\"baseRefName\":\"main\",\"headRefOid\":\"head\",\"headRepository\":{{\"nameWithOwner\":\"example/repo\"}},\"baseRepository\":{{\"nameWithOwner\":\"example/repo\"}},\"state\":\"OPEN\"}}]}}}}}}}}'; exit 0; fi\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                log.display()
+            ),
+        );
+        crate::test_support::install_tool(
+            &mut config,
+            &temp,
+            "git",
+            "#!/bin/sh\nif [ \"$3\" = remote ] && [ \"$4\" = get-url ]; then printf '%s\\n' 'https://github.com/example/repo.git'; exit 0; fi\nexit 1\n",
         );
         (temp, config, log)
     }
 
     fn guard() -> PendingPushGuard {
         PendingPushGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             repair_kind: RepairKind::Review,
             commit_sha: "repair".to_string(),
             expected_local_head_sha: "repair".to_string(),

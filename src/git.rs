@@ -197,26 +197,6 @@ pub(crate) fn fetch_origin(path: &std::path::Path, config: &Config) -> Result<()
     )
 }
 
-pub(crate) fn fetch_pull_request_branch(
-    path: &std::path::Path,
-    config: &Config,
-    number: u64,
-    branch: &str,
-) -> Result<(), String> {
-    if branch.trim().is_empty() || branch == "(detached)" {
-        return Err("cannot fetch pull request into an empty or detached branch name".to_string());
-    }
-    run_status_named(
-        Command::new(config.tool("git"))
-            .arg("-C")
-            .arg(path)
-            .args(["fetch", "origin"])
-            .arg(format!("+pull/{number}/head:refs/heads/{branch}")),
-        ProcessPolicy::NetworkQuery,
-        ProcessDescriptor::new("git.fetch"),
-    )
-}
-
 pub fn selected_dirty(path: &std::path::Path, config: &Config) -> Result<bool, String> {
     Ok(inspect_dirty(path, config)?.dirty)
 }

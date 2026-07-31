@@ -225,8 +225,8 @@ impl Tui {
                     Some(TUI_ACTION_JOB_TIMEOUT),
                     format!("prism-pr-summary-{repo_index}"),
                     move |_| {
-                        let github_remote_configured =
-                            crate::github::github_remote_configured(&path, &config);
+                        let adapter = crate::remote::dispatcher::capabilities(&path, &config);
+                        let github_remote_configured = adapter.is_ok();
                         let summaries = if github_remote_configured {
                             let _ = refresh_repo_policy_cache(
                                 &crate::repo::Repository { root: path.clone() },
@@ -235,7 +235,7 @@ impl Tui {
                             );
                             fetch_pr_summary_index(&path, &config)
                         } else {
-                            Ok(Vec::new())
+                            Err(adapter.unwrap_err())
                         };
                         let observations = match &summaries {
                             Ok(summaries) => Ok(session_snapshots
@@ -343,19 +343,20 @@ impl Tui {
                         .collect::<Vec<_>>();
                     let mut persistence = Vec::new();
                     if !github_remote_configured {
+                        let error = summaries
+                            .as_ref()
+                            .err()
+                            .cloned()
+                            .unwrap_or_else(|| "remote adapter is unavailable".to_string());
                         for (index, session) in self
                             .sessions
                             .iter_mut()
                             .enumerate()
                             .filter(|(_, session)| session.repo_index == repo_index)
                         {
-                            if session.pr.clear_for_missing_github_remote() {
-                                session.unseen_comments = false;
+                            if session.pr.record_remote_unavailable(error.clone()) {
                                 persistence.push(index);
                             }
-                        }
-                        if let Some(repo) = self.repos.get_mut(repo_index) {
-                            repo.pr_summaries.clear();
                         }
                     } else {
                         if let Ok(summaries) = summaries

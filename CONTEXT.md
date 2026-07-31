@@ -10,7 +10,7 @@ discussing behavior, code, and docs.
 
 A repository is a Git working tree root discovered with `git rev-parse
 --show-toplevel`. Prism treats the repository root as the source of branches,
-worktrees, GitHub pull request state, and per-repository Prism state.
+worktrees, remote change-request state, and per-repository Prism state.
 
 Per-repository Prism state is stored under the user Prism config directory, not
 inside the repository root. The path is derived from the repository name and a
@@ -40,7 +40,7 @@ and path. Branch names and paths may be reused after deletion, but the new
 worktree is a new session and cannot inherit the old session's active state.
 
 Prism may attach metadata to a session, including prompt summary, agent state,
-logs, hidden markers, pull request cache data, and workflow history. Deleting a
+logs, hidden markers, change-request cache data, and workflow history. Deleting a
 session retires it from active use while retaining historical Plan and Auto Flow
 runs under that session identity.
 
@@ -50,8 +50,8 @@ users migrate, defer, or pin that association when opening it.
 
 The Worktree Session module owns session identity, default-branch
 classification, branch metadata facts, background-safe snapshots, and deletion
-warnings. It may carry Agent Session and PR Cache facts for callers, but it
-should not own tmux lifecycle behavior or GitHub refresh semantics.
+warnings. It may carry Agent Session and Change Request Cache facts for callers,
+but it should not own tmux lifecycle behavior or provider refresh semantics.
 
 ### Agent Session
 
@@ -78,18 +78,18 @@ Prism does not poll or display pull request state for the default branch. Startu
 setup also uses the default branch to decide whether the current checkout should
 be moved into a separate worktree.
 
-### PR Cache
+### Change Request Cache
 
-The PR cache is Prism's local snapshot of GitHub pull request state for a
-non-default branch. It includes summary fields, details such as comments and
-checks, polling timestamps, a signature used to detect changes, and any refresh
-error.
+The Change Request Cache is Prism's local snapshot of GitHub pull-request,
+GitLab merge-request, or Forgejo pull-request state for a non-default branch. It
+includes canonical provider, host, project, native identity, exact head SHA,
+summary fields, independently observed details, polling timestamps, and errors.
 
-The cache exists to keep the board responsive and to avoid polling GitHub on
-every render. Refresh logic should preserve that separation: UI renders cached
-state, while lifecycle or GitHub code refreshes it.
+The cache exists to keep the board responsive and avoid provider work on every
+render. Failed refreshes preserve stale display state but cannot authorize a
+mutation. Provider adapters refresh it outside the TUI thread.
 
-The PR Cache module owns branch eligibility, refresh pollability, summary/detail
+The Change Request Cache module owns branch eligibility, refresh pollability, summary/detail
 preservation rules, comment-count facts, render-change signatures, and refresh
 errors. Callers should consume those facts instead of rebuilding timestamp,
 signature, default-branch, or optional-detail rules.
@@ -143,7 +143,7 @@ Managed executor database connections install claim-bound SQLite guards. The
 guards reject run, step, output, event, and process writes unless the connection
 still owns the current unexpired fencing token; linked Plan writes use their
 parent Auto Flow claim. Executor loops also revalidate ownership before harness,
-verification, Git, GitHub, and cleanup effects. Resume and retry requests made
+verification, Git, remote-provider, and cleanup effects. Resume and retry requests made
 while an executor is releasing persist a requeue intent so runnable work cannot
 be stranded by the release race.
 
@@ -166,16 +166,16 @@ of duplicating each phase as an Auto Flow step. The Auto pipeline records one
 `RunPlan` step with a linked `PlanRun`, waits for that plan run to finish, and
 then continues with local verification and the rest of the PR pipeline.
 
-### PR Stabilization
+### Change Request Stabilization
 
-PR Stabilization is Prism's core workflow for taking an existing pull request
+Change Request Stabilization is Prism's core workflow for taking an existing change request
 from its current observed state to all required gates passing. It starts after
 Auto Flow creates or updates a pull request, or when a user asks Prism to manage
 a review, CI, or mergeability repair for an existing Worktree Session. Auto Flow
-delegates pull request gate decisions to PR Stabilization instead of owning a
+delegates change-request gate decisions to stabilization instead of owning a
 separate linear PR checklist.
 
-Prism treats PR Stabilization as derived work rather than a fixed checklist. It
+Prism treats Change Request Stabilization as derived work rather than a fixed checklist. It
 observes local Git state, cached pull request state, repository policy, and the
 configured Auto Flow goal, derives the current blocker, and chooses one safe next
 work item such as review repair, CI repair, waiting for checks, or ready for
@@ -184,10 +184,10 @@ manual merge.
 Managed repair work remains auditable in Prism state. A managed repair may ask an
 agent to prepare a change, verify it, and create a local repair commit. The
 commit can then wait in a pending-push state for user review. If a guarded review
-repair is pushed, Prism may resolve only the exact GitHub review threads that the
-repair was based on.
+repair is pushed, Prism may resolve only the exact provider conversation IDs that
+the repair recorded, and only when that adapter supports resolution.
 
-Actionable review feedback means feedback submitted through GitHub review
+Actionable review feedback means feedback submitted through provider review
 mechanisms, such as review bodies and inline review-thread comments. Top-level
 pull request comments are not treated as review feedback by default.
 
@@ -210,7 +210,7 @@ that the branch can be moved, and refuses to move a dirty checkout.
 
 - Use the terms above in code, docs, and reviews.
 - Keep product behavior centered on repositories, worktree sessions, agent
-  sessions, and cached PR state.
+  sessions, and cached change-request state.
 - Prefer changes that preserve local state outside project repositories unless a
   feature explicitly needs repository-owned files.
 - Treat default-branch behavior as a product boundary: task branch workflows
