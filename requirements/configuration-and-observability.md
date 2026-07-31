@@ -33,8 +33,10 @@
   missing tools and relevant configuration locations. Optional tools are checked
   only when their actions require them.
 - **Behavior**: `prism doctor` reports tool availability and versions, GitHub
-  authentication, configured checks, selected harness capabilities, and discovered
-  worktrees.
+  and GitLab CLI authentication, Forgejo credential-source availability,
+  resolved remote host/provider, remote capabilities and server version when
+  discoverable, configured checks, selected harness capabilities, and discovered
+  worktrees without printing credential values.
 
 ## Verification Commands
 

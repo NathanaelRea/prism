@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::{ErrorKind, Read};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,6 +7,8 @@ use std::time::{Duration, SystemTime};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use url::Url;
+
+use crate::flight_recorder::{self, ExternalCallCategory, ExternalCallOutcome, ExternalCallTrace};
 
 use super::{
     HostProfile, ProviderKind, RemoteError, RemoteErrorClass, RemoteOperation, RetryHint,
@@ -21,6 +24,8 @@ pub(super) struct HttpClient {
     credential_environment: Option<String>,
     response_limit: usize,
     cancelled: Arc<AtomicBool>,
+    deadline: Duration,
+    host_identity: String,
 }
 
 pub(super) struct HttpResponse {
@@ -66,11 +71,13 @@ impl HttpClient {
             .into();
 
         Ok(Self {
+            host_identity: safe_host_identity(&api_base),
             api_base,
             agent,
             credential_environment: profile.credential_environment.clone(),
             response_limit,
             cancelled,
+            deadline: timeout,
         })
     }
 
@@ -93,18 +100,42 @@ impl HttpClient {
     ) -> Result<Vec<T>, RemoteError> {
         let mut url = self.endpoint(path, query, operation)?;
         let mut values = Vec::new();
+        let mut visited = HashSet::new();
+        let mut expected_total = None;
         for _ in 0..MAX_PAGES {
+            if !visited.insert(url.as_str().to_string()) {
+                return Err(pagination_error(operation));
+            }
             let response = self.send(operation, url.clone(), None)?;
             let next = response.next_link(&self.api_base, operation)?;
+            let total = response.total_count(operation)?;
+            if let Some(total) = total {
+                if expected_total.is_some_and(|expected| expected != total) {
+                    return Err(pagination_error(operation));
+                }
+                expected_total = Some(total);
+            }
             let page = response.json::<Vec<T>>(operation)?;
             let full_page_without_link = next.is_none()
                 && requested_page_size(&url).is_some_and(|limit| page.len() >= limit);
+            let page_len = page.len();
             values.extend(page);
+            if let Some(total) = expected_total {
+                if values.len() > total {
+                    return Err(pagination_error(operation));
+                }
+                if values.len() == total {
+                    return Ok(values);
+                }
+                if page_len == 0 {
+                    return Err(pagination_error(operation));
+                }
+            }
             if let Some(next) = next {
                 url = next;
                 continue;
             }
-            if full_page_without_link {
+            if full_page_without_link || expected_total.is_some_and(|total| values.len() < total) {
                 url = next_numbered_page(&url).ok_or_else(|| pagination_error(operation))?;
             } else {
                 return Ok(values);
@@ -223,70 +254,104 @@ impl HttpClient {
         } else {
             None
         };
-        let response = if let Some(body) = body {
-            let mut request = self
-                .agent
-                .post(url.as_str())
-                .header("Accept", "application/json")
-                .header("User-Agent", concat!("prism/", env!("CARGO_PKG_VERSION")))
-                .header("Content-Type", "application/json");
-            if let Some(authorization) = &authorization {
-                request = request.header("Authorization", authorization);
+        let request_bytes = body.as_ref().map_or(0, Vec::len);
+        let mut trace = ExternalCallTrace::begin(
+            ExternalCallCategory::Http,
+            "forgejo.http.request",
+            vec![
+                flight_recorder::text("provider", "forgejo"),
+                flight_recorder::text("operation", operation_label(operation)),
+                flight_recorder::text("transport", "http"),
+                flight_recorder::unsigned("deadline_ms", self.deadline.as_millis()),
+                flight_recorder::unsigned("request_bytes", request_bytes),
+                flight_recorder::text("host", &self.host_identity),
+            ],
+        );
+        let mut status = None;
+        let mut response_bytes = 0;
+        let result = (|| {
+            let response = if let Some(body) = body {
+                let mut request = self
+                    .agent
+                    .post(url.as_str())
+                    .header("Accept", "application/json")
+                    .header("User-Agent", concat!("prism/", env!("CARGO_PKG_VERSION")))
+                    .header("Content-Type", "application/json");
+                if let Some(authorization) = &authorization {
+                    request = request.header("Authorization", authorization);
+                }
+                request.send(body.as_slice())
+            } else {
+                let mut request = self
+                    .agent
+                    .get(url.as_str())
+                    .header("Accept", "application/json")
+                    .header("User-Agent", concat!("prism/", env!("CARGO_PKG_VERSION")));
+                if let Some(authorization) = &authorization {
+                    request = request.header("Authorization", authorization);
+                }
+                request.call()
             }
-            request.send(body.as_slice())
-        } else {
-            let mut request = self
-                .agent
-                .get(url.as_str())
-                .header("Accept", "application/json")
-                .header("User-Agent", concat!("prism/", env!("CARGO_PKG_VERSION")));
-            if let Some(authorization) = &authorization {
-                request = request.header("Authorization", authorization);
+            .map_err(|error| transport_error(operation, &error))?;
+            let response_status = response.status().as_u16();
+            status = Some(response_status);
+            let headers = response
+                .headers()
+                .iter()
+                .map(|(name, value)| {
+                    value
+                        .to_str()
+                        .map(|value| (name.as_str().to_string(), value.to_string()))
+                        .map_err(|_| {
+                            invalid_transport_response(
+                                operation,
+                                "Forgejo returned an invalid header",
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            if !(200..300).contains(&response_status) {
+                return Err(HttpResponse {
+                    status: response_status,
+                    headers,
+                    body: Vec::new(),
+                }
+                .status_error(operation));
             }
-            request.call()
-        }
-        .map_err(|error| transport_error(operation, &error))?;
-        let status = response.status().as_u16();
-        let headers = response
-            .headers()
-            .iter()
-            .map(|(name, value)| {
-                value
-                    .to_str()
-                    .map(|value| (name.as_str().to_string(), value.to_string()))
-                    .map_err(|_| {
-                        invalid_transport_response(operation, "Forgejo returned an invalid header")
-                    })
+            if content_length(&headers).is_some_and(|length| length > self.response_limit) {
+                return Err(response_too_large(operation));
+            }
+            let mut bytes = Vec::new();
+            let mut reader = response
+                .into_body()
+                .into_with_config()
+                // Leave one byte beyond the detection byte so ureq can observe EOF
+                // without reporting its own limit error for an exactly sized body.
+                .limit(self.response_limit as u64 + 2)
+                .reader();
+            let mut chunk = [0_u8; 8192];
+            loop {
+                self.check_cancelled(operation)?;
+                let count = reader
+                    .read(&mut chunk)
+                    .map_err(|error| io_error(operation, &error))?;
+                if count == 0 {
+                    break;
+                }
+                bytes.extend_from_slice(&chunk[..count]);
+                response_bytes = bytes.len().min(self.response_limit);
+                if bytes.len() > self.response_limit {
+                    return Err(response_too_large(operation));
+                }
+            }
+            Ok(HttpResponse {
+                status: response_status,
+                headers,
+                body: bytes,
             })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut bytes = Vec::new();
-        response
-            .into_body()
-            .into_with_config()
-            // Leave one byte beyond the detection byte so ureq can observe EOF
-            // without reporting its own limit error for an exactly sized body.
-            .limit(self.response_limit as u64 + 2)
-            .reader()
-            .read_to_end(&mut bytes)
-            .map_err(|error| io_error(operation, &error))?;
-        if bytes.len() > self.response_limit {
-            return Err(RemoteError::new(
-                ProviderKind::Forgejo,
-                operation,
-                RemoteErrorClass::InvalidResponse,
-                Retryability::NotRetryable,
-                "Forgejo response exceeded the configured size limit",
-            ));
-        }
-        let response = HttpResponse {
-            status,
-            headers,
-            body: bytes,
-        };
-        if !(200..300).contains(&status) {
-            return Err(response.status_error(operation));
-        }
-        Ok(response)
+        })();
+        finish_http_trace(&mut trace, &result, status, response_bytes);
+        result
     }
 
     fn check_cancelled(&self, operation: RemoteOperation) -> Result<(), RemoteError> {
@@ -372,6 +437,7 @@ impl HttpResponse {
             .join(target)
             .map_err(|_| pagination_error(operation))?;
         if !same_origin(api_base, &next)
+            || !next.path().starts_with(api_base.path())
             || !next.username().is_empty()
             || next.password().is_some()
             || next.fragment().is_some()
@@ -379,6 +445,12 @@ impl HttpResponse {
             return Err(pagination_error(operation));
         }
         Ok(Some(next))
+    }
+
+    fn total_count(&self, operation: RemoteOperation) -> Result<Option<usize>, RemoteError> {
+        self.header("X-Total-Count")
+            .map(|value| value.parse().map_err(|_| pagination_error(operation)))
+            .transpose()
     }
 
     fn status_error(&self, operation: RemoteOperation) -> RemoteError {
@@ -403,7 +475,12 @@ impl HttpResponse {
                 Retryability::Retryable,
                 "Forgejo request timed out",
             ),
-            409 | 412 => (
+            405 if operation == RemoteOperation::MergeChangeRequest => (
+                RemoteErrorClass::Unsupported,
+                Retryability::NotRetryable,
+                "Forgejo does not support the requested merge method",
+            ),
+            409 | 412 | 423 => (
                 RemoteErrorClass::Conflict,
                 Retryability::NotRetryable,
                 "Forgejo rejected a conflicting operation",
@@ -498,6 +575,68 @@ fn same_origin(left: &Url, right: &Url) -> bool {
         && left.port_or_known_default() == right.port_or_known_default()
 }
 
+fn safe_host_identity(url: &Url) -> String {
+    let host = url.host_str().unwrap_or("unknown");
+    match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    }
+}
+
+fn operation_label(operation: RemoteOperation) -> &'static str {
+    match operation {
+        RemoteOperation::DiscoverRepository => "discover_repository",
+        RemoteOperation::ListChangeRequests => "list_change_requests",
+        RemoteOperation::ObserveChangeRequest => "observe_change_request",
+        RemoteOperation::ObserveReviewThreads => "observe_review_threads",
+        RemoteOperation::ResolveReviewThread => "resolve_review_thread",
+        RemoteOperation::ObserveChecks => "observe_checks",
+        RemoteOperation::LoadCiLogs => "load_ci_logs",
+        RemoteOperation::ObserveChangedFiles => "observe_changed_files",
+        RemoteOperation::ObserveRepositoryPolicy => "observe_repository_policy",
+        RemoteOperation::FetchChangeRequest => "fetch_change_request",
+        RemoteOperation::CreateChangeRequest => "create_change_request",
+        RemoteOperation::MergeChangeRequest => "merge_change_request",
+        RemoteOperation::ObserveMergeQueue => "observe_merge_queue",
+    }
+}
+
+fn finish_http_trace(
+    trace: &mut ExternalCallTrace,
+    result: &Result<HttpResponse, RemoteError>,
+    status: Option<u16>,
+    response_bytes: usize,
+) {
+    let mut fields = vec![flight_recorder::unsigned("response_bytes", response_bytes)];
+    if let Some(status) = status {
+        fields.push(flight_recorder::unsigned("status", status));
+    }
+    let (outcome, retryability) = match result {
+        Ok(_) => (ExternalCallOutcome::Success, "not_applicable"),
+        Err(error) => (
+            match error.class() {
+                RemoteErrorClass::Timeout => ExternalCallOutcome::TimedOut,
+                RemoteErrorClass::Cancelled => ExternalCallOutcome::Canceled,
+                _ => ExternalCallOutcome::Failed,
+            },
+            match error.retryability() {
+                Retryability::Retryable => "retryable",
+                Retryability::NotRetryable => "not_retryable",
+                Retryability::Unknown => "unknown",
+            },
+        ),
+    };
+    fields.push(flight_recorder::text("retryability", retryability));
+    trace.finish(outcome, fields);
+}
+
+fn content_length(headers: &[(String, String)]) -> Option<usize> {
+    headers
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("Content-Length"))
+        .and_then(|(_, value)| value.parse().ok())
+}
+
 fn configuration_error(message: &str) -> RemoteError {
     RemoteError::new(
         ProviderKind::Forgejo,
@@ -514,7 +653,17 @@ fn pagination_error(operation: RemoteOperation) -> RemoteError {
         operation,
         RemoteErrorClass::InvalidResponse,
         Retryability::NotRetryable,
-        "Forgejo returned an invalid cross-origin pagination link",
+        "Forgejo returned invalid or incomplete pagination metadata",
+    )
+}
+
+fn response_too_large(operation: RemoteOperation) -> RemoteError {
+    RemoteError::new(
+        ProviderKind::Forgejo,
+        operation,
+        RemoteErrorClass::InvalidResponse,
+        Retryability::NotRetryable,
+        "Forgejo response exceeded the configured size limit",
     )
 }
 

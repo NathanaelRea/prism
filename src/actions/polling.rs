@@ -180,12 +180,7 @@ impl Tui {
                 self.queue_pr_persistence(index, false);
                 changed = true;
             }
-            let has_pr_branches = self.sessions.iter().any(|session| {
-                session.repo_index == repo_index
-                    && !session.hidden
-                    && pr_cache_pollable_for_session(session, &config)
-            });
-            if has_pr_branches && (force || summaries_due) && !summary_in_flight {
+            if (force || summaries_due) && !summary_in_flight {
                 let poll_started_at = std::time::Instant::now();
                 let path = self.repos[repo_index].repo.root.clone();
                 let repository = self.repos[repo_index].identity.clone();
@@ -205,6 +200,7 @@ impl Tui {
                     .map(|(key, _)| key.clone())
                     .collect::<Vec<_>>();
                 let config = self.repos[repo_index].config.clone();
+                let reconciliation_refs = self.remote_push_reconciliation_refs(&repository);
                 for session in self
                     .sessions
                     .iter_mut()
@@ -235,7 +231,14 @@ impl Tui {
                             );
                             fetch_pr_summary_index(&path, &config)
                         } else {
-                            Err(adapter.unwrap_err())
+                            Err(adapter.as_ref().unwrap_err().clone())
+                        };
+                        let capabilities = if summaries.is_ok() {
+                            crate::remote::dispatcher::capabilities(&path, &config)
+                                .ok()
+                                .or_else(|| adapter.ok())
+                        } else {
+                            adapter.ok()
                         };
                         let observations = match &summaries {
                             Ok(summaries) => Ok(session_snapshots
@@ -249,12 +252,23 @@ impl Tui {
                                 .collect()),
                             Err(error) => Err(error.clone()),
                         };
+                        let remote_branch_heads = reconciliation_refs
+                            .into_iter()
+                            .filter_map(|(remote, branch)| {
+                                remote_branch_head(&path, &config, &remote, &branch)
+                                    .ok()
+                                    .flatten()
+                                    .map(|head| ((remote, branch), head))
+                            })
+                            .collect();
                         Ok(Some(TuiJobPayload::PrPoll(PrPollResult::Summary {
                             repository: job_repository,
                             sessions,
                             github_remote_configured,
+                            capabilities,
                             summaries,
                             observations,
+                            remote_branch_heads,
                             refreshed: crate::util::timestamp_label(),
                             poll_started_at,
                         })))
@@ -319,11 +333,14 @@ impl Tui {
                     repository,
                     sessions,
                     github_remote_configured,
+                    capabilities,
                     summaries,
                     observations,
+                    remote_branch_heads,
                     refreshed,
                     poll_started_at,
                 } => {
+                    let summary_evidence = summaries.as_ref().ok().cloned();
                     let Some(repo_index) = self
                         .repos
                         .iter()
@@ -342,6 +359,14 @@ impl Tui {
                         .map(|session| pr_cache_comment_count(&session.pr))
                         .collect::<Vec<_>>();
                     let mut persistence = Vec::new();
+                    if let Some(repo) = self.repos.get_mut(repo_index) {
+                        repo.remote_capabilities = capabilities;
+                        repo.remote_capability_error = if github_remote_configured {
+                            None
+                        } else {
+                            summaries.as_ref().err().cloned()
+                        };
+                    }
                     if !github_remote_configured {
                         let error = summaries
                             .as_ref()
@@ -363,6 +388,9 @@ impl Tui {
                             && let Some(repo) = self.repos.get_mut(repo_index)
                         {
                             repo.pr_summaries = summaries;
+                        }
+                        if repo_index == self.current_repo {
+                            self.ensure_selected_repo_pr();
                         }
                         let observations = match observations {
                             Ok(observations) => observations
@@ -394,6 +422,13 @@ impl Tui {
                     }
                     for index in persistence {
                         self.queue_pr_persistence(index, false);
+                    }
+                    if let Some(summaries) = summary_evidence {
+                        self.reconcile_remote_mutation_summaries(
+                            &repository,
+                            &summaries,
+                            &remote_branch_heads,
+                        );
                     }
                     let after = self
                         .sessions
@@ -441,6 +476,11 @@ impl Tui {
                         };
                         if applied {
                             self.queue_pr_persistence(session_index, true);
+                            let repository = self.repos[self.sessions[session_index].repo_index]
+                                .identity
+                                .clone();
+                            let cache = self.sessions[session_index].pr.clone();
+                            self.reconcile_remote_mutation_details(&repository, &cache);
                         }
                     }
                 }
@@ -474,7 +514,7 @@ impl Tui {
         changed
     }
 
-    fn queue_pr_persistence(&mut self, session_index: usize, details: bool) {
+    pub(super) fn queue_pr_persistence(&mut self, session_index: usize, details: bool) {
         let Some(session) = self.sessions.get(session_index) else {
             return;
         };
@@ -530,7 +570,7 @@ impl Tui {
         let Some(session) = self.sessions.get_mut(session_index) else {
             return;
         };
-        session.pr = crate::github::PrCache::default();
+        session.pr = crate::remote::PrCache::default();
         session.unseen_comments = false;
         self.queue_pr_persistence(session_index, false);
         self.start_pr_persistence_jobs();
@@ -762,4 +802,26 @@ impl Tui {
         }
         changed
     }
+}
+
+fn remote_branch_head(
+    path: &Path,
+    config: &crate::config::Config,
+    remote: &str,
+    branch: &str,
+) -> Result<Option<String>, String> {
+    let reference = format!("refs/heads/{branch}");
+    let output = run_capture(
+        Command::new(config.tool("git")).arg("-C").arg(path).args([
+            "ls-remote",
+            "--heads",
+            remote,
+            &reference,
+        ]),
+        crate::process::ProcessPolicy::NetworkQuery,
+    )?;
+    Ok(output.lines().find_map(|line| {
+        let (sha, observed_ref) = line.split_once(char::is_whitespace)?;
+        (observed_ref.trim() == reference && !sha.trim().is_empty()).then(|| sha.trim().to_string())
+    }))
 }

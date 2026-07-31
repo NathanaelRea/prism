@@ -1052,8 +1052,8 @@ mod tests {
 
     use crate::agent::AgentState;
     use crate::config::Config;
-    use crate::github::PrCache;
     use crate::opencode::{OpencodeRuntime, save_runtime, server_url};
+    use crate::remote::PrCache;
     use crate::repo::Repository;
     use crate::session::Session;
 

@@ -27,6 +27,32 @@ PRISM_TEST_TMUX="$(command -v tmux)" \
 
 The full-stack test creates a Git worktree, runs `prism agent ensure`, verifies the OpenCode-backed tmux session, runs ensure again to check reuse, and cleans up the isolated server and socket. It does not invoke a model.
 
+## Remote Compatibility
+
+Remote adapter compatibility is intentionally separate from normal CI. The
+weekly or manually dispatched `Remote compatibility` workflow runs fixture tests
+against pinned local GitLab CE `18.2.0-ce.0` and Forgejo `11.0.1` API instances.
+It also runs unauthenticated, read-only schema drift probes against GitHub.com,
+GitLab.com, and Codeberg. It never creates or changes public data.
+
+Run an individual local suite with Docker:
+
+```sh
+scripts/remote-compatibility.sh gitlab
+scripts/remote-compatibility.sh forgejo
+```
+
+Run the public probes without credentials:
+
+```sh
+scripts/remote-drift-probe.sh all
+```
+
+The scripts print `SKIP` and succeed when a required tool, Docker daemon, or
+pinned image is unavailable. A service that starts but violates its expected API
+shape fails the compatibility run. See [Remote Hosting](remote-hosting.md) for
+the recorded metadata and security boundaries.
+
 To enforce the same gate as a pre-push hook, opt into the versioned hooks:
 
 ```sh
@@ -54,5 +80,6 @@ Prism stores per-repository runtime state in `prism.db` under the user's Prism c
 - `opencode_runtime`: OpenCode server/session records associated with worktrees.
 - `plan_run`, `plan_step_run`, `plan_output_line`: persisted Plan Mode runs, step state, and bounded step output.
 - `auto_run`, `auto_step_run`, `auto_output_line`, `auto_event`: persisted Auto Flow runs, attempts, output, and event history.
-- `pr_cache`, `pr_details_cache`: GitHub pull request summaries and detail payload caches.
+- `pr_cache`, `pr_details_cache`: provider-neutral change-request summary and
+  detail caches; the historical table names are retained for migration safety.
 - `event`, `startup_run`, `startup_phase`: observability events and startup timing records.

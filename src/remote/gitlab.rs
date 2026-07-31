@@ -12,10 +12,11 @@ use crate::process::{
 use super::{
     Capabilities, ChangeRequest, ChangeRequestDetails, ChangeRequestId, ChangeRequestSummary,
     CheckContext, CheckState, CiFailure, Comment, CreateChangeRequest, FetchChangeRequest,
-    GuardedMerge, LifecycleState, MergeMethod, MergeabilityState, NativeChangeRequestId,
-    NativeReviewThreadId, Observation, PolicyFacts, ProviderKind, QueueState, RemoteError,
-    RemoteErrorClass, RemoteOperation, RemoteRepositoryId, RepositoryPolicy, ResolveReviewThread,
-    RetryHint, Retryability, Review, ReviewDecision, ReviewThread, SupportLevel,
+    GuardedMerge, LifecycleState, MergeMethod, MergeMutationResult, MergeabilityState,
+    NativeChangeRequestId, NativeReviewThreadId, NativeStateEvidence, Observation, PolicyFacts,
+    ProviderKind, QueueState, RemoteError, RemoteErrorClass, RemoteOperation, RemoteRepositoryId,
+    RepositoryPolicy, ResolveReviewThread, RetryHint, Retryability, Review, ReviewDecision,
+    ReviewThread, SupportLevel,
 };
 
 const PAGE_SIZE: usize = 50;
@@ -29,6 +30,8 @@ const MAX_CHANGE_REQUEST_PIPELINES: usize = 20;
 pub(super) struct GitLabAdapter {
     glab_path: String,
     repository: RemoteRepositoryId,
+    api_base_override: Option<String>,
+    merge_method: crate::config::MergeMethod,
 }
 
 impl GitLabAdapter {
@@ -46,6 +49,8 @@ impl GitLabAdapter {
         }
         Ok(Self {
             glab_path: config.tool("glab"),
+            api_base_override: config.remote_api_override(repository.host()),
+            merge_method: config.merge_method,
             repository,
         })
     }
@@ -55,24 +60,33 @@ impl GitLabAdapter {
         Self {
             glab_path: glab_path.to_string(),
             repository,
+            api_base_override: None,
+            merge_method: crate::config::MergeMethod::Squash,
         }
     }
 
-    pub(super) fn capabilities() -> Capabilities {
-        Capabilities {
+    pub(super) fn capabilities(&self) -> Capabilities {
+        let mut capabilities = Capabilities {
             list_change_requests: SupportLevel::Supported,
             change_request_details: SupportLevel::Supported,
             review_threads: SupportLevel::Supported,
             resolve_review_thread: SupportLevel::Supported,
             check_rollup: SupportLevel::Supported,
-            ci_logs: SupportLevel::Conditional,
+            ci_logs: SupportLevel::Supported,
             changed_files: SupportLevel::Supported,
             repository_policy: SupportLevel::Conditional,
             fetch_change_request: SupportLevel::Supported,
             create_change_request: SupportLevel::Supported,
-            guarded_merge: SupportLevel::Conditional,
+            guarded_merge: SupportLevel::Supported,
+            guarded_merge_reason: None,
             merge_queue: SupportLevel::Conditional,
+        };
+        if self.merge_method == crate::config::MergeMethod::Rebase {
+            capabilities.guarded_merge = SupportLevel::Unsupported;
+            capabilities.guarded_merge_reason =
+                Some("GitLab adapter does not support rebase merges".to_string());
         }
+        capabilities
     }
 
     pub(super) fn list_change_requests(&self) -> Result<Vec<ChangeRequestSummary>, RemoteError> {
@@ -96,17 +110,11 @@ impl GitLabAdapter {
                     "GitLab pagination returned a duplicate global merge request ID",
                 ));
             }
-            let source_id = required_project_id(
-                merge_request.source_project_id,
-                "source_project_id",
-                RemoteOperation::ListChangeRequests,
-            )?;
             let target_id = required_project_id(
                 merge_request.target_project_id,
                 "target_project_id",
                 RemoteOperation::ListChangeRequests,
             )?;
-            let source = self.repository_for_project_id(source_id, &mut projects)?;
             let target = self.repository_for_project_id(target_id, &mut projects)?;
             if target != self.repository {
                 return Err(invalid_response(
@@ -114,7 +122,17 @@ impl GitLabAdapter {
                     "GitLab project merge-request list returned a different target project",
                 ));
             }
-            let review = self.review_decision(
+            let Some(source_id) = merge_request.source_project_id.filter(|id| *id > 0) else {
+                return Err(incomplete_change_request_list(
+                    "GitLab merge-request list includes an item without source project identity",
+                    None,
+                ));
+            };
+            let source =
+                list_source_repository(source_id, target_id, target.clone(), |source_id| {
+                    self.repository_for_project_id(source_id, &mut projects)
+                })?;
+            let (review, review_evidence) = self.review_decision(
                 merge_request.iid,
                 &merge_request,
                 RemoteOperation::ListChangeRequests,
@@ -125,6 +143,7 @@ impl GitLabAdapter {
                 target,
                 merge_request,
                 review,
+                review_evidence,
                 RemoteOperation::ListChangeRequests,
             )?);
         }
@@ -143,6 +162,15 @@ impl GitLabAdapter {
         id: &ChangeRequestId,
         operation: RemoteOperation,
     ) -> Result<ChangeRequestSummary, RemoteError> {
+        let merge_request = self.change_request_metadata(id, operation)?;
+        self.summary_from_metadata(merge_request, operation)
+    }
+
+    fn change_request_metadata(
+        &self,
+        id: &ChangeRequestId,
+        operation: RemoteOperation,
+    ) -> Result<GitLabMergeRequest, RemoteError> {
         self.validate_change_request_id(id, operation)?;
         let iid = required_iid(id, operation)?;
         let merge_request: GitLabMergeRequest =
@@ -153,7 +181,7 @@ impl GitLabAdapter {
                 "GitLab returned a different global merge request ID",
             ));
         }
-        self.summary_from_metadata(merge_request, operation)
+        Ok(merge_request)
     }
 
     pub(super) fn fetch_metadata(
@@ -173,29 +201,28 @@ impl GitLabAdapter {
         &self,
         change_request: &ChangeRequest,
     ) -> Result<ChangeRequestDetails, RemoteError> {
-        let observed = self.observe_change_request(&change_request.id)?;
-        if observed.change_request.head_sha != change_request.head_sha
-            || observed.change_request.source_repository != change_request.source_repository
-            || observed.change_request.target_repository != change_request.target_repository
-            || observed.change_request.source_branch != change_request.source_branch
-            || observed.change_request.target_branch != change_request.target_branch
-        {
-            return Err(stale_head(
-                RemoteOperation::ObserveChangeRequest,
-                "merge request association changed before details were loaded",
-            ));
-        }
+        let metadata = self
+            .change_request_metadata(&change_request.id, RemoteOperation::ObserveChangeRequest)?;
+        let requested_reviewers = metadata.reviewers.clone();
+        let observed =
+            self.summary_from_metadata(metadata, RemoteOperation::ObserveChangeRequest)?;
+        ensure_association(
+            &observed.change_request,
+            change_request,
+            RemoteOperation::ObserveChangeRequest,
+            "merge request association changed before details were loaded",
+        )?;
         let change_request = &observed.change_request;
         let iid = required_iid(&change_request.id, RemoteOperation::ObserveChangeRequest)?;
         let association = Some(change_request.head_association());
 
         let notes = self.notes(iid);
         let discussions = self.discussions(iid);
-        let reviews = self.reviews(iid);
+        let reviews = self.reviews(iid, requested_reviewers);
         let changed_files = self.changed_files(iid);
         let (checks, ci_failures) = self.checks_and_failures(change_request, iid);
 
-        Ok(ChangeRequestDetails {
+        let details = ChangeRequestDetails {
             association,
             comments: notes,
             reviews,
@@ -203,7 +230,16 @@ impl GitLabAdapter {
             changed_files,
             checks,
             ci_failures,
-        })
+        };
+
+        let after = self.observe_change_request(&change_request.id)?;
+        ensure_association(
+            &after.change_request,
+            change_request,
+            RemoteOperation::ObserveChangeRequest,
+            "merge request association changed while details were loaded",
+        )?;
+        Ok(details)
     }
 
     pub(super) fn repository_policy(
@@ -337,6 +373,26 @@ impl GitLabAdapter {
                 "GitLab returned different source-project metadata",
             ));
         }
+        let target = if request.source_repository == request.target_repository {
+            source.clone()
+        } else {
+            let target: GitLabProject = self.get_json(
+                RemoteOperation::CreateChangeRequest,
+                &format!(
+                    "projects/{}",
+                    encode_path_segment(request.target_repository.project_path())
+                ),
+            )?;
+            if target.id == 0
+                || target.path_with_namespace != request.target_repository.project_path()
+            {
+                return Err(invalid_response(
+                    RemoteOperation::CreateChangeRequest,
+                    "GitLab returned different target-project metadata",
+                ));
+            }
+            target
+        };
         let source_branch: GitLabBranch = self.get_json(
             RemoteOperation::CreateChangeRequest,
             &format!(
@@ -355,17 +411,7 @@ impl GitLabAdapter {
         } else {
             request.title.clone()
         };
-        let endpoint = format!(
-            "projects/{}/merge_requests",
-            encode_path_segment(self.repository.project_path())
-        );
-        let fields = vec![
-            ("source_branch", request.source_branch.clone()),
-            ("target_branch", request.target_branch.clone()),
-            ("source_project_id", source.id.to_string()),
-            ("title", title),
-            ("description", request.body.clone()),
-        ];
+        let (endpoint, fields) = create_merge_request_request(&source, &target, request, title);
         let created: GitLabMergeRequest = self.api_json(
             RemoteOperation::CreateChangeRequest,
             &endpoint,
@@ -376,6 +422,16 @@ impl GitLabAdapter {
             return Err(stale_head(
                 RemoteOperation::CreateChangeRequest,
                 "created merge request does not reference the expected source SHA",
+            ));
+        }
+        if created.source_project_id != Some(source.id)
+            || created.target_project_id != Some(target.id)
+            || created.source_branch != request.source_branch
+            || created.target_branch != request.target_branch
+        {
+            return Err(invalid_response(
+                RemoteOperation::CreateChangeRequest,
+                "created merge request does not match the requested source and target",
             ));
         }
         let id = ChangeRequestId::new(
@@ -464,7 +520,15 @@ impl GitLabAdapter {
     pub(super) fn merge_change_request(
         &self,
         request: &GuardedMerge,
-    ) -> Result<ChangeRequestSummary, RemoteError> {
+    ) -> Result<MergeMutationResult, RemoteError> {
+        if request.method == MergeMethod::Rebase {
+            return Err(remote_error(
+                RemoteOperation::MergeChangeRequest,
+                RemoteErrorClass::Unsupported,
+                Retryability::NotRetryable,
+                "GitLab adapter does not support rebase merges",
+            ));
+        }
         self.validate_target_repository(
             &request.target_repository,
             RemoteOperation::MergeChangeRequest,
@@ -488,23 +552,48 @@ impl GitLabAdapter {
         )?;
         let iid = required_iid(&request.id, RemoteOperation::MergeChangeRequest)?;
         let fields = merge_fields(request)?;
-        let _: GitLabMergeRequest = self.api_json(
+        let accepted: GitLabMergeRequest = self.api_json(
             RemoteOperation::MergeChangeRequest,
             &format!("{}/merge", self.merge_request_endpoint(iid)),
             "PUT",
             &fields,
         )?;
-        let observed =
+        if accepted.id.to_string() != request.id.native_id().as_str()
+            || accepted.iid != iid
+            || accepted.sha != request.expected_source_sha
+        {
+            return Err(invalid_response(
+                RemoteOperation::MergeChangeRequest,
+                "GitLab merge response does not match the guarded merge request",
+            ));
+        }
+        let mut observed =
             self.observe_change_request_for(&request.id, RemoteOperation::MergeChangeRequest)?;
-        if observed.lifecycle != LifecycleState::Merged {
+        if observed.change_request.target_repository != request.target_repository
+            || observed.change_request.target_branch != request.target_branch
+        {
             return Err(remote_error(
                 RemoteOperation::MergeChangeRequest,
                 RemoteErrorClass::Conflict,
-                Retryability::Unknown,
-                "GitLab accepted the merge request mutation but it is not observed as merged",
+                Retryability::NotRetryable,
+                "merge request target changed during merge",
             ));
         }
-        Ok(observed)
+        ensure_head(
+            &observed.change_request.head_sha,
+            &request.expected_source_sha,
+            RemoteOperation::MergeChangeRequest,
+        )?;
+        if observed.lifecycle == LifecycleState::Merged {
+            return Ok(merge_mutation_result(observed, &accepted));
+        }
+        let accepted_queue = queue_state(&accepted);
+        if observed.queue_state == QueueState::NotQueued && accepted_queue != QueueState::NotQueued
+        {
+            observed.queue_state = accepted_queue;
+            observed.native_state_evidence.queue = native_queue_evidence(&accepted);
+        }
+        Ok(merge_mutation_result(observed, &accepted))
     }
 
     fn summary_from_metadata(
@@ -530,13 +619,15 @@ impl GitLabAdapter {
                 "GitLab returned a merge request for a different target project",
             ));
         }
-        let review = self.review_decision(merge_request.iid, &merge_request, operation);
+        let (review, review_evidence) =
+            self.review_decision(merge_request.iid, &merge_request, operation);
         summary_from_merge_request(
             &self.repository,
             source,
             target,
             merge_request,
             review,
+            review_evidence,
             operation,
         )
     }
@@ -546,21 +637,37 @@ impl GitLabAdapter {
         iid: u64,
         merge_request: &GitLabMergeRequest,
         operation: RemoteOperation,
-    ) -> ReviewDecision {
+    ) -> (ReviewDecision, Vec<String>) {
         if merge_request.detailed_merge_status == "requested_changes" {
-            return ReviewDecision::ChangesRequested;
+            return (
+                ReviewDecision::ChangesRequested,
+                vec![merge_request.detailed_merge_status.clone()],
+            );
         }
         let endpoint = format!("{}/approvals", self.merge_request_endpoint(iid));
         match self.get_json::<GitLabApprovals>(operation, &endpoint) {
-            Ok(approvals) if approvals.approved => ReviewDecision::Approved,
-            Ok(approvals) if approvals.approvals_required > 0 || approvals.approvals_left > 0 => {
-                ReviewDecision::ReviewRequired
+            Ok(approvals) => {
+                let evidence = vec![
+                    format!("approved={}", approvals.approved),
+                    format!("approvals_required={}", approvals.approvals_required),
+                    format!("approvals_left={}", approvals.approvals_left),
+                ];
+                let decision = if approvals.approved {
+                    ReviewDecision::Approved
+                } else if approvals.approvals_required > 0 || approvals.approvals_left > 0 {
+                    ReviewDecision::ReviewRequired
+                } else {
+                    ReviewDecision::Pending
+                };
+                (decision, evidence)
             }
-            Ok(_) => ReviewDecision::Pending,
-            Err(error) => ReviewDecision::Unknown(format!(
-                "approval_state_unavailable:{}",
-                error_class_label(error.class())
-            )),
+            Err(error) => (
+                ReviewDecision::Unknown(format!(
+                    "approval_state_unavailable:{}",
+                    error_class_label(error.class())
+                )),
+                Vec::new(),
+            ),
         }
     }
 
@@ -601,23 +708,26 @@ impl GitLabAdapter {
         }
     }
 
-    fn reviews(&self, iid: u64) -> Observation<Vec<Review>> {
+    fn reviews(&self, iid: u64, requested_reviewers: Vec<GitLabUser>) -> Observation<Vec<Review>> {
         let endpoint = format!("{}/approvals", self.merge_request_endpoint(iid));
+        let mut requested = requested_reviews(requested_reviewers);
         match self.get_json::<GitLabApprovals>(RemoteOperation::ObserveChangeRequest, &endpoint) {
-            Ok(approvals) => values_observation(
-                approvals
-                    .approved_by
-                    .into_iter()
-                    .map(|approval| Review {
-                        native_id: approval.user.id.to_string(),
+            Ok(approvals) => {
+                for approval in approvals.approved_by {
+                    requested.retain(|review| review.author != approval.user.username);
+                    requested.push(Review {
+                        native_id: reviewer_identity(&approval.user),
                         author: approval.user.username,
                         decision: ReviewDecision::Approved,
                         body: String::new(),
                         submitted_at: None,
-                    })
-                    .collect(),
-            ),
-            Err(error) => observation_error(error),
+                    });
+                }
+                requested.sort_by(|left, right| left.author.cmp(&right.author));
+                requested.dedup_by(|left, right| left.author == right.author);
+                values_observation(requested)
+            }
+            Err(error) => partial_observation(requested, Some(error)),
         }
     }
 
@@ -675,19 +785,28 @@ impl GitLabAdapter {
             ));
         }
 
+        let pipeline_evidence = pipelines
+            .into_iter()
+            .map(|pipeline| {
+                let evidence = pipeline_evidence(&pipeline, change_request, iid);
+                (pipeline, evidence)
+            })
+            .filter(|(_, evidence)| evidence.include)
+            .collect::<Vec<_>>();
+        let has_authoritative_pipeline = pipeline_evidence
+            .iter()
+            .any(|(_, evidence)| evidence.authoritative);
+
         let mut checks = Vec::new();
         let mut failed_jobs = Vec::new();
         let mut authoritative_pipeline_states = Vec::new();
-        for pipeline in pipelines {
-            let evidence = pipeline_evidence(&pipeline, change_request, iid);
-            if !evidence.include {
-                continue;
-            }
-            if !evidence.authoritative {
-                errors.push(unassociated_pipeline_error(
-                    RemoteOperation::ObserveChecks,
-                    &evidence.identity,
-                ));
+        for (pipeline, evidence) in pipeline_evidence {
+            if let Some(error) = pipeline_association_error(
+                RemoteOperation::ObserveChecks,
+                &evidence,
+                has_authoritative_pipeline,
+            ) {
+                errors.push(error);
                 ci_errors.push(unassociated_pipeline_error(
                     RemoteOperation::LoadCiLogs,
                     &evidence.identity,
@@ -701,6 +820,10 @@ impl GitLabAdapter {
             });
             if evidence.authoritative {
                 authoritative_pipeline_states.push(gitlab_check_state(&pipeline.status));
+            } else {
+                // Keep provenance visible, but never let merged-result, train, or
+                // unknown jobs stand in for exact source-head checks and failures.
+                continue;
             }
             let Some(project_id) = pipeline.project_id.filter(|id| *id > 0) else {
                 errors.push(invalid_response(
@@ -904,12 +1027,34 @@ impl GitLabAdapter {
     ) -> Result<String, RemoteError> {
         let args = api_args(
             &self.repository.host().to_string(),
+            self.api_base_override.as_deref(),
             endpoint,
             method,
             fields,
         );
+        self.run_api(operation, &args)
+    }
+
+    fn api_page<T: DeserializeOwned>(
+        &self,
+        operation: RemoteOperation,
+        endpoint: &str,
+    ) -> Result<GitLabApiPage<T>, RemoteError> {
+        let mut args = api_args(
+            &self.repository.host().to_string(),
+            self.api_base_override.as_deref(),
+            endpoint,
+            "GET",
+            &[],
+        );
+        args.push("--include".to_string());
+        let raw = self.run_api(operation, &args)?;
+        parse_api_page(&raw, operation)
+    }
+
+    fn run_api(&self, operation: RemoteOperation, args: &[String]) -> Result<String, RemoteError> {
         let output = run_output_allow_failure_named(
-            Command::new(&self.glab_path).args(&args),
+            Command::new(&self.glab_path).args(args),
             ProcessPolicy::NetworkQuery,
             descriptor_for(operation),
         )
@@ -926,7 +1071,7 @@ impl GitLabAdapter {
             |page| {
                 let separator = if endpoint.contains('?') { '&' } else { '?' };
                 let endpoint = format!("{endpoint}{separator}per_page={PAGE_SIZE}&page={page}");
-                self.get_json::<Vec<T>>(operation, &endpoint)
+                self.api_page::<T>(operation, &endpoint)
             },
             operation,
         )
@@ -939,14 +1084,33 @@ struct Paginated<T> {
     partial_error: Option<RemoteError>,
 }
 
+#[derive(Debug)]
+struct GitLabApiPage<T> {
+    items: Vec<T>,
+    pagination: GitLabPagination,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GitLabPagination {
+    page: usize,
+    per_page: usize,
+    next_page: Option<usize>,
+    total: Option<usize>,
+    total_pages: Option<usize>,
+}
+
 fn collect_pages<T>(
-    mut fetch: impl FnMut(usize) -> Result<Vec<T>, RemoteError>,
+    mut fetch: impl FnMut(usize) -> Result<GitLabApiPage<T>, RemoteError>,
     operation: RemoteOperation,
 ) -> Result<Paginated<T>, RemoteError> {
     let mut items = Vec::new();
-    for page in 1..=MAX_PAGES {
-        let values = match fetch(page) {
-            Ok(values) => values,
+    let mut page = 1;
+    let mut expected_per_page = None;
+    let mut expected_total: Option<Option<usize>> = None;
+    let mut expected_total_pages: Option<Option<usize>> = None;
+    for _ in 0..MAX_PAGES {
+        let response = match fetch(page) {
+            Ok(response) => response,
             Err(error) if items.is_empty() => return Err(error),
             Err(error) => {
                 return Ok(Paginated {
@@ -955,9 +1119,51 @@ fn collect_pages<T>(
                 });
             }
         };
-        let complete = values.len() < PAGE_SIZE;
-        items.extend(values);
-        if complete {
+        let pagination = response.pagination;
+        let invalid = pagination.page != page
+            || pagination.per_page == 0
+            || pagination.per_page > PAGE_SIZE
+            || response.items.len() > pagination.per_page
+            || response.items.is_empty() && pagination.next_page.is_some()
+            || pagination.next_page.is_some_and(|next| next != page + 1)
+            || expected_per_page.is_some_and(|expected| expected != pagination.per_page)
+            || expected_total.is_some_and(|expected| expected != pagination.total)
+            || expected_total_pages.is_some_and(|expected| expected != pagination.total_pages)
+            || !pagination_totals_are_valid(pagination);
+        if invalid {
+            return pagination_failure(
+                items,
+                operation,
+                "GitLab returned malformed or discontinuous pagination metadata",
+            );
+        }
+        expected_per_page.get_or_insert(pagination.per_page);
+        expected_total.get_or_insert(pagination.total);
+        expected_total_pages.get_or_insert(pagination.total_pages);
+        items.extend(response.items);
+        if pagination.total.is_some_and(|total| items.len() > total) {
+            return pagination_failure(
+                items,
+                operation,
+                "GitLab pagination returned more items than its declared total",
+            );
+        }
+        if let Some(next_page) = pagination.next_page {
+            if pagination.total.is_some_and(|total| items.len() >= total) {
+                return pagination_failure(
+                    items,
+                    operation,
+                    "GitLab pagination continued after reaching its declared total",
+                );
+            }
+            page = next_page;
+        } else if pagination.total.is_some_and(|total| items.len() != total) {
+            return pagination_failure(
+                items,
+                operation,
+                "GitLab pagination ended before reaching its declared total",
+            );
+        } else {
             return Ok(Paginated {
                 items,
                 partial_error: None,
@@ -973,12 +1179,153 @@ fn collect_pages<T>(
     })
 }
 
+fn pagination_totals_are_valid(pagination: GitLabPagination) -> bool {
+    match (pagination.total, pagination.total_pages) {
+        (Some(0), Some(total_pages)) => {
+            matches!(total_pages, 0 | 1) && pagination.page == 1 && pagination.next_page.is_none()
+        }
+        (Some(total), Some(total_pages)) => {
+            total_pages == total.div_ceil(pagination.per_page)
+                && pagination.page <= total_pages
+                && pagination.next_page.is_some() == (pagination.page < total_pages)
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn pagination_failure<T>(
+    items: Vec<T>,
+    operation: RemoteOperation,
+    message: &str,
+) -> Result<Paginated<T>, RemoteError> {
+    let error = invalid_response(operation, message);
+    if items.is_empty() {
+        Err(error)
+    } else {
+        Ok(Paginated {
+            items,
+            partial_error: Some(error),
+        })
+    }
+}
+
+fn parse_api_page<T: DeserializeOwned>(
+    raw: &str,
+    operation: RemoteOperation,
+) -> Result<GitLabApiPage<T>, RemoteError> {
+    let (headers, body) = raw
+        .split_once("\r\n\r\n")
+        .or_else(|| raw.split_once("\n\n"))
+        .ok_or_else(|| {
+            invalid_response(
+                operation,
+                "GitLab paginated response is missing HTTP headers",
+            )
+        })?;
+    let mut lines = headers.lines();
+    let status = lines.next().unwrap_or_default().trim_end_matches('\r');
+    let valid_status = status.starts_with("HTTP/")
+        && status
+            .split_ascii_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse::<u16>().ok())
+            .is_some_and(|status| (200..300).contains(&status));
+    if !valid_status {
+        return Err(invalid_response(
+            operation,
+            "GitLab paginated response has a malformed HTTP status line",
+        ));
+    }
+    let headers = lines
+        .map(|line| line.trim_end_matches('\r'))
+        .map(|line| {
+            line.split_once(':').ok_or_else(|| {
+                invalid_response(
+                    operation,
+                    "GitLab paginated response has a malformed HTTP header",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let page = required_pagination_number(&headers, "X-Page", operation)?;
+    let per_page = required_pagination_number(&headers, "X-Per-Page", operation)?;
+    let next_page = optional_pagination_number(&headers, "X-Next-Page", true, operation)?;
+    let total = optional_pagination_number(&headers, "X-Total", false, operation)?;
+    let total_pages = optional_pagination_number(&headers, "X-Total-Pages", false, operation)?;
+    if total.is_some() != total_pages.is_some() {
+        return Err(invalid_response(
+            operation,
+            "GitLab paginated response has incomplete total metadata",
+        ));
+    }
+    let items = serde_json::from_str(body.trim()).map_err(|error| {
+        invalid_response(
+            operation,
+            &format!("malformed GitLab paginated response: {error}"),
+        )
+    })?;
+    Ok(GitLabApiPage {
+        items,
+        pagination: GitLabPagination {
+            page,
+            per_page,
+            next_page,
+            total,
+            total_pages,
+        },
+    })
+}
+
+fn required_pagination_number(
+    headers: &[(&str, &str)],
+    name: &str,
+    operation: RemoteOperation,
+) -> Result<usize, RemoteError> {
+    optional_pagination_number(headers, name, false, operation)?.ok_or_else(|| {
+        invalid_response(
+            operation,
+            &format!("GitLab paginated response is missing {name}"),
+        )
+    })
+}
+
+fn optional_pagination_number(
+    headers: &[(&str, &str)],
+    name: &str,
+    required: bool,
+    operation: RemoteOperation,
+) -> Result<Option<usize>, RemoteError> {
+    let mut values = headers
+        .iter()
+        .filter(|(header, _)| header.trim().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim());
+    let value = values.next();
+    if values.next().is_some() || required && value.is_none() {
+        return Err(invalid_response(
+            operation,
+            &format!("GitLab paginated response has invalid {name} metadata"),
+        ));
+    }
+    match value {
+        Some("") => Ok(None),
+        Some(value) => value.parse().map(Some).map_err(|_| {
+            invalid_response(
+                operation,
+                &format!("GitLab paginated response has nonnumeric {name} metadata"),
+            )
+        }),
+        None => Ok(None),
+    }
+}
+
 fn summary_from_merge_request(
     repository: &RemoteRepositoryId,
     source_repository: RemoteRepositoryId,
     target_repository: RemoteRepositoryId,
     merge_request: GitLabMergeRequest,
     review_decision: ReviewDecision,
+    review_evidence: Vec<String>,
     operation: RemoteOperation,
 ) -> Result<ChangeRequestSummary, RemoteError> {
     if merge_request.id == 0 || merge_request.iid == 0 || merge_request.sha.trim().is_empty() {
@@ -993,17 +1340,19 @@ fn summary_from_merge_request(
     let id = ChangeRequestId::new(repository.clone(), native_id, Some(merge_request.iid));
     let lifecycle = lifecycle(&merge_request);
     let mergeability = mergeability(&merge_request.detailed_merge_status);
-    let check_state = merge_request
-        .head_pipeline
-        .as_ref()
-        .map(|pipeline| gitlab_check_state(&pipeline.status))
-        .unwrap_or_else(|| CheckState::Unknown("not_observed".to_string()));
-    let queue_state = if merge_request.merge_when_pipeline_succeeds
-        || merge_request.auto_merge_enabled == Some(true)
-    {
-        QueueState::Queued
-    } else {
-        QueueState::NotQueued
+    let check_state = head_pipeline_state(&merge_request);
+    let queue_state = queue_state(&merge_request);
+    let native_state_evidence = NativeStateEvidence {
+        lifecycle: NativeStateEvidence::retain([merge_request.state.clone()]),
+        review: NativeStateEvidence::retain(review_evidence),
+        mergeability: NativeStateEvidence::retain([merge_request.detailed_merge_status.clone()]),
+        check: NativeStateEvidence::retain(
+            merge_request
+                .head_pipeline
+                .iter()
+                .map(|pipeline| pipeline.status.clone()),
+        ),
+        queue: native_queue_evidence(&merge_request),
     };
     Ok(ChangeRequestSummary {
         change_request: ChangeRequest {
@@ -1023,9 +1372,15 @@ fn summary_from_merge_request(
         web_url: merge_request.web_url,
         lifecycle,
         review_decision,
+        requested_reviewers: merge_request
+            .reviewers
+            .into_iter()
+            .map(|reviewer| reviewer.username)
+            .collect(),
         mergeability,
         check_state,
         queue_state,
+        native_state_evidence,
         draft: merge_request.draft || merge_request.work_in_progress,
         updated_at: merge_request.updated_at,
     })
@@ -1068,6 +1423,49 @@ fn gitlab_check_state(native: &str) -> CheckState {
         }
         _ => CheckState::from_native(native.to_string()),
     }
+}
+
+fn head_pipeline_state(merge_request: &GitLabMergeRequest) -> CheckState {
+    match merge_request.head_pipeline.as_ref() {
+        Some(pipeline) if pipeline.sha == merge_request.sha => gitlab_check_state(&pipeline.status),
+        Some(_) => CheckState::Unknown("head_pipeline_sha_mismatch".to_string()),
+        None => CheckState::Unknown("not_observed".to_string()),
+    }
+}
+
+fn queue_state(merge_request: &GitLabMergeRequest) -> QueueState {
+    if lifecycle(merge_request) == LifecycleState::Merged {
+        QueueState::Complete
+    } else if merge_request.merge_when_pipeline_succeeds
+        || merge_request.auto_merge_enabled == Some(true)
+    {
+        QueueState::Queued
+    } else {
+        QueueState::NotQueued
+    }
+}
+
+fn native_queue_evidence(merge_request: &GitLabMergeRequest) -> Vec<String> {
+    NativeStateEvidence::retain([
+        format!(
+            "merge_when_pipeline_succeeds={}",
+            merge_request.merge_when_pipeline_succeeds
+        ),
+        format!(
+            "auto_merge_enabled={}",
+            merge_request
+                .auto_merge_enabled
+                .map(|enabled| enabled.to_string())
+                .unwrap_or_else(|| "null".to_string())
+        ),
+    ])
+}
+
+fn merge_mutation_result(
+    summary: ChangeRequestSummary,
+    accepted: &GitLabMergeRequest,
+) -> MergeMutationResult {
+    MergeMutationResult::from_summary(summary, accepted.state.clone())
 }
 
 fn discussion_to_thread(discussion: GitLabDiscussion) -> Result<ReviewThread, RemoteError> {
@@ -1316,6 +1714,65 @@ fn repository_from_project(
     )
 }
 
+fn source_project_unavailable(error: &RemoteError) -> bool {
+    matches!(
+        error.class(),
+        RemoteErrorClass::Authorization | RemoteErrorClass::NotFound
+    )
+}
+
+fn list_source_repository(
+    source_id: u64,
+    target_id: u64,
+    target: RemoteRepositoryId,
+    resolve: impl FnOnce(u64) -> Result<RemoteRepositoryId, RemoteError>,
+) -> Result<RemoteRepositoryId, RemoteError> {
+    if source_id == target_id {
+        return Ok(target);
+    }
+    match resolve(source_id) {
+        Ok(source) => Ok(source),
+        Err(error) if source_project_unavailable(&error) => Err(incomplete_change_request_list(
+            "GitLab merge-request list is incomplete because a source project is hidden or deleted",
+            Some(&error),
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn incomplete_change_request_list(message: &str, cause: Option<&RemoteError>) -> RemoteError {
+    let mut error = invalid_response(RemoteOperation::ListChangeRequests, message);
+    if let Some(status) = cause.and_then(RemoteError::status) {
+        error = error.with_status(status);
+    }
+    if let Some(exit_code) = cause.and_then(RemoteError::exit_code) {
+        error = error.with_exit_code(exit_code);
+    }
+    error
+}
+
+fn reviewer_identity(reviewer: &GitLabUser) -> String {
+    if reviewer.id > 0 {
+        reviewer.id.to_string()
+    } else {
+        format!("reviewer:{}", reviewer.username)
+    }
+}
+
+fn requested_reviews(reviewers: Vec<GitLabUser>) -> Vec<Review> {
+    reviewers
+        .into_iter()
+        .filter(|reviewer| !reviewer.username.trim().is_empty())
+        .map(|reviewer| Review {
+            native_id: reviewer_identity(&reviewer),
+            author: reviewer.username,
+            decision: ReviewDecision::Pending,
+            body: String::new(),
+            submitted_at: None,
+        })
+        .collect()
+}
+
 fn required_project_id(
     value: Option<u64>,
     field: &str,
@@ -1370,6 +1827,25 @@ fn ensure_head(
     }
 }
 
+fn ensure_association(
+    observed: &ChangeRequest,
+    expected: &ChangeRequest,
+    operation: RemoteOperation,
+    message: &str,
+) -> Result<(), RemoteError> {
+    if observed.id == expected.id
+        && observed.head_sha == expected.head_sha
+        && observed.source_repository == expected.source_repository
+        && observed.target_repository == expected.target_repository
+        && observed.source_branch == expected.source_branch
+        && observed.target_branch == expected.target_branch
+    {
+        Ok(())
+    } else {
+        Err(stale_head(operation, message))
+    }
+}
+
 fn validate_mutation_text(
     value: &str,
     name: &str,
@@ -1390,6 +1866,25 @@ fn validate_mutation_text(
 fn has_draft_prefix(title: &str) -> bool {
     let title = title.trim_start().to_ascii_lowercase();
     title.starts_with("draft:") || title.starts_with("wip:")
+}
+
+fn create_merge_request_request(
+    source: &GitLabProject,
+    target: &GitLabProject,
+    request: &CreateChangeRequest,
+    title: String,
+) -> (String, Vec<(&'static str, String)>) {
+    let endpoint = format!("projects/{}/merge_requests", source.id);
+    let mut fields = vec![
+        ("source_branch", request.source_branch.clone()),
+        ("target_branch", request.target_branch.clone()),
+        ("title", title),
+        ("description", request.body.clone()),
+    ];
+    if source.id != target.id {
+        fields.push(("target_project_id", target.id.to_string()));
+    }
+    (endpoint, fields)
 }
 
 fn merge_fields(request: &GuardedMerge) -> Result<Vec<(&'static str, String)>, RemoteError> {
@@ -1566,17 +2061,40 @@ fn unassociated_pipeline_error(operation: RemoteOperation, identity: &str) -> Re
     )
 }
 
+fn pipeline_association_error(
+    operation: RemoteOperation,
+    evidence: &GitLabPipelineEvidence,
+    has_authoritative_pipeline: bool,
+) -> Option<RemoteError> {
+    (!evidence.authoritative && !has_authoritative_pipeline)
+        .then(|| unassociated_pipeline_error(operation, &evidence.identity))
+}
+
 fn api_args(
-    hostname: &str,
+    host: &str,
+    api_base: Option<&str>,
     endpoint: &str,
     method: &str,
     fields: &[(&str, String)],
 ) -> Vec<String> {
+    let endpoint = api_base.map_or_else(
+        || endpoint.to_string(),
+        |base| {
+            format!(
+                "{}/{}",
+                base.trim_end_matches('/'),
+                endpoint.trim_start_matches('/')
+            )
+        },
+    );
     let mut args = vec![
         "api".to_string(),
         "--hostname".to_string(),
-        hostname.to_string(),
-        endpoint.to_string(),
+        // glab rejects ports here; its per-host `api_host` setting carries the port.
+        host.split_once(':')
+            .map_or(host, |(hostname, _)| hostname)
+            .to_string(),
+        endpoint,
         "--method".to_string(),
         method.to_string(),
     ];
@@ -1629,32 +2147,38 @@ fn classify_output(
     operation: RemoteOperation,
     output: ProcessOutput,
 ) -> Result<String, RemoteError> {
+    let exit_code = output.status.code();
     if output.stdout_truncated {
-        return Err(invalid_response(
+        return Err(RemoteError::classified(
+            ProviderKind::GitLab,
             operation,
-            "glab stdout exceeded the supervised capture limit",
+            RemoteErrorClass::InvalidResponse,
+            Retryability::Unknown,
+            None,
+            exit_code,
+            None,
         ));
     }
     if output.status.success() {
         return Ok(output.stdout);
     }
-    let message = if output.stderr.trim().is_empty() {
-        format!("glab exited with {}", output.status)
-    } else {
-        output.stderr.trim().to_string()
-    };
-    let mut error = classify_message(operation, &message);
-    if let Some(code) = output.status.code() {
-        error = error.with_exit_code(code);
-    }
-    Err(error)
+    let diagnostic = format!("{}\n{}", output.stderr, output.stdout);
+    Err(classify_diagnostic(operation, &diagnostic, exit_code))
 }
 
 fn classify_process_error(operation: RemoteOperation, message: &str) -> RemoteError {
-    classify_message(operation, message)
+    classify_diagnostic(operation, message, None)
 }
 
 fn classify_message(operation: RemoteOperation, message: &str) -> RemoteError {
+    classify_diagnostic(operation, message, None)
+}
+
+fn classify_diagnostic(
+    operation: RemoteOperation,
+    message: &str,
+    exit_code: Option<i32>,
+) -> RemoteError {
     let lower = message.to_ascii_lowercase();
     let status = extract_status(&lower);
     let (class, retryability, hint) = if lower.contains("timed out") || lower.contains("timeout") {
@@ -1709,6 +2233,12 @@ fn classify_message(operation: RemoteOperation, message: &str) -> RemoteError {
             Retryability::NotRetryable,
             None,
         )
+    } else if status.is_some_and(|status| (500..=599).contains(&status)) {
+        (
+            RemoteErrorClass::Provider,
+            Retryability::Retryable,
+            Some(RetryHint::Backoff),
+        )
     } else if lower.contains("no such file") || lower.contains("failed to start") {
         (
             RemoteErrorClass::Configuration,
@@ -1728,14 +2258,15 @@ fn classify_message(operation: RemoteOperation, message: &str) -> RemoteError {
     } else {
         (RemoteErrorClass::Provider, Retryability::Unknown, None)
     };
-    let mut error = remote_error(operation, class, retryability, message);
-    if let Some(status) = status {
-        error = error.with_status(status);
-    }
-    if let Some(hint) = hint {
-        error = error.with_retry_hint(hint);
-    }
-    error
+    RemoteError::classified(
+        ProviderKind::GitLab,
+        operation,
+        class,
+        retryability,
+        status,
+        exit_code,
+        hint,
+    )
 }
 
 fn extract_status(message: &str) -> Option<u16> {
@@ -1750,22 +2281,7 @@ fn extract_status(message: &str) -> Option<u16> {
 }
 
 fn error_class_label(class: RemoteErrorClass) -> &'static str {
-    match class {
-        RemoteErrorClass::Configuration => "configuration",
-        RemoteErrorClass::Authentication => "authentication",
-        RemoteErrorClass::Authorization => "authorization",
-        RemoteErrorClass::NotFound => "not_found",
-        RemoteErrorClass::Unsupported => "unsupported",
-        RemoteErrorClass::Validation => "validation",
-        RemoteErrorClass::Conflict => "conflict",
-        RemoteErrorClass::StaleHead => "stale_head",
-        RemoteErrorClass::RateLimited => "rate_limited",
-        RemoteErrorClass::Timeout => "timeout",
-        RemoteErrorClass::Transport => "transport",
-        RemoteErrorClass::InvalidResponse => "invalid_response",
-        RemoteErrorClass::Cancelled => "cancelled",
-        RemoteErrorClass::Provider => "provider",
-    }
+    class.label()
 }
 
 fn remote_error(
@@ -1784,22 +2300,15 @@ fn remote_error(
 }
 
 fn reclassify_error(error: RemoteError, operation: RemoteOperation) -> RemoteError {
-    let mut reclassified = remote_error(
+    RemoteError::classified(
+        ProviderKind::GitLab,
         operation,
         error.class(),
         error.retryability(),
-        error.safe_message(),
-    );
-    if let Some(status) = error.status() {
-        reclassified = reclassified.with_status(status);
-    }
-    if let Some(exit_code) = error.exit_code() {
-        reclassified = reclassified.with_exit_code(exit_code);
-    }
-    if let Some(retry_hint) = error.retry_hint() {
-        reclassified = reclassified.with_retry_hint(retry_hint);
-    }
-    reclassified
+        error.status(),
+        error.exit_code(),
+        error.retry_hint(),
+    )
 }
 
 fn invalid_response(operation: RemoteOperation, message: &str) -> RemoteError {
@@ -1867,6 +2376,8 @@ struct GitLabMergeRequest {
     target_project_id: Option<u64>,
     #[serde(default)]
     author: GitLabUser,
+    #[serde(default)]
+    reviewers: Vec<GitLabUser>,
     updated_at: Option<String>,
     merged_at: Option<String>,
     head_pipeline: Option<GitLabPipeline>,
@@ -2044,8 +2555,45 @@ struct GitLabBranchReference {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{HostIdentity, NativeMergeGuard};
+    use super::super::{
+        HostIdentity, HostProfile, NativeMergeGuard, RemoteBase, RemoteDiscovery, WebScheme,
+    };
     use super::*;
+
+    #[test]
+    fn implemented_ci_logs_and_guarded_merge_are_supported_capabilities() {
+        let adapter = GitLabAdapter::with_glab_path("glab", repository("group/project"));
+        let capabilities = adapter.capabilities();
+
+        assert_eq!(capabilities.ci_logs, SupportLevel::Supported);
+        assert_eq!(capabilities.guarded_merge, SupportLevel::Supported);
+    }
+
+    #[test]
+    fn configured_rebase_disables_guarded_merge_with_shared_reason() {
+        let mut adapter = GitLabAdapter::with_glab_path("glab", repository("group/project"));
+        adapter.merge_method = crate::config::MergeMethod::Rebase;
+
+        let capabilities = adapter.capabilities();
+
+        assert_eq!(capabilities.guarded_merge, SupportLevel::Unsupported);
+        assert_eq!(
+            capabilities.guarded_merge_reason.as_deref(),
+            Some("GitLab adapter does not support rebase merges")
+        );
+
+        for method in [
+            crate::config::MergeMethod::Merge,
+            crate::config::MergeMethod::Squash,
+        ] {
+            adapter.merge_method = method;
+            assert_eq!(
+                adapter.capabilities().guarded_merge,
+                SupportLevel::Supported
+            );
+            assert!(adapter.capabilities().guarded_merge_reason.is_none());
+        }
+    }
 
     fn repository(path: &str) -> RemoteRepositoryId {
         RemoteRepositoryId::new(
@@ -2075,8 +2623,40 @@ mod tests {
         }
     }
 
+    fn create_request(source: &str, target: &str) -> CreateChangeRequest {
+        CreateChangeRequest {
+            source_repository: repository(source),
+            target_repository: repository(target),
+            source_branch: "feature/topic".to_string(),
+            target_branch: "main".to_string(),
+            expected_head_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
+            title: "Title".to_string(),
+            body: "Body".to_string(),
+            draft: false,
+        }
+    }
+
     fn pipeline(json: &str) -> GitLabPipeline {
         serde_json::from_str(json).unwrap()
+    }
+
+    fn api_page<T>(
+        items: Vec<T>,
+        page: usize,
+        per_page: usize,
+        next_page: Option<usize>,
+        total: Option<usize>,
+    ) -> GitLabApiPage<T> {
+        GitLabApiPage {
+            items,
+            pagination: GitLabPagination {
+                page,
+                per_page,
+                next_page,
+                total,
+                total_pages: total.map(|total| total.div_ceil(per_page).max(1)),
+            },
+        }
     }
 
     #[test]
@@ -2099,6 +2679,7 @@ mod tests {
             target.clone(),
             mr,
             ReviewDecision::Approved,
+            Vec::new(),
             RemoteOperation::ListChangeRequests,
         )
         .unwrap();
@@ -2111,6 +2692,71 @@ mod tests {
             summary.change_request.head_sha,
             "0123456789abcdef0123456789abcdef01234567"
         );
+        assert_eq!(summary.native_state_evidence.lifecycle, ["opened"]);
+        assert_eq!(
+            summary.native_state_evidence.mergeability,
+            ["can_be_merged"]
+        );
+        assert_eq!(summary.native_state_evidence.review, Vec::<String>::new());
+    }
+
+    #[test]
+    fn same_project_and_fork_fixtures_preserve_source_target_identity() {
+        let same = merge_request(include_str!(
+            "../../tests/fixtures/remote/gitlab/mr-same-project.json"
+        ));
+        let fork = merge_request(include_str!(
+            "../../tests/fixtures/remote/gitlab/mr-fork.json"
+        ));
+
+        assert_eq!(same.source_project_id, same.target_project_id);
+        assert_ne!(fork.source_project_id, fork.target_project_id);
+        assert_eq!(fork.iid, 42);
+        assert_eq!(fork.id, 2002);
+    }
+
+    #[test]
+    fn create_uses_source_project_endpoint_and_target_id_only_for_forks() {
+        let source = GitLabProject {
+            id: 10,
+            path_with_namespace: "contributors/alice/widget".to_string(),
+            ..GitLabProject::default()
+        };
+        let target = GitLabProject {
+            id: 20,
+            path_with_namespace: "platform/widget".to_string(),
+            ..GitLabProject::default()
+        };
+        let fork_request = create_request("contributors/alice/widget", "platform/widget");
+        let (endpoint, fields) =
+            create_merge_request_request(&source, &target, &fork_request, "Title".to_string());
+
+        assert_eq!(endpoint, "projects/10/merge_requests");
+        assert!(fields.contains(&("target_project_id", "20".to_string())));
+        assert!(!fields.iter().any(|(name, _)| *name == "source_project_id"));
+
+        let same_request = create_request("platform/widget", "platform/widget");
+        let (endpoint, fields) =
+            create_merge_request_request(&target, &target, &same_request, "Title".to_string());
+        assert_eq!(endpoint, "projects/20/merge_requests");
+        assert!(!fields.iter().any(|(name, _)| *name == "target_project_id"));
+    }
+
+    #[test]
+    fn requested_reviewers_are_represented_as_pending_reviews() {
+        let merge_request = merge_request(include_str!(
+            "../../tests/fixtures/remote/gitlab/mr-same-project.json"
+        ));
+        let reviews = requested_reviews(merge_request.reviewers);
+
+        assert_eq!(reviews.len(), 2);
+        assert!(
+            reviews
+                .iter()
+                .all(|review| review.decision == ReviewDecision::Pending)
+        );
+        assert_eq!(reviews[0].author, "bob");
+        assert_eq!(reviews[0].native_id, "2");
     }
 
     #[test]
@@ -2243,6 +2889,40 @@ mod tests {
     }
 
     #[test]
+    fn embedded_head_pipeline_must_match_merge_request_sha() {
+        let exact = merge_request(include_str!(
+            "../../tests/fixtures/remote/gitlab/mr-same-project.json"
+        ));
+        let stale = merge_request(include_str!(
+            "../../tests/fixtures/remote/gitlab/mr-mismatched-head-pipeline.json"
+        ));
+
+        assert_eq!(head_pipeline_state(&exact), CheckState::Passed);
+        assert_eq!(
+            head_pipeline_state(&stale),
+            CheckState::Unknown("head_pipeline_sha_mismatch".to_string())
+        );
+
+        let target = repository("group/project");
+        let summary = summary_from_merge_request(
+            &target,
+            target.clone(),
+            target.clone(),
+            stale,
+            ReviewDecision::Approved,
+            vec!["approved=true".to_string()],
+            RemoteOperation::ListChangeRequests,
+        )
+        .unwrap();
+        assert_eq!(
+            summary.check_state,
+            CheckState::Unknown("head_pipeline_sha_mismatch".to_string())
+        );
+        assert_eq!(summary.native_state_evidence.check, ["success"]);
+        assert_eq!(summary.native_state_evidence.review, ["approved=true"]);
+    }
+
+    #[test]
     fn source_branch_head_pipeline_is_authoritative_and_labeled() {
         let pipeline = pipeline(
             r#"{"id":11,"sha":"0123456789abcdef0123456789abcdef01234567",
@@ -2309,6 +2989,26 @@ mod tests {
     }
 
     #[test]
+    fn non_authoritative_pipeline_does_not_stale_coexisting_exact_head_evidence() {
+        let pipelines: Vec<GitLabPipeline> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/remote/gitlab/pipelines-mixed.json"
+        ))
+        .unwrap();
+        let evidence = pipelines
+            .iter()
+            .map(|pipeline| pipeline_evidence(pipeline, &change_request(), 7))
+            .collect::<Vec<_>>();
+        let has_authoritative = evidence.iter().any(|item| item.authoritative);
+
+        assert!(has_authoritative);
+        assert!(evidence.iter().any(|item| !item.authoritative));
+        assert!(evidence.iter().all(|item| {
+            pipeline_association_error(RemoteOperation::ObserveChecks, item, has_authoritative)
+                .is_none()
+        }));
+    }
+
+    #[test]
     fn unknown_or_missing_pipeline_provenance_fails_closed() {
         for json in [
             r#"{"id":15,"sha":"0123456789abcdef0123456789abcdef01234567",
@@ -2365,7 +3065,13 @@ mod tests {
             |_| {
                 calls += 1;
                 if calls == 1 {
-                    Ok(vec![1_u64; PAGE_SIZE])
+                    Ok(api_page(
+                        vec![1_u64; PAGE_SIZE],
+                        1,
+                        PAGE_SIZE,
+                        Some(2),
+                        None,
+                    ))
                 } else {
                     Err(remote_error(
                         RemoteOperation::ObserveChangedFiles,
@@ -2381,6 +3087,231 @@ mod tests {
         let observed = page_observation(page, Ok);
 
         assert!(matches!(observed, Observation::Stale { value, .. } if value.len() == PAGE_SIZE));
+    }
+
+    #[test]
+    fn pagination_follows_server_page_cap_instead_of_requested_page_size() {
+        let mut calls = 0;
+        let page = collect_pages(
+            |page| {
+                calls += 1;
+                let response = match page {
+                    1 => "HTTP/2.0 200 OK\r\nX-Page: 1\r\nX-Per-Page: 2\r\nX-Next-Page: 2\r\nX-Total: 3\r\nX-Total-Pages: 2\r\n\r\n[1,2]",
+                    2 => "HTTP/2.0 200 OK\r\nX-Page: 2\r\nX-Per-Page: 2\r\nX-Next-Page: \r\nX-Total: 3\r\nX-Total-Pages: 2\r\n\r\n[3]",
+                    _ => unreachable!(),
+                };
+                parse_api_page::<u64>(response, RemoteOperation::ListChangeRequests)
+            },
+            RemoteOperation::ListChangeRequests,
+        )
+        .unwrap();
+
+        assert_eq!(calls, 2);
+        assert_eq!(page.items, vec![1, 2, 3]);
+        assert!(page.partial_error.is_none());
+    }
+
+    #[test]
+    fn pagination_propagates_first_page_errors_without_claiming_absence() {
+        let result = collect_pages::<u64>(
+            |_| {
+                Err(remote_error(
+                    RemoteOperation::ListChangeRequests,
+                    RemoteErrorClass::RateLimited,
+                    Retryability::Retryable,
+                    "HTTP 429",
+                ))
+            },
+            RemoteOperation::ListChangeRequests,
+        );
+
+        assert_eq!(result.unwrap_err().class(), RemoteErrorClass::RateLimited);
+    }
+
+    #[test]
+    fn hidden_or_deleted_source_projects_cannot_be_skipped() {
+        for (status, class) in [
+            (403, RemoteErrorClass::Authorization),
+            (404, RemoteErrorClass::NotFound),
+        ] {
+            let cause = classify_message(
+                RemoteOperation::ListChangeRequests,
+                &format!("HTTP {status}: source unavailable"),
+            );
+            assert_eq!(cause.class(), class);
+
+            let error =
+                list_source_repository(10, 20, repository("target/project"), |_| Err(cause))
+                    .unwrap_err();
+            assert_eq!(error.class(), RemoteErrorClass::InvalidResponse);
+            assert_eq!(error.status(), Some(status));
+            assert!(error.safe_message().contains("incomplete"));
+        }
+        let authentication = remote_error(
+            RemoteOperation::ListChangeRequests,
+            RemoteErrorClass::Authentication,
+            Retryability::NotRetryable,
+            "token unavailable",
+        );
+        assert!(!source_project_unavailable(&authentication));
+    }
+
+    #[test]
+    fn paginated_response_requires_complete_consistent_gitlab_headers() {
+        let missing_next = "HTTP/2.0 200 OK\r\nX-Page: 1\r\nX-Per-Page: 20\r\n\r\n[1]";
+        let incomplete_totals = "HTTP/2.0 200 OK\r\nX-Page: 1\r\nX-Per-Page: 20\r\nX-Next-Page: \r\nX-Total: 1\r\n\r\n[1]";
+
+        for response in [missing_next, incomplete_totals] {
+            let error =
+                parse_api_page::<u64>(response, RemoteOperation::ListChangeRequests).unwrap_err();
+            assert_eq!(error.class(), RemoteErrorClass::InvalidResponse);
+        }
+    }
+
+    #[test]
+    fn malformed_later_page_is_reported_as_partial() {
+        let page = collect_pages(
+            |page| match page {
+                1 => Ok(api_page(vec![1_u64, 2], 1, 2, Some(2), None)),
+                2 => parse_api_page(
+                    "HTTP/2.0 200 OK\r\nX-Page: 2\r\nX-Per-Page: 2\r\n\r\n[3]",
+                    RemoteOperation::ObserveChangedFiles,
+                ),
+                _ => unreachable!(),
+            },
+            RemoteOperation::ObserveChangedFiles,
+        )
+        .unwrap();
+
+        assert_eq!(page.items, vec![1, 2]);
+        assert_eq!(
+            page.partial_error.unwrap().class(),
+            RemoteErrorClass::InvalidResponse
+        );
+    }
+
+    #[test]
+    fn pagination_rejects_totals_that_contradict_the_effective_page_cap() {
+        let result = collect_pages(
+            |_| {
+                Ok(GitLabApiPage {
+                    items: vec![1_u64, 2],
+                    pagination: GitLabPagination {
+                        page: 1,
+                        per_page: 2,
+                        next_page: Some(2),
+                        total: Some(3),
+                        total_pages: Some(3),
+                    },
+                })
+            },
+            RemoteOperation::ListChangeRequests,
+        );
+
+        assert_eq!(
+            result.unwrap_err().class(),
+            RemoteErrorClass::InvalidResponse
+        );
+    }
+
+    #[test]
+    fn pagination_rejects_a_declared_next_page_after_the_total() {
+        let error = collect_pages(
+            |_| Ok(api_page(vec![1_u64, 2], 1, 2, Some(2), Some(2))),
+            RemoteOperation::ListChangeRequests,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.class(), RemoteErrorClass::InvalidResponse);
+    }
+
+    #[test]
+    fn association_mutation_is_rejected_after_multi_call_details() {
+        let expected = change_request();
+        let mut changed = expected.clone();
+        changed.head_sha = "fedcba9876543210fedcba9876543210fedcba98".to_string();
+
+        let error = ensure_association(
+            &changed,
+            &expected,
+            RemoteOperation::ObserveChangeRequest,
+            "changed while loading",
+        )
+        .unwrap_err();
+        assert_eq!(error.class(), RemoteErrorClass::StaleHead);
+    }
+
+    #[test]
+    fn hidden_policy_endpoint_is_stale_or_failed_never_empty_known() {
+        let hidden = remote_error(
+            RemoteOperation::ObserveRepositoryPolicy,
+            RemoteErrorClass::NotFound,
+            Retryability::NotRetryable,
+            "HTTP 404",
+        );
+        assert!(matches!(
+            policy_checks(Err(hidden.clone()), "main", Some(false)),
+            Observation::Stale { value, error: Some(_) } if value.is_empty()
+        ));
+        assert!(matches!(
+            policy_checks(Err(hidden), "main", None),
+            Observation::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn queued_merge_is_pending_and_preserves_gitlab_state() {
+        let mut queued = merge_request(include_str!(
+            "../../tests/fixtures/remote/gitlab/mr-same-project.json"
+        ));
+        queued.merge_when_pipeline_succeeds = true;
+        let native_state = queued.state.clone();
+        let target = repository("group/project");
+        let mut summary = summary_from_merge_request(
+            &target,
+            target.clone(),
+            target.clone(),
+            queued.clone(),
+            ReviewDecision::Approved,
+            Vec::new(),
+            RemoteOperation::MergeChangeRequest,
+        )
+        .unwrap();
+        summary.queue_state = QueueState::Queued;
+
+        let outcome = merge_mutation_result(summary, &queued);
+
+        assert_eq!(outcome.outcome, super::super::MergeMutationOutcome::Pending);
+        assert_eq!(outcome.native_state, native_state);
+        assert_eq!(outcome.summary.queue_state, QueueState::Queued);
+    }
+
+    #[test]
+    fn unknown_post_merge_state_without_queue_confirmation_is_uncertain() {
+        let accepted = merge_request(include_str!(
+            "../../tests/fixtures/remote/gitlab/mr-same-project.json"
+        ));
+        let target = repository("group/project");
+        let mut summary = summary_from_merge_request(
+            &target,
+            target.clone(),
+            target.clone(),
+            accepted.clone(),
+            ReviewDecision::Approved,
+            vec!["approved".to_string()],
+            RemoteOperation::MergeChangeRequest,
+        )
+        .unwrap();
+        summary.lifecycle = LifecycleState::Unknown("preparing".to_string());
+        summary.queue_state = QueueState::NotQueued;
+        summary.native_state_evidence.queue.clear();
+
+        let result = merge_mutation_result(summary, &accepted);
+
+        assert_eq!(
+            result.outcome,
+            super::super::MergeMutationOutcome::Uncertain
+        );
     }
 
     #[test]
@@ -2401,6 +3332,7 @@ mod tests {
         let fields = merge_fields(&request).unwrap();
         let args = api_args(
             "git.example.com",
+            None,
             "projects/group%2Fproject/merge_requests/7/merge",
             "PUT",
             &fields,
@@ -2424,7 +3356,7 @@ mod tests {
             "projects/{}/merge_requests",
             encode_path_segment("parent/subgroup/project")
         );
-        let args = api_args("git.corp.example", &endpoint, "GET", &[]);
+        let args = api_args("git.corp.example", None, &endpoint, "GET", &[]);
 
         assert_eq!(
             args,
@@ -2436,6 +3368,47 @@ mod tests {
                 "--method",
                 "GET",
             ]
+        );
+    }
+
+    #[test]
+    fn api_args_route_override_through_full_endpoint_and_canonical_credential_host() {
+        let args = api_args(
+            "git.corp.example",
+            Some("https://api.corp.example/gitlab/api/v4"),
+            "projects/group%2Fproject/merge_requests",
+            "GET",
+            &[],
+        );
+
+        assert!(
+            args.contains(
+                &"https://api.corp.example/gitlab/api/v4/projects/group%2Fproject/merge_requests"
+                    .to_string()
+            )
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--hostname", "git.corp.example"])
+        );
+    }
+
+    #[test]
+    fn api_args_select_the_glab_config_host_for_a_self_managed_port() {
+        let host = HostIdentity::new("localhost", Some(8443)).unwrap();
+        let args = api_args(
+            &host.to_string(),
+            None,
+            "projects/group%2Fproject",
+            "GET",
+            &[],
+        );
+
+        assert_eq!(
+            args.windows(2)
+                .find(|pair| pair[0] == "--hostname")
+                .unwrap(),
+            ["--hostname", "localhost"]
         );
     }
 
@@ -2471,5 +3444,232 @@ mod tests {
         assert_eq!(auth.class(), RemoteErrorClass::Authentication);
         assert_eq!(auth.status(), Some(401));
         assert_eq!(stale.class(), RemoteErrorClass::StaleHead);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn glab_failure_classifies_then_discards_all_untrusted_output() {
+        let directory = std::env::temp_dir().join(format!(
+            "prism-gitlab-safe-error-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let glab = directory.join("glab");
+        crate::test_support::write_executable(
+            &glab,
+            r#"#!/bin/sh
+printf '%s\n' 'https://attacker.example/collect?private_token=query-secret'
+printf '%s\n' '{"message":"malicious response body"}'
+printf '%s\n' 'HTTP 503 Service Unavailable' >&2
+printf '%s\n' 'glpat-direct-secret' >&2
+printf '%s\n' 'Authorization: Bearer bearer-header-secret' >&2
+printf '%s\n' 'PRIVATE-TOKEN: glpat-private-header-secret' >&2
+printf '%s\n' 'first malicious line' 'second malicious line' >&2
+exit 17
+"#,
+        );
+        let adapter = GitLabAdapter::with_glab_path(glab.to_str().unwrap(), repository("g/p"));
+
+        let error = adapter
+            .get_json::<GitLabProject>(RemoteOperation::ObserveRepositoryPolicy, "projects/g%2Fp")
+            .unwrap_err();
+
+        assert_eq!(error.class(), RemoteErrorClass::Provider);
+        assert_eq!(error.retryability(), Retryability::Retryable);
+        assert_eq!(error.status(), Some(503));
+        assert_eq!(error.exit_code(), Some(17));
+        assert_eq!(error.retry_hint(), Some(RetryHint::Backoff));
+        assert_eq!(
+            error.to_string(),
+            "GitLab observe_repository_policy failed: provider; retry=retryable; status=503; exit=17; hint=backoff"
+        );
+        for untrusted in [
+            "glpat-direct-secret",
+            "bearer-header-secret",
+            "glpat-private-header-secret",
+            "query-secret",
+            "Authorization",
+            "PRIVATE-TOKEN",
+            "https://attacker.example",
+            "malicious response body",
+            "first malicious line",
+        ] {
+            assert!(
+                !error.to_string().contains(untrusted),
+                "untrusted output survived: {untrusted}"
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires scripts/remote-compatibility.sh gitlab"]
+    fn pinned_local_gitlab_adapter_compatibility() {
+        assert!(
+            matches!(std::env::var("PRISM_REMOTE_COMPATIBILITY"), Ok(value) if value == "1"),
+            "unsupported fixture: run this test only through scripts/remote-compatibility.sh gitlab"
+        );
+        let base_url = std::env::var("PRISM_GITLAB_COMPAT_URL")
+            .expect("unsupported fixture: PRISM_GITLAB_COMPAT_URL is required");
+        let glab = std::env::var("PRISM_GITLAB_COMPAT_GLAB")
+            .expect("unsupported fixture: PRISM_GITLAB_COMPAT_GLAB is required");
+        let parsed = url::Url::parse(&base_url).expect("compatibility URL");
+        let host = HostIdentity::new(
+            parsed.host_str().expect("compatibility host"),
+            parsed.port(),
+        )
+        .unwrap();
+        let profile = HostProfile::new(host.clone(), ProviderKind::GitLab)
+            .unwrap()
+            .with_http_allowed(true)
+            .with_bases(
+                RemoteBase::new(WebScheme::Http, host.clone(), "").unwrap(),
+                RemoteBase::new(WebScheme::Http, host.clone(), "api/v4").unwrap(),
+            );
+        let discovery = RemoteDiscovery::new([profile]).unwrap();
+        let discovered = discovery
+            .discover(&format!("{base_url}/prism-target/compat-target.git"))
+            .unwrap();
+        let target = discovered.repository.id;
+        assert_eq!(target.provider(), ProviderKind::GitLab);
+        assert_eq!(target.project_path(), "prism-target/compat-target");
+
+        let adapter = GitLabAdapter::with_glab_path(&glab, target.clone());
+        let summaries = adapter.list_change_requests().unwrap();
+        let same = summaries
+            .iter()
+            .find(|summary| summary.title == "compat same-project seeded")
+            .expect("same-project fixture must be listed");
+        assert_eq!(same.change_request.source_repository, target);
+        assert_eq!(same.change_request.target_repository, target);
+        let fork = summaries
+            .iter()
+            .find(|summary| summary.title == "compat fork seeded")
+            .expect("fork fixture must be listed");
+        assert_eq!(
+            fork.change_request.source_repository.project_path(),
+            "prism-fork/compat-target"
+        );
+        assert_eq!(fork.change_request.target_repository, target);
+
+        let fetched = adapter.fetch_metadata(&fork.change_request.id).unwrap();
+        assert_eq!(
+            fetched.source_repository,
+            fork.change_request.source_repository
+        );
+        assert_eq!(fetched.expected_head_sha, fork.change_request.head_sha);
+
+        let details = adapter
+            .change_request_details(&same.change_request)
+            .unwrap();
+        assert!(details.association.as_ref().is_some_and(|association| {
+            association.matches(&same.change_request.id, &same.change_request.head_sha)
+        }));
+        let comments = details
+            .comments
+            .known()
+            .expect("GitLab notes endpoint must be supported");
+        assert!(
+            comments
+                .iter()
+                .any(|comment| comment.body == "compat seeded note")
+        );
+        let threads = details
+            .review_threads
+            .known()
+            .expect("unsupported fixture: GitLab discussions API returned no usable observation");
+        let thread = threads
+            .iter()
+            .find(|thread| {
+                thread
+                    .comments
+                    .iter()
+                    .any(|comment| comment.body == "compat exact discussion")
+            })
+            .expect("unsupported fixture: GitLab did not expose the seeded exact discussion");
+        assert!(
+            thread.resolvable,
+            "unsupported fixture: GitLab did not make the seeded discussion resolvable"
+        );
+        assert!(!thread.resolved);
+        let checks = details
+            .checks
+            .known()
+            .expect("GitLab commit status endpoint must return evidence");
+        assert!(
+            checks.iter().any(|check| {
+                check.name == "compat/status" && check.state == CheckState::Passed
+            })
+        );
+
+        let resolved = adapter
+            .resolve_review_thread(&ResolveReviewThread {
+                id: same.change_request.id.clone(),
+                thread_id: thread.native_id.clone(),
+                expected_head_sha: same.change_request.head_sha.clone(),
+            })
+            .unwrap();
+        assert!(resolved.review_threads.known().is_some_and(|threads| {
+            threads
+                .iter()
+                .any(|observed| observed.native_id == thread.native_id && observed.resolved)
+        }));
+
+        let policy = adapter.repository_policy("main").unwrap();
+        assert_eq!(policy.repository, Some(target.clone()));
+        assert_eq!(
+            policy.facts.conversations_must_be_resolved,
+            Observation::Known(true)
+        );
+
+        let create_request = |expected_head_sha: &str| CreateChangeRequest {
+            source_repository: target.clone(),
+            target_repository: target.clone(),
+            source_branch: "adapter-create".to_string(),
+            target_branch: "main".to_string(),
+            expected_head_sha: expected_head_sha.to_string(),
+            title: "compat adapter-created".to_string(),
+            body: "created by the real GitLab adapter".to_string(),
+            draft: false,
+        };
+        let stale = adapter
+            .create_change_request(&create_request("0000000000000000000000000000000000000000"))
+            .unwrap_err();
+        assert_eq!(stale.class(), RemoteErrorClass::StaleHead);
+        let branch: GitLabBranch = adapter
+            .get_json(
+                RemoteOperation::CreateChangeRequest,
+                &format!(
+                    "projects/{}/repository/branches/adapter-create",
+                    encode_path_segment(target.project_path())
+                ),
+            )
+            .unwrap();
+        let created = adapter
+            .create_change_request(&create_request(&branch.commit.id))
+            .unwrap();
+        assert_eq!(created.change_request.head_sha, branch.commit.id);
+
+        let merge_request = |expected_source_sha: &str| GuardedMerge {
+            id: created.change_request.id.clone(),
+            target_repository: target.clone(),
+            target_branch: "main".to_string(),
+            expected_source_sha: expected_source_sha.to_string(),
+            method: MergeMethod::Merge,
+            native_guard: None,
+        };
+        let stale = adapter
+            .merge_change_request(&merge_request("0000000000000000000000000000000000000000"))
+            .unwrap_err();
+        assert_eq!(stale.class(), RemoteErrorClass::StaleHead);
+        let merged = adapter
+            .merge_change_request(&merge_request(&created.change_request.head_sha))
+            .unwrap();
+        assert_eq!(merged.outcome, super::super::MergeMutationOutcome::Merged);
+        assert_eq!(merged.summary.lifecycle, LifecycleState::Merged);
     }
 }

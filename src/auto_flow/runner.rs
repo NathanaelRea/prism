@@ -46,7 +46,7 @@ pub fn execute_auto_initial_step(
         }
 
         if persisted.run.pending_push.is_some() && config.auto.push_repairs {
-            let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
+            let mut cache = crate::remote::load_pr_cache(repo, &persisted.run.branch);
             stabilization_execute::progress_pending_push(
                 conn,
                 repo,
@@ -55,6 +55,28 @@ pub fn execute_auto_initial_step(
                 &mut cache,
                 || Ok(()),
             )?;
+            continue;
+        }
+
+        if let Some(step_index) = next_waiting_merge_step(persisted) {
+            if let Err(error) = reconcile_waiting_merge_until_complete(
+                conn,
+                repo,
+                config,
+                persisted,
+                step_index,
+                executor.max_output_lines_per_step,
+            ) {
+                persisted.run.status = AutoRunStatus::Failed;
+                persisted.run.pause_requested = false;
+                persisted.run.updated_unix_ms = unix_ms();
+                save_run_with_conn(conn, &persisted.run)?;
+                return Err(error);
+            }
+            if persisted.run.status == AutoRunStatus::Paused {
+                return Ok(());
+            }
+            pause_before_next_auto_step_with_context(conn, repo, config, persisted)?;
             continue;
         }
 

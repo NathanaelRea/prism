@@ -74,16 +74,17 @@ The default branch is the base branch Prism uses to distinguish mainline work
 from task branches. It defaults to `main` and can be configured globally or per
 repository with `default_base`.
 
-Prism does not poll or display pull request state for the default branch. Startup
+Prism does not poll or display change-request state for the default branch. Startup
 setup also uses the default branch to decide whether the current checkout should
 be moved into a separate worktree.
 
 ### Change Request Cache
 
-The Change Request Cache is Prism's local snapshot of GitHub pull-request,
-GitLab merge-request, or Forgejo pull-request state for a non-default branch. It
-includes canonical provider, host, project, native identity, exact head SHA,
-summary fields, independently observed details, polling timestamps, and errors.
+The Change Request Cache is Prism's local snapshot of provider-hosted
+change-request state for a non-default branch. A change request is a GitHub or
+Forgejo pull request, or a GitLab merge request. The cache includes canonical
+provider, host, project, native identity, exact head SHA, summary fields,
+independently observed details, polling timestamps, and errors.
 
 The cache exists to keep the board responsive and avoid provider work on every
 render. Failed refreshes preserve stale display state but cannot authorize a
@@ -93,6 +94,25 @@ The Change Request Cache module owns branch eligibility, refresh pollability, su
 preservation rules, comment-count facts, render-change signatures, and refresh
 errors. Callers should consume those facts instead of rebuilding timestamp,
 signature, default-branch, or optional-detail rules.
+
+### Provider Adapter
+
+A Provider Adapter owns one hosting protocol: GitHub, GitLab, or Forgejo. It
+discovers and normalizes change-request facts while retaining provider-native
+identity and state. Codeberg uses the Forgejo adapter with a built-in Host
+Profile; it is not a fourth adapter.
+
+Adapters declare each optional operation as supported, unsupported, conditional,
+or unknown. Capability does not imply fresh evidence. Callers must separately
+evaluate observation quality and cannot authorize mutation from stale, failed,
+partial, or unknown observations.
+
+### Host Profile
+
+A Host Profile maps one canonical hostname to a Provider Adapter and its web/API
+bases. GitHub.com, GitLab.com, and Codeberg have built-in profiles. Every other
+host requires explicit configuration before Prism probes it or consults a
+credential source.
 
 ### Plan Mode
 
@@ -170,13 +190,13 @@ then continues with local verification and the rest of the PR pipeline.
 
 Change Request Stabilization is Prism's core workflow for taking an existing change request
 from its current observed state to all required gates passing. It starts after
-Auto Flow creates or updates a pull request, or when a user asks Prism to manage
+Auto Flow creates or updates a change request, or when a user asks Prism to manage
 a review, CI, or mergeability repair for an existing Worktree Session. Auto Flow
 delegates change-request gate decisions to stabilization instead of owning a
 separate linear PR checklist.
 
 Prism treats Change Request Stabilization as derived work rather than a fixed checklist. It
-observes local Git state, cached pull request state, repository policy, and the
+observes local Git state, cached change-request state, repository policy, and the
 configured Auto Flow goal, derives the current blocker, and chooses one safe next
 work item such as review repair, CI repair, waiting for checks, or ready for
 manual merge.

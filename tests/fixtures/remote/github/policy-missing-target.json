@@ -1,0 +1,19 @@
+{
+  "data": {
+    "repository": {
+      "defaultBranchRef": {"name": "main"},
+      "branchProtectionRules": {
+        "pageInfo": {"hasNextPage": false},
+        "nodes": [
+          {
+            "pattern": "release/*",
+            "requiredApprovingReviewCount": 0,
+            "requiresConversationResolution": false,
+            "requiresStrictStatusChecks": false,
+            "requiredStatusCheckContexts": []
+          }
+        ]
+      }
+    }
+  }
+}

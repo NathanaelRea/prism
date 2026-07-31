@@ -1,6 +1,33 @@
 use super::*;
 
+const AUTO_SCHEMA_VERSION: i64 = 7;
+
 pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
+    let has_version_table = conn
+        .query_row(
+            "select exists(
+               select 1 from sqlite_master
+               where type = 'table' and name = 'auto_schema_version'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("inspect auto schema version table: {error}"))?;
+    if has_version_table {
+        let existing_version = conn
+            .query_row(
+                "select version from auto_schema_version where id = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|error| format!("read auto schema version: {error}"))?;
+        if let Some(version) = existing_version.filter(|version| *version > AUTO_SCHEMA_VERSION) {
+            return Err(format!(
+                "auto flow schema version {version} is newer than supported version {AUTO_SCHEMA_VERSION}"
+            ));
+        }
+    }
     conn.execute_batch(
         "
         create table if not exists auto_run (
@@ -22,6 +49,7 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
           status text not null,
           pause_requested integer not null default 0,
           selected_step_run_id integer,
+          change_request_identity_json text,
           pr_number integer,
           pr_url text,
           current_head_sha text,
@@ -131,6 +159,15 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
         )
         .map_err(|error| format!("migrate auto_run worktree_incarnation column: {error}"))?;
     }
+    if !table_has_column(conn, "auto_run", "change_request_identity_json")? {
+        conn.execute(
+            "alter table auto_run add column change_request_identity_json text",
+            [],
+        )
+        .map_err(|error| {
+            format!("migrate auto_run change_request_identity_json column: {error}")
+        })?;
+    }
     if !table_has_column(conn, "auto_run", "implementation_source")? {
         conn.execute(
             "alter table auto_run add column implementation_source text not null default 'prompt'",
@@ -199,11 +236,11 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
                 .map_err(|error| format!("migrate {table} {column} column: {error}"))?;
         }
     }
-    reset_incompatible_active_runs(conn)?;
+    fail_legacy_active_runs(conn)?;
     conn.execute(
-        "insert into auto_schema_version (id, version) values (1, 6)
+        "insert into auto_schema_version (id, version) values (1, ?1)
          on conflict(id) do update set version = excluded.version",
-        [],
+        params![AUTO_SCHEMA_VERSION],
     )
     .map_err(|error| format!("write auto schema version: {error}"))?;
     Ok(())
@@ -596,6 +633,52 @@ pub(super) fn load_run_with_conn(
     .map_err(|error| format!("load auto run: {error}"))
 }
 
+pub(super) fn save_observed_change_request_identity(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+    identity: Option<&crate::remote::CanonicalChangeRequestIdentity>,
+) -> Result<(), String> {
+    let identity_json = identity
+        .map(|identity| {
+            serde_json::to_string(identity)
+                .map_err(|error| format!("serialize auto change request identity: {error}"))
+        })
+        .transpose()?;
+    let changed = conn
+        .execute(
+            "update auto_run set change_request_identity_json = ?1 where id = ?2",
+            params![identity_json, run_id],
+        )
+        .map_err(|error| format!("write auto change request identity: {error}"))?;
+    if changed != 1 {
+        return Err(format!(
+            "write auto change request identity: auto flow run not found: {run_id}"
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn load_observed_change_request_identity(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+) -> Result<Option<crate::remote::CanonicalChangeRequestIdentity>, String> {
+    let value = conn
+        .query_row(
+            "select change_request_identity_json from auto_run where id = ?1",
+            params![run_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(|error| format!("read auto change request identity: {error}"))?
+        .flatten();
+    value
+        .map(|value| {
+            serde_json::from_str(&value)
+                .map_err(|error| format!("parse auto change request identity: {error}"))
+        })
+        .transpose()
+}
+
 pub(super) fn load_steps_with_conn(
     conn: &rusqlite::Connection,
     run_id: &str,
@@ -657,7 +740,7 @@ pub(super) fn load_steps_with_conn(
         .map_err(|error| format!("read auto steps: {error}"))
 }
 
-fn reset_incompatible_active_runs(conn: &rusqlite::Connection) -> Result<(), String> {
+fn fail_legacy_active_runs(conn: &rusqlite::Connection) -> Result<(), String> {
     let version = conn
         .query_row(
             "select version from auto_schema_version where id = 1",
@@ -674,28 +757,31 @@ fn reset_incompatible_active_runs(conn: &rusqlite::Connection) -> Result<(), Str
     let now = u64_to_i64(unix_ms());
     conn.execute(
         "update auto_step_run
-         set status = 'aborted',
+         set status = 'failed',
              finished_unix_ms = coalesce(finished_unix_ms, ?1),
-             error = coalesce(error, 'Archived during PR Stabilization persistence migration')
+             error = coalesce(error, 'Interrupted by Auto Flow persistence migration; retry requires a fresh remote observation')
          where run_id in (
            select id from auto_run
            where archived_unix_ms is null
              and status in ('queued', 'running', 'paused', 'failed')
          )
-           and status in ('queued', 'starting', 'running', 'waiting', 'failed')",
+           and status in ('queued', 'starting', 'running', 'waiting')",
         params![now],
     )
-    .map_err(|error| format!("archive incompatible auto steps: {error}"))?;
+    .map_err(|error| format!("fail incompatible auto steps: {error}"))?;
     conn.execute(
         "update auto_run
-         set status = 'aborted',
-             archived_unix_ms = coalesce(archived_unix_ms, ?1),
+         set status = 'failed',
+             pause_requested = 0,
+             stabilization_status = 'escalated',
+             stabilization_blocker = 'observation_failed',
+             stabilization_next_work = 'escalate',
              updated_unix_ms = ?1
          where archived_unix_ms is null
            and status in ('queued', 'running', 'paused', 'failed')",
         params![now],
     )
-    .map_err(|error| format!("archive incompatible auto runs: {error}"))?;
+    .map_err(|error| format!("fail incompatible auto runs: {error}"))?;
     Ok(())
 }
 

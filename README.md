@@ -8,7 +8,10 @@
 ▓▒░▒▓█▓ M ◤◥◣◢◤◥◣
 ```
 
-Prism is a meta-harness for managing agents in parallel on separate worktrees with tmux. It integrates with GitHub, GitLab, Forgejo, and Codeberg, so you don't need to switch between worktrees, terminals, browsers, or repositories.
+Prism is a meta-harness for managing agents in parallel on separate worktrees
+with tmux. Its provider-neutral change-request workflows integrate with GitHub,
+GitLab, Forgejo, and Codeberg, so you don't need to switch between worktrees,
+terminals, browsers, or repositories.
 
 ## Overview
 
@@ -16,11 +19,14 @@ Prism is a meta-harness for managing agents in parallel on separate worktrees wi
 
 ## What it enables
 
-It's a local dashboard to manage code change lifecycles. From planning, implementation, PR, CI checks, CR comments/fixes. It's a centralized location to do this all in one place along different threads at the same time.
+It's a local dashboard for code-change lifecycles: planning, implementation,
+change-request creation, CI checks, and review fixes. It keeps parallel work in
+one place.
 
 - Isolate tasks with git worktrees and tmux sessions
-- See repo, worktree, PR, CI, and agent state in one TUI.
-- Kick off repeatable agent flows for implementing a plan, or fixing from reviews, ci failures, or merge issues
+- See repository, worktree, change-request, CI, and agent state in one TUI.
+- Kick off repeatable agent flows for implementing a plan or fixing review, CI,
+  and merge issues.
 
 ## Prerequisites
 
@@ -34,7 +40,12 @@ Install the transport required by each repository:
 
 - GitHub CLI (`gh`) for GitHub
 - GitLab CLI (`glab`) for GitLab
-- No provider CLI for Forgejo or Codeberg; configure a token environment variable when private access is needed
+- No provider CLI for Forgejo or Codeberg; configure the name of a token
+  environment variable when private or mutating access is needed
+
+GitHub.com, GitLab.com, and Codeberg are recognized automatically. Self-hosted
+servers require an explicit mapping. See [Remote Hosting](docs/remote-hosting.md)
+for authentication, supported server versions, capabilities, and diagnostics.
 
 Agent harnesses are optional individually. Install and select whichever harness you want Prism to manage:
 
@@ -84,5 +95,6 @@ prism
 
 - [Keybindings](docs/keybindings.md)
 - [Configuration](docs/config.md)
+- [Remote Hosting](docs/remote-hosting.md)
 - [Auto Flow](docs/auto-flow.md)
 - [Development](docs/development.md)

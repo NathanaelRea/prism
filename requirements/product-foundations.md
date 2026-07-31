@@ -21,7 +21,7 @@
   explicitly creates a repository-owned artifact.
 - **Invariant**: The Default Branch remains a Worktree Session but is not treated
   as a task branch or Agent Session target from the worktree list. It sorts ahead
-  of task worktrees and is not polled for or decorated with pull request state.
+  of task worktrees and is not polled for or decorated with change-request state.
 - **Invariant**: A logical prompt-starting action creates at most one intended
   harness session and submits its prompt exactly once through an adapter-supported transport.
 - **Invariant**: Repository, Worktree Session, Agent Session, Plan run, Auto Flow

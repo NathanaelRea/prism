@@ -397,7 +397,12 @@ fn merge_gate_label(session: &Session) -> String {
     let Some(summary) = session.pr.summary() else {
         return String::new();
     };
-    if merge_blocked(summary) {
+    if !matches!(
+        summary.queue_state.trim().to_ascii_lowercase().as_str(),
+        "" | "not_queued" | "none"
+    ) {
+        format!("queue ({})", summary.queue_state)
+    } else if merge_blocked(summary) {
         if summary.merge_state_status.trim().is_empty() {
             "blocked".to_string()
         } else {
@@ -418,7 +423,7 @@ fn policy_gate_label(blocker: &StabilizationBlocker) -> String {
     }
 }
 
-fn merge_blocked(summary: &crate::github::PrSummary) -> bool {
+fn merge_blocked(summary: &crate::remote::PrSummary) -> bool {
     matches!(
         summary
             .merge_state_status

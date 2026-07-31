@@ -714,16 +714,7 @@ pub fn agent_spawn_data_json(argv: &[String], workdir: &Path) -> String {
 }
 
 pub fn sanitize_command_text(command: &str) -> String {
-    let mut redact_next = false;
-    command
-        .split_whitespace()
-        .map(|part| {
-            let sanitized = sanitize_arg(part, redact_next);
-            redact_next = is_secret_flag(part);
-            sanitized
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    sanitize_token_sequence(command)
 }
 
 pub fn tail_runtime_log(repo: &Repository, lines: usize) -> Result<Vec<String>, String> {
@@ -1385,8 +1376,7 @@ fn sanitized_argv(command: &Command) -> Vec<String> {
     let mut redact_next = false;
     for arg in command.get_args() {
         let text = os_to_string(arg);
-        argv.push(sanitize_arg(&text, redact_next));
-        redact_next = is_secret_flag(&text);
+        argv.push(sanitize_sequence_part(&text, &mut redact_next));
     }
     argv
 }
@@ -1398,6 +1388,9 @@ fn sanitize_arg(arg: &str, redact: bool) -> String {
     let lower = arg.to_ascii_lowercase();
     if lower.contains("prism-prompts/prompt-") {
         return "<prompt-file>".to_string();
+    }
+    if lower.contains("http://") || lower.contains("https://") {
+        return "<redacted-url>".to_string();
     }
     if arg.chars().any(char::is_whitespace) {
         let sanitized = sanitize_command_text(arg);
@@ -1420,6 +1413,7 @@ fn sanitize_arg(arg: &str, redact: bool) -> String {
         || lower.contains("apikey=")
         || lower.contains("password=")
         || lower.contains("secret=")
+        || contains_sensitive_header(&lower)
         || looks_like_secret(arg)
         || arg.contains('\n')
         || arg.chars().count() > 120
@@ -1443,33 +1437,91 @@ fn secret_flags() -> &'static [&'static str] {
         "--secret",
         "--auth",
         "--github-token",
+        "--gitlab-token",
+        "--forgejo-token",
+        "--private-token",
+        "--access-token",
+        "--oauth-token",
         "--prompt",
         "--prompt-file",
     ]
 }
 
 pub(crate) fn redact_freeform(value: &str, max_chars: usize) -> String {
-    let redacted = value
-        .split_whitespace()
-        .map(|word| {
-            if looks_like_secret(word) {
-                "<redacted>".to_string()
-            } else {
-                sanitize_arg(word, false)
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+    let redacted = sanitize_token_sequence(value);
     truncate(&single_line(&redacted), max_chars)
 }
 
 fn looks_like_secret(value: &str) -> bool {
-    let lower = value.to_ascii_lowercase();
+    let lower = value
+        .trim_start_matches(|character: char| !character.is_ascii_alphanumeric())
+        .to_ascii_lowercase();
     lower.starts_with("sk-")
         || lower.starts_with("ghp_")
         || lower.starts_with("github_pat_")
+        || lower.contains("glpat-")
         || lower.starts_with("xoxb-")
         || lower.starts_with("xoxp-")
+}
+
+fn sanitize_token_sequence(value: &str) -> String {
+    let mut redact_next = false;
+    value
+        .split_whitespace()
+        .map(|part| sanitize_sequence_part(part, &mut redact_next))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn sanitize_sequence_part(part: &str, redact_next: &mut bool) -> String {
+    if *redact_next {
+        if is_authorization_scheme(part) {
+            return sanitize_arg(part, false);
+        }
+        *redact_next = false;
+        return "<redacted>".to_string();
+    }
+    let sanitized = sanitize_arg(part, false);
+    *redact_next = secret_value_follows(part);
+    sanitized
+}
+
+fn secret_value_follows(value: &str) -> bool {
+    if is_secret_flag(value) || is_authorization_scheme(value) {
+        return true;
+    }
+    let lower = value.to_ascii_lowercase();
+    for name in ["authorization", "private-token", "private_token"] {
+        if let Some(index) = lower.find(name) {
+            let remainder = lower[index + name.len()..]
+                .trim_matches(|character: char| matches!(character, ':' | '=' | '"' | '\''));
+            return remainder.is_empty() || is_authorization_scheme(remainder);
+        }
+    }
+    false
+}
+
+fn is_authorization_scheme(value: &str) -> bool {
+    matches!(
+        value
+            .trim_matches(|character: char| !character.is_ascii_alphanumeric())
+            .to_ascii_lowercase()
+            .as_str(),
+        "bearer" | "token" | "basic"
+    )
+}
+
+fn contains_sensitive_header(lower: &str) -> bool {
+    [
+        "authorization:",
+        "authorization=",
+        "private-token:",
+        "private-token=",
+        "private_token:",
+        "private_token=",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 fn os_to_string(value: &OsStr) -> String {
@@ -1540,7 +1592,8 @@ mod tests {
 
     use super::{
         DEFERRED_DB_EVENT_CAPACITY, Event, LogLevel, ObserverOptions, ObserverState, db_path,
-        now_ms, open_writable_db_path, sanitize_command_text, sanitized_argv, writable_db,
+        now_ms, open_writable_db_path, redact_freeform, sanitize_command_text, sanitized_argv,
+        writable_db,
     };
 
     #[test]
@@ -1618,6 +1671,62 @@ mod tests {
         let argv = sanitized_argv(&command);
 
         assert_eq!(argv, vec!["tmux", "agent --token <redacted>"]);
+    }
+
+    #[test]
+    fn redacts_provider_tokens_headers_and_query_parameters() {
+        let secrets = [
+            "glpat-direct-secret",
+            "gitlab-bearer-secret",
+            "gitlab-private-header-secret",
+            "forgejo-token-secret",
+            "query-token-secret",
+        ];
+        let text = format!(
+            "token={} Authorization: Bearer {} PRIVATE-TOKEN: {} token {} https://gitlab.example/api?access_token={}&page=1",
+            secrets[0], secrets[1], secrets[2], secrets[3], secrets[4]
+        );
+
+        let redacted = redact_freeform(&text, 1_000);
+
+        for secret in secrets {
+            assert!(!redacted.contains(secret), "secret survived: {secret}");
+        }
+        assert!(!redacted.contains("https://gitlab.example"));
+        assert!(redacted.contains("<redacted-url>"));
+        assert!(redacted.matches("<redacted>").count() >= 5);
+    }
+
+    #[test]
+    fn redacts_authorization_forms_in_command_text() {
+        let secrets = [
+            "inline-bearer-secret",
+            "separate-bearer-secret",
+            "private-token-secret",
+            "glpat-command-secret",
+        ];
+        let command = format!(
+            "curl -H Authorization:Bearer {} -H 'Authorization: Bearer {}' -H PRIVATE-TOKEN: {} --gitlab-token {}",
+            secrets[0], secrets[1], secrets[2], secrets[3]
+        );
+
+        let redacted = sanitize_command_text(&command);
+
+        for secret in secrets {
+            assert!(!redacted.contains(secret), "secret survived: {secret}");
+        }
+    }
+
+    #[test]
+    fn redacts_authorization_header_split_across_argv() {
+        let secret = "split-argv-bearer-secret";
+        let mut command = Command::new("curl");
+        command.args(["-H", "Authorization:", "Bearer", secret, "safe"]);
+
+        let argv = sanitized_argv(&command);
+
+        assert!(!argv.join(" ").contains(secret));
+        assert_eq!(argv.last().map(String::as_str), Some("safe"));
     }
 
     #[test]

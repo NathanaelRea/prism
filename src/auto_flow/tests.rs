@@ -258,6 +258,20 @@ fn prompt_implementation_pr_delegates_to_stabilization_ready_state() {
     let mut config = Config::load(&repo);
     configure_pr_observation(&temp, &mut config, "feat/auto", &head);
     seed_pr_cache(&repo, "feat/auto", &head);
+    crate::remote::save_repo_policy_cache(
+        &repo,
+        &crate::remote::RepoPolicyCache {
+            repo_remote: "example/repo".to_string(),
+            provider: Some(crate::remote::ProviderKind::GitHub),
+            canonical_host: Some("github.com".to_string()),
+            project_path: Some("example/repo".to_string()),
+            target_branch: Some("main".to_string()),
+            identity_complete: true,
+            default_branch: Some("main".to_string()),
+            ..crate::remote::RepoPolicyCache::default()
+        },
+    )
+    .unwrap();
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
     let mut persisted = AutoLaunch::new(&work, &work, "feat/auto", "Implement auto")
@@ -1075,6 +1089,9 @@ fn schema_round_trips_run_steps_and_output() {
     persisted.run.selected_step_run_id = Some(2);
 
     save_auto_run(&conn, &mut persisted).unwrap();
+    let identity = crate::remote::test_change_request_identity();
+    save_observed_change_request_identity(&conn, &persisted.run.id, Some(&identity)).unwrap();
+    save_auto_run(&conn, &mut persisted).unwrap();
     let implement_id = persisted.steps[1].id.expect("step id");
     append_output_line(
         &conn,
@@ -1094,6 +1111,10 @@ fn schema_round_trips_run_steps_and_output() {
         .expect("run");
 
     assert_eq!(loaded.run, persisted.run);
+    assert_eq!(
+        load_observed_change_request_identity(&conn, &persisted.run.id).unwrap(),
+        Some(identity)
+    );
     assert_eq!(loaded.steps, persisted.steps);
     assert_eq!(loaded.status_counts().done, 1);
     assert_eq!(loaded.status_counts().running, 1);
@@ -1130,6 +1151,7 @@ fn schema_round_trips_stabilization_guards_and_planner_state() {
     });
     persisted.steps[0].work_guard = Some(stabilization_model::WorkGuard {
         change_request_identity: Some(crate::remote::test_change_request_identity()),
+        authorized_target_branch: Some("main".to_string()),
         local_head_sha: Some("local-sha".to_string()),
         remote_head_sha: Some("remote-sha".to_string()),
         pr_head_sha: Some("pr-sha".to_string()),
@@ -1229,6 +1251,7 @@ fn review_repair_commit_enters_pending_push_with_guard_data() {
     ));
     persisted.steps[0].work_guard = Some(stabilization_model::WorkGuard {
         change_request_identity: Some(crate::remote::test_change_request_identity()),
+        authorized_target_branch: Some("main".to_string()),
         local_head_sha: Some(remote_head.clone()),
         remote_head_sha: None,
         pr_head_sha: Some(remote_head.clone()),
@@ -1285,6 +1308,7 @@ fn invalidated_repair_guard_replans_without_creating_a_commit() {
     ));
     persisted.steps[0].work_guard = Some(stabilization_model::WorkGuard {
         change_request_identity: Some(crate::remote::test_change_request_identity()),
+        authorized_target_branch: Some("main".to_string()),
         local_head_sha: Some(original_head.clone()),
         remote_head_sha: None,
         pr_head_sha: Some("superseded-head".to_string()),
@@ -1340,6 +1364,7 @@ fn ci_repair_commit_enters_pending_push_with_guard_data() {
     ));
     persisted.steps[0].work_guard = Some(stabilization_model::WorkGuard {
         change_request_identity: Some(crate::remote::test_change_request_identity()),
+        authorized_target_branch: Some("main".to_string()),
         local_head_sha: Some(remote_head.clone()),
         remote_head_sha: Some(remote_head.clone()),
         pr_head_sha: Some(remote_head.clone()),
@@ -1377,7 +1402,7 @@ fn ci_repair_commit_enters_pending_push_with_guard_data() {
 }
 
 #[test]
-fn schema_migration_archives_old_active_auto_runs_once() {
+fn schema_migration_preserves_and_fails_old_active_auto_runs_once() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     conn.execute_batch(
         "
@@ -1399,11 +1424,15 @@ fn schema_migration_archives_old_active_auto_runs_once() {
           selected_step_run_id integer,
           pr_number integer,
           pr_url text,
-          current_head_sha text,
-          review_baseline_json text,
-          created_unix_ms integer not null,
-          updated_unix_ms integer not null,
-          archived_unix_ms integer
+           current_head_sha text,
+           review_baseline_json text,
+           stabilization_status text,
+           stabilization_blocker text,
+           stabilization_next_work text,
+           pending_push_json text,
+           created_unix_ms integer not null,
+           updated_unix_ms integer not null,
+           archived_unix_ms integer
         );
         create table auto_step_run (
           id integer primary key autoincrement,
@@ -1418,54 +1447,270 @@ fn schema_migration_archives_old_active_auto_runs_once() {
           opencode_server_url text,
           opencode_session_id text,
           process_id integer,
-          plan_run_id text,
-          commit_sha text,
-          head_sha text,
-          summary text,
-          error text,
-          unique(run_id, sequence)
-        );
-        insert into auto_run (
-          id, repo_root, worktree_path, branch, mode, implementation_source, plan_run_mode,
-          variant, prompt_summary, initial_prompt, status, created_unix_ms, updated_unix_ms
-        ) values ('old', '/repo', '/repo/feature', 'feature', 'standard', 'prompt', 'sequential',
-          'default', 'old', 'old', 'running', 1, 1);
-        insert into auto_step_run (
-          run_id, sequence, step_key, status, attempt,
-          opencode_server_url, opencode_session_id, process_id
-        ) values ('old', 1, 'wait_ci', 'running', 1,
-          'http://127.0.0.1:41000', 'ses_old', 1234);
-        ",
+           plan_run_id text,
+           commit_sha text,
+           head_sha text,
+           work_guard_json text,
+           blocker text,
+           summary text,
+           error text,
+           unique(run_id, sequence)
+         );
+         create table auto_output_line (
+           step_run_id integer not null references auto_step_run(id) on delete cascade,
+           line_number integer not null,
+           time_unix_ms integer not null,
+           kind text not null,
+           text text not null,
+           block_id text,
+           primary key (step_run_id, line_number)
+         );
+         create table auto_event (
+           id integer primary key autoincrement,
+           run_id text not null references auto_run(id) on delete cascade,
+           step_run_id integer references auto_step_run(id) on delete set null,
+           time_unix_ms integer not null,
+           kind text not null,
+           data_json text not null
+         );
+         create table auto_schema_version (
+           id integer primary key check (id = 1),
+           version integer not null
+         );
+         insert into auto_schema_version (id, version) values (1, 3);
+         insert into auto_run (
+           id, repo_root, worktree_path, branch, mode, implementation_source, plan_run_mode,
+           variant, prompt_summary, initial_prompt, status, created_unix_ms, updated_unix_ms
+         ) values
+           ('old-running', '/repo', '/repo/feature', 'feature', 'standard', 'prompt', 'sequential',
+            'default', 'old running', 'old running', 'running', 1, 1),
+           ('old-paused', '/repo', '/repo/paused', 'paused', 'standard', 'prompt', 'sequential',
+            'default', 'old paused', 'old paused', 'paused', 2, 2),
+           ('old-done', '/repo', '/repo/done', 'done', 'standard', 'prompt', 'sequential',
+            'default', 'old done', 'old done', 'done', 3, 3);
+         insert into auto_step_run (
+           run_id, sequence, step_key, status, attempt,
+           opencode_server_url, opencode_session_id, process_id
+         ) values
+           ('old-running', 1, 'prepare', 'done', 1, null, null, null),
+           ('old-running', 2, 'merge', 'running', 1,
+            'http://127.0.0.1:41000', 'ses_old', 1234),
+           ('old-paused', 1, 'wait_ci', 'waiting', 1, null, null, null),
+           ('old-done', 1, 'cleanup', 'done', 1, null, null, null);
+         insert into auto_output_line (
+           step_run_id, line_number, time_unix_ms, kind, text
+         ) values (2, 1, 4, 'status', 'legacy output');
+         insert into auto_event (
+           run_id, step_run_id, time_unix_ms, kind, data_json
+         ) values ('old-running', 2, 5, 'legacy_event', '{}');
+         ",
+    )
+    .unwrap();
+    let pending_push = stabilization_model::PendingPushGuard {
+        change_request_identity: None,
+        repair_kind: stabilization_model::RepairKind::Review,
+        commit_sha: "repair-sha".to_string(),
+        expected_local_head_sha: "repair-sha".to_string(),
+        expected_remote_head_sha: Some("remote-sha".to_string()),
+        pr_number: Some(42),
+        expected_pr_head_sha: Some("remote-sha".to_string()),
+        expected_base_sha: Some("base-sha".to_string()),
+        guarded_review_thread_ids: vec!["thread-1".to_string()],
+    };
+    let work_guard = stabilization_model::WorkGuard {
+        change_request_identity: None,
+        authorized_target_branch: None,
+        local_head_sha: Some("repair-sha".to_string()),
+        remote_head_sha: Some("remote-sha".to_string()),
+        pr_head_sha: Some("remote-sha".to_string()),
+        base_sha: Some("base-sha".to_string()),
+        review_thread_ids: vec!["thread-1".to_string()],
+    };
+    conn.execute(
+        "update auto_run set pending_push_json = ?1 where id = 'old-running'",
+        params![serde_json::to_string(&pending_push).unwrap()],
+    )
+    .unwrap();
+    conn.execute(
+        "update auto_step_run set work_guard_json = ?1 where id = 2",
+        params![serde_json::to_string(&work_guard).unwrap()],
     )
     .unwrap();
 
     migrate_schema(&conn).unwrap();
-    let loaded = load_auto_run(&conn, "old").unwrap().expect("run");
+    let loaded = load_auto_run(&conn, "old-running")
+        .unwrap()
+        .expect("running run");
+    let paused = load_auto_run(&conn, "old-paused")
+        .unwrap()
+        .expect("paused run");
+    let done = load_auto_run(&conn, "old-done").unwrap().expect("done run");
 
-    assert_eq!(loaded.run.status, AutoRunStatus::Aborted);
+    assert_eq!(loaded.run.status, AutoRunStatus::Failed);
     assert_eq!(loaded.run.worktree_incarnation, None);
-    assert!(loaded.run.archived_unix_ms.is_some());
-    assert_eq!(loaded.steps[0].status, AutoStepStatus::Aborted);
+    assert_eq!(loaded.run.archived_unix_ms, None);
     assert_eq!(
-        loaded.steps[0].session.endpoint.as_deref(),
+        loaded.run.stabilization_status,
+        Some(stabilization_model::StabilizationStatus::Escalated)
+    );
+    assert_eq!(
+        loaded.run.stabilization_blocker,
+        Some(stabilization_model::StabilizationBlocker::ObservationFailed)
+    );
+    assert_eq!(
+        loaded.run.stabilization_next_work,
+        Some(stabilization_model::StabilizationWorkKind::Escalate)
+    );
+    assert_eq!(loaded.steps.len(), 2);
+    assert_eq!(loaded.steps[0].status, AutoStepStatus::Done);
+    assert_eq!(loaded.steps[1].status, AutoStepStatus::Failed);
+    assert_eq!(
+        loaded.steps[1].session.endpoint.as_deref(),
         Some("http://127.0.0.1:41000")
     );
-    assert_eq!(loaded.steps[0].session.id.as_deref(), Some("ses_old"));
+    assert_eq!(loaded.steps[1].session.id.as_deref(), Some("ses_old"));
     assert_eq!(
-        loaded.steps[0].session.adapter_id.as_deref(),
+        loaded.steps[1].session.adapter_id.as_deref(),
         Some("opencode")
     );
-    assert_eq!(loaded.steps[0].execution.process_id, Some(1234));
+    assert_eq!(loaded.steps[1].execution.process_id, Some(1234));
     assert!(
-        loaded.steps[0]
+        loaded.steps[1]
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("PR Stabilization"))
+            .is_some_and(|error| error.contains("fresh remote observation"))
     );
+    assert_eq!(loaded.run.pending_push.as_ref(), Some(&pending_push));
+    assert_eq!(loaded.steps[1].work_guard.as_ref(), Some(&work_guard));
+    assert_eq!(paused.run.status, AutoRunStatus::Failed);
+    assert_eq!(paused.run.archived_unix_ms, None);
+    assert_eq!(paused.steps[0].status, AutoStepStatus::Failed);
+    assert_eq!(done.run.status, AutoRunStatus::Done);
+    assert_eq!(done.steps[0].status, AutoStepStatus::Done);
+    assert_eq!(
+        load_observed_change_request_identity(&conn, "old-running").unwrap(),
+        None
+    );
+    assert!(
+        load_recent_active_runs_for_repo(&conn, Path::new("/repo"), 10)
+            .unwrap()
+            .iter()
+            .any(|run| run.run.id == "old-running")
+    );
+    assert_eq!(
+        load_output_lines(&conn, 2).unwrap()[0].text,
+        "legacy output"
+    );
+    assert_eq!(
+        conn.query_row("select count(*) from auto_event", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    let identity = crate::remote::test_change_request_identity();
+    assert!(matches!(
+        stabilization_execute::decide_guarded_push(
+            loaded.run.pending_push.as_ref().unwrap(),
+            Some(&identity),
+            Some("repair-sha"),
+            Some("remote-sha"),
+            Some(42),
+            Some("remote-sha"),
+            Some("base-sha"),
+        ),
+        stabilization_execute::GuardedPushDecision::Invalidated { reason }
+            if reason.contains("no canonical change request identity")
+    ));
+    assert!(matches!(
+        stabilization_execute::decide_work_guard(
+            &stabilization_model::RepairKind::Merge,
+            loaded.steps[1].work_guard.as_ref().unwrap(),
+            &stabilization_model::WorkGuard {
+                change_request_identity: Some(identity.clone()),
+                ..work_guard.clone()
+            },
+        ),
+        stabilization_execute::WorkGuardDecision::Invalidated { reason }
+            if reason.contains("no canonical change request identity")
+    ));
+
+    let first_migration = loaded.clone();
+    let identity = crate::remote::test_change_request_identity();
+    save_observed_change_request_identity(&conn, "old-running", Some(&identity)).unwrap();
 
     migrate_schema(&conn).unwrap();
-    let loaded = load_auto_run(&conn, "old").unwrap().expect("run");
-    assert_eq!(loaded.run.status, AutoRunStatus::Aborted);
+    let loaded = load_auto_run(&conn, "old-running")
+        .unwrap()
+        .expect("running run");
+    assert_eq!(loaded, first_migration);
+    assert_eq!(
+        load_observed_change_request_identity(&conn, "old-running").unwrap(),
+        Some(identity)
+    );
+    assert_eq!(
+        conn.query_row(
+            "select version from auto_schema_version where id = 1",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        7
+    );
+}
+
+#[test]
+fn malformed_auto_run_identity_fails_closed_without_dropping_the_row() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted = AutoLaunch::new(&repo, &repo.join("feature"), "feat/auto", "Implement")
+        .unwrap()
+        .create_run();
+    save_auto_run(&conn, &mut persisted).unwrap();
+    conn.execute(
+        "update auto_run set change_request_identity_json = '{not-json' where id = ?1",
+        params![persisted.run.id],
+    )
+    .unwrap();
+
+    let error = load_observed_change_request_identity(&conn, &persisted.run.id).unwrap_err();
+
+    assert!(error.contains("parse auto change request identity"));
+    assert!(load_auto_run(&conn, &persisted.run.id).unwrap().is_some());
+}
+
+#[test]
+fn future_auto_schema_version_fails_without_changing_rows() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "create table auto_schema_version (
+           id integer primary key check (id = 1),
+           version integer not null
+         );
+         insert into auto_schema_version (id, version) values (1, 8);
+         create table auto_run (id text primary key);
+         insert into auto_run (id) values ('future');",
+    )
+    .unwrap();
+
+    let error = migrate_schema(&conn).unwrap_err();
+
+    assert!(error.contains("newer than supported"));
+    assert_eq!(
+        conn.query_row("select count(*) from auto_run", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row(
+            "select version from auto_schema_version where id = 1",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        8
+    );
 }
 
 #[test]
@@ -1836,7 +2081,7 @@ fn restart_after_unrelated_commit_does_not_adopt_it_as_the_repair_commit() {
     let conn = rusqlite::Connection::open(&database).unwrap();
     migrate_schema(&conn).unwrap();
     let mut reopened = load_auto_run(&conn, &run_id).unwrap().unwrap();
-    let mut cache = crate::github::load_pr_cache(&repo, "feat/auto");
+    let mut cache = crate::remote::load_pr_cache(&repo, "feat/auto");
 
     let mut config = test_config();
     crate::test_support::use_real_tool(&mut config, "git");
@@ -1910,7 +2155,7 @@ fn transient_base_lookup_failure_retains_pending_push_for_retry() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
     save_auto_run(&conn, &mut persisted).unwrap();
-    let mut cache = crate::github::load_pr_cache(&repo, "feat/auto");
+    let mut cache = crate::remote::load_pr_cache(&repo, "feat/auto");
 
     let first_error = stabilization_execute::progress_pending_push(
         &conn,
@@ -2239,14 +2484,14 @@ fn review_poll_detects_new_actionable_pr_comments() {
     };
     let summary = test_pr_summary("feat/auto", "abc123", "2026-01-01T00:00:00Z");
     let config = Config::load(&repo);
-    let details = crate::github::PrDetails {
-        comments: vec![crate::github::PrComment {
+    let details = crate::remote::PrDetails {
+        comments: vec![crate::remote::PrComment {
             id: "comment-1".to_string(),
             author: "github-copilot".to_string(),
             body: "Please simplify this branch.".to_string(),
             created_at: "2026-01-01T00:01:00Z".to_string(),
         }],
-        ..crate::github::PrDetails::default()
+        ..crate::remote::PrDetails::default()
     };
     let mut persisted = AutoLaunch::new(temp.path(), temp.path(), "feat/auto", "Implement auto")
         .unwrap()
@@ -2277,14 +2522,14 @@ fn review_poll_skips_feedback_at_or_before_baseline() {
     };
     let summary = test_pr_summary("feat/auto", "abc123", "2026-01-01T00:05:00Z");
     let config = Config::load(&repo);
-    let details = crate::github::PrDetails {
-        comments: vec![crate::github::PrComment {
+    let details = crate::remote::PrDetails {
+        comments: vec![crate::remote::PrComment {
             id: "comment-1".to_string(),
             author: "github-copilot".to_string(),
             body: "Already handled.".to_string(),
             created_at: "2026-01-01T00:05:00Z".to_string(),
         }],
-        ..crate::github::PrDetails::default()
+        ..crate::remote::PrDetails::default()
     };
     let mut persisted = AutoLaunch::new(temp.path(), temp.path(), "feat/auto", "Implement auto")
         .unwrap()
@@ -2332,7 +2577,7 @@ fn ci_status_builds_failure_prompt_with_logs() {
     summary.check_status = "failed".to_string();
     let details = PrDetails {
         failing_checks: vec!["test".to_string()],
-        ci_failures: vec![crate::github::CiFailure {
+        ci_failures: vec![crate::remote::CachedCiFailure {
             workflow: "CI".to_string(),
             name: "test".to_string(),
             conclusion: "failure".to_string(),
@@ -2406,9 +2651,190 @@ fn manual_merge_skip_completes_run_without_cleanup() {
     );
 }
 
+#[test]
+fn waiting_merge_reconciliation_keeps_pending_without_resubmitting() {
+    let temp = TempDir::new("merge-reconcile-pending");
+    let repo = Repository::with_config_dir_for_test(
+        temp.path().to_path_buf(),
+        temp.path().join("prism-config"),
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut persisted = waiting_merge_run(&conn, temp.path());
+    let observations = std::cell::Cell::new(0);
+
+    for queue_state in [
+        crate::remote::QueueState::Queued,
+        crate::remote::QueueState::Running,
+    ] {
+        let progress =
+            reconcile_waiting_merge_step_with(&conn, &repo, &mut persisted, 0, 100, |expected| {
+                observations.set(observations.get() + 1);
+                Ok(waiting_merge_observation(
+                    expected,
+                    crate::remote::LifecycleState::Open,
+                    queue_state,
+                ))
+            })
+            .unwrap();
+
+        assert_eq!(progress, MergeReconciliationProgress::Waiting);
+        assert_eq!(persisted.steps[0].status, AutoStepStatus::Waiting);
+        assert_eq!(persisted.steps[0].attempt, 1);
+    }
+
+    assert_eq!(observations.get(), 2);
+    assert!(
+        persisted.steps[0]
+            .summary
+            .as_deref()
+            .is_some_and(|summary| summary.contains("still pending"))
+    );
+}
+
+#[test]
+fn waiting_merge_reconciliation_completes_and_queues_cleanup_when_merged() {
+    let temp = TempDir::new("merge-reconcile-merged");
+    let repo = Repository::with_config_dir_for_test(
+        temp.path().to_path_buf(),
+        temp.path().join("prism-config"),
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut persisted = waiting_merge_run(&conn, temp.path());
+
+    let progress =
+        reconcile_waiting_merge_step_with(&conn, &repo, &mut persisted, 0, 100, |expected| {
+            Ok(waiting_merge_observation(
+                expected,
+                crate::remote::LifecycleState::Merged,
+                crate::remote::QueueState::Complete,
+            ))
+        })
+        .unwrap();
+
+    assert_eq!(progress, MergeReconciliationProgress::Done);
+    assert_eq!(persisted.steps[0].status, AutoStepStatus::Done);
+    assert_eq!(
+        persisted.run.stabilization_status,
+        Some(stabilization_model::StabilizationStatus::Done)
+    );
+    assert!(
+        ensure_next_auto_step_with_context(&conn, &repo, &test_config(), &mut persisted).unwrap()
+    );
+    assert_eq!(persisted.steps[1].step_key, AutoStepKey::Cleanup);
+}
+
+#[test]
+fn waiting_merge_reconciliation_escalates_stale_identity_without_observing() {
+    let temp = TempDir::new("merge-reconcile-stale-identity");
+    let repo = Repository::with_config_dir_for_test(
+        temp.path().to_path_buf(),
+        temp.path().join("prism-config"),
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut persisted = waiting_merge_run(&conn, temp.path());
+    let changed_repository = crate::remote::RemoteRepositoryId::new(
+        crate::remote::ProviderKind::GitHub,
+        crate::remote::HostIdentity::new("github.com", None).unwrap(),
+        "example/other",
+    )
+    .unwrap();
+    let changed_identity = crate::remote::CanonicalChangeRequestIdentity::new(
+        &changed_repository,
+        &crate::remote::NativeChangeRequestId::new("PR_other").unwrap(),
+        &changed_repository,
+        &changed_repository,
+    );
+    save_observed_change_request_identity(&conn, &persisted.run.id, Some(&changed_identity))
+        .unwrap();
+    let observed = std::cell::Cell::new(false);
+
+    let error = reconcile_waiting_merge_step_with(&conn, &repo, &mut persisted, 0, 100, |_| {
+        observed.set(true);
+        unreachable!("stale identity must fail before provider observation")
+    })
+    .unwrap_err();
+
+    assert!(error.contains("identity changed or was lost"));
+    assert!(!observed.get());
+    assert_eq!(persisted.steps[0].status, AutoStepStatus::Failed);
+    assert_eq!(persisted.run.status, AutoRunStatus::Failed);
+    assert_eq!(
+        persisted.run.stabilization_status,
+        Some(stabilization_model::StabilizationStatus::Escalated)
+    );
+}
+
+#[test]
+fn waiting_merge_reconciliation_escalates_terminal_unmerged_closure() {
+    let temp = TempDir::new("merge-reconcile-closed");
+    let repo = Repository::with_config_dir_for_test(
+        temp.path().to_path_buf(),
+        temp.path().join("prism-config"),
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut persisted = waiting_merge_run(&conn, temp.path());
+
+    let error =
+        reconcile_waiting_merge_step_with(&conn, &repo, &mut persisted, 0, 100, |expected| {
+            Ok(waiting_merge_observation(
+                expected,
+                crate::remote::LifecycleState::Closed,
+                crate::remote::QueueState::NotQueued,
+            ))
+        })
+        .unwrap_err();
+
+    assert!(error.contains("closed without merging"));
+    assert_eq!(persisted.steps[0].status, AutoStepStatus::Failed);
+    assert_eq!(
+        persisted.run.stabilization_status,
+        Some(stabilization_model::StabilizationStatus::Escalated)
+    );
+}
+
+#[test]
+fn restart_preserves_waiting_merge_for_reconciliation() {
+    let temp = TempDir::new("merge-reconcile-restart");
+    let database = temp.path().join("auto.db");
+    let repo = Repository::with_config_dir_for_test(
+        temp.path().to_path_buf(),
+        temp.path().join("prism-config"),
+    );
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    migrate_schema(&conn).unwrap();
+    let persisted = waiting_merge_run(&conn, temp.path());
+    let run_id = persisted.run.id.clone();
+    drop(conn);
+
+    let conn = rusqlite::Connection::open(&database).unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut restarted = load_auto_run(&conn, &run_id).unwrap().unwrap();
+
+    assert!(prepare_auto_run_for_resume(&conn, &mut restarted, 100).unwrap());
+    assert_eq!(restarted.steps[0].status, AutoStepStatus::Waiting);
+    assert_eq!(next_waiting_merge_step(&restarted), Some(0));
+
+    let progress =
+        reconcile_waiting_merge_step_with(&conn, &repo, &mut restarted, 0, 100, |expected| {
+            Ok(waiting_merge_observation(
+                expected,
+                crate::remote::LifecycleState::Merged,
+                crate::remote::QueueState::Complete,
+            ))
+        })
+        .unwrap();
+
+    assert_eq!(progress, MergeReconciliationProgress::Done);
+    assert_eq!(restarted.steps[0].status, AutoStepStatus::Done);
+}
+
 #[cfg(unix)]
 #[test]
-fn headless_merge_step_refreshes_policy_before_merging() {
+fn headless_merge_step_refreshes_and_blocks_unknown_policy() {
     let temp = TempDir::new("merge-step-success");
     let origin = temp.path().join("origin.git");
     let work = temp.path().join("work");
@@ -2431,18 +2857,24 @@ fn headless_merge_step_refreshes_policy_before_merging() {
         &format!(
             r#"#!/bin/sh
  printf 'args=%s\n' "$*" >> '{}'
-if [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'branchProtectionRules'; then
-  printf '%s\n' '{{"data":{{"repository":{{"defaultBranchRef":{{"name":"main"}},"branchProtectionRules":{{"nodes":[]}}}}}}}}'
-  exit 0
-fi
+case "$*" in
+  *'/repos/example/repo/branches/main/protection'*)
+   printf '%s\n' '{{"url":"https://api.github.com/repos/example/repo/branches/main/protection"}}'
+   exit 0
+   ;;
+  *'/repos/example/repo/rules/branches/main?per_page=100'*)
+   printf '%s\n' 'gh: Resource not accessible by integration (HTTP 403)' >&2
+   exit 1
+   ;;
+esac
 if [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'pullRequests(first: 100'; then
-  printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_test","number":42,"title":"Auto","author":{{"login":"example"}},"body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"APPROVED","reviewRequests":{{"nodes":[]}},"headRefName":"feat/auto","baseRefName":"main","headRefOid":"{}","headRepository":{{"nameWithOwner":"example/repo"}},"baseRepository":{{"nameWithOwner":"example/repo"}},"updatedAt":"2026-01-01T00:00:00Z","mergeStateStatus":"CLEAN","merged":false,"isDraft":false,"comments":{{"totalCount":0}},"reviewThreads":{{"totalCount":0}},"commits":{{"nodes":[]}}}}]}}}}}}}}'
+  printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_test","number":42,"title":"Auto","author":{{"login":"example"}},"body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"APPROVED","reviewRequests":{{"nodes":[]}},"headRefName":"feat/auto","baseRefName":"main","headRefOid":"{}","headRepository":{{"nameWithOwner":"example/repo"}},"baseRepository":{{"nameWithOwner":"example/repo"}},"updatedAt":"2026-01-01T00:00:00Z","mergeStateStatus":"CLEAN","merged":false,"isDraft":false,"comments":{{"totalCount":0}},"reviewThreads":{{"totalCount":0}},"commits":{{"nodes":[]}}}}],"pageInfo":{{"hasNextPage":false}}}}}}}}}}'
   exit 0
 fi
-if [ "$1" = "pr" ] && [ "$2" = "view" ] && [ "$5" = "comments,reviews,files,statusCheckRollup" ]; then
-  printf '%s\n' '{{"comments":[],"reviews":[],"files":[],"statusCheckRollup":{{"contexts":{{"nodes":[]}}}}}}'
-  exit 0
-fi
+case "$*" in
+  *'/repos/example/repo/issues/42/comments?per_page=100'*|*'/repos/example/repo/pulls/42/reviews?per_page=100'*|*'/repos/example/repo/pulls/42/files?per_page=100'*|*'/repos/example/repo/commits/{}/statuses?per_page=100'*) printf '%s\n' '[[]]'; exit 0 ;;
+  *'/repos/example/repo/commits/{}/check-runs?per_page=100'*) printf '%s\n' '[{{"total_count":0,"check_runs":[]}}]'; exit 0 ;;
+esac
 if [ "$1" = "pr" ] && [ "$2" = "view" ] && [ "$3" = "feat/auto" ]; then
   cat <<'JSON'
 {{"id":"PR_test","number":42,"title":"Auto","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"APPROVED","reviewRequests":[],"headRefName":"feat/auto","baseRefName":"main","headRefOid":"{}","headRepository":{{"nameWithOwner":"example/repo"}},"baseRepository":{{"nameWithOwner":"example/repo"}},"updatedAt":"2026-01-01T00:00:00Z","statusCheckRollup":{{"contexts":{{"nodes":[{{"__typename":"StatusContext","context":"ci","state":"SUCCESS"}}]}}}},"mergeStateStatus":"CLEAN","mergedAt":null,"isDraft":false}}
@@ -2457,12 +2889,14 @@ if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
   exit 0
 fi
 if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
-  printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
+  printf '%s\n' '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}]'
   exit 0
 fi
 exit 1
 "#,
             gh_log.display(),
+            head,
+            head,
             head,
             head
         ),
@@ -2489,6 +2923,7 @@ exit 1
     persisted.run.pr_number = Some(42);
     persisted.steps[0].work_guard = Some(stabilization_model::WorkGuard {
         change_request_identity: Some(crate::remote::test_change_request_identity()),
+        authorized_target_branch: Some("main".to_string()),
         local_head_sha: Some(head.clone()),
         remote_head_sha: Some(head.clone()),
         pr_head_sha: Some(head.clone()),
@@ -2498,16 +2933,15 @@ exit 1
     save_auto_run(&conn, &mut persisted).unwrap();
     start_non_agent_step(&conn, &mut persisted, 0).unwrap();
 
-    execute_merge_step(&conn, &repo, &config, &mut persisted, 0, 100).unwrap();
+    let error = execute_merge_step(&conn, &repo, &config, &mut persisted, 0, 100).unwrap_err();
 
     let loaded = load_auto_run(&conn, &persisted.run.id).unwrap().unwrap();
-    assert_eq!(loaded.steps[0].status, AutoStepStatus::Done);
+    assert!(error.contains("repository policy is unknown"));
+    assert_eq!(loaded.steps[0].status, AutoStepStatus::Failed);
     let commands = fs::read_to_string(gh_log).unwrap();
-    assert!(commands.contains("branchProtectionRules"));
-    assert!(commands.contains(&format!(
-        "args=pr merge 42 --squash --match-head-commit {head}"
-    )));
-    assert!(commands.contains("args=pr view 42 --json state,mergedAt"));
+    assert!(commands.contains("/repos/example/repo/branches/main/protection"));
+    assert!(commands.contains("/repos/example/repo/rules/branches/main?per_page=100"));
+    assert!(!commands.contains("args=pr merge"));
 }
 
 #[test]
@@ -2610,6 +3044,63 @@ fn push_test_step(
     });
 }
 
+fn waiting_merge_run(conn: &rusqlite::Connection, root: &Path) -> PersistedAutoRun {
+    let mut persisted = AutoLaunch::new(root, root, "feat/auto", "Merge pending change request")
+        .unwrap()
+        .create_run();
+    persisted.steps.clear();
+    persisted.steps.push(AutoStepRun::running(
+        &persisted.run.id,
+        1,
+        AutoStepKey::Merge,
+        1,
+    ));
+    persisted.steps[0].status = AutoStepStatus::Waiting;
+    persisted.steps[0].summary = Some("merge accepted and pending".to_string());
+    let identity = crate::remote::test_change_request_identity();
+    persisted.steps[0].work_guard = Some(stabilization_model::WorkGuard {
+        change_request_identity: Some(identity.clone()),
+        authorized_target_branch: Some("main".to_string()),
+        local_head_sha: Some("head".to_string()),
+        remote_head_sha: Some("head".to_string()),
+        pr_head_sha: Some("head".to_string()),
+        base_sha: Some("base".to_string()),
+        review_thread_ids: Vec::new(),
+    });
+    persisted.run.pr_number = Some(42);
+    persisted.run.status = AutoRunStatus::Running;
+    persisted.run.stabilization_status = Some(stabilization_model::StabilizationStatus::Waiting);
+    persisted.run.stabilization_blocker =
+        Some(stabilization_model::StabilizationBlocker::ReadyToAutoMerge);
+    persisted.run.stabilization_next_work = Some(stabilization_model::StabilizationWorkKind::Merge);
+    save_auto_run(conn, &mut persisted).unwrap();
+    save_observed_change_request_identity(conn, &persisted.run.id, Some(&identity)).unwrap();
+    persisted
+}
+
+fn waiting_merge_observation(
+    expected: &crate::remote::ChangeRequest,
+    lifecycle: crate::remote::LifecycleState,
+    queue_state: crate::remote::QueueState,
+) -> crate::remote::ChangeRequestSummary {
+    crate::remote::ChangeRequestSummary {
+        change_request: expected.clone(),
+        title: "Auto".to_string(),
+        author: "author".to_string(),
+        body: String::new(),
+        web_url: Some("https://example.com/pr/42".to_string()),
+        lifecycle,
+        review_decision: crate::remote::ReviewDecision::Approved,
+        requested_reviewers: Vec::new(),
+        mergeability: crate::remote::MergeabilityState::Mergeable,
+        check_state: crate::remote::CheckState::Passed,
+        queue_state,
+        native_state_evidence: crate::remote::NativeStateEvidence::default(),
+        draft: false,
+        updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+    }
+}
+
 fn standalone_completed_repair(
     conn: &rusqlite::Connection,
     repair_step: AutoStepKey,
@@ -2704,10 +3195,11 @@ fn setup_git_worktree(origin: &Path, work: &Path) {
 
 #[cfg(unix)]
 fn seed_pr_cache(repo: &Repository, branch: &str, head_sha: &str) {
-    let cache = crate::github::PrCache::observed(
-        crate::github::PrSummary {
+    let cache = crate::remote::PrCache::observed(
+        crate::remote::PrSummary {
             number: 42,
             change_request_identity: Some(crate::remote::test_change_request_identity()),
+            native_state_evidence: crate::remote::NativeStateEvidence::default(),
             title: "Auto".to_string(),
             author: "author".to_string(),
             body: String::new(),
@@ -2721,13 +3213,14 @@ fn seed_pr_cache(repo: &Repository, branch: &str, head_sha: &str) {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             check_status: "passed".to_string(),
             merge_state_status: "CLEAN".to_string(),
+            queue_state: "not_queued".to_string(),
             comment_count: 0,
             merged: false,
             draft: false,
         },
-        Some(crate::github::PrDetails::default()),
+        Some(crate::remote::PrDetails::default()),
     );
-    crate::github::save_pr_cache(repo, branch, &cache).unwrap();
+    crate::remote::save_pr_cache(repo, branch, &cache).unwrap();
 }
 
 #[cfg(unix)]
@@ -2741,17 +3234,16 @@ fn configure_pr_observation(temp: &TempDir, config: &mut Config, branch: &str, h
     let script = format!(
         r#"#!/bin/sh
 case "$*" in
-  "pr view {branch} --json comments,reviews,files,statusCheckRollup")
-    printf '%s\n' '{{"comments":[],"reviews":[],"files":[],"statusCheckRollup":{{"contexts":{{"nodes":[]}}}}}}'
-    ;;
+  *"/repos/example/repo/issues/42/comments?per_page=100"*|*"/repos/example/repo/pulls/42/reviews?per_page=100"*|*"/repos/example/repo/pulls/42/files?per_page=100"*|*"/repos/example/repo/commits/{head_sha}/statuses?per_page=100"*) printf '%s\n' '[[]]' ;;
+  *"/repos/example/repo/commits/{head_sha}/check-runs?per_page=100"*) printf '%s\n' '[{{"total_count":1,"check_runs":[{{"name":"ci","status":"completed","conclusion":"success"}}]}}]' ;;
   api\ graphql*)
-    printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
+    printf '%s\n' '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}]'
     ;;
   "run list "*)
     printf '[]\n'
     ;;
   *)
-    printf '%s\n' '{{"id":"PR_test","number":42,"title":"Auto","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"","reviewRequests":{{"nodes":[]}},"headRefName":"{branch}","baseRefName":"main","headRefOid":"{head_sha}","headRepository":{{"nameWithOwner":"example/repo"}},"baseRepository":{{"nameWithOwner":"example/repo"}},"updatedAt":"2026-01-01T00:00:00Z","comments":{{"totalCount":0}},"statusCheckRollup":{{"contexts":{{"nodes":[]}}}},"mergeStateStatus":"CLEAN","isDraft":false}}'
+    printf '%s\n' '{{"id":"PR_test","number":42,"title":"Auto","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"","reviewRequests":{{"nodes":[]}},"headRefName":"{branch}","baseRefName":"main","headRefOid":"{head_sha}","headRepository":{{"nameWithOwner":"example/repo"}},"baseRepository":{{"nameWithOwner":"example/repo"}},"updatedAt":"2026-01-01T00:00:00Z","comments":{{"totalCount":0}},"statusCheckRollup":{{"contexts":{{"nodes":[{{"__typename":"StatusContext","context":"ci","state":"SUCCESS"}}]}}}},"mergeStateStatus":"CLEAN","isDraft":false}}'
     ;;
 esac
 "#
@@ -2765,10 +3257,11 @@ esac
         .insert("git".to_string(), git.display().to_string());
 }
 
-fn test_pr_summary(branch: &str, head_sha: &str, updated_at: &str) -> crate::github::PrSummary {
-    crate::github::PrSummary {
+fn test_pr_summary(branch: &str, head_sha: &str, updated_at: &str) -> crate::remote::PrSummary {
+    crate::remote::PrSummary {
         number: 42,
         change_request_identity: Some(crate::remote::test_change_request_identity()),
+        native_state_evidence: crate::remote::NativeStateEvidence::default(),
         title: "Auto".to_string(),
         author: "author".to_string(),
         body: String::new(),
@@ -2782,6 +3275,7 @@ fn test_pr_summary(branch: &str, head_sha: &str, updated_at: &str) -> crate::git
         updated_at: updated_at.to_string(),
         check_status: "unknown".to_string(),
         merge_state_status: "CLEAN".to_string(),
+        queue_state: "not_queued".to_string(),
         comment_count: 1,
         merged: false,
         draft: false,

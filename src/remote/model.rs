@@ -257,7 +257,7 @@ fn canonical_path_prefix(path: &str) -> Result<String, IdentityError> {
     Ok(format!("/{path}"))
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Debug)]
 pub(crate) struct RemoteRepositoryId {
     provider: ProviderKind,
     host: HostIdentity,
@@ -287,6 +287,47 @@ impl RemoteRepositoryId {
 
     pub(crate) fn project_path(&self) -> &str {
         &self.project_path
+    }
+
+    pub(crate) fn project_path_eq(&self, other: &str) -> bool {
+        project_paths_equal(self.provider, &self.project_path, other)
+    }
+}
+
+impl PartialEq for RemoteRepositoryId {
+    fn eq(&self, other: &Self) -> bool {
+        self.provider == other.provider
+            && self.host == other.host
+            && project_paths_equal(self.provider, &self.project_path, &other.project_path)
+    }
+}
+
+impl Eq for RemoteRepositoryId {}
+
+impl PartialOrd for RemoteRepositoryId {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RemoteRepositoryId {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.provider
+            .cmp(&other.provider)
+            .then_with(|| self.host.cmp(&other.host))
+            .then_with(|| {
+                project_path_comparison_key(self.provider, &self.project_path).cmp(
+                    &project_path_comparison_key(other.provider, &other.project_path),
+                )
+            })
+    }
+}
+
+impl Hash for RemoteRepositoryId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.provider.hash(state);
+        self.host.hash(state);
+        project_path_comparison_key(self.provider, &self.project_path).hash(state);
     }
 }
 
@@ -318,6 +359,20 @@ pub(super) fn canonical_project_path(path: &str) -> Result<String, IdentityError
         ));
     }
     Ok(path.to_string())
+}
+
+fn project_paths_equal(provider: ProviderKind, first: &str, second: &str) -> bool {
+    match provider {
+        ProviderKind::GitHub => first.eq_ignore_ascii_case(second),
+        ProviderKind::GitLab | ProviderKind::Forgejo => first == second,
+    }
+}
+
+fn project_path_comparison_key(provider: ProviderKind, path: &str) -> std::borrow::Cow<'_, str> {
+    match provider {
+        ProviderKind::GitHub => std::borrow::Cow::Owned(path.to_ascii_lowercase()),
+        ProviderKind::GitLab | ProviderKind::Forgejo => std::borrow::Cow::Borrowed(path),
+    }
 }
 
 macro_rules! opaque_id {
@@ -383,7 +438,7 @@ pub(crate) struct ChangeRequestId {
     display_number: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct CanonicalChangeRequestIdentity {
     provider: ProviderKind,
     canonical_host: String,
@@ -396,6 +451,31 @@ pub(crate) struct CanonicalChangeRequestIdentity {
     target_canonical_host: String,
     target_project_path: String,
 }
+
+impl PartialEq for CanonicalChangeRequestIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.provider == other.provider
+            && self.canonical_host == other.canonical_host
+            && project_paths_equal(self.provider, &self.project_path, &other.project_path)
+            && self.native_id == other.native_id
+            && self.source_provider == other.source_provider
+            && self.source_canonical_host == other.source_canonical_host
+            && project_paths_equal(
+                self.source_provider,
+                &self.source_project_path,
+                &other.source_project_path,
+            )
+            && self.target_provider == other.target_provider
+            && self.target_canonical_host == other.target_canonical_host
+            && project_paths_equal(
+                self.target_provider,
+                &self.target_project_path,
+                &other.target_project_path,
+            )
+    }
+}
+
+impl Eq for CanonicalChangeRequestIdentity {}
 
 impl CanonicalChangeRequestIdentity {
     pub(crate) fn new(
@@ -494,17 +574,22 @@ impl CanonicalChangeRequestIdentity {
         let source_provider = self.source_provider.to_string();
         let target_provider = self.target_provider.to_string();
         let mut hash = 0xcbf29ce484222325_u64;
+        let project_path = project_path_comparison_key(self.provider, &self.project_path);
+        let source_project_path =
+            project_path_comparison_key(self.source_provider, &self.source_project_path);
+        let target_project_path =
+            project_path_comparison_key(self.target_provider, &self.target_project_path);
         for component in [
             provider.as_str(),
             &self.canonical_host,
-            &self.project_path,
+            project_path.as_ref(),
             &self.native_id,
             source_provider.as_str(),
             &self.source_canonical_host,
-            &self.source_project_path,
+            source_project_path.as_ref(),
             target_provider.as_str(),
             &self.target_canonical_host,
-            &self.target_project_path,
+            target_project_path.as_ref(),
         ] {
             for byte in component.bytes().chain(std::iter::once(0)) {
                 hash ^= u64::from(byte);
@@ -629,6 +714,32 @@ normalized_state!(QueueState {
     Complete => ["complete", "completed", "merged"]
 });
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct NativeStateEvidence {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) lifecycle: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) review: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) mergeability: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) check: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) queue: Vec<String>,
+}
+
+impl NativeStateEvidence {
+    pub(crate) fn retain(values: impl IntoIterator<Item = String>) -> Vec<String> {
+        let mut retained = Vec::new();
+        for value in values {
+            if !value.trim().is_empty() && !retained.contains(&value) {
+                retained.push(value);
+            }
+        }
+        retained
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Observation<T> {
     #[default]
@@ -706,9 +817,11 @@ pub(crate) struct ChangeRequestSummary {
     pub(crate) web_url: Option<String>,
     pub(crate) lifecycle: LifecycleState,
     pub(crate) review_decision: ReviewDecision,
+    pub(crate) requested_reviewers: Vec<String>,
     pub(crate) mergeability: MergeabilityState,
     pub(crate) check_state: CheckState,
     pub(crate) queue_state: QueueState,
+    pub(crate) native_state_evidence: NativeStateEvidence,
     pub(crate) draft: bool,
     pub(crate) updated_at: Option<String>,
 }
@@ -827,4 +940,74 @@ pub(crate) struct GuardedMerge {
     pub(crate) expected_source_sha: String,
     pub(crate) method: MergeMethod,
     pub(crate) native_guard: Option<NativeMergeGuard>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MergeMutationOutcome {
+    Merged,
+    Pending,
+    Uncertain,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MergeMutationResult {
+    pub(crate) outcome: MergeMutationOutcome,
+    pub(crate) native_state: String,
+    pub(crate) summary: ChangeRequestSummary,
+}
+
+impl MergeMutationResult {
+    pub(crate) fn from_summary(
+        summary: ChangeRequestSummary,
+        native_state: impl Into<String>,
+    ) -> Self {
+        let outcome = if summary.lifecycle == LifecycleState::Merged {
+            MergeMutationOutcome::Merged
+        } else if matches!(
+            summary.queue_state,
+            QueueState::Queued | QueueState::Running | QueueState::Blocked
+        ) || summary.native_state_evidence.queue.iter().any(|state| {
+            !matches!(
+                state.trim().to_ascii_lowercase().as_str(),
+                "" | "null" | "none" | "not_queued" | "unsupported" | "unknown"
+            )
+        }) {
+            MergeMutationOutcome::Pending
+        } else {
+            MergeMutationOutcome::Uncertain
+        };
+        Self {
+            outcome,
+            native_state: native_state.into(),
+            summary,
+        }
+    }
+}
+
+impl GuardedMerge {
+    pub(crate) fn validate_observation(
+        &self,
+        summary: &ChangeRequestSummary,
+    ) -> Result<(), IdentityError> {
+        let observed = &summary.change_request;
+        if observed.id != self.id
+            || observed.target_repository != self.target_repository
+            || observed.target_branch != self.target_branch
+        {
+            return Err(IdentityError::new(
+                "change request target changed since merge authorization",
+            ));
+        }
+        if observed.head_sha != self.expected_source_sha {
+            return Err(IdentityError::new(
+                "change request head changed since merge authorization",
+            ));
+        }
+        if summary.lifecycle != LifecycleState::Open {
+            return Err(IdentityError::new(
+                "change request lifecycle is not authoritatively open",
+            ));
+        }
+        Ok(())
+    }
 }

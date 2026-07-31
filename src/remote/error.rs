@@ -86,6 +86,42 @@ impl RemoteError {
         }
     }
 
+    pub(crate) fn classified(
+        provider: ProviderKind,
+        operation: RemoteOperation,
+        class: RemoteErrorClass,
+        retryability: Retryability,
+        status: Option<u16>,
+        exit_code: Option<i32>,
+        retry_hint: Option<RetryHint>,
+    ) -> Self {
+        let mut safe_message = format!(
+            "{provider} {} failed: {}; retry={}",
+            operation.label(),
+            class.label(),
+            retryability.label()
+        );
+        if let Some(status) = status {
+            safe_message.push_str(&format!("; status={status}"));
+        }
+        if let Some(exit_code) = exit_code {
+            safe_message.push_str(&format!("; exit={exit_code}"));
+        }
+        if let Some(retry_hint) = retry_hint {
+            safe_message.push_str(&format!("; hint={}", retry_hint.label()));
+        }
+        Self {
+            provider,
+            operation,
+            class,
+            retryability,
+            status,
+            exit_code,
+            retry_hint,
+            safe_message,
+        }
+    }
+
     pub(crate) fn with_status(mut self, status: u16) -> Self {
         self.status = Some(status);
         self
@@ -134,6 +170,68 @@ impl RemoteError {
     }
 }
 
+impl RemoteOperation {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::DiscoverRepository => "discover_repository",
+            Self::ListChangeRequests => "list_change_requests",
+            Self::ObserveChangeRequest => "observe_change_request",
+            Self::ObserveReviewThreads => "observe_review_threads",
+            Self::ResolveReviewThread => "resolve_review_thread",
+            Self::ObserveChecks => "observe_checks",
+            Self::LoadCiLogs => "load_ci_logs",
+            Self::ObserveChangedFiles => "observe_changed_files",
+            Self::ObserveRepositoryPolicy => "observe_repository_policy",
+            Self::FetchChangeRequest => "fetch_change_request",
+            Self::CreateChangeRequest => "create_change_request",
+            Self::MergeChangeRequest => "merge_change_request",
+            Self::ObserveMergeQueue => "observe_merge_queue",
+        }
+    }
+}
+
+impl RemoteErrorClass {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Configuration => "configuration",
+            Self::Authentication => "authentication",
+            Self::Authorization => "authorization",
+            Self::NotFound => "not_found",
+            Self::Unsupported => "unsupported",
+            Self::Validation => "validation",
+            Self::Conflict => "conflict",
+            Self::StaleHead => "stale_head",
+            Self::RateLimited => "rate_limited",
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::InvalidResponse => "invalid_response",
+            Self::Cancelled => "cancelled",
+            Self::Provider => "provider",
+        }
+    }
+}
+
+impl Retryability {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Retryable => "retryable",
+            Self::NotRetryable => "not_retryable",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl RetryHint {
+    fn label(self) -> String {
+        match self {
+            Self::After(duration) => format!("after_{}ms", duration.as_millis()),
+            Self::Backoff => "backoff".to_string(),
+            Self::Reauthenticate => "reauthenticate".to_string(),
+            Self::RefreshObservation => "refresh_observation".to_string(),
+        }
+    }
+}
+
 impl fmt::Display for RemoteError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.safe_message)
@@ -144,25 +242,5 @@ impl std::error::Error for RemoteError {}
 
 fn sanitize_safe_message(message: &str) -> String {
     const MAX_CHARS: usize = 512;
-
-    let mut sanitized = String::new();
-    let mut previous_was_space = false;
-    let mut character_count = 0;
-    for character in message.chars().filter(|character| !character.is_control()) {
-        let is_space = character.is_whitespace();
-        if is_space {
-            if previous_was_space || sanitized.is_empty() {
-                continue;
-            }
-            sanitized.push(' ');
-        } else {
-            sanitized.push(character);
-        }
-        character_count += 1;
-        previous_was_space = is_space;
-        if character_count == MAX_CHARS {
-            break;
-        }
-    }
-    sanitized.trim_end().to_string()
+    crate::observability::redact_freeform(message, MAX_CHARS)
 }

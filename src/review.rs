@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::github::{PrDetails, PrSummary, trusted_pr_for_session};
+use crate::remote::{PrDetails, PrSummary, trusted_pr_for_session};
 use crate::session::Session;
 use crate::util::empty_dash;
 
@@ -25,9 +25,9 @@ pub struct ReviewFeedbackFilter<'a> {
 
 #[derive(Clone, Debug, Default)]
 pub struct ReviewFeedback<'a> {
-    pub inline_comments: Vec<&'a crate::github::PrReviewComment>,
-    pub review_bodies: Vec<&'a crate::github::PrReview>,
-    pub pr_comments: Vec<&'a crate::github::PrComment>,
+    pub inline_comments: Vec<&'a crate::remote::PrReviewComment>,
+    pub review_bodies: Vec<&'a crate::remote::PrReview>,
+    pub pr_comments: Vec<&'a crate::remote::PrComment>,
     pub skipped_resolved_inline: usize,
     pub skipped_old: usize,
     pub skipped_author: usize,
@@ -368,7 +368,7 @@ mod tests {
 
     use crate::agent::AgentState;
     use crate::config::Config;
-    use crate::github::{PrCache, PrComment, PrDetails, PrReview, PrReviewComment, PrSummary};
+    use crate::remote::{PrCache, PrComment, PrDetails, PrReview, PrReviewComment, PrSummary};
 
     use super::*;
 
@@ -706,6 +706,7 @@ mod tests {
                 PrSummary {
                     number: 123,
                     change_request_identity: None,
+                    native_state_evidence: crate::remote::NativeStateEvidence::default(),
                     title: "Title".to_string(),
                     author: "author".to_string(),
                     body: String::new(),
@@ -719,6 +720,7 @@ mod tests {
                     updated_at: "2026-06-14T12:00:00Z".to_string(),
                     check_status: "SUCCESS".to_string(),
                     merge_state_status: "CLEAN".to_string(),
+                    queue_state: "not_queued".to_string(),
                     comment_count: 3,
                     merged: false,
                     draft: false,

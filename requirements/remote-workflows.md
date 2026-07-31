@@ -9,10 +9,10 @@
 - **Behavior**: A repository without a known or explicitly configured hosting
   adapter does not trigger change-request, CI, or review queries. Unknown hosts
   are never probed and cached display state is retained as stale.
-- **Behavior**: The main panel hides the entire PR section when no PR exists. When
-  present, PR number and title precede state, next action, merge, review, CI, and
+- **Behavior**: The main panel hides the entire change-request section when none
+  exists. When present, display number and title precede state, next action, merge, review, CI, and
   related gate facts.
-- **Behavior**: PR state and next action use the same aligned key/value treatment
+- **Behavior**: Change-request state and next action use the same aligned key/value treatment
   as gate rows. Internal guard terms, base/head noise, and redundant section
   labels are omitted.
 - **Behavior**: Review comments render as compact selectable rows that distinguish
@@ -84,3 +84,19 @@
 - **Codeberg**: Codeberg is a built-in Forgejo host profile, not a separate
   protocol. Version, paging limits, Actions, and log availability are runtime
   observations.
+
+## Compatibility And Rollout
+
+- **Quality**: Provider contract fixtures run without network access and retain
+  no credentials or private response data.
+- **Quality**: Scheduled or manually dispatched compatibility jobs exercise
+  pinned local GitLab and Forgejo API versions separately from normal CI. A
+  missing required tool, Docker daemon, or image is reported as an explicit
+  skip; an incompatible started service fails its job.
+- **Invariant**: Public-host drift probes for GitHub.com, GitLab.com, and
+  Codeberg are unauthenticated and read-only. They never create, update, resolve,
+  merge, or delete public data and never emit response bodies or headers.
+- **Quality**: Drift records contain only fixed host/provider identity, safe
+  version/schema/capability metadata, outcome, bounded response byte count,
+  latency, and observation time. Network unavailability is distinct from
+  reachable schema drift.

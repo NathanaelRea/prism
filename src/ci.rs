@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::github::{PrDetails, PrSummary, trusted_pr_for_session};
+use crate::remote::{PrDetails, PrSummary, trusted_pr_for_session};
 use crate::session::Session;
 use crate::util::empty_dash;
 
@@ -107,7 +107,7 @@ mod tests {
 
     use crate::agent::AgentState;
     use crate::config::Config;
-    use crate::github::{CiFailure, PrCache, PrDetails, PrSummary};
+    use crate::remote::{CachedCiFailure, PrCache, PrDetails, PrSummary};
 
     use super::*;
 
@@ -115,7 +115,7 @@ mod tests {
     fn ci_failure_prompt_contains_pr_metadata_and_log_tails() {
         let session = test_session(PrDetails {
             failing_checks: vec!["test".to_string()],
-            ci_failures: vec![CiFailure {
+            ci_failures: vec![CachedCiFailure {
                 workflow: "CI".to_string(),
                 name: "test".to_string(),
                 conclusion: "failure".to_string(),
@@ -187,6 +187,7 @@ mod tests {
                 PrSummary {
                     number: 123,
                     change_request_identity: None,
+                    native_state_evidence: crate::remote::NativeStateEvidence::default(),
                     title: "Title".to_string(),
                     author: "author".to_string(),
                     body: String::new(),
@@ -200,6 +201,7 @@ mod tests {
                     updated_at: "2026-06-14T12:00:00Z".to_string(),
                     check_status: "failed".to_string(),
                     merge_state_status: "CLEAN".to_string(),
+                    queue_state: "not_queued".to_string(),
                     comment_count: 0,
                     merged: false,
                     draft: false,

@@ -1,0 +1,16 @@
+{
+  "id": 2002,
+  "iid": 42,
+  "title": "Fork merge request",
+  "description": "Adapter fixture",
+  "state": "opened",
+  "draft": false,
+  "source_branch": "feature/fork",
+  "target_branch": "main",
+  "sha": "abcdef0123456789abcdef0123456789abcdef01",
+  "source_project_id": 10,
+  "target_project_id": 20,
+  "author": { "id": 4, "username": "contributor" },
+  "reviewers": [{ "id": 2, "username": "bob" }],
+  "detailed_merge_status": "can_be_merged"
+}

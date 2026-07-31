@@ -17,15 +17,15 @@ Prism uses a lazygit-style panel model.
 - `Space Enter` opens tmux window 3: terminal.
 - `Ctrl-/` also opens tmux window 3 where the terminal reports that key combination distinctly; use `Space Enter` as the reliable alternative.
 - `Space g g` opens tmux window 2: lazygit.
-- `Space g P` pushes a guarded pending PR Stabilization repair commit and continues stabilization. If actionable review conversations block a run without a pending push, Prism offers to mark all freshly observed conversations resolved before reobserving; the confirmation defaults to No.
-- `Space g o` opens the selected pull request in a browser.
-- `Space g M` runs local checks and observes the selected pull request's gates. If only unresolved inline review conversations block the merge, Prism resolves the observed conversations, verifies all gates once more, and merges.
-- `Space g c` starts or appends a managed PR Stabilization CI repair for the selected worktree.
-- `Space g f` starts or appends a managed PR Stabilization review repair for the selected worktree.
+- `Space g P` pushes a guarded pending Change Request Stabilization repair commit and continues stabilization. If actionable review conversations block a run without a pending push, Prism offers to mark all freshly observed conversations resolved before reobserving; the confirmation defaults to No.
+- `Space g o` opens the selected change request in a browser.
+- `Space g M` runs local checks and observes the selected change request's gates. If only unresolved inline review conversations block the merge and the provider supports resolution, Prism resolves the observed conversations, verifies all gates once more, and merges.
+- `Space g c` starts or appends a managed Change Request Stabilization CI repair for the selected worktree.
+- `Space g f` starts or appends a managed Change Request Stabilization review repair for the selected worktree.
 - `Space g R` resolves all unresolved inline review conversations visible when the key is pressed while `0 Main` is focused.
-- Unavailable `Space g` actions are shown in dark gray and ignored. PR actions require a known pull request; repair actions also require a headless-capable harness.
+- Unavailable `Space g` actions are shown in dark gray and ignored. Remote actions require a known change request and provider capability; repair actions also require a headless-capable harness.
 - `P` opens plan mode from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through the selected harness. Active plan runs render automatically in the Worktrees main panel for the selected worktree.
-- `A` starts or focuses Auto Flow for the selected non-default worktree. Focusing a run blocked by actionable inline review feedback refreshes GitHub and offers to mark all unresolved conversations resolved; the confirmation defaults to No.
+- `A` starts or focuses Auto Flow for the selected non-default worktree. Focusing a run blocked by actionable inline review feedback refreshes its provider and, when supported, offers to mark all unresolved conversations resolved; the confirmation defaults to No.
 - `u` pauses/resumes the selected Auto Flow or plan run from Status or the Worktrees main panel; paused Auto Flow resumes only after a dialog describes the next step.
 - `f` retries failed Auto Flow or Plan steps from the active dashboard.
 - `B` retries Auto Flow or Plan execution from the selected step.
@@ -42,14 +42,14 @@ Prism uses a lazygit-style panel model.
 - `x` also aborts the selected Plan phase from the active Plan dashboard, or accepts `all` when prompted to abort all running phases.
 - `e` edits the selected Prism repository config and reloads after save.
 - `E` edits the Prism user config and reloads after save.
-- `C` opens a picker of remote pull requests for the selected repository and creates or selects a local `pr/<number>` worktree for the chosen PR.
+- `C` opens a picker of remote change requests for the selected repository and creates or selects a local worktree for the chosen request.
 - `W` opens the in-app worktree column selector for the selected repository. Use `Space` to enable/disable a column, `J`/`K` to move an enabled column down/up, and `Enter` to save.
 - `/` filters the focused Repos or Worktrees panel.
 - `?` opens the in-app keybinding dialog.
 - `D` archives the selected non-default worktree/session, hiding it from normal navigation while leaving files and branch intact.
 - `U` opens a picker of archived worktrees for the selected repository and restores the chosen one.
 - `X` permanently deletes the selected non-default worktree/session after explicit confirmation.
-- `r` refreshes cached repository, worktree, PR, and agent state outside the Repos panel.
+- `r` refreshes cached repository, worktree, change-request, and agent state outside the Repos panel.
 - `q` or `Ctrl-C` quits.
 
 Most repository actions are only active from the Repos panel. Pulling the default branch and editing worktree columns are active from the selected repository context. Worktree actions are only active from the Worktrees panel.

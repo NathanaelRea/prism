@@ -11,7 +11,6 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::github::{PrCheckState, PrDetails, PrSummary};
 use crate::observability::{self, LogLevel};
 use crate::plan::PlanExecution;
 use crate::plan_run::{
@@ -21,6 +20,7 @@ use crate::plan_run::{
     resume_paused_plan_run, retry_failed_steps as retry_plan_failed_steps,
     retry_from_step as retry_plan_from_step, save_plan_run,
 };
+use crate::remote::{PrCheckState, PrDetails, PrSummary};
 use crate::repo::Repository;
 use crate::review::{ReviewFeedback, ReviewFeedbackFilter, actionable_review_feedback};
 use crate::verify::{VerifyMode, VerifyResult};

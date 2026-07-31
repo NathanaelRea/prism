@@ -82,10 +82,10 @@ pub(crate) fn discover_git_remote(
 ) -> Result<DiscoveredRemote, DiscoveryError> {
     let mut command = Command::new(config.tool("git"));
     command.arg("-C").arg(path).args(["remote", "get-url"]);
+    command.arg(remote_name);
     if kind == RemoteUrlKind::Push {
         command.arg("--push");
     }
-    command.arg(remote_name);
     let remote = run_capture(&mut command, ProcessPolicy::Metadata)
         .map_err(|error| DiscoveryError::Git(format!("read {remote_name} remote URL: {error}")))?;
     config

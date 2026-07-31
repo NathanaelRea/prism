@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::github::{CiFailure, PrCheckState};
+use crate::remote::{CachedCiFailure, PrCheckState};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +77,7 @@ pub(crate) struct PullRequestFacts {
     pub ci: CiFacts,
     pub review: ReviewFacts,
     pub mergeability: MergeabilityFacts,
+    pub queue_state: crate::remote::QueueState,
     pub top_level_comment_count: usize,
     pub observation_error: Option<String>,
 }
@@ -94,7 +95,7 @@ pub(crate) struct CiFacts {
     pub aggregate: PrCheckState,
     pub required: Vec<CheckFact>,
     pub optional_failures: Vec<String>,
-    pub failures: Vec<CiFailure>,
+    pub failures: Vec<CachedCiFailure>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -109,9 +110,21 @@ pub(crate) struct CheckFact {
 pub(crate) struct ReviewFacts {
     pub decision: String,
     pub approval_required: bool,
+    pub approval_count: u64,
+    pub required_approvals: u64,
     pub actionable_reviews: Vec<ActionableReviewItem>,
     pub unresolved_threads: Vec<ReviewThreadFact>,
     pub top_level_comments: usize,
+}
+
+impl ReviewFacts {
+    pub(crate) fn approval_requirement_satisfied(&self) -> bool {
+        let aggregate_approved = self.decision.eq_ignore_ascii_case("APPROVED");
+        if self.required_approvals > 0 {
+            return aggregate_approved && self.approval_count >= self.required_approvals;
+        }
+        !self.approval_required || aggregate_approved
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -250,6 +263,8 @@ pub enum StabilizationWorkKind {
 pub struct WorkGuard {
     #[serde(default)]
     pub(crate) change_request_identity: Option<crate::remote::CanonicalChangeRequestIdentity>,
+    #[serde(default)]
+    pub authorized_target_branch: Option<String>,
     pub local_head_sha: Option<String>,
     pub remote_head_sha: Option<String>,
     pub pr_head_sha: Option<String>,

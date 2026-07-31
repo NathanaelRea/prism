@@ -15,12 +15,6 @@ use crate::auto_flow::{
 };
 use crate::config::Config;
 use crate::git::{branch_behind, git_status_label, has_upstream, pull_branch, selected_dirty};
-use crate::github::{
-    PR_SUMMARY_POLL_INTERVAL, apply_pr_details_poll_result, apply_pr_summary_poll_result,
-    persist_pr_cache_snapshot, pr_cache_comment_count, pr_cache_pollable_for_session,
-    pr_cache_render_signature, pr_details_pollable, pr_summary_or_error, record_pr_merged,
-    record_pr_summary, resolve_pr_summary_for_session,
-};
 use crate::harness::{HarnessConfig, OutputFormat, PromptTransport};
 use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::lifecycle::{
@@ -48,6 +42,11 @@ use crate::remote::dispatcher::{
     refresh_repository_policy as refresh_repo_policy_cache,
     repository_project as github_remote_repo, wait_for_change_request_merged as wait_for_pr_merged,
 };
+use crate::remote::{
+    PR_SUMMARY_POLL_INTERVAL, PrCache, apply_pr_details_poll_result, apply_pr_summary_poll_result,
+    persist_pr_cache_snapshot, pr_cache_comment_count, pr_cache_render_signature,
+    pr_details_pollable, pr_summary_or_error, resolve_pr_summary_for_session,
+};
 use crate::repo::Repository;
 use crate::session::{
     CreateWorktreeOutcome, DeleteWorktreeOutcome, archive_worktree_session,
@@ -55,11 +54,11 @@ use crate::session::{
 };
 use crate::tmux::TmuxWindow;
 use crate::tui::{
-    DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, ManagedRepo,
+    DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, GitAction, ManagedRepo,
     OpencodeEventResult, OpencodeListenerKey, OpencodePollKey, OpencodePollResult,
-    PrPersistenceRequest, PrPollKey, PrPollResult, PrSummarySessionResult, SessionRefreshResult,
-    SessionRefreshSnapshot, TUI_ACTION_JOB_TIMEOUT, Tui, TuiJobKey, TuiJobKind, TuiJobPayload,
-    WtPollResult,
+    PrPersistenceRequest, PrPollKey, PrPollResult, PrSummarySessionResult, RemoteActionValue,
+    RemoteMergeOutcome, RemotePushPrepared, SessionRefreshResult, SessionRefreshSnapshot,
+    TUI_ACTION_JOB_TIMEOUT, Tui, TuiJobKey, TuiJobKind, TuiJobPayload, WtPollResult,
 };
 use crate::tui_jobs::CoalescedFacet;
 

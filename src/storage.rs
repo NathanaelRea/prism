@@ -756,7 +756,7 @@ fn apply_additive_schema_migrations(conn: &Connection) -> Result<(), StorageErro
     crate::plan_run::migrate_schema(conn).map_err(migration_error)?;
     crate::auto_flow::migrate_schema(conn).map_err(migration_error)?;
     crate::execution::migrate_schema(conn).map_err(migration_error)?;
-    crate::github::migrate_pr_cache_schema(conn).map_err(migration_error)?;
+    crate::remote::migrate_pr_cache_schema(conn).map_err(migration_error)?;
     Ok(())
 }
 

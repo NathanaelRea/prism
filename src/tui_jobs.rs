@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -923,16 +923,25 @@ where
         self.accepting = false;
     }
 
-    pub(crate) fn cancel_all(&self) {
+    pub(crate) fn cancel_all_except(&self, protected: &BTreeSet<JobId>) {
         for entry in self.jobs.values() {
+            if protected.contains(&entry.metadata.id) {
+                continue;
+            }
             entry.cancellation.canceled.store(true, Ordering::Release);
             entry.cancellation.wake.notify_all();
         }
-        self.delivery
+        let mut coalesced = self
+            .delivery
             .coalesced
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clear();
+            .unwrap_or_else(|error| error.into_inner());
+        coalesced.retain(|(job_id, _), _| protected.contains(job_id));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cancel_all(&self) {
+        self.cancel_all_except(&BTreeSet::new());
     }
 
     pub(crate) fn cancel(&self, id: JobId) {
@@ -1353,6 +1362,71 @@ mod tests {
         assert!(canceled_at.elapsed() < Duration::from_secs(1));
         assert!(!jobs.has_jobs());
         std::fs::remove_file(marker).unwrap();
+    }
+
+    #[test]
+    fn selective_shutdown_cancels_ordinary_jobs_but_keeps_protected_jobs_running() {
+        let (ordinary_stopped_tx, ordinary_stopped_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let mut jobs = JobRegistry::<&'static str, &'static str, &'static str>::default();
+        jobs.spawn(
+            "poll",
+            "ordinary",
+            0,
+            None,
+            "ordinary-job".to_string(),
+            move |context| {
+                while !context.wait(Duration::from_secs(60)) {}
+                ordinary_stopped_tx.send(()).unwrap();
+                Ok(None)
+            },
+        );
+        let protected = jobs.spawn_reliable(
+            "mutation",
+            "protected",
+            0,
+            None,
+            "protected-job".to_string(),
+            move |context| {
+                release_rx.recv().unwrap();
+                assert!(!context.is_canceled());
+                Ok(Some("accepted"))
+            },
+        );
+
+        jobs.stop_accepting();
+        jobs.cancel_all_except(&std::collections::BTreeSet::from([protected]));
+
+        ordinary_stopped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        release_tx.send(()).unwrap();
+        wait_until_all_finished(&mut jobs);
+        assert!(matches!(
+            jobs.take_latest_by(|_| 0),
+            Some(JobMessage::Payload {
+                metadata,
+                payload: "accepted"
+            }) if metadata.id == protected
+        ));
+        let outcomes = jobs
+            .drain_terminals(usize::MAX)
+            .into_iter()
+            .filter_map(|message| match message {
+                JobMessage::Terminal { metadata, outcome } => Some((metadata.id, outcome)),
+                JobMessage::Payload { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            outcomes.iter().any(|(id, outcome)| {
+                *id != protected && matches!(outcome, JobOutcome::Canceled)
+            })
+        );
+        assert!(
+            outcomes.iter().any(|(id, outcome)| {
+                *id == protected && matches!(outcome, JobOutcome::Completed)
+            })
+        );
     }
 
     fn wait_until_all_finished<K, Q, P>(jobs: &mut JobRegistry<K, Q, P>)

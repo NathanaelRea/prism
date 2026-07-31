@@ -15,12 +15,12 @@ use crate::{
         },
     },
     config::Config,
-    github::{PrCache, PrDetails, PrReviewComment, PrSummary},
     opencode::{OpencodeState, OpencodeStatus},
     plan_run::{
         PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRun, PlanRunMode, PlanRunStatus,
         PlanStepRun, PlanStepStatus,
     },
+    remote::{PrCache, PrDetails, PrReviewComment, PrSummary},
     session::Session,
     view::{
         AutoDashboard, AutoOutputViewerState, ChoiceList, DialogLine, DialogModel, FrameModel,
@@ -599,6 +599,15 @@ fn pr_merge_conflict_uses_conflict_icon() {
 }
 
 #[test]
+fn unknown_pr_lifecycle_has_an_explicit_unknown_display() {
+    let mut summary = test_pr_summary();
+    summary.state = "SUPERSEDED_BY_TRAIN".to_string();
+
+    assert_eq!(pr_state_label(&summary), "unknown");
+    assert_eq!(pr_state_icon(&summary, IconStyle::Unicode), "?");
+}
+
+#[test]
 fn worktree_detail_omits_loaded_wt_columns() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Running);
@@ -652,9 +661,14 @@ fn repo_main_panel_lists_indexed_pr_without_worktree() {
     closed.number = 25;
     closed.title = "Closed PR".to_string();
     closed.state = "CLOSED".to_string();
+    let mut unknown = remote.clone();
+    unknown.number = 26;
+    unknown.title = "Future lifecycle".to_string();
+    unknown.state = "SUPERSEDED_BY_TRAIN".to_string();
     model.repo_prs = vec![
         RepoPrRow::from_summary("repo".to_string(), &remote, false, false),
         RepoPrRow::from_summary("repo".to_string(), &closed, false, false),
+        RepoPrRow::from_summary("repo".to_string(), &unknown, false, false),
     ];
 
     let buffer = render_to_string(&model, 120, 30);
@@ -664,6 +678,8 @@ fn repo_main_panel_lists_indexed_pr_without_worktree() {
     assert!(buffer.contains("octocat"));
     assert!(buffer.contains("alice,backend"));
     assert!(buffer.contains("no"));
+    assert!(buffer.contains("#26"));
+    assert!(buffer.contains("unknown"));
     assert!(!buffer.contains("#25"));
     assert!(!buffer.contains("Closed PR"));
 }
@@ -1598,6 +1614,7 @@ fn test_pr_summary() -> PrSummary {
     PrSummary {
         number: 42,
         change_request_identity: None,
+        native_state_evidence: crate::remote::NativeStateEvidence::default(),
         title: "Feature PR".to_string(),
         author: "author".to_string(),
         body: String::new(),
@@ -1611,6 +1628,7 @@ fn test_pr_summary() -> PrSummary {
         updated_at: "2026-01-01T00:00:00Z".to_string(),
         check_status: "failed".to_string(),
         merge_state_status: "CLEAN".to_string(),
+        queue_state: "not_queued".to_string(),
         comment_count: 5,
         merged: false,
         draft: false,

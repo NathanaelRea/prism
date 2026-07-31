@@ -22,6 +22,7 @@ pub(crate) struct Capabilities {
     pub(crate) fetch_change_request: SupportLevel,
     pub(crate) create_change_request: SupportLevel,
     pub(crate) guarded_merge: SupportLevel,
+    pub(crate) guarded_merge_reason: Option<String>,
     pub(crate) merge_queue: SupportLevel,
 }
 
@@ -40,6 +41,7 @@ impl Capabilities {
                 fetch_change_request: SupportLevel::Supported,
                 create_change_request: SupportLevel::Supported,
                 guarded_merge: SupportLevel::Supported,
+                guarded_merge_reason: None,
                 merge_queue: SupportLevel::Unknown,
             },
             super::ProviderKind::GitLab => Self {
@@ -54,6 +56,7 @@ impl Capabilities {
                 fetch_change_request: SupportLevel::Supported,
                 create_change_request: SupportLevel::Supported,
                 guarded_merge: SupportLevel::Conditional,
+                guarded_merge_reason: None,
                 merge_queue: SupportLevel::Conditional,
             },
             super::ProviderKind::Forgejo => Self {
@@ -68,6 +71,7 @@ impl Capabilities {
                 fetch_change_request: SupportLevel::Supported,
                 create_change_request: SupportLevel::Conditional,
                 guarded_merge: SupportLevel::Conditional,
+                guarded_merge_reason: None,
                 merge_queue: SupportLevel::Unsupported,
             },
         }

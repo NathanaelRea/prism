@@ -389,6 +389,9 @@ pub fn reconcile_stale_auto_run(
         ) {
             continue;
         }
+        if step.step_key == AutoStepKey::Merge && step.status == AutoStepStatus::Waiting {
+            continue;
+        }
         if step.step_key == AutoStepKey::RunPlan && step.plan_run_id.is_some() {
             continue;
         }
@@ -585,6 +588,7 @@ pub fn prepare_auto_run_for_resume(
     });
     if has_queued_agent_step
         || has_queued_non_agent_step(persisted)
+        || next_waiting_merge_step(persisted).is_some()
         || queued_prepare_needs_initial_agent_step(persisted)
         || next_state_machine_step_needed(persisted)
         || implementation_follow_up_step_needed(persisted)

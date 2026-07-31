@@ -11,8 +11,7 @@ use crate::config::MergeMethod;
 use crate::git::current_head_sha;
 use crate::observability;
 use crate::process::{
-    ProcessDescriptor, ProcessPolicy, run_capture, run_capture_named, run_output_allow_failure,
-    run_output_allow_failure_named,
+    ProcessDescriptor, ProcessPolicy, run_capture_named, run_output_allow_failure_named,
 };
 use crate::repo::Repository;
 use crate::session::Session;
@@ -44,6 +43,7 @@ struct PersistedPrDetails {
     details: PrDetails,
     association: Option<PrDetailsAssociation>,
     errors: Vec<String>,
+    warnings: Vec<String>,
 }
 
 impl PrDetailsAssociation {
@@ -70,6 +70,7 @@ pub(super) struct ProviderDetailsObservation {
     pub failing_checks: Result<Vec<String>, String>,
     pub check_contexts: Result<Vec<PrCheckContext>, String>,
     pub ci_failures: Result<Vec<CiFailure>, String>,
+    pub partial_errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -86,6 +87,7 @@ pub struct PrCache {
     details_association: Option<PrDetailsAssociation>,
     summary_error: Option<String>,
     details_errors: Vec<String>,
+    details_warnings: Vec<String>,
     persistence_error: Option<String>,
     details_persistence_error: Option<String>,
     next_generation: u64,
@@ -120,6 +122,17 @@ impl PrCache {
         if self.details.is_some() {
             self.details_quality = PrObservationQuality::PreservedStale;
         }
+    }
+
+    pub(crate) fn require_reconciliation(&mut self, reason: &str) {
+        if self.summary.is_some() {
+            self.summary_quality = PrObservationQuality::PreservedStale;
+        }
+        if self.details.is_some() {
+            self.details_quality = PrObservationQuality::PreservedStale;
+        }
+        self.summary_error = Some(reason.to_string());
+        self.rebuild_error();
     }
 
     #[cfg(test)]
@@ -188,6 +201,7 @@ impl PrCache {
             .summary_error
             .iter()
             .chain(self.details_errors.iter())
+            .chain(self.details_warnings.iter())
             .chain(self.persistence_error.iter())
             .chain(self.details_persistence_error.iter())
             .next()
@@ -242,6 +256,7 @@ impl PrCache {
                     self.details_association = None;
                     self.details_quality = PrObservationQuality::Unknown;
                     self.details_errors.clear();
+                    self.details_warnings.clear();
                 }
                 self.summary = Some(summary);
                 self.summary_observed_in_process = true;
@@ -263,6 +278,7 @@ impl PrCache {
                 self.details_association = None;
                 self.summary_error = None;
                 self.details_errors.clear();
+                self.details_warnings.clear();
                 self.last_refreshed = Some(refreshed);
                 self.rebuild_error();
                 PrCacheSummaryMutation::RemoveSummary
@@ -276,7 +292,7 @@ impl PrCache {
         }
 
         let mut details = self.details.take().unwrap_or_default();
-        let mut errors = Vec::new();
+        let mut errors = observation.partial_errors;
         macro_rules! record_component {
             ($field:ident, $label:literal) => {
                 match observation.$field {
@@ -291,7 +307,13 @@ impl PrCache {
         record_component!(files, "files");
         record_component!(failing_checks, "checks");
         record_component!(check_contexts, "check contexts");
-        record_component!(ci_failures, "CI logs");
+        let mut warnings = Vec::new();
+        match observation.ci_failures {
+            Ok(value) => details.ci_failures = value,
+            Err(error) => {
+                warnings.push(format!("CI logs unavailable: {error}"));
+            }
+        }
 
         self.details = Some(details);
         self.details_association = Some(observation.association);
@@ -301,6 +323,7 @@ impl PrCache {
             PrObservationQuality::PreservedStale
         };
         self.details_errors = errors;
+        self.details_warnings = warnings;
         self.rebuild_error();
         true
     }
@@ -502,10 +525,12 @@ pub(super) fn record_provider_details_refresh(
                 failing_checks: observation.failing_checks,
                 check_contexts: observation.check_contexts,
                 ci_failures: observation.ci_failures,
+                partial_errors: observation.partial_errors,
             });
         }
         Err(error) => {
             cache.details_errors = vec![error];
+            cache.details_warnings.clear();
             cache.details_association = Some(PrDetailsAssociation::from_summary(&summary));
             cache.details_quality = if cache.details.is_some() {
                 PrObservationQuality::PreservedStale
@@ -580,6 +605,7 @@ enum PrCacheSummaryMutation {
 pub struct PrSummary {
     pub number: u64,
     pub(crate) change_request_identity: Option<crate::remote::CanonicalChangeRequestIdentity>,
+    pub(crate) native_state_evidence: crate::remote::NativeStateEvidence,
     pub title: String,
     pub author: String,
     pub body: String,
@@ -593,6 +619,7 @@ pub struct PrSummary {
     pub updated_at: String,
     pub check_status: String,
     pub merge_state_status: String,
+    pub queue_state: String,
     pub comment_count: u64,
     pub merged: bool,
     pub draft: bool,
@@ -601,7 +628,7 @@ pub struct PrSummary {
 impl PrSummary {
     pub fn signature(&self) -> String {
         format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
             self.number,
             self.author,
             self.state,
@@ -612,6 +639,7 @@ impl PrSummary {
             self.updated_at,
             self.check_status,
             self.merge_state_status,
+            self.queue_state,
             self.comment_count
         )
     }
@@ -685,6 +713,7 @@ struct PrDetailsObservation {
     failing_checks: Result<Vec<String>, String>,
     check_contexts: Result<Vec<PrCheckContext>, String>,
     ci_failures: Result<Vec<CiFailure>, String>,
+    partial_errors: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -754,42 +783,20 @@ struct GithubRepository {
     pull_requests: GithubPullRequestConnection,
     #[serde(default, rename = "pullRequest")]
     pull_request: GithubPullRequest,
-    #[serde(default, rename = "defaultBranchRef")]
-    default_branch_ref: GithubBranchRef,
-    #[serde(default, rename = "branchProtectionRules")]
-    branch_protection_rules: GithubBranchProtectionRuleConnection,
 }
 
 #[derive(Debug, Default, Deserialize)]
-struct GithubBranchRef {
-    #[serde(default)]
-    name: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct GithubBranchProtectionRuleConnection {
-    #[serde(default)]
-    nodes: Vec<GithubBranchProtectionRule>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct GithubBranchProtectionRule {
-    #[serde(default)]
-    pattern: String,
-    #[serde(default, rename = "requiredApprovingReviewCount")]
-    required_approving_review_count: u64,
-    #[serde(default, rename = "requiresConversationResolution")]
-    requires_conversation_resolution: bool,
-    #[serde(default, rename = "requiresStrictStatusChecks")]
-    requires_strict_status_checks: bool,
-    #[serde(default, rename = "requiredStatusCheckContexts")]
-    required_status_check_contexts: Vec<String>,
+struct GithubPageInfo {
+    #[serde(default, rename = "hasNextPage")]
+    has_next_page: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct GithubPullRequestConnection {
     #[serde(default)]
     nodes: Vec<GithubPullRequest>,
+    #[serde(default, rename = "pageInfo")]
+    page_info: GithubPageInfo,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -837,12 +844,43 @@ struct GithubPullRequest {
     status_check_rollup: GithubStatusCheckRollup,
     #[serde(default, rename = "mergeStateStatus")]
     merge_state_status: String,
+    #[serde(
+        default,
+        rename = "mergeQueueEntry",
+        deserialize_with = "deserialize_merge_queue_entry"
+    )]
+    merge_queue_entry: GithubMergeQueueObservation,
     #[serde(default)]
     merged: Option<bool>,
     #[serde(default, rename = "mergedAt")]
     merged_at: Option<String>,
     #[serde(default, rename = "isDraft")]
     is_draft: bool,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GithubMergeQueueEntry {
+    #[serde(default)]
+    state: String,
+}
+
+#[derive(Debug, Default)]
+enum GithubMergeQueueObservation {
+    #[default]
+    NotObserved,
+    NotQueued,
+    Entry(GithubMergeQueueEntry),
+}
+
+fn deserialize_merge_queue_entry<'de, D>(
+    deserializer: D,
+) -> Result<GithubMergeQueueObservation, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<GithubMergeQueueEntry>::deserialize(deserializer)?
+        .map(GithubMergeQueueObservation::Entry)
+        .unwrap_or(GithubMergeQueueObservation::NotQueued))
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -894,6 +932,8 @@ struct GithubCount {
 struct GithubReviewThreadConnection {
     #[serde(default, rename = "totalCount")]
     total_count: u64,
+    #[serde(default, rename = "pageInfo")]
+    page_info: GithubPageInfo,
     #[serde(default)]
     nodes: Vec<GithubReviewThread>,
 }
@@ -910,6 +950,10 @@ struct GithubReviewThread {
 
 #[derive(Debug, Default, Deserialize)]
 struct GithubReviewThreadCommentConnection {
+    #[serde(default, rename = "totalCount")]
+    total_count: u64,
+    #[serde(default, rename = "pageInfo")]
+    page_info: GithubPageInfo,
     #[serde(default)]
     nodes: Vec<GithubReviewThreadComment>,
 }
@@ -927,7 +971,7 @@ struct GithubReviewThreadComment {
     original_line: Option<u64>,
     #[serde(default)]
     body: String,
-    #[serde(default, rename = "createdAt")]
+    #[serde(default, rename = "createdAt", alias = "created_at")]
     created_at: String,
 }
 
@@ -963,7 +1007,7 @@ struct GhPrComment {
     user: GhActor,
     #[serde(default)]
     body: String,
-    #[serde(default, rename = "createdAt")]
+    #[serde(default, rename = "createdAt", alias = "created_at")]
     created_at: String,
 }
 
@@ -979,7 +1023,7 @@ struct GhPrReview {
     state: String,
     #[serde(default)]
     body: String,
-    #[serde(default, rename = "submittedAt")]
+    #[serde(default, rename = "submittedAt", alias = "submitted_at")]
     submitted_at: String,
 }
 
@@ -991,17 +1035,25 @@ struct GhActor {
 
 #[derive(Debug, Default, Deserialize)]
 struct GhPrFile {
-    #[serde(default)]
+    #[serde(default, alias = "filename")]
     path: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
+struct GhCheckRunsPage {
+    #[serde(default)]
+    total_count: u64,
+    #[serde(default)]
+    check_runs: Vec<GithubStatusContext>,
+}
+
+#[derive(Debug, Default, Deserialize)]
 struct GhRunListItem {
-    #[serde(default, rename = "databaseId")]
+    #[serde(default, rename = "databaseId", alias = "id")]
     database_id: u64,
     #[serde(default, rename = "workflowName")]
     workflow_name: String,
-    #[serde(default, rename = "displayTitle")]
+    #[serde(default, rename = "displayTitle", alias = "display_title")]
     display_title: String,
     #[serde(default)]
     name: String,
@@ -1009,10 +1061,18 @@ struct GhRunListItem {
     conclusion: String,
     #[serde(default)]
     status: String,
-    #[serde(default, rename = "headSha")]
+    #[serde(default, rename = "headSha", alias = "head_sha")]
     head_sha: String,
-    #[serde(default)]
+    #[serde(default, alias = "html_url")]
     url: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct GhWorkflowRunsPage {
+    #[serde(default)]
+    total_count: u64,
+    #[serde(default)]
+    workflow_runs: Vec<GhRunListItem>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1039,6 +1099,8 @@ struct GithubCommit {
 
 #[derive(Debug, Default, Deserialize)]
 struct GithubStatusCheckRollup {
+    #[serde(skip)]
+    observed: bool,
     #[serde(default)]
     contexts: GithubStatusContextConnection,
     #[serde(default)]
@@ -1051,15 +1113,49 @@ where
 {
     let value = serde_json::Value::deserialize(deserializer)?;
     if value.is_null() {
-        return Ok(GithubStatusCheckRollup::default());
+        return Ok(GithubStatusCheckRollup {
+            observed: true,
+            ..GithubStatusCheckRollup::default()
+        });
     }
     if let Ok(nodes) = serde_json::from_value::<Vec<GithubStatusContext>>(value.clone()) {
+        if nodes.len() >= 100 {
+            return Err(serde::de::Error::custom(
+                "check rollup contexts reached the unpaginated gh pr view limit",
+            ));
+        }
         return Ok(GithubStatusCheckRollup {
+            observed: true,
             contexts: GithubStatusContextConnection::default(),
             nodes,
         });
     }
-    serde_json::from_value(value).map_err(serde::de::Error::custom)
+    let contexts = value
+        .get("contexts")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| serde::de::Error::custom("check rollup is missing contexts"))?;
+    if !contexts
+        .get("nodes")
+        .is_some_and(serde_json::Value::is_array)
+    {
+        return Err(serde::de::Error::custom(
+            "check rollup contexts are missing nodes",
+        ));
+    }
+    if contexts
+        .get("pageInfo")
+        .and_then(|page_info| page_info.get("hasNextPage"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return Err(serde::de::Error::custom(
+            "check rollup contexts are truncated",
+        ));
+    }
+    let mut rollup = serde_json::from_value::<GithubStatusCheckRollup>(value)
+        .map_err(serde::de::Error::custom)?;
+    rollup.observed = true;
+    Ok(rollup)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1083,10 +1179,11 @@ pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
             "select
                 number, title, author, body, url, state, review_decision, requested_reviewers,
                 head_ref, base_ref, head_sha, updated_at, check_status, merge_state_status,
-                comment_count, merged, draft, last_refreshed, observation_error,
+                queue_state, comment_count, merged, draft, last_refreshed, observation_error,
                 provider, canonical_host, project_path, native_cr_id,
                 source_provider, source_canonical_host, source_project_path,
-                target_provider, target_canonical_host, target_project_path, identity_complete
+                target_provider, target_canonical_host, target_project_path, identity_complete,
+                native_state_evidence
               from pr_cache
               where branch = ?1",
             params![branch],
@@ -1094,7 +1191,10 @@ pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
                 Ok((
                     PrSummary {
                         number: row_u64(row, 0)?,
-                        change_request_identity: row_change_request_identity(row, 19)?,
+                        change_request_identity: row_change_request_identity(row, 20)?,
+                        native_state_evidence: decode_native_state_evidence(
+                            &row.get::<_, String>(31)?,
+                        ),
                         title: row.get(1)?,
                         author: row.get(2)?,
                         body: row.get(3)?,
@@ -1108,12 +1208,13 @@ pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
                         updated_at: row.get(11)?,
                         check_status: row.get(12)?,
                         merge_state_status: row.get(13)?,
-                        comment_count: row_u64(row, 14)?,
-                        merged: row.get(15)?,
-                        draft: row.get(16)?,
+                        queue_state: row.get(14)?,
+                        comment_count: row_u64(row, 15)?,
+                        merged: row.get(16)?,
+                        draft: row.get(17)?,
                     },
-                    row.get::<_, String>(17)?,
-                    row.get::<_, Option<String>>(18)?,
+                    row.get::<_, String>(18)?,
+                    row.get::<_, Option<String>>(19)?,
                 ))
             },
         )
@@ -1129,11 +1230,16 @@ pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
             return cache;
         }
     };
-    let (details, details_association, details_errors) =
+    let (details, details_association, details_errors, details_warnings) =
         match load_pr_details_cache_record(repo, branch) {
-            Ok(Some(record)) => (Some(record.details), record.association, record.errors),
-            Ok(None) => (None, None, Vec::new()),
-            Err(error) => (None, None, vec![error]),
+            Ok(Some(record)) => (
+                Some(record.details),
+                record.association,
+                record.errors,
+                record.warnings,
+            ),
+            Ok(None) => (None, None, Vec::new(), Vec::new()),
+            Err(error) => (None, None, vec![error], Vec::new()),
         };
     let association_matches = details_association
         .as_ref()
@@ -1161,6 +1267,7 @@ pub fn load_pr_cache(repo: &Repository, branch: &str) -> PrCache {
         details_association,
         summary_error,
         details_errors,
+        details_warnings,
         ..PrCache::default()
     };
     cache.rebuild_error();
@@ -1177,11 +1284,10 @@ pub(crate) fn load_pr_cache_for_branch(
         return remove_invalid_pr_cache(repo, branch);
     }
     let cache = load_pr_cache(repo, branch);
-    if cache
-        .summary
-        .as_ref()
-        .is_some_and(|summary| summary.head_ref != branch)
-    {
+    if cache.summary.as_ref().is_some_and(|summary| {
+        summary.head_ref != branch
+            && (summary.change_request_identity.is_none() || summary.head_sha.trim().is_empty())
+    }) {
         return remove_invalid_pr_cache(repo, branch);
     }
     cache
@@ -1210,7 +1316,22 @@ pub fn refresh_pr_cache(
         persist_pr_summary_mutation(repo, branch, cache, mutation);
         return cache.refresh_result();
     }
-    let result = fetch_pr_summary(path, branch, config);
+    let result = fetch_pr_summary(path, branch, config).map(|observation| {
+        let origin_push =
+            super::discover_git_remote(path, config, "origin", super::RemoteUrlKind::Push)
+                .ok()
+                .map(|remote| remote.repository.id);
+        let local_head = current_head_sha(path, config).ok();
+        observation.filter(|(summary, _)| {
+            pr_summary_matches_worktree(
+                summary,
+                branch,
+                cache.summary.as_ref(),
+                origin_push.as_ref(),
+                local_head.as_deref(),
+            )
+        })
+    });
     match result {
         Ok(Some((summary, _raw))) => {
             if !cache.finish_summary_poll(started_at) {
@@ -1412,14 +1533,16 @@ pub fn refresh_pr_details_cache(
             details,
             &association,
             &cache.details_errors,
+            &cache.details_warnings,
         )
-    } else if !cache.details_errors.is_empty() {
+    } else if !cache.details_errors.is_empty() || !cache.details_warnings.is_empty() {
         save_pr_details_cache_for_association(
             repo,
             branch,
             &PrDetails::default(),
             &association,
             &cache.details_errors,
+            &cache.details_warnings,
         )
     } else {
         Ok(())
@@ -1441,6 +1564,7 @@ pub(crate) fn refresh_pr_details_cache_state(
         cache.details_association = None;
         cache.details_quality = PrObservationQuality::AuthoritativeAbsence;
         cache.details_errors.clear();
+        cache.details_warnings.clear();
         cache.rebuild_error();
         return;
     }
@@ -1461,6 +1585,7 @@ pub(crate) fn refresh_pr_details_cache_state(
         }
         Err(error) => {
             cache.details_errors = vec![error];
+            cache.details_warnings.clear();
             cache.details_association = Some(PrDetailsAssociation::from_summary(&summary));
             cache.details_quality = if cache.details.is_some() {
                 PrObservationQuality::PreservedStale
@@ -1505,6 +1630,7 @@ pub(crate) fn apply_pr_details_poll_result(cache: &mut PrCache, poll_result: PrC
     cache.details_association = result_identity;
     cache.details_quality = poll_result.details_quality;
     cache.details_errors = poll_result.details_errors;
+    cache.details_warnings = poll_result.details_warnings;
     cache.pending_details = None;
     cache.rebuild_error();
     true
@@ -1574,18 +1700,34 @@ pub(crate) fn refresh_pr_summary_index_for_target_sessions(
 fn pr_summary_matches_worktree(
     summary: &PrSummary,
     branch: &str,
-    path: &std::path::Path,
-    config: &Config,
     known_summary: Option<&PrSummary>,
+    origin_push: Option<&crate::remote::RemoteRepositoryId>,
+    local_head: Option<&str>,
 ) -> bool {
-    if summary.head_ref != branch {
-        return false;
-    }
+    let cached_canonical_association = known_summary.is_some_and(|known| {
+        known.change_request_identity.is_some()
+            && known.change_request_identity == summary.change_request_identity
+    });
+    let initial_canonical_association = summary.head_ref == branch
+        && local_head == Some(summary.head_sha.as_str())
+        && summary
+            .change_request_identity
+            .as_ref()
+            .and_then(|identity| identity.source_repository().ok())
+            .as_ref()
+            == origin_push;
     if !summary.merged && summary.state.eq_ignore_ascii_case("open") {
-        return current_head_sha(path, config).is_ok_and(|head| head == summary.head_sha)
-            || known_summary.is_some_and(|known| known.number == summary.number);
+        return cached_canonical_association || initial_canonical_association;
     }
-    summary.merged && current_head_sha(path, config).is_ok_and(|head| head == summary.head_sha)
+    if !summary.merged
+        && !matches!(
+            summary.state.trim().to_ascii_uppercase().as_str(),
+            "OPEN" | "CLOSED" | "MERGED"
+        )
+    {
+        return cached_canonical_association || initial_canonical_association;
+    }
+    summary.merged && (cached_canonical_association || initial_canonical_association)
 }
 
 pub(crate) fn resolve_pr_summary_for_session(
@@ -1596,19 +1738,20 @@ pub(crate) fn resolve_pr_summary_for_session(
     if !PrCacheEligibility::for_successful_index(session, config).can_observe() {
         return None;
     }
+    let origin_push =
+        super::discover_git_remote(&session.path, config, "origin", super::RemoteUrlKind::Push)
+            .ok()
+            .map(|remote| remote.repository.id);
+    let local_head = current_head_sha(&session.path, config).ok();
     summaries
         .iter()
         .find(|summary| {
             pr_summary_matches_worktree(
                 summary,
                 &session.branch,
-                &session.path,
-                config,
-                session
-                    .pr
-                    .summary_observed_in_process
-                    .then_some(session.pr.summary.as_ref())
-                    .flatten(),
+                session.pr.summary.as_ref(),
+                origin_push.as_ref(),
+                local_head.as_deref(),
             )
         })
         .cloned()
@@ -1698,14 +1841,18 @@ pub(crate) fn persist_pr_cache_snapshot(
             details,
             association,
             &cache.details_errors,
+            &cache.details_warnings,
         ),
-        (None, Some(association)) if !cache.details_errors.is_empty() => {
+        (None, Some(association))
+            if !cache.details_errors.is_empty() || !cache.details_warnings.is_empty() =>
+        {
             save_pr_details_cache_for_association(
                 repo,
                 branch,
                 &PrDetails::default(),
                 association,
                 &cache.details_errors,
+                &cache.details_warnings,
             )
         }
         _ => remove_pr_details_cache(repo, branch),
@@ -1782,6 +1929,7 @@ fn persist_pr_summary_mutation(
                     details,
                     association,
                     &cache.details_errors,
+                    &cache.details_warnings,
                 )
             } else {
                 remove_pr_details_cache(repo, branch)
@@ -1815,8 +1963,7 @@ pub(super) fn fetch_pr_summary_index_for_repository(
         .ok_or_else(|| "GitHub project path is malformed".to_string())?;
     let raw = run_capture_named(
         Command::new(config.tool("gh"))
-            .arg("api")
-            .arg("graphql")
+            .args(github_graphql_api_args(config, repository.host()))
             .arg("-F")
             .arg(format!("owner={owner}"))
             .arg("-F")
@@ -1836,28 +1983,48 @@ pub(crate) fn refresh_repo_policy_cache(
     config: &Config,
 ) -> Result<RepoPolicyCache, String> {
     let repository = github_remote_repository_id(path, config, "origin")?;
+    let target_branch = config.default_base.as_deref().unwrap_or("main");
+    refresh_repo_policy_cache_for_repository(repo, path, config, &repository, target_branch)
+}
+
+pub(crate) fn refresh_repo_policy_cache_for_repository(
+    repo: &Repository,
+    path: &std::path::Path,
+    config: &Config,
+    repository: &crate::remote::RemoteRepositoryId,
+    target_branch: &str,
+) -> Result<RepoPolicyCache, String> {
     let remote = repository.project_path().to_string();
-    let policy = match fetch_repo_policy(path, config) {
+    let policy = match fetch_repo_policy(path, config, repository, target_branch) {
         Ok(mut policy) => {
             policy.repo_remote = remote.clone();
             policy.provider = Some(repository.provider());
             policy.canonical_host = Some(repository.host().to_string());
             policy.project_path = Some(repository.project_path().to_string());
-            policy.target_branch = policy.default_branch.clone();
-            policy.identity_complete = policy.target_branch.is_some();
+            policy.target_branch = Some(target_branch.to_string());
+            policy.identity_complete = true;
             policy
         }
-        Err(error) => RepoPolicyCache {
-            repo_remote: remote.clone(),
-            provider: Some(repository.provider()),
-            canonical_host: Some(repository.host().to_string()),
-            project_path: Some(repository.project_path().to_string()),
-            target_branch: None,
-            identity_complete: false,
-            refreshed_unix_ms: unix_seconds().max(0) as u64,
-            error: Some(error),
-            ..RepoPolicyCache::default()
-        },
+        Err(error) => {
+            if let Some(mut stale) =
+                load_repo_policy_cache_for_identity(repo, repository, target_branch)
+            {
+                stale.error = Some(error);
+                stale
+            } else {
+                RepoPolicyCache {
+                    repo_remote: remote.clone(),
+                    provider: Some(repository.provider()),
+                    canonical_host: Some(repository.host().to_string()),
+                    project_path: Some(repository.project_path().to_string()),
+                    target_branch: Some(target_branch.to_string()),
+                    identity_complete: false,
+                    refreshed_unix_ms: unix_seconds().max(0) as u64,
+                    error: Some(error),
+                    ..RepoPolicyCache::default()
+                }
+            }
+        }
     };
     save_repo_policy_cache(repo, &policy)?;
     Ok(policy)
@@ -1866,11 +2033,12 @@ pub(crate) fn refresh_repo_policy_cache(
 pub(crate) fn resolve_review_thread(
     path: &std::path::Path,
     config: &Config,
+    host: &crate::remote::HostIdentity,
     thread_id: &str,
 ) -> Result<(), String> {
     let raw = run_capture_named(
         Command::new(config.tool("gh"))
-            .args(resolve_review_thread_args(thread_id))
+            .args(resolve_review_thread_args(config, host, thread_id))
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.api.graphql"),
@@ -1897,15 +2065,54 @@ pub(crate) fn resolve_review_thread(
     Ok(())
 }
 
-fn resolve_review_thread_args(thread_id: &str) -> Vec<String> {
-    vec![
-        "api".to_string(),
-        "graphql".to_string(),
+fn resolve_review_thread_args(
+    config: &Config,
+    host: &crate::remote::HostIdentity,
+    thread_id: &str,
+) -> Vec<String> {
+    let mut args = github_graphql_api_args(config, host);
+    args.extend([
         "-F".to_string(),
         format!("thread={thread_id}"),
         "-f".to_string(),
         format!("query={RESOLVE_REVIEW_THREAD_MUTATION}"),
+    ]);
+    args
+}
+
+fn github_graphql_api_args(config: &Config, host: &crate::remote::HostIdentity) -> Vec<String> {
+    let endpoint = config.remote_api_override(host).map_or_else(
+        || "graphql".to_string(),
+        |base| {
+            base.strip_suffix("/api/v3").map_or_else(
+                || format!("{}/graphql", base.trim_end_matches('/')),
+                |root| format!("{root}/api/graphql"),
+            )
+        },
+    );
+    vec![
+        "api".to_string(),
+        endpoint,
+        "--hostname".to_string(),
+        host.to_string(),
     ]
+}
+
+fn github_api_endpoint(
+    config: &Config,
+    host: &crate::remote::HostIdentity,
+    endpoint: &str,
+) -> String {
+    config.remote_api_override(host).map_or_else(
+        || endpoint.to_string(),
+        |base| {
+            format!(
+                "{}/{}",
+                base.trim_end_matches('/'),
+                endpoint.trim_start_matches('/')
+            )
+        },
+    )
 }
 
 const RESOLVE_REVIEW_THREAD_MUTATION: &str = r#"
@@ -1965,61 +2172,508 @@ pub(crate) fn load_repo_policy_cache_for_repository(
     repo: &Repository,
     repository: &crate::remote::RemoteRepositoryId,
 ) -> Option<RepoPolicyCache> {
+    let latest = observability::with_writable_db(repo, |conn| {
+        conn.query_row(
+            "select repo_remote, default_branch, required_approvals,
+                    require_conversation_resolution, require_branch_up_to_date,
+                    required_checks, merge_queue_required, refreshed_unix_ms, error,
+                    provider, canonical_host, project_path, target_branch
+               from repo_policy_cache_v2
+               where provider = ?1 and canonical_host = ?2
+                 and project_path_key = ?3
+              order by refreshed_unix_ms desc
+              limit 1",
+            params![
+                repository.provider().config_label(),
+                repository.host().to_string(),
+                repo_policy_project_path_key(repository.provider(), repository.project_path()),
+            ],
+            repo_policy_from_v2_row,
+        )
+        .optional()
+        .map_err(|error| format!("read identity-keyed repo policy cache: {error}"))
+    })
+    .ok()
+    .flatten();
+    if latest.is_some() {
+        return latest;
+    }
     let policy = load_repo_policy_cache(repo, repository.project_path())?;
     let expected_host = repository.host().to_string();
     (policy.identity_complete
         && policy.provider == Some(repository.provider())
         && policy.canonical_host.as_deref() == Some(expected_host.as_str())
-        && policy.project_path.as_deref() == Some(repository.project_path())
+        && policy
+            .project_path
+            .as_deref()
+            .is_some_and(|path| repository.project_path_eq(path))
         && policy.target_branch.is_some()
         && policy.target_branch == policy.default_branch)
         .then_some(policy)
 }
 
-fn fetch_repo_policy(path: &std::path::Path, config: &Config) -> Result<RepoPolicyCache, String> {
-    let (owner, name) = github_owner_repo(path, config)?;
-    let raw = run_capture_named(
-        Command::new(config.tool("gh"))
-            .arg("api")
-            .arg("graphql")
-            .arg("-F")
-            .arg(format!("owner={owner}"))
-            .arg("-F")
-            .arg(format!("name={name}"))
-            .arg("-f")
-            .arg(format!("query={REPO_POLICY_QUERY}"))
-            .current_dir(path),
-        ProcessPolicy::NetworkQuery,
-        ProcessDescriptor::new("gh.api.graphql"),
-    )?;
-    parse_repo_policy(&format!("{owner}/{name}"), &raw).ok_or_else(|| {
-        "GitHub repository policy response did not include repository data".to_string()
+pub(crate) fn load_repo_policy_cache_for_identity(
+    repo: &Repository,
+    repository: &crate::remote::RemoteRepositoryId,
+    target_branch: &str,
+) -> Option<RepoPolicyCache> {
+    observability::with_writable_db(repo, |conn| {
+        conn.query_row(
+            "select repo_remote, default_branch, required_approvals,
+                    require_conversation_resolution, require_branch_up_to_date,
+                    required_checks, merge_queue_required, refreshed_unix_ms, error,
+                    provider, canonical_host, project_path, target_branch
+               from repo_policy_cache_v2
+               where provider = ?1 and canonical_host = ?2
+                 and project_path_key = ?3
+                and target_branch = ?4",
+            params![
+                repository.provider().config_label(),
+                repository.host().to_string(),
+                repo_policy_project_path_key(repository.provider(), repository.project_path()),
+                target_branch,
+            ],
+            repo_policy_from_v2_row,
+        )
+        .optional()
+        .map_err(|error| format!("read identity-keyed repo policy cache: {error}"))
+    })
+    .ok()
+    .flatten()
+    .or_else(|| {
+        let policy = load_repo_policy_cache(repo, repository.project_path())?;
+        let expected_host = repository.host().to_string();
+        (policy.identity_complete
+            && policy.provider == Some(repository.provider())
+            && policy.canonical_host.as_deref() == Some(expected_host.as_str())
+            && policy
+                .project_path
+                .as_deref()
+                .is_some_and(|path| repository.project_path_eq(path))
+            && policy.target_branch.as_deref() == Some(target_branch))
+        .then_some(policy)
     })
 }
 
-const REPO_POLICY_QUERY: &str = r#"
-query($owner: String!, $name: String!) {
-  repository(owner: $owner, name: $name) {
-    defaultBranchRef {
-      name
-    }
-    branchProtectionRules(first: 20) {
-      nodes {
-        pattern
-        requiredApprovingReviewCount
-        requiresConversationResolution
-        requiresStrictStatusChecks
-        requiredStatusCheckContexts
-      }
-    }
-  }
+fn repo_policy_from_v2_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RepoPolicyCache> {
+    Ok(RepoPolicyCache {
+        repo_remote: row.get(0)?,
+        default_branch: row.get(1)?,
+        required_approvals: row_u64(row, 2)?,
+        require_conversation_resolution: row.get::<_, i64>(3)? != 0,
+        require_branch_up_to_date: row.get::<_, i64>(4)? != 0,
+        required_checks: decode_string_values(&row.get::<_, String>(5)?),
+        merge_queue_required: row.get::<_, i64>(6)? != 0,
+        refreshed_unix_ms: row_u64(row, 7)?,
+        error: row.get(8)?,
+        provider: row
+            .get::<_, Option<String>>(9)?
+            .as_deref()
+            .and_then(crate::remote::ProviderKind::parse),
+        canonical_host: row.get(10)?,
+        project_path: row.get(11)?,
+        target_branch: row.get(12)?,
+        identity_complete: true,
+    })
 }
-"#;
+
+fn repo_policy_project_path_key(
+    provider: crate::remote::ProviderKind,
+    project_path: &str,
+) -> String {
+    match provider {
+        crate::remote::ProviderKind::GitHub => project_path.to_ascii_lowercase(),
+        crate::remote::ProviderKind::GitLab | crate::remote::ProviderKind::Forgejo => {
+            project_path.to_string()
+        }
+    }
+}
+
+fn fetch_repo_policy(
+    path: &std::path::Path,
+    config: &Config,
+    repository: &crate::remote::RemoteRepositoryId,
+    target_branch: &str,
+) -> Result<RepoPolicyCache, String> {
+    let (owner, name) = repository
+        .project_path()
+        .split_once('/')
+        .filter(|(_, name)| !name.contains('/'))
+        .ok_or_else(|| "GitHub project path is malformed".to_string())?;
+    let owner = encode_path_segment(owner);
+    let name = encode_path_segment(name);
+    let branch = encode_path_segment(target_branch);
+    let classic_endpoint = format!("/repos/{owner}/{name}/branches/{branch}/protection");
+    let rules_endpoint = format!("/repos/{owner}/{name}/rules/branches/{branch}?per_page=100");
+
+    let classic_endpoint = github_api_endpoint(config, repository.host(), &classic_endpoint);
+    let rules_endpoint = github_api_endpoint(config, repository.host(), &rules_endpoint);
+    let classic = fetch_classic_branch_protection(
+        path,
+        config,
+        &repository.host().to_string(),
+        &classic_endpoint,
+    )?;
+    let raw_rules = run_capture_named(
+        Command::new(config.tool("gh"))
+            .args(github_policy_api_args(
+                &repository.host().to_string(),
+                &rules_endpoint,
+                true,
+            ))
+            .current_dir(path),
+        ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.api.rules.branch"),
+    )?;
+    let rulesets = parse_evaluated_branch_rules(&raw_rules)?;
+    let facts = classic.combine(rulesets);
+
+    Ok(RepoPolicyCache {
+        repo_remote: repository.project_path().to_string(),
+        provider: None,
+        canonical_host: None,
+        project_path: None,
+        target_branch: Some(target_branch.to_string()),
+        identity_complete: false,
+        default_branch: Some(target_branch.to_string()),
+        required_approvals: facts.required_approvals,
+        require_conversation_resolution: facts.require_conversation_resolution,
+        require_branch_up_to_date: facts.require_branch_up_to_date,
+        required_checks: facts.required_checks,
+        merge_queue_required: facts.merge_queue_required,
+        refreshed_unix_ms: unix_seconds().max(0) as u64,
+        error: None,
+    })
+}
+
+fn github_policy_api_args(host: &str, endpoint: &str, paginate: bool) -> Vec<String> {
+    let mut args = vec![
+        "api".to_string(),
+        "--hostname".to_string(),
+        host.to_string(),
+        "--method".to_string(),
+        "GET".to_string(),
+        "-H".to_string(),
+        "Accept: application/vnd.github+json".to_string(),
+    ];
+    if paginate {
+        args.push("--paginate".to_string());
+        args.push("--slurp".to_string());
+    }
+    args.push(endpoint.to_string());
+    args
+}
+
+fn fetch_classic_branch_protection(
+    path: &std::path::Path,
+    config: &Config,
+    host: &str,
+    endpoint: &str,
+) -> Result<GithubPolicyFacts, String> {
+    let output = run_output_allow_failure_named(
+        Command::new(config.tool("gh"))
+            .args(github_policy_api_args(host, endpoint, false))
+            .current_dir(path),
+        ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.api.branch.protection"),
+    )?;
+    if output.status.success() {
+        if output.stdout_truncated {
+            return Err(format!(
+                "GitHub classic branch protection response was truncated from {} bytes",
+                output.stdout_total_bytes
+            ));
+        }
+        return parse_classic_branch_protection(&output.stdout);
+    }
+    if !output.stderr_truncated && is_unprotected_branch_response(&output.stderr) {
+        return Ok(GithubPolicyFacts::default());
+    }
+    let message = output.stderr.trim();
+    Err(if message.is_empty() {
+        format!(
+            "gh api classic branch protection exited with {}",
+            output.status
+        )
+    } else {
+        format!("gh api classic branch protection: {message}")
+    })
+}
+
+fn is_unprotected_branch_response(stderr: &str) -> bool {
+    let stderr = stderr.to_ascii_lowercase();
+    stderr.contains("branch not protected") && stderr.contains("http 404")
+}
+
+#[derive(Debug, Default)]
+struct GithubPolicyFacts {
+    required_approvals: u64,
+    require_conversation_resolution: bool,
+    require_branch_up_to_date: bool,
+    required_checks: Vec<String>,
+    merge_queue_required: bool,
+}
+
+impl GithubPolicyFacts {
+    fn combine(mut self, other: Self) -> Self {
+        self.required_approvals = self.required_approvals.max(other.required_approvals);
+        self.require_conversation_resolution |= other.require_conversation_resolution;
+        self.require_branch_up_to_date |= other.require_branch_up_to_date;
+        self.merge_queue_required |= other.merge_queue_required;
+        self.required_checks.extend(other.required_checks);
+        self.required_checks = normalized_required_checks(&self.required_checks);
+        self
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubClassicBranchProtection {
+    url: String,
+    #[serde(default)]
+    required_pull_request_reviews: Option<GithubClassicReviewRequirement>,
+    #[serde(default)]
+    required_status_checks: Option<GithubClassicStatusRequirement>,
+    #[serde(default)]
+    required_conversation_resolution: Option<GithubEnabledRequirement>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubClassicReviewRequirement {
+    required_approving_review_count: u64,
+    #[serde(default)]
+    require_code_owner_reviews: bool,
+    #[serde(default)]
+    require_last_push_approval: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubClassicStatusRequirement {
+    strict: bool,
+    #[serde(default)]
+    contexts: Vec<String>,
+    #[serde(default)]
+    checks: Vec<GithubRequiredStatusCheck>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRequiredStatusCheck {
+    context: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubEnabledRequirement {
+    enabled: bool,
+}
+
+fn parse_classic_branch_protection(raw: &str) -> Result<GithubPolicyFacts, String> {
+    let protection = serde_json::from_str::<GithubClassicBranchProtection>(raw)
+        .map_err(|error| format!("parse GitHub classic branch protection: {error}"))?;
+    if protection.url.trim().is_empty() {
+        return Err("parse GitHub classic branch protection: missing URL".to_string());
+    }
+    let reviews = protection.required_pull_request_reviews;
+    let statuses = protection.required_status_checks;
+    let mut required_checks = statuses
+        .as_ref()
+        .map(|statuses| statuses.contexts.clone())
+        .unwrap_or_default();
+    required_checks.extend(
+        statuses
+            .as_ref()
+            .into_iter()
+            .flat_map(|statuses| statuses.checks.iter())
+            .map(|check| check.context.clone()),
+    );
+    Ok(GithubPolicyFacts {
+        required_approvals: reviews
+            .map(|reviews| {
+                reviews.required_approving_review_count.max(u64::from(
+                    reviews.require_code_owner_reviews || reviews.require_last_push_approval,
+                ))
+            })
+            .unwrap_or(0),
+        require_conversation_resolution: protection
+            .required_conversation_resolution
+            .map(|requirement| requirement.enabled)
+            .unwrap_or(false),
+        require_branch_up_to_date: statuses
+            .as_ref()
+            .map(|statuses| statuses.strict)
+            .unwrap_or(false),
+        required_checks: normalized_required_checks(&required_checks),
+        merge_queue_required: false,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubEvaluatedBranchRule {
+    #[serde(rename = "type")]
+    rule_type: String,
+    #[serde(default)]
+    parameters: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRulesetPullRequestParameters {
+    required_approving_review_count: u64,
+    required_review_thread_resolution: bool,
+    require_code_owner_review: bool,
+    require_last_push_approval: bool,
+    #[serde(default)]
+    required_reviewers: Vec<GithubRulesetRequiredReviewer>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRulesetRequiredReviewer {
+    minimum_approvals: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubRulesetStatusCheckParameters {
+    strict_required_status_checks_policy: bool,
+    required_status_checks: Vec<GithubRequiredStatusCheck>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GithubMergeQueueParameters {
+    #[serde(rename = "check_response_timeout_minutes")]
+    _check_response_timeout_minutes: u64,
+    #[serde(rename = "grouping_strategy")]
+    _grouping_strategy: String,
+    #[serde(rename = "max_entries_to_build")]
+    _max_entries_to_build: u64,
+    #[serde(rename = "max_entries_to_merge")]
+    _max_entries_to_merge: u64,
+    #[serde(rename = "merge_method")]
+    _merge_method: String,
+    #[serde(rename = "min_entries_to_merge")]
+    _min_entries_to_merge: u64,
+    #[serde(rename = "min_entries_to_merge_wait_minutes")]
+    _min_entries_to_merge_wait_minutes: u64,
+}
+
+fn parse_evaluated_branch_rules(raw: &str) -> Result<GithubPolicyFacts, String> {
+    let pages = serde_json::from_str::<Vec<Vec<GithubEvaluatedBranchRule>>>(raw)
+        .map_err(|error| format!("parse GitHub evaluated branch rules: {error}"))?;
+    if pages.is_empty() {
+        return Err(
+            "parse GitHub evaluated branch rules: missing paginated response envelope".to_string(),
+        );
+    }
+    let mut facts = GithubPolicyFacts::default();
+    for rule in pages.into_iter().flatten() {
+        match rule.rule_type.as_str() {
+            "pull_request" => {
+                let parameters = parse_rule_parameters::<GithubRulesetPullRequestParameters>(
+                    rule.parameters,
+                    "pull_request",
+                )?;
+                facts.required_approvals = facts
+                    .required_approvals
+                    .max(parameters.required_approving_review_count)
+                    .max(u64::from(
+                        parameters.require_code_owner_review
+                            || parameters.require_last_push_approval,
+                    ))
+                    .max(
+                        parameters
+                            .required_reviewers
+                            .iter()
+                            .map(|reviewer| reviewer.minimum_approvals)
+                            .max()
+                            .unwrap_or(0),
+                    );
+                facts.require_conversation_resolution |=
+                    parameters.required_review_thread_resolution;
+            }
+            "required_status_checks" => {
+                let parameters = parse_rule_parameters::<GithubRulesetStatusCheckParameters>(
+                    rule.parameters,
+                    "required_status_checks",
+                )?;
+                facts.require_branch_up_to_date |= parameters.strict_required_status_checks_policy;
+                facts.required_checks.extend(
+                    parameters
+                        .required_status_checks
+                        .into_iter()
+                        .map(|check| check.context),
+                );
+            }
+            "merge_queue" => {
+                let _parameters = parse_rule_parameters::<GithubMergeQueueParameters>(
+                    rule.parameters,
+                    "merge_queue",
+                )?;
+                facts.merge_queue_required = true;
+            }
+            "creation"
+            | "update"
+            | "deletion"
+            | "required_linear_history"
+            | "required_signatures"
+            | "non_fast_forward"
+            | "commit_message_pattern"
+            | "commit_author_email_pattern"
+            | "committer_email_pattern"
+            | "branch_name_pattern"
+            | "file_path_restriction"
+            | "max_file_path_length"
+            | "file_extension_restriction"
+            | "max_file_size" => {}
+            "workflows" | "required_deployments" | "code_scanning" => {
+                return Err(format!(
+                    "GitHub policy evidence is unknown: safety-relevant evaluated branch rule {} is not supported",
+                    rule.rule_type
+                ));
+            }
+            "" => {
+                return Err("parse GitHub evaluated branch rules: rule type is empty".to_string());
+            }
+            unsupported => {
+                return Err(format!(
+                    "GitHub policy evidence is unknown: unrecognized evaluated branch rule {unsupported}"
+                ));
+            }
+        }
+    }
+    facts.required_checks = normalized_required_checks(&facts.required_checks);
+    Ok(facts)
+}
+
+fn parse_rule_parameters<T: serde::de::DeserializeOwned>(
+    parameters: Option<serde_json::Value>,
+    rule_type: &str,
+) -> Result<T, String> {
+    let parameters = parameters.ok_or_else(|| {
+        format!("parse GitHub evaluated branch rules: {rule_type} rule is missing parameters")
+    })?;
+    serde_json::from_value(parameters).map_err(|error| {
+        format!("parse GitHub evaluated branch rules: malformed {rule_type} parameters: {error}")
+    })
+}
+
+fn encode_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    encoded
+}
 
 const PR_SUMMARY_INDEX_QUERY: &str = r#"
 query($owner: String!, $name: String!) {
   repository(owner: $owner, name: $name) {
     pullRequests(first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      pageInfo {
+        hasNextPage
+      }
       nodes {
         id
         number
@@ -2055,6 +2709,9 @@ query($owner: String!, $name: String!) {
         }
         updatedAt
         mergeStateStatus
+        mergeQueueEntry {
+          state
+        }
         merged
         isDraft
         comments {
@@ -2068,6 +2725,9 @@ query($owner: String!, $name: String!) {
             commit {
               statusCheckRollup {
                 contexts(first: 50) {
+                  pageInfo {
+                    hasNextPage
+                  }
                   nodes {
                     __typename
                     ... on CheckRun {
@@ -2162,9 +2822,27 @@ fn try_parse_pr_summary_index_for_repository(
     {
         return Err("parse GitHub PR summary index: missing pull request connection".to_string());
     }
+    if !value
+        .pointer("/data/repository/pullRequests/pageInfo/hasNextPage")
+        .is_some_and(serde_json::Value::is_boolean)
+    {
+        return Err("parse GitHub PR summary index: missing pull request pagination".to_string());
+    }
+    validate_pr_summary_check_pagination(&value)?;
     let response = serde_json::from_str::<GithubPrSummaryIndexResponse>(raw)
         .map_err(|error| format!("parse GitHub PR summary index: {error}"))?;
-    response
+    if response
+        .data
+        .repository
+        .pull_requests
+        .page_info
+        .has_next_page
+    {
+        return Err(
+            "GitHub PR summary index is truncated after the first 100 pull requests".to_string(),
+        );
+    }
+    let summaries = response
         .data
         .repository
         .pull_requests
@@ -2174,54 +2852,43 @@ fn try_parse_pr_summary_index_for_repository(
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| {
             "parse GitHub PR summary index: pull request is missing identity".to_string()
-        })
+        })?;
+    Ok(summaries)
 }
 
-pub(crate) fn parse_repo_policy(repo_remote: &str, raw: &str) -> Option<RepoPolicyCache> {
-    let response = serde_json::from_str::<GithubPrSummaryIndexResponse>(raw).ok()?;
-    let repository = response.data.repository;
-    let default_branch = (!repository.default_branch_ref.name.trim().is_empty())
-        .then_some(repository.default_branch_ref.name);
-    let selected_rule = select_branch_protection_rule(
-        &repository.branch_protection_rules.nodes,
-        default_branch.as_deref(),
-    );
-    Some(RepoPolicyCache {
-        repo_remote: repo_remote.to_string(),
-        provider: None,
-        canonical_host: None,
-        project_path: None,
-        target_branch: None,
-        identity_complete: false,
-        default_branch,
-        required_approvals: selected_rule
-            .map(|rule| rule.required_approving_review_count)
-            .unwrap_or(0),
-        require_conversation_resolution: selected_rule
-            .map(|rule| rule.requires_conversation_resolution)
-            .unwrap_or(false),
-        require_branch_up_to_date: selected_rule
-            .map(|rule| rule.requires_strict_status_checks)
-            .unwrap_or(false),
-        required_checks: selected_rule
-            .map(|rule| normalized_required_checks(&rule.required_status_check_contexts))
-            .unwrap_or_default(),
-        merge_queue_required: false,
-        refreshed_unix_ms: unix_seconds().max(0) as u64,
-        error: None,
-    })
-}
-
-fn select_branch_protection_rule<'a>(
-    rules: &'a [GithubBranchProtectionRule],
-    default_branch: Option<&str>,
-) -> Option<&'a GithubBranchProtectionRule> {
-    let default_branch = default_branch.unwrap_or_default();
-    rules
-        .iter()
-        .find(|rule| rule.pattern == default_branch)
-        .or_else(|| rules.iter().find(|rule| rule.pattern == "*"))
-        .or_else(|| rules.first())
+fn validate_pr_summary_check_pagination(value: &serde_json::Value) -> Result<(), String> {
+    let pull_requests = value
+        .pointer("/data/repository/pullRequests/nodes")
+        .and_then(serde_json::Value::as_array)
+        .expect("pull request nodes were validated above");
+    for pull_request in pull_requests {
+        let Some(commits) = pull_request
+            .pointer("/commits/nodes")
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        for commit in commits {
+            let Some(rollup) = commit.pointer("/commit/statusCheckRollup") else {
+                continue;
+            };
+            if rollup.is_null() {
+                continue;
+            }
+            let has_next_page = rollup
+                .pointer("/contexts/pageInfo/hasNextPage")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or_else(|| {
+                    "parse GitHub PR summary index: missing check rollup pagination".to_string()
+                })?;
+            if has_next_page {
+                return Err(
+                    "GitHub check rollup is truncated after the first 50 contexts".to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn normalized_required_checks(checks: &[String]) -> Vec<String> {
@@ -2241,9 +2908,31 @@ fn pr_summary_from_node(
     repository: Option<&crate::remote::RemoteRepositoryId>,
 ) -> Option<PrSummary> {
     let number = node.number?;
+    let queue_evidence = match &node.merge_queue_entry {
+        GithubMergeQueueObservation::NotObserved => Vec::new(),
+        GithubMergeQueueObservation::NotQueued => vec!["null".to_string()],
+        GithubMergeQueueObservation::Entry(entry) => vec![entry.state.clone()],
+    };
     Some(PrSummary {
         number,
         change_request_identity: github_change_request_identity(node, repository),
+        native_state_evidence: crate::remote::NativeStateEvidence {
+            lifecycle: crate::remote::NativeStateEvidence::retain([node.state.clone()]),
+            review: crate::remote::NativeStateEvidence::retain(node.review_decision.clone()),
+            mergeability: crate::remote::NativeStateEvidence::retain([node
+                .merge_state_status
+                .clone()]),
+            check: crate::remote::NativeStateEvidence::retain(
+                status_contexts_for_pr(node)
+                    .into_iter()
+                    .flat_map(|context| {
+                        [context.status, context.conclusion, context.state]
+                            .into_iter()
+                            .flatten()
+                    }),
+            ),
+            queue: crate::remote::NativeStateEvidence::retain(queue_evidence),
+        },
         title: node.title.clone(),
         author: node.author.login.clone(),
         body: node.body.clone(),
@@ -2260,8 +2949,16 @@ fn pr_summary_from_node(
         base_ref: node.base_ref_name.clone(),
         head_sha: node.head_ref_oid.clone(),
         updated_at: node.updated_at.clone(),
-        check_status: check_status_from_contexts(&status_contexts_for_pr(node)),
+        check_status: check_status_for_pr(node),
         merge_state_status: node.merge_state_status.clone(),
+        queue_state: match &node.merge_queue_entry {
+            GithubMergeQueueObservation::NotObserved => "unknown".to_string(),
+            GithubMergeQueueObservation::NotQueued => "not_queued".to_string(),
+            GithubMergeQueueObservation::Entry(entry) if !entry.state.trim().is_empty() => {
+                entry.state.clone()
+            }
+            GithubMergeQueueObservation::Entry(_) => "unknown".to_string(),
+        },
         comment_count: node.comments.total_count + node.review_threads.total_count,
         merged: merged_status_from_node(node),
         draft: node.is_draft,
@@ -2374,37 +3071,214 @@ fn fetch_pr_details(
     association: PrDetailsAssociation,
     config: &Config,
 ) -> Result<PrDetailsObservation, String> {
-    let pr_number = association.pr_number;
-    let head_sha = association.head_sha.as_str();
-    let fields = ["comments", "reviews", "files", "statusCheckRollup"].join(",");
-    let raw = run_capture_named(
-        Command::new(config.tool("gh"))
-            .arg("pr")
-            .arg("view")
-            .arg(branch)
-            .arg("--json")
-            .arg(fields)
-            .current_dir(path),
-        ProcessPolicy::NetworkQuery,
-        ProcessDescriptor::new("gh.pr.view"),
-    )?;
-    let details = try_parse_pr_details(&raw)?;
-    let review_comments = fetch_inline_review_comments(path, pr_number, config);
-    let ci_failures = if details.failing_checks.is_empty() {
-        Ok(Vec::new())
-    } else {
-        fetch_ci_failures(path, branch, head_sha, config)
+    let repository = match association.change_request_identity.as_ref() {
+        Some(identity) => identity
+            .target_repository()
+            .map_err(|error| format!("invalid canonical GitHub target repository: {error}"))?,
+        None => github_remote_repository_id(path, config, "origin")?,
     };
+    let details = fetch_pr_details_for_repository_number(
+        path,
+        config,
+        &repository,
+        association.pr_number,
+        branch,
+        &association.head_sha,
+    )?;
     Ok(PrDetailsObservation {
         association,
-        comments: Ok(details.comments),
-        reviews: Ok(details.reviews),
-        review_comments,
-        files: Ok(details.files),
-        failing_checks: Ok(details.failing_checks),
-        check_contexts: Ok(details.check_contexts),
-        ci_failures,
+        comments: details.comments,
+        reviews: details.reviews,
+        review_comments: details.review_comments,
+        files: details.files,
+        failing_checks: details.failing_checks,
+        check_contexts: details.check_contexts,
+        ci_failures: details.ci_failures,
+        partial_errors: details.partial_errors,
     })
+}
+
+pub(super) fn fetch_pr_details_for_repository_number(
+    path: &std::path::Path,
+    config: &Config,
+    repository: &crate::remote::RemoteRepositoryId,
+    pr_number: u64,
+    source_branch: &str,
+    head_sha: &str,
+) -> Result<ProviderDetailsObservation, String> {
+    if repository.provider() != crate::remote::ProviderKind::GitHub {
+        return Err("GitHub detail adapter requires a GitHub target repository".to_string());
+    }
+    let endpoint = |suffix: &str| github_repository_api_endpoint(repository, suffix);
+    let comments = fetch_paginated_github_array::<GhPrComment>(
+        path,
+        config,
+        repository,
+        &endpoint(&format!("issues/{pr_number}/comments?per_page=100"))?,
+        "pull request comments",
+    )
+    .map(|comments| parse_gh_comments(&comments));
+    let reviews = fetch_paginated_github_array::<GhPrReview>(
+        path,
+        config,
+        repository,
+        &endpoint(&format!("pulls/{pr_number}/reviews?per_page=100"))?,
+        "pull request reviews",
+    )
+    .map(|reviews| parse_gh_reviews(&reviews));
+    let files = fetch_paginated_github_array::<GhPrFile>(
+        path,
+        config,
+        repository,
+        &endpoint(&format!("pulls/{pr_number}/files?per_page=100"))?,
+        "pull request files",
+    )
+    .and_then(|files| {
+        // GitHub documents a hard ceiling of 3,000 files for this endpoint. At the ceiling
+        // pagination cannot prove that the observed set is complete.
+        if files.len() >= 3_000 {
+            return Err(
+                "GitHub pull request files reached the 3,000-file API completeness limit"
+                    .to_string(),
+            );
+        }
+        Ok(files
+            .into_iter()
+            .map(|file| file.path)
+            .filter(|path| !path.trim().is_empty())
+            .collect())
+    });
+    let review_comments = fetch_inline_review_comments(path, repository, pr_number, config);
+    let checks = fetch_complete_check_contexts(path, config, repository, head_sha);
+    let (failing_checks, check_contexts) = match checks {
+        Ok(contexts) => (
+            Ok(collect_failing_checks_from_contexts(&contexts)),
+            Ok(collect_check_contexts_from_contexts(&contexts)),
+        ),
+        Err(error) => (Err(error.clone()), Err(error)),
+    };
+    let ci_failures = match &failing_checks {
+        Ok(failing_checks) if !failing_checks.is_empty() => {
+            fetch_ci_failures(path, repository, source_branch, head_sha, config)
+        }
+        _ => Ok(Vec::new()),
+    };
+    Ok(ProviderDetailsObservation {
+        comments,
+        reviews,
+        review_comments,
+        files,
+        failing_checks,
+        check_contexts,
+        ci_failures,
+        partial_errors: Vec::new(),
+    })
+}
+
+fn github_repository_api_endpoint(
+    repository: &crate::remote::RemoteRepositoryId,
+    suffix: &str,
+) -> Result<String, String> {
+    let (owner, name) = repository
+        .project_path()
+        .split_once('/')
+        .filter(|(_, name)| !name.contains('/'))
+        .ok_or_else(|| "GitHub project path is malformed".to_string())?;
+    Ok(format!(
+        "/repos/{}/{}/{suffix}",
+        encode_path_segment(owner),
+        encode_path_segment(name)
+    ))
+}
+
+fn fetch_paginated_github_array<T: serde::de::DeserializeOwned>(
+    path: &std::path::Path,
+    config: &Config,
+    repository: &crate::remote::RemoteRepositoryId,
+    endpoint: &str,
+    label: &str,
+) -> Result<Vec<T>, String> {
+    let raw = run_capture_named(
+        Command::new(config.tool("gh"))
+            .args(github_policy_api_args(
+                &repository.host().to_string(),
+                &github_api_endpoint(config, repository.host(), endpoint),
+                true,
+            ))
+            .current_dir(path),
+        ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.api.paginated"),
+    )?;
+    let pages = serde_json::from_str::<Vec<Vec<T>>>(&raw)
+        .map_err(|error| format!("parse paginated GitHub {label}: {error}"))?;
+    if pages.is_empty() {
+        return Err(format!(
+            "parse paginated GitHub {label}: missing pagination envelope"
+        ));
+    }
+    Ok(pages.into_iter().flatten().collect())
+}
+
+fn fetch_complete_check_contexts(
+    path: &std::path::Path,
+    config: &Config,
+    repository: &crate::remote::RemoteRepositoryId,
+    head_sha: &str,
+) -> Result<Vec<GithubStatusContext>, String> {
+    if head_sha.trim().is_empty() {
+        return Err("GitHub checks cannot be fetched without a head SHA".to_string());
+    }
+    let check_runs_endpoint = github_repository_api_endpoint(
+        repository,
+        &format!(
+            "commits/{}/check-runs?per_page=100",
+            encode_path_segment(head_sha)
+        ),
+    )?;
+    let raw = run_capture_named(
+        Command::new(config.tool("gh"))
+            .args(github_policy_api_args(
+                &repository.host().to_string(),
+                &github_api_endpoint(config, repository.host(), &check_runs_endpoint),
+                true,
+            ))
+            .current_dir(path),
+        ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.api.check-runs"),
+    )?;
+    let pages = serde_json::from_str::<Vec<GhCheckRunsPage>>(&raw)
+        .map_err(|error| format!("parse paginated GitHub check runs: {error}"))?;
+    let Some(total_count) = pages.first().map(|page| page.total_count) else {
+        return Err("parse paginated GitHub check runs: missing pagination envelope".to_string());
+    };
+    if pages.iter().any(|page| page.total_count != total_count) {
+        return Err("GitHub check run pagination returned inconsistent totals".to_string());
+    }
+    let mut contexts = pages
+        .into_iter()
+        .flat_map(|page| page.check_runs)
+        .collect::<Vec<_>>();
+    if contexts.len() as u64 != total_count {
+        return Err(format!(
+            "GitHub returned only {} of {total_count} check runs",
+            contexts.len()
+        ));
+    }
+    let statuses_endpoint = github_repository_api_endpoint(
+        repository,
+        &format!(
+            "commits/{}/statuses?per_page=100",
+            encode_path_segment(head_sha)
+        ),
+    )?;
+    contexts.extend(fetch_paginated_github_array::<GithubStatusContext>(
+        path,
+        config,
+        repository,
+        &statuses_endpoint,
+        "commit statuses",
+    )?);
+    Ok(contexts)
 }
 
 #[cfg(test)]
@@ -2438,7 +3312,6 @@ fn try_parse_pr_details(raw: &str) -> Result<PrDetails, String> {
             .into_iter()
             .map(|file| file.path)
             .filter(|path| !path.trim().is_empty())
-            .take(8)
             .collect(),
         failing_checks,
         check_contexts,
@@ -2448,41 +3321,51 @@ fn try_parse_pr_details(raw: &str) -> Result<PrDetails, String> {
 
 fn fetch_ci_failures(
     path: &std::path::Path,
-    branch: &str,
+    repository: &crate::remote::RemoteRepositoryId,
+    _branch: &str,
     head_sha: &str,
     config: &Config,
 ) -> Result<Vec<CiFailure>, String> {
-    let output = run_output_allow_failure_named(
+    let endpoint = github_repository_api_endpoint(
+        repository,
+        &format!(
+            "actions/runs?head_sha={}&per_page=100",
+            encode_path_segment(head_sha)
+        ),
+    )?;
+    let raw = run_capture_named(
         Command::new(config.tool("gh"))
-            .arg("run")
-            .arg("list")
-            .arg("--branch")
-            .arg(branch)
-            .arg("--commit")
-            .arg(head_sha)
-            .arg("--limit")
-            .arg("20")
-            .arg("--json")
-            .arg("databaseId,workflowName,displayTitle,name,conclusion,status,headSha,url")
+            .args(github_policy_api_args(
+                &repository.host().to_string(),
+                &github_api_endpoint(config, repository.host(), &endpoint),
+                true,
+            ))
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
-        ProcessDescriptor::new("gh.run.list"),
+        ProcessDescriptor::new("gh.api.workflow-runs"),
     )?;
-    if !output.status.success() {
-        let message = output.stderr.trim();
-        return Err(if message.is_empty() {
-            format!("gh run list exited with {}", output.status)
-        } else {
-            format!("gh run list: {message}")
-        });
+    let pages = serde_json::from_str::<Vec<GhWorkflowRunsPage>>(&raw)
+        .map_err(|error| format!("parse paginated GitHub workflow runs: {error}"))?;
+    let Some(total_count) = pages.first().map(|page| page.total_count) else {
+        return Err(
+            "parse paginated GitHub workflow runs: missing pagination envelope".to_string(),
+        );
+    };
+    if pages.iter().any(|page| page.total_count != total_count) {
+        return Err("GitHub workflow run pagination returned inconsistent totals".to_string());
     }
-    let runs = serde_json::from_str::<Vec<GhRunListItem>>(&output.stdout)
-        .map_err(|error| format!("parse gh run list output: {error}"))?;
+    let runs = pages
+        .into_iter()
+        .flat_map(|page| page.workflow_runs)
+        .collect::<Vec<_>>();
+    if runs.len() as u64 != total_count {
+        return Err(format!(
+            "GitHub returned only {} of {total_count} workflow runs",
+            runs.len()
+        ));
+    }
     let mut failures = Vec::new();
     for run in runs {
-        if failures.len() >= 4 {
-            break;
-        }
         if !run.head_sha.trim().is_empty() && run.head_sha != head_sha {
             continue;
         }
@@ -2490,7 +3373,7 @@ fn fetch_ci_failures(
             continue;
         }
         let run_id = run.database_id.to_string();
-        let log_tail = fetch_failed_run_log_tail(path, &run_id, config)?;
+        let log_tail = fetch_failed_run_log_tail(path, repository, &run_id, config)?;
         failures.push(CiFailure {
             workflow: first_non_empty([run.workflow_name.as_str(), run.name.as_str()]),
             name: first_non_empty([run.display_title.as_str(), run.name.as_str()]),
@@ -2505,6 +3388,7 @@ fn fetch_ci_failures(
 
 fn fetch_failed_run_log_tail(
     path: &std::path::Path,
+    repository: &crate::remote::RemoteRepositoryId,
     run_id: &str,
     config: &Config,
 ) -> Result<String, String> {
@@ -2517,6 +3401,8 @@ fn fetch_failed_run_log_tail(
             .arg("view")
             .arg(run_id)
             .arg("--log-failed")
+            .arg("--repo")
+            .arg(gh_repository_selector(repository))
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.run.view"),
@@ -2530,6 +3416,14 @@ fn fetch_failed_run_log_tail(
         });
     }
     Ok(tail_lines(&strip_ansi(&output.stdout), 80))
+}
+
+fn gh_repository_selector(repository: &crate::remote::RemoteRepositoryId) -> String {
+    if repository.host().to_string() == "github.com" {
+        repository.project_path().to_string()
+    } else {
+        format!("{}/{}", repository.host(), repository.project_path())
+    }
 }
 
 fn is_failure_conclusion(value: &str) -> bool {
@@ -2547,14 +3441,18 @@ fn tail_lines(text: &str, max_lines: usize) -> String {
 
 fn fetch_inline_review_comments(
     path: &std::path::Path,
+    repository: &crate::remote::RemoteRepositoryId,
     pr_number: u64,
     config: &Config,
 ) -> Result<Vec<PrReviewComment>, String> {
-    let (owner, name) = github_owner_repo(path, config)?;
+    let (owner, name) = repository
+        .project_path()
+        .split_once('/')
+        .filter(|(_, name)| !name.contains('/'))
+        .ok_or_else(|| "GitHub project path is malformed".to_string())?;
     let raw = run_capture_named(
         Command::new(config.tool("gh"))
-            .arg("api")
-            .arg("graphql")
+            .args(github_graphql_api_args(config, repository.host()))
             .arg("-F")
             .arg(format!("owner={owner}"))
             .arg("-F")
@@ -2586,6 +3484,10 @@ query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
           id
           isResolved
           comments(first: 100) {
+            totalCount
+            pageInfo {
+              hasNextPage
+            }
             nodes {
               author {
                 login
@@ -2606,8 +3508,11 @@ query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
 "#;
 
 fn parse_pr_comments(details: &GhPrViewDetails) -> Vec<PrComment> {
-    details
-        .comments
+    parse_gh_comments(&details.comments)
+}
+
+fn parse_gh_comments(comments: &[GhPrComment]) -> Vec<PrComment> {
+    comments
         .iter()
         .map(|object| PrComment {
             id: object.id.clone(),
@@ -2616,13 +3521,15 @@ fn parse_pr_comments(details: &GhPrViewDetails) -> Vec<PrComment> {
             created_at: object.created_at.clone(),
         })
         .filter(|comment| !comment.body.trim().is_empty())
-        .take(20)
         .collect()
 }
 
 fn parse_pr_reviews(details: &GhPrViewDetails) -> Vec<PrReview> {
-    details
-        .reviews
+    parse_gh_reviews(&details.reviews)
+}
+
+fn parse_gh_reviews(reviews: &[GhPrReview]) -> Vec<PrReview> {
+    reviews
         .iter()
         .map(|object| PrReview {
             id: object.id.clone(),
@@ -2632,7 +3539,6 @@ fn parse_pr_reviews(details: &GhPrViewDetails) -> Vec<PrReview> {
             submitted_at: object.submitted_at.clone(),
         })
         .filter(|review| !review.state.trim().is_empty() || !review.body.trim().is_empty())
-        .take(20)
         .collect()
 }
 
@@ -2716,9 +3622,13 @@ fn try_parse_review_thread_comments(raw: &str) -> Result<Vec<PrReviewComment>, S
         serde_json::Value::Array(pages) => pages,
         page => vec![page],
     };
+    if pages.is_empty() {
+        return Err("parse GitHub review threads: missing pagination envelope".to_string());
+    }
+    let page_count = pages.len();
     let mut review_threads = Vec::new();
-    let mut total_count = 0;
-    for page in pages {
+    let mut total_count = None;
+    for (page_index, page) in pages.into_iter().enumerate() {
         if !page
             .pointer("/data/repository/pullRequest/reviewThreads/nodes")
             .is_some_and(serde_json::Value::is_array)
@@ -2727,13 +3637,66 @@ fn try_parse_review_thread_comments(raw: &str) -> Result<Vec<PrReviewComment>, S
                 "parse GitHub review threads: missing review thread connection".to_string(),
             );
         }
+        let Some(page_total_count) = page
+            .pointer("/data/repository/pullRequest/reviewThreads/totalCount")
+            .and_then(serde_json::Value::as_u64)
+        else {
+            return Err("parse GitHub review threads: missing total count".to_string());
+        };
+        let Some(has_next_page) = page
+            .pointer("/data/repository/pullRequest/reviewThreads/pageInfo/hasNextPage")
+            .and_then(serde_json::Value::as_bool)
+        else {
+            return Err("parse GitHub review threads: missing pagination metadata".to_string());
+        };
+        if has_next_page != (page_index + 1 < page_count) {
+            return Err("parse GitHub review threads: incomplete pagination sequence".to_string());
+        }
+        if total_count
+            .replace(page_total_count)
+            .is_some_and(|total| total != page_total_count)
+        {
+            return Err("parse GitHub review threads: inconsistent total count".to_string());
+        }
+        let Some(threads) = page
+            .pointer("/data/repository/pullRequest/reviewThreads/nodes")
+            .and_then(serde_json::Value::as_array)
+        else {
+            unreachable!("review thread nodes were validated above");
+        };
+        for thread in threads {
+            let Some(comment_count) = thread
+                .pointer("/comments/totalCount")
+                .and_then(serde_json::Value::as_u64)
+            else {
+                return Err("parse GitHub review threads: missing thread comment count".to_string());
+            };
+            let Some(comments_have_next_page) = thread
+                .pointer("/comments/pageInfo/hasNextPage")
+                .and_then(serde_json::Value::as_bool)
+            else {
+                return Err(
+                    "parse GitHub review threads: missing thread comment pagination".to_string(),
+                );
+            };
+            let observed_comments = thread
+                .pointer("/comments/nodes")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            if comments_have_next_page || observed_comments as u64 != comment_count {
+                return Err(format!(
+                    "GitHub returned only {observed_comments} of {comment_count} comments for a review thread"
+                ));
+            }
+        }
         let response = serde_json::from_value::<GithubPrSummaryIndexResponse>(page)
             .map_err(|error| format!("parse GitHub review threads: {error}"))?;
         let page_threads = response.data.repository.pull_request.review_threads;
-        total_count = total_count.max(page_threads.total_count);
         review_threads.extend(page_threads.nodes);
     }
-    if total_count > review_threads.len() as u64 {
+    let total_count = total_count.unwrap_or(0);
+    if total_count != review_threads.len() as u64 {
         return Err(format!(
             "GitHub returned only {} of {} review threads",
             review_threads.len(),
@@ -2741,7 +3704,28 @@ fn try_parse_review_thread_comments(raw: &str) -> Result<Vec<PrReviewComment>, S
         ));
     }
     let mut comments = Vec::new();
+    let mut observed_thread_ids = Vec::new();
     for thread in review_threads {
+        if thread.id.trim().is_empty()
+            || observed_thread_ids
+                .iter()
+                .any(|observed| observed == &thread.id)
+        {
+            return Err(
+                "parse GitHub review threads: missing or duplicate thread identity".to_string(),
+            );
+        }
+        observed_thread_ids.push(thread.id.clone());
+        if thread.comments.page_info.has_next_page
+            || thread.comments.total_count != thread.comments.nodes.len() as u64
+        {
+            return Err(format!(
+                "GitHub returned only {} of {} comments for review thread {}",
+                thread.comments.nodes.len(),
+                thread.comments.total_count,
+                thread.id
+            ));
+        }
         for object in thread.comments.nodes {
             let comment = PrReviewComment {
                 thread_id: thread.id.clone(),
@@ -2822,23 +3806,33 @@ fn check_status_from_contexts(contexts: &[GithubStatusContext]) -> String {
 }
 
 fn collect_failing_checks(rollup: &GithubStatusCheckRollup) -> Vec<String> {
-    status_contexts_from_rollup(rollup)
-        .into_iter()
+    collect_failing_checks_from_contexts(&status_contexts_from_rollup(rollup))
+}
+
+fn collect_failing_checks_from_contexts(contexts: &[GithubStatusContext]) -> Vec<String> {
+    contexts
+        .iter()
         .filter_map(|context| {
-            matches!(
-                context.conclusion.as_deref().unwrap_or_default(),
-                "FAILURE" | "CANCELLED" | "TIMED_OUT" | "ACTION_REQUIRED"
-            )
-            .then(|| context.name.or(context.context))
+            (context
+                .conclusion
+                .as_deref()
+                .is_some_and(is_failure_conclusion)
+                || context.state.as_deref().is_some_and(|state| {
+                    matches!(state.to_ascii_uppercase().as_str(), "FAILURE" | "ERROR")
+                }))
+            .then(|| context.name.clone().or_else(|| context.context.clone()))
             .flatten()
         })
-        .take(8)
         .collect()
 }
 
 fn collect_check_contexts(rollup: &GithubStatusCheckRollup) -> Vec<PrCheckContext> {
-    status_contexts_from_rollup(rollup)
-        .into_iter()
+    collect_check_contexts_from_contexts(&status_contexts_from_rollup(rollup))
+}
+
+fn collect_check_contexts_from_contexts(contexts: &[GithubStatusContext]) -> Vec<PrCheckContext> {
+    contexts
+        .iter()
         .filter_map(|context| {
             let name = context.name.clone().or(context.context.clone())?;
             let name = name.trim().to_string();
@@ -2847,10 +3841,9 @@ fn collect_check_contexts(rollup: &GithubStatusCheckRollup) -> Vec<PrCheckContex
             }
             Some(PrCheckContext {
                 name,
-                state: check_context_state(&context),
+                state: check_context_state(context),
             })
         })
-        .take(64)
         .collect()
 }
 
@@ -2931,16 +3924,30 @@ fn merged_status_from_node(node: &GithubPullRequest) -> bool {
 }
 
 fn status_contexts_for_pr(node: &GithubPullRequest) -> Vec<GithubStatusContext> {
-    if !node.status_check_rollup.contexts.nodes.is_empty()
-        || !node.status_check_rollup.nodes.is_empty()
-    {
+    if node.status_check_rollup.observed {
         return status_contexts_from_rollup(&node.status_check_rollup);
     }
     node.commits
         .nodes
         .iter()
+        .filter(|node| node.commit.status_check_rollup.observed)
         .flat_map(|node| status_contexts_from_rollup(&node.commit.status_check_rollup))
         .collect()
+}
+
+fn check_status_for_pr(node: &GithubPullRequest) -> String {
+    let observed = node.status_check_rollup.observed
+        || node
+            .commits
+            .nodes
+            .iter()
+            .any(|node| node.commit.status_check_rollup.observed);
+    let contexts = status_contexts_for_pr(node);
+    if observed && contexts.is_empty() {
+        "passed".to_string()
+    } else {
+        check_status_from_contexts(&contexts)
+    }
 }
 
 fn status_contexts_from_rollup(rollup: &GithubStatusCheckRollup) -> Vec<GithubStatusContext> {
@@ -3030,12 +4037,14 @@ pub(crate) fn migrate_pr_cache_schema(conn: &rusqlite::Connection) -> Result<(),
           updated_at text not null,
           check_status text not null,
           merge_state_status text not null default '',
+          queue_state text not null default '',
           comment_count integer not null default 0,
           merged integer not null,
           draft integer not null,
           last_refreshed text not null,
           refreshed_unix_ms integer not null,
-          observation_error text
+          observation_error text,
+          native_state_evidence text not null default '{}'
         );
 
         create table if not exists pr_details_cache (
@@ -3081,6 +4090,24 @@ pub(crate) fn migrate_pr_cache_schema(conn: &rusqlite::Connection) -> Result<(),
           refreshed_unix_ms integer not null,
           error text
         );
+
+        create table if not exists repo_policy_cache_v2 (
+          provider text not null,
+          canonical_host text not null,
+          project_path text not null,
+          project_path_key text not null default '',
+          target_branch text not null,
+          repo_remote text not null,
+          default_branch text,
+          required_approvals integer not null default 0,
+          require_conversation_resolution integer not null default 0,
+          require_branch_up_to_date integer not null default 0,
+          required_checks text not null default '[]',
+          merge_queue_required integer not null default 0,
+          refreshed_unix_ms integer not null,
+          error text,
+          primary key (provider, canonical_host, project_path, target_branch)
+        );
         ",
     )
     .map_err(|error| format!("create PR cache schema: {error}"))?;
@@ -3112,12 +4139,26 @@ pub(crate) fn migrate_pr_cache_schema(conn: &rusqlite::Connection) -> Result<(),
         )
         .map_err(|error| format!("migrate pr_cache merge_state_status column: {error}"))?;
     }
+    if !table_has_column(conn, "pr_cache", "queue_state")? {
+        conn.execute(
+            "alter table pr_cache add column queue_state text not null default ''",
+            [],
+        )
+        .map_err(|error| format!("migrate pr_cache queue_state column: {error}"))?;
+    }
     if !table_has_column(conn, "pr_cache", "requested_reviewers")? {
         conn.execute(
             "alter table pr_cache add column requested_reviewers text not null default ''",
             [],
         )
         .map_err(|error| format!("migrate pr_cache requested_reviewers column: {error}"))?;
+    }
+    if !table_has_column(conn, "pr_cache", "native_state_evidence")? {
+        conn.execute(
+            "alter table pr_cache add column native_state_evidence text not null default '{}'",
+            [],
+        )
+        .map_err(|error| format!("migrate pr_cache native_state_evidence column: {error}"))?;
     }
     if !table_has_column(conn, "pr_details_cache", "ci_failures")? {
         conn.execute(
@@ -3206,6 +4247,41 @@ pub(crate) fn migrate_pr_cache_schema(conn: &rusqlite::Connection) -> Result<(),
             .map_err(|error| format!("migrate {table} {column} column: {error}"))?;
         }
     }
+    if !table_has_column(conn, "repo_policy_cache_v2", "project_path_key")? {
+        conn.execute(
+            "alter table repo_policy_cache_v2 add column project_path_key text not null default ''",
+            [],
+        )
+        .map_err(|error| format!("migrate repository policy project path key: {error}"))?;
+    }
+    conn.execute(
+        "update repo_policy_cache_v2
+            set project_path_key = case when provider = 'github' then lower(project_path) else project_path end
+          where project_path_key = '' or project_path_key != case when provider = 'github' then lower(project_path) else project_path end",
+        [],
+    )
+    .map_err(|error| format!("normalize repository policy project path keys: {error}"))?;
+    conn.execute(
+        "delete from repo_policy_cache_v2
+          where rowid in (
+            select rowid from (
+              select rowid,
+                     row_number() over (
+                       partition by provider, canonical_host, project_path_key, target_branch
+                       order by refreshed_unix_ms desc, rowid desc
+                     ) as duplicate_rank
+                from repo_policy_cache_v2
+            ) where duplicate_rank > 1
+          )",
+        [],
+    )
+    .map_err(|error| format!("deduplicate repository policy project path keys: {error}"))?;
+    conn.execute(
+        "create unique index if not exists repo_policy_cache_v2_identity_key
+             on repo_policy_cache_v2(provider, canonical_host, project_path_key, target_branch)",
+        [],
+    )
+    .map_err(|error| format!("index repository policy project path keys: {error}"))?;
     backfill_legacy_remote_identity(conn)?;
     Ok(())
 }
@@ -3365,11 +4441,19 @@ fn load_pr_details_cache_record(
                     }
                     _ => None,
                 };
-                let errors = row
+                let observation_messages = row
                     .get::<_, Option<String>>(9)?
                     .filter(|error| !error.is_empty())
-                    .into_iter()
-                    .collect();
+                    .unwrap_or_default();
+                let mut errors = Vec::new();
+                let mut warnings = Vec::new();
+                for message in observation_messages.lines() {
+                    if let Some(warning) = message.strip_prefix("warning:") {
+                        warnings.push(warning.to_string());
+                    } else if !message.is_empty() {
+                        errors.push(message.to_string());
+                    }
+                }
                 Ok(PersistedPrDetails {
                     details: PrDetails {
                         comments: decode_pr_comments(&row.get::<_, String>(0)?),
@@ -3382,6 +4466,7 @@ fn load_pr_details_cache_record(
                     },
                     association,
                     errors,
+                    warnings,
                 })
             },
         )
@@ -3421,7 +4506,7 @@ pub(crate) fn save_pr_details_cache(
         )
         .map_err(|error| format!("read PR summary association: {error}"))
     })?;
-    save_pr_details_cache_for_association(repo, branch, details, &association, &[])
+    save_pr_details_cache_for_association(repo, branch, details, &association, &[], &[])
 }
 
 fn save_pr_details_cache_for_association(
@@ -3430,6 +4515,7 @@ fn save_pr_details_cache_for_association(
     details: &PrDetails,
     association: &PrDetailsAssociation,
     errors: &[String],
+    warnings: &[String],
 ) -> Result<(), String> {
     observability::with_writable_db(repo, |conn| {
         let identity = association.change_request_identity.as_ref();
@@ -3489,7 +4575,14 @@ fn save_pr_details_cache_for_association(
                 encode_ci_failures(&details.ci_failures),
                 encode_check_contexts(&details.check_contexts),
                 unix_seconds(),
-                (!errors.is_empty()).then(|| errors.join("\n")),
+                (!errors.is_empty() || !warnings.is_empty()).then(|| {
+                    errors
+                        .iter()
+                        .cloned()
+                        .chain(warnings.iter().map(|warning| format!("warning:{warning}")))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }),
             ],
         )
         .map_err(|error| format!("write PR details cache: {error}"))?;
@@ -3527,9 +4620,9 @@ pub fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result
                 target_provider, target_canonical_host, target_project_path, identity_complete,
                 title, author, body, url, state, review_decision, requested_reviewers,
                 head_ref, base_ref, head_sha, updated_at, check_status, merge_state_status,
-                comment_count, merged, draft, last_refreshed, refreshed_unix_ms,
-                observation_error
-             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33)
+                queue_state, comment_count, merged, draft, last_refreshed, refreshed_unix_ms,
+                observation_error, native_state_evidence
+             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35)
               on conflict(branch) do update set
                 number = excluded.number,
                 provider = excluded.provider,
@@ -3557,12 +4650,14 @@ pub fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result
                 updated_at = excluded.updated_at,
                 check_status = excluded.check_status,
                 merge_state_status = excluded.merge_state_status,
+                queue_state = excluded.queue_state,
                 comment_count = excluded.comment_count,
                 merged = excluded.merged,
                 draft = excluded.draft,
                 last_refreshed = excluded.last_refreshed,
                 refreshed_unix_ms = excluded.refreshed_unix_ms,
-                observation_error = excluded.observation_error",
+                observation_error = excluded.observation_error,
+                native_state_evidence = excluded.native_state_evidence",
             params![
                 branch,
                 number,
@@ -3591,12 +4686,14 @@ pub fn save_pr_cache(repo: &Repository, branch: &str, cache: &PrCache) -> Result
                 summary.updated_at.as_str(),
                 summary.check_status.as_str(),
                 summary.merge_state_status.as_str(),
+                summary.queue_state.as_str(),
                 comment_count,
                 summary.merged,
                 summary.draft,
                 cache.last_refreshed.as_deref().unwrap_or(""),
                 unix_seconds(),
                 cache.summary_error.as_deref(),
+                encode_native_state_evidence(&summary.native_state_evidence),
             ],
         )
         .map_err(|error| format!("write PR cache: {error}"))?;
@@ -3609,6 +4706,51 @@ pub(crate) fn save_repo_policy_cache(
     policy: &RepoPolicyCache,
 ) -> Result<(), String> {
     observability::with_writable_db(repo, |conn| {
+        if policy.identity_complete
+            && let (Some(provider), Some(canonical_host), Some(project_path), Some(target_branch)) = (
+                policy.provider,
+                policy.canonical_host.as_deref(),
+                policy.project_path.as_deref(),
+                policy.target_branch.as_deref(),
+            )
+        {
+            conn.execute(
+                "insert into repo_policy_cache_v2 (
+                    provider, canonical_host, project_path, project_path_key, target_branch, repo_remote,
+                    default_branch, required_approvals, require_conversation_resolution,
+                    require_branch_up_to_date, required_checks, merge_queue_required,
+                    refreshed_unix_ms, error
+                 ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                  on conflict(provider, canonical_host, project_path_key, target_branch) do update set
+                    project_path = excluded.project_path,
+                    repo_remote = excluded.repo_remote,
+                    default_branch = excluded.default_branch,
+                    required_approvals = excluded.required_approvals,
+                    require_conversation_resolution = excluded.require_conversation_resolution,
+                    require_branch_up_to_date = excluded.require_branch_up_to_date,
+                    required_checks = excluded.required_checks,
+                    merge_queue_required = excluded.merge_queue_required,
+                    refreshed_unix_ms = excluded.refreshed_unix_ms,
+                    error = excluded.error",
+                params![
+                    provider.config_label(),
+                    canonical_host,
+                    project_path,
+                    repo_policy_project_path_key(provider, project_path),
+                    target_branch,
+                    policy.repo_remote.as_str(),
+                    policy.default_branch.as_deref(),
+                    sqlite_i64(policy.required_approvals, "required approvals")?,
+                    policy.require_conversation_resolution,
+                    policy.require_branch_up_to_date,
+                    encode_string_values(&policy.required_checks),
+                    policy.merge_queue_required,
+                    sqlite_i64(policy.refreshed_unix_ms, "policy refresh time")?,
+                    policy.error.as_deref(),
+                ],
+            )
+            .map_err(|error| format!("write identity-keyed repo policy cache: {error}"))?;
+        }
         conn.execute(
             "insert into repo_policy_cache (
                 repo_remote, provider, canonical_host, project_path, target_branch,
@@ -3654,6 +4796,14 @@ pub(crate) fn save_repo_policy_cache(
 
 fn encode_requested_reviewers(reviewers: &[String]) -> String {
     reviewers.join("\n")
+}
+
+fn encode_native_state_evidence(evidence: &crate::remote::NativeStateEvidence) -> String {
+    serde_json::to_string(evidence).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn decode_native_state_evidence(raw: &str) -> crate::remote::NativeStateEvidence {
+    serde_json::from_str(raw).unwrap_or_default()
 }
 
 fn decode_requested_reviewers(value: &str) -> Vec<String> {
@@ -3889,6 +5039,7 @@ mod tests {
         assert!(table_has_column(&conn, "pr_details_cache", "head_sha").unwrap());
         assert!(table_has_column(&conn, "pr_cache", "native_cr_id").unwrap());
         assert!(table_has_column(&conn, "pr_cache", "identity_complete").unwrap());
+        assert!(table_has_column(&conn, "pr_cache", "native_state_evidence").unwrap());
         assert!(table_has_column(&conn, "pr_details_cache", "target_project_path").unwrap());
         assert!(table_has_column(&conn, "repo_policy_cache", "target_branch").unwrap());
         let old_row = conn
@@ -3905,6 +5056,15 @@ mod tests {
             )
             .unwrap();
         assert_eq!(old_row, ("Old row".to_string(), String::new(), 0));
+        assert_eq!(
+            conn.query_row(
+                "select native_state_evidence from pr_cache where branch = 'feature'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "{}"
+        );
         let association = conn
             .query_row(
                 "select pr_number, head_sha from pr_details_cache where branch = 'feature'",
@@ -4002,6 +5162,69 @@ mod tests {
     }
 
     #[test]
+    fn migration_normalizes_and_deduplicates_github_policy_identity_keys_only() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            create table repo_policy_cache_v2 (
+              provider text not null,
+              canonical_host text not null,
+              project_path text not null,
+              target_branch text not null,
+              repo_remote text not null,
+              default_branch text,
+              required_approvals integer not null default 0,
+              require_conversation_resolution integer not null default 0,
+              require_branch_up_to_date integer not null default 0,
+              required_checks text not null default '[]',
+              merge_queue_required integer not null default 0,
+              refreshed_unix_ms integer not null,
+              error text,
+              primary key (provider, canonical_host, project_path, target_branch)
+            );
+            insert into repo_policy_cache_v2 values
+              ('github', 'github.com', 'acme/widget', 'main', 'acme/widget', 'main', 1, 0, 0, '[]', 0, 10, null),
+              ('github', 'github.com', 'Acme/Widget', 'main', 'Acme/Widget', 'main', 2, 0, 0, '[]', 0, 20, null),
+              ('gitlab', 'gitlab.com', 'acme/widget', 'main', 'acme/widget', 'main', 3, 0, 0, '[]', 0, 30, null),
+              ('gitlab', 'gitlab.com', 'Acme/Widget', 'main', 'Acme/Widget', 'main', 4, 0, 0, '[]', 0, 40, null);
+            ",
+        )
+        .unwrap();
+
+        migrate_pr_cache_schema(&conn).unwrap();
+        migrate_pr_cache_schema(&conn).unwrap();
+
+        let github = conn
+            .query_row(
+                "select count(*), project_path, project_path_key, required_approvals
+                   from repo_policy_cache_v2 where provider = 'github'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            github,
+            (1, "Acme/Widget".to_string(), "acme/widget".to_string(), 2)
+        );
+        assert_eq!(
+            conn.query_row(
+                "select count(*) from repo_policy_cache_v2 where provider = 'gitlab'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            2
+        );
+    }
+
+    #[test]
     fn direct_and_index_summary_paths_produce_equivalent_cache_facts() {
         let temp = unique_temp_dir("prism-pr-equivalent-summary-paths");
         fs::create_dir_all(&temp).unwrap();
@@ -4014,8 +5237,20 @@ mod tests {
             temp.join("index-config"),
         );
         let config = test_config();
-        let old_summary = test_summary("feature", "head-a", 1);
-        let new_summary = test_summary("feature", "head-a", 2);
+        let identity = test_identity(
+            crate::remote::ProviderKind::GitHub,
+            "github.com",
+            "example/repo",
+            "PR_equivalent",
+        );
+        let old_summary = PrSummary {
+            change_request_identity: Some(identity.clone()),
+            ..test_summary("feature", "head-a", 1)
+        };
+        let new_summary = PrSummary {
+            change_request_identity: Some(identity),
+            ..test_summary("feature", "head-a", 2)
+        };
         let details = PrDetails {
             comments: vec![PrComment {
                 body: "preserved".to_string(),
@@ -4270,6 +5505,45 @@ exit 0
     }
 
     #[test]
+    fn empty_check_rollup_is_authoritative_no_ci_but_missing_rollup_is_unknown() {
+        for rollup in ["[]", "null", r#"{"contexts":{"nodes":[]}}"#] {
+            let raw = format!(
+                r#"{{
+                    "number": 42,
+                    "state": "OPEN",
+                    "statusCheckRollup": {rollup}
+                }}"#
+            );
+            let node = serde_json::from_str::<GithubPullRequest>(&raw).unwrap();
+            let summary = pr_summary_from_node(&node, None).unwrap();
+
+            assert_eq!(summary.check_state(), PrCheckState::Success);
+        }
+
+        let node =
+            serde_json::from_str::<GithubPullRequest>(r#"{"number":42,"state":"OPEN"}"#).unwrap();
+        let summary = pr_summary_from_node(&node, None).unwrap();
+        assert_eq!(summary.check_state(), PrCheckState::Unknown);
+    }
+
+    #[test]
+    fn malformed_or_truncated_check_rollup_is_unknown_evidence() {
+        for raw in [
+            r#"{"number":42,"state":"OPEN","statusCheckRollup":{}}"#,
+            r#"{"number":42,"state":"OPEN","statusCheckRollup":{"contexts":{}}}"#,
+            r#"{"number":42,"state":"OPEN","statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":true},"nodes":[]}}}"#,
+        ] {
+            assert!(serde_json::from_str::<GithubPullRequest>(raw).is_err());
+        }
+        let capped = serde_json::json!({
+            "number": 42,
+            "state": "OPEN",
+            "statusCheckRollup": vec![serde_json::json!({"name": "check"}); 100]
+        });
+        assert!(serde_json::from_value::<GithubPullRequest>(capped).is_err());
+    }
+
+    #[test]
     fn check_state_normalizes_display_labels_for_workflow_decisions() {
         assert_eq!(PrCheckState::from_label("running"), PrCheckState::Pending);
         assert_eq!(PrCheckState::from_label("pending"), PrCheckState::Pending);
@@ -4281,15 +5555,141 @@ exit 0
     }
 
     #[test]
+    fn rest_check_failures_are_detected_case_insensitively() {
+        let contexts = vec![
+            GithubStatusContext {
+                name: Some("check-run".to_string()),
+                conclusion: Some("failure".to_string()),
+                ..GithubStatusContext::default()
+            },
+            GithubStatusContext {
+                context: Some("commit-status".to_string()),
+                state: Some("error".to_string()),
+                ..GithubStatusContext::default()
+            },
+        ];
+
+        assert_eq!(
+            collect_failing_checks_from_contexts(&contexts),
+            ["check-run", "commit-status"]
+        );
+    }
+
+    #[test]
     fn resolve_review_thread_args_target_exact_thread_id() {
-        let args = resolve_review_thread_args("PRRT_thread_1");
+        let host = crate::remote::HostIdentity::new("github.example.com", None).unwrap();
+        let config = crate::test_support::test_config();
+        let args = resolve_review_thread_args(&config, &host, "PRRT_thread_1");
 
         assert_eq!(args[0], "api");
         assert_eq!(args[1], "graphql");
+        assert!(
+            args.windows(2).any(|pair| {
+                pair == ["--hostname".to_string(), "github.example.com".to_string()]
+            })
+        );
         assert!(args.contains(&"thread=PRRT_thread_1".to_string()));
         assert!(args
             .iter()
             .any(|arg| arg.contains("resolveReviewThread") && arg.contains("threadId: $thread")));
+    }
+
+    #[test]
+    fn configured_api_override_uses_full_rest_and_graphql_endpoints_with_canonical_host() {
+        let host = crate::remote::HostIdentity::new("github.example.com", None).unwrap();
+        let mut config = crate::test_support::test_config();
+        config.remote_hosts.insert(
+            "github.example.com".to_string(),
+            crate::config::RemoteHostConfig {
+                provider: crate::remote::ProviderKind::GitHub,
+                web_url: None,
+                api_url: Some("https://broker.example.com/github/api/v3".to_string()),
+                credential_env: None,
+                allow_http: false,
+            },
+        );
+
+        let graphql = github_graphql_api_args(&config, &host);
+        let rest = github_api_endpoint(&config, &host, "/repos/Acme/Widget");
+
+        assert_eq!(graphql[1], "https://broker.example.com/github/api/graphql");
+        assert!(
+            graphql.windows(2).any(|pair| {
+                pair == ["--hostname".to_string(), "github.example.com".to_string()]
+            })
+        );
+        assert_eq!(
+            rest,
+            "https://broker.example.com/github/api/v3/repos/Acme/Widget"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ghes_summary_graphql_uses_the_canonical_hostname() {
+        let temp = unique_temp_dir("prism-ghes-summary-host");
+        fs::create_dir_all(&temp).unwrap();
+        let gh = temp.join("gh");
+        let log = temp.join("gh.log");
+        write_executable(
+            &gh,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nprintf '%s\\n' '{{\"data\":{{\"repository\":{{\"pullRequests\":{{\"nodes\":[],\"pageInfo\":{{\"hasNextPage\":false}}}}}}}}}}'\n",
+                log.display()
+            ),
+        );
+        let mut config = test_config();
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+        let repository = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.example.com", None).unwrap(),
+            "Acme/Widget",
+        )
+        .unwrap();
+
+        assert!(
+            fetch_pr_summary_index_for_repository(&temp, &config, &repository)
+                .unwrap()
+                .is_empty()
+        );
+        let command = fs::read_to_string(log).unwrap();
+        assert!(command.contains("api graphql --hostname github.example.com"));
+        assert!(command.contains("owner=Acme"));
+        assert!(command.contains("name=Widget"));
+
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ghes_review_thread_mutation_uses_the_canonical_hostname() {
+        let temp = unique_temp_dir("prism-ghes-thread-host");
+        fs::create_dir_all(&temp).unwrap();
+        let gh = temp.join("gh");
+        let log = temp.join("gh.log");
+        write_executable(
+            &gh,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nprintf '%s\\n' '{{\"data\":{{\"resolveReviewThread\":{{\"thread\":{{\"id\":\"PRRT_1\",\"isResolved\":true}}}}}}}}'\n",
+                log.display()
+            ),
+        );
+        let mut config = test_config();
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+        let host = crate::remote::HostIdentity::new("github.example.com", None).unwrap();
+
+        resolve_review_thread(&temp, &config, &host, "PRRT_1").unwrap();
+
+        assert!(
+            fs::read_to_string(log)
+                .unwrap()
+                .contains("api graphql --hostname github.example.com")
+        );
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
@@ -4390,6 +5790,13 @@ exit 0
         let summary = PrSummary {
             number: 42,
             change_request_identity: Some(crate::remote::test_change_request_identity()),
+            native_state_evidence: crate::remote::NativeStateEvidence {
+                lifecycle: vec!["OPEN".to_string()],
+                review: vec!["CHANGES_REQUESTED".to_string()],
+                mergeability: vec!["CLEAN".to_string()],
+                check: vec!["COMPLETED".to_string(), "FAILURE".to_string()],
+                queue: vec!["PREPARING".to_string()],
+            },
             title: "Fix review".to_string(),
             author: "author".to_string(),
             body: "Body with \"quotes\"".to_string(),
@@ -4403,6 +5810,7 @@ exit 0
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             check_status: "failed".to_string(),
             merge_state_status: "CLEAN".to_string(),
+            queue_state: "preparing_merged_result".to_string(),
             comment_count: 2,
             merged: false,
             draft: false,
@@ -4452,6 +5860,14 @@ exit 0
         save_pr_cache(&repo, "feature", &cache).unwrap();
         save_pr_details_cache(&repo, "feature", cache.details().unwrap()).unwrap();
         let loaded = load_pr_cache(&repo, "feature");
+        assert_eq!(
+            loaded.summary().unwrap().queue_state,
+            "preparing_merged_result"
+        );
+        assert_eq!(
+            loaded.summary().unwrap().native_state_evidence,
+            cache.summary().unwrap().native_state_evidence
+        );
         let prism_dir = repo.prism_dir();
 
         assert_eq!(loaded.summary().unwrap().number, 42);
@@ -4538,6 +5954,7 @@ exit 0
             &details,
             &PrDetailsAssociation::from_summary(&summary),
             &["review threads: unavailable".to_string()],
+            &[],
         )
         .unwrap();
         let partial = load_pr_cache(&repo, "feature");
@@ -4689,6 +6106,7 @@ exit 0
             failing_checks: Ok(Vec::new()),
             check_contexts: Ok(Vec::new()),
             ci_failures: Ok(Vec::new()),
+            partial_errors: Vec::new(),
         }
     }
 
@@ -4794,7 +6212,7 @@ exit 0
     }
 
     #[test]
-    fn partial_ci_log_failure_preserves_previous_logs() {
+    fn unavailable_ci_logs_preserve_previous_logs_without_poisoning_other_details() {
         let (temp, repo, mut cache, summary) = persisted_cache_with_observed_details();
         let mut observation = successful_details_observation_for(&summary);
         observation.ci_failures = Err("logs unavailable".to_string());
@@ -4807,14 +6225,19 @@ exit 0
         ));
 
         assert_eq!(cache.details().unwrap().ci_failures[0].log_tail, "old log");
-        assert!(cache.trusted_details().is_err());
+        assert!(cache.trusted_details().is_ok());
+        assert!(
+            cache
+                .display_error()
+                .is_some_and(|error| error.contains("CI logs unavailable: logs unavailable"))
+        );
         let loaded = load_pr_cache(&repo, "feature");
         assert_eq!(loaded.details().unwrap().ci_failures[0].run_id, "old-run");
         assert_eq!(loaded.details().unwrap().ci_failures[0].log_tail, "");
         assert!(
             loaded
                 .display_error()
-                .is_some_and(|error| error.contains("CI logs: logs unavailable"))
+                .is_some_and(|error| error.contains("CI logs unavailable: logs unavailable"))
         );
         assert!(loaded.trusted_details().is_err());
 
@@ -5151,6 +6574,55 @@ exit 0
     }
 
     #[test]
+    fn canonical_cached_pr_survives_restart_on_a_synthetic_local_branch() {
+        let temp = unique_temp_dir("prism-synthetic-canonical-pr-test");
+        fs::create_dir_all(&temp).unwrap();
+        let git = temp.join("git");
+        write_executable(
+            &git,
+            "#!/bin/sh\ncase \"$*\" in *\"remote get-url origin\"*) printf 'https://github.com/example/repo.git\\n' ;; *) printf 'local-head\\n' ;; esac\n",
+        );
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut config = test_config();
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        let mut summary = test_summary("provider-topic", "remote-head", 1);
+        summary.change_request_identity = Some(test_identity(
+            crate::remote::ProviderKind::GitHub,
+            "github.com",
+            "example/repo",
+            "PR_canonical",
+        ));
+        let details = PrDetails {
+            comments: vec![PrComment {
+                body: "persisted association".to_string(),
+                ..PrComment::default()
+            }],
+            ..PrDetails::default()
+        };
+        let cache = PrCache::observed(summary.clone(), Some(details));
+        persist_pr_cache_snapshot(&repo, "pr-42", &cache).unwrap();
+
+        let loaded = load_pr_cache_for_branch(&repo, &config, "pr-42", &temp);
+
+        assert_eq!(loaded.summary(), Some(&summary));
+        assert_eq!(
+            loaded.details().unwrap().comments[0].body,
+            "persisted association"
+        );
+        let mut session = test_session("pr-42", loaded);
+        session.path = temp.clone();
+        assert_eq!(
+            resolve_pr_summary_for_session(&session, &config, &[summary.clone()]),
+            Some(summary)
+        );
+
+        let _ = fs::remove_dir_all(repo.prism_dir());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn known_open_pr_is_preserved_while_local_repair_is_unpushed() {
         let temp = unique_temp_dir("prism-known-open-pr-local-divergence-test");
         fs::create_dir_all(&temp).unwrap();
@@ -5164,7 +6636,15 @@ exit 0
         config
             .tools
             .insert("git".to_string(), git.display().to_string());
-        let summary = test_summary("feature", "remote-pr-head", 0);
+        let summary = PrSummary {
+            change_request_identity: Some(test_identity(
+                crate::remote::ProviderKind::GitHub,
+                "github.com",
+                "example/repo",
+                "PR_local_repair",
+            )),
+            ..test_summary("feature", "remote-pr-head", 0)
+        };
         let mut sessions = vec![test_session(
             "feature",
             PrCache::observed(summary.clone(), None),
@@ -5195,6 +6675,7 @@ exit 0
           "data": {
             "repository": {
               "pullRequests": {
+                "pageInfo": {"hasNextPage": false},
                 "nodes": [
                   {
                     "number": 9,
@@ -5225,6 +6706,7 @@ exit 0
                           "commit": {
                             "statusCheckRollup": {
                               "contexts": {
+                                "pageInfo": {"hasNextPage": false},
                                 "nodes": [
                                   {
                                     "__typename": "StatusContext",
@@ -5259,6 +6741,45 @@ exit 0
     }
 
     #[test]
+    fn graphql_queue_state_distinguishes_native_entry_absence_and_unobserved() {
+        let queued = try_parse_pr_summary_index(
+            r#"{"data":{"repository":{"pullRequests":{"nodes":[{"number":42,"mergeQueueEntry":{"state":"AWAITING_CHECKS"}}],"pageInfo":{"hasNextPage":false}}}}}"#,
+        )
+        .unwrap();
+        let not_queued = try_parse_pr_summary_index(
+            r#"{"data":{"repository":{"pullRequests":{"nodes":[{"number":42,"mergeQueueEntry":null}],"pageInfo":{"hasNextPage":false}}}}}"#,
+        )
+        .unwrap();
+        let direct: GithubPullRequest = serde_json::from_str(r#"{"number":42}"#).unwrap();
+
+        assert_eq!(queued[0].queue_state, "AWAITING_CHECKS");
+        assert_eq!(not_queued[0].queue_state, "not_queued");
+        assert_eq!(
+            pr_summary_from_node(&direct, None).unwrap().queue_state,
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn graphql_summary_index_preserves_unknown_lifecycle_without_dropping_other_items() {
+        let raw = r#"{
+          "data": {"repository": {"pullRequests": {
+            "pageInfo": {"hasNextPage": false},
+            "nodes": [
+              {"number": 9, "state": "OPEN"},
+              {"number": 10, "state": "SUPERSEDED_BY_TRAIN"}
+            ]
+          }}}
+        }"#;
+
+        let summaries = try_parse_pr_summary_index(raw).unwrap();
+
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].state, "OPEN");
+        assert_eq!(summaries[1].state, "SUPERSEDED_BY_TRAIN");
+    }
+
+    #[test]
     fn incomplete_graphql_summary_index_is_an_observation_failure() {
         let raw = r#"{"data":{"repository":{}}}"#;
 
@@ -5266,43 +6787,300 @@ exit 0
     }
 
     #[test]
-    fn parses_repo_policy_for_default_branch_rule() {
-        let raw = r#"{
-          "data": {
-            "repository": {
-              "defaultBranchRef": {"name": "main"},
-              "branchProtectionRules": {
-                "nodes": [
-                  {
-                    "pattern": "release/*",
-                    "requiredApprovingReviewCount": 2,
-                    "requiresConversationResolution": false,
-                    "requiresStrictStatusChecks": false,
-                    "requiredStatusCheckContexts": ["release"]
-                  },
-                  {
-                    "pattern": "main",
-                    "requiredApprovingReviewCount": 1,
-                    "requiresConversationResolution": true,
-                    "requiresStrictStatusChecks": true,
-                    "requiredStatusCheckContexts": ["ci", "ci", " lint ", ""]
-                  }
-                ]
-              }
-            }
-          }
-        }"#;
+    fn truncated_graphql_summary_index_is_a_reported_failure() {
+        let raw = include_str!("../../tests/fixtures/remote/github/summary-truncated.json");
+        let error = try_parse_pr_summary_index(raw).unwrap_err();
+        let summary = test_summary("feature", "abc123", 0);
+        let mut cache = PrCache::observed(summary.clone(), None);
+        let poll_started_at = Instant::now();
+        cache.begin_summary_poll(poll_started_at);
 
-        let policy = parse_repo_policy("owner/repo", raw).unwrap();
+        assert!(apply_pr_summary_poll_result(
+            &mut cache,
+            poll_started_at,
+            Err(error.clone()),
+            "not refreshed",
+        ));
 
-        assert_eq!(policy.repo_remote, "owner/repo");
-        assert_eq!(policy.default_branch.as_deref(), Some("main"));
-        assert_eq!(policy.required_approvals, 1);
+        assert!(error.contains("first 100"));
+        assert_eq!(cache.summary(), Some(&summary));
+        assert_eq!(
+            cache.summary_observation_quality(),
+            PrObservationQuality::PreservedStale
+        );
+        assert_eq!(cache.display_error(), Some(error.as_str()));
+        assert!(cache.trusted_summary().is_err());
+    }
+
+    #[test]
+    fn incomplete_or_truncated_graphql_check_rollup_is_rejected() {
+        let response = |page_info: &str| {
+            format!(
+                r#"{{"data":{{"repository":{{"pullRequests":{{
+                    "pageInfo":{{"hasNextPage":false}},
+                    "nodes":[{{"number":1,"state":"OPEN","commits":{{"nodes":[{{"commit":{{
+                        "statusCheckRollup":{{"contexts":{{{page_info}"nodes":[]}}}}
+                    }}}}]}}}}]
+                }}}}}}}}"#
+            )
+        };
+
+        assert!(
+            try_parse_pr_summary_index(&response(""))
+                .unwrap_err()
+                .contains("missing check rollup")
+        );
+        assert!(
+            try_parse_pr_summary_index(&response(r#""pageInfo":{"hasNextPage":true},"#))
+                .unwrap_err()
+                .contains("first 50")
+        );
+    }
+
+    #[test]
+    fn parses_classic_branch_protection_without_discarding_checks_shape() {
+        let facts = parse_classic_branch_protection(
+            r#"{
+                "url":"https://api.github.com/repos/owner/repo/branches/main/protection",
+                "required_pull_request_reviews":{"required_approving_review_count":0,"require_code_owner_reviews":true},
+                "required_status_checks":{
+                    "strict":true,
+                    "contexts":["ci", " lint ", ""],
+                    "checks":[{"context":"ci"}, {"context":"build"}]
+                },
+                "required_conversation_resolution":{"enabled":true}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(facts.required_approvals, 1);
+        assert!(facts.require_conversation_resolution);
+        assert!(facts.require_branch_up_to_date);
+        assert_eq!(facts.required_checks, ["ci", "lint", "build"]);
+        assert!(!facts.merge_queue_required);
+        assert!(parse_classic_branch_protection("{}").is_err());
+    }
+
+    #[test]
+    fn fetches_and_combines_exact_branch_classic_and_evaluated_ruleset_policy() {
+        let temp = unique_temp_dir("prism-github-exact-policy");
+        fs::create_dir_all(&temp).unwrap();
+        let gh = temp.join("gh");
+        let log = temp.join("gh.log");
+        write_executable(
+            &gh,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *'/repos/owner/repo/branches/release%2Fnext/protection'*)
+    printf '%s\n' '{{"url":"https://api.github.com/repos/owner/repo/branches/release%2Fnext/protection","required_pull_request_reviews":{{"required_approving_review_count":1}},"required_status_checks":{{"strict":false,"contexts":["classic-ci"]}},"required_conversation_resolution":{{"enabled":true}}}}'
+    ;;
+  *'/repos/owner/repo/rules/branches/release%2Fnext?per_page=100'*)
+    printf '%s\n' '[[{{"type":"pull_request","parameters":{{"required_approving_review_count":2,"required_review_thread_resolution":false,"require_code_owner_review":false,"require_last_push_approval":false}}}},{{"type":"required_status_checks","parameters":{{"strict_required_status_checks_policy":true,"required_status_checks":[{{"context":"ruleset-ci"}}]}}}},{{"type":"merge_queue","parameters":{{"check_response_timeout_minutes":60,"grouping_strategy":"ALLGREEN","max_entries_to_build":5,"max_entries_to_merge":5,"merge_method":"SQUASH","min_entries_to_merge":1,"min_entries_to_merge_wait_minutes":0}}}}]]'
+    ;;
+  *)
+    printf '%s\n' 'unexpected gh command' >&2
+    exit 1
+    ;;
+esac
+"#,
+                log.display()
+            ),
+        );
+        let mut config = test_config();
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+        let repository = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.com", None).unwrap(),
+            "owner/repo",
+        )
+        .unwrap();
+
+        let policy = fetch_repo_policy(&temp, &config, &repository, "release/next").unwrap();
+
+        assert_eq!(policy.target_branch.as_deref(), Some("release/next"));
+        assert_eq!(policy.required_approvals, 2);
         assert!(policy.require_conversation_resolution);
         assert!(policy.require_branch_up_to_date);
-        assert_eq!(policy.required_checks, vec!["ci", "lint"]);
+        assert_eq!(policy.required_checks, ["classic-ci", "ruleset-ci"]);
+        assert!(policy.merge_queue_required);
+        assert!(policy.error.is_none());
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(commands.contains("--paginate --slurp"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn authoritative_unprotected_and_empty_rulesets_produce_known_empty_policy() {
+        let temp = unique_temp_dir("prism-github-empty-policy");
+        fs::create_dir_all(&temp).unwrap();
+        let gh = temp.join("gh");
+        write_executable(
+            &gh,
+            r#"#!/bin/sh
+case "$*" in
+  *'/protection'*)
+    printf '%s\n' 'gh: Branch not protected (HTTP 404)' >&2
+    exit 1
+    ;;
+  *'/rules/branches/'*)
+    printf '%s\n' '[[]]'
+    ;;
+  *) exit 1 ;;
+esac
+"#,
+        );
+        let mut config = test_config();
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+        let repository = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.com", None).unwrap(),
+            "owner/repo",
+        )
+        .unwrap();
+
+        let policy = fetch_repo_policy(&temp, &config, &repository, "main").unwrap();
+
+        assert_eq!(policy.required_approvals, 0);
+        assert!(policy.required_checks.is_empty());
         assert!(!policy.merge_queue_required);
         assert!(policy.error.is_none());
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn evaluated_rules_require_paginated_envelope_and_complete_parameters() {
+        assert!(parse_evaluated_branch_rules("[]").is_err());
+        assert!(parse_evaluated_branch_rules(r#"[{"type":"merge_queue"}]"#).is_err());
+        assert!(parse_evaluated_branch_rules(r#"[[{"type":"merge_queue"}]]"#).is_err());
+        assert!(
+            parse_evaluated_branch_rules(r#"[[{"type":"required_status_checks"}]]"#)
+                .unwrap_err()
+                .contains("missing parameters")
+        );
+        assert!(
+            parse_evaluated_branch_rules(
+                r#"[[{"type":"pull_request","parameters":{"required_approving_review_count":"one"}}]]"#,
+            )
+            .unwrap_err()
+            .contains("malformed pull_request")
+        );
+    }
+
+    #[test]
+    fn evaluated_rules_ignore_known_non_merge_constraints() {
+        let facts = parse_evaluated_branch_rules(
+            r#"[[
+                {"type":"required_linear_history"},
+                {"type":"required_signatures"},
+                {"type":"commit_message_pattern","parameters":{"operator":"starts_with"}}
+            ]]"#,
+        )
+        .unwrap();
+
+        assert_eq!(facts.required_approvals, 0);
+        assert!(facts.required_checks.is_empty());
+        assert!(!facts.merge_queue_required);
+    }
+
+    #[test]
+    fn safety_relevant_and_unknown_rules_produce_unknown_policy_evidence() {
+        for rule_type in [
+            "workflows",
+            "required_deployments",
+            "code_scanning",
+            "future_rule",
+        ] {
+            let raw = format!(r#"[[{{"type":"{rule_type}"}}]]"#);
+            let error = parse_evaluated_branch_rules(&raw).unwrap_err();
+
+            assert!(error.contains("policy evidence is unknown"));
+            assert!(error.contains(rule_type));
+            assert!(!error.contains("malformed"));
+        }
+    }
+
+    #[test]
+    fn only_explicit_unprotected_404_is_authoritative_classic_absence() {
+        assert!(is_unprotected_branch_response(
+            "gh: Branch not protected (HTTP 404)"
+        ));
+        assert!(!is_unprotected_branch_response(
+            "gh: Branch not found (HTTP 404)"
+        ));
+        assert!(!is_unprotected_branch_response(
+            "gh: Resource not accessible by integration (HTTP 403)"
+        ));
+    }
+
+    #[test]
+    fn failed_policy_refresh_preserves_identity_matched_stale_facts() {
+        let temp = unique_temp_dir("prism-github-stale-policy-refresh");
+        fs::create_dir_all(&temp).unwrap();
+        let gh = temp.join("gh");
+        write_executable(&gh, "#!/bin/sh\necho 'policy unavailable' >&2\nexit 1\n");
+        let git = temp.join("git");
+        write_executable(
+            &git,
+            "#!/bin/sh\nprintf 'https://github.com/owner/repo.git\\n'\n",
+        );
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut config = test_config();
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        let stale = RepoPolicyCache {
+            repo_remote: "owner/repo".to_string(),
+            provider: Some(crate::remote::ProviderKind::GitHub),
+            canonical_host: Some("github.com".to_string()),
+            project_path: Some("owner/repo".to_string()),
+            target_branch: Some("main".to_string()),
+            identity_complete: true,
+            default_branch: Some("main".to_string()),
+            required_approvals: 2,
+            require_conversation_resolution: true,
+            require_branch_up_to_date: true,
+            required_checks: vec!["ci".to_string()],
+            merge_queue_required: true,
+            refreshed_unix_ms: 123,
+            error: None,
+        };
+        save_repo_policy_cache(&repo, &stale).unwrap();
+
+        let refreshed = refresh_repo_policy_cache(&repo, &temp, &config).unwrap();
+
+        assert_eq!(refreshed.required_approvals, stale.required_approvals);
+        assert_eq!(refreshed.required_checks, stale.required_checks);
+        assert_eq!(
+            refreshed.require_conversation_resolution,
+            stale.require_conversation_resolution
+        );
+        assert_eq!(
+            refreshed.require_branch_up_to_date,
+            stale.require_branch_up_to_date
+        );
+        assert_eq!(refreshed.merge_queue_required, stale.merge_queue_required);
+        assert_eq!(refreshed.refreshed_unix_ms, stale.refreshed_unix_ms);
+        assert!(
+            refreshed
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("policy unavailable"))
+        );
+        assert_eq!(load_repo_policy_cache(&repo, "owner/repo"), Some(refreshed));
+
+        let _ = fs::remove_dir_all(repo.prism_dir());
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -5366,6 +7144,94 @@ exit 0
     }
 
     #[test]
+    fn repo_policy_cache_keeps_distinct_target_branches_under_one_identity() {
+        let temp = unique_temp_dir("prism-repo-policy-identity-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let repository = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitLab,
+            crate::remote::HostIdentity::new("gitlab.example.com", Some(8443)).unwrap(),
+            "owner/repo",
+        )
+        .unwrap();
+        let policy = |target: &str, approvals: u64| RepoPolicyCache {
+            repo_remote: "owner/repo".to_string(),
+            provider: Some(crate::remote::ProviderKind::GitLab),
+            canonical_host: Some("gitlab.example.com:8443".to_string()),
+            project_path: Some("owner/repo".to_string()),
+            target_branch: Some(target.to_string()),
+            identity_complete: true,
+            default_branch: Some("main".to_string()),
+            required_approvals: approvals,
+            refreshed_unix_ms: approvals,
+            ..RepoPolicyCache::default()
+        };
+
+        save_repo_policy_cache(&repo, &policy("main", 1)).unwrap();
+        save_repo_policy_cache(&repo, &policy("release/next", 2)).unwrap();
+
+        assert_eq!(
+            load_repo_policy_cache_for_identity(&repo, &repository, "main")
+                .unwrap()
+                .required_approvals,
+            1
+        );
+        assert_eq!(
+            load_repo_policy_cache_for_identity(&repo, &repository, "release/next")
+                .unwrap()
+                .required_approvals,
+            2
+        );
+
+        let _ = fs::remove_dir_all(repo.prism_dir());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn github_policy_identity_queries_and_upserts_use_normalized_path_keys() {
+        let temp = unique_temp_dir("prism-github-policy-case-key-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let policy = |project_path: &str, approvals: u64| RepoPolicyCache {
+            repo_remote: project_path.to_string(),
+            provider: Some(crate::remote::ProviderKind::GitHub),
+            canonical_host: Some("github.com".to_string()),
+            project_path: Some(project_path.to_string()),
+            target_branch: Some("main".to_string()),
+            identity_complete: true,
+            default_branch: Some("main".to_string()),
+            required_approvals: approvals,
+            refreshed_unix_ms: approvals,
+            ..RepoPolicyCache::default()
+        };
+        save_repo_policy_cache(&repo, &policy("Acme/Widget", 1)).unwrap();
+        save_repo_policy_cache(&repo, &policy("acme/widget", 2)).unwrap();
+        let lowercase = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.com", None).unwrap(),
+            "ACME/WIDGET",
+        )
+        .unwrap();
+
+        let loaded = load_repo_policy_cache_for_identity(&repo, &lowercase, "main").unwrap();
+        let count = observability::with_writable_db(&repo, |conn| {
+            conn.query_row(
+                "select count(*) from repo_policy_cache_v2 where provider = 'github'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())
+        })
+        .unwrap();
+
+        assert_eq!(loaded.required_approvals, 2);
+        assert_eq!(loaded.project_path.as_deref(), Some("acme/widget"));
+        assert_eq!(count, 1);
+        let _ = fs::remove_dir_all(repo.prism_dir());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn parses_requested_reviewers_from_gh_pr_view() {
         let raw = r#"{
           "reviewRequests": [
@@ -5418,13 +7284,17 @@ exit 0
         let raw = r#"{
           "data": {
             "repository": {
-              "pullRequest": {
-                "reviewThreads": {
-                  "nodes": [
+                "pullRequest": {
+                  "reviewThreads": {
+                    "totalCount": 2,
+                    "pageInfo": {"hasNextPage": false},
+                    "nodes": [
                     {
                       "id": "PRRT_kw123",
                       "isResolved": true,
                       "comments": {
+                        "totalCount": 1,
+                        "pageInfo": {"hasNextPage": false},
                         "nodes": [
                           {
                             "id": "PRRC_kw123",
@@ -5441,6 +7311,8 @@ exit 0
                       "id": "PRRT_kw456",
                       "isResolved": false,
                       "comments": {
+                        "totalCount": 1,
+                        "pageInfo": {"hasNextPage": false},
                         "nodes": [
                           {
                             "id": "PRRC_kw456",
@@ -5485,11 +7357,12 @@ exit 0
               "pullRequest": {
                 "reviewThreads": {
                   "totalCount": 2,
+                  "pageInfo": {"hasNextPage": false},
                   "nodes": [
                     {
                       "id": "PRRT_kw123",
                       "isResolved": false,
-                      "comments": {"nodes": []}
+                      "comments": {"totalCount": 0, "pageInfo": {"hasNextPage": false}, "nodes": []}
                     }
                   ]
                 }
@@ -5510,20 +7383,22 @@ exit 0
           {
             "data": {"repository": {"pullRequest": {"reviewThreads": {
               "totalCount": 2,
+              "pageInfo": {"hasNextPage": true},
               "nodes": [{
                 "id": "PRRT_1",
                 "isResolved": false,
-                "comments": {"nodes": [{"id": "C1", "body": "one"}]}
+                "comments": {"totalCount": 1, "pageInfo": {"hasNextPage": false}, "nodes": [{"id": "C1", "body": "one"}]}
               }]
             }}}}
           },
           {
             "data": {"repository": {"pullRequest": {"reviewThreads": {
               "totalCount": 2,
+              "pageInfo": {"hasNextPage": false},
               "nodes": [{
                 "id": "PRRT_2",
                 "isResolved": false,
-                "comments": {"nodes": [{"id": "C2", "body": "two"}]}
+                "comments": {"totalCount": 1, "pageInfo": {"hasNextPage": false}, "nodes": [{"id": "C2", "body": "two"}]}
               }]
             }}}}
           }
@@ -5534,6 +7409,102 @@ exit 0
         assert_eq!(comments.len(), 2);
         assert_eq!(comments[0].thread_id, "PRRT_1");
         assert_eq!(comments[1].thread_id, "PRRT_2");
+    }
+
+    #[test]
+    fn rejects_truncated_comments_inside_a_review_thread() {
+        let raw = r#"[{
+          "data": {"repository": {"pullRequest": {"reviewThreads": {
+            "totalCount": 1,
+            "pageInfo": {"hasNextPage": false},
+            "nodes": [{
+              "id": "PRRT_1",
+              "isResolved": false,
+              "comments": {
+                "totalCount": 101,
+                "pageInfo": {"hasNextPage": true},
+                "nodes": [{"id": "C1", "body": "one"}]
+              }
+            }]
+          }}}}
+        }]"#;
+
+        let error = try_parse_review_thread_comments(raw).unwrap_err();
+
+        assert!(error.contains("only 1 of 101 comments"));
+    }
+
+    #[test]
+    fn canonical_target_number_details_use_complete_paginated_endpoints() {
+        let temp = unique_temp_dir("prism-github-paginated-details");
+        fs::create_dir_all(&temp).unwrap();
+        let gh = temp.join("gh");
+        let log = temp.join("gh.log");
+        write_executable(
+            &gh,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *'/repos/target/repo/issues/42/comments?per_page=100'*)
+    printf '%s\n' '[[{{"id":"C1","body":"one","user":{{"login":"alice"}}}}],[{{"id":"C2","body":"two","user":{{"login":"bob"}}}}]]'
+    ;;
+  *'/repos/target/repo/pulls/42/reviews?per_page=100'*)
+    printf '%s\n' '[[{{"id":"R1","state":"APPROVED","user":{{"login":"reviewer"}}}}]]'
+    ;;
+  *'/repos/target/repo/pulls/42/files?per_page=100'*)
+    printf '%s\n' '[[{{"filename":"src/one.rs"}}],[{{"filename":"src/two.rs"}}]]'
+    ;;
+  *'/repos/target/repo/commits/head-sha/check-runs?per_page=100'*)
+    printf '%s\n' '[{{"total_count":1,"check_runs":[{{"name":"build","status":"completed","conclusion":"success"}}]}}]'
+    ;;
+  *'/repos/target/repo/commits/head-sha/statuses?per_page=100'*)
+    printf '%s\n' '[[{{"context":"legacy-ci","state":"success"}}]]'
+    ;;
+  *'api graphql'*)
+    printf '%s\n' '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}]'
+    ;;
+  *)
+    printf '%s\n' 'unexpected gh command' >&2
+    exit 1
+    ;;
+esac
+"#,
+                log.display()
+            ),
+        );
+        let mut config = test_config();
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+        let repository = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.com", None).unwrap(),
+            "target/repo",
+        )
+        .unwrap();
+
+        let details = fetch_pr_details_for_repository_number(
+            &temp,
+            &config,
+            &repository,
+            42,
+            "synthetic-local-branch",
+            "head-sha",
+        )
+        .unwrap();
+
+        assert_eq!(details.comments.unwrap().len(), 2);
+        assert_eq!(details.reviews.unwrap().len(), 1);
+        assert_eq!(details.files.unwrap(), ["src/one.rs", "src/two.rs"]);
+        assert!(details.review_comments.unwrap().is_empty());
+        assert!(details.failing_checks.unwrap().is_empty());
+        assert_eq!(details.check_contexts.unwrap().len(), 2);
+        let commands = fs::read_to_string(log).unwrap();
+        assert_eq!(commands.matches("--paginate --slurp").count(), 6);
+        assert!(!commands.contains("synthetic-local-branch"));
+
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -5613,6 +7584,89 @@ JSON
     }
 
     #[test]
+    fn fetch_pr_summary_preserves_unknown_native_lifecycle() {
+        let temp = unique_temp_dir("prism-gh-unknown-summary-test");
+        let bin = temp.join("bin");
+        let repo = temp.join("repo");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&repo).unwrap();
+        let gh = bin.join("gh");
+        let git = bin.join("git");
+        write_executable(
+            &gh,
+            r#"#!/bin/sh
+cat <<'JSON'
+{
+  "number": 7,
+  "id": "PR_test",
+  "title": "Test PR",
+  "state": "SUPERSEDED_BY_TRAIN",
+  "headRefName": "feature",
+  "baseRefName": "main",
+  "headRefOid": "abc123",
+  "headRepository": {"nameWithOwner": "example/repo"},
+  "statusCheckRollup": []
+}
+JSON
+"#,
+        );
+        write_executable(
+            &git,
+            "#!/bin/sh\nprintf 'https://github.com/example/repo.git\\n'\n",
+        );
+        let mut config = test_config();
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+
+        let summary = fetch_pr_summary(&repo, "feature", &config)
+            .unwrap()
+            .unwrap()
+            .0;
+
+        assert_eq!(summary.state, "SUPERSEDED_BY_TRAIN");
+        assert!(!summary.merged);
+        assert_eq!(
+            summary.native_state_evidence.lifecycle,
+            ["SUPERSEDED_BY_TRAIN"]
+        );
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn github_summary_retains_known_lossy_and_future_native_states() {
+        let node: GithubPullRequest = serde_json::from_str(
+            r#"{
+                "number":42,
+                "state":"OPEN",
+                "reviewDecision":"REVIEW_REQUIRED",
+                "mergeStateStatus":"HAS_HOOKS",
+                "statusCheckRollup":[
+                    {"name":"build","status":"COMPLETED","conclusion":"NEUTRAL"},
+                    {"context":"future","state":"NEW_CHECK_STATE"}
+                ],
+                "mergeQueueEntry":{"state":"AWAITING_CHECKS"}
+            }"#,
+        )
+        .unwrap();
+
+        let summary = pr_summary_from_node(&node, None).unwrap();
+
+        assert_eq!(summary.native_state_evidence.lifecycle, ["OPEN"]);
+        assert_eq!(summary.native_state_evidence.review, ["REVIEW_REQUIRED"]);
+        assert_eq!(summary.native_state_evidence.mergeability, ["HAS_HOOKS"]);
+        assert_eq!(
+            summary.native_state_evidence.check,
+            ["COMPLETED", "NEUTRAL", "NEW_CHECK_STATE"]
+        );
+        assert_eq!(summary.native_state_evidence.queue, ["AWAITING_CHECKS"]);
+    }
+
+    #[test]
     fn closed_unmerged_request_does_not_match_a_worktree() {
         let mut summary = test_summary("feature", "head123", 0);
         summary.state = "CLOSED".to_string();
@@ -5620,10 +7674,162 @@ JSON
         assert!(!pr_summary_matches_worktree(
             &summary,
             "feature",
-            std::path::Path::new("/not-consulted"),
-            &test_config(),
             Some(&summary),
+            None,
+            None,
         ));
+    }
+
+    #[test]
+    fn initial_association_requires_origin_push_source_and_exact_local_head() {
+        let origin_push = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.example.com", None).unwrap(),
+            "Contributor/Widget",
+        )
+        .unwrap();
+        let target = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.example.com", None).unwrap(),
+            "Acme/Widget",
+        )
+        .unwrap();
+        let unrelated = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.example.com", None).unwrap(),
+            "Other/Widget",
+        )
+        .unwrap();
+        let native = crate::remote::NativeChangeRequestId::new("PR_42").unwrap();
+        let mut summary = test_summary("topic", "head-42", 0);
+        summary.change_request_identity = Some(crate::remote::CanonicalChangeRequestIdentity::new(
+            &target, &native, &unrelated, &target,
+        ));
+
+        assert!(!pr_summary_matches_worktree(
+            &summary,
+            "topic",
+            None,
+            Some(&origin_push),
+            Some("head-42"),
+        ));
+
+        summary.change_request_identity = Some(crate::remote::CanonicalChangeRequestIdentity::new(
+            &target,
+            &native,
+            &crate::remote::RemoteRepositoryId::new(
+                crate::remote::ProviderKind::GitHub,
+                crate::remote::HostIdentity::new("github.example.com", None).unwrap(),
+                "contributor/widget",
+            )
+            .unwrap(),
+            &target,
+        ));
+        assert!(!pr_summary_matches_worktree(
+            &summary,
+            "topic",
+            None,
+            Some(&origin_push),
+            Some("different-head"),
+        ));
+        assert!(pr_summary_matches_worktree(
+            &summary,
+            "topic",
+            None,
+            Some(&origin_push),
+            Some("head-42"),
+        ));
+    }
+
+    #[test]
+    fn explicit_cached_target_pr_preserves_maintainer_fork_association() {
+        let host = crate::remote::HostIdentity::new("github.com", None).unwrap();
+        let source = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            host.clone(),
+            "contributor/widget",
+        )
+        .unwrap();
+        let target = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            host,
+            "acme/widget",
+        )
+        .unwrap();
+        let identity = crate::remote::CanonicalChangeRequestIdentity::new(
+            &target,
+            &crate::remote::NativeChangeRequestId::new("PR_fork").unwrap(),
+            &source,
+            &target,
+        );
+        let known = PrSummary {
+            change_request_identity: Some(identity.clone()),
+            ..test_summary("contributor-topic", "remote-head", 0)
+        };
+        let observed = PrSummary {
+            head_sha: "advanced-remote-head".to_string(),
+            ..known.clone()
+        };
+        let maintainer_origin = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.com", None).unwrap(),
+            "acme/widget",
+        )
+        .unwrap();
+
+        assert!(pr_summary_matches_worktree(
+            &observed,
+            "pr/42",
+            Some(&known),
+            Some(&maintainer_origin),
+            Some("local-repair"),
+        ));
+    }
+
+    #[test]
+    fn unknown_lifecycle_poll_preserves_matching_canonical_session_association() {
+        let identity = test_identity(
+            crate::remote::ProviderKind::GitHub,
+            "github.com",
+            "example/repo",
+            "PR_42",
+        );
+        let mut known = test_summary("provider-feature", "head123", 0);
+        known.change_request_identity = Some(identity.clone());
+        let mut observed = known.clone();
+        observed.state = "SUPERSEDED_BY_TRAIN".to_string();
+        let mut session = test_session(
+            "pr/42",
+            PrCache::observed(known, Some(PrDetails::default())),
+        );
+
+        let resolved = resolve_pr_summary_for_session(
+            &session,
+            &test_config(),
+            std::slice::from_ref(&observed),
+        );
+        let poll_started_at = Instant::now();
+        session.pr.begin_summary_poll(poll_started_at);
+        assert!(apply_pr_summary_poll_result(
+            &mut session.pr,
+            poll_started_at,
+            Ok(resolved),
+            "now",
+        ));
+
+        assert_eq!(session.pr.summary(), Some(&observed));
+        assert_eq!(
+            session.pr.summary_observation_quality(),
+            PrObservationQuality::Fresh
+        );
+        assert!(session.pr.trusted_summary().is_ok());
+        assert_eq!(
+            session
+                .pr
+                .summary()
+                .and_then(|summary| summary.change_request_identity.as_ref()),
+            Some(&identity)
+        );
     }
 
     fn test_config() -> Config {
@@ -5642,6 +7848,7 @@ JSON
         PrSummary {
             number: 42,
             change_request_identity: None,
+            native_state_evidence: crate::remote::NativeStateEvidence::default(),
             title: "Fix review".to_string(),
             author: "author".to_string(),
             body: "Body".to_string(),
@@ -5655,6 +7862,7 @@ JSON
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             check_status: "failed".to_string(),
             merge_state_status: "CLEAN".to_string(),
+            queue_state: "not_queued".to_string(),
             comment_count,
             merged: false,
             draft: false,

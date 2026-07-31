@@ -71,19 +71,27 @@ pub(crate) enum MergeAuthorization {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AuthorizedMerge {
-    pr_number: u64,
+    display_number: u64,
     guard: WorkGuard,
 }
 
 impl AuthorizedMerge {
     pub(crate) fn pr_number(&self) -> u64 {
-        self.pr_number
+        self.display_number
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ManualMergeExecution {
-    Merged { pr_number: u64 },
+    Merged {
+        result: Box<crate::remote::MergeMutationResult>,
+    },
+    Pending {
+        result: Box<crate::remote::MergeMutationResult>,
+    },
+    Uncertain {
+        result: Box<crate::remote::MergeMutationResult>,
+    },
     Blocked(super::stabilization_model::StabilizationState),
 }
 
@@ -146,7 +154,7 @@ pub(crate) fn observe_manual_merge_authorization(
 
     match authorization {
         Ok(work) => MergeAuthorization::Authorized(AuthorizedMerge {
-            pr_number: snapshot
+            display_number: snapshot
                 .pull_request
                 .as_ref()
                 .expect("authorized pull request")
@@ -211,7 +219,7 @@ fn review_resolution_authorization(
         .pull_request
         .as_mut()
         .expect("review threads require a pull request");
-    let pr_number = pull_request.number;
+    let display_number = pull_request.number;
     pull_request.review.unresolved_threads.clear();
     pull_request.review.actionable_reviews.clear();
     if mergeability_is_conversation_blocked {
@@ -234,7 +242,10 @@ fn review_resolution_authorization(
     let mut guard = work.guard;
     guard.review_thread_ids = thread_ids.clone();
     MergeAuthorization::ReviewResolutionRequired {
-        candidate: AuthorizedMerge { pr_number, guard },
+        candidate: AuthorizedMerge {
+            display_number,
+            guard,
+        },
         thread_ids,
         state,
     }
@@ -246,21 +257,36 @@ pub(crate) fn execute_merge_authorization(
     authorization: MergeAuthorization,
 ) -> Result<ManualMergeExecution, String> {
     match authorization {
-        MergeAuthorization::Authorized(AuthorizedMerge { pr_number, guard }) => {
+        MergeAuthorization::Authorized(AuthorizedMerge {
+            display_number,
+            guard,
+        }) => {
             let identity = guard.change_request_identity.as_ref().ok_or_else(|| {
                 "authorized merge is missing the canonical change request identity".to_string()
             })?;
             let expected_head_sha = guard.pr_head_sha.as_deref().ok_or_else(|| {
                 "authorized merge is missing the observed pull request head".to_string()
             })?;
-            crate::remote::dispatcher::merge_change_request(
+            let result = crate::remote::dispatcher::merge_change_request(
                 config,
                 path,
                 identity,
-                pr_number,
+                display_number,
                 expected_head_sha,
             )?;
-            Ok(ManualMergeExecution::Merged { pr_number })
+            match result.outcome {
+                crate::remote::MergeMutationOutcome::Merged => Ok(ManualMergeExecution::Merged {
+                    result: Box::new(result),
+                }),
+                crate::remote::MergeMutationOutcome::Pending => Ok(ManualMergeExecution::Pending {
+                    result: Box::new(result),
+                }),
+                crate::remote::MergeMutationOutcome::Uncertain => {
+                    Ok(ManualMergeExecution::Uncertain {
+                        result: Box::new(result),
+                    })
+                }
+            }
         }
         MergeAuthorization::ReviewResolutionRequired { state, .. }
         | MergeAuthorization::Blocked(state) => Ok(ManualMergeExecution::Blocked(state)),
@@ -279,6 +305,7 @@ pub(crate) fn reobserve_and_execute_manual_merge(
         MergeAuthorization::Blocked(state) => return Ok(ManualMergeExecution::Blocked(state)),
     };
     let path = session.path.clone();
+    crate::lifecycle::run_pre_push_checks(config, &path)?;
     let fresh_authorization = observe_manual_merge_authorization(repo, config, session);
     let fresh = match fresh_authorization {
         MergeAuthorization::Authorized(fresh) => fresh,
@@ -294,7 +321,7 @@ fn reauthorize_observed_merge(
     initial: AuthorizedMerge,
     fresh: AuthorizedMerge,
 ) -> MergeAuthorization {
-    if initial.pr_number != fresh.pr_number {
+    if initial.display_number != fresh.display_number {
         return MergeAuthorization::Blocked(changed_merge_state(
             "pull request identity changed during pre-push checks".to_string(),
         ));
@@ -320,7 +347,7 @@ fn changed_merge_state(reason: String) -> super::stabilization_model::Stabilizat
 
 pub(crate) fn authorize_auto_merge(
     snapshot: &super::stabilization_model::StabilizationSnapshot,
-    expected_pr_number: Option<u64>,
+    expected_display_number: Option<u64>,
     expected_guard: &WorkGuard,
 ) -> MergeAuthorization {
     let work = stabilization_plan::plan(snapshot);
@@ -330,7 +357,7 @@ pub(crate) fn authorize_auto_merge(
     if work.kind != super::stabilization_model::StabilizationWorkKind::Merge {
         return MergeAuthorization::Blocked(work.state());
     }
-    if expected_pr_number != Some(pull_request.number) {
+    if expected_display_number != Some(pull_request.number) {
         let mut state = work.state();
         state.status = super::stabilization_model::StabilizationStatus::Escalated;
         state.blocker = super::stabilization_model::StabilizationBlocker::ObservationFailed;
@@ -351,7 +378,7 @@ pub(crate) fn authorize_auto_merge(
         return MergeAuthorization::Blocked(state);
     }
     MergeAuthorization::Authorized(AuthorizedMerge {
-        pr_number: pull_request.number,
+        display_number: pull_request.number,
         guard: work.guard,
     })
 }
@@ -498,6 +525,7 @@ pub(crate) fn prepare_standalone_repair(
     let current_guard = WorkGuard {
         change_request_identity: summary
             .and_then(|summary| summary.change_request_identity.clone()),
+        authorized_target_branch: summary.map(|summary| summary.base_ref.clone()),
         local_head_sha,
         remote_head_sha,
         pr_head_sha,
@@ -540,6 +568,12 @@ pub(crate) fn decide_work_guard(
     if current.change_request_identity.as_ref() != Some(expected_identity) {
         return WorkGuardDecision::Invalidated {
             reason: "canonical change request identity changed while the repair was in progress"
+                .to_string(),
+        };
+    }
+    if guard.authorized_target_branch != current.authorized_target_branch {
+        return WorkGuardDecision::Invalidated {
+            reason: "change request target branch changed while the repair was in progress"
                 .to_string(),
         };
     }
@@ -652,6 +686,11 @@ pub(crate) fn append_planned_work(
     persisted: &mut PersistedAutoRun,
     work: StabilizationWorkItem,
 ) -> Result<bool, String> {
+    super::save_observed_change_request_identity(
+        conn,
+        &persisted.run.id,
+        work.guard.change_request_identity.as_ref(),
+    )?;
     let Some(step_key) = step_for_work(&work.kind) else {
         save_run_with_conn(conn, &persisted.run)?;
         return Ok(false);
@@ -878,6 +917,11 @@ pub(crate) fn observe_plan_and_save(
 ) -> Result<StabilizationWorkItem, String> {
     let work = observe_and_plan(repo, config, persisted);
     save_run_with_conn(conn, &persisted.run)?;
+    super::save_observed_change_request_identity(
+        conn,
+        &persisted.run.id,
+        work.guard.change_request_identity.as_ref(),
+    )?;
     Ok(work)
 }
 
@@ -974,11 +1018,16 @@ pub(crate) fn complete_repair_commit(
     kind: super::stabilization_model::RepairKind,
     result: crate::git::GitCommitResult,
     local_head_sha: Option<String>,
-    pr_summary: Option<crate::github::PrSummary>,
-    cache: &mut crate::github::PrCache,
+    pr_summary: Option<crate::remote::PrSummary>,
+    cache: &mut crate::remote::PrCache,
 ) -> Result<RepairCommitOutcome, String> {
     persisted.run.current_head_sha = local_head_sha.clone();
     if let Some(summary) = &pr_summary {
+        super::save_observed_change_request_identity(
+            conn,
+            &persisted.run.id,
+            summary.change_request_identity.as_ref(),
+        )?;
         persisted.run.pr_number = Some(summary.number);
         persisted.run.pr_url = Some(summary.url.clone());
         persisted.run.review_baseline_json = Some(super::review_baseline_json(summary));
@@ -1159,7 +1208,7 @@ pub(crate) fn progress_pending_push(
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
-    cache: &mut crate::github::PrCache,
+    cache: &mut crate::remote::PrCache,
     before_push: impl FnOnce() -> Result<(), String>,
 ) -> Result<GuardedPushProgress, String> {
     if persisted
@@ -1188,6 +1237,11 @@ pub(crate) fn progress_pending_push(
         .clone()
         .ok_or_else(|| "repair push is missing its persisted guard".to_string())?;
     let summary = cache.trusted_summary()?;
+    super::save_observed_change_request_identity(
+        conn,
+        &persisted.run.id,
+        summary.and_then(|summary| summary.change_request_identity.as_ref()),
+    )?;
     let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
     let remote_head = crate::git::remote_branch_head_sha(
         &persisted.run.worktree_path,
@@ -1314,7 +1368,7 @@ fn refresh_after_guarded_effect(
     repo: &Repository,
     config: &Config,
     persisted: &PersistedAutoRun,
-    cache: &mut crate::github::PrCache,
+    cache: &mut crate::remote::PrCache,
 ) -> Result<(), String> {
     crate::remote::dispatcher::refresh_change_request_cache(
         repo,
@@ -1365,7 +1419,7 @@ mod tests {
         },
     };
     use crate::config::Config;
-    use crate::github::{CiFailure, PrCheckState};
+    use crate::remote::{CachedCiFailure, PrCheckState};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1448,7 +1502,7 @@ mod tests {
         for snapshot in cases {
             let authorization = match stabilization_plan::manual_merge_authorization(&snapshot) {
                 Ok(work) => MergeAuthorization::Authorized(AuthorizedMerge {
-                    pr_number: 42,
+                    display_number: 42,
                     guard: work.guard,
                 }),
                 Err(state) => MergeAuthorization::Blocked(state),
@@ -1472,13 +1526,16 @@ mod tests {
             &config,
             &temp,
             MergeAuthorization::Authorized(AuthorizedMerge {
-                pr_number: snapshot.pull_request.unwrap().number,
+                display_number: snapshot.pull_request.unwrap().number,
                 guard: authorization.guard,
             }),
         )
         .unwrap();
 
-        assert_eq!(execution, ManualMergeExecution::Merged { pr_number: 42 });
+        let ManualMergeExecution::Merged { result } = execution else {
+            panic!("expected an immediately merged result")
+        };
+        assert_eq!(result.summary.change_request.id.display_number(), Some(42));
         assert_eq!(
             fs::read_to_string(&log).unwrap(),
             "pr merge 42 --squash --match-head-commit head\n"
@@ -1506,7 +1563,7 @@ mod tests {
             &config,
             &temp,
             MergeAuthorization::Authorized(AuthorizedMerge {
-                pr_number: 42,
+                display_number: 42,
                 guard: work.guard,
             }),
         )
@@ -1521,6 +1578,7 @@ mod tests {
     fn manual_merge_authorization_cannot_switch_pr_or_guard_after_checks() {
         let guard = WorkGuard {
             change_request_identity: Some(crate::remote::test_change_request_identity()),
+            authorized_target_branch: Some("main".to_string()),
             local_head_sha: Some("head".to_string()),
             remote_head_sha: Some("head".to_string()),
             pr_head_sha: Some("head".to_string()),
@@ -1529,11 +1587,11 @@ mod tests {
         };
         let switched_pr = reauthorize_observed_merge(
             AuthorizedMerge {
-                pr_number: 42,
+                display_number: 42,
                 guard: guard.clone(),
             },
             AuthorizedMerge {
-                pr_number: 43,
+                display_number: 43,
                 guard: guard.clone(),
             },
         );
@@ -1541,24 +1599,24 @@ mod tests {
         changed_guard.local_head_sha = Some("new-head".to_string());
         let moved_head = reauthorize_observed_merge(
             AuthorizedMerge {
-                pr_number: 42,
+                display_number: 42,
                 guard,
             },
             AuthorizedMerge {
-                pr_number: 42,
+                display_number: 42,
                 guard: changed_guard.clone(),
             },
         );
         let resolved_reviews = reauthorize_observed_merge(
             AuthorizedMerge {
-                pr_number: 42,
+                display_number: 42,
                 guard: WorkGuard {
                     review_thread_ids: vec!["thread-1".to_string()],
                     ..changed_guard.clone()
                 },
             },
             AuthorizedMerge {
-                pr_number: 42,
+                display_number: 42,
                 guard: WorkGuard {
                     review_thread_ids: Vec::new(),
                     ..changed_guard
@@ -1722,6 +1780,7 @@ mod tests {
         .unwrap();
         let fresh = WorkGuard {
             change_request_identity: Some(current_identity),
+            authorized_target_branch: Some("main".to_string()),
             local_head_sha: Some("head".to_string()),
             remote_head_sha: Some("head".to_string()),
             pr_head_sha: Some("head".to_string()),
@@ -1731,6 +1790,19 @@ mod tests {
         assert!(matches!(
             decide_work_guard(&RepairKind::Merge, &persisted, &fresh),
             WorkGuardDecision::Invalidated { .. }
+        ));
+
+        let mut legacy_json = serde_json::to_value(&fresh).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("authorized_target_branch");
+        let legacy_with_identity: WorkGuard = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy_with_identity.authorized_target_branch, None);
+        assert!(matches!(
+            decide_work_guard(&RepairKind::Merge, &legacy_with_identity, &fresh),
+            WorkGuardDecision::Invalidated { ref reason }
+                if reason.contains("target branch")
         ));
     }
 
@@ -1778,6 +1850,27 @@ mod tests {
             ),
             GuardedPushDecision::Invalidated { .. }
         ));
+    }
+
+    #[test]
+    fn changed_target_branch_invalidates_merge_and_repair_guards() {
+        let original = WorkGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
+            authorized_target_branch: Some("main".to_string()),
+            ..WorkGuard::default()
+        };
+        let current = WorkGuard {
+            authorized_target_branch: Some("release".to_string()),
+            ..original.clone()
+        };
+
+        for kind in [RepairKind::Review, RepairKind::Ci, RepairKind::Merge] {
+            assert!(matches!(
+                decide_work_guard(&kind, &original, &current),
+                WorkGuardDecision::Invalidated { ref reason }
+                    if reason.contains("target branch")
+            ));
+        }
     }
 
     #[test]
@@ -1852,6 +1945,7 @@ mod tests {
     fn changed_original_work_guard_is_invalidated_before_commit() {
         let original = WorkGuard {
             change_request_identity: Some(crate::remote::test_change_request_identity()),
+            authorized_target_branch: Some("main".to_string()),
             local_head_sha: Some("head-a".to_string()),
             remote_head_sha: Some("head-a".to_string()),
             pr_head_sha: Some("head-a".to_string()),
@@ -2134,6 +2228,24 @@ mod tests {
         let mut base = ready.clone();
         base.pull_request.as_mut().unwrap().base_ref = "release".to_string();
         cases.push(base);
+        let mut identity = ready.clone();
+        let changed_repository = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.com", None).unwrap(),
+            "example/repo",
+        )
+        .unwrap();
+        identity
+            .pull_request
+            .as_mut()
+            .unwrap()
+            .change_request_identity = Some(crate::remote::CanonicalChangeRequestIdentity::new(
+            &changed_repository,
+            &crate::remote::NativeChangeRequestId::new("PR_other").unwrap(),
+            &changed_repository,
+            &changed_repository,
+        ));
+        cases.push(identity);
         let mut policy = ready.clone();
         policy.policy = PolicyFacts::Unknown {
             reason: Some("policy refresh failed".to_string()),
@@ -2170,6 +2282,49 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn manual_merge_rechecks_local_gates_in_the_final_execution_job() {
+        let (temp, mut config, log) = manual_merge_test_config();
+        config.checks.pre_push = vec!["false".to_string()];
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let work =
+            stabilization_plan::manual_merge_authorization(&ready_manual_merge_snapshot()).unwrap();
+        let authorization = MergeAuthorization::Authorized(AuthorizedMerge {
+            display_number: 42,
+            guard: work.guard,
+        });
+        let mut session = crate::session::Session {
+            repo_index: 0,
+            repo_label: "repo".to_string(),
+            repo_key: None,
+            path: temp.clone(),
+            incarnation: String::new(),
+            path_display: temp.display().to_string(),
+            branch: "feature".to_string(),
+            prompt_summary: String::new(),
+            classification: crate::session::SessionClassification::Work,
+            visibility: 0,
+            adopted: false,
+            hidden: false,
+            status_label: "clean".to_string(),
+            agent_state: crate::agent::AgentState::Idle,
+            opencode_status: None,
+            pr: crate::remote::PrCache::default(),
+            wt_columns: std::collections::BTreeMap::new(),
+            unseen_comments: false,
+        };
+
+        let error = reobserve_and_execute_manual_merge(&repo, &config, &mut session, authorization)
+            .unwrap_err();
+
+        assert!(error.contains("pre_push check"), "{error}");
+        assert!(
+            !log.exists(),
+            "provider mutation must not run after a late gate failure"
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
     fn ready_manual_merge_snapshot() -> StabilizationSnapshot {
         StabilizationSnapshot {
             run: None,
@@ -2203,16 +2358,19 @@ mod tests {
                     aggregate: PrCheckState::Success,
                     required: Vec::new(),
                     optional_failures: Vec::new(),
-                    failures: Vec::<CiFailure>::new(),
+                    failures: Vec::<CachedCiFailure>::new(),
                 },
                 review: ReviewFacts {
                     decision: "APPROVED".to_string(),
                     approval_required: false,
+                    approval_count: 0,
+                    required_approvals: 0,
                     actionable_reviews: Vec::new(),
                     unresolved_threads: Vec::new(),
                     top_level_comments: 0,
                 },
                 mergeability: MergeabilityFacts::Clean,
+                queue_state: crate::remote::QueueState::NotQueued,
                 top_level_comment_count: 0,
                 observation_error: None,
             }),
@@ -2243,7 +2401,9 @@ mod tests {
             &temp,
             "gh",
             &format!(
-                "#!/bin/sh\nif [ \"$1\" = api ]; then printf '%s\\n' '{{\"data\":{{\"repository\":{{\"pullRequests\":{{\"nodes\":[{{\"id\":\"PR_test\",\"number\":42,\"headRefName\":\"feature\",\"baseRefName\":\"main\",\"headRefOid\":\"head\",\"headRepository\":{{\"nameWithOwner\":\"example/repo\"}},\"baseRepository\":{{\"nameWithOwner\":\"example/repo\"}},\"state\":\"OPEN\"}}]}}}}}}}}'; exit 0; fi\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                "#!/bin/sh\nif [ \"$1\" = api ]; then if [ -e '{}/observed-open' ]; then state=MERGED; merged=true; else state=OPEN; merged=false; touch '{}/observed-open'; fi; printf '%s\\n' \"{{\\\"data\\\":{{\\\"repository\\\":{{\\\"pullRequests\\\":{{\\\"nodes\\\":[{{\\\"id\\\":\\\"PR_test\\\",\\\"number\\\":42,\\\"headRefName\\\":\\\"feature\\\",\\\"baseRefName\\\":\\\"main\\\",\\\"headRefOid\\\":\\\"head\\\",\\\"headRepository\\\":{{\\\"nameWithOwner\\\":\\\"example/repo\\\"}},\\\"baseRepository\\\":{{\\\"nameWithOwner\\\":\\\"example/repo\\\"}},\\\"state\\\":\\\"$state\\\",\\\"merged\\\":$merged}}],\\\"pageInfo\\\":{{\\\"hasNextPage\\\":false}}}}}}}}}}\"; exit 0; fi\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                temp.display(),
+                temp.display(),
                 log.display()
             ),
         );

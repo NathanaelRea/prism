@@ -14,9 +14,9 @@ path = "/path/to/repo"
 key = "1"
 ```
 
-Repository-specific Prism config lives under the repository config path opened by `e`. Common settings include `default_base`, layout width, worktree columns, merge method, Auto Flow and PR Stabilization behavior, tools, and prompt templates. Harness selection and definitions are global-only.
+Repository-specific Prism config lives under the repository config path opened by `e`. Common settings include `default_base`, layout width, worktree columns, merge method, Auto Flow and Change Request Stabilization behavior, tools, and prompt templates. Harness selection and definitions are global-only.
 
-Per-repository Prism state also lives under that repository config directory, not inside the project repository. The state database is named `prism.db` and stores worktree session metadata, harness runtime records, Plan Mode and Auto Flow runs, PR cache data, and observability records.
+Per-repository Prism state also lives under that repository config directory, not inside the project repository. The state database is named `prism.db` and stores worktree session metadata, harness runtime records, Plan Mode and Auto Flow runs, change-request cache data, and observability records.
 
 Use `R` from Prism to edit repository order, keys, and tracked repositories.
 
@@ -61,9 +61,11 @@ The `#:schema` line is an optional TOML comment. Prism ignores it, while Taplo-c
 
 The `review_fix` template supports `{inline_comments}`, `{review_bodies}`, and `{pr_comments}` when feedback sources need separate placement. `{comments}` combines all three for compatibility. Copilot's review overview is excluded from review bodies; its unresolved inline comments remain actionable feedback.
 
-Prism treats `main` as the default branch by default. The default branch is not polled or shown as a pull request branch.
+Prism treats `main` as the default branch by default. The default branch is not polled or shown as a change-request branch.
 
-Prism uses squash merges for pull requests by default. Set `merge_method` to `merge` or `rebase` if a repository requires a different GitHub merge method.
+Prism uses squash merges for change requests by default. Set `merge_method` to
+`merge` or `rebase` when the selected provider supports that method. GitLab does
+not expose rebase through Prism's merge-request merge operation.
 
 ## Remote Hosts
 
@@ -95,6 +97,10 @@ Current capability exceptions are intentional:
 - Prism discovers Forgejo's API version and paging settings at runtime. Read
   observations retain unknown states, while create and merge are currently
   qualified for Forgejo majors 9 through 16; other majors fail closed.
+
+See [Remote Hosting](remote-hosting.md) for the full capability matrix,
+qualified server versions, authentication commands, Codeberg CI limitations,
+and doctor/debug troubleshooting.
 
 ## Harnesses
 
@@ -185,9 +191,10 @@ default_harness = "opencode"
 program = "/opt/bin/opencode"
 ```
 
-## Auto Flow and PR Stabilization
+## Auto Flow and Change Request Stabilization
 
-`[auto]` controls Auto Flow implementation automation and PR Stabilization gate behavior:
+`[auto]` controls Auto Flow implementation automation and Change Request
+Stabilization gate behavior:
 
 ```toml
 [auto]
@@ -202,9 +209,9 @@ ci_wait_enabled = true
 
 `merge = false` makes successful stabilization stop at `ReadyForManualMerge`. Set it to `true` only when Prism may merge after all required gates pass and repository policy is known.
 
-`push_initial = true` allows Auto Flow to push the initial implementation commit and open or refresh the PR. `push_repairs = false` keeps managed review and CI repair commits local as guarded pending pushes for user inspection; use `Space g P` to push them after review.
+`push_initial = true` allows Auto Flow to push the initial implementation commit and open or refresh the change request. `push_repairs = false` keeps managed review and CI repair commits local as guarded pending pushes for user inspection; use `Space g P` to push them after review.
 
-`require_review_approval = false` means review approval is not required unless repository policy requires it. When enabled, PR Stabilization treats missing approval as a blocker.
+`require_review_approval = false` means review approval is not required unless repository policy requires it. When enabled, Change Request Stabilization treats missing approval as a blocker.
 
 `review_wait_enabled` and `ci_wait_enabled` control whether Auto Flow waits for review and CI observations when those work items are selected.
 

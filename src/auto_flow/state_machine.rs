@@ -116,6 +116,12 @@ pub(super) fn next_queued_non_agent_step(persisted: &PersistedAutoRun) -> Option
     })
 }
 
+pub(super) fn next_waiting_merge_step(persisted: &PersistedAutoRun) -> Option<usize> {
+    persisted.steps.iter().position(|step| {
+        step.status == AutoStepStatus::Waiting && step.step_key == AutoStepKey::Merge
+    })
+}
+
 pub(super) fn has_queued_non_agent_step(persisted: &PersistedAutoRun) -> bool {
     next_queued_non_agent_step(persisted).is_some()
 }
@@ -126,6 +132,7 @@ pub(super) fn has_queued_auto_step(persisted: &PersistedAutoRun) -> bool {
 
 pub(super) fn has_pending_auto_work(persisted: &PersistedAutoRun) -> bool {
     has_queued_auto_step(persisted)
+        || next_waiting_merge_step(persisted).is_some()
         || queued_prepare_needs_initial_agent_step(persisted)
         || next_state_machine_step_needed(persisted)
         || implementation_follow_up_step_needed(persisted)

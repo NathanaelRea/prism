@@ -467,7 +467,7 @@ pub(super) fn execute_push_pr_step(
     crate::execution::validate_installed_claim(conn)?;
     crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
 
-    let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
+    let mut cache = crate::remote::load_pr_cache(repo, &persisted.run.branch);
     let _ = crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &persisted.run.branch,
@@ -502,6 +502,11 @@ pub(super) fn execute_push_pr_step(
     let summary = cache
         .trusted_summary()?
         .ok_or_else(|| "push/create PR completed but no PR summary was found".to_string())?;
+    save_observed_change_request_identity(
+        conn,
+        &persisted.run.id,
+        summary.change_request_identity.as_ref(),
+    )?;
     persisted.run.pr_number = Some(summary.number);
     persisted.run.pr_url = Some(summary.url.clone());
     persisted.run.current_head_sha = Some(if summary.head_sha.trim().is_empty() {
@@ -561,7 +566,7 @@ pub(super) fn execute_wait_review_step(
 
     let deadline = unix_ms().saturating_add(config.auto.review_max_wait_seconds * 1000);
     loop {
-        let outcome = poll_review_feedback(repo, config, persisted)?;
+        let outcome = poll_review_feedback(conn, repo, config, persisted)?;
         let work = stabilization_execute::observe_plan_and_save(conn, repo, config, persisted)?;
         append_auto_event(
             conn,
@@ -694,7 +699,7 @@ pub(super) fn execute_commit_review_fix_step(
     step_index: usize,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
-    let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
+    let mut cache = crate::remote::load_pr_cache(repo, &persisted.run.branch);
     crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
     crate::remote::dispatcher::refresh_change_request_cache(
         repo,
@@ -705,7 +710,15 @@ pub(super) fn execute_commit_review_fix_step(
         true,
     )?;
     let current_guard = current_work_guard(config, persisted, &cache)?;
-    let pr_number = cache.trusted_summary()?.map(|summary| summary.number);
+    let pr_summary = cache.trusted_summary()?.cloned();
+    save_observed_change_request_identity(
+        conn,
+        &persisted.run.id,
+        pr_summary
+            .as_ref()
+            .and_then(|summary| summary.change_request_identity.as_ref()),
+    )?;
+    let pr_number = pr_summary.as_ref().map(|summary| summary.number);
     if let stabilization_execute::RepairCommitGate::Invalidated { summary } =
         stabilization_execute::validate_and_begin_repair_commit(
             conn,
@@ -740,7 +753,6 @@ pub(super) fn execute_commit_review_fix_step(
     crate::execution::validate_installed_claim(conn)?;
     let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
     let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
-    let pr_summary = cache.trusted_summary()?.cloned();
     let outcome = stabilization_execute::complete_repair_commit(
         conn,
         repo,
@@ -799,7 +811,7 @@ pub(super) fn execute_wait_ci_step(
 
     let deadline = unix_ms().saturating_add(config.auto.ci_max_wait_seconds * 1000);
     loop {
-        let outcome = poll_ci_status(repo, config, persisted)?;
+        let outcome = poll_ci_status(conn, repo, config, persisted)?;
         let work = stabilization_execute::observe_plan_and_save(conn, repo, config, persisted)?;
         append_auto_event(
             conn,
@@ -934,7 +946,7 @@ pub(super) fn execute_commit_ci_fix_step(
     step_index: usize,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
-    let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
+    let mut cache = crate::remote::load_pr_cache(repo, &persisted.run.branch);
     crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
     crate::remote::dispatcher::refresh_change_request_cache(
         repo,
@@ -945,7 +957,15 @@ pub(super) fn execute_commit_ci_fix_step(
         true,
     )?;
     let current_guard = current_work_guard(config, persisted, &cache)?;
-    let pr_number = cache.trusted_summary()?.map(|summary| summary.number);
+    let pr_summary = cache.trusted_summary()?.cloned();
+    save_observed_change_request_identity(
+        conn,
+        &persisted.run.id,
+        pr_summary
+            .as_ref()
+            .and_then(|summary| summary.change_request_identity.as_ref()),
+    )?;
+    let pr_number = pr_summary.as_ref().map(|summary| summary.number);
     if let stabilization_execute::RepairCommitGate::Invalidated { summary } =
         stabilization_execute::validate_and_begin_repair_commit(
             conn,
@@ -978,7 +998,6 @@ pub(super) fn execute_commit_ci_fix_step(
     crate::execution::validate_installed_claim(conn)?;
     let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
     let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
-    let pr_summary = cache.trusted_summary()?.cloned();
     let outcome = stabilization_execute::complete_repair_commit(
         conn,
         repo,
@@ -1046,12 +1065,24 @@ pub(super) fn execute_merge_step(
         .work_guard
         .as_ref()
         .ok_or_else(|| "auto merge step is missing its stabilization work guard".to_string())?;
+    let observed_identity = snapshot
+        .pull_request
+        .as_ref()
+        .and_then(|pull_request| pull_request.change_request_identity.as_ref());
+    save_observed_change_request_identity(conn, &persisted.run.id, observed_identity)?;
+    let persisted_identity = load_observed_change_request_identity(conn, &persisted.run.id)?;
     let authorization = stabilization_execute::authorize_auto_merge(
         &snapshot,
         persisted.run.pr_number,
         expected_guard,
     );
-    let gate = if !verify.passed {
+    let gate = if persisted_identity.as_ref() != observed_identity {
+        MergeGateOutcome {
+            allowed: false,
+            summary: "merge blocked: canonical change request identity was not durably observed"
+                .to_string(),
+        }
+    } else if !verify.passed {
         MergeGateOutcome {
             allowed: false,
             summary: format!("merge blocked:\n- {}", format_verify_result(&verify)),
@@ -1096,9 +1127,27 @@ pub(super) fn execute_merge_step(
         &persisted.run.worktree_path,
         authorization,
     )?;
-    let stabilization_execute::ManualMergeExecution::Merged { pr_number } = execution else {
-        unreachable!("the final gate only passes an authorized merge")
+    let (result, mutation_state) = match execution {
+        stabilization_execute::ManualMergeExecution::Merged { result } => (result, "merged"),
+        stabilization_execute::ManualMergeExecution::Pending { result } => (result, "accepted"),
+        stabilization_execute::ManualMergeExecution::Uncertain { result } => (result, "uncertain"),
+        stabilization_execute::ManualMergeExecution::Blocked(_) => {
+            unreachable!("the final gate only passes an authorized merge")
+        }
     };
+    let pr_number = result
+        .summary
+        .change_request
+        .id
+        .display_number()
+        .ok_or_else(|| "change request mutation has no display number".to_string())?;
+    let mut cache = crate::remote::load_pr_cache(repo, &persisted.run.branch);
+    crate::remote::dispatcher::record_change_request_summary(
+        repo,
+        &persisted.run.branch,
+        &mut cache,
+        result.summary.clone(),
+    )?;
     append_system_output(
         conn,
         step_id,
@@ -1107,15 +1156,64 @@ pub(super) fn execute_merge_step(
         None,
         max_output_lines_per_step,
     )?;
-    let merged = crate::remote::dispatcher::wait_for_change_request_merged(
+    if mutation_state != "merged" {
+        let summary = if mutation_state == "accepted" {
+            format!(
+                "merge accepted for PR #{pr_number} and pending (provider state: {})",
+                result.native_state
+            )
+        } else {
+            format!(
+                "merge outcome for PR #{pr_number} is uncertain; reconciling (provider state: {})",
+                result.native_state
+            )
+        };
+        append_system_output(
+            conn,
+            step_id,
+            AutoOutputKind::Status,
+            &summary,
+            None,
+            max_output_lines_per_step,
+        )?;
+        finish_non_agent_step(
+            conn,
+            &mut persisted.steps[step_index],
+            AutoStepStatus::Waiting,
+            Some(summary),
+            None,
+        )?;
+        persisted.run.stabilization_status =
+            Some(stabilization_model::StabilizationStatus::Waiting);
+        persisted.run.stabilization_blocker =
+            Some(stabilization_model::StabilizationBlocker::ReadyToAutoMerge);
+        persisted.run.stabilization_next_work =
+            Some(stabilization_model::StabilizationWorkKind::Merge);
+        persisted.run.updated_unix_ms = unix_ms();
+        save_run_with_conn(conn, &persisted.run)?;
+        return reconcile_waiting_merge_until_complete(
+            conn,
+            repo,
+            config,
+            persisted,
+            step_index,
+            max_output_lines_per_step,
+        );
+    }
+    let observed = crate::remote::dispatcher::wait_for_change_request_merged(
         &persisted.run.worktree_path,
-        pr_number,
+        &result.summary.change_request,
         config,
     )?;
-    if !merged {
+    crate::remote::dispatcher::record_change_request_summary(
+        repo,
+        &persisted.run.branch,
+        &mut cache,
+        observed.clone(),
+    )?;
+    if observed.lifecycle != crate::remote::LifecycleState::Merged {
         let error = format!(
-            "PR #{} merge command completed, but GitHub has not marked it merged yet",
-            pr_number
+            "PR #{pr_number} merge command completed, but the provider has not marked it merged yet"
         );
         finish_non_agent_step(
             conn,
@@ -1126,7 +1224,6 @@ pub(super) fn execute_merge_step(
         )?;
         return Err(error);
     }
-    let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
     crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &persisted.run.branch,
@@ -1153,6 +1250,280 @@ pub(super) fn execute_merge_step(
         Some(done),
         None,
     )?;
+    persisted.run.updated_unix_ms = unix_ms();
+    save_run_with_conn(conn, &persisted.run)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MergeReconciliationProgress {
+    Waiting,
+    Done,
+}
+
+pub(super) fn reconcile_waiting_merge_until_complete(
+    conn: &rusqlite::Connection,
+    repo: &Repository,
+    config: &Config,
+    persisted: &mut PersistedAutoRun,
+    step_index: usize,
+    max_output_lines_per_step: usize,
+) -> Result<(), String> {
+    loop {
+        crate::execution::validate_installed_claim(conn)?;
+        let worktree_path = persisted.run.worktree_path.clone();
+        let progress = reconcile_waiting_merge_step_with(
+            conn,
+            repo,
+            persisted,
+            step_index,
+            max_output_lines_per_step,
+            |expected| {
+                crate::remote::dispatcher::wait_for_change_request_merged(
+                    &worktree_path,
+                    expected,
+                    config,
+                )
+            },
+        )?;
+        if progress == MergeReconciliationProgress::Done {
+            return Ok(());
+        }
+
+        interruptible_execution_sleep(conn, config.auto.ci_poll_interval_seconds)?;
+        if reload_pause_request(conn, persisted)? {
+            return Ok(());
+        }
+    }
+}
+
+pub(super) fn reconcile_waiting_merge_step_with<F>(
+    conn: &rusqlite::Connection,
+    repo: &Repository,
+    persisted: &mut PersistedAutoRun,
+    step_index: usize,
+    max_output_lines_per_step: usize,
+    observe: F,
+) -> Result<MergeReconciliationProgress, String>
+where
+    F: FnOnce(&crate::remote::ChangeRequest) -> Result<crate::remote::ChangeRequestSummary, String>,
+{
+    let result = pending_merge_change_request(conn, persisted, step_index)
+        .and_then(|expected| {
+            let observed = observe(&expected)?;
+            validate_pending_merge_observation(&expected, &observed)?;
+            Ok(observed)
+        })
+        .and_then(|observed| {
+            let pr_number = observed
+                .change_request
+                .id
+                .display_number()
+                .or(persisted.run.pr_number)
+                .ok_or_else(|| "pending merge change request has no display number".to_string())?;
+            let mut cache = crate::remote::load_pr_cache(repo, &persisted.run.branch);
+            crate::remote::dispatcher::record_change_request_summary(
+                repo,
+                &persisted.run.branch,
+                &mut cache,
+                observed.clone(),
+            )?;
+
+            match &observed.lifecycle {
+                crate::remote::LifecycleState::Merged => {
+                    let summary = format!("merged PR #{pr_number}");
+                    append_merge_reconciliation_output(
+                        conn,
+                        &persisted.steps[step_index],
+                        AutoOutputKind::Status,
+                        &summary,
+                        max_output_lines_per_step,
+                    )?;
+                    finish_non_agent_step(
+                        conn,
+                        &mut persisted.steps[step_index],
+                        AutoStepStatus::Done,
+                        Some(summary),
+                        None,
+                    )?;
+                    persisted.run.stabilization_status =
+                        Some(stabilization_model::StabilizationStatus::Done);
+                    persisted.run.stabilization_blocker =
+                        Some(stabilization_model::StabilizationBlocker::Merged);
+                    persisted.run.stabilization_next_work =
+                        Some(stabilization_model::StabilizationWorkKind::Done);
+                    persisted.run.status = persisted.authoritative_status();
+                    persisted.run.updated_unix_ms = unix_ms();
+                    save_run_with_conn(conn, &persisted.run)?;
+                    Ok(MergeReconciliationProgress::Done)
+                }
+                crate::remote::LifecycleState::Closed => Err(format!(
+                    "PR #{pr_number} closed without merging after its merge was accepted"
+                )),
+                crate::remote::LifecycleState::Open | crate::remote::LifecycleState::Unknown(_) => {
+                    let summary = format!(
+                        "merge for PR #{pr_number} is still pending (provider state: {})",
+                        merge_pending_state(&observed)
+                    );
+                    append_merge_reconciliation_output(
+                        conn,
+                        &persisted.steps[step_index],
+                        AutoOutputKind::Status,
+                        &summary,
+                        max_output_lines_per_step,
+                    )?;
+                    set_auto_step_waiting(conn, &mut persisted.steps[step_index], summary.clone())?;
+                    persisted.run.stabilization_status =
+                        Some(stabilization_model::StabilizationStatus::Waiting);
+                    persisted.run.status = persisted.authoritative_status();
+                    persisted.run.updated_unix_ms = unix_ms();
+                    save_run_with_conn(conn, &persisted.run)?;
+                    append_auto_event(
+                        conn,
+                        &AutoEvent {
+                            id: None,
+                            run_id: persisted.run.id.clone(),
+                            step_run_id: persisted.steps[step_index].id,
+                            time_unix_ms: unix_ms(),
+                            kind: "merge_wait_poll".to_string(),
+                            data_json: format!("{{\"summary\":{}}}", json_string(&summary)),
+                        },
+                    )?;
+                    Ok(MergeReconciliationProgress::Waiting)
+                }
+            }
+        });
+
+    if let Err(error) = &result {
+        fail_waiting_merge_step(
+            conn,
+            persisted,
+            step_index,
+            error,
+            max_output_lines_per_step,
+        )?;
+    }
+    result
+}
+
+fn validate_pending_merge_observation(
+    expected: &crate::remote::ChangeRequest,
+    observed: &crate::remote::ChangeRequestSummary,
+) -> Result<(), String> {
+    let observed = &observed.change_request;
+    if observed.id != expected.id
+        || observed.source_repository != expected.source_repository
+        || observed.target_repository != expected.target_repository
+        || observed.source_branch != expected.source_branch
+        || observed.target_branch != expected.target_branch
+    {
+        return Err(
+            "change request identity or target changed while merge was pending".to_string(),
+        );
+    }
+    if observed.head_sha != expected.head_sha {
+        return Err("change request head changed while merge was pending".to_string());
+    }
+    Ok(())
+}
+
+fn pending_merge_change_request(
+    conn: &rusqlite::Connection,
+    persisted: &PersistedAutoRun,
+    step_index: usize,
+) -> Result<crate::remote::ChangeRequest, String> {
+    let guard = persisted.steps[step_index]
+        .work_guard
+        .as_ref()
+        .ok_or_else(|| "waiting merge step has no persisted work guard".to_string())?;
+    let identity = guard
+        .change_request_identity
+        .as_ref()
+        .ok_or_else(|| "waiting merge step has no canonical change request identity".to_string())?;
+    if load_observed_change_request_identity(conn, &persisted.run.id)?.as_ref() != Some(identity) {
+        return Err(
+            "canonical change request identity changed or was lost while merge was pending"
+                .to_string(),
+        );
+    }
+    let display_number = persisted
+        .run
+        .pr_number
+        .ok_or_else(|| "waiting merge step has no change request number".to_string())?;
+    let source_repository = identity
+        .source_repository()
+        .map_err(|error| error.to_string())?;
+    let target_repository = identity
+        .target_repository()
+        .map_err(|error| error.to_string())?;
+    Ok(crate::remote::ChangeRequest {
+        id: identity
+            .change_request_id(Some(display_number))
+            .map_err(|error| error.to_string())?,
+        source_repository,
+        target_repository,
+        source_branch: persisted.run.branch.clone(),
+        target_branch: guard
+            .authorized_target_branch
+            .clone()
+            .ok_or_else(|| "waiting merge step has no authorized target branch".to_string())?,
+        head_sha: guard
+            .pr_head_sha
+            .clone()
+            .ok_or_else(|| "waiting merge step has no authorized head SHA".to_string())?,
+    })
+}
+
+fn merge_pending_state(observed: &crate::remote::ChangeRequestSummary) -> String {
+    match &observed.queue_state {
+        crate::remote::QueueState::NotQueued => "not queued".to_string(),
+        crate::remote::QueueState::Queued => "queued".to_string(),
+        crate::remote::QueueState::Running => "running".to_string(),
+        crate::remote::QueueState::Blocked => "blocked".to_string(),
+        crate::remote::QueueState::Complete => "complete".to_string(),
+        crate::remote::QueueState::Unknown(native) => native.clone(),
+    }
+}
+
+fn append_merge_reconciliation_output(
+    conn: &rusqlite::Connection,
+    step: &AutoStepRun,
+    kind: AutoOutputKind,
+    summary: &str,
+    max_output_lines_per_step: usize,
+) -> Result<(), String> {
+    let step_id = step
+        .id
+        .ok_or_else(|| "waiting merge step must be saved before output".to_string())?;
+    append_system_output(
+        conn,
+        step_id,
+        kind,
+        summary,
+        None,
+        max_output_lines_per_step,
+    )
+}
+
+fn fail_waiting_merge_step(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+    step_index: usize,
+    error: &str,
+    max_output_lines_per_step: usize,
+) -> Result<(), String> {
+    fail_step(
+        conn,
+        &mut persisted.steps[step_index],
+        error,
+        max_output_lines_per_step,
+    )?;
+    persisted.run.stabilization_status = Some(stabilization_model::StabilizationStatus::Escalated);
+    persisted.run.stabilization_blocker =
+        Some(stabilization_model::StabilizationBlocker::ObservationFailed);
+    persisted.run.stabilization_next_work =
+        Some(stabilization_model::StabilizationWorkKind::Escalate);
+    persisted.run.status = AutoRunStatus::Failed;
+    persisted.run.pause_requested = false;
     persisted.run.updated_unix_ms = unix_ms();
     save_run_with_conn(conn, &persisted.run)
 }
@@ -1318,11 +1689,12 @@ struct MergeGateOutcome {
 }
 
 pub(super) fn poll_ci_status(
+    conn: &rusqlite::Connection,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
 ) -> Result<CiPollOutcome, String> {
-    let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
+    let mut cache = crate::remote::load_pr_cache(repo, &persisted.run.branch);
     crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &persisted.run.branch,
@@ -1334,6 +1706,11 @@ pub(super) fn poll_ci_status(
     let summary = cache
         .trusted_summary()?
         .ok_or_else(|| "CI wait could not find pull request summary".to_string())?;
+    save_observed_change_request_identity(
+        conn,
+        &persisted.run.id,
+        summary.change_request_identity.as_ref(),
+    )?;
     persisted.run.pr_number = Some(summary.number);
     persisted.run.pr_url = Some(summary.url.clone());
     persisted.run.current_head_sha = Some(summary.head_sha.clone());
@@ -1401,11 +1778,12 @@ pub(super) fn evaluate_ci_status(
 }
 
 pub(super) fn poll_review_feedback(
+    conn: &rusqlite::Connection,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
 ) -> Result<ReviewPollOutcome, String> {
-    let mut cache = crate::github::load_pr_cache(repo, &persisted.run.branch);
+    let mut cache = crate::remote::load_pr_cache(repo, &persisted.run.branch);
     crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &persisted.run.branch,
@@ -1417,6 +1795,11 @@ pub(super) fn poll_review_feedback(
     let summary = cache
         .trusted_summary()?
         .ok_or_else(|| "review wait could not find pull request summary".to_string())?;
+    save_observed_change_request_identity(
+        conn,
+        &persisted.run.id,
+        summary.change_request_identity.as_ref(),
+    )?;
     persisted.run.pr_number = Some(summary.number);
     persisted.run.pr_url = Some(summary.url.clone());
     persisted.run.current_head_sha = Some(summary.head_sha.clone());
@@ -1429,8 +1812,8 @@ pub(super) fn poll_review_feedback(
 pub(super) fn evaluate_review_feedback(
     config: &Config,
     persisted: &mut PersistedAutoRun,
-    summary: &crate::github::PrSummary,
-    details: Option<&crate::github::PrDetails>,
+    summary: &crate::remote::PrSummary,
+    details: Option<&crate::remote::PrDetails>,
 ) -> Result<ReviewPollOutcome, String> {
     let baseline = parse_review_baseline(persisted.run.review_baseline_json.as_deref());
     let after = baseline
@@ -1505,7 +1888,7 @@ pub(super) fn evaluate_review_feedback(
 }
 
 pub(super) fn has_configured_reviewer_requested(
-    summary: &crate::github::PrSummary,
+    summary: &crate::remote::PrSummary,
     config: &Config,
 ) -> bool {
     if config.auto.review_reviewer_identities.is_empty() {
@@ -1520,7 +1903,7 @@ pub(super) fn has_configured_reviewer_requested(
     })
 }
 
-pub(super) fn review_baseline_json(summary: &crate::github::PrSummary) -> String {
+pub(super) fn review_baseline_json(summary: &crate::remote::PrSummary) -> String {
     serde_json::to_string(&ReviewBaseline {
         head_sha: summary.head_sha.clone(),
         updated_at: summary.updated_at.clone(),
@@ -1645,7 +2028,7 @@ pub(super) fn implementation_commit_message(run: &AutoRun) -> String {
 fn current_work_guard(
     config: &Config,
     persisted: &PersistedAutoRun,
-    cache: &crate::github::PrCache,
+    cache: &crate::remote::PrCache,
 ) -> Result<stabilization_model::WorkGuard, String> {
     let summary = cache.trusted_summary()?;
     let remote_head_sha = crate::git::remote_branch_head_sha(
@@ -1674,6 +2057,7 @@ fn current_work_guard(
     Ok(stabilization_model::WorkGuard {
         change_request_identity: summary
             .and_then(|summary| summary.change_request_identity.clone()),
+        authorized_target_branch: summary.map(|summary| summary.base_ref.clone()),
         local_head_sha: Some(crate::git::current_head_sha(
             &persisted.run.worktree_path,
             config,

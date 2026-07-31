@@ -6,9 +6,9 @@ use crate::auto_flow::stabilization_model::{
 };
 use crate::auto_flow::{AutoLaunch, AutoStepKey, load_auto_run, save_auto_run};
 use crate::config::Config;
-use crate::github::{PrCache, PrComment, PrDetails, PrSummary, pr_summary_or_error};
 use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
 use crate::plan_run::PlanRunMode;
+use crate::remote::{PrCache, PrComment, PrDetails, PrSummary, pr_summary_or_error};
 use crate::repo::Repository;
 use crate::session::{DeleteWorktreeOutcome, Session};
 use crate::tui::{
@@ -86,20 +86,20 @@ fn confirmed_bulk_review_resolution_resolves_each_thread_once() {
 fn review_resolution_uses_only_unresolved_threads_in_the_observed_details() {
     let details = PrDetails {
         review_comments: vec![
-            crate::github::PrReviewComment {
+            crate::remote::PrReviewComment {
                 thread_id: "thread-2".to_string(),
                 resolved: false,
-                ..crate::github::PrReviewComment::default()
+                ..crate::remote::PrReviewComment::default()
             },
-            crate::github::PrReviewComment {
+            crate::remote::PrReviewComment {
                 thread_id: "thread-1".to_string(),
                 resolved: false,
-                ..crate::github::PrReviewComment::default()
+                ..crate::remote::PrReviewComment::default()
             },
-            crate::github::PrReviewComment {
+            crate::remote::PrReviewComment {
                 thread_id: "thread-2".to_string(),
                 resolved: true,
-                ..crate::github::PrReviewComment::default()
+                ..crate::remote::PrReviewComment::default()
             },
         ],
         ..PrDetails::default()
@@ -226,19 +226,21 @@ fn review_fix_refreshes_pr_details_before_sending_prompt() {
         &gh,
         r#"#!/bin/sh
 case "$*" in
-  "pr view feature --json comments,reviews,files,statusCheckRollup")
-cat <<'JSON'
-{"comments":[{"id":"PRC_fresh","author":{"login":"reviewer"},"body":"fresh top-level comment","createdAt":"2026-06-14T12:00:00Z"}],"reviews":[{"id":"PRR_fresh","author":{"login":"bot"},"state":"CHANGES_REQUESTED","body":"fresh review body","submittedAt":"2026-06-14T12:01:00Z"}],"files":[],"statusCheckRollup":{"contexts":{"nodes":[]}}}
-JSON
-;;
+  *"/repos/example/repo/issues/42/comments?per_page=100"*)
+    echo '[[{"id":"PRC_fresh","user":{"login":"reviewer"},"body":"fresh top-level comment","created_at":"2026-06-14T12:00:00Z"}]]' ;;
+  *"/repos/example/repo/pulls/42/reviews?per_page=100"*)
+    echo '[[{"id":"PRR_fresh","user":{"login":"bot"},"state":"CHANGES_REQUESTED","body":"fresh review body","submitted_at":"2026-06-14T12:01:00Z"}]]' ;;
+  *"/repos/example/repo/pulls/42/files?per_page=100"*) echo '[[]]' ;;
+  *"/repos/example/repo/commits/abc123/check-runs?per_page=100"*) echo '[{"total_count":0,"check_runs":[]}]' ;;
+  *"/repos/example/repo/commits/abc123/statuses?per_page=100"*) echo '[[]]' ;;
   api\ graphql*)
 cat <<'JSON'
-{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"id":"PRRT_fresh","isResolved":false,"comments":{"nodes":[{"id":"PRRC_fresh","path":"src/lib.rs","originalLine":12,"body":"fresh inline comment","createdAt":"2026-06-14T12:01:30Z","author":{"login":"reviewer"}}]}}]}}}}}
+[{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false},"nodes":[{"id":"PRRT_fresh","isResolved":false,"comments":{"totalCount":1,"pageInfo":{"hasNextPage":false},"nodes":[{"id":"PRRC_fresh","path":"src/lib.rs","originalLine":12,"body":"fresh inline comment","createdAt":"2026-06-14T12:01:30Z","author":{"login":"reviewer"}}]}}]}}}}}]
 JSON
 ;;
   *)
 cat <<'JSON'
-{"number":42,"title":"Review refresh","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"CHANGES_REQUESTED","reviewRequests":{"nodes":[]},"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","updatedAt":"2026-06-14T12:02:00Z","comments":{"totalCount":2},"statusCheckRollup":{"contexts":{"nodes":[]}},"isDraft":false}
+{"id":"PR_review","number":42,"title":"Review refresh","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"CHANGES_REQUESTED","reviewRequests":{"nodes":[]},"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","headRepository":{"nameWithOwner":"example/repo"},"updatedAt":"2026-06-14T12:02:00Z","comments":{"totalCount":2},"statusCheckRollup":{"contexts":{"nodes":[]}},"isDraft":false}
 JSON
 ;;
 esac
@@ -251,6 +253,9 @@ esac
 case "$*" in
   *"remote get-url origin"*)
 echo "https://github.com/example/repo.git"
+;;
+  *"rev-parse HEAD"*)
+echo "abc123"
 ;;
 esac
 "#,
@@ -276,6 +281,7 @@ esac
         PrSummary {
             number: 42,
             change_request_identity: None,
+            native_state_evidence: crate::remote::NativeStateEvidence::default(),
             title: "Stale review".to_string(),
             author: "author".to_string(),
             body: String::new(),
@@ -289,6 +295,7 @@ esac
             updated_at: "2026-06-14T11:00:00Z".to_string(),
             check_status: "unknown".to_string(),
             merge_state_status: "CLEAN".to_string(),
+            queue_state: "not_queued".to_string(),
             comment_count: 1,
             merged: false,
             draft: false,
@@ -358,23 +365,27 @@ case "$*" in
     touch '{}'
     echo '{{"data":{{"resolveReviewThread":{{"thread":{{"isResolved":true}}}}}}}}'
     ;;
-  "pr view feature --json comments,reviews,files,statusCheckRollup")
+  *"/repos/example/repo/issues/42/comments?per_page=100"*) echo '[[]]' ;;
+  *"/repos/example/repo/pulls/42/reviews?per_page=100"*)
     if [ -f '{}' ]; then
-      echo '{{"comments":[],"reviews":[{{"id":"PRR_fresh","author":{{"login":"reviewer"}},"state":"APPROVED","body":"","submittedAt":"2026-07-13T12:01:00Z"}}],"files":[],"statusCheckRollup":{{"contexts":{{"nodes":[]}}}}}}'
+      echo '[[{{"id":"PRR_fresh","user":{{"login":"reviewer"}},"state":"APPROVED","body":"","submitted_at":"2026-07-13T12:01:00Z"}}]]'
     else
-      echo '{{"comments":[],"reviews":[{{"id":"PRR_stale","author":{{"login":"reviewer"}},"state":"CHANGES_REQUESTED","body":"address guarded feedback","submittedAt":"2026-07-13T12:00:00Z"}}],"files":[],"statusCheckRollup":{{"contexts":{{"nodes":[]}}}}}}'
+      echo '[[{{"id":"PRR_stale","user":{{"login":"reviewer"}},"state":"CHANGES_REQUESTED","body":"address guarded feedback","submitted_at":"2026-07-13T12:00:00Z"}}]]'
     fi
     ;;
+  *"/repos/example/repo/pulls/42/files?per_page=100"*) echo '[[]]' ;;
+  *"/repos/example/repo/commits/repair-sha/check-runs?per_page=100"*) echo '[{{"total_count":1,"check_runs":[{{"name":"test","status":"completed","conclusion":"success"}}]}}]' ;;
+  *"/repos/example/repo/commits/repair-sha/statuses?per_page=100"*) echo '[[]]' ;;
   api\ graphql*)
     if [ -f '{}' ]; then
-      echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
+      echo '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}]'
     else
-      echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{{"id":"PRRT_guarded_1","isResolved":false,"comments":{{"nodes":[{{"id":"PRRC_guarded","path":"src/lib.rs","originalLine":12,"body":"address guarded feedback","createdAt":"2026-07-13T12:00:30Z","author":{{"login":"reviewer"}}}}]}}}}]}}}}}}}}}}'
+      echo '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":1,"pageInfo":{{"hasNextPage":false}},"nodes":[{{"id":"PRRT_guarded_1","isResolved":false,"comments":{{"totalCount":1,"pageInfo":{{"hasNextPage":false}},"nodes":[{{"id":"PRRC_guarded","path":"src/lib.rs","originalLine":12,"body":"address guarded feedback","createdAt":"2026-07-13T12:00:30Z","author":{{"login":"reviewer"}}}}]}}}}]}}}}}}}}}}]'
     fi
     ;;
   *)
     if [ -f '{}' ]; then decision=APPROVED; else decision=CHANGES_REQUESTED; fi
-    echo "{{\"id\":\"PR_test\",\"number\":42,\"title\":\"Guarded repair\",\"body\":\"\",\"url\":\"https://github.com/example/repo/pull/42\",\"state\":\"OPEN\",\"reviewDecision\":\"$decision\",\"reviewRequests\":{{\"nodes\":[]}},\"headRefName\":\"feature\",\"baseRefName\":\"main\",\"headRefOid\":\"repair-sha\",\"headRepository\":{{\"nameWithOwner\":\"example/repo\"}},\"updatedAt\":\"2026-07-13T12:02:00Z\",\"comments\":{{\"totalCount\":0}},\"statusCheckRollup\":{{\"contexts\":{{\"nodes\":[]}}}},\"mergeStateStatus\":\"CLEAN\",\"isDraft\":false}}"
+    echo "{{\"id\":\"PR_test\",\"number\":42,\"title\":\"Guarded repair\",\"body\":\"\",\"url\":\"https://github.com/example/repo/pull/42\",\"state\":\"OPEN\",\"reviewDecision\":\"$decision\",\"reviewRequests\":{{\"nodes\":[]}},\"headRefName\":\"feature\",\"baseRefName\":\"main\",\"headRefOid\":\"repair-sha\",\"headRepository\":{{\"nameWithOwner\":\"example/repo\"}},\"updatedAt\":\"2026-07-13T12:02:00Z\",\"comments\":{{\"totalCount\":0}},\"statusCheckRollup\":{{\"contexts\":{{\"nodes\":[{{\"__typename\":\"CheckRun\",\"name\":\"test\",\"status\":\"COMPLETED\",\"conclusion\":\"SUCCESS\"}}]}}}},\"mergeStateStatus\":\"CLEAN\",\"isDraft\":false}}"
     ;;
 esac
 "#,
@@ -439,6 +450,7 @@ esac
         PrSummary {
             number: 42,
             change_request_identity: Some(crate::remote::test_change_request_identity()),
+            native_state_evidence: crate::remote::NativeStateEvidence::default(),
             title: "Guarded repair".to_string(),
             author: "author".to_string(),
             body: String::new(),
@@ -452,16 +464,17 @@ esac
             updated_at: "2026-07-13T12:00:00Z".to_string(),
             check_status: "passed".to_string(),
             merge_state_status: "CLEAN".to_string(),
+            queue_state: "not_queued".to_string(),
             comment_count: 1,
             merged: false,
             draft: false,
         },
         Some(PrDetails {
-            review_comments: vec![crate::github::PrReviewComment {
+            review_comments: vec![crate::remote::PrReviewComment {
                 thread_id: "PRRT_guarded_1".to_string(),
                 body: "address guarded feedback".to_string(),
                 resolved: false,
-                ..crate::github::PrReviewComment::default()
+                ..crate::remote::PrReviewComment::default()
             }],
             ..PrDetails::default()
         }),
@@ -507,11 +520,11 @@ esac
     assert!(reloaded.run.pending_push.is_none());
     assert_eq!(
         reloaded.run.stabilization_blocker,
-        Some(StabilizationBlocker::ReadyForManualMerge)
+        Some(StabilizationBlocker::PolicyUnknown)
     );
     assert_eq!(
         reloaded.run.stabilization_next_work,
-        Some(StabilizationWorkKind::MarkReadyForManualMerge)
+        Some(StabilizationWorkKind::Escalate)
     );
 
     let _ = fs::remove_dir_all(temp);
@@ -545,16 +558,18 @@ case "$*" in
     touch '{}'
     echo '{{"data":{{"resolveReviewThread":{{"thread":{{"isResolved":true}}}}}}}}'
     ;;
-  "pr view feature --json comments,reviews,files,statusCheckRollup")
-    echo '{{"comments":[],"reviews":[],"files":[],"statusCheckRollup":{{"contexts":{{"nodes":[]}}}}}}'
-    ;;
+  *"/repos/example/repo/issues/42/comments?per_page=100"*) echo '[[]]' ;;
+  *"/repos/example/repo/pulls/42/reviews?per_page=100"*) echo '[[]]' ;;
+  *"/repos/example/repo/pulls/42/files?per_page=100"*) echo '[[]]' ;;
+  *"/repos/example/repo/commits/repair-sha/check-runs?per_page=100"*) echo '[{{"total_count":0,"check_runs":[]}}]' ;;
+  *"/repos/example/repo/commits/repair-sha/statuses?per_page=100"*) echo '[[]]' ;;
   api\ graphql*)
     if [ ! -f '{}' ]; then
-      echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{{"id":"PRRT_1","isResolved":false,"comments":{{"nodes":[{{"id":"C1","path":"src/lib.rs","body":"one","createdAt":"2026-07-13T12:00:00Z","author":{{"login":"reviewer"}}}}]}}}},{{"id":"PRRT_2","isResolved":false,"comments":{{"nodes":[{{"id":"C2","path":"src/lib.rs","body":"two","createdAt":"2026-07-13T12:00:01Z","author":{{"login":"reviewer"}}}}]}}}}]}}}}}}}}}}'
+      echo '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":2,"pageInfo":{{"hasNextPage":false}},"nodes":[{{"id":"PRRT_1","isResolved":false,"comments":{{"totalCount":1,"pageInfo":{{"hasNextPage":false}},"nodes":[{{"id":"C1","path":"src/lib.rs","body":"one","createdAt":"2026-07-13T12:00:00Z","author":{{"login":"reviewer"}}}}]}}}},{{"id":"PRRT_2","isResolved":false,"comments":{{"totalCount":1,"pageInfo":{{"hasNextPage":false}},"nodes":[{{"id":"C2","path":"src/lib.rs","body":"two","createdAt":"2026-07-13T12:00:01Z","author":{{"login":"reviewer"}}}}]}}}}]}}}}}}}}}}]'
     elif [ ! -f '{}' ]; then
-      echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[{{"id":"PRRT_2","isResolved":false,"comments":{{"nodes":[{{"id":"C2","path":"src/lib.rs","body":"two","createdAt":"2026-07-13T12:00:01Z","author":{{"login":"reviewer"}}}}]}}}}]}}}}}}}}}}'
+      echo '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":1,"pageInfo":{{"hasNextPage":false}},"nodes":[{{"id":"PRRT_2","isResolved":false,"comments":{{"totalCount":1,"pageInfo":{{"hasNextPage":false}},"nodes":[{{"id":"C2","path":"src/lib.rs","body":"two","createdAt":"2026-07-13T12:00:01Z","author":{{"login":"reviewer"}}}}]}}}}]}}}}}}}}}}]'
     else
-      echo '{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"nodes":[]}}}}}}}}}}'
+      echo '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}]'
     fi
     ;;
   pr\ view\ feature\ --json\ id,number,title,*)
@@ -706,11 +721,11 @@ fn phase_1_failed_details_refresh_does_not_start_repair_from_stale_thread_ids() 
     session.pr = PrCache::observed(
         phase_1_pr_summary("old-head"),
         Some(PrDetails {
-            review_comments: vec![crate::github::PrReviewComment {
+            review_comments: vec![crate::remote::PrReviewComment {
                 thread_id: "PRRT_stale".to_string(),
                 body: "stale review feedback".to_string(),
                 resolved: false,
-                ..crate::github::PrReviewComment::default()
+                ..crate::remote::PrReviewComment::default()
             }],
             ..PrDetails::default()
         }),
@@ -745,20 +760,20 @@ fn ci_fix_sends_prompt_to_agent_session() {
         &gh,
         r#"#!/bin/sh
 case "$*" in
-  "pr view feature --json comments,reviews,files,statusCheckRollup")
-cat <<'JSON'
-{"comments":[],"reviews":[],"files":[],"statusCheckRollup":{"contexts":{"nodes":[{"name":"test","status":"COMPLETED","conclusion":"FAILURE"}]}}}
-JSON
-;;
+  *"/repos/example/repo/issues/42/comments?per_page=100"*) echo '[[]]' ;;
+  *"/repos/example/repo/pulls/42/reviews?per_page=100"*) echo '[[]]' ;;
+  *"/repos/example/repo/pulls/42/files?per_page=100"*) echo '[[]]' ;;
+  *"/repos/example/repo/commits/abc123/check-runs?per_page=100"*) echo '[{"total_count":1,"check_runs":[{"name":"test","status":"completed","conclusion":"failure"}]}]' ;;
+  *"/repos/example/repo/commits/abc123/statuses?per_page=100"*) echo '[[]]' ;;
   "run list "*)
 printf '[]\n'
 ;;
   api\ graphql*)
-printf '%s\n' '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}'
+printf '%s\n' '[{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]}}}}}]'
 ;;
   *)
 cat <<'JSON'
-{"number":42,"title":"CI refresh","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"","reviewRequests":{"nodes":[]},"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","updatedAt":"2026-06-14T12:02:00Z","comments":{"totalCount":0},"statusCheckRollup":{"contexts":{"nodes":[{"name":"test","status":"COMPLETED","conclusion":"FAILURE"}]}},"isDraft":false}
+{"id":"PR_ci","number":42,"title":"CI refresh","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"","reviewRequests":{"nodes":[]},"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","headRepository":{"nameWithOwner":"example/repo"},"updatedAt":"2026-06-14T12:02:00Z","comments":{"totalCount":0},"statusCheckRollup":{"contexts":{"nodes":[{"name":"test","status":"COMPLETED","conclusion":"FAILURE"}]}},"isDraft":false}
 JSON
 ;;
 esac
@@ -771,6 +786,9 @@ esac
 case "$*" in
   *"remote get-url origin"*)
 echo "https://github.com/example/repo.git"
+;;
+  *"rev-parse HEAD"*)
+echo "abc123"
 ;;
 esac
 "#,
@@ -1257,7 +1275,7 @@ fn completed_delete_schedules_inventory_refresh_without_tui_thread_io() {
     fs::create_dir_all(&temp).unwrap();
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let cache = PrCache::observed(phase_1_pr_summary("abc123"), None);
-    crate::github::save_pr_cache(&repo, "feature/delete", &cache).unwrap();
+    crate::remote::save_pr_cache(&repo, "feature/delete", &cache).unwrap();
     let mut session = test_session(temp.join("worktree"), "feature/delete");
     session.pr = cache;
     let mut tui = Tui::new_single(repo.clone(), test_config(), vec![session]);
@@ -1292,7 +1310,7 @@ fn completed_delete_schedules_inventory_refresh_without_tui_thread_io() {
     tui.pr_persistence_in_flight.remove(&pr_key);
     wait_for_pr_persistence(&mut tui);
     assert!(
-        crate::github::load_pr_cache(&repo, "feature/delete")
+        crate::remote::load_pr_cache(&repo, "feature/delete")
             .summary()
             .is_none()
     );
@@ -1472,8 +1490,8 @@ fn unavailable_remote_preserves_stale_live_and_persisted_display_state() {
             ..PrDetails::default()
         }),
     );
-    crate::github::save_pr_cache(&repo, "feature", &cache).unwrap();
-    crate::github::save_pr_details_cache(&repo, "feature", cache.details().unwrap()).unwrap();
+    crate::remote::save_pr_cache(&repo, "feature", &cache).unwrap();
+    crate::remote::save_pr_details_cache(&repo, "feature", cache.details().unwrap()).unwrap();
     let mut session = test_session(temp.join("worktree"), "feature");
     session.pr = cache;
     session.unseen_comments = true;
@@ -1482,7 +1500,7 @@ fn unavailable_remote_preserves_stale_live_and_persisted_display_state() {
     assert!(!tui.poll_pull_requests(true));
     let started = Instant::now();
     let mut changed = false;
-    while tui.sessions[0].pr.display_error().is_none() {
+    while tui.sessions[0].pr.trusted_summary().is_ok() {
         changed |= tui.poll_pull_requests(false);
         assert!(
             started.elapsed() < Duration::from_secs(1),
@@ -1497,7 +1515,7 @@ fn unavailable_remote_preserves_stale_live_and_persisted_display_state() {
     assert!(tui.sessions[0].pr.trusted_summary().is_err());
     assert!(tui.sessions[0].unseen_comments);
     wait_for_pr_persistence(&mut tui);
-    let persisted = crate::github::load_pr_cache(&repo, "feature");
+    let persisted = crate::remote::load_pr_cache(&repo, "feature");
     assert!(persisted.summary().is_some());
     assert!(persisted.details().is_some());
     assert!(persisted.trusted_summary().is_err());
@@ -1520,7 +1538,7 @@ fn missing_github_remote_clears_hidden_non_pollable_pr_cache_state() {
         .insert("git".to_string(), git.display().to_string());
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let cache = PrCache::observed(phase_1_pr_summary("old-head"), None);
-    crate::github::save_pr_cache(&repo, "feature", &cache).unwrap();
+    crate::remote::save_pr_cache(&repo, "feature", &cache).unwrap();
     let mut session = test_session(temp.join("worktree"), "feature");
     session.hidden = true;
     session.pr = cache;
@@ -1531,7 +1549,7 @@ fn missing_github_remote_clears_hidden_non_pollable_pr_cache_state() {
     assert!(tui.sessions[0].pr.summary().is_none());
     wait_for_pr_persistence(&mut tui);
     assert!(
-        crate::github::load_pr_cache(&repo, "feature")
+        crate::remote::load_pr_cache(&repo, "feature")
             .summary()
             .is_none()
     );
@@ -1551,7 +1569,7 @@ fn wait_for_pr_persistence(tui: &mut Tui) {
 }
 
 #[test]
-fn default_branch_does_not_start_pr_polling() {
+fn default_branch_starts_only_repository_level_remote_polling() {
     let temp = unique_temp_dir("prism-default-branch-pr-poll-test");
     fs::create_dir_all(&temp).unwrap();
 
@@ -1564,7 +1582,7 @@ fn default_branch_does_not_start_pr_polling() {
     let changed = tui.poll_pull_requests(false);
 
     assert!(!changed);
-    assert!(!tui.repos[0].pr_summary_poll_in_flight);
+    assert!(tui.repos[0].pr_summary_poll_in_flight);
     assert!(tui.pr_polls_in_flight.is_empty());
 
     let _ = fs::remove_dir_all(temp);
@@ -2104,6 +2122,7 @@ fn phase_1_pr_summary(head_sha: &str) -> PrSummary {
     PrSummary {
         number: 42,
         change_request_identity: None,
+        native_state_evidence: crate::remote::NativeStateEvidence::default(),
         title: "Phase 1 safety".to_string(),
         author: "author".to_string(),
         body: String::new(),
@@ -2117,6 +2136,7 @@ fn phase_1_pr_summary(head_sha: &str) -> PrSummary {
         updated_at: "2026-07-13T12:00:00Z".to_string(),
         check_status: "passed".to_string(),
         merge_state_status: "CLEAN".to_string(),
+        queue_state: "not_queued".to_string(),
         comment_count: 1,
         merged: false,
         draft: false,
