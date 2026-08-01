@@ -2,8 +2,9 @@
   "schema": 2,
   "items": [
     {"branch": "main", "worktree": {"path": "/redacted/repo.main"}},
-    {"branch": "absent", "worktree": {"path": "/redacted/repo.absent"}},
-    {"branch": "null", "worktree": {"path": "/redacted/repo.null"}, "dev_server": null},
+    {"branch": "missing", "worktree": {"path": "/redacted/repo.missing"}, "dev_server": {}},
+    {"branch": "null", "worktree": {"path": "/redacted/repo.null"}, "dev_server": {"url": null}},
+    {"branch": "empty", "worktree": {"path": "/redacted/repo.empty"}, "dev_server": {"url": ""}},
     {"branch": "without-worktree"}
   ]
 }

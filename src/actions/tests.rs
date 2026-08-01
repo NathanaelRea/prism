@@ -17,6 +17,8 @@ use crate::tui::{
     TuiJobKey, TuiJobKind, WtObservation, WtPollResult,
 };
 
+use super::pull_requests::windows_browser_opener_candidate;
+use super::worktrees::development_url_opened_message;
 use super::{
     apply_bulk_review_resolution, archived_picker_overflow_message, discover_wt_columns,
     open_http_url_in_browser, plan_run_mode_from_parallel_confirmation, pr_target_choice_list,
@@ -160,7 +162,33 @@ fn development_browser_rejects_non_http_urls_without_exposing_the_value() {
 }
 
 #[test]
-fn worktree_column_aliases_are_discoverable_without_duplicates() {
+fn windows_browser_opener_is_direct_and_keeps_the_url_in_one_argument() {
+    let (program, args) = windows_browser_opener_candidate();
+    let url = "https://example.test/a path?x=1&y=2";
+    let mut command = std::process::Command::new(program);
+    command.args(args).arg(url);
+
+    assert_eq!(program, "rundll32.exe");
+    assert_eq!(
+        command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        vec!["url.dll,FileProtocolHandler", url]
+    );
+}
+
+#[test]
+fn worktree_url_column_choices_are_unconditional_and_semantically_deduplicated() {
+    let unconditional = worktree_column_choices(&[], &[], 0);
+    assert_eq!(
+        unconditional
+            .iter()
+            .map(|choice| choice.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["url", "url_active"]
+    );
+
     let temp = unique_temp_dir("prism-column-alias-test");
     let mut session = test_session(temp.join("feature"), "feature");
     for key in [
@@ -173,13 +201,13 @@ fn worktree_column_aliases_are_discoverable_without_duplicates() {
             .wt_columns
             .insert(key.to_string(), "value".to_string());
     }
-    let choices = worktree_column_choices(&[], &[session], 0);
+    let choices = worktree_column_choices(&["dev_server.url".to_string()], &[session], 0);
     assert_eq!(
         choices
             .iter()
             .map(|choice| choice.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["url", "url_active"]
+        vec!["dev_server.url", "url_active"]
     );
     let _ = fs::remove_dir_all(temp);
 }
@@ -1535,8 +1563,13 @@ exit 0
     }
 
     assert!(tui.delete_sessions_in_flight.is_empty());
-    assert!(tui.sessions.iter().all(|session| session.path != worktree));
-    assert!(tui.visible_session_indices().is_empty());
+    let pending = tui
+        .sessions
+        .iter()
+        .find(|session| session.path == worktree)
+        .expect("partial deletion remains selectable for retry");
+    assert_eq!(pending.status_label, "deletion pending");
+    assert_eq!(tui.visible_session_indices(), vec![0]);
 
     let _ = fs::remove_dir_all(temp);
 }
@@ -2004,6 +2037,17 @@ fn worktrunk_failure_preserves_successful_columns_as_stale() {
 }
 
 #[test]
+fn stale_development_url_reports_generic_feedback_without_the_cached_url() {
+    let cached_url = "http://localhost:3000/private-token-123";
+    let message = development_url_opened_message(true);
+    assert_eq!(
+        message,
+        "opened development URL from stale Worktrunk observation"
+    );
+    assert!(!message.contains(cached_url));
+}
+
+#[test]
 fn worktrunk_refresh_requests_coalesce_while_poll_is_in_flight() {
     let temp = unique_temp_dir("prism-wt-coalesced-refresh-test");
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
@@ -2015,6 +2059,66 @@ fn worktrunk_refresh_requests_coalesce_while_poll_is_in_flight() {
 
     assert!(tui.repos[0].wt_poll_pending);
     assert!(tui.repos[0].wt_poll_in_flight);
+}
+
+#[test]
+fn worktrunk_hook_log_inventory_is_repository_scoped_and_preserves_stale_entries() {
+    let temp = unique_temp_dir("prism-wt-hook-log-cache-test");
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut tui = Tui::new_single(repo, test_config(), Vec::new());
+    assert!(matches!(
+        tui.repos[0].wt_hook_logs.quality,
+        crate::worktrunk::ObservationQuality::NeverLoaded
+    ));
+    let repository = tui.repos[0].identity.clone();
+    let entry = crate::worktrunk::HookLogEntry {
+        path: temp.join(".git/wt/logs/dev.log"),
+        branch: "feature/cache".to_string(),
+        source: "project".to_string(),
+        hook_type: Some("post-start".to_string()),
+        name: "dev".to_string(),
+        modified_at: "2026-01-01T00:00:00Z".to_string(),
+        size: 12,
+    };
+    tui.wt_hook_log_poll_tx
+        .send(crate::tui::WtHookLogPollResult {
+            repository,
+            observation: Ok(crate::tui::WtHookLogObservation {
+                entries: vec![entry.clone()],
+                observed_at: Instant::now(),
+            }),
+        })
+        .unwrap();
+
+    assert!(tui.poll_wt_hook_logs());
+    assert_eq!(tui.repos[0].wt_hook_logs.entries, vec![entry]);
+    assert!(matches!(
+        tui.repos[0].wt_hook_logs.quality,
+        crate::worktrunk::ObservationQuality::Fresh
+    ));
+
+    assert!(tui.mark_wt_hook_logs_stale(0, "refresh failed".to_string()));
+    assert_eq!(tui.repos[0].wt_hook_logs.entries.len(), 1);
+    assert!(matches!(
+        tui.repos[0].wt_hook_logs.quality,
+        crate::worktrunk::ObservationQuality::Stale { .. }
+    ));
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn worktrunk_hook_log_refresh_coalesces_while_in_flight() {
+    let temp = unique_temp_dir("prism-wt-hook-log-coalesce-test");
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut tui = Tui::new_single(repo, test_config(), Vec::new());
+    tui.repos[0].wt_hook_logs.refresh_in_flight = true;
+
+    tui.request_wt_hook_log_refresh(0);
+    tui.request_wt_hook_log_refresh(0);
+
+    assert!(tui.repos[0].wt_hook_logs.refresh_in_flight);
+    assert!(tui.repos[0].wt_hook_logs.refresh_pending);
+    let _ = fs::remove_dir_all(temp);
 }
 
 #[test]

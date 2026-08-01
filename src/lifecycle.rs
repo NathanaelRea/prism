@@ -4,7 +4,7 @@ use std::process::Command;
 use crate::config::Config;
 use crate::process::{
     ProcessDescriptor, ProcessPolicy, run_capture, run_capture_named, run_configured_commands,
-    run_status,
+    run_output_allow_failure, run_status,
 };
 use crate::repo::Repository;
 pub(crate) use crate::worktrunk::ApprovalStatus as WorktrunkApprovalStatus;
@@ -261,6 +261,32 @@ pub(crate) fn branch_oid(
         Err(format!("branch {branch} identity was empty; retained it"))
     } else {
         Ok(oid.to_string())
+    }
+}
+
+pub(crate) fn branch_exists(
+    repo: &Repository,
+    config: &Config,
+    branch: &str,
+) -> Result<bool, String> {
+    let output = run_output_allow_failure(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(&repo.root)
+            .args([
+                "show-ref",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ]),
+        ProcessPolicy::Metadata,
+    )?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "could not determine whether branch {branch} exists"
+        )),
     }
 }
 
@@ -1100,6 +1126,175 @@ exit 0
     }
 
     #[test]
+    fn failed_worktrunk_removal_after_path_removal_is_resumable_without_repeating_remove() {
+        let temp = unique_temp_dir("prism-wt-failed-after-remove-retry-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        let branch = "feature/retry-removed";
+        let path = temp.join("worktree");
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join(".git"), "gitdir: /repo/.git/worktrees/retry\n").unwrap();
+        let branch_deleted = temp.join("branch-deleted");
+        let git = temp.join("git");
+        write_executable(
+            &git,
+            &format!(
+                r#"#!/bin/sh
+case "$*" in
+  *"worktree list --porcelain"*)
+    test ! -d '{path}' || printf 'worktree {path}\nbranch refs/heads/{branch}\n\n'
+    ;;
+  *"rev-parse --verify refs/heads/{branch}"*) printf 'branch-oid\n' ;;
+  *"show-ref --verify --quiet refs/heads/{branch}"*) test ! -e '{branch_deleted}' ;;
+  *"branch -D {branch}"*) touch '{branch_deleted}' ;;
+esac
+exit 0
+"#,
+                path = path.display(),
+                branch_deleted = branch_deleted.display(),
+            ),
+        );
+        let wt_log = temp.join("wt.log");
+        let wt = temp.join("wt");
+        write_executable(
+            &wt,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nrm -rf '{}'\necho 'post-remove hook failed' >&2\nexit 1\n",
+                wt_log.display(),
+                path.display(),
+            ),
+        );
+        let tmux = temp.join("tmux");
+        write_executable(&tmux, "#!/bin/sh\nexit 0\n");
+        let mut config = test_config();
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        observability::with_writable_db(&repo, |conn| {
+            conn.execute(
+                "insert into task_metadata (
+                    branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
+                 ) values (?1, 'summary', 'prompt', ?2, 123)",
+                params![branch, path.display().to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+
+        let first =
+            crate::session::delete_worktree_session_if_current(&repo, &config, &path, branch, None)
+                .unwrap();
+
+        assert!(matches!(
+            first,
+            crate::session::DeleteWorktreeOutcome::BranchRetained {
+                owned_state_removed: false,
+                ..
+            }
+        ));
+        assert!(!path.exists());
+        assert!(!branch_deleted.exists());
+        assert_eq!(count_rows(&repo, "task_metadata", branch), 1);
+        let first_wt_log = fs::read_to_string(&wt_log).unwrap();
+
+        let retried =
+            crate::session::delete_worktree_session_if_current(&repo, &config, &path, branch, None)
+                .unwrap();
+
+        assert_eq!(retried, crate::session::DeleteWorktreeOutcome::Deleted);
+        assert!(branch_deleted.exists());
+        assert_eq!(count_rows(&repo, "task_metadata", branch), 0);
+        assert_eq!(fs::read_to_string(&wt_log).unwrap(), first_wt_log);
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn pending_removed_worktree_with_absent_branch_resumes_owned_state_cleanup() {
+        let temp = unique_temp_dir("prism-pending-removed-absent-branch-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        let branch = "feature/crash-window";
+        let path = temp.join("removed-worktree");
+        let git_log = temp.join("git.log");
+        let git = temp.join("git");
+        write_executable(
+            &git,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncase \"$*\" in\n  *\"show-ref --verify --quiet refs/heads/{branch}\"*) exit 1 ;;\nesac\nexit 0\n",
+                git_log.display(),
+            ),
+        );
+        let wt_called = temp.join("wt-called");
+        let wt = temp.join("wt");
+        write_executable(
+            &wt,
+            &format!("#!/bin/sh\ntouch '{}'\nexit 99\n", wt_called.display()),
+        );
+        let tmux = temp.join("tmux");
+        write_executable(&tmux, "#!/bin/sh\nexit 0\n");
+        let mut config = test_config();
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        observability::with_writable_db(&repo, |conn| {
+            conn.execute(
+                "insert into task_metadata (
+                    branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
+                 ) values (?1, 'summary', 'prompt', ?2, 123)",
+                params![branch, path.display().to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+            conn.execute(
+                "insert into pending_worktree_deletion (
+                    branch, worktree_path, worktree_incarnation, branch_oid,
+                    worktree_removed, branch_deleted, updated_unix_ms
+                 ) values (?1, ?2, 'incarnation', 'branch-oid', 1, 0, 123)",
+                params![branch, path.display().to_string()],
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+
+        crate::session::reconcile_worktree_state(&repo, &config).unwrap();
+        assert_eq!(count_rows(&repo, "task_metadata", branch), 1);
+        assert_eq!(
+            crate::session::discover_sessions(&repo, &config)
+                .unwrap()
+                .iter()
+                .map(|session| session.status_label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["deletion pending"]
+        );
+
+        let outcome =
+            crate::session::delete_worktree_session_if_current(&repo, &config, &path, branch, None)
+                .unwrap();
+
+        assert_eq!(outcome, crate::session::DeleteWorktreeOutcome::Deleted);
+        assert!(!wt_called.exists(), "resumed cleanup repeated wt remove");
+        assert_eq!(count_rows(&repo, "task_metadata", branch), 0);
+        assert_eq!(count_rows(&repo, "pending_worktree_deletion", branch), 0);
+        let git_commands = fs::read_to_string(git_log).unwrap();
+        assert!(git_commands.contains("show-ref --verify --quiet"));
+        assert!(!git_commands.contains(&format!("branch -D {branch}")));
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn branch_delete_failure_reports_removed_worktree_and_retained_branch() {
         let temp = unique_temp_dir("prism-delete-branch-retained-test");
         fs::create_dir_all(&temp).unwrap();
@@ -1108,9 +1303,14 @@ exit 0
         let git = temp.join("git");
         let wt = temp.join("wt");
         let wt_log = temp.join("wt.log");
+        let fail_branch_delete = temp.join("fail-branch-delete");
+        fs::write(&fail_branch_delete, "fail\n").unwrap();
         write_executable(
             &git,
-            "#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --verify refs/heads/feature/keep\"*) echo branch-oid; exit 0 ;;\n  *\"branch -D feature/keep\"*) echo retained >&2; exit 1 ;;\n  *\"worktree list --porcelain\"*) exit 0 ;;\nesac\nexit 0\n",
+            &format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --verify refs/heads/feature/keep\"*) echo branch-oid; exit 0 ;;\n  *\"branch -D feature/keep\"*) test ! -e '{}' || exit 1 ;;\n  *\"worktree list --porcelain\"*) exit 0 ;;\nesac\nexit 0\n",
+                fail_branch_delete.display()
+            ),
         );
         let mut config = test_config();
         config
@@ -1151,7 +1351,22 @@ exit 0
             outcome,
             crate::session::DeleteWorktreeOutcome::BranchRetained { .. }
         ));
+        assert_eq!(count_rows(&repo, "task_metadata", "feature/keep"), 1);
+        let first_wt_command = fs::read_to_string(&wt_log).unwrap();
+
+        fs::remove_file(fail_branch_delete).unwrap();
+        let retried = crate::session::delete_worktree_session_if_current(
+            &repo,
+            &config,
+            &path,
+            "feature/keep",
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(retried, crate::session::DeleteWorktreeOutcome::Deleted);
         assert_eq!(count_rows(&repo, "task_metadata", "feature/keep"), 0);
+        assert_eq!(fs::read_to_string(&wt_log).unwrap(), first_wt_command);
         let _ = fs::remove_dir_all(temp);
     }
 

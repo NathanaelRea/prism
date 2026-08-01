@@ -2637,6 +2637,104 @@ fn cleanup_escalates_pending_worktrunk_approval_without_retiring_metadata() {
     assert!(worktree.exists());
 }
 
+#[test]
+fn pending_cleanup_intent_with_present_worktree_rechecks_worktrunk_approval() {
+    let temp = TempDir::new("pending-cleanup-rechecks-approval");
+    let worktree = temp.path().join("worktree");
+    fs::create_dir_all(&worktree).unwrap();
+    fs::write(
+        worktree.join(".git"),
+        "gitdir: /repo/.git/worktrees/feature\n",
+    )
+    .unwrap();
+    let repo = Repository::with_config_dir_for_test(
+        temp.path().join("repo"),
+        temp.path().join("prism-config"),
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut persisted = AutoLaunch::new(&repo.root, &worktree, "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+    let incarnation = persisted.run.worktree_incarnation.clone().unwrap();
+    persisted.steps.clear();
+    persisted.steps.push(AutoStepRun::queued(
+        &persisted.run.id,
+        1,
+        AutoStepKey::Cleanup,
+        1,
+        Some("cleanup".to_string()),
+    ));
+    save_auto_run(&conn, &mut persisted).unwrap();
+    start_non_agent_step(&conn, &mut persisted, 0).unwrap();
+    crate::observability::with_writable_db(&repo, |db| {
+        db.execute(
+            "insert into task_metadata (
+                branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
+             ) values (?1, '', '', ?2, 0)",
+            rusqlite::params![persisted.run.branch, worktree.display().to_string()],
+        )
+        .map_err(|error| error.to_string())?;
+        db.execute(
+            "insert into pending_worktree_deletion (
+                branch, worktree_path, worktree_incarnation, branch_oid,
+                worktree_removed, branch_deleted, updated_unix_ms
+             ) values (?1, ?2, ?3, 'branch-oid', 0, 0, 0)",
+            rusqlite::params![
+                persisted.run.branch,
+                worktree.display().to_string(),
+                incarnation
+            ],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    })
+    .unwrap();
+    let wt_log = temp.path().join("wt.log");
+    let wt = temp.path().join("wt");
+    write_executable(
+        &wt,
+        &format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nprintf '%s\\n' 'repo needs approval to execute commands; cannot prompt in non-interactive mode' >&2\nexit 1\n",
+            wt_log.display()
+        ),
+    );
+    let mut config = test_config();
+    config.auto.cleanup_after_merge = true;
+    config
+        .tools
+        .insert("wt".to_string(), wt.display().to_string());
+
+    let error = execute_cleanup_step(&conn, &repo, &config, &mut persisted, 0, 100)
+        .expect_err("new approval requirement must stop pending cleanup");
+
+    assert!(error.contains("requires interactive approval"));
+    assert!(worktree.exists());
+    let wt_commands = fs::read_to_string(wt_log).unwrap();
+    assert!(wt_commands.contains("config approvals add"));
+    assert!(!wt_commands.contains("remove"));
+    let (metadata, pending) = crate::observability::with_writable_db(&repo, |db| {
+        let metadata = db
+            .query_row(
+                "select count(*) from task_metadata where branch = 'feat/auto'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let pending = db
+            .query_row(
+                "select count(*) from pending_worktree_deletion
+                 where branch = 'feat/auto' and worktree_removed = 0",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        Ok((metadata, pending))
+    })
+    .unwrap();
+    assert_eq!((metadata, pending), (1, 1));
+}
+
 fn push_test_step(
     persisted: &mut PersistedAutoRun,
     sequence: usize,

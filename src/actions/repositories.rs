@@ -661,11 +661,16 @@ pub(super) fn worktree_column_choices(
             enabled: true,
         })
         .collect::<Vec<_>>();
-    let discovered = sessions
-        .iter()
-        .filter(|session| session.repo_index == repo_index)
-        .flat_map(|session| session.wt_columns.keys().cloned())
-        .map(|key| semantic_column(&key).to_string())
+    let discovered = ["url", "url_active"]
+        .into_iter()
+        .map(str::to_string)
+        .chain(
+            sessions
+                .iter()
+                .filter(|session| session.repo_index == repo_index)
+                .flat_map(|session| session.wt_columns.keys().cloned())
+                .map(|key| semantic_column(&key).to_string()),
+        )
         .collect::<BTreeSet<_>>();
     choices.extend(discovered.into_iter().filter_map(|key| {
         seen.insert(key.clone())

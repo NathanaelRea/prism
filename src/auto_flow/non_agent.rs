@@ -1207,13 +1207,33 @@ pub(super) fn execute_cleanup_step(
             "auto cleanup retained the worktree because this run has no persisted worktree incarnation"
                 .to_string()
         })?;
-    if crate::session::worktree_incarnation(&persisted.run.worktree_path) != expected_incarnation {
+    let deletion_pending = crate::session::worktree_deletion_is_pending(
+        repo,
+        &persisted.run.worktree_path,
+        &persisted.run.branch,
+        expected_incarnation,
+    )?;
+    let worktree_removed = crate::session::worktree_removal_is_complete(
+        repo,
+        &persisted.run.worktree_path,
+        &persisted.run.branch,
+        expected_incarnation,
+    )?;
+    if !deletion_pending
+        && crate::session::worktree_incarnation(&persisted.run.worktree_path)
+            != expected_incarnation
+    {
         return Err(format!(
             "worktree {} was replaced while deletion was pending; retained the replacement",
             persisted.run.branch
         ));
     }
-    match crate::worktrunk::approval_status(repo, config).map_err(|error| error.to_string())? {
+    match worktree_removed
+        .then_some(crate::worktrunk::ApprovalStatus::Approved)
+        .map(Ok)
+        .unwrap_or_else(|| crate::worktrunk::approval_status(repo, config))
+        .map_err(|error| error.to_string())?
+    {
         crate::worktrunk::ApprovalStatus::Pending => {
             return Err(format!(
                 "auto cleanup requires interactive approval for Worktrunk project commands; retained the worktree and Prism metadata. Run:\n{}",

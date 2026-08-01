@@ -119,13 +119,17 @@ fn run_browser_opener_private(candidates: &[(&str, &[&str])], url: &str) -> Resu
 
 pub(super) const NO_BROWSER_ARGS: &[&str] = &[];
 pub(super) const GIO_BROWSER_ARGS: &[&str] = &["open"];
-pub(super) const WINDOWS_BROWSER_ARGS: &[&str] = &["/C", "start", ""];
+pub(super) const WINDOWS_BROWSER_ARGS: &[&str] = &["url.dll,FileProtocolHandler"];
+
+pub(super) fn windows_browser_opener_candidate() -> (&'static str, &'static [&'static str]) {
+    ("rundll32.exe", WINDOWS_BROWSER_ARGS)
+}
 
 pub(super) fn browser_opener_candidates() -> Vec<(&'static str, &'static [&'static str])> {
     if cfg!(target_os = "macos") {
         vec![("open", NO_BROWSER_ARGS)]
     } else if cfg!(target_os = "windows") {
-        vec![("cmd", WINDOWS_BROWSER_ARGS)]
+        vec![windows_browser_opener_candidate()]
     } else {
         vec![
             ("xdg-open", NO_BROWSER_ARGS),
@@ -303,12 +307,15 @@ impl Tui {
             "Remote Pull Requests",
             &format!("Opening worktree for PR #{}", summary.number),
         )?;
-        let creation = match checkout_worktree_session(&context.repo, &context.config, &branch) {
+        let first_attempt = checkout_worktree_session(&context.repo, &context.config, &branch);
+        self.request_wt_hook_log_refresh(context.repo_index);
+        let creation = match first_attempt {
             Ok(outcome) => outcome,
             Err(error) => {
                 if !error.approval_required()
                     || !self.offer_worktrunk_approval(raw, &context.repo, &context.config)?
                 {
+                    self.request_wt_poll(context.repo_index);
                     return Err(error.to_string());
                 }
                 self.show_loading_dialog(
@@ -316,12 +323,20 @@ impl Tui {
                     "Remote Pull Requests",
                     &format!("Opening worktree for PR #{}", summary.number),
                 )?;
-                checkout_worktree_session(&context.repo, &context.config, &branch)
-                    .map_err(|error| error.to_string())?
+                let retry = checkout_worktree_session(&context.repo, &context.config, &branch);
+                self.request_wt_hook_log_refresh(context.repo_index);
+                match retry {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        self.request_wt_poll(context.repo_index);
+                        return Err(error.to_string());
+                    }
+                }
             }
         };
         if let CreateWorktreeOutcome::CreatedMetadataFailed { error } = creation {
             self.refresh_sessions()?;
+            self.request_wt_poll(context.repo_index);
             self.show_message(&format!(
                 "worktree opened, but restoring Prism metadata failed: {error}"
             ))?;
@@ -329,8 +344,8 @@ impl Tui {
         }
 
         self.refresh_sessions()?;
+        self.request_wt_poll(context.repo_index);
         self.start_tmux_agent_warmup();
-        self.start_wt_column_poll();
         self.select_pr_worktree_by_branch(context.repo_index, &branch, Some(summary.clone()));
         self.focus_worktrees();
         self.show_message(&format!("opened worktree for PR #{}", summary.number))?;

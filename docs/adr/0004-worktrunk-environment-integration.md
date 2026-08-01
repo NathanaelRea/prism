@@ -57,13 +57,12 @@ Worktrunk also owns hook-log files. Prism may present a bounded, sanitized tail
 from a canonical regular file under `.git/wt/logs`, but does not persist log
 bodies or use file presence as process-liveness or hook-success evidence.
 
-## Planned Upstream Topics
+## Upstream Topics
 
-No upstream issues were opened as part of this change. The following are
-planned issue topics, deliberately listed without placeholder links:
+The remaining integration limitations are tracked upstream:
 
-1. Read-only structured project-command approval status.
-2. Machine-readable error codes for JSON commands, including approval-required failures.
-3. A command-line JSON schema selector independent of repository and user configuration.
-4. Worktree removal or branch-state cleanup guarded by an expected branch OID.
-5. Stable branch identity in structured hook-log entries.
+1. [Read-only structured project-command approval status](https://github.com/max-sixty/worktrunk/issues/3698).
+2. [Machine-readable error codes for JSON commands](https://github.com/max-sixty/worktrunk/issues/3697).
+3. [A command-line JSON schema selector](https://github.com/max-sixty/worktrunk/issues/3696).
+4. [Removal or branch cleanup guarded by an expected branch OID](https://github.com/max-sixty/worktrunk/issues/3700).
+5. [Stable branch identity in structured hook-log entries](https://github.com/max-sixty/worktrunk/issues/3699).

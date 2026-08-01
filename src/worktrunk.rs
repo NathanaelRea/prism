@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -313,7 +313,8 @@ struct Schema2Worktree {
 
 #[derive(Deserialize)]
 struct Schema2DevServer {
-    url: String,
+    #[serde(default)]
+    url: Option<String>,
     #[serde(default)]
     listening: Option<bool>,
 }
@@ -326,7 +327,6 @@ struct Schema2Display {
 
 #[derive(Deserialize)]
 struct HookLogEnvelope {
-    #[serde(default)]
     hook_output: Vec<HookLogJson>,
 }
 
@@ -431,8 +431,15 @@ pub(crate) fn observe_hook_logs(
     if !output.status.success() {
         return Err(WorktrunkFailure::from_output(&command, &output));
     }
+    parse_hook_log_output(&command, &output)
+}
+
+fn parse_hook_log_output(
+    command: &Command,
+    output: &ProcessOutput,
+) -> Result<Vec<HookLogEntry>, WorktrunkFailure> {
     let envelope = serde_json::from_str::<HookLogEnvelope>(&output.stdout)
-        .map_err(|error| WorktrunkFailure::malformed(&command, &output, error))?;
+        .map_err(|error| WorktrunkFailure::malformed(command, output, error))?;
     Ok(envelope
         .hook_output
         .into_iter()
@@ -454,8 +461,7 @@ pub(crate) fn observe_hook_logs(
 }
 
 pub(crate) fn read_hook_log_tail(repo: &Repository, path: &Path) -> Result<Vec<String>, String> {
-    let root = repo.root.join(".git/wt/logs");
-    let root = root
+    let root = worktrunk_log_root(repo)?
         .canonicalize()
         .map_err(|error| format!("Worktrunk log root is unavailable: {error}"))?;
     if path
@@ -506,6 +512,41 @@ pub(crate) fn read_hook_log_tail(repo: &Repository, path: &Path) -> Result<Vec<S
         lines.drain(..lines.len() - HOOK_LOG_TAIL_LINES);
     }
     Ok(lines)
+}
+
+fn worktrunk_log_root(repo: &Repository) -> Result<PathBuf, String> {
+    let dot_git = repo.root.join(".git");
+    let common_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let pointer = fs::read_to_string(&dot_git)
+            .map_err(|error| format!("read linked-worktree git directory: {error}"))?;
+        let git_dir = pointer
+            .trim()
+            .strip_prefix("gitdir:")
+            .map(str::trim)
+            .ok_or_else(|| "linked-worktree .git file has no gitdir pointer".to_string())?;
+        let git_dir = PathBuf::from(git_dir);
+        let git_dir = if git_dir.is_absolute() {
+            git_dir
+        } else {
+            repo.root.join(git_dir)
+        };
+        let common_pointer = git_dir.join("commondir");
+        if common_pointer.exists() {
+            let common = fs::read_to_string(&common_pointer)
+                .map_err(|error| format!("read linked-worktree common directory: {error}"))?;
+            let common = PathBuf::from(common.trim());
+            if common.is_absolute() {
+                common
+            } else {
+                git_dir.join(common)
+            }
+        } else {
+            git_dir
+        }
+    };
+    Ok(common_dir.join("wt/logs"))
 }
 
 fn sanitize_log_line(line: &str) -> String {
@@ -751,7 +792,9 @@ fn parse_schema1_items(
         if value.get("path").is_none() {
             continue;
         }
-        let raw = serde_json::from_value::<Schema1Item>(value)?;
+        let Ok(raw) = serde_json::from_value::<Schema1Item>(value) else {
+            continue;
+        };
         let mut columns = BTreeMap::new();
         for (key, value) in &raw.fields {
             collect_column(&mut columns, key, value);
@@ -809,10 +852,17 @@ fn parse_schema2_items(
         if value.get("worktree").is_none() {
             continue;
         }
-        let raw = serde_json::from_value::<Schema2Item>(value)?;
-        let dev_server = raw.dev_server.map(|server| DevServerObservation {
-            url: server.url,
-            listening: server.listening,
+        let Ok(raw) = serde_json::from_value::<Schema2Item>(value) else {
+            continue;
+        };
+        let dev_server = raw.dev_server.and_then(|server| {
+            server
+                .url
+                .filter(|url| !url.trim().is_empty())
+                .map(|url| DevServerObservation {
+                    url,
+                    listening: server.listening,
+                })
         });
         let mut columns = BTreeMap::new();
         for (key, value) in raw.display.unwrap_or_default().columns {
@@ -1064,6 +1114,38 @@ mod tests {
                     .contains("symlink")
             );
         }
+        assert!(
+            read_hook_log_tail(&repo, &logs)
+                .unwrap_err()
+                .contains("regular file")
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn hook_log_tail_resolves_linked_worktree_common_git_directory() {
+        let temp = unique_temp_dir("prism-worktrunk-linked-log-tail");
+        let common = temp.join("main/.git");
+        let linked_git = common.join("worktrees/feature");
+        let linked = temp.join("feature");
+        let logs = common.join("wt/logs");
+        fs::create_dir_all(&linked_git).unwrap();
+        fs::create_dir_all(&linked).unwrap();
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", linked_git.display()),
+        )
+        .unwrap();
+        fs::write(linked_git.join("commondir"), "../..\n").unwrap();
+        let log = logs.join("post-start.log");
+        fs::write(&log, "linked worktree output\n").unwrap();
+        let repo = Repository::with_config_dir_for_test(linked, temp.join("config"));
+
+        assert_eq!(
+            read_hook_log_tail(&repo, &log).unwrap(),
+            vec!["linked worktree output"]
+        );
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -1077,6 +1159,31 @@ mod tests {
             envelope.hook_output[0].modified_at,
             serde_json::json!(1720000000)
         );
+    }
+
+    #[test]
+    fn hook_log_inventory_parses_empty_populated_and_future_fields() {
+        assert!(
+            parse_hook_log_fixture(r#"{"hook_output":[]}"#)
+                .unwrap()
+                .is_empty()
+        );
+        let entries = parse_hook_log_fixture(
+            r#"{"future":"ignored","hook_output":[{"path":"/repo/.git/wt/logs/hook.log","branch":"feature/a","source":"project","hook_type":"post-start","name":"dev","modified_at":"2026-01-01T00:00:00Z","size":42,"future":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].branch, "feature/a");
+        assert_eq!(entries[0].hook_type.as_deref(), Some("post-start"));
+        assert_eq!(entries[0].size, 42);
+    }
+
+    #[test]
+    fn hook_log_inventory_rejects_malformed_output() {
+        let error = parse_hook_log_fixture(r#"{"hook_output":"not-an-array"}"#).unwrap_err();
+        assert_eq!(error.kind, FailureKind::MalformedOutput);
+        let missing = parse_hook_log_fixture("{}").unwrap_err();
+        assert_eq!(missing.kind, FailureKind::MalformedOutput);
     }
 
     #[test]
@@ -1322,7 +1429,7 @@ mod tests {
         assert_eq!(facts.extra_columns["dev_server.listening"], "true");
         assert_eq!(facts.extra_columns["vars.enabled"], "true");
         assert_eq!(facts.extra_columns["Ticket"], "PRISM-42");
-        assert_eq!(minimal.by_path.len(), 3);
+        assert_eq!(minimal.by_path.len(), 4);
         assert!(
             minimal
                 .by_path
@@ -1332,15 +1439,23 @@ mod tests {
     }
 
     #[test]
-    fn unknown_schema_and_malformed_items_fail_closed() {
+    fn unknown_schema_fails_closed_and_malformed_items_are_isolated() {
         let unsupported = parse_list_fixture(r#"{"schema":3,"items":[]}"#).unwrap_err();
         assert_eq!(unsupported.kind, FailureKind::UnsupportedSchema);
 
-        let malformed = parse_list_fixture(
+        let schema1 = parse_list_fixture(
             r#"[{"path":"/valid","url":"http://localhost:3000"},{"path":42},{"kind":"branch"}]"#,
         )
-        .unwrap_err();
-        assert_eq!(malformed.kind, FailureKind::MalformedOutput);
+        .unwrap();
+        assert_eq!(schema1.by_path.len(), 1);
+        assert!(schema1.by_path.contains_key(Path::new("/valid")));
+
+        let schema2 = parse_list_fixture(
+            r#"{"schema":2,"items":[{"worktree":{"path":"/valid"}},{"worktree":{"path":42}},{"branch":"missing-worktree"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(schema2.by_path.len(), 1);
+        assert!(schema2.by_path.contains_key(Path::new("/valid")));
     }
 
     #[test]
@@ -1553,6 +1668,21 @@ mod tests {
             stderr_truncated: false,
         };
         parse_list_output(&command, &output, &[])
+    }
+
+    fn parse_hook_log_fixture(stdout: &str) -> Result<Vec<HookLogEntry>, WorktrunkFailure> {
+        let mut command = Command::new("wt");
+        command.args(["config", "state", "logs"]);
+        let output = ProcessOutput {
+            status: success_status(),
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            stdout_total_bytes: stdout.len() as u64,
+            stdout_truncated: false,
+            stderr_total_bytes: 0,
+            stderr_truncated: false,
+        };
+        parse_hook_log_output(&command, &output)
     }
 
     fn parse_remove_fixture(

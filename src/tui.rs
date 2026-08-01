@@ -91,6 +91,8 @@ pub struct Tui {
     pub(crate) tmux_portal_resized: Option<(AgentSessionWarmupKey, (u16, u16))>,
     pub(crate) wt_poll_tx: LatestSender<WorktreeRepositoryKey, WtPollResult>,
     pub(crate) wt_poll_rx: LatestReceiver<WorktreeRepositoryKey, WtPollResult>,
+    pub(crate) wt_hook_log_poll_tx: LatestSender<WorktreeRepositoryKey, WtHookLogPollResult>,
+    pub(crate) wt_hook_log_poll_rx: LatestReceiver<WorktreeRepositoryKey, WtHookLogPollResult>,
     pub(crate) default_branch_poll_tx: LatestSender<WorktreeSessionKey, DefaultBranchPollResult>,
     pub(crate) default_branch_poll_rx: LatestReceiver<WorktreeSessionKey, DefaultBranchPollResult>,
     pub(crate) opencode_poll_tx: LatestSender<OpencodePollKey, OpencodePollResult>,
@@ -169,8 +171,32 @@ pub(crate) struct ManagedRepo {
     pub wt_snapshot: Option<crate::worktrunk::WorktrunkSnapshot>,
     pub wt_facts: BTreeMap<WorktreeSessionKey, crate::worktrunk::WorktrunkWorktreeFacts>,
     pub wt_quality: crate::worktrunk::ObservationQuality,
+    pub wt_hook_logs: WtHookLogInventory,
     pub default_branch_poll_in_flight: bool,
     pub default_branch_last_polled: Option<std::time::Instant>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct WtHookLogInventory {
+    pub entries: Vec<crate::worktrunk::HookLogEntry>,
+    pub quality: crate::worktrunk::ObservationQuality,
+    pub last_success: Option<Instant>,
+    pub last_error: Option<String>,
+    pub refresh_in_flight: bool,
+    pub refresh_pending: bool,
+}
+
+impl Default for WtHookLogInventory {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+            quality: crate::worktrunk::ObservationQuality::NeverLoaded,
+            last_success: None,
+            last_error: None,
+            refresh_in_flight: false,
+            refresh_pending: false,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -259,6 +285,7 @@ impl ManagedRepo {
             wt_snapshot: None,
             wt_facts: BTreeMap::new(),
             wt_quality: crate::worktrunk::ObservationQuality::NeverLoaded,
+            wt_hook_logs: WtHookLogInventory::default(),
             default_branch_poll_in_flight: false,
             default_branch_last_polled: None,
         }
@@ -437,6 +464,16 @@ pub(crate) struct WtObservation {
     pub observed_at: Instant,
 }
 
+pub(crate) struct WtHookLogPollResult {
+    pub repository: WorktreeRepositoryKey,
+    pub observation: Result<WtHookLogObservation, crate::worktrunk::WorktrunkFailure>,
+}
+
+pub(crate) struct WtHookLogObservation {
+    pub entries: Vec<crate::worktrunk::HookLogEntry>,
+    pub observed_at: Instant,
+}
+
 pub(crate) struct DefaultBranchPollResult {
     pub key: WorktreeSessionKey,
     pub status_label: Result<String, String>,
@@ -503,6 +540,7 @@ pub(crate) enum TuiJobKind {
     TmuxWarmup,
     TmuxPortal,
     WorktreeColumns,
+    WorktrunkHookLogs,
     DefaultBranch,
     OpencodePoll,
     OpencodeListener,
@@ -523,6 +561,7 @@ impl TuiJobKind {
             Self::TmuxWarmup => "tmux_warmup",
             Self::TmuxPortal => "tmux_portal",
             Self::WorktreeColumns => "worktree_columns",
+            Self::WorktrunkHookLogs => "worktrunk_hook_logs",
             Self::DefaultBranch => "default_branch",
             Self::OpencodePoll => "opencode_poll",
             Self::OpencodeListener => "opencode_listener",
@@ -534,6 +573,7 @@ impl TuiJobKind {
 pub(crate) enum TuiJobKey {
     None,
     Repository(WorktreeRepositoryKey),
+    WorktrunkHookLogs(WorktreeRepositoryKey),
     WorkflowRepository(WorktreeRepositoryKey),
     DashboardOutput(DashboardOutputKey),
     Worktree(WorktreeSessionKey),
@@ -577,6 +617,7 @@ pub(crate) enum TuiJobPayload {
     TmuxWarmup(AgentSessionWarmupResult),
     TmuxPortal(TmuxPortalResult),
     WorktreeColumns(WtPollResult),
+    WorktrunkHookLogs(WtHookLogPollResult),
     DefaultBranch(DefaultBranchPollResult),
     OpencodePoll(OpencodePollResult),
     OpencodeEvent(OpencodeEventResult),
@@ -672,11 +713,12 @@ fn plan_run_status_sort_key(status: PlanRunStatus) -> u8 {
 }
 
 #[derive(Default)]
-struct TuiBackgroundChanges {
+pub(crate) struct TuiBackgroundChanges {
     sessions: bool,
     tmux: bool,
     tmux_portal: bool,
     worktree_columns: bool,
+    worktrunk_hook_logs: bool,
     default_branch: bool,
     opencode_status: bool,
     opencode_events: bool,
@@ -688,11 +730,12 @@ struct TuiBackgroundChanges {
 }
 
 impl TuiBackgroundChanges {
-    fn any(&self) -> bool {
+    pub(crate) fn any(&self) -> bool {
         self.tmux
             || self.sessions
             || self.tmux_portal
             || self.worktree_columns
+            || self.worktrunk_hook_logs
             || self.default_branch
             || self.opencode_status
             || self.opencode_events
@@ -799,6 +842,8 @@ impl Tui {
             latest_channel(|result: &TmuxPortalResult| result.key.clone());
         let (wt_poll_tx, wt_poll_rx) =
             latest_channel(|result: &WtPollResult| result.repository.clone());
+        let (wt_hook_log_poll_tx, wt_hook_log_poll_rx) =
+            latest_channel(|result: &WtHookLogPollResult| result.repository.clone());
         let (default_branch_poll_tx, default_branch_poll_rx) =
             latest_channel(|result: &DefaultBranchPollResult| result.key.clone());
         let (opencode_poll_tx, opencode_poll_rx) =
@@ -885,6 +930,8 @@ impl Tui {
             tmux_portal_resized: None,
             wt_poll_tx,
             wt_poll_rx,
+            wt_hook_log_poll_tx,
+            wt_hook_log_poll_rx,
             default_branch_poll_tx,
             default_branch_poll_rx,
             opencode_poll_tx,
@@ -1629,7 +1676,7 @@ impl Tui {
         Ok(shutdown_reason)
     }
 
-    fn tick_tui_action_jobs(&mut self) -> TuiBackgroundChanges {
+    pub(crate) fn tick_tui_action_jobs(&mut self) -> TuiBackgroundChanges {
         let started = Instant::now();
         self.tui_tick_active = true;
         let routed = self.route_tui_job_messages();
@@ -1638,6 +1685,7 @@ impl Tui {
             tmux: self.poll_tmux_agent_warmup(),
             tmux_portal: self.poll_tmux_portal(),
             worktree_columns: self.poll_wt_columns(),
+            worktrunk_hook_logs: self.poll_wt_hook_logs(),
             default_branch: self.poll_default_branch_status(),
             opencode_status: self.poll_opencode_status(),
             opencode_events: self.poll_opencode_events(),
@@ -1648,6 +1696,7 @@ impl Tui {
             status_message: self.expire_status_message(),
         };
         self.start_scheduled_wt_polls();
+        self.start_pending_wt_hook_log_refreshes();
         self.start_default_branch_status_poll(false);
         self.start_opencode_status_poll(false);
         self.start_opencode_event_listeners();
@@ -1792,6 +1841,8 @@ impl Tui {
             processed += 1;
             self.clear_tui_job_in_flight(&metadata);
             self.record_tui_job_terminal(&metadata, &outcome);
+            let delete_needs_recovery_refresh = metadata.kind == TuiJobKind::DeleteSession
+                && !matches!(outcome, JobOutcome::Completed);
             match outcome {
                 JobOutcome::Completed | JobOutcome::Canceled => {}
                 JobOutcome::Failed(_) | JobOutcome::SpawnFailed(_) => {
@@ -1803,6 +1854,16 @@ impl Tui {
                 JobOutcome::DeadlineExceeded => {
                     self.recover_failed_tui_job(&metadata);
                 }
+            }
+            if delete_needs_recovery_refresh && let TuiJobKey::Delete(key) = &metadata.key {
+                if let Some(repo_index) = self
+                    .repos
+                    .iter()
+                    .position(|repo| repo.identity == key.worktree.repository)
+                {
+                    self.request_worktrunk_refreshes(repo_index);
+                }
+                let _ = self.refresh_sessions_after_tmux();
             }
             if metadata.kind == TuiJobKind::SessionRefresh && self.session_refresh_pending {
                 restart_session_refresh = true;
@@ -1831,6 +1892,7 @@ impl Tui {
                     TuiJobKey::OpencodeListener(stream) => &stream.worktree == selected,
                     TuiJobKey::None
                     | TuiJobKey::Repository(_)
+                    | TuiJobKey::WorktrunkHookLogs(_)
                     | TuiJobKey::WorkflowRepository(_)
                     | TuiJobKey::DashboardOutput(_)
                     | TuiJobKey::Delete(_) => false,
@@ -1959,6 +2021,9 @@ impl Tui {
             TuiJobPayload::WorktreeColumns(result) => {
                 let _ = self.wt_poll_tx.send(result);
             }
+            TuiJobPayload::WorktrunkHookLogs(result) => {
+                let _ = self.wt_hook_log_poll_tx.send(result);
+            }
             TuiJobPayload::DefaultBranch(result) => {
                 let _ = self.default_branch_poll_tx.send(result);
             }
@@ -2020,6 +2085,15 @@ impl Tui {
                     repo.wt_poll_in_flight = false;
                 }
             }
+            (TuiJobKind::WorktrunkHookLogs, TuiJobKey::WorktrunkHookLogs(repository)) => {
+                if let Some(repo) = self
+                    .repos
+                    .iter_mut()
+                    .find(|repo| &repo.identity == repository)
+                {
+                    repo.wt_hook_logs.refresh_in_flight = false;
+                }
+            }
             (TuiJobKind::DefaultBranch, TuiJobKey::Worktree(key)) => {
                 if let Some(repo) = self
                     .repos
@@ -2046,6 +2120,9 @@ impl Tui {
                     || metadata.generation == self.session_inventory_generation
             }
             TuiJobKey::Repository(_) => metadata.generation == self.session_inventory_generation,
+            TuiJobKey::WorktrunkHookLogs(repository) => {
+                self.repos.iter().any(|repo| &repo.identity == repository)
+            }
             TuiJobKey::WorkflowRepository(_) | TuiJobKey::DashboardOutput(_) => {
                 metadata.generation == self.workflow_revision
             }
@@ -2296,14 +2373,27 @@ impl Tui {
             let error = "Worktrunk observation job failed or timed out".to_string();
             self.mark_wt_observation_stale(repo_index, error, None);
         }
+        if let (TuiJobKind::WorktrunkHookLogs, TuiJobKey::WorktrunkHookLogs(repository)) =
+            (&metadata.kind, &metadata.key)
+            && let Some(repo_index) = self
+                .repos
+                .iter()
+                .position(|repo| &repo.identity == repository)
+        {
+            self.mark_wt_hook_logs_stale(
+                repo_index,
+                "Worktrunk hook-log inventory job failed or timed out".to_string(),
+            );
+        }
         if let (TuiJobKind::DeleteSession, TuiJobKey::Delete(key)) = (&metadata.kind, &metadata.key)
-            && let Some(session) = self.sessions.iter_mut().find(|session| {
+        {
+            if let Some(session) = self.sessions.iter_mut().find(|session| {
                 self.repos
                     .get(session.repo_index)
                     .is_some_and(|repo| session.identity_key(&repo.identity) == key.worktree)
-            })
-        {
-            session.hidden = false;
+            }) {
+                session.hidden = false;
+            }
             self.ensure_navigation_valid();
         }
     }
