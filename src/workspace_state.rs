@@ -4,12 +4,21 @@ use std::path::{Path, PathBuf};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 
+use crate::agent::AgentState;
+use crate::auto_flow::{
+    AutoExecutorDecision, AutoRunControlEffect, AutoRunControlIntent, apply_auto_run_control,
+};
 use crate::config::Config;
 use crate::execution::{self, WorkflowIdentity as ExecutionIdentity, WorkflowKind};
 use crate::git::{self, GitStatus};
 use crate::lifecycle;
+use crate::plan_run::{
+    PlanExecutorDecision, PlanRunControlEffect, PlanRunControlIntent, apply_plan_run_control,
+};
 use crate::repo::Repository;
 use crate::{storage, worker, workspace};
+
+const RECENT_TERMINAL_WORKFLOWS: usize = 10;
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceContext {
@@ -69,7 +78,7 @@ pub enum BranchState {
 
 #[derive(Clone, Debug, Serialize, Default)]
 pub struct AgentStatus {
-    pub state: Option<String>,
+    pub state: Option<AgentState>,
     pub updated_unix_ms: Option<i64>,
 }
 
@@ -78,12 +87,78 @@ pub struct CachedPullRequest {
     pub number: i64,
     pub title: String,
     pub url: String,
-    pub state: String,
-    pub mergeability: Option<String>,
-    pub ci: Option<String>,
+    pub state: PullRequestState,
+    pub mergeability: Option<MergeabilityState>,
+    pub ci: Option<CiState>,
     pub observed_unix_ms: i64,
     pub age_ms: i64,
-    pub provenance: &'static str,
+    pub stale: bool,
+    pub error: Option<String>,
+    pub provenance: ObservationProvenance,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PullRequestState {
+    Open,
+    Draft,
+    Closed,
+    Merged,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeabilityState {
+    Clean,
+    Dirty,
+    Blocked,
+    Behind,
+    Unstable,
+    HasHooks,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CiState {
+    Pending,
+    Success,
+    Failed,
+    Mixed,
+    Unknown,
+}
+
+impl CiState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Success => "success",
+            Self::Failed => "failed",
+            Self::Mixed => "mixed",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for CiState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+impl std::ops::Deref for CiState {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.label()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationProvenance {
+    SqliteCache,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -91,7 +166,7 @@ pub struct WorkflowSnapshot {
     pub identity: WorkflowIdentity,
     pub owner: Option<WorkflowIdentity>,
     pub worktree: WorktreeIdentity,
-    pub lifecycle: String,
+    pub lifecycle: WorkflowLifecycle,
     pub pause_requested: bool,
     pub dispatch: DispatchSnapshot,
     pub current_step: Option<StepSummary>,
@@ -103,14 +178,14 @@ pub struct WorkflowSnapshot {
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct WorkflowIdentity {
     pub repository: PathBuf,
-    pub kind: String,
+    pub kind: WorkflowKind,
     pub run_id: String,
     pub display_id: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct DispatchSnapshot {
-    pub state: Option<String>,
+    pub state: Option<execution::DispatchState>,
     pub daemon_instance_id: Option<String>,
     pub worker_id: Option<String>,
     pub lease_expires_unix_ms: Option<i64>,
@@ -122,7 +197,124 @@ pub struct DispatchSnapshot {
 #[derive(Clone, Debug, Serialize)]
 pub struct StepSummary {
     pub label: String,
-    pub state: String,
+    pub state: StepState,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowLifecycle {
+    Draft,
+    Queued,
+    Running,
+    Paused,
+    Done,
+    Failed,
+    Aborted,
+}
+
+impl WorkflowLifecycle {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "draft" => Ok(Self::Draft),
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "paused" => Ok(Self::Paused),
+            "done" => Ok(Self::Done),
+            "failed" => Ok(Self::Failed),
+            "aborted" => Ok(Self::Aborted),
+            other => Err(format!("unknown workflow lifecycle: {other}")),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Draft => "draft",
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Aborted => "aborted",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        self.label()
+    }
+
+    pub(crate) fn terminal(self) -> bool {
+        matches!(self, Self::Done | Self::Failed | Self::Aborted)
+    }
+}
+
+impl PartialEq<&str> for WorkflowLifecycle {
+    fn eq(&self, other: &&str) -> bool {
+        self.label() == *other
+    }
+}
+
+impl std::fmt::Display for WorkflowLifecycle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+impl std::ops::Deref for WorkflowLifecycle {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.label()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StepState {
+    Queued,
+    Starting,
+    Running,
+    Waiting,
+    Done,
+    Failed,
+    Aborted,
+    Skipped,
+    Unknown,
+}
+
+impl StepState {
+    fn parse(value: Option<String>) -> Self {
+        match value.as_deref() {
+            Some("queued") => Self::Queued,
+            Some("starting") => Self::Starting,
+            Some("running") => Self::Running,
+            Some("waiting") => Self::Waiting,
+            Some("done") => Self::Done,
+            Some("failed") => Self::Failed,
+            Some("aborted") => Self::Aborted,
+            Some("skipped") => Self::Skipped,
+            _ => Self::Unknown,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Aborted => "aborted",
+            Self::Skipped => "skipped",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+impl std::fmt::Display for StepState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Default)]
@@ -156,8 +348,33 @@ pub struct RepositoryTotals {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Diagnostic {
+    pub code: DiagnosticCode,
+    pub severity: DiagnosticSeverity,
     pub scope: String,
+    pub operation: Option<&'static str>,
+    pub provenance: Option<ObservationProvenance>,
     pub message: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticCode {
+    #[serde(rename = "repository_discovery_failed")]
+    RepositoryDiscovery,
+    #[serde(rename = "repository_inspection_failed")]
+    RepositoryInspection,
+    #[serde(rename = "projection_read_failed")]
+    ProjectionRead,
+    #[serde(rename = "daemon_probe_failed")]
+    DaemonProbe,
+    #[serde(rename = "cached_observation_failed")]
+    CachedObservation,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticSeverity {
+    Warning,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,6 +395,18 @@ pub struct ControlRequest {
 pub struct ControlReceipt {
     pub workflow: WorkflowIdentity,
     pub state: String,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct RecoveryDecision {
+    pub workflow: WorkflowIdentity,
+    pub interruption_generation: i64,
+    pub restart: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RecoveryBatchReceipt {
     pub warnings: Vec<String>,
 }
 
@@ -210,7 +439,11 @@ impl WorkspaceState {
                         shortcut: entry.key,
                     }),
                     Err(error) => diagnostics.push(Diagnostic {
+                        code: DiagnosticCode::RepositoryDiscovery,
+                        severity: DiagnosticSeverity::Warning,
                         scope: entry.root.display().to_string(),
+                        operation: Some("discover_repository"),
+                        provenance: None,
                         message: error,
                     }),
                 }
@@ -241,7 +474,11 @@ impl WorkspaceState {
             Ok(health) => health,
             Err(error) => {
                 warnings.push(Diagnostic {
+                    code: DiagnosticCode::DaemonProbe,
+                    severity: DiagnosticSeverity::Warning,
                     scope: "daemon".to_string(),
+                    operation: Some("probe_daemon_health"),
+                    provenance: None,
                     message: error,
                 });
                 worker::DaemonHealth::stopped()
@@ -255,7 +492,11 @@ impl WorkspaceState {
                     warnings.append(&mut repository_warnings);
                 }
                 Err(error) => warnings.push(Diagnostic {
+                    code: DiagnosticCode::RepositoryInspection,
+                    severity: DiagnosticSeverity::Warning,
                     scope: source.repo.root.display().to_string(),
+                    operation: Some("inspect_repository"),
+                    provenance: None,
                     message: error,
                 }),
             }
@@ -270,6 +511,12 @@ impl WorkspaceState {
             workflows: repositories.iter().map(|repo| repo.workflows.len()).sum(),
             attention: repositories.iter().map(|repo| repo.totals.attention).sum(),
         };
+        warnings.sort_by(|left, right| {
+            left.scope
+                .cmp(&right.scope)
+                .then_with(|| left.operation.cmp(&right.operation))
+                .then_with(|| left.message.cmp(&right.message))
+        });
         Ok(WorkspaceSnapshot {
             schema_version: 1,
             observed_unix_ms: observed,
@@ -342,6 +589,21 @@ impl WorkspaceState {
                 target.identity.display_id, owner.display_id, owner.display_id
             ));
         }
+        if request.action == ControlAction::Recover {
+            if target.dispatch.state != Some(execution::DispatchState::RecoveryPending) {
+                return Err("workflow does not require recovery".to_string());
+            }
+            let batch = self.recover_batch(&[RecoveryDecision {
+                workflow: target.identity.clone(),
+                interruption_generation: target.dispatch.interruption_generation,
+                restart: true,
+            }])?;
+            return Ok(ControlReceipt {
+                workflow: target.identity.clone(),
+                state: "queued".to_string(),
+                warnings: batch.warnings,
+            });
+        }
         let source = self
             .sources
             .iter()
@@ -349,43 +611,77 @@ impl WorkspaceState {
             .ok_or_else(|| "workflow repository is no longer available".to_string())?;
         let path = source.repo.prism_dir().join("prism.db");
         let mut conn = storage::open_writable(&path).map_err(|error| error.to_string())?;
-        let (state, mut warnings) = if request.action == ControlAction::Recover {
-            if target.dispatch.state.as_deref() != Some("recovery_pending") {
-                return Err("workflow does not require recovery".to_string());
-            }
-            execution::apply_recovery_decision(
-                &mut conn,
-                &[(
-                    execution_identity(&target.identity)?,
-                    target.dispatch.interruption_generation,
-                    true,
-                )],
-            )?;
-            ("queued".to_string(), Vec::new())
-        } else {
-            apply_control_transaction(&mut conn, target, request.action)?
-        };
-        if matches!(
-            request.action,
-            ControlAction::Resume | ControlAction::Recover
-        ) {
-            if let Err(error) = worker::ensure_running().and_then(|_| worker::wake()) {
-                warnings.push(format!(
-                    "control committed, but daemon notification failed: {error}"
-                ));
-            }
-        } else if request.action == ControlAction::Pause
-            && let Err(error) = worker::wake()
-        {
-            warnings.push(format!(
-                "control committed, but daemon wake failed: {error}"
-            ));
+        let (state, mut warnings) = apply_control_transaction(&mut conn, target, request.action)?;
+        if request.action == ControlAction::Resume {
+            notify_daemon_after_commit(true, "control", &mut warnings);
+        } else if request.action == ControlAction::Pause {
+            notify_daemon_after_commit(false, "control", &mut warnings);
         }
         Ok(ControlReceipt {
             workflow: target.identity.clone(),
             state,
             warnings,
         })
+    }
+
+    pub fn recover_batch(
+        &self,
+        decisions: &[RecoveryDecision],
+    ) -> Result<RecoveryBatchReceipt, String> {
+        for decision in decisions {
+            self.source_for_identity(&decision.workflow)?;
+        }
+        for decision in decisions.iter().filter(|decision| decision.restart) {
+            let source = self.source_for_identity(&decision.workflow)?;
+            let config = Config::load(&source.repo);
+            if worker::legacy_worker_running(
+                &source.repo,
+                &config,
+                &execution_identity(&decision.workflow)?,
+            )? {
+                return Err(format!(
+                    "legacy {} worker for run {} is still active; try recovery after it exits",
+                    decision.workflow.kind, decision.workflow.run_id
+                ));
+            }
+        }
+
+        let mut receipt = RecoveryBatchReceipt::default();
+        for source in &self.sources {
+            let repository_decisions = decisions
+                .iter()
+                .filter(|decision| paths_equal(&decision.workflow.repository, &source.repo.root))
+                .map(|decision| {
+                    Ok((
+                        execution_identity(&decision.workflow)?,
+                        decision.interruption_generation,
+                        decision.restart,
+                    ))
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            if repository_decisions.is_empty() {
+                continue;
+            }
+            let path = source.repo.prism_dir().join("prism.db");
+            let mut conn = storage::open_writable(&path).map_err(|error| error.to_string())?;
+            execution::apply_recovery_decision(&mut conn, &repository_decisions)?;
+            if repository_decisions.iter().any(|(_, _, restart)| *restart) {
+                notify_daemon_after_commit(true, "recovery", &mut receipt.warnings);
+            }
+        }
+        Ok(receipt)
+    }
+
+    fn source_for_identity(&self, identity: &WorkflowIdentity) -> Result<&RepoSource, String> {
+        self.sources
+            .iter()
+            .find(|source| paths_equal(&source.repo.root, &identity.repository))
+            .ok_or_else(|| {
+                format!(
+                    "workflow repository is no longer available: {}",
+                    identity.repository.display()
+                )
+            })
     }
 
     fn resolve_workflow<'a>(
@@ -438,6 +734,20 @@ impl WorkspaceState {
     }
 }
 
+fn notify_daemon_after_commit(ensure: bool, operation: &str, warnings: &mut Vec<String>) {
+    if ensure && let Err(error) = worker::ensure_running() {
+        warnings.push(format!(
+            "{operation} committed, but daemon is unavailable: {error}"
+        ));
+        return;
+    }
+    if let Err(error) = worker::wake() {
+        warnings.push(format!(
+            "{operation} committed, but daemon wake failed: {error}"
+        ));
+    }
+}
+
 pub(crate) fn control_repository_workflow(
     repo: &Repository,
     action: ControlAction,
@@ -474,18 +784,33 @@ fn inspect_repository(
         match storage::open_readonly(&db_path) {
             Ok(conn) => Some(conn),
             Err(error) => {
-                warnings.push(repository_diagnostic(source, error.to_string()));
+                warnings.push(repository_diagnostic(
+                    source,
+                    "open_readonly_database",
+                    error.to_string(),
+                ));
                 None
             }
         }
     } else {
         None
     };
-    let hidden = read_projection(&conn, source, &mut warnings, load_hidden).unwrap_or_default();
-    let mut workflows = read_projection(&conn, source, &mut warnings, |conn| {
+    let hidden = read_projection(&conn, source, &mut warnings, "load_hidden", load_hidden)
+        .unwrap_or_default();
+    let mut workflows = read_projection(&conn, source, &mut warnings, "load_workflows", |conn| {
         load_workflows(conn, &source.repo.root, request.include_terminal)
     })
     .unwrap_or_default();
+    workflows.sort_by(|left, right| {
+        right
+            .updated_unix_ms
+            .cmp(&left.updated_unix_ms)
+            .then_with(|| left.identity.kind.cmp(&right.identity.kind))
+            .then_with(|| left.identity.run_id.cmp(&right.identity.run_id))
+    });
+    if request.include_terminal {
+        retain_recent_terminal_workflows(&mut workflows, RECENT_TERMINAL_WORKFLOWS);
+    }
     let mut worktrees = Vec::new();
     for entry in inventory {
         let is_hidden = hidden.contains(&entry.branch);
@@ -510,15 +835,29 @@ fn inspect_repository(
         } else {
             BranchState::Named(entry.branch.clone())
         };
-        let agent = read_projection(&conn, source, &mut warnings, |conn| {
+        let agent = read_projection(&conn, source, &mut warnings, "load_agent", |conn| {
             load_agent(conn, &entry.branch)
         })
         .flatten()
         .unwrap_or_default();
-        let pull_request = read_projection(&conn, source, &mut warnings, |conn| {
-            load_pr(conn, &entry.branch, observed)
-        })
-        .flatten();
+        let pull_request =
+            read_projection(&conn, source, &mut warnings, "load_pull_request", |conn| {
+                load_pr(conn, &entry.branch, observed)
+            })
+            .flatten();
+        if let Some(error) = pull_request
+            .as_ref()
+            .and_then(|pull_request| pull_request.error.as_ref())
+        {
+            warnings.push(Diagnostic {
+                code: DiagnosticCode::CachedObservation,
+                severity: DiagnosticSeverity::Warning,
+                scope: identity.path.display().to_string(),
+                operation: Some("refresh_pull_request"),
+                provenance: Some(ObservationProvenance::SqliteCache),
+                message: error.clone(),
+            });
+        }
         let associated = workflows
             .iter()
             .filter(|workflow| paths_equal(&workflow.worktree.path, &identity.path))
@@ -535,21 +874,29 @@ fn inspect_repository(
         });
     }
     worktrees.sort_by(|left, right| left.identity.path.cmp(&right.identity.path));
-    workflows.sort_by(|left, right| {
-        right
-            .updated_unix_ms
-            .cmp(&left.updated_unix_ms)
-            .then_with(|| left.identity.kind.cmp(&right.identity.kind))
-            .then_with(|| left.identity.run_id.cmp(&right.identity.run_id))
-    });
-    let attention = workflows
+    let workflow_attention = workflows
         .iter()
         .filter(|workflow| {
-            matches!(workflow.lifecycle.as_str(), "failed")
-                || workflow.dispatch.state.as_deref() == Some("recovery_pending")
+            workflow.lifecycle == WorkflowLifecycle::Failed
+                || workflow.dispatch.state == Some(execution::DispatchState::RecoveryPending)
                 || workflow.pause_requested
         })
         .count();
+    let worktree_attention = worktrees
+        .iter()
+        .filter(|worktree| {
+            matches!(
+                worktree.agent.state,
+                Some(AgentState::NeedsInput | AgentState::NeedsRestart | AgentState::ExitedError)
+            ) || worktree.git.conflicts > 0
+                || worktree.git.error.is_some()
+                || worktree.pull_request.as_ref().is_some_and(|pull_request| {
+                    pull_request.error.is_some()
+                        || matches!(pull_request.ci, Some(CiState::Failed | CiState::Mixed))
+                })
+        })
+        .count();
+    let attention = workflow_attention + worktree_attention;
     Ok((
         RepositorySnapshot {
             root: absolute_path(&source.repo.root),
@@ -567,25 +914,51 @@ fn inspect_repository(
     ))
 }
 
+fn retain_recent_terminal_workflows(workflows: &mut Vec<WorkflowSnapshot>, limit: usize) {
+    let mut terminal = 0;
+    workflows.retain(|workflow| {
+        let terminal_workflow = matches!(
+            workflow.lifecycle,
+            WorkflowLifecycle::Done | WorkflowLifecycle::Aborted
+        ) && matches!(
+            workflow.dispatch.state,
+            None | Some(execution::DispatchState::Terminal)
+        );
+        !terminal_workflow || {
+            terminal += 1;
+            terminal <= limit
+        }
+    });
+}
+
 fn read_projection<T>(
     conn: &Option<Connection>,
     source: &RepoSource,
     warnings: &mut Vec<Diagnostic>,
+    operation: &'static str,
     read: impl FnOnce(&Connection) -> Result<T, String>,
 ) -> Option<T> {
     let conn = conn.as_ref()?;
     match read(conn) {
         Ok(value) => Some(value),
         Err(error) => {
-            warnings.push(repository_diagnostic(source, error));
+            warnings.push(repository_diagnostic(source, operation, error));
             None
         }
     }
 }
 
-fn repository_diagnostic(source: &RepoSource, message: String) -> Diagnostic {
+fn repository_diagnostic(
+    source: &RepoSource,
+    operation: &'static str,
+    message: String,
+) -> Diagnostic {
     Diagnostic {
+        code: DiagnosticCode::ProjectionRead,
+        severity: DiagnosticSeverity::Warning,
         scope: source.repo.root.display().to_string(),
+        operation: Some(operation),
+        provenance: Some(ObservationProvenance::SqliteCache),
         message,
     }
 }
@@ -612,8 +985,15 @@ fn load_agent(conn: &Connection, branch: &str) -> Result<Option<AgentStatus>, St
         "select state, updated_unix_ms from agent_state where branch = ?1",
         [branch],
         |row| {
+            let state = row
+                .get::<_, Option<String>>(0)?
+                .map(|value| {
+                    AgentState::parse(&value)
+                        .ok_or_else(|| sql_value_error(0, format!("unknown agent state: {value}")))
+                })
+                .transpose()?;
             Ok(AgentStatus {
-                state: row.get(0)?,
+                state,
                 updated_unix_ms: row.get(1)?,
             })
         },
@@ -631,18 +1011,82 @@ fn load_pr(
         return Ok(None);
     }
     conn.query_row(
-        "select number, title, url, state, review_decision, check_status, refreshed_unix_ms from pr_cache where branch = ?1",
+        "select number, title, url, state, merge_state_status, check_status,
+                refreshed_unix_ms, merged, draft, observation_error
+         from pr_cache where branch = ?1",
         [branch],
         |row| {
             let refreshed = row.get::<_, i64>(6)?.saturating_mul(1_000);
+            let age_ms = observed.saturating_sub(refreshed).max(0);
+            let error = row.get::<_, Option<String>>(9)?;
+            let state = pull_request_state(
+                &row.get::<_, String>(3)?,
+                row.get::<_, i64>(7)? != 0,
+                row.get::<_, i64>(8)? != 0,
+            );
             Ok(CachedPullRequest {
-                number: row.get(0)?, title: row.get(1)?, url: row.get(2)?, state: row.get(3)?,
-                mergeability: row.get::<_, Option<String>>(4)?.filter(|value| !value.is_empty()),
-                ci: row.get::<_, Option<String>>(5)?.filter(|value| !value.is_empty()),
-                observed_unix_ms: refreshed, age_ms: observed.saturating_sub(refreshed), provenance: "sqlite_cache",
+                number: row.get(0)?,
+                title: row.get(1)?,
+                url: row.get(2)?,
+                state,
+                mergeability: row
+                    .get::<_, Option<String>>(4)?
+                    .filter(|value| !value.is_empty())
+                    .map(|value| mergeability_state(&value)),
+                ci: row
+                    .get::<_, Option<String>>(5)?
+                    .filter(|value| !value.is_empty())
+                    .map(|value| ci_state(&value)),
+                observed_unix_ms: refreshed,
+                age_ms,
+                stale: error.is_some()
+                    || age_ms
+                        > i64::try_from(crate::github::PR_SUMMARY_POLL_INTERVAL.as_millis() * 2)
+                            .unwrap_or(i64::MAX),
+                error,
+                provenance: ObservationProvenance::SqliteCache,
             })
         },
-    ).optional().map_err(|error| error.to_string())
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+}
+
+fn pull_request_state(value: &str, merged: bool, draft: bool) -> PullRequestState {
+    if merged {
+        PullRequestState::Merged
+    } else if draft {
+        PullRequestState::Draft
+    } else {
+        match value.to_ascii_lowercase().as_str() {
+            "open" => PullRequestState::Open,
+            "closed" => PullRequestState::Closed,
+            "merged" => PullRequestState::Merged,
+            _ => PullRequestState::Unknown,
+        }
+    }
+}
+
+fn mergeability_state(value: &str) -> MergeabilityState {
+    match value.to_ascii_lowercase().as_str() {
+        "clean" => MergeabilityState::Clean,
+        "dirty" => MergeabilityState::Dirty,
+        "blocked" => MergeabilityState::Blocked,
+        "behind" => MergeabilityState::Behind,
+        "unstable" => MergeabilityState::Unstable,
+        "has_hooks" => MergeabilityState::HasHooks,
+        _ => MergeabilityState::Unknown,
+    }
+}
+
+fn ci_state(value: &str) -> CiState {
+    match value.to_ascii_lowercase().as_str() {
+        "running" | "pending" => CiState::Pending,
+        "passed" | "success" => CiState::Success,
+        "failed" | "failure" => CiState::Failed,
+        "mixed" => CiState::Mixed,
+        _ => CiState::Unknown,
+    }
 }
 
 fn load_workflows(
@@ -685,14 +1129,23 @@ fn load_workflows(
     let rows = statement
         .query_map([repo_root.display().to_string()], |row| {
             let kind: String = row.get(0)?;
-            let lifecycle: String = row.get(3)?;
+            let lifecycle = WorkflowLifecycle::parse(&row.get::<_, String>(3)?)
+                .map_err(|error| sql_value_error(3, error))?;
             let pause_requested = row.get::<_, i64>(4)? != 0;
-            let dispatch_state: Option<String> = row.get(6)?;
+            let dispatch_state = row
+                .get::<_, Option<String>>(6)?
+                .map(|state| execution::DispatchState::parse(&state))
+                .transpose()
+                .map_err(|error| sql_value_error(6, error))?;
             let ownerless = true;
             Ok(WorkflowSnapshot {
                 identity: WorkflowIdentity {
                     repository: absolute_path(repo_root),
-                    kind: kind.clone(),
+                    kind: if kind == "auto" {
+                        WorkflowKind::Auto
+                    } else {
+                        WorkflowKind::Plan
+                    },
                     run_id: row.get(1)?,
                     display_id: String::new(),
                 },
@@ -701,10 +1154,10 @@ fn load_workflows(
                     path: absolute_path(Path::new(&row.get::<_, String>(2)?)),
                     display: String::new(),
                 },
-                lifecycle: lifecycle.clone(),
+                lifecycle,
                 pause_requested,
                 dispatch: DispatchSnapshot {
-                    state: dispatch_state.clone(),
+                    state: dispatch_state,
                     daemon_instance_id: row.get(7)?,
                     worker_id: row.get(8)?,
                     lease_expires_unix_ms: row.get(9)?,
@@ -714,20 +1167,16 @@ fn load_workflows(
                 },
                 current_step: row.get::<_, Option<String>>(13)?.map(|label| StepSummary {
                     label,
-                    state: row
-                        .get::<_, Option<String>>(14)
-                        .ok()
-                        .flatten()
-                        .unwrap_or_else(|| "unknown".to_string()),
+                    state: StepState::parse(row.get::<_, Option<String>>(14).ok().flatten()),
                 }),
                 progress: Progress {
                     completed: row.get::<_, i64>(15)?.max(0) as usize,
                     total: row.get::<_, i64>(16)?.max(0) as usize,
                 },
                 available_controls: controls_for(
-                    &lifecycle,
+                    lifecycle,
                     pause_requested,
-                    dispatch_state.as_deref(),
+                    dispatch_state,
                     ownerless,
                 ),
                 updated_unix_ms: row.get(5)?,
@@ -738,33 +1187,37 @@ fn load_workflows(
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| format!("read workflow projection: {error}"))?;
     drop(statement);
-    let owners = linked_plan_owners(conn)?;
+    let owners = linked_plan_owners(conn, repo_root)?;
     let identities = workflows
         .iter()
         .map(|workflow| {
             (
-                (
-                    workflow.identity.kind.clone(),
-                    workflow.identity.run_id.clone(),
-                ),
+                (workflow.identity.kind, workflow.identity.run_id.clone()),
                 workflow.identity.clone(),
             )
         })
         .collect::<BTreeMap<_, _>>();
     for workflow in &mut workflows {
-        if workflow.identity.kind == "plan"
-            && let Some(auto_id) = owners.get(&workflow.identity.run_id)
-            && let Some(owner) = identities.get(&("auto".to_string(), auto_id.clone()))
+        if workflow.identity.kind == WorkflowKind::Plan
+            && let Some(owner) = owners.get(&workflow.identity.run_id)
         {
-            workflow.owner = Some(owner.clone());
+            workflow.owner = Some(
+                identities
+                    .get(&(WorkflowKind::Auto, owner.run_id.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| owner.clone()),
+            );
             workflow.available_controls = AvailableControls::default();
         }
     }
     Ok(workflows)
 }
 
-fn linked_plan_owners(conn: &Connection) -> Result<BTreeMap<String, String>, String> {
-    let mut statement = conn.prepare("select distinct plan_run_id, run_id from auto_step_run where plan_run_id is not null order by plan_run_id, run_id").map_err(|error| format!("prepare linked plan ownership: {error}"))?;
+fn linked_plan_owners(
+    conn: &Connection,
+    repo_root: &Path,
+) -> Result<BTreeMap<String, WorkflowIdentity>, String> {
+    let mut statement = conn.prepare("select distinct s.plan_run_id, s.run_id from auto_step_run s join auto_run r on r.id = s.run_id where s.plan_run_id is not null and r.archived_unix_ms is null order by s.plan_run_id, s.run_id").map_err(|error| format!("prepare linked plan ownership: {error}"))?;
     let rows = statement
         .query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -773,44 +1226,57 @@ fn linked_plan_owners(conn: &Connection) -> Result<BTreeMap<String, String>, Str
     let mut owners = BTreeMap::new();
     for row in rows {
         let (plan, auto) = row.map_err(|error| format!("read linked plan ownership: {error}"))?;
-        owners.entry(plan).or_insert(auto);
+        owners.entry(plan).or_insert_with(|| WorkflowIdentity {
+            repository: absolute_path(repo_root),
+            kind: WorkflowKind::Auto,
+            display_id: short_id(WorkflowKind::Auto, &auto),
+            run_id: auto,
+        });
     }
     Ok(owners)
 }
 
 fn controls_for(
-    lifecycle: &str,
+    lifecycle: WorkflowLifecycle,
     pause_requested: bool,
-    dispatch: Option<&str>,
+    dispatch: Option<execution::DispatchState>,
     ownerless: bool,
 ) -> AvailableControls {
-    let terminal = matches!(lifecycle, "done" | "failed" | "aborted");
+    let terminal = lifecycle.terminal();
     AvailableControls {
-        pause: ownerless && !terminal && !pause_requested && dispatch != Some("recovery_pending"),
+        pause: ownerless
+            && !terminal
+            && !pause_requested
+            && !matches!(
+                dispatch,
+                Some(execution::DispatchState::RecoveryPending | execution::DispatchState::Paused)
+            ),
         resume: ownerless
             && !terminal
-            && (pause_requested || lifecycle == "paused")
-            && dispatch != Some("recovery_pending"),
+            && (pause_requested
+                || lifecycle == WorkflowLifecycle::Paused
+                || dispatch == Some(execution::DispatchState::Paused))
+            && dispatch != Some(execution::DispatchState::RecoveryPending),
         stop: ownerless && !terminal,
-        recover: ownerless && dispatch == Some("recovery_pending"),
+        recover: ownerless && dispatch == Some(execution::DispatchState::RecoveryPending),
     }
 }
 
 fn assign_display_ids(repositories: &mut [RepositorySnapshot]) {
     let mut counts = BTreeMap::<String, usize>::new();
     for workflow in repositories.iter().flat_map(|repo| &repo.workflows) {
-        let prefix = short_id(&workflow.identity.kind, &workflow.identity.run_id);
+        let prefix = short_id(workflow.identity.kind, &workflow.identity.run_id);
         *counts.entry(prefix).or_default() += 1;
     }
     for repository in repositories {
         for workflow in &mut repository.workflows {
-            let short = short_id(&workflow.identity.kind, &workflow.identity.run_id);
+            let short = short_id(workflow.identity.kind, &workflow.identity.run_id);
             workflow.identity.display_id = if counts[&short] == 1 {
                 short
             } else {
                 format!(
                     "{}:{}",
-                    kind_prefix(&workflow.identity.kind),
+                    kind_prefix(workflow.identity.kind),
                     workflow.identity.run_id
                 )
             };
@@ -839,18 +1305,14 @@ fn assign_display_ids(repositories: &mut [RepositorySnapshot]) {
             .iter()
             .map(|workflow| {
                 (
-                    (
-                        workflow.identity.kind.clone(),
-                        workflow.identity.run_id.clone(),
-                    ),
+                    (workflow.identity.kind, workflow.identity.run_id.clone()),
                     workflow.identity.display_id.clone(),
                 )
             })
             .collect::<BTreeMap<_, _>>();
         for workflow in &mut repository.workflows {
             if let Some(owner) = &mut workflow.owner
-                && let Some(display_id) =
-                    display_ids.get(&(owner.kind.clone(), owner.run_id.clone()))
+                && let Some(display_id) = display_ids.get(&(owner.kind, owner.run_id.clone()))
             {
                 owner.display_id.clone_from(display_id);
             }
@@ -863,7 +1325,7 @@ fn apply_control_transaction(
     workflow: &WorkflowSnapshot,
     action: ControlAction,
 ) -> Result<(String, Vec<String>), String> {
-    if workflow.dispatch.state.as_deref() == Some("recovery_pending") {
+    if workflow.dispatch.state == Some(execution::DispatchState::RecoveryPending) {
         return Err("workflow was interrupted; use recover instead".to_string());
     }
     let tx = conn
@@ -871,106 +1333,100 @@ fn apply_control_transaction(
         .map_err(|error| format!("begin workflow control: {error}"))?;
     let now = execution::now_ms();
     validate_control_snapshot(&tx, workflow)?;
-    let (run_table, step_table, active_states) = if workflow.identity.kind == "auto" {
-        (
-            "auto_run",
-            "auto_step_run",
-            "('starting','running','waiting')",
-        )
+    let (run_table, step_table) = if workflow.identity.kind == WorkflowKind::Auto {
+        ("auto_run", "auto_step_run")
     } else {
-        ("plan_run", "plan_step_run", "('starting','running')")
+        ("plan_run", "plan_step_run")
     };
-    let active: i64 = tx
-        .query_row(
-            &format!(
-                "select count(*) from {step_table} where run_id = ?1 and status in {active_states}"
-            ),
-            [&workflow.identity.run_id],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("inspect active workflow steps: {error}"))?;
     let mut warnings = Vec::new();
     let state = match action {
         ControlAction::Pause => {
-            if workflow.pause_requested || workflow.lifecycle == "paused" {
-                return Err("workflow is already paused".to_string());
-            }
-            let state = if active > 0 {
-                workflow.lifecycle.as_str()
+            let paused = if workflow.identity.kind == WorkflowKind::Auto {
+                let outcome = apply_auto_run_control(
+                    &tx,
+                    &workflow.identity.run_id,
+                    AutoRunControlIntent::Pause,
+                )?;
+                warnings.extend(outcome.warnings);
+                outcome.effect == AutoRunControlEffect::Paused
             } else {
-                "paused"
+                let outcome = apply_plan_run_control(
+                    &tx,
+                    &workflow.identity.run_id,
+                    PlanRunControlIntent::Pause,
+                )?;
+                warnings.extend(outcome.warnings);
+                outcome.effect == PlanRunControlEffect::Paused
             };
-            let changed = tx.execute(&format!("update {run_table} set pause_requested = 1, status = ?1, updated_unix_ms = ?2 where id = ?3 and status not in ('done','aborted')"), params![state, now, workflow.identity.run_id]).map_err(|error| format!("pause workflow: {error}"))?;
-            if changed != 1 {
-                return Err("workflow cannot be paused from its current state".to_string());
-            }
-            if active == 0 {
+            if paused {
                 set_dispatch(&tx, workflow, "paused", now)?;
             }
-            if workflow.identity.kind == "auto" {
-                tx.execute("update plan_run set pause_requested = 1, status = case when exists(select 1 from plan_step_run s where s.run_id = plan_run.id and s.status in ('starting','running')) then status else 'paused' end, updated_unix_ms = ?1 where id in (select plan_run_id from auto_step_run where run_id = ?2 and plan_run_id is not null and status in ('queued','starting','running','waiting')) and status not in ('done','failed','aborted')", params![now, workflow.identity.run_id]).map_err(|error| format!("pause linked plan: {error}"))?;
-            }
-            if active > 0 {
-                "pause_requested".to_string()
-            } else {
+            if paused {
                 "paused".to_string()
+            } else {
+                "pause_requested".to_string()
             }
         }
         ControlAction::Resume => {
-            if !workflow.pause_requested && workflow.lifecycle != "paused" {
+            if !workflow.pause_requested
+                && workflow.lifecycle != WorkflowLifecycle::Paused
+                && workflow.dispatch.state != Some(execution::DispatchState::Paused)
+            {
                 return Err("workflow is not paused".to_string());
             }
-            let live_execution: i64 = tx
-                .query_row(
-                    &format!(
-                        "select count(*) from {step_table}
-                         where run_id = ?1 and status in ('starting','running')"
-                    ),
-                    [&workflow.identity.run_id],
-                    |row| row.get(0),
-                )
-                .map_err(|error| format!("inspect live workflow steps: {error}"))?;
-            let resumed_state = if live_execution > 0 {
-                "running"
-            } else {
-                "queued"
-            };
-            let changed = tx.execute(&format!("update {run_table} set pause_requested = 0, status = ?1, updated_unix_ms = ?2 where id = ?3 and (pause_requested = 1 or status = 'paused')"), params![resumed_state, now, workflow.identity.run_id]).map_err(|error| format!("resume workflow: {error}"))?;
-            if changed != 1 {
-                return Err("workflow changed while applying resume".to_string());
-            }
-            if workflow.identity.kind == "auto" {
+            if !workflow.pause_requested && workflow.lifecycle != WorkflowLifecycle::Paused {
                 tx.execute(
-                    "update plan_run set pause_requested = 0,
-                       status = case when exists(
-                         select 1 from plan_step_run s where s.run_id = plan_run.id
-                           and s.status in ('starting','running')
-                       ) then 'running' else 'queued' end,
-                       updated_unix_ms = ?1
-                     where id in (select plan_run_id from auto_step_run
-                       where run_id = ?2 and plan_run_id is not null
-                         and status in ('queued','starting','running','waiting'))
-                       and status = 'paused'",
-                    params![now, workflow.identity.run_id],
+                    &format!("update {run_table} set pause_requested = 1 where id = ?1"),
+                    [&workflow.identity.run_id],
                 )
-                .map_err(|error| format!("resume linked plan: {error}"))?;
+                .map_err(|error| format!("adapt paused dispatch for resume: {error}"))?;
             }
-            if live_execution == 0 {
+            let claimed = workflow.dispatch.state == Some(execution::DispatchState::Claimed);
+            let resumed_state = if claimed {
+                resume_claimed_workflow(&tx, workflow, now)?;
+                "running"
+            } else if workflow.identity.kind == WorkflowKind::Auto {
+                let outcome = apply_auto_run_control(
+                    &tx,
+                    &workflow.identity.run_id,
+                    AutoRunControlIntent::Resume,
+                )?;
+                warnings.extend(outcome.warnings);
+                match outcome.executor {
+                    AutoExecutorDecision::Start => "queued",
+                    AutoExecutorDecision::AlreadyRunning => "running",
+                    AutoExecutorDecision::DoNotStart => "paused",
+                }
+            } else {
+                let outcome = apply_plan_run_control(
+                    &tx,
+                    &workflow.identity.run_id,
+                    PlanRunControlIntent::Resume,
+                )?;
+                warnings.extend(outcome.warnings);
+                match outcome.executor {
+                    PlanExecutorDecision::Start => "queued",
+                    PlanExecutorDecision::AlreadyRunning => "running",
+                    PlanExecutorDecision::DoNotStart => "paused",
+                }
+            };
+            if resumed_state == "queued" {
                 enqueue_dispatch(&tx, workflow, now)?;
             }
             resumed_state.to_string()
         }
         ControlAction::Stop => {
             let cancellation = recorded_cancellation(&tx, workflow)?;
-            tx.execute(&format!("update {step_table} set status = 'aborted', finished_unix_ms = ?1, error = coalesce(error, 'aborted') where run_id = ?2 and status in ('queued','starting','running','waiting')"), params![now, workflow.identity.run_id]).map_err(|error| format!("abort workflow steps: {error}"))?;
+            tx.execute(&format!("update {step_table} set status = 'aborted', finished_unix_ms = ?1, error = coalesce(error, 'aborted'), execution_process_id = null, execution_process_start_time_ticks = null, process_id = null where run_id = ?2 and status in ('queued','starting','running','waiting')"), params![now, workflow.identity.run_id]).map_err(|error| format!("abort workflow steps: {error}"))?;
             let changed = tx.execute(&format!("update {run_table} set pause_requested = 0, status = 'aborted', updated_unix_ms = ?1 where id = ?2 and status not in ('done','aborted')"), params![now, workflow.identity.run_id]).map_err(|error| format!("stop workflow: {error}"))?;
             if changed != 1 {
                 return Err("workflow cannot be stopped from its current state".to_string());
             }
-            if workflow.identity.kind == "auto" {
+            if workflow.identity.kind == WorkflowKind::Auto {
                 tx.execute(
                     "update plan_step_run set status = 'aborted', finished_unix_ms = ?1,
-                       error = coalesce(error, 'aborted')
+                       error = coalesce(error, 'aborted'), execution_process_id = null,
+                       execution_process_start_time_ticks = null, process_id = null
                      where run_id in (select plan_run_id from auto_step_run
                        where run_id = ?2 and plan_run_id is not null)
                        and status in ('queued','starting','running')",
@@ -1000,13 +1456,53 @@ fn apply_control_transaction(
     Ok((state, warnings))
 }
 
+fn resume_claimed_workflow(
+    conn: &Connection,
+    workflow: &WorkflowSnapshot,
+    now: i64,
+) -> Result<(), String> {
+    let run_table = if workflow.identity.kind == WorkflowKind::Auto {
+        "auto_run"
+    } else {
+        "plan_run"
+    };
+    let changed = conn
+        .execute(
+            &format!(
+                "update {run_table} set pause_requested = 0, status = 'running',
+                   updated_unix_ms = ?1 where id = ?2 and pause_requested = 1"
+            ),
+            params![now, workflow.identity.run_id],
+        )
+        .map_err(|error| format!("resume claimed workflow: {error}"))?;
+    if changed != 1 {
+        return Err("workflow changed while applying resume".to_string());
+    }
+    if workflow.identity.kind == WorkflowKind::Auto {
+        conn.execute(
+            "update plan_run set pause_requested = 0,
+               status = case when exists(
+                 select 1 from plan_step_run s where s.run_id = plan_run.id
+                   and s.status in ('starting','running')
+               ) then 'running' else 'queued' end,
+               updated_unix_ms = ?1
+             where id in (select plan_run_id from auto_step_run
+               where run_id = ?2 and plan_run_id is not null)
+               and (pause_requested = 1 or status = 'paused')",
+            params![now, workflow.identity.run_id],
+        )
+        .map_err(|error| format!("resume claimed linked plan: {error}"))?;
+    }
+    Ok(())
+}
+
 fn set_dispatch(
     conn: &Connection,
     workflow: &WorkflowSnapshot,
     state: &str,
     now: i64,
 ) -> Result<(), String> {
-    conn.execute("update workflow_execution set dispatch_state = ?1, worker_id = null, daemon_instance_id = null, lease_expires_unix_ms = null, executor_pid = null, executor_process_identity = null, requeue_requested = 0, fencing_token = fencing_token + 1, updated_unix_ms = ?2 where workflow_kind = ?3 and run_id = ?4", params![state, now, workflow.identity.kind, workflow.identity.run_id]).map_err(|error| format!("update workflow dispatch: {error}"))?;
+    conn.execute("update workflow_execution set dispatch_state = ?1, worker_id = null, daemon_instance_id = null, lease_expires_unix_ms = null, executor_pid = null, executor_process_identity = null, requeue_requested = 0, fencing_token = fencing_token + 1, updated_unix_ms = ?2 where workflow_kind = ?3 and run_id = ?4", params![state, now, workflow.identity.kind.label(), workflow.identity.run_id]).map_err(|error| format!("update workflow dispatch: {error}"))?;
     Ok(())
 }
 
@@ -1015,7 +1511,7 @@ fn enqueue_dispatch(
     workflow: &WorkflowSnapshot,
     now: i64,
 ) -> Result<(), String> {
-    conn.execute("insert into workflow_execution (workflow_kind, run_id, dispatch_state, fencing_token, interruption_generation, created_unix_ms, updated_unix_ms) values (?1, ?2, 'queued', 0, 0, ?3, ?3) on conflict(workflow_kind, run_id) do update set dispatch_state = case when workflow_execution.dispatch_state = 'claimed' then 'claimed' else 'queued' end, requeue_requested = case when workflow_execution.dispatch_state = 'claimed' then 1 else 0 end, worker_id = case when workflow_execution.dispatch_state = 'claimed' then worker_id else null end, daemon_instance_id = case when workflow_execution.dispatch_state = 'claimed' then daemon_instance_id else null end, updated_unix_ms = excluded.updated_unix_ms", params![workflow.identity.kind, workflow.identity.run_id, now]).map_err(|error| format!("queue workflow: {error}"))?;
+    conn.execute("insert into workflow_execution (workflow_kind, run_id, dispatch_state, fencing_token, requeue_requested, interruption_generation, created_unix_ms, updated_unix_ms) values (?1, ?2, 'queued', 0, 0, 0, ?3, ?3) on conflict(workflow_kind, run_id) do update set dispatch_state = case when workflow_execution.dispatch_state = 'claimed' then 'claimed' else 'queued' end, requeue_requested = case when workflow_execution.dispatch_state = 'claimed' then 1 else 0 end, worker_id = case when workflow_execution.dispatch_state = 'claimed' then worker_id else null end, daemon_instance_id = case when workflow_execution.dispatch_state = 'claimed' then daemon_instance_id else null end, updated_unix_ms = excluded.updated_unix_ms", params![workflow.identity.kind.label(), workflow.identity.run_id, now]).map_err(|error| format!("queue workflow: {error}"))?;
     Ok(())
 }
 
@@ -1038,7 +1534,7 @@ fn validate_explicit_control(
     };
     if available {
         Ok(workflow)
-    } else if workflow.dispatch.state.as_deref() == Some("recovery_pending")
+    } else if workflow.dispatch.state == Some(execution::DispatchState::RecoveryPending)
         && action != ControlAction::Recover
     {
         Err("workflow was interrupted; use recover instead".to_string())
@@ -1052,7 +1548,7 @@ fn validate_explicit_control(
 }
 
 fn validate_control_snapshot(conn: &Connection, workflow: &WorkflowSnapshot) -> Result<(), String> {
-    let run_table = if workflow.identity.kind == "auto" {
+    let run_table = if workflow.identity.kind == WorkflowKind::Auto {
         "auto_run"
     } else {
         "plan_run"
@@ -1066,7 +1562,7 @@ fn validate_control_snapshot(conn: &Connection, workflow: &WorkflowSnapshot) -> 
                    on e.workflow_kind = ?1 and e.run_id = r.id
                  where r.id = ?2"
             ),
-            params![workflow.identity.kind, workflow.identity.run_id],
+            params![workflow.identity.kind.label(), workflow.identity.run_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -1080,10 +1576,13 @@ fn validate_control_snapshot(conn: &Connection, workflow: &WorkflowSnapshot) -> 
         .optional()
         .map_err(|error| format!("validate workflow control: {error}"))?;
     let expected = (
-        workflow.lifecycle.clone(),
+        workflow.lifecycle.label().to_string(),
         workflow.pause_requested,
         workflow.updated_unix_ms,
-        workflow.dispatch.state.clone(),
+        workflow
+            .dispatch
+            .state
+            .map(|state| state.label().to_string()),
         workflow.dispatch.interruption_generation,
     );
     if current.as_ref() != Some(&expected) {
@@ -1101,7 +1600,7 @@ fn recorded_cancellation(
     conn: &Connection,
     workflow: &WorkflowSnapshot,
 ) -> Result<RecordedCancellation, String> {
-    let query = if workflow.identity.kind == "auto" {
+    let query = if workflow.identity.kind == WorkflowKind::Auto {
         "select execution_process_id, execution_process_start_time_ticks
          from auto_step_run where run_id = ?1 and execution_process_id is not null
          union
@@ -1128,7 +1627,7 @@ fn recorded_cancellation(
             processes.push((pid, start.and_then(|value| u64::try_from(value).ok())));
         }
     }
-    let query = if workflow.identity.kind == "auto" {
+    let query = if workflow.identity.kind == WorkflowKind::Auto {
         "select session_adapter_id, session_endpoint, session_id
          from auto_step_run where run_id = ?1 and session_id is not null
          union
@@ -1204,24 +1703,27 @@ fn eligible_refs<'a>(
     match candidates.as_slice() {
         [workflow] => Ok(*workflow),
         [] => Err("no eligible owner workflow found".to_string()),
-        _ => Err(format!(
-            "ambiguous workflow target; matches {}",
-            candidates
+        _ => Err(format!("ambiguous workflow target; matches {}", {
+            let mut display_ids = candidates
                 .iter()
                 .map(|workflow| workflow.identity.display_id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
+                .collect::<Vec<_>>();
+            display_ids.sort_unstable();
+            display_ids.join(", ")
+        })),
     }
 }
 
 fn execution_identity(identity: &WorkflowIdentity) -> Result<ExecutionIdentity, String> {
-    let kind = match identity.kind.as_str() {
-        "auto" => WorkflowKind::Auto,
-        "plan" => WorkflowKind::Plan,
-        other => return Err(format!("unknown workflow kind: {other}")),
-    };
-    Ok(ExecutionIdentity::new(kind, &identity.run_id))
+    Ok(ExecutionIdentity::new(identity.kind, &identity.run_id))
+}
+
+fn sql_value_error(index: usize, error: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        index,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
+    )
 }
 
 fn table_exists(conn: &Connection, table: &str) -> Result<bool, String> {
@@ -1238,20 +1740,20 @@ fn workflow_selector_matches(selector: &str, identity: &WorkflowIdentity) -> boo
     selector == identity.display_id
         || selector
             .strip_prefix("auto:")
-            .is_some_and(|id| identity.kind == "auto" && id == identity.run_id)
+            .is_some_and(|id| identity.kind == WorkflowKind::Auto && id == identity.run_id)
         || selector
             .strip_prefix("plan:")
-            .is_some_and(|id| identity.kind == "plan" && id == identity.run_id)
+            .is_some_and(|id| identity.kind == WorkflowKind::Plan && id == identity.run_id)
         || selector.strip_prefix("a:").is_some_and(|id| {
-            identity.kind == "auto" && id.len() == 8 && identity.run_id.starts_with(id)
+            identity.kind == WorkflowKind::Auto && id.len() == 8 && identity.run_id.starts_with(id)
         })
         || selector.strip_prefix("p:").is_some_and(|id| {
-            identity.kind == "plan" && id.len() == 8 && identity.run_id.starts_with(id)
+            identity.kind == WorkflowKind::Plan && id.len() == 8 && identity.run_id.starts_with(id)
         })
 }
 
 fn subject_candidates(snapshot: &WorkspaceSnapshot, subjects: &[Subject]) -> Vec<String> {
-    subjects
+    let mut candidates = subjects
         .iter()
         .map(|subject| match *subject {
             Subject::Repository(repo) => format!("repo:{}", snapshot.repositories[repo].label),
@@ -1264,10 +1766,12 @@ fn subject_candidates(snapshot: &WorkspaceSnapshot, subjects: &[Subject]) -> Vec
                 .display_id
                 .clone(),
         })
-        .collect()
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates
 }
 
-fn short_id(kind: &str, run_id: &str) -> String {
+fn short_id(kind: WorkflowKind, run_id: &str) -> String {
     format!(
         "{}:{}",
         kind_prefix(kind),
@@ -1275,8 +1779,8 @@ fn short_id(kind: &str, run_id: &str) -> String {
     )
 }
 
-fn kind_prefix(kind: &str) -> &str {
-    if kind == "auto" { "a" } else { "p" }
+fn kind_prefix(kind: WorkflowKind) -> &'static str {
+    if kind == WorkflowKind::Auto { "a" } else { "p" }
 }
 fn branch_label(branch: &BranchState) -> &str {
     match branch {
@@ -1306,23 +1810,14 @@ mod tests {
 
     fn connection() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
+        crate::plan_run::migrate_schema(&conn).unwrap();
         conn.execute_batch(
-            "create table plan_run (
-               id text primary key, status text not null, pause_requested integer not null,
-               updated_unix_ms integer not null
-             );
-             create table plan_step_run (
-               run_id text not null, step integer not null, status text not null,
-               finished_unix_ms integer, error text, execution_process_id integer,
-               execution_process_start_time_ticks integer, session_adapter_id text,
-               session_endpoint text, session_id text
-             );
-             create table workflow_execution (
+            "create table workflow_execution (
                workflow_kind text not null, run_id text not null, dispatch_state text not null,
                worker_id text, daemon_instance_id text, lease_expires_unix_ms integer,
                heartbeat_unix_ms integer, fencing_token integer not null,
                executor_pid integer, executor_process_identity text,
-               requeue_requested integer not null, interruption_generation integer not null,
+               requeue_requested integer not null default 0, interruption_generation integer not null,
                created_unix_ms integer not null, updated_unix_ms integer not null,
                primary key (workflow_kind, run_id)
              );",
@@ -1332,10 +1827,19 @@ mod tests {
     }
 
     fn workflow(status: &str, paused: bool, dispatch: &str) -> WorkflowSnapshot {
+        let lifecycle = WorkflowLifecycle::parse(status).unwrap();
+        let dispatch = match dispatch {
+            "queued" => execution::DispatchState::Queued,
+            "claimed" => execution::DispatchState::Claimed,
+            "recovery_pending" => execution::DispatchState::RecoveryPending,
+            "paused" => execution::DispatchState::Paused,
+            "terminal" => execution::DispatchState::Terminal,
+            other => panic!("unexpected dispatch state: {other}"),
+        };
         WorkflowSnapshot {
             identity: WorkflowIdentity {
                 repository: PathBuf::from("/repo"),
-                kind: "plan".to_string(),
+                kind: WorkflowKind::Plan,
                 run_id: "plan-1".to_string(),
                 display_id: "p:plan-1".to_string(),
             },
@@ -1344,10 +1848,10 @@ mod tests {
                 path: PathBuf::from("/repo"),
                 display: "repo".to_string(),
             },
-            lifecycle: status.to_string(),
+            lifecycle,
             pause_requested: paused,
             dispatch: DispatchSnapshot {
-                state: Some(dispatch.to_string()),
+                state: Some(dispatch),
                 daemon_instance_id: None,
                 worker_id: None,
                 lease_expires_unix_ms: None,
@@ -1364,7 +1868,14 @@ mod tests {
 
     fn insert_run(conn: &Connection, status: &str, paused: bool, dispatch: &str) {
         conn.execute(
-            "insert into plan_run values ('plan-1', ?1, ?2, 20)",
+            "insert into plan_run (
+               id, repo_root, scope_path, plan_path, plan_display, step_name,
+               start_step, total_steps, mode, status, pause_requested, selected_step,
+               created_unix_ms, updated_unix_ms
+             ) values (
+               'plan-1', '/repo', '/repo', '/repo/plan.md', 'plan.md', 'phase',
+               1, 1, 'sequential', ?1, ?2, 1, 10, 20
+             )",
             params![status, paused],
         )
         .unwrap();
@@ -1379,12 +1890,110 @@ mod tests {
     }
 
     #[test]
+    fn cached_pull_request_states_use_mergeability_not_review_decision() {
+        assert_eq!(
+            pull_request_state("OPEN", false, false),
+            PullRequestState::Open
+        );
+        assert_eq!(
+            pull_request_state("OPEN", false, true),
+            PullRequestState::Draft
+        );
+        assert_eq!(
+            pull_request_state("CLOSED", true, false),
+            PullRequestState::Merged
+        );
+        assert_eq!(mergeability_state("DIRTY"), MergeabilityState::Dirty);
+        assert_eq!(ci_state("passed"), CiState::Success);
+    }
+
+    #[test]
+    fn persisted_agent_labels_project_as_stable_typed_states() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "create table agent_state (
+               branch text primary key, state text, updated_unix_ms integer
+             );
+             insert into agent_state values ('feature', 'needs input', 42);",
+        )
+        .unwrap();
+
+        let agent = load_agent(&conn, "feature").unwrap().unwrap();
+
+        assert_eq!(agent.state, Some(AgentState::NeedsInput));
+        assert_eq!(agent.updated_unix_ms, Some(42));
+        assert_eq!(serde_json::to_value(agent).unwrap()["state"], "needs_input");
+    }
+
+    #[test]
+    fn cached_pull_request_preserves_mergeability_staleness_and_error_provenance() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "create table pr_cache (
+               branch text primary key, number integer, title text, url text, state text,
+               review_decision text, merge_state_status text, check_status text,
+               refreshed_unix_ms integer, merged integer, draft integer,
+               observation_error text
+             );
+             insert into pr_cache values (
+               'feature', 42, 'PR', 'https://example.test/42', 'OPEN',
+               'APPROVED', 'DIRTY', 'passed', 10, 0, 0, 'gh unavailable'
+             );",
+        )
+        .unwrap();
+
+        let pull_request = load_pr(&conn, "feature", 100_000).unwrap().unwrap();
+
+        assert_eq!(pull_request.state, PullRequestState::Open);
+        assert_eq!(pull_request.mergeability, Some(MergeabilityState::Dirty));
+        assert_eq!(pull_request.ci, Some(CiState::Success));
+        assert_eq!(pull_request.age_ms, 90_000);
+        assert!(pull_request.stale);
+        assert_eq!(pull_request.error.as_deref(), Some("gh unavailable"));
+        assert_eq!(pull_request.provenance, ObservationProvenance::SqliteCache);
+        let json = serde_json::to_value(&pull_request).unwrap();
+        assert_eq!(json["state"], "open");
+        assert_eq!(json["mergeability"], "dirty");
+        assert_eq!(json["ci"], "success");
+        assert_eq!(json["provenance"], "sqlite_cache");
+    }
+
+    #[test]
+    fn recent_terminal_filter_keeps_attention_workflows_and_is_bounded() {
+        let mut workflows = (0..12)
+            .map(|index| {
+                let mut workflow = workflow("done", false, "terminal");
+                workflow.identity.run_id = format!("done-{index:02}");
+                workflow.updated_unix_ms = 100 - index;
+                workflow
+            })
+            .collect::<Vec<_>>();
+        workflows.push(workflow("failed", false, "terminal"));
+        workflows.push(workflow("running", false, "claimed"));
+
+        retain_recent_terminal_workflows(&mut workflows, 10);
+
+        assert_eq!(workflows.len(), 12);
+        assert!(
+            workflows
+                .iter()
+                .any(|workflow| workflow.lifecycle == WorkflowLifecycle::Failed)
+        );
+        assert!(
+            workflows
+                .iter()
+                .any(|workflow| workflow.lifecycle == WorkflowLifecycle::Running)
+        );
+    }
+
+    #[test]
     fn active_resume_does_not_request_a_second_execution() {
         let mut conn = connection();
         insert_run(&conn, "running", true, "claimed");
         conn.execute(
-            "insert into plan_step_run (run_id, step, status) values ('plan-1', 1, 'running')",
-            [],
+            "insert into plan_step_run (run_id, step, prompt, status, execution_process_id)
+             values ('plan-1', 1, 'phase', 'running', ?1)",
+            [i64::from(std::process::id())],
         )
         .unwrap();
 
@@ -1404,6 +2013,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dispatch, ("claimed".to_string(), 0));
+    }
+
+    #[test]
+    fn claimed_resume_does_not_reconcile_a_starting_step_without_a_pid() {
+        let mut conn = connection();
+        insert_run(&conn, "running", true, "claimed");
+        conn.execute(
+            "insert into plan_step_run (run_id, step, prompt, status)
+             values ('plan-1', 1, 'phase', 'starting')",
+            [],
+        )
+        .unwrap();
+
+        let (state, _) = apply_control_transaction(
+            &mut conn,
+            &workflow("running", true, "claimed"),
+            ControlAction::Resume,
+        )
+        .unwrap();
+
+        assert_eq!(state, "running");
+        let persisted: (String, String, i64) = conn
+            .query_row(
+                "select p.status, e.dispatch_state, e.requeue_requested
+                 from plan_run p join workflow_execution e on e.run_id = p.id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, ("running".to_string(), "claimed".to_string(), 0));
+        let step: String = conn
+            .query_row("select status from plan_step_run", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(step, "starting");
     }
 
     #[test]
@@ -1454,9 +2097,9 @@ mod tests {
         let start = crate::harness::process_start_time_ticks(pid).unwrap();
         conn.execute(
             "insert into plan_step_run (
-               run_id, step, status, execution_process_id,
+               run_id, step, prompt, status, execution_process_id,
                execution_process_start_time_ticks
-             ) values ('plan-1', 1, 'running', ?1, ?2)",
+             ) values ('plan-1', 1, 'phase', 'running', ?1, ?2)",
             params![pid, i64::try_from(start).unwrap()],
         )
         .unwrap();
@@ -1470,7 +2113,72 @@ mod tests {
 
         assert_eq!(state, "aborted");
         assert!(warnings.is_empty(), "{warnings:?}");
+        let process: (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "select execution_process_id, execution_process_start_time_ticks
+                 from plan_step_run where run_id = 'plan-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(process, (None, None));
         let _ = child.wait();
         assert_ne!(crate::harness::process_start_time_ticks(pid), Some(start));
+    }
+
+    #[test]
+    fn dispatch_only_pause_advertises_and_accepts_resume() {
+        let controls = controls_for(
+            WorkflowLifecycle::Running,
+            false,
+            Some(execution::DispatchState::Paused),
+            true,
+        );
+        assert!(controls.resume);
+        assert!(!controls.pause);
+
+        let mut conn = connection();
+        insert_run(&conn, "running", false, "paused");
+        let (state, _) = apply_control_transaction(
+            &mut conn,
+            &workflow("running", false, "paused"),
+            ControlAction::Resume,
+        )
+        .unwrap();
+        assert_eq!(state, "queued");
+    }
+
+    #[test]
+    fn linked_plan_owner_is_available_when_owner_is_not_projected() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "create table auto_run (id text primary key, archived_unix_ms integer);
+             create table auto_step_run (run_id text, plan_run_id text);
+             insert into auto_run values ('auto-owner-12345678', null);
+             insert into auto_step_run values ('auto-owner-12345678', 'plan-child');",
+        )
+        .unwrap();
+
+        let owners = linked_plan_owners(&conn, Path::new("/repo")).unwrap();
+        let owner = owners.get("plan-child").unwrap();
+        assert_eq!(owner.kind, WorkflowKind::Auto);
+        assert_eq!(owner.run_id, "auto-owner-12345678");
+        assert_eq!(owner.display_id, "a:auto-own");
+    }
+
+    #[test]
+    fn archived_auto_link_does_not_make_a_plan_uncontrollable() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "create table auto_run (id text primary key, archived_unix_ms integer);
+             create table auto_step_run (run_id text, plan_run_id text);
+             insert into auto_run values ('archived-owner', 42);
+             insert into auto_step_run values ('archived-owner', 'active-plan');",
+        )
+        .unwrap();
+
+        let owners = linked_plan_owners(&conn, Path::new("/repo")).unwrap();
+
+        assert!(!owners.contains_key("active-plan"));
     }
 }

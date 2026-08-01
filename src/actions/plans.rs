@@ -320,14 +320,16 @@ impl Tui {
             .steps
             .iter()
             .find(|step| step.step == dashboard.run.run.selected_step);
-        let resuming =
-            dashboard.run.run.pause_requested || dashboard.run.run.status == PlanRunStatus::Paused;
+        let controls = self
+            .workflow_controls(
+                Path::new(&dashboard.run.run.repo_root),
+                crate::execution::WorkflowKind::Plan,
+                &dashboard.run.run.id,
+            )
+            .cloned()
+            .unwrap_or_default();
         let availability = PlanActionAvailability {
-            pause_resume: resuming
-                || !matches!(
-                    dashboard.run.run.status,
-                    PlanRunStatus::Done | PlanRunStatus::Failed | PlanRunStatus::Aborted
-                ),
+            pause_resume: controls.pause || controls.resume,
             retry_failed: dashboard.run.steps.iter().any(|step| {
                 matches!(
                     step.status,
@@ -416,14 +418,16 @@ impl Tui {
                 .iter()
                 .find(|step| step.step == linked.run.run.selected_step)
         });
-        let resuming =
-            dashboard.run.run.pause_requested || dashboard.run.run.status == AutoRunStatus::Paused;
+        let controls = self
+            .workflow_controls(
+                Path::new(&dashboard.run.run.repo_root),
+                crate::execution::WorkflowKind::Auto,
+                &dashboard.run.run.id,
+            )
+            .cloned()
+            .unwrap_or_default();
         let availability = PlanActionAvailability {
-            pause_resume: resuming
-                || !matches!(
-                    dashboard.run.run.status,
-                    AutoRunStatus::Done | AutoRunStatus::Failed | AutoRunStatus::Aborted
-                ),
+            pause_resume: controls.pause || controls.resume,
             retry_failed: dashboard.run.steps.iter().any(|step| {
                 matches!(
                     step.status,
@@ -534,12 +538,15 @@ impl Tui {
                     PlanStepStatus::Starting | PlanStepStatus::Running
                 )
         });
-        let run_active = dashboard.run.steps.iter().any(|step| {
-            matches!(
-                step.status,
-                PlanStepStatus::Queued | PlanStepStatus::Starting | PlanStepStatus::Running
-            )
-        });
+        let run_active = self
+            .workflow_controls(&repo.root, crate::execution::WorkflowKind::Plan, &run_id)
+            .is_some_and(|controls| controls.stop)
+            && dashboard.run.steps.iter().any(|step| {
+                matches!(
+                    step.status,
+                    PlanStepStatus::Queued | PlanStepStatus::Starting | PlanStepStatus::Running
+                )
+            });
         let answer = self.prompt_choice_dialog(
             raw,
             crate::view::ChoiceList {
@@ -724,12 +731,16 @@ impl Tui {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
         let run_id = dashboard.run.run.id.clone();
-        let resuming =
-            dashboard.run.run.pause_requested || dashboard.run.run.status == PlanRunStatus::Paused;
-        let action = if resuming {
-            crate::workspace_state::ControlAction::Resume
+        let controls = self
+            .workflow_controls(&repo.root, crate::execution::WorkflowKind::Plan, &run_id)
+            .cloned()
+            .unwrap_or_default();
+        let (action, resuming) = if controls.resume {
+            (crate::workspace_state::ControlAction::Resume, true)
+        } else if controls.pause {
+            (crate::workspace_state::ControlAction::Pause, false)
         } else {
-            crate::workspace_state::ControlAction::Pause
+            return Err("pause/resume is not available for this plan run".to_string());
         };
         let receipt =
             crate::workspace_state::control_repository_workflow(&repo, action, "plan", &run_id)?;

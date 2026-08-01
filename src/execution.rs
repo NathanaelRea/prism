@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,13 +6,18 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 const DEFAULT_LEASE_MS: i64 = 15_000;
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkflowKind {
     Auto,
     Plan,
 }
 
 impl WorkflowKind {
+    pub fn as_str(self) -> &'static str {
+        self.label()
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::Auto => "auto",
@@ -21,7 +25,7 @@ impl WorkflowKind {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "auto" => Ok(Self::Auto),
             "plan" => Ok(Self::Plan),
@@ -30,7 +34,20 @@ impl WorkflowKind {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+impl std::fmt::Display for WorkflowKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.label())
+    }
+}
+
+impl PartialEq<&str> for WorkflowKind {
+    fn eq(&self, other: &&str) -> bool {
+        self.label() == *other
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DispatchState {
     Queued,
     Claimed,
@@ -50,7 +67,7 @@ impl DispatchState {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "queued" => Ok(Self::Queued),
             "claimed" => Ok(Self::Claimed),
@@ -59,6 +76,14 @@ impl DispatchState {
             "terminal" => Ok(Self::Terminal),
             other => Err(format!("unknown dispatch state: {other}")),
         }
+    }
+}
+
+impl std::ops::Deref for DispatchState {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.label()
     }
 }
 
@@ -83,17 +108,6 @@ pub struct ExecutionClaim {
     pub worker_id: String,
     pub daemon_instance_id: String,
     pub fencing_token: i64,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RecoveryCandidate {
-    pub workflow: WorkflowIdentity,
-    pub repo_root: PathBuf,
-    pub worktree: PathBuf,
-    pub branch: String,
-    pub active_step: String,
-    pub last_heartbeat_unix_ms: Option<i64>,
-    pub interruption_generation: i64,
 }
 
 pub fn new_instance_id(prefix: &str) -> String {
@@ -584,65 +598,6 @@ pub fn mark_abandoned(conn: &Connection, daemon_instance_id: &str) -> Result<usi
     .map_err(|error| format!("mark abandoned workflows: {error}"))
 }
 
-pub fn recovery_candidates(conn: &Connection) -> Result<Vec<RecoveryCandidate>, String> {
-    let mut candidates = Vec::new();
-    let mut statement = conn
-        .prepare(
-            "select e.workflow_kind, e.run_id, e.heartbeat_unix_ms,
-                    e.interruption_generation,
-                    coalesce(a.repo_root, p.repo_root),
-                    coalesce(a.worktree_path, p.scope_path),
-                    coalesce(a.branch, p.plan_display),
-                    case e.workflow_kind
-                      when 'auto' then coalesce((
-                        select s.step_key from auto_step_run s
-                        where s.run_id = e.run_id
-                        order by s.sequence desc limit 1
-                      ), 'Auto Flow')
-                      else coalesce((
-                        select p2.step_name || ' ' || s.step || ' of ' || p2.total_steps
-                        from plan_step_run s join plan_run p2 on p2.id = s.run_id
-                        where s.run_id = e.run_id
-                        order by s.step desc limit 1
-                      ), 'Plan')
-                    end
-             from workflow_execution e
-             left join auto_run a on e.workflow_kind = 'auto' and a.id = e.run_id
-             left join plan_run p on e.workflow_kind = 'plan' and p.id = e.run_id
-             where e.dispatch_state = 'recovery_pending'
-             order by coalesce(a.repo_root, p.repo_root), e.workflow_kind, e.run_id",
-        )
-        .map_err(|error| format!("prepare recovery candidate query: {error}"))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-                row.get::<_, String>(7)?,
-            ))
-        })
-        .map_err(|error| format!("query recovery candidates: {error}"))?;
-    for row in rows {
-        let (kind, run_id, heartbeat, generation, repo, worktree, branch, active_step) =
-            row.map_err(|error| format!("read recovery candidate: {error}"))?;
-        candidates.push(RecoveryCandidate {
-            workflow: WorkflowIdentity::new(WorkflowKind::parse(&kind)?, run_id),
-            repo_root: PathBuf::from(repo),
-            worktree: PathBuf::from(worktree),
-            branch,
-            active_step,
-            last_heartbeat_unix_ms: heartbeat,
-            interruption_generation: generation,
-        });
-    }
-    Ok(candidates)
-}
-
 pub fn apply_recovery_decision(
     conn: &mut Connection,
     decisions: &[(WorkflowIdentity, i64, bool)],
@@ -666,7 +621,7 @@ pub fn apply_recovery_decision(
             .map_err(|error| format!("validate recovery decision: {error}"))?;
         if current.is_none() {
             return Err(format!(
-                "recovery state changed for {} run {}",
+                "stale recovery generation for {} run {}",
                 workflow.kind.label(),
                 workflow.run_id
             ));
@@ -698,7 +653,7 @@ pub fn apply_recovery_decision(
             .map_err(|error| format!("apply recovery decision: {error}"))?;
         if changed != 1 {
             return Err(format!(
-                "recovery state changed for {} run {}",
+                "stale recovery generation for {} run {}",
                 workflow.kind.label(),
                 workflow.run_id
             ));
@@ -715,6 +670,32 @@ pub fn apply_recovery_decision(
                         [&workflow.run_id],
                     )
                     .map_err(|error| format!("reset interrupted Auto Flow step: {error}"))?;
+                    tx.execute(
+                        "update plan_step_run set status = 'queued', started_unix_ms = null,
+                           finished_unix_ms = null, execution_state = null,
+                           execution_process_id = null, execution_process_start_time_ticks = null,
+                           process_id = null, error = null
+                         where run_id in (
+                           select plan_run_id from auto_step_run
+                           where run_id = ?1 and plan_run_id is not null
+                         ) and status in ('starting', 'running')",
+                        [&workflow.run_id],
+                    )
+                    .map_err(|error| format!("reset interrupted linked Plan step: {error}"))?;
+                    tx.execute(
+                        "update plan_run set status = 'queued', pause_requested = 0,
+                           updated_unix_ms = ?1
+                         where id in (
+                           select plan_run_id from auto_step_run
+                           where run_id = ?2 and plan_run_id is not null
+                         ) and status in ('queued', 'running', 'paused')
+                           and exists (
+                             select 1 from plan_step_run s
+                             where s.run_id = plan_run.id and s.status = 'queued'
+                           )",
+                        params![now, workflow.run_id],
+                    )
+                    .map_err(|error| format!("queue interrupted linked Plan run: {error}"))?;
                 }
                 tx.execute(
                     "update auto_run set status = ?1, pause_requested = 0,
@@ -754,16 +735,27 @@ fn terminate_recorded_processes(
     conn: &Connection,
     workflow: &WorkflowIdentity,
 ) -> Result<(), String> {
-    let table = match workflow.kind {
-        WorkflowKind::Auto => "auto_step_run",
-        WorkflowKind::Plan => "plan_step_run",
+    let query = match workflow.kind {
+        WorkflowKind::Auto => {
+            "select distinct execution_process_id, execution_process_start_time_ticks
+             from auto_step_run
+             where run_id = ?1 and execution_process_id is not null
+             union
+             select distinct execution_process_id, execution_process_start_time_ticks
+             from plan_step_run
+             where run_id in (
+               select plan_run_id from auto_step_run
+               where run_id = ?1 and plan_run_id is not null
+             ) and execution_process_id is not null"
+        }
+        WorkflowKind::Plan => {
+            "select distinct execution_process_id, execution_process_start_time_ticks
+             from plan_step_run
+             where run_id = ?1 and execution_process_id is not null"
+        }
     };
     let mut statement = conn
-        .prepare(&format!(
-            "select distinct execution_process_id, execution_process_start_time_ticks
-             from {table}
-             where run_id = ?1 and execution_process_id is not null"
-        ))
+        .prepare(query)
         .map_err(|error| format!("prepare interrupted process query: {error}"))?;
     let rows = statement
         .query_map([&workflow.run_id], |row| {
@@ -852,6 +844,7 @@ pub fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::PathBuf;
 
     use super::*;
 
@@ -1070,6 +1063,125 @@ mod tests {
             )
             .unwrap();
         assert_eq!(process_id, Some(999999));
+        drop(conn);
+        drop(other);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn stale_batch_recovery_changes_none_of_the_workflows() {
+        let (path, mut conn, other) = connections("stale-recovery-batch");
+        for (run_id, generation) in [("plan-1", 1), ("plan-2", 2)] {
+            conn.execute(
+                "insert into plan_run (id, status, created_unix_ms, updated_unix_ms)
+                 values (?1, 'running', 1, 1)",
+                [run_id],
+            )
+            .unwrap();
+            conn.execute(
+                "insert into workflow_execution (
+                   workflow_kind, run_id, dispatch_state, fencing_token,
+                   interruption_generation, created_unix_ms, updated_unix_ms
+                 ) values ('plan', ?1, 'recovery_pending', 1, ?2, 1, 1)",
+                params![run_id, generation],
+            )
+            .unwrap();
+        }
+
+        let error = apply_recovery_decision(
+            &mut conn,
+            &[
+                (WorkflowIdentity::new(WorkflowKind::Plan, "plan-1"), 1, true),
+                (WorkflowIdentity::new(WorkflowKind::Plan, "plan-2"), 1, true),
+            ],
+        )
+        .unwrap_err();
+
+        assert_eq!(error, "stale recovery generation for plan run plan-2");
+        let pending: i64 = conn
+            .query_row(
+                "select count(*) from workflow_execution where dispatch_state = 'recovery_pending'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 2);
+        drop(conn);
+        drop(other);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn auto_recovery_terminates_recorded_linked_plan_processes() {
+        use std::os::unix::process::CommandExt;
+
+        let (path, mut conn, other) = connections("auto-linked-plan-recovery");
+        conn.execute(
+            "insert into auto_run (id, status, created_unix_ms, updated_unix_ms)
+             values ('auto-1', 'running', 1, 1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into auto_step_run (id, run_id, plan_run_id, status)
+             values (1, 'auto-1', 'plan-1', 'running')",
+            [],
+        )
+        .unwrap();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("30");
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        let start = crate::harness::process_start_time_ticks(pid).unwrap();
+        let reaper = std::thread::spawn(move || child.wait().unwrap());
+        conn.execute(
+            "insert into plan_step_run (
+               run_id, step, status, execution_process_id,
+               execution_process_start_time_ticks
+             ) values ('plan-1', 1, 'running', ?1, ?2)",
+            params![pid, i64::try_from(start).unwrap()],
+        )
+        .unwrap();
+        conn.execute(
+            "insert into workflow_execution (
+               workflow_kind, run_id, dispatch_state, fencing_token,
+               interruption_generation, created_unix_ms, updated_unix_ms
+             ) values ('auto', 'auto-1', 'recovery_pending', 1, 1, 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        apply_recovery_decision(
+            &mut conn,
+            &[(WorkflowIdentity::new(WorkflowKind::Auto, "auto-1"), 1, true)],
+        )
+        .unwrap();
+
+        reaper.join().unwrap();
+        assert_ne!(crate::harness::process_start_time_ticks(pid), Some(start));
+        assert_eq!(
+            dispatch_state(&conn, &WorkflowIdentity::new(WorkflowKind::Auto, "auto-1")).unwrap(),
+            Some(DispatchState::Queued)
+        );
+        let linked_step: (String, Option<i64>) = conn
+            .query_row(
+                "select status, execution_process_id from plan_step_run
+                 where run_id = 'plan-1' and step = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(linked_step, ("queued".to_string(), None));
         drop(conn);
         drop(other);
         let _ = fs::remove_file(path);

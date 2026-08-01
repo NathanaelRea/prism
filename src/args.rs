@@ -303,10 +303,17 @@ impl Args {
                 }
                 "list" => {
                     let mut options = InspectOptions::default();
-                    for flag in iter.by_ref() {
+                    while let Some(flag) = iter.next() {
                         match flag.to_string_lossy().as_ref() {
                             "--all" => options.all = true,
                             "--json" => options.json = true,
+                            "--repo" if repo.is_none() => {
+                                repo = Some(PathBuf::from(
+                                    iter.next()
+                                        .ok_or_else(|| "--repo requires a path".to_string())?,
+                                ));
+                            }
+                            "--repo" => return Err("--repo accepts only one path".to_string()),
                             other => return Err(format!("unknown list argument: {other}")),
                         }
                     }
@@ -315,10 +322,17 @@ impl Args {
                 }
                 "status" => {
                     let mut options = StatusOptions::default();
-                    for value in iter.by_ref() {
+                    while let Some(value) = iter.next() {
                         let value = value.to_string_lossy().to_string();
                         if value == "--json" {
                             options.json = true;
+                        } else if value == "--repo" && repo.is_none() {
+                            repo = Some(PathBuf::from(
+                                iter.next()
+                                    .ok_or_else(|| "--repo requires a path".to_string())?,
+                            ));
+                        } else if value == "--repo" {
+                            return Err("--repo accepts only one path".to_string());
                         } else if options.selector.is_none() {
                             options.selector = Some(value);
                         } else {
@@ -330,12 +344,21 @@ impl Args {
                 }
                 "pause" | "resume" | "stop" | "recover" => {
                     let name = text.into_owned();
-                    let selector = iter.next().map(|value| value.to_string_lossy().to_string());
-                    if let Some(extra) = iter.next() {
-                        return Err(format!(
-                            "unknown {name} argument: {}",
-                            extra.to_string_lossy()
-                        ));
+                    let mut selector = None;
+                    while let Some(value) = iter.next() {
+                        let value = value.to_string_lossy().to_string();
+                        if value == "--repo" && repo.is_none() {
+                            repo = Some(PathBuf::from(
+                                iter.next()
+                                    .ok_or_else(|| "--repo requires a path".to_string())?,
+                            ));
+                        } else if value == "--repo" {
+                            return Err("--repo accepts only one path".to_string());
+                        } else if selector.is_none() {
+                            selector = Some(value);
+                        } else {
+                            return Err(format!("unknown {name} argument: {value}"));
+                        }
                     }
                     command = match name.as_str() {
                         "pause" => CommandKind::Pause(selector),
@@ -575,6 +598,18 @@ mod tests {
             CommandKind::Stop(Some("auto:run-1".to_string()))
         );
         assert_eq!(parse(&["recover"]), CommandKind::Recover(None));
+    }
+
+    #[test]
+    fn inspection_and_control_accept_command_local_repo() {
+        for arguments in [
+            vec!["list", "--json", "--repo", "/tmp/repo"],
+            vec!["status", "--repo", "/tmp/repo", "wt:feature"],
+            vec!["pause", "a:12345678", "--repo", "/tmp/repo"],
+        ] {
+            let parsed = Args::parse(arguments.into_iter().map(OsString::from)).unwrap();
+            assert_eq!(parsed.repo, Some(PathBuf::from("/tmp/repo")));
+        }
     }
 
     #[test]

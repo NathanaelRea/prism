@@ -2,6 +2,89 @@ use super::*;
 
 pub const ARCHIVED_PLAN_RETENTION_MS: u64 = 60 * 60 * 24 * 30 * 1_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanRunControlIntent {
+    Pause,
+    Resume,
+    AbortRun,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanRunControlEffect {
+    PauseRequested,
+    Paused,
+    Resumed,
+    AbortedRun,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanExecutorDecision {
+    Start,
+    AlreadyRunning,
+    DoNotStart,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanRunControlOutcome {
+    pub run: PersistedPlanRun,
+    pub effect: PlanRunControlEffect,
+    pub executor: PlanExecutorDecision,
+    pub warnings: Vec<String>,
+}
+
+pub fn apply_plan_run_control(
+    conn: &rusqlite::Connection,
+    run_id: &str,
+    intent: PlanRunControlIntent,
+) -> Result<PlanRunControlOutcome, String> {
+    let mut persisted =
+        load_plan_run(conn, run_id)?.ok_or_else(|| format!("plan run not found: {run_id}"))?;
+    let mut warnings = Vec::new();
+    let (effect, executor) = match intent {
+        PlanRunControlIntent::Pause => {
+            request_plan_run_pause(conn, &mut persisted)?;
+            let effect = if persisted.run.status == PlanRunStatus::Paused {
+                PlanRunControlEffect::Paused
+            } else {
+                PlanRunControlEffect::PauseRequested
+            };
+            (effect, PlanExecutorDecision::DoNotStart)
+        }
+        PlanRunControlIntent::Resume => {
+            if !persisted.run.pause_requested && persisted.run.status != PlanRunStatus::Paused {
+                return Err("plan run is not paused".to_string());
+            }
+            let should_execute =
+                prepare_plan_run_for_resume(conn, &mut persisted, DEFAULT_OUTPUT_LINES_PER_STEP)?;
+            (
+                PlanRunControlEffect::Resumed,
+                if should_execute {
+                    PlanExecutorDecision::Start
+                } else if persisted.run.status == PlanRunStatus::Running {
+                    PlanExecutorDecision::AlreadyRunning
+                } else {
+                    PlanExecutorDecision::DoNotStart
+                },
+            )
+        }
+        PlanRunControlIntent::AbortRun => {
+            if let Err(error) = abort_plan_run(conn, &mut persisted) {
+                warnings.push(error);
+            }
+            (
+                PlanRunControlEffect::AbortedRun,
+                PlanExecutorDecision::DoNotStart,
+            )
+        }
+    };
+    Ok(PlanRunControlOutcome {
+        run: persisted,
+        effect,
+        executor,
+        warnings,
+    })
+}
+
 pub(super) enum RecordedProcessState {
     Missing,
     Live(u32),

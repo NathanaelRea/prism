@@ -305,6 +305,7 @@ fn run_recover_command(
         include_hidden: true,
         include_terminal: true,
     })?;
+    print_snapshot_warnings(&snapshot);
     let candidates = snapshot
         .repositories
         .iter()
@@ -377,7 +378,7 @@ fn run_daemon_command(command: DaemonCommand) -> Result<(), String> {
 
 fn print_workspace_table(snapshot: &WorkspaceSnapshot) {
     println!(
-        "REPO       WORKTREE             GIT                 WORKFLOW     STATE              STEP                 CI"
+        "REPO       WORKTREE             GIT                 AGENT          WORKFLOW     STATE              STEP                 CI"
     );
     for repo in &snapshot.repositories {
         let mut rendered_workflows = std::collections::BTreeSet::new();
@@ -389,10 +390,11 @@ fn print_workspace_table(snapshot: &WorkspaceSnapshot) {
                 .collect::<Vec<_>>();
             if workflows.is_empty() {
                 println!(
-                    "{:<10} {:<20} {:<19} {:<12} {:<18} {:<20} {}",
+                    "{:<10} {:<20} {:<19} {:<14} {:<12} {:<18} {:<20} {}",
                     repo.label,
                     worktree.identity.display,
                     worktree.git.label(),
+                    agent_label(worktree),
                     "-",
                     "-",
                     "-",
@@ -406,10 +408,12 @@ fn print_workspace_table(snapshot: &WorkspaceSnapshot) {
                     ));
                     let state = if workflow.dispatch.state.as_deref() == Some("recovery_pending") {
                         "recovery_pending"
-                    } else if workflow.pause_requested && workflow.lifecycle != "paused" {
+                    } else if workflow.pause_requested
+                        && workflow.lifecycle != crate::workspace_state::WorkflowLifecycle::Paused
+                    {
                         "pause_requested"
                     } else {
-                        &workflow.lifecycle
+                        workflow.lifecycle.label()
                     };
                     let step = workflow
                         .current_step
@@ -422,10 +426,11 @@ fn print_workspace_table(snapshot: &WorkspaceSnapshot) {
                         })
                         .unwrap_or_else(|| "-".to_string());
                     println!(
-                        "{:<10} {:<20} {:<19} {:<12} {:<18} {:<20} {}",
+                        "{:<10} {:<20} {:<19} {:<14} {:<12} {:<18} {:<20} {}",
                         repo.label,
                         worktree.identity.display,
                         worktree.git.label(),
+                        agent_label(worktree),
                         workflow.identity.display_id,
                         state,
                         step,
@@ -443,10 +448,12 @@ fn print_workspace_table(snapshot: &WorkspaceSnapshot) {
             }
             let state = if workflow.dispatch.state.as_deref() == Some("recovery_pending") {
                 "recovery_pending"
-            } else if workflow.pause_requested && workflow.lifecycle != "paused" {
+            } else if workflow.pause_requested
+                && workflow.lifecycle != crate::workspace_state::WorkflowLifecycle::Paused
+            {
                 "pause_requested"
             } else {
-                &workflow.lifecycle
+                workflow.lifecycle.label()
             };
             let step = workflow
                 .current_step
@@ -459,10 +466,11 @@ fn print_workspace_table(snapshot: &WorkspaceSnapshot) {
                 })
                 .unwrap_or_else(|| "-".to_string());
             println!(
-                "{:<10} {:<20} {:<19} {:<12} {:<18} {:<20} -",
+                "{:<10} {:<20} {:<19} {:<14} {:<12} {:<18} {:<20} -",
                 repo.label,
                 workflow.worktree.display,
                 "unavailable",
+                "unknown",
                 workflow.identity.display_id,
                 state,
                 step
@@ -500,10 +508,33 @@ fn print_subject(snapshot: &WorkspaceSnapshot, subject: &Subject) {
                 worktree.identity.path.display(),
                 branch_label(&worktree.branch),
                 worktree.git.label(),
-                worktree.agent.state.as_deref().unwrap_or("unknown")
+                worktree
+                    .agent
+                    .state
+                    .map(crate::agent::AgentState::label)
+                    .unwrap_or("unknown")
             );
             for workflow in &worktree.workflows {
                 println!("workflow = {}", workflow.display_id);
+            }
+            if let Some(pull_request) = &worktree.pull_request {
+                println!(
+                    "pull_request = {}\nci = {}\nmergeability = {}\nobservation_age_ms = {}\nobservation_stale = {}\nobservation_provenance = sqlite_cache",
+                    pull_request.number,
+                    pull_request
+                        .ci
+                        .map(|state| state.label())
+                        .unwrap_or("unknown"),
+                    pull_request
+                        .mergeability
+                        .map(mergeability_label)
+                        .unwrap_or("unknown"),
+                    pull_request.age_ms,
+                    pull_request.stale,
+                );
+                if let Some(error) = &pull_request.error {
+                    println!("observation_error = {error}");
+                }
             }
         }
         Subject::Workflow(repo, workflow) => {
@@ -516,7 +547,7 @@ fn print_subject(snapshot: &WorkspaceSnapshot, subject: &Subject) {
                 workflow.identity.run_id,
                 workflow.identity.repository.display(),
                 workflow.worktree.path.display(),
-                workflow.lifecycle,
+                workflow.lifecycle.label(),
                 workflow.dispatch.state.as_deref().unwrap_or("unknown"),
                 workflow.pause_requested,
                 workflow.progress.completed,
@@ -526,7 +557,7 @@ fn print_subject(snapshot: &WorkspaceSnapshot, subject: &Subject) {
                 println!("owner = {}", owner.display_id);
             }
             if let Some(step) = &workflow.current_step {
-                println!("step = {} ({})", step.label, step.state);
+                println!("step = {} ({})", step.label, step.state.label());
             }
             println!(
                 "controls = pause:{} resume:{} stop:{} recover:{}",
@@ -576,9 +607,29 @@ fn ci_label(worktree: &crate::workspace_state::WorktreeSnapshot) -> String {
         .and_then(|pr| {
             pr.ci
                 .as_ref()
-                .map(|ci| format!("{} {}s", ci, pr.age_ms / 1_000))
+                .map(|ci| format!("{} {}s cache", ci.label(), pr.age_ms / 1_000))
         })
         .unwrap_or_else(|| "-".to_string())
+}
+
+fn agent_label(worktree: &crate::workspace_state::WorktreeSnapshot) -> &'static str {
+    worktree
+        .agent
+        .state
+        .map(crate::agent::AgentState::label)
+        .unwrap_or("unknown")
+}
+
+fn mergeability_label(state: crate::workspace_state::MergeabilityState) -> &'static str {
+    match state {
+        crate::workspace_state::MergeabilityState::Clean => "clean",
+        crate::workspace_state::MergeabilityState::Dirty => "dirty",
+        crate::workspace_state::MergeabilityState::Blocked => "blocked",
+        crate::workspace_state::MergeabilityState::Behind => "behind",
+        crate::workspace_state::MergeabilityState::Unstable => "unstable",
+        crate::workspace_state::MergeabilityState::HasHooks => "has_hooks",
+        crate::workspace_state::MergeabilityState::Unknown => "unknown",
+    }
 }
 
 fn daemon_state_label(state: &crate::worker::DaemonState) -> &'static str {

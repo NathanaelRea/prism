@@ -261,15 +261,22 @@ impl Tui {
                         | AutoStepStatus::Waiting
                 )
             });
-        let run_active = dashboard.run.steps.iter().any(|step| {
-            matches!(
-                step.status,
-                AutoStepStatus::Queued
-                    | AutoStepStatus::Starting
-                    | AutoStepStatus::Running
-                    | AutoStepStatus::Waiting
+        let run_active = self
+            .workflow_controls(
+                Path::new(&dashboard.run.run.repo_root),
+                crate::execution::WorkflowKind::Auto,
+                &dashboard.run.run.id,
             )
-        });
+            .is_some_and(|controls| controls.stop)
+            && dashboard.run.steps.iter().any(|step| {
+                matches!(
+                    step.status,
+                    AutoStepStatus::Queued
+                        | AutoStepStatus::Starting
+                        | AutoStepStatus::Running
+                        | AutoStepStatus::Waiting
+                )
+            });
         let answer = self.prompt_choice_dialog(
             raw,
             crate::view::ChoiceList {
@@ -426,8 +433,14 @@ impl Tui {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
         let run_id = dashboard.run.run.id.clone();
-        let resuming =
-            dashboard.run.run.pause_requested || dashboard.run.run.status == AutoRunStatus::Paused;
+        let controls = self
+            .workflow_controls(&repo.root, crate::execution::WorkflowKind::Auto, &run_id)
+            .cloned()
+            .unwrap_or_default();
+        let resuming = controls.resume;
+        if !resuming && !controls.pause {
+            return Err("pause/resume is not available for this Auto Flow run".to_string());
+        }
         if resuming && !self.confirm_resume_auto_step(raw, &dashboard.run)? {
             self.show_message("Auto Flow resume cancelled")?;
             return Ok(true);

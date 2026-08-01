@@ -1238,6 +1238,38 @@ touch should-not-run
 }
 
 #[test]
+fn plan_control_entry_point_reports_pause_and_resume_execution_effects() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let persisted = PlanLaunch::new(
+        &repo,
+        &repo,
+        &repo.join("plan.md"),
+        "phase",
+        1,
+        1,
+        PlanRunMode::Sequential,
+    )
+    .unwrap()
+    .create_run();
+    save_plan_run(&conn, &persisted).unwrap();
+
+    let paused =
+        apply_plan_run_control(&conn, &persisted.run.id, PlanRunControlIntent::Pause).unwrap();
+    assert_eq!(paused.effect, PlanRunControlEffect::Paused);
+    assert_eq!(paused.executor, PlanExecutorDecision::DoNotStart);
+    assert_eq!(paused.run.run.status, PlanRunStatus::Paused);
+
+    let resumed =
+        apply_plan_run_control(&conn, &persisted.run.id, PlanRunControlIntent::Resume).unwrap();
+    assert_eq!(resumed.effect, PlanRunControlEffect::Resumed);
+    assert_eq!(resumed.executor, PlanExecutorDecision::Start);
+    assert_eq!(resumed.run.run.status, PlanRunStatus::Queued);
+    assert!(!resumed.run.run.pause_requested);
+}
+
+#[test]
 fn resumable_run_requeues_interrupted_steps_and_preserves_done_steps() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
