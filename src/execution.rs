@@ -772,6 +772,7 @@ fn terminate_recorded_processes(
             continue;
         };
         let start_time_ticks = start_time_ticks.and_then(|ticks| u64::try_from(ticks).ok());
+        #[cfg(target_os = "linux")]
         if start_time_ticks.is_none() {
             let result = unsafe { libc::kill(process_id as libc::pid_t, 0) };
             if result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
@@ -784,19 +785,22 @@ fn terminate_recorded_processes(
             continue;
         }
         crate::harness::terminate_process(process_id, start_time_ticks)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
-            if crate::harness::process_start_time_ticks(process_id) != start_time_ticks {
-                break;
+        #[cfg(target_os = "linux")]
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if crate::harness::process_start_time_ticks(process_id) != start_time_ticks {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
             }
-            std::thread::sleep(std::time::Duration::from_millis(25));
-        }
-        if crate::harness::process_start_time_ticks(process_id) == start_time_ticks {
-            return Err(format!(
-                "interrupted {} run {} is blocked because process {process_id} did not exit",
-                workflow.kind.label(),
-                workflow.run_id
-            ));
+            if crate::harness::process_start_time_ticks(process_id) == start_time_ticks {
+                return Err(format!(
+                    "interrupted {} run {} is blocked because process {process_id} did not exit",
+                    workflow.kind.label(),
+                    workflow.run_id
+                ));
+            }
         }
     }
     Ok(())
