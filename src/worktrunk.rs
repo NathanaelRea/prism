@@ -1229,7 +1229,7 @@ mod tests {
         })
         .unwrap();
         let snapshot = observe_repository(&repo, &config).unwrap();
-        assert!(snapshot.by_path.contains_key(&created.path));
+        assert!(associate_snapshot(&snapshot, [(created.path.clone(), ())]).contains_key(&()));
         let removed = remove_worktree(RemoveRequest {
             repo: &repo,
             config: &config,
