@@ -1349,6 +1349,21 @@ fn load_task_metadata(repo: &Repository, branch: &str) -> Result<Option<TaskMeta
     })
 }
 
+pub(crate) fn load_task_initial_prompt(
+    repo: &Repository,
+    branch: &str,
+) -> Result<Option<String>, String> {
+    observability::with_writable_db(repo, |conn| {
+        conn.query_row(
+            "select initial_prompt from task_metadata where branch = ?1",
+            params![branch],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("read task initial prompt: {error}"))
+    })
+}
+
 fn load_hidden_sessions(repo: &Repository) -> Result<BTreeMap<String, i64>, String> {
     observability::with_writable_db(repo, |conn| {
         let mut statement = conn

@@ -10,7 +10,7 @@ use crate::github::{PrCache, PrComment, PrDetails, PrSummary, pr_summary_or_erro
 use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
 use crate::plan_run::PlanRunMode;
 use crate::repo::Repository;
-use crate::session::{DeleteWorktreeOutcome, Session};
+use crate::session::{DeleteWorktreeOutcome, Session, adopt_worktree_session};
 use crate::tui::{
     DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, OpencodeEventResult,
     OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PanelFocus, PrPollKey, Tui,
@@ -275,6 +275,11 @@ esac
         .insert("git".to_string(), git.display().to_string());
     let repo = Repository::with_config_dir_for_test(repo_root.clone(), temp.join("config"));
     let mut session = test_session(worktree, "feature");
+    let original_task = "Implement the complete original task without shortening this multiline description.\nPreserve this final requirement in the review repair prompt.";
+    assert_eq!(
+        adopt_worktree_session(&repo, &mut session, original_task),
+        crate::session::AdoptWorktreeOutcome::Adopted
+    );
     session.pr = PrCache::observed(
         PrSummary {
             number: 42,
@@ -320,6 +325,7 @@ esac
             .unwrap();
     assert_eq!(persisted.steps.len(), 1);
     assert_eq!(persisted.steps[0].step_key, AutoStepKey::FixReview);
+    assert_eq!(persisted.run.initial_prompt, original_task);
     let prompt = persisted.steps[0].reason.as_deref().unwrap();
     assert!(!prompt.contains("fresh top-level comment"));
     assert!(prompt.contains("fresh review body"));
