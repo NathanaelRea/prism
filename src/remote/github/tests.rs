@@ -550,6 +550,32 @@ fn pr_json_parser_reads_summary_details_and_missing_fields() {
 }
 
 #[test]
+fn paginated_rest_reviews_accept_numeric_github_ids() {
+    let pages = serde_json::from_str::<Vec<Vec<GhPrReview>>>(
+        r#"[[{"id":4833758968,"user":{"login":"maintainer"},"state":"APPROVED"}]]"#,
+    )
+    .unwrap();
+
+    let reviews = parse_gh_reviews(&pages.into_iter().flatten().collect::<Vec<_>>());
+    assert_eq!(reviews[0].id, "4833758968");
+    assert_eq!(reviews[0].author, "maintainer");
+    assert_eq!(reviews[0].state, "APPROVED");
+}
+
+#[test]
+fn paginated_rest_comments_accept_numeric_github_ids() {
+    let pages = serde_json::from_str::<Vec<Vec<GhPrComment>>>(
+        r#"[[{"id":2195515127,"user":{"login":"reviewer"},"body":"Looks good"}]]"#,
+    )
+    .unwrap();
+
+    let comments = parse_gh_comments(&pages.into_iter().flatten().collect::<Vec<_>>());
+    assert_eq!(comments[0].id, "2195515127");
+    assert_eq!(comments[0].author, "reviewer");
+    assert_eq!(comments[0].body, "Looks good");
+}
+
+#[test]
 fn empty_check_rollup_is_authoritative_no_ci_but_missing_rollup_is_unknown() {
     for rollup in ["[]", "null", r#"{"contexts":{"nodes":[]}}"#] {
         let raw = format!(

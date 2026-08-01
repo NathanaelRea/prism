@@ -264,7 +264,7 @@ struct GhPrViewDetails {
 
 #[derive(Debug, Default, Deserialize)]
 struct GhPrComment {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_github_rest_id")]
     id: String,
     #[serde(default)]
     author: GhActor,
@@ -278,7 +278,7 @@ struct GhPrComment {
 
 #[derive(Debug, Default, Deserialize)]
 struct GhPrReview {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_github_rest_id")]
     id: String,
     #[serde(default)]
     author: GhActor,
@@ -290,6 +290,23 @@ struct GhPrReview {
     body: String,
     #[serde(default, rename = "submittedAt", alias = "submitted_at")]
     submitted_at: String,
+}
+
+fn deserialize_github_rest_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum GithubRestId {
+        String(String),
+        Number(u64),
+    }
+
+    Ok(match GithubRestId::deserialize(deserializer)? {
+        GithubRestId::String(id) => id,
+        GithubRestId::Number(id) => id.to_string(),
+    })
 }
 
 #[derive(Debug, Default, Deserialize)]
