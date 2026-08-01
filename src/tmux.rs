@@ -527,7 +527,11 @@ fn configure_agent_session(
     match configure_detach_on_destroy(config, name) {
         Ok(()) => {
             if let Some(runtime) = runtime {
-                configure_opencode_runtime(config, name, runtime)?;
+                match configure_opencode_runtime(config, name, runtime) {
+                    Ok(()) => {}
+                    Err(error) if tmux_missing_session_error(&error) => return Ok(false),
+                    Err(error) => return Err(error),
+                }
             }
             Ok(true)
         }
@@ -2047,6 +2051,64 @@ exit 0
         assert!(commands.contains("new-session -d -s"));
         assert!(commands.contains("set-option -t"));
         assert!(!commands.contains("kill-session -t"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn configure_agent_session_reports_session_disappearing_before_runtime_marker() {
+        let temp = unique_temp_dir("prism-tmux-vanished-before-runtime-marker-test");
+        fs::create_dir_all(&temp).unwrap();
+        let configure_count = temp.join("configure-count");
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  set-option)
+    count="$(cat '{}' 2>/dev/null || echo 0)"
+    count="$((count + 1))"
+    echo "$count" > '{}'
+    if [ "$count" -eq 2 ]; then
+      echo "can't find session: vanished" >&2
+      exit 1
+    fi
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+                configure_count.display(),
+                configure_count.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+        let runtime = OpencodeRuntime {
+            repo_root: temp.display().to_string(),
+            harness_id: "opencode".to_string(),
+            branch: "feature".to_string(),
+            worktree_path: temp.join("worktree").display().to_string(),
+            server_port: 41_234,
+            server_url: server_url(41_234),
+            server_pid: Some(123),
+            server_start_time_ticks: None,
+            opencode_session_id: Some("ses_123".to_string()),
+            generation: 1,
+            updated_unix_ms: 42,
+        };
+
+        let result = super::configure_agent_session(&config, "prism-test", Some(&runtime));
+
+        assert_eq!(result, Ok(false));
 
         let _ = fs::remove_dir_all(temp);
     }
