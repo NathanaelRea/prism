@@ -127,6 +127,33 @@
         }
       }
     },
+    "notifications": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Opt-in desktop notifications. Every value may be overridden by repository config.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable desktop notifications for live Agent Session transitions."
+        },
+        "needs_input": {
+          "type": "boolean",
+          "default": true,
+          "description": "Notify when active work begins waiting for input."
+        },
+        "completed": {
+          "type": "boolean",
+          "default": true,
+          "description": "Notify when active work completes successfully."
+        },
+        "failed": {
+          "type": "boolean",
+          "default": true,
+          "description": "Notify when active work fails or needs to be restarted."
+        }
+      }
+    },
     "checks": {
       "type": "object",
       "additionalProperties": false,

@@ -26,7 +26,7 @@ Use `R` from Prism to edit repository order, keys, and tracked repositories.
 default_base = "main"
 merge_method = "squash"
 
-# Prism starts local OpenCode servers on deterministic ports in this range.
+# Prism starts shared repository OpenCode servers on deterministic ports in this range.
 opencode_port_base = 41000
 opencode_port_span = 1000
 
@@ -38,6 +38,12 @@ sidebar_width = 56
 
 [ui]
 icon_style = "unicode" # or "nerd-font"
+
+[notifications]
+enabled = false
+needs_input = true
+completed = true
+failed = true
 
 [worktrees]
 columns = []
@@ -60,6 +66,16 @@ The `review_fix` template supports `{inline_comments}`, `{review_bodies}`, and `
 Prism treats `main` as the default branch by default. The default branch is not polled or shown as a pull request branch.
 
 Prism uses squash merges for pull requests by default. Set `merge_method` to `merge` or `rebase` if a repository requires a different GitHub merge method.
+
+## Desktop notifications
+
+Desktop notifications are opt-in. Set `notifications.enabled = true` globally or in a repository config. The category switches control sessions waiting for input, successful completion, and failures; `failed` also covers sessions that need to be restarted. Reloading config with `E` or `e` changes subsequent notifications without reporting sessions that are already blocked or finished.
+
+Prism uses the desktop notification service directly and does not run `notify-send` or detect a desktop environment. GNOME, KDE, and similar Linux desktops normally provide a notification server. Minimal Wayland compositors such as Hyprland and Sway require a daemon such as `mako`, `swaync`, or `dunst`. A missing server is non-fatal.
+
+On macOS, Notification Center owns permission prompts, Focus mode, and display preferences. Headless, container, and SSH sessions may have no graphical notification service; Prism does not forward notifications to the SSH client.
+
+Notifications are best effort and contain only the repository label, branch, and state description. They are emitted while the Prism dashboard event loop is running. Delivery can be delayed while Prism is blocked in an attached tmux client, and stops after Prism exits.
 
 ## Harnesses
 
@@ -182,7 +198,7 @@ repair_commit_ci = "fix: ci"
 repair_commit_merge = "fix: merge"
 ```
 
-Prism manages one local OpenCode server per worktree session. `opencode_port_base` and `opencode_port_span` define the deterministic local port range used for those servers. By default Prism keeps servers warm after the TUI exits; set `opencode_shutdown_owned_servers = true` to send SIGTERM to OpenCode servers that Prism spawned during the session.
+Prism shares one local OpenCode server across worktree sessions that use the same harness in a repository. Each worktree keeps an independent native OpenCode session and tmux client. `opencode_port_base` and `opencode_port_span` define the deterministic local port range used for repository servers. By default Prism keeps servers warm after the TUI exits; set `opencode_shutdown_owned_servers = true` to send SIGTERM to shared OpenCode servers that this Prism process spawned, disconnecting every worktree client using them.
 
 `[layout] sidebar_width` controls the Status/Repos/Worktrees sidebar width in terminal columns. Values are bounded to `20..=120`. When the terminal is too narrow, Prism reduces the configured width so the main panel keeps usable space; this preserves the board layout instead of strictly honoring a width that would hide the main panel.
 

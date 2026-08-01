@@ -16,6 +16,7 @@ use crate::auto_flow::{
     load_output_lines as load_auto_output_lines, load_recent_active_run_snapshots_for_repo,
 };
 use crate::config::Config;
+use crate::desktop_notification::{AgentObservation, DesktopNotifier};
 use crate::github::{PrCache, PrSummary};
 use crate::input::{Key, KeyInput};
 use crate::opencode::{OpencodeEvent, OpencodeStatus};
@@ -42,6 +43,7 @@ pub struct Tui {
     pub(crate) repos: Vec<ManagedRepo>,
     pub(crate) current_repo: usize,
     pub(crate) sessions: Vec<Session>,
+    pub(crate) desktop_notifier: DesktopNotifier,
     pub(crate) session_repository_identities: BTreeMap<usize, WorktreeRepositoryKey>,
     pub(crate) worktree_generations: BTreeMap<WorktreeSessionKey, u64>,
     pub(crate) worktree_harness_configs: BTreeMap<WorktreeSessionKey, Config>,
@@ -881,6 +883,7 @@ impl Tui {
             repos,
             current_repo,
             sessions,
+            desktop_notifier: DesktopNotifier::new(),
             session_repository_identities,
             worktree_generations,
             worktree_harness_configs: BTreeMap::new(),
@@ -989,6 +992,7 @@ impl Tui {
             .get(tui.current_repo)
             .map(|repo| repo.repo.root.clone());
         tui.ensure_navigation_valid();
+        tui.reseed_desktop_notifications();
         tui
     }
 
@@ -2179,6 +2183,91 @@ impl Tui {
         generation: u64,
     ) -> bool {
         self.worktree_generations.get(worktree).copied() == Some(generation)
+    }
+
+    pub(crate) fn apply_agent_state(
+        &mut self,
+        session_index: usize,
+        state: AgentState,
+        notify: bool,
+    ) -> bool {
+        let Some(session) = self.sessions.get_mut(session_index) else {
+            return false;
+        };
+        if session.agent_state == state {
+            return false;
+        }
+        session.agent_state = state;
+        self.queue_agent_state_persistence(session_index);
+        self.submit_agent_observation(session_index, notify);
+        true
+    }
+
+    pub(crate) fn accept_external_agent_state_change(
+        &mut self,
+        session_index: usize,
+        previous: AgentState,
+    ) -> bool {
+        if self
+            .sessions
+            .get(session_index)
+            .is_none_or(|session| session.agent_state == previous)
+        {
+            return false;
+        }
+        self.queue_agent_state_persistence(session_index);
+        self.submit_agent_observation(session_index, true);
+        true
+    }
+
+    fn submit_agent_observation(&mut self, session_index: usize, notify: bool) {
+        let Some(session) = self.sessions.get(session_index) else {
+            return;
+        };
+        let Some(managed) = self.repos.get(session.repo_index) else {
+            return;
+        };
+        let key = session.identity_key(&managed.identity);
+        let state = session.agent_state;
+        let config = managed.config.notifications;
+        let observation = AgentObservation {
+            session: &key,
+            repo_label: &session.repo_label,
+            branch: &session.branch,
+            state,
+            config,
+        };
+        if notify {
+            self.desktop_notifier.observe(observation);
+        } else {
+            self.desktop_notifier.baseline(observation);
+        }
+    }
+
+    pub(crate) fn reseed_desktop_notifications(&mut self) {
+        let observations = self
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                let managed = self.repos.get(session.repo_index)?;
+                Some((
+                    session.identity_key(&managed.identity),
+                    session.repo_label.clone(),
+                    session.branch.clone(),
+                    session.agent_state,
+                    managed.config.notifications,
+                ))
+            })
+            .collect::<Vec<_>>();
+        self.desktop_notifier.seed(observations.iter().map(
+            |(session, repo_label, branch, state, config)| AgentObservation {
+                session,
+                repo_label,
+                branch,
+                state: *state,
+                config: *config,
+            },
+        ));
     }
 
     pub(crate) fn queue_agent_state_persistence(&mut self, session_index: usize) {

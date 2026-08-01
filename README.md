@@ -44,6 +44,7 @@ Optional integrations:
 
 - `fzf` for interactive plan selection
 - `lazygit` for the tmux Git window
+- Desktop notifications on Linux or macOS, enabled in [configuration](docs/config.md#desktop-notifications)
 
 On first interactive startup, Prism lists the installed built-in harnesses and saves your selection to `~/.config/prism/config.toml`. OpenCode remains the fallback for non-interactive startup when no harness is configured. To use a generic command, configure it from the `H` chooser; see [Configuration](docs/config.md#harnesses).
 

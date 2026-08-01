@@ -706,19 +706,11 @@ impl<'a> Harness<'a> {
     }
 }
 
-pub fn list_sessions(endpoint: &str) -> Result<Vec<crate::opencode::OpencodeSession>, String> {
-    crate::opencode::list_sessions(endpoint)
-}
-
 pub fn inspect_session(
     endpoint: &str,
     session_id: &str,
 ) -> Result<crate::opencode::OpencodeStatus, String> {
     crate::opencode::poll_session_status(endpoint, session_id)
-}
-
-pub fn submit_session(endpoint: &str, session_id: &str, prompt: &str) -> Result<(), String> {
-    crate::opencode::submit_prompt(endpoint, session_id, prompt)
 }
 
 pub fn cancel_native_session(session: &SessionRef) -> Result<bool, String> {

@@ -170,6 +170,7 @@ impl Tui {
             self.opencode_listeners.insert(target.stream.clone());
             let stream = target.stream;
             let listener_url = stream.server_url.clone();
+            let listener_directory = stream.worktree.path.clone();
             let job_stream = stream.clone();
             self.spawn_tui_job(
                 TuiJobKind::OpencodeListener,
@@ -185,6 +186,7 @@ impl Tui {
                         }
                         let result = opencode::listen_classified_events_until(
                             &listener_url,
+                            &listener_directory,
                             || context.is_canceled(),
                             |event, snapshot_facet| {
                                 let facet = match snapshot_facet {
@@ -350,6 +352,14 @@ impl Tui {
 
     pub(crate) fn apply_opencode_event_result(&mut self, result: OpencodeEventResult) -> bool {
         if self
+            .worktree_generations
+            .get(&result.stream.worktree)
+            .copied()
+            != Some(result.stream.generation)
+        {
+            return false;
+        }
+        if self
             .opencode_event_watermarks
             .get(&result.stream.worktree)
             .is_some_and(|watermark| result.received_at <= *watermark)
@@ -488,7 +498,8 @@ impl Tui {
     }
 
     pub(super) fn apply_opencode_status(&mut self, index: usize, status: OpencodeStatus) -> bool {
-        let (changed, agent_state_changed) = {
+        let notify = status.detail.as_deref() != Some("MessageAbortedError");
+        let (changed, agent_state) = {
             let Some(session) = self.sessions.get_mut(index) else {
                 return false;
             };
@@ -498,17 +509,9 @@ impl Tui {
                 session.opencode_status = Some(status);
                 changed = true;
             }
-            let agent_state_changed = session.agent_state != agent_state;
-            if agent_state_changed {
-                session.agent_state = agent_state;
-                changed = true;
-            }
-            (changed, agent_state_changed)
+            (changed, agent_state)
         };
-        if agent_state_changed {
-            self.queue_agent_state_persistence(index);
-        }
-        changed
+        self.apply_agent_state(index, agent_state, notify) || changed
     }
 
     pub(crate) fn abort_selected_opencode_session(
@@ -586,8 +589,7 @@ impl Tui {
                 .unwrap_or_default(),
             last_updated_unix_ms: Some(current_unix_ms()),
         });
-        self.sessions[selected].agent_state = AgentState::NeedsInput;
-        self.queue_agent_state_persistence(selected);
+        self.apply_agent_state(selected, AgentState::NeedsInput, false);
         self.start_opencode_status_poll(true);
         self.show_message("agent session abort requested")?;
         Ok(())

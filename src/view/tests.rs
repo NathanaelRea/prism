@@ -682,7 +682,7 @@ fn repo_main_panel_lists_indexed_pr_without_worktree() {
         RepoPrRow::from_summary("repo".to_string(), &closed, false, false),
     ];
 
-    let buffer = render_to_string(&model, 120, 30);
+    let buffer = render_to_string(&model, 200, 30);
 
     assert!(buffer.contains("#12345"));
     assert!(buffer.contains("Remote only"));
@@ -691,6 +691,32 @@ fn repo_main_panel_lists_indexed_pr_without_worktree() {
     assert!(buffer.contains("no"));
     assert!(!buffer.contains("#25"));
     assert!(!buffer.contains("Closed PR"));
+}
+
+#[test]
+fn repo_main_panel_keeps_long_pr_titles_on_one_row() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Running)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Repos, None, None);
+    let mut first = test_pr_summary();
+    first.number = 12345;
+    first.title = "A very long pull request title with wide text 界界 ".repeat(8);
+    let mut second = first.clone();
+    second.number = 12346;
+    model.repo_prs = vec![
+        RepoPrRow::from_summary("repo".to_string(), &first, false, false),
+        RepoPrRow::from_summary("repo".to_string(), &second, false, false),
+    ];
+
+    for cols in [80, 120, 200] {
+        let buffer = render_to_buffer(&model, cols, 30);
+
+        assert_eq!(
+            find_line(&buffer, "#12346"),
+            find_line(&buffer, "#12345") + 1,
+            "PR rows wrapped at {cols} columns",
+        );
+    }
 }
 
 #[test]
