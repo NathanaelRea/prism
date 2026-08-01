@@ -405,7 +405,7 @@ fn tmux_session_names(config: &Config) -> Result<Vec<String>, String> {
     )?;
     if !output.status.success() {
         let stderr = output.stderr.trim();
-        if tmux_missing_session_error(stderr) {
+        if tmux_missing_session_error(stderr) || stderr.contains("error connecting to") {
             return Ok(Vec::new());
         }
         return Err(if stderr.is_empty() {
@@ -1570,6 +1570,33 @@ exit 1
 
         assert!(error.contains("migrate tmux session"));
         assert!(error.contains("rename failed"));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn startup_migration_accepts_missing_tmux_socket() {
+        let temp = unique_temp_dir("prism-tmux-missing-socket-migration-test");
+        fs::create_dir_all(&temp).unwrap();
+        let tmux = temp.join("tmux");
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        fs::write(
+            &tmux,
+            "#!/bin/sh\necho 'error connecting to /tmp/tmux/prism (No such file or directory)' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+
+        let result = migrate_legacy_agent_sessions(&repo, &config);
+
+        assert_eq!(result, Ok(()));
 
         let _ = fs::remove_dir_all(temp);
     }
