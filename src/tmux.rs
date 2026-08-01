@@ -16,6 +16,7 @@ const EXISTING_SESSION_READY_WAIT: Duration = Duration::from_millis(250);
 const CREATED_SESSION_READY_WAIT: Duration = Duration::from_secs(2);
 const SESSION_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const AGENT_INPUT_READY_WAIT: Duration = Duration::from_secs(5);
+const OPENCODE_RUNTIME_OPTION: &str = "@prism-opencode-runtime";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TmuxAgentSession {
@@ -140,8 +141,10 @@ fn ensure_tmux_agent_session_for_attach(
     session: &Session,
     runtime: &TmuxAgentSession,
 ) -> Result<(), String> {
+    let opencode_runtime = usable_opencode_runtime(repo, config, session);
     if tmux_agent_session_running(config, runtime)
-        && configure_agent_session(config, runtime.name())?
+        && agent_session_runtime_matches(config, runtime.name(), session, opencode_runtime.as_ref())
+        && configure_agent_session(config, runtime.name(), opencode_runtime.as_ref())?
     {
         ensure_companion_windows(config, session, runtime)?;
         return Ok(());
@@ -156,7 +159,16 @@ fn ensure_tmux_agent_session(
     runtime_session: &TmuxAgentSession,
 ) -> Result<bool, String> {
     if session_exists(config, runtime_session.name())? {
-        if !configure_agent_session(config, runtime_session.name())? {
+        let stored_runtime = usable_opencode_runtime(repo, config, session);
+        if !agent_session_runtime_matches(
+            config,
+            runtime_session.name(),
+            session,
+            stored_runtime.as_ref(),
+        ) {
+            kill_session(config, runtime_session.name())?;
+        } else if !configure_agent_session(config, runtime_session.name(), stored_runtime.as_ref())?
+        {
             let runtime = opencode_runtime_for_session(repo, config, session)?;
             create_detached_agent_session(
                 repo,
@@ -167,19 +179,23 @@ fn ensure_tmux_agent_session(
                 None,
                 None,
             )?;
-            configure_agent_session(config, runtime_session.name())?;
+            configure_agent_session(config, runtime_session.name(), runtime.as_ref())?;
             ensure_companion_windows(config, session, runtime_session)?;
             return Ok(wait_for_agent_session_running(
                 config,
                 runtime_session,
                 CREATED_SESSION_READY_WAIT,
             ));
-        }
-        if wait_for_agent_session_running(config, runtime_session, EXISTING_SESSION_READY_WAIT) {
+        } else if wait_for_agent_session_running(
+            config,
+            runtime_session,
+            EXISTING_SESSION_READY_WAIT,
+        ) {
             ensure_companion_windows(config, session, runtime_session)?;
             return Ok(true);
+        } else {
+            kill_session(config, runtime_session.name())?;
         }
-        kill_session(config, runtime_session.name())?;
     }
     let runtime = opencode_runtime_for_session(repo, config, session)?;
     create_detached_agent_session(
@@ -191,7 +207,7 @@ fn ensure_tmux_agent_session(
         None,
         None,
     )?;
-    configure_agent_session(config, runtime_session.name())?;
+    configure_agent_session(config, runtime_session.name(), runtime.as_ref())?;
     ensure_companion_windows(config, session, runtime_session)?;
     Ok(wait_for_agent_session_running(
         config,
@@ -218,8 +234,13 @@ pub fn paste_agent_prompt(
             .as_deref()
             .ok_or_else(|| "OpenCode session ID is not available".to_string())?;
         ensure_agent_session(repo, config, session, generation)?;
-        return crate::harness::submit_session(&runtime.server_url, session_id, prompt)
-            .map_err(|error| format!("submit prompt through harness protocol: {error}"));
+        return crate::opencode::submit_prompt_for_worktree(
+            &runtime.server_url,
+            session_id,
+            prompt,
+            &session.path,
+        )
+        .map_err(|error| format!("submit prompt through harness protocol: {error}"));
     }
     if uses_legacy_agent_override(config)
         || (selected_adapter_is(config, "opencode") && config.is_default_branch(&session.branch))
@@ -248,7 +269,7 @@ pub fn paste_agent_prompt(
         Some(prompt),
         None,
     )?;
-    configure_agent_session(config, runtime_session.name())?;
+    configure_agent_session(config, runtime_session.name(), runtime.as_ref())?;
     ensure_companion_windows(config, session, &runtime_session)?;
     if wait_for_agent_session_running(config, &runtime_session, CREATED_SESSION_READY_WAIT) {
         Ok(())
@@ -493,17 +514,39 @@ pub fn attach_resumable_harness_session(
         None,
         Some(session_id),
     )?;
-    configure_agent_session(config, runtime_session.name())?;
+    configure_agent_session(config, runtime_session.name(), None)?;
     ensure_companion_windows(config, session, &runtime_session)?;
     attach(config, &runtime_session, TmuxWindow::Agent)
 }
 
-fn configure_agent_session(config: &Config, name: &str) -> Result<bool, String> {
+fn configure_agent_session(
+    config: &Config,
+    name: &str,
+    runtime: Option<&OpencodeRuntime>,
+) -> Result<bool, String> {
     match configure_detach_on_destroy(config, name) {
-        Ok(()) => Ok(true),
+        Ok(()) => {
+            if let Some(runtime) = runtime {
+                configure_opencode_runtime(config, name, runtime)?;
+            }
+            Ok(true)
+        }
         Err(error) if tmux_missing_session_error(&error) => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+fn configure_opencode_runtime(
+    config: &Config,
+    name: &str,
+    runtime: &OpencodeRuntime,
+) -> Result<(), String> {
+    run_tmux_status(
+        Command::new(config.tool("tmux"))
+            .env_remove("TMUX")
+            .args(["set-option", "-t", name, OPENCODE_RUNTIME_OPTION])
+            .arg(opencode_runtime_marker(runtime)),
+    )
 }
 
 fn configure_detach_on_destroy(config: &Config, name: &str) -> Result<(), String> {
@@ -1012,6 +1055,57 @@ fn usable_opencode_runtime(
     })
 }
 
+fn agent_session_runtime_matches(
+    config: &Config,
+    name: &str,
+    session: &Session,
+    runtime: Option<&OpencodeRuntime>,
+) -> bool {
+    let Some(runtime) = runtime else {
+        return true;
+    };
+    let expected = opencode_runtime_marker(runtime);
+    let recorded = run_tmux_capture(
+        Command::new(config.tool("tmux")).env_remove("TMUX").args([
+            "show-options",
+            "-v",
+            "-t",
+            name,
+            OPENCODE_RUNTIME_OPTION,
+        ]),
+        ProcessPolicy::TmuxPoll,
+    )
+    .ok()
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty());
+    if let Some(recorded) = recorded {
+        return recorded == expected;
+    }
+
+    let Some(command) = pane_start_command(config, name) else {
+        return false;
+    };
+    let argv = split_command_words(&command);
+    if !argv.iter().any(|argument| argument == "attach") {
+        return true;
+    }
+    command.contains(&runtime.server_url)
+        && runtime
+            .opencode_session_id
+            .as_deref()
+            .is_none_or(|session_id| command.contains(session_id))
+        && command.contains(&session.path.display().to_string())
+}
+
+fn opencode_runtime_marker(runtime: &OpencodeRuntime) -> String {
+    format!(
+        "{}\t{}\t{}",
+        runtime.server_url,
+        runtime.opencode_session_id.as_deref().unwrap_or_default(),
+        runtime.worktree_path
+    )
+}
+
 fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
@@ -1320,7 +1414,7 @@ exit 0
                 worktree_path: session.path.display().to_string(),
                 server_port: port,
                 server_url: server_url(port),
-                server_pid: Some(123),
+                server_pid: None,
                 server_start_time_ticks: None,
                 opencode_session_id: None,
                 generation: 1,
@@ -1753,7 +1847,7 @@ exit 1
                 worktree_path: session.path.display().to_string(),
                 server_port: port,
                 server_url: server_url(port),
-                server_pid: Some(123),
+                server_pid: None,
                 server_start_time_ticks: None,
                 opencode_session_id: Some("ses_123".to_string()),
                 generation: 1,
@@ -2268,15 +2362,16 @@ exit 0
             r#"{{"id":"ses_123","directory":"{}","title":"feature"}}"#,
             worktree.display()
         );
-        let (status, body) = if request_line.starts_with("GET /global/health ") {
+        let request_target = request_line.split_whitespace().nth(1).unwrap_or_default();
+        let request_path = request_target.split('?').next().unwrap_or(request_target);
+        let method = request_line.split_whitespace().next().unwrap_or_default();
+        let (status, body) = if method == "GET" && request_path == "/global/health" {
             (200, "{}".to_string())
-        } else if request_line.starts_with("GET /session/ses_123 ") {
+        } else if method == "GET" && request_path == "/session/ses_123" {
             (200, session)
-        } else if request_line.starts_with("GET /session ")
-            || request_line.starts_with("GET /session?")
-        {
+        } else if method == "GET" && request_path == "/session" {
             (200, format!(r#"{{"data":[{session}]}}"#))
-        } else if request_line.starts_with("POST /session/ses_123/prompt_async ") {
+        } else if method == "POST" && request_path == "/session/ses_123/prompt_async" {
             (prompt_status, String::new())
         } else {
             (404, "{}".to_string())

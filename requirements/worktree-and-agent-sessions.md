@@ -26,11 +26,14 @@
 - **Behavior**: Enter on a Worktree Session attaches to its persistent tmux Agent
   Session. Prism reuses a healthy matching session and replaces a stale or
   incompatible runtime when necessary.
-- **Invariant**: Prism associates adapter runtime identity with each active
-  Worktree Session. OpenCode servers are never shut down unless Prism owns them.
+- **Invariant**: Prism associates native adapter session identity with each
+  active Worktree Session. Worktrees using the same harness in one repository
+  share one OpenCode server. Worktree deletion shuts that server down only when
+  Prism owns it and no retained Worktree Session references it.
 - **Default**: Prism allocates OpenCode servers from a deterministic range
-  beginning at port 41000 and spanning 1000 ports. Owned servers remain warm
-  when Prism exits unless shutdown is enabled.
+  beginning at port 41000 and spanning 1000 ports. One server is allocated per
+  repository and harness. Owned servers remain warm when Prism exits unless
+  shutdown is enabled, in which case the shared owned server is terminated.
 - **Invariant**: Active harness session association is resolved independently
   per worktree. Creating `/new` or changing activity in one worktree cannot
   retarget prompts or status in another.
