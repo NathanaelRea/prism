@@ -1963,6 +1963,60 @@ pub(super) fn fetch_pr_summary_index_for_repository(
     config: &Config,
     repository: &crate::remote::RemoteRepositoryId,
 ) -> Result<Vec<PrSummary>, String> {
+    fetch_open_pr_summaries_for_repository(path, config, repository, None)
+}
+
+pub(super) fn fetch_open_pr_summaries_for_repository_head(
+    path: &std::path::Path,
+    config: &Config,
+    repository: &crate::remote::RemoteRepositoryId,
+    head_ref: &str,
+) -> Result<Vec<PrSummary>, String> {
+    fetch_open_pr_summaries_for_repository(path, config, repository, Some(head_ref))
+}
+
+fn fetch_open_pr_summaries_for_repository(
+    path: &std::path::Path,
+    config: &Config,
+    repository: &crate::remote::RemoteRepositoryId,
+    head_ref: Option<&str>,
+) -> Result<Vec<PrSummary>, String> {
+    if repository.provider() != crate::remote::ProviderKind::GitHub {
+        return Err("GitHub summary adapter requires a GitHub repository".to_string());
+    }
+    let (owner, name) = repository
+        .project_path()
+        .split_once('/')
+        .filter(|(_, name)| !name.contains('/'))
+        .ok_or_else(|| "GitHub project path is malformed".to_string())?;
+    let mut command = Command::new(config.tool("gh"));
+    command
+        .args(github_graphql_api_args(config, repository.host()))
+        .args(["--paginate", "--slurp"])
+        .arg("-F")
+        .arg(format!("owner={owner}"))
+        .arg("-F")
+        .arg(format!("name={name}"));
+    if let Some(head_ref) = head_ref {
+        command.arg("-f").arg(format!("headRefName={head_ref}"));
+    }
+    let raw = run_capture_named(
+        command
+            .arg("-f")
+            .arg(format!("query={PR_SUMMARY_INDEX_QUERY}"))
+            .current_dir(path),
+        ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("gh.api.graphql"),
+    )?;
+    try_parse_pr_summary_index_for_repository(&raw, Some(repository))
+}
+
+pub(super) fn fetch_pr_summary_for_repository_number(
+    path: &std::path::Path,
+    config: &Config,
+    repository: &crate::remote::RemoteRepositoryId,
+    number: u64,
+) -> Result<Option<PrSummary>, String> {
     if repository.provider() != crate::remote::ProviderKind::GitHub {
         return Err("GitHub summary adapter requires a GitHub repository".to_string());
     }
@@ -1978,13 +2032,15 @@ pub(super) fn fetch_pr_summary_index_for_repository(
             .arg(format!("owner={owner}"))
             .arg("-F")
             .arg(format!("name={name}"))
+            .arg("-F")
+            .arg(format!("number={number}"))
             .arg("-f")
-            .arg(format!("query={PR_SUMMARY_INDEX_QUERY}"))
+            .arg(format!("query={PR_SUMMARY_QUERY}"))
             .current_dir(path),
         ProcessPolicy::NetworkQuery,
         ProcessDescriptor::new("gh.api.graphql"),
     )?;
-    try_parse_pr_summary_index_for_repository(&raw, Some(repository))
+    try_parse_pr_summary_for_repository(&raw, repository)
 }
 
 pub(crate) fn refresh_repo_policy_cache(
@@ -2629,7 +2685,8 @@ fn parse_evaluated_branch_rules(raw: &str) -> Result<GithubPolicyFacts, String> 
             | "file_path_restriction"
             | "max_file_path_length"
             | "file_extension_restriction"
-            | "max_file_size" => {}
+            | "max_file_size"
+            | "copilot_code_review" => {}
             "workflows" | "required_deployments" | "code_scanning" => {
                 return Err(format!(
                     "GitHub policy evidence is unknown: safety-relevant evaluated branch rule {} is not supported",
@@ -2678,11 +2735,12 @@ fn encode_path_segment(value: &str) -> String {
 }
 
 const PR_SUMMARY_INDEX_QUERY: &str = r#"
-query($owner: String!, $name: String!) {
+query($owner: String!, $name: String!, $headRefName: String, $endCursor: String) {
   repository(owner: $owner, name: $name) {
-    pullRequests(first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
+    pullRequests(first: 100, after: $endCursor, states: OPEN, headRefName: $headRefName, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo {
         hasNextPage
+        endCursor
       }
       nodes {
         id
@@ -2761,6 +2819,85 @@ query($owner: String!, $name: String!) {
 }
 "#;
 
+const PR_SUMMARY_QUERY: &str = r#"
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      id
+      number
+      title
+      author {
+        login
+      }
+      body
+      url
+      state
+      reviewDecision
+      reviewRequests(first: 10) {
+        nodes {
+          requestedReviewer {
+            __typename
+            ... on User {
+              login
+            }
+            ... on Team {
+              slug
+            }
+          }
+        }
+      }
+      headRefName
+      baseRefName
+      headRefOid
+      headRepository {
+        nameWithOwner
+      }
+      baseRepository {
+        nameWithOwner
+      }
+      updatedAt
+      mergeStateStatus
+      mergeQueueEntry {
+        state
+      }
+      merged
+      isDraft
+      comments {
+        totalCount
+      }
+      reviewThreads(first: 1) {
+        totalCount
+      }
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup {
+              contexts(first: 50) {
+                pageInfo {
+                  hasNextPage
+                }
+                nodes {
+                  __typename
+                  ... on CheckRun {
+                    name
+                    status
+                    conclusion
+                  }
+                  ... on StatusContext {
+                    context
+                    state
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
 fn github_owner_repo(path: &std::path::Path, config: &Config) -> Result<(String, String), String> {
     github_remote_owner_repo(path, config, "origin")
 }
@@ -2826,44 +2963,89 @@ fn try_parse_pr_summary_index_for_repository(
 ) -> Result<Vec<PrSummary>, String> {
     let value = serde_json::from_str::<serde_json::Value>(raw)
         .map_err(|error| format!("parse GitHub PR summary index: {error}"))?;
-    if !value
-        .pointer("/data/repository/pullRequests/nodes")
-        .is_some_and(serde_json::Value::is_array)
-    {
-        return Err("parse GitHub PR summary index: missing pull request connection".to_string());
-    }
-    if !value
-        .pointer("/data/repository/pullRequests/pageInfo/hasNextPage")
-        .is_some_and(serde_json::Value::is_boolean)
-    {
-        return Err("parse GitHub PR summary index: missing pull request pagination".to_string());
-    }
-    validate_pr_summary_check_pagination(&value)?;
-    let response = serde_json::from_str::<GithubPrSummaryIndexResponse>(raw)
-        .map_err(|error| format!("parse GitHub PR summary index: {error}"))?;
-    if response
-        .data
-        .repository
-        .pull_requests
-        .page_info
-        .has_next_page
-    {
-        return Err(
-            "GitHub PR summary index is truncated after the first 100 pull requests".to_string(),
+    let pages = match &value {
+        serde_json::Value::Array(pages) if !pages.is_empty() => pages.as_slice(),
+        serde_json::Value::Array(_) => {
+            return Err("parse GitHub PR summary index: missing paginated response".to_string());
+        }
+        _ => std::slice::from_ref(&value),
+    };
+    let mut summaries = Vec::new();
+    for (index, page) in pages.iter().enumerate() {
+        if !page
+            .pointer("/data/repository/pullRequests/nodes")
+            .is_some_and(serde_json::Value::is_array)
+        {
+            return Err(
+                "parse GitHub PR summary index: missing pull request connection".to_string(),
+            );
+        }
+        if !page
+            .pointer("/data/repository/pullRequests/pageInfo/hasNextPage")
+            .is_some_and(serde_json::Value::is_boolean)
+        {
+            return Err(
+                "parse GitHub PR summary index: missing pull request pagination".to_string(),
+            );
+        }
+        validate_pr_summary_check_pagination(page)?;
+        let response = serde_json::from_value::<GithubPrSummaryIndexResponse>(page.clone())
+            .map_err(|error| format!("parse GitHub PR summary index: {error}"))?;
+        let has_next_page = response
+            .data
+            .repository
+            .pull_requests
+            .page_info
+            .has_next_page;
+        if has_next_page != (index + 1 < pages.len()) {
+            return Err(
+                "GitHub PR summary index pagination is incomplete or inconsistent".to_string(),
+            );
+        }
+        summaries.extend(
+            response
+                .data
+                .repository
+                .pull_requests
+                .nodes
+                .iter()
+                .map(|node| pr_summary_from_node(node, repository))
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    "parse GitHub PR summary index: pull request is missing identity".to_string()
+                })?,
         );
     }
-    let summaries = response
-        .data
-        .repository
-        .pull_requests
-        .nodes
-        .iter()
-        .map(|node| pr_summary_from_node(node, repository))
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| {
-            "parse GitHub PR summary index: pull request is missing identity".to_string()
-        })?;
     Ok(summaries)
+}
+
+fn try_parse_pr_summary_for_repository(
+    raw: &str,
+    repository: &crate::remote::RemoteRepositoryId,
+) -> Result<Option<PrSummary>, String> {
+    let value = serde_json::from_str::<serde_json::Value>(raw)
+        .map_err(|error| format!("parse GitHub PR summary: {error}"))?;
+    if value
+        .get("errors")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|errors| !errors.is_empty())
+    {
+        return Err("GitHub PR summary query returned GraphQL errors".to_string());
+    }
+    let Some(node) = value.pointer("/data/repository/pullRequest") else {
+        return Err("parse GitHub PR summary: missing pull request field".to_string());
+    };
+    if node.is_null() {
+        return Ok(None);
+    }
+    validate_pr_summary_check_pagination(&serde_json::json!({
+        "data": {"repository": {"pullRequests": {"nodes": [node]}}}
+    }))?;
+    let node = serde_json::from_value::<GithubPullRequest>(node.clone())
+        .map_err(|error| format!("parse GitHub PR summary: {error}"))?;
+    pr_summary_from_node(&node, Some(repository))
+        .map(Some)
+        .ok_or_else(|| "parse GitHub PR summary: pull request is missing identity".to_string())
 }
 
 fn validate_pr_summary_check_pagination(value: &serde_json::Value) -> Result<(), String> {
@@ -5675,7 +5857,49 @@ exit 0
         assert!(command.contains("api graphql --hostname github.example.com"));
         assert!(command.contains("owner=Acme"));
         assert!(command.contains("name=Widget"));
+        assert!(command.contains("states: OPEN"));
 
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_summary_observation_queries_only_the_requested_number() {
+        let temp = unique_temp_dir("prism-github-exact-summary");
+        fs::create_dir_all(&temp).unwrap();
+        let gh = temp.join("gh");
+        let log = temp.join("gh.log");
+        write_executable(
+            &gh,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" > '{}'
+printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_42","number":42,"state":"MERGED","headRefName":"feature","baseRefName":"main","headRefOid":"head","headRepository":{{"nameWithOwner":"Acme/Widget"}},"baseRepository":{{"nameWithOwner":"Acme/Widget"}},"merged":true}}}}}}}}'
+"#,
+                log.display()
+            ),
+        );
+        let mut config = test_config();
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+        let repository = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.com", None).unwrap(),
+            "Acme/Widget",
+        )
+        .unwrap();
+
+        let summary = fetch_pr_summary_for_repository_number(&temp, &config, &repository, 42)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(summary.number, 42);
+        assert!(summary.merged);
+        let command = fs::read_to_string(log).unwrap();
+        assert!(command.contains("number=42"));
+        assert!(command.contains("pullRequest(number: $number)"));
+        assert!(!command.contains("pullRequests("));
         fs::remove_dir_all(temp).unwrap();
     }
 
@@ -6804,7 +7028,7 @@ exit 0
     }
 
     #[test]
-    fn truncated_graphql_summary_index_is_a_reported_failure() {
+    fn incomplete_graphql_summary_pagination_is_a_reported_failure() {
         let raw = include_str!("../../tests/fixtures/remote/github/summary-truncated.json");
         let error = try_parse_pr_summary_index(raw).unwrap_err();
         let summary = test_summary("feature", "abc123", 0);
@@ -6819,7 +7043,7 @@ exit 0
             "not refreshed",
         ));
 
-        assert!(error.contains("first 100"));
+        assert!(error.contains("pagination is incomplete"));
         assert_eq!(cache.summary(), Some(&summary));
         assert_eq!(
             cache.summary_observation_quality(),
@@ -6827,6 +7051,58 @@ exit 0
         );
         assert_eq!(cache.display_error(), Some(error.as_str()));
         assert!(cache.trusted_summary().is_err());
+    }
+
+    #[test]
+    fn paginated_graphql_summary_index_combines_every_page() {
+        let raw = r#"[
+          {"data":{"repository":{"pullRequests":{
+            "pageInfo":{"hasNextPage":true,"endCursor":"page-1"},
+            "nodes":[{"number":107,"state":"OPEN","headRefName":"feat/remote-adapters"}]
+          }}}},
+          {"data":{"repository":{"pullRequests":{
+            "pageInfo":{"hasNextPage":false,"endCursor":"page-2"},
+            "nodes":[{"number":108,"state":"OPEN","headRefName":"feat/tmux-name-convention"}]
+          }}}}
+        ]"#;
+
+        let summaries = try_parse_pr_summary_index(raw).unwrap();
+
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| (summary.number, summary.head_ref.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (107, "feat/remote-adapters"),
+                (108, "feat/tmux-name-convention")
+            ]
+        );
+    }
+
+    #[test]
+    fn exact_graphql_summary_distinguishes_absence_from_query_errors() {
+        let repository = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::parse("github.com").unwrap(),
+            "example/repo",
+        )
+        .unwrap();
+        let absent = r#"{"data":{"repository":{"pullRequest":null}}}"#;
+        let failed = r#"{
+          "data":{"repository":{"pullRequest":null}},
+          "errors":[{"message":"temporary failure"}]
+        }"#;
+
+        assert_eq!(
+            try_parse_pr_summary_for_repository(absent, &repository).unwrap(),
+            None
+        );
+        assert!(
+            try_parse_pr_summary_for_repository(failed, &repository)
+                .unwrap_err()
+                .contains("GraphQL errors")
+        );
     }
 
     #[test]
@@ -6997,7 +7273,8 @@ esac
             r#"[[
                 {"type":"required_linear_history"},
                 {"type":"required_signatures"},
-                {"type":"commit_message_pattern","parameters":{"operator":"starts_with"}}
+                {"type":"commit_message_pattern","parameters":{"operator":"starts_with"}},
+                {"type":"copilot_code_review","parameters":{"review_on_push":false}}
             ]]"#,
         )
         .unwrap();

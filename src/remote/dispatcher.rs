@@ -442,14 +442,28 @@ pub(crate) fn capabilities_for_summary(summary: &PrSummary) -> Capabilities {
 }
 
 pub(crate) fn list_change_requests(path: &Path, config: &Config) -> Result<Vec<PrSummary>, String> {
+    list_change_requests_for_head(path, config, None)
+}
+
+fn list_change_requests_for_head(
+    path: &Path,
+    config: &Config,
+    head_ref: Option<&str>,
+) -> Result<Vec<PrSummary>, String> {
     let repositories = configured_change_request_repositories(path, config)?;
     let mut summaries = Vec::new();
     for repository in repositories {
         let adapter = Adapter::for_repository(config, &repository)?;
         let observed = match adapter {
-            Adapter::GitHub => {
-                github::fetch_pr_summary_index_for_repository(path, config, &repository)?
-            }
+            Adapter::GitHub => match head_ref {
+                Some(head_ref) => github::fetch_open_pr_summaries_for_repository_head(
+                    path,
+                    config,
+                    &repository,
+                    head_ref,
+                )?,
+                None => github::fetch_pr_summary_index_for_repository(path, config, &repository)?,
+            },
             Adapter::GitLab(adapter) => adapter
                 .list_change_requests()
                 .map_err(|error| error.to_string())?
@@ -473,6 +487,27 @@ pub(crate) fn list_change_requests(path: &Path, config: &Config) -> Result<Vec<P
         }
     }
     Ok(summaries)
+}
+
+fn exact_github_summary(
+    path: &Path,
+    config: &Config,
+    repository: &RemoteRepositoryId,
+    number: u64,
+    expected_identity: &CanonicalChangeRequestIdentity,
+) -> Result<Option<PrSummary>, String> {
+    let observed =
+        github::fetch_pr_summary_for_repository_number(path, config, repository, number)?;
+    match observed {
+        Some(summary)
+            if summary.change_request_identity.as_ref() == Some(expected_identity)
+                && summary.number == number =>
+        {
+            Ok(Some(summary))
+        }
+        Some(_) => Err("GitHub returned a different change request identity".to_string()),
+        None => Ok(None),
+    }
 }
 
 fn configured_change_request_repositories(
@@ -799,18 +834,6 @@ pub(crate) fn refresh_change_request_cache(
     force_details: bool,
 ) -> Result<(), String> {
     let remotes = configured_remote_repositories(path, config)?;
-    let has_distinct_upstream = remotes
-        .upstream_fetch
-        .as_ref()
-        .is_some_and(|repository| repository != &remotes.origin_fetch)
-        || remotes
-            .upstream_push
-            .as_ref()
-            .is_some_and(|repository| repository != &remotes.origin_push)
-        || remotes.origin_push != remotes.origin_fetch;
-    if remotes.origin_fetch.provider() == ProviderKind::GitHub && !has_distinct_upstream {
-        return github::refresh_pr_cache(repo, branch, cache, path, config, force_details);
-    }
     let observation = if let Some(summary) = cache.summary()
         && let Ok(change_request) = change_request_from_legacy(summary)
     {
@@ -819,20 +842,17 @@ pub(crate) fn refresh_change_request_cache(
         } else {
             let target_adapter = Adapter::for_repository(config, change_request.id.repository())?;
             match target_adapter {
-                Adapter::GitHub => github::fetch_pr_summary_index_for_repository(
+                Adapter::GitHub => exact_github_summary(
                     path,
                     config,
                     change_request.id.repository(),
+                    summary.number,
+                    summary
+                        .change_request_identity
+                        .as_ref()
+                        .expect("change request conversion requires identity"),
                 )
-                .and_then(|summaries| {
-                    let observed = summaries.into_iter().find(|summary| {
-                        summary.change_request_identity.as_ref()
-                            == cache
-                                .summary()
-                                .and_then(|summary| summary.change_request_identity.as_ref())
-                    });
-                    observed.map_or(Ok(None), authoritative_active_summary)
-                }),
+                .and_then(|observed| observed.map_or(Ok(None), authoritative_active_summary)),
                 Adapter::GitLab(adapter) => adapter
                     .observe_change_request(&change_request.id)
                     .map(to_legacy_summary)
@@ -849,7 +869,7 @@ pub(crate) fn refresh_change_request_cache(
         }
     } else {
         let local_head = crate::git::current_head_sha(path, config)?;
-        list_change_requests(path, config).map(|summaries| {
+        list_change_requests_for_head(path, config, Some(branch)).map(|summaries| {
             let matching = summaries.into_iter().filter(|summary| {
                 summary.head_ref == branch
                     && summary.head_sha == local_head
@@ -900,16 +920,16 @@ pub(crate) fn refresh_change_request_details_state(
         let adapter = Adapter::for_repository(config, change_request.id.repository())?;
         let details = match adapter {
             Adapter::GitHub => {
-                let observed = github::fetch_pr_summary_index_for_repository(
+                let observed = exact_github_summary(
                     path,
                     config,
                     change_request.id.repository(),
+                    summary.number,
+                    summary
+                        .change_request_identity
+                        .as_ref()
+                        .expect("change request conversion requires identity"),
                 )?
-                .into_iter()
-                .find(|observed| {
-                    observed.number == summary.number
-                        && observed.change_request_identity == summary.change_request_identity
-                })
                 .ok_or_else(|| {
                     "canonical change request was not returned while details were loaded"
                         .to_string()
@@ -1134,18 +1154,25 @@ pub(crate) fn create_change_request(
             Some(&guard.target_branch),
             Some(&github_head),
         )?;
-        let summary = github::fetch_pr_summary_index_for_repository(path, config, &target)?
-            .into_iter()
-            .find(|summary| {
-                summary.head_ref == guard.source_branch
-                    && summary
-                        .change_request_identity
-                        .as_ref()
-                        .and_then(|identity| identity.source_repository().ok())
-                        .as_ref()
-                        == Some(&source)
-            })
-            .ok_or_else(|| "created pull request was not returned by GitHub".to_string())?;
+        let summary = github::fetch_open_pr_summaries_for_repository_head(
+            path,
+            config,
+            &target,
+            &guard.source_branch,
+        )?
+        .into_iter()
+        .find(|summary| {
+            summary.head_ref == guard.source_branch
+                && summary.base_ref == guard.target_branch
+                && summary.head_sha == guard.expected_head_sha
+                && summary
+                    .change_request_identity
+                    .as_ref()
+                    .and_then(|identity| identity.source_repository().ok())
+                    .as_ref()
+                    == Some(&source)
+        })
+        .ok_or_else(|| "created pull request was not returned by GitHub".to_string())?;
         github::record_pr_summary(repo, &guard.local_branch, cache, summary);
         return refresh_change_request_cache(repo, &guard.local_branch, cache, path, config, true);
     }
@@ -1209,14 +1236,14 @@ pub(crate) fn merge_change_request(
         }));
     }
     if matches!(adapter, Adapter::GitHub) {
-        let observed =
-            github::fetch_pr_summary_index_for_repository(path, config, &authorized_target)?
-                .into_iter()
-                .find(|summary| {
-                    summary.change_request_identity.as_ref() == Some(authorized_identity)
-                        && summary.number == display_number
-                })
-                .ok_or_else(|| "authorized change request is no longer present".to_string())?;
+        let observed = exact_github_summary(
+            path,
+            config,
+            &authorized_target,
+            display_number,
+            authorized_identity,
+        )?
+        .ok_or_else(|| "authorized change request is no longer present".to_string())?;
         if observed.head_sha != expected_head_sha {
             return Err("change request head changed since authorization".to_string());
         }
@@ -1232,14 +1259,14 @@ pub(crate) fn merge_change_request(
             expected_head_sha,
             target_project,
         )?;
-        let observed =
-            github::fetch_pr_summary_index_for_repository(path, config, &authorized_target)?
-                .into_iter()
-                .find(|summary| {
-                    summary.change_request_identity.as_ref() == Some(authorized_identity)
-                        && summary.number == display_number
-                })
-                .ok_or_else(|| "mutated change request was not returned by GitHub".to_string())?;
+        let observed = exact_github_summary(
+            path,
+            config,
+            &authorized_target,
+            display_number,
+            authorized_identity,
+        )?
+        .ok_or_else(|| "mutated change request was not returned by GitHub".to_string())?;
         if observed.head_sha != expected_head_sha {
             return Err("change request head changed during merge".to_string());
         }
@@ -1367,16 +1394,16 @@ fn observe_exact_change_request(
                 &expected.source_repository,
                 &expected.target_repository,
             );
-            let summary = github::fetch_pr_summary_index_for_repository(
+            let summary = exact_github_summary(
                 path,
                 config,
                 expected.id.repository(),
+                expected
+                    .id
+                    .display_number()
+                    .ok_or_else(|| "GitHub change request has no display number".to_string())?,
+                &identity,
             )?
-            .into_iter()
-            .find(|summary| {
-                summary.change_request_identity.as_ref() == Some(&identity)
-                    && expected.id.display_number() == Some(summary.number)
-            })
             .ok_or_else(|| "canonical change request was not returned by GitHub".to_string())?;
             change_request_summary_from_legacy(summary)?
         }
@@ -1950,8 +1977,17 @@ esac
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> '{}'
 case "$*" in
-  *"api graphql"*"owner=acme"*)
-    printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_42","number":42,"title":"Fork change","state":"OPEN","headRefName":"topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}}}}],"pageInfo":{{"hasNextPage":false}}}}}}}}}}'
+  *"api graphql"*"reviewThreads(first: 100"*)
+    printf '%s\n' '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}]'
+    ;;
+  *"api graphql"*"owner=acme"*"number=42"*)
+    printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_42","number":42,"title":"Fork change","state":"OPEN","headRefName":"topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}}}}}}}}}}'
+    ;;
+  *"/issues/42/comments"*|*"/pulls/42/reviews"*|*"/pulls/42/files"*|*"/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/statuses"*)
+    printf '%s\n' '[[]]'
+    ;;
+  *"/commits/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/check-runs"*)
+    printf '%s\n' '[{{"total_count":0,"check_runs":[]}}]'
     ;;
   *) exit 1 ;;
 esac
@@ -2196,7 +2232,8 @@ esac
 printf '%s\n' "$*" >> '{}'
 case "$*" in
   "pr create"*) printf '%s\n' 'https://github.com/acme/widget/pull/42' ;;
-  *) printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_fork","number":42,"title":"Fork change","state":"OPEN","merged":false,"headRefName":"topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}}}}],"pageInfo":{{"hasNextPage":false}}}}}}}}}}' ;;
+  *"number=42"*) printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_fork","number":42,"title":"Fork change","state":"OPEN","merged":false,"headRefName":"topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}}}}}}}}}}' ;;
+  *) printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_wrong_base","number":40,"state":"OPEN","headRefName":"topic","baseRefName":"release","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}}}},{{"id":"PR_wrong_head","number":41,"state":"OPEN","headRefName":"topic","baseRefName":"main","headRefOid":"cccccccccccccccccccccccccccccccccccccccc","headRepository":{{"nameWithOwner":"contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}}}},{{"id":"PR_fork","number":42,"title":"Fork change","state":"OPEN","merged":false,"headRefName":"topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}}}}],"pageInfo":{{"hasNextPage":false}}}}}}}}}}' ;;
 esac
 "#,
                 gh_log.display()
@@ -2295,13 +2332,10 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_fo
             identity.source_repository().unwrap(),
             repository(ProviderKind::GitHub, "contributor/widget")
         );
-        assert_eq!(
-            std::fs::read_to_string(&gh_log)
-                .unwrap()
-                .matches("api graphql")
-                .count(),
-            1
-        );
+        let commands = std::fs::read_to_string(&gh_log).unwrap();
+        assert_eq!(commands.matches("api graphql").count(), 1);
+        assert!(commands.contains("headRefName=topic"));
+        assert!(commands.contains("states: OPEN"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2341,7 +2375,7 @@ esac
 printf '%s\n' "$*" >> '{}'
 case "$*" in
   *"api graphql"*)
-    printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_stale","number":42,"title":"Fork change","state":"OPEN","headRefName":"topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"former-contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}}}}],"pageInfo":{{"hasNextPage":false}}}}}}}}}}'
+    printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_stale","number":42,"title":"Fork change","state":"OPEN","headRefName":"topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"former-contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}}}}}}}}}}'
     ;;
   *"pr merge 42"*) exit 0 ;;
   *) exit 1 ;;
@@ -2496,7 +2530,7 @@ printf '%s\n' '{"data":{"resolveReviewThread":{"thread":{"id":"PRRT_1","isResolv
             &format!(
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> '{}'
-printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_fork","number":42,"title":"Fork change","state":"MERGED","merged":true,"headRefName":"topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}}}}],"pageInfo":{{"hasNextPage":false}}}}}}}}}}'
+printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_fork","number":42,"title":"Fork change","state":"MERGED","merged":true,"headRefName":"topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}}}}}}}}}}'
 "#,
                 log.display()
             ),
@@ -2522,6 +2556,11 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_fo
         let commands = std::fs::read_to_string(&log).unwrap();
         assert!(commands.contains("owner=acme"), "{commands}");
         assert!(commands.contains("name=widget"), "{commands}");
+        assert!(commands.contains("number=42"), "{commands}");
+        assert!(
+            commands.contains("pullRequest(number: $number)"),
+            "{commands}"
+        );
         std::fs::remove_dir_all(directory).unwrap();
     }
 

@@ -2886,7 +2886,11 @@ case "$*" in
    ;;
 esac
 if [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q 'pullRequests(first: 100'; then
-  printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_test","number":42,"title":"Auto","author":{{"login":"example"}},"body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"APPROVED","reviewRequests":{{"nodes":[]}},"headRefName":"feat/auto","baseRefName":"main","headRefOid":"{}","headRepository":{{"nameWithOwner":"example/repo"}},"baseRepository":{{"nameWithOwner":"example/repo"}},"updatedAt":"2026-01-01T00:00:00Z","mergeStateStatus":"CLEAN","merged":false,"isDraft":false,"comments":{{"totalCount":0}},"reviewThreads":{{"totalCount":0}},"commits":{{"nodes":[]}}}}],"pageInfo":{{"hasNextPage":false}}}}}}}}}}'
+  printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_test","number":42,"title":"Auto","author":{{"login":"example"}},"body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"APPROVED","reviewRequests":{{"nodes":[]}},"headRefName":"feat/auto","baseRefName":"main","headRefOid":"{}","headRepository":{{"nameWithOwner":"example/repo"}},"baseRepository":{{"nameWithOwner":"example/repo"}},"updatedAt":"2026-01-01T00:00:00Z","mergeStateStatus":"CLEAN","merged":false,"isDraft":false,"comments":{{"totalCount":0}},"reviewThreads":{{"totalCount":0}},"commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{{"contexts":{{"pageInfo":{{"hasNextPage":false}},"nodes":[{{"name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}}]}}}}}}}}]}}}}],"pageInfo":{{"hasNextPage":false}}}}}}}}}}'
+  exit 0
+fi
+if [ "$1" = "api" ] && [ "$2" = "graphql" ] && printf '%s' "$*" | grep -q '\$number: Int!)'; then
+  printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_test","number":42,"title":"Auto","state":"OPEN","reviewDecision":"APPROVED","headRefName":"feat/auto","baseRefName":"main","headRefOid":"{}","headRepository":{{"nameWithOwner":"example/repo"}},"baseRepository":{{"nameWithOwner":"example/repo"}},"mergeStateStatus":"CLEAN","commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{{"contexts":{{"pageInfo":{{"hasNextPage":false}},"nodes":[{{"name":"ci","status":"COMPLETED","conclusion":"SUCCESS"}}]}}}}}}}}]}}}}}}}}}}'
   exit 0
 fi
 case "$*" in
@@ -2913,6 +2917,7 @@ fi
 exit 1
 "#,
             gh_log.display(),
+            head,
             head,
             head,
             head,
@@ -2954,7 +2959,7 @@ exit 1
     let error = execute_merge_step(&conn, &repo, &config, &mut persisted, 0, 100).unwrap_err();
 
     let loaded = load_auto_run(&conn, &persisted.run.id).unwrap().unwrap();
-    assert!(error.contains("repository policy is unknown"));
+    assert!(error.contains("repository policy is unknown"), "{error}");
     assert_eq!(loaded.steps[0].status, AutoStepStatus::Failed);
     let commands = fs::read_to_string(gh_log).unwrap();
     assert!(commands.contains("/repos/example/repo/branches/main/protection"));
@@ -3252,10 +3257,15 @@ fn configure_pr_observation(temp: &TempDir, config: &mut Config, branch: &str, h
     let script = format!(
         r#"#!/bin/sh
 case "$*" in
+  *"/repos/example/repo/branches/main/protection"*) printf '%s\n' 'gh: Branch not protected (HTTP 404)' >&2; exit 1 ;;
+  *"/repos/example/repo/rules/branches/main?per_page=100"*) printf '%s\n' '[[]]' ;;
   *"/repos/example/repo/issues/42/comments?per_page=100"*|*"/repos/example/repo/pulls/42/reviews?per_page=100"*|*"/repos/example/repo/pulls/42/files?per_page=100"*|*"/repos/example/repo/commits/{head_sha}/statuses?per_page=100"*) printf '%s\n' '[[]]' ;;
   *"/repos/example/repo/commits/{head_sha}/check-runs?per_page=100"*) printf '%s\n' '[{{"total_count":1,"check_runs":[{{"name":"ci","status":"completed","conclusion":"success"}}]}}]' ;;
-  api\ graphql*)
+  *"reviewThreads(first: 100"*)
     printf '%s\n' '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}]'
+    ;;
+  api\ graphql*)
+    printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_test","number":42,"title":"Auto","state":"OPEN","headRefName":"{branch}","baseRefName":"main","headRefOid":"{head_sha}","headRepository":{{"nameWithOwner":"example/repo"}},"baseRepository":{{"nameWithOwner":"example/repo"}},"mergeStateStatus":"CLEAN","commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{{"contexts":{{"pageInfo":{{"hasNextPage":false}},"nodes":[{{"context":"ci","state":"SUCCESS"}}]}}}}}}}}]}}}}}}}}}}'
     ;;
   "run list "*)
     printf '[]\n'

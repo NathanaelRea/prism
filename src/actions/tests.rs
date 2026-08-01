@@ -257,9 +257,19 @@ case "$*" in
   *"/repos/example/repo/pulls/42/files?per_page=100"*) echo '[[]]' ;;
   *"/repos/example/repo/commits/abc123/check-runs?per_page=100"*) echo '[{"total_count":0,"check_runs":[]}]' ;;
   *"/repos/example/repo/commits/abc123/statuses?per_page=100"*) echo '[[]]' ;;
-  api\ graphql*)
+  *"pullRequests(first: 100"*)
+cat <<'JSON'
+[{"data":{"repository":{"pullRequests":{"nodes":[{"id":"PR_review","number":42,"title":"Review refresh","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"CHANGES_REQUESTED","reviewRequests":{"nodes":[]},"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","headRepository":{"nameWithOwner":"example/repo"},"baseRepository":{"nameWithOwner":"example/repo"},"updatedAt":"2026-06-14T12:02:00Z","comments":{"totalCount":2},"commits":{"nodes":[]},"isDraft":false}],"pageInfo":{"hasNextPage":false}}}}}]
+JSON
+;;
+  *"reviewThreads(first: 100"*)
 cat <<'JSON'
 [{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false},"nodes":[{"id":"PRRT_fresh","isResolved":false,"comments":{"totalCount":1,"pageInfo":{"hasNextPage":false},"nodes":[{"id":"PRRC_fresh","path":"src/lib.rs","originalLine":12,"body":"fresh inline comment","createdAt":"2026-06-14T12:01:30Z","author":{"login":"reviewer"}}]}}]}}}}}]
+JSON
+;;
+  api\ graphql*)
+cat <<'JSON'
+{"data":{"repository":{"pullRequest":{"id":"PR_review","number":42,"title":"Review refresh","state":"OPEN","reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","headRepository":{"nameWithOwner":"example/repo"},"baseRepository":{"nameWithOwner":"example/repo"},"commits":{"nodes":[]}}}}}
 JSON
 ;;
   *)
@@ -400,12 +410,16 @@ case "$*" in
   *"/repos/example/repo/pulls/42/files?per_page=100"*) echo '[[]]' ;;
   *"/repos/example/repo/commits/repair-sha/check-runs?per_page=100"*) echo '[{{"total_count":1,"check_runs":[{{"name":"test","status":"completed","conclusion":"success"}}]}}]' ;;
   *"/repos/example/repo/commits/repair-sha/statuses?per_page=100"*) echo '[[]]' ;;
-  api\ graphql*)
+  *"reviewThreads(first: 100"*)
     if [ -f '{}' ]; then
       echo '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}]'
     else
       echo '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":1,"pageInfo":{{"hasNextPage":false}},"nodes":[{{"id":"PRRT_guarded_1","isResolved":false,"comments":{{"totalCount":1,"pageInfo":{{"hasNextPage":false}},"nodes":[{{"id":"PRRC_guarded","path":"src/lib.rs","originalLine":12,"body":"address guarded feedback","createdAt":"2026-07-13T12:00:30Z","author":{{"login":"reviewer"}}}}]}}}}]}}}}}}}}}}]'
     fi
+    ;;
+  api\ graphql*)
+    if [ -f '{}' ]; then decision=APPROVED; else decision=CHANGES_REQUESTED; fi
+    echo "{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"id\":\"PR_test\",\"number\":42,\"title\":\"Guarded repair\",\"state\":\"OPEN\",\"reviewDecision\":\"$decision\",\"headRefName\":\"feature\",\"baseRefName\":\"main\",\"headRefOid\":\"repair-sha\",\"headRepository\":{{\"nameWithOwner\":\"example/repo\"}},\"baseRepository\":{{\"nameWithOwner\":\"example/repo\"}},\"commits\":{{\"nodes\":[{{\"commit\":{{\"statusCheckRollup\":{{\"contexts\":{{\"pageInfo\":{{\"hasNextPage\":false}},\"nodes\":[{{\"context\":\"ci\",\"state\":\"SUCCESS\"}}]}}}}}}}}]}}}}}}}}}}"
     ;;
   *)
     if [ -f '{}' ]; then decision=APPROVED; else decision=CHANGES_REQUESTED; fi
@@ -414,6 +428,7 @@ case "$*" in
 esac
 "#,
             gh_log.display(),
+            resolved.display(),
             resolved.display(),
             resolved.display(),
             resolved.display(),
@@ -521,6 +536,8 @@ esac
     assert_eq!(progress, GuardedPushProgress::AlreadySatisfied);
 
     let commands = fs::read_to_string(&gh_log).unwrap();
+    assert!(commands.contains("-F number=42"));
+    assert!(commands.contains("pullRequest(number: $number)"));
     assert_eq!(commands.matches("thread=PRRT_guarded_1").count(), 1);
     assert_eq!(
         commands.matches("thread=PRRT_guarded_2").count(),
@@ -587,7 +604,14 @@ case "$*" in
   *"/repos/example/repo/pulls/42/files?per_page=100"*) echo '[[]]' ;;
   *"/repos/example/repo/commits/repair-sha/check-runs?per_page=100"*) echo '[{{"total_count":0,"check_runs":[]}}]' ;;
   *"/repos/example/repo/commits/repair-sha/statuses?per_page=100"*) echo '[[]]' ;;
-  api\ graphql*)
+  *"pullRequests(first: 100"*)
+    if [ -f '{}' ] && [ ! -f '{}' ]; then
+      echo 'transient refresh failure' >&2
+      exit 1
+    fi
+    echo '[{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_test","number":42,"title":"Repair","state":"OPEN","headRefName":"feature","baseRefName":"main","headRefOid":"repair-sha","headRepository":{{"nameWithOwner":"example/repo"}},"baseRepository":{{"nameWithOwner":"example/repo"}},"commits":{{"nodes":[]}}}}],"pageInfo":{{"hasNextPage":false}}}}}}}}}}]'
+    ;;
+  *"reviewThreads(first: 100"*)
     if [ ! -f '{}' ]; then
       echo '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":2,"pageInfo":{{"hasNextPage":false}},"nodes":[{{"id":"PRRT_1","isResolved":false,"comments":{{"totalCount":1,"pageInfo":{{"hasNextPage":false}},"nodes":[{{"id":"C1","path":"src/lib.rs","body":"one","createdAt":"2026-07-13T12:00:00Z","author":{{"login":"reviewer"}}}}]}}}},{{"id":"PRRT_2","isResolved":false,"comments":{{"totalCount":1,"pageInfo":{{"hasNextPage":false}},"nodes":[{{"id":"C2","path":"src/lib.rs","body":"two","createdAt":"2026-07-13T12:00:01Z","author":{{"login":"reviewer"}}}}]}}}}]}}}}}}}}}}]'
     elif [ ! -f '{}' ]; then
@@ -596,12 +620,12 @@ case "$*" in
       echo '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}]'
     fi
     ;;
-  pr\ view\ feature\ --json\ id,number,title,*)
+  api\ graphql*)
     if [ -f '{}' ] && [ ! -f '{}' ]; then
       echo 'transient refresh failure' >&2
       exit 1
     fi
-    echo '{{"id":"PR_test","number":42,"title":"Repair","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"","reviewRequests":{{"nodes":[]}},"headRefName":"feature","baseRefName":"main","headRefOid":"repair-sha","headRepository":{{"nameWithOwner":"example/repo"}},"updatedAt":"2026-07-13T12:02:00Z","comments":{{"totalCount":0}},"statusCheckRollup":{{"contexts":{{"nodes":[]}}}},"mergeStateStatus":"CLEAN","isDraft":false}}'
+    echo '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_test","number":42,"title":"Repair","state":"OPEN","headRefName":"feature","baseRefName":"main","headRefOid":"repair-sha","headRepository":{{"nameWithOwner":"example/repo"}},"baseRepository":{{"nameWithOwner":"example/repo"}},"commits":{{"nodes":[]}}}}}}}}}}'
     ;;
   "run list "*) echo '[]' ;;
   *)
@@ -613,6 +637,8 @@ esac
             first_resolved.display(),
             allow_second.display(),
             second_resolved.display(),
+            second_resolved.display(),
+            allow_refresh.display(),
             first_resolved.display(),
             second_resolved.display(),
             second_resolved.display(),
@@ -690,7 +716,7 @@ esac
     let refresh_failure = crate::observability::with_writable_db(&repo, |conn| {
         progress_pending_push(conn, &repo, &config, &mut reopened, &mut cache, || Ok(()))
     });
-    assert!(refresh_failure.is_err());
+    assert!(refresh_failure.is_err(), "{refresh_failure:?}");
     let mut reopened =
         crate::observability::with_writable_db(&repo, |conn| load_auto_run(conn, &reopened.run.id))
             .unwrap()
@@ -792,8 +818,14 @@ case "$*" in
   "run list "*)
 printf '[]\n'
 ;;
-  api\ graphql*)
+  *"pullRequests(first: 100"*)
+printf '%s\n' '[{"data":{"repository":{"pullRequests":{"nodes":[{"id":"PR_ci","number":42,"title":"CI refresh","state":"OPEN","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","headRepository":{"nameWithOwner":"example/repo"},"baseRepository":{"nameWithOwner":"example/repo"},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false},"nodes":[{"name":"test","status":"COMPLETED","conclusion":"FAILURE"}]}}}}]}}],"pageInfo":{"hasNextPage":false}}}}}]'
+;;
+  *"reviewThreads(first: 100"*)
 printf '%s\n' '[{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]}}}}}]'
+;;
+  api\ graphql*)
+printf '%s\n' '{"data":{"repository":{"pullRequest":{"id":"PR_ci","number":42,"title":"CI refresh","state":"OPEN","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","headRepository":{"nameWithOwner":"example/repo"},"baseRepository":{"nameWithOwner":"example/repo"},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"contexts":{"pageInfo":{"hasNextPage":false},"nodes":[{"name":"test","status":"COMPLETED","conclusion":"FAILURE"}]}}}}]}}}}}'
 ;;
   *)
 cat <<'JSON'
