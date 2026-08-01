@@ -31,6 +31,28 @@ pub(super) fn worktree_detail_lines(model: &crate::view::FrameModel<'_>) -> Vec<
         Line::from(Span::styled(session.branch.clone(), title_style(true))),
         Line::from(Span::styled(session.path_display.clone(), muted_style())),
     ];
+    if let Some(environment) = model
+        .worktrees
+        .iter()
+        .find(|row| row.session_index == index)
+        .and_then(|row| row.development.as_ref())
+    {
+        let reachability = match environment.listening {
+            Some(true) => "listening",
+            Some(false) => "not listening",
+            None => "unknown",
+        };
+        let quality = match environment.quality {
+            DevelopmentEnvironmentQuality::NeverLoaded => "unknown",
+            DevelopmentEnvironmentQuality::Refreshing => "refreshing",
+            DevelopmentEnvironmentQuality::Fresh => reachability,
+            DevelopmentEnvironmentQuality::Stale => "stale",
+        };
+        lines.push(Line::from(""));
+        lines.push(heading_line("Development"));
+        lines.push(labelled_line("url", environment.url.clone()));
+        lines.push(labelled_line("status", quality.to_string()));
+    }
     if !session.prompt_summary.trim().is_empty() {
         lines.push(Line::from(""));
         lines.push(labelled_line("prompt", session.prompt_summary.clone()));

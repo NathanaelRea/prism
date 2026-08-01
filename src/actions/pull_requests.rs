@@ -75,6 +75,48 @@ pub(super) fn open_url_in_browser(url: &str) -> Result<(), String> {
     run_browser_opener(&browser_opener_candidates(), url).map(|_| ())
 }
 
+pub(super) fn open_http_url_in_browser(url: &str) -> Result<(), String> {
+    let scheme = url.split_once(':').map(|(scheme, _)| scheme);
+    if !scheme.is_some_and(|scheme| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    }) {
+        return Err("development URL must use http or https".to_string());
+    }
+    run_browser_opener_private(&browser_opener_candidates(), url).map(|_| ())
+}
+
+fn run_browser_opener_private(candidates: &[(&str, &[&str])], url: &str) -> Result<String, String> {
+    let mut attempted = false;
+    for (program, args) in candidates {
+        if !command_exists(program) {
+            continue;
+        }
+        attempted = true;
+        let mut command = Command::new(program);
+        command
+            .args(*args)
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        match command.spawn() {
+            Ok(mut child) => {
+                let program = (*program).to_string();
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Ok(program);
+            }
+            Err(_) => continue,
+        }
+    }
+    if attempted {
+        Err("browser opener failed".to_string())
+    } else {
+        Err("no browser opener found".to_string())
+    }
+}
+
 pub(super) const NO_BROWSER_ARGS: &[&str] = &[];
 pub(super) const GIO_BROWSER_ARGS: &[&str] = &["open"];
 pub(super) const WINDOWS_BROWSER_ARGS: &[&str] = &["/C", "start", ""];

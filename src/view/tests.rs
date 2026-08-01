@@ -573,6 +573,7 @@ fn clean_worktree_git_check_is_green() {
         status_label: session.status_label.clone(),
         pr: session.pr.clone(),
         wt_columns: session.wt_columns.clone(),
+        development: None,
         auto_status: None,
         plan_status: None,
         updated_label: "-".to_string(),
@@ -615,6 +616,30 @@ fn worktree_detail_omits_loaded_wt_columns() {
     assert!(!buffer.contains("wt columns"));
     assert!(!buffer.contains("ci.status"));
     assert!(!buffer.contains("vars.localdev"));
+}
+
+#[test]
+fn worktree_detail_renders_typed_development_url_and_non_color_stale_cue() {
+    let config = crate::test_support::test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.worktrees[0].development = Some(DevelopmentEnvironment {
+        url: "https://localhost:3000/very/long/路径".to_string(),
+        listening: Some(true),
+        quality: DevelopmentEnvironmentQuality::Stale,
+    });
+
+    let buffer = render_to_string(&model, 160, 30);
+    let detail_text = worktree_detail_lines(&model)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(buffer.contains("Development"));
+    assert!(buffer.contains("https://localhost:3000/very/long/"));
+    assert!(detail_text.contains("路径"));
+    assert!(buffer.contains("stale"));
 }
 
 #[test]
@@ -1653,6 +1678,7 @@ fn test_model<'a>(
                 status_label: session.status_label.clone(),
                 pr: session.pr.clone(),
                 wt_columns: session.wt_columns.clone(),
+                development: None,
                 auto_status: None,
                 plan_status: None,
                 updated_label: "-".to_string(),

@@ -167,6 +167,7 @@ pub(crate) struct ManagedRepo {
     pub wt_last_success: Option<std::time::Instant>,
     pub wt_last_error: Option<String>,
     pub wt_snapshot: Option<crate::worktrunk::WorktrunkSnapshot>,
+    pub wt_facts: BTreeMap<WorktreeSessionKey, crate::worktrunk::WorktrunkWorktreeFacts>,
     pub wt_quality: crate::worktrunk::ObservationQuality,
     pub default_branch_poll_in_flight: bool,
     pub default_branch_last_polled: Option<std::time::Instant>,
@@ -256,6 +257,7 @@ impl ManagedRepo {
             wt_last_success: None,
             wt_last_error: None,
             wt_snapshot: None,
+            wt_facts: BTreeMap::new(),
             wt_quality: crate::worktrunk::ObservationQuality::NeverLoaded,
             default_branch_poll_in_flight: false,
             default_branch_last_polled: None,
@@ -1346,6 +1348,20 @@ impl Tui {
                         && let Err(error) = self.open_selected_pr(runtime)
                     {
                         self.show_error("open PR failed", &error)?;
+                    }
+                }
+                Key::OpenDevelopmentUrl => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if let Err(error) = self.open_selected_development_url() {
+                        self.show_error("open development URL failed", &error)?;
+                    }
+                }
+                Key::WorktrunkLogs => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if let Err(error) = self.show_selected_worktrunk_logs(runtime) {
+                        self.show_error("Worktrunk hook logs failed", &error)?;
                     }
                 }
                 Key::SubmitReview => {
@@ -2590,6 +2606,8 @@ impl Tui {
             "e            edit selected repository config, then reload",
             "E            edit user config, then reload",
             "W            repos: edit visible worktree columns in repo config",
+            "o            worktrees: open the selected Worktrunk development URL",
+            "L            worktrees: inspect bounded Worktrunk hook logs",
             "/            search/filter focused panel",
             "?            show keybindings; / filters this dialog",
             "D            archive non-default worktree/session",
@@ -3104,6 +3122,46 @@ impl Tui {
         Ok(())
     }
 
+    pub(crate) fn wait_for_dialog_job<T>(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        title: &str,
+        message: &str,
+        receiver: std::sync::mpsc::Receiver<T>,
+    ) -> Result<Option<T>, String> {
+        self.dialog = Some(view::DialogModel::Progress {
+            title: title.to_string(),
+            message: message.to_string(),
+        });
+        self.draw(runtime)?;
+        loop {
+            match receiver.recv_timeout(Duration::from_millis(50)) {
+                Ok(value) => {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Ok(Some(value));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Err("background dialog job stopped unexpectedly".to_string());
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if self.tick_tui_action_jobs().any() {
+                self.draw(runtime)?;
+            }
+            if let Some(RuntimeEvent::Key(event)) = runtime.poll_event(Duration::ZERO)?
+                && event.kind == KeyEventKind::Press
+                && matches!(event.code, KeyCode::Esc)
+            {
+                self.dialog = None;
+                self.draw(runtime)?;
+                return Ok(None);
+            }
+        }
+    }
+
     pub(crate) fn confirm_dialog(
         &mut self,
         runtime: &mut TerminalRuntime,
@@ -3192,17 +3250,34 @@ impl Tui {
     ) -> Result<(), String> {
         self.dialog = Some(view::DialogModel::Notice {
             title: title.to_string(),
-            lines,
+            lines: lines.clone(),
+            scroll: 0,
         });
         self.draw(runtime)?;
+        let mut scroll = 0usize;
         loop {
             let Some(event) = runtime.poll_event(Duration::from_millis(100))? else {
                 continue;
             };
-            if matches!(event, RuntimeEvent::Key(event) if event.kind == KeyEventKind::Press) {
-                self.dialog = None;
+            if let RuntimeEvent::Key(event) = event
+                && event.kind == KeyEventKind::Press
+            {
+                match event.code {
+                    KeyCode::Down | KeyCode::Char('j') => scroll = scroll.saturating_add(1),
+                    KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => {
+                        self.dialog = None;
+                        self.draw(runtime)?;
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                self.dialog = Some(view::DialogModel::Notice {
+                    title: title.to_string(),
+                    lines: lines.clone(),
+                    scroll,
+                });
                 self.draw(runtime)?;
-                return Ok(());
             }
         }
     }
@@ -4683,6 +4758,15 @@ impl Tui {
                     status_label: session.status_label.clone(),
                     pr: session.pr.clone(),
                     wt_columns: session.wt_columns.clone(),
+                    development: self.repos.get(session.repo_index).and_then(|managed| {
+                        let key = session.identity_key(&managed.identity);
+                        let dev_server = managed.wt_facts.get(&key)?.dev_server.as_ref()?;
+                        Some(view::DevelopmentEnvironment {
+                            url: dev_server.url.clone(),
+                            listening: dev_server.listening,
+                            quality: view::DevelopmentEnvironmentQuality::from(&managed.wt_quality),
+                        })
+                    }),
                     auto_status,
                     plan_status,
                     updated_label: worktree_updated_label(session),

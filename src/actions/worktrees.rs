@@ -19,7 +19,33 @@ pub(super) fn archived_picker_overflow_message(
 }
 
 impl Tui {
+    pub(crate) fn open_selected_development_url(&self) -> Result<(), String> {
+        if self.focused_panel != crate::tui::PanelFocus::Worktrees {
+            return Err("focus worktrees to open a development URL".to_string());
+        }
+        let context = self
+            .selected_worktree_context()
+            .ok_or_else(|| "no worktree selected".to_string())?;
+        let session = self
+            .sessions
+            .get(context.session_index)
+            .ok_or_else(|| "no worktree selected".to_string())?;
+        let managed = self
+            .repos
+            .get(session.repo_index)
+            .ok_or_else(|| "repository is no longer available".to_string())?;
+        let key = session.identity_key(&managed.identity);
+        let url = managed
+            .wt_facts
+            .get(&key)
+            .and_then(|facts| facts.dev_server.as_ref())
+            .map(|server| server.url.as_str())
+            .ok_or_else(|| "selected worktree has no development URL".to_string())?;
+        super::pull_requests::open_http_url_in_browser(url)
+    }
+
     pub(crate) fn refresh_sessions_after_tmux(&mut self) -> Result<(), String> {
+        self.start_wt_column_poll();
         self.route_tui_job_messages();
         self.poll_session_refresh();
         if self.session_refresh_in_flight {
@@ -616,6 +642,19 @@ impl Tui {
         let warnings = self.sessions[selected].deletion_warnings();
         if !self.confirm_delete_dialog(raw, &branch, &path_display, &warnings, false)? {
             return Ok(());
+        }
+        if check_worktrunk_approval_status(&context.repo, &context.config)?
+            == WorktrunkApprovalStatus::Pending
+        {
+            if !self.offer_worktrunk_approval(raw, &context.repo, &context.config)? {
+                return Ok(());
+            }
+            if check_worktrunk_approval_status(&context.repo, &context.config)?
+                == WorktrunkApprovalStatus::Pending
+            {
+                self.show_message("Worktrunk approvals still pending; deletion was not started")?;
+                return Ok(());
+            }
         }
         self.start_delete_worktree_session(context.repo, context.config, path, branch)?;
         Ok(())

@@ -63,30 +63,54 @@ pub(crate) fn create_worktree(
     repo: &Repository,
     config: &Config,
     branch: &str,
-) -> Result<(), crate::worktrunk::WorktrunkFailure> {
+) -> Result<crate::worktrunk::SwitchOutcome, crate::worktrunk::WorktrunkFailure> {
     crate::worktrunk::switch_worktree(crate::worktrunk::SwitchRequest {
         repo,
         config,
         branch,
         create: true,
         base: config.default_base.as_deref(),
-    })?;
-    Ok(())
+    })
 }
 
 pub(crate) fn checkout_worktree(
     repo: &Repository,
     config: &Config,
     branch: &str,
-) -> Result<(), crate::worktrunk::WorktrunkFailure> {
+) -> Result<crate::worktrunk::SwitchOutcome, crate::worktrunk::WorktrunkFailure> {
     crate::worktrunk::switch_worktree(crate::worktrunk::SwitchRequest {
         repo,
         config,
         branch,
         create: false,
         base: None,
-    })?;
-    Ok(())
+    })
+}
+
+pub(crate) fn verify_switch_outcome(
+    repo: &Repository,
+    config: &Config,
+    requested_branch: &str,
+    outcome: &crate::worktrunk::SwitchOutcome,
+) -> Result<(), String> {
+    if outcome.branch != requested_branch {
+        return Err(format!(
+            "Worktrunk returned branch {:?} for requested branch {requested_branch:?}",
+            outcome.branch
+        ));
+    }
+    if list_worktrees(repo, config)?.into_iter().any(|entry| {
+        crate::worktrunk::paths_equivalent(&entry.path, &outcome.path)
+            && entry.branch == outcome.branch
+    }) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Worktrunk reported {} for branch {}, but fresh Git worktree inventory did not contain that exact path and branch",
+            outcome.path.display(),
+            outcome.branch
+        ))
+    }
 }
 
 pub(crate) fn check_worktrunk_approval_status(
@@ -131,7 +155,7 @@ pub(crate) fn move_current_branch_to_worktree(
         Command::new(config.tool("git")).args(switch_checkout_args(&repo.root, base)),
         ProcessPolicy::LocalMutation,
     )?;
-    crate::worktrunk::switch_worktree(crate::worktrunk::SwitchRequest {
+    let outcome = crate::worktrunk::switch_worktree(crate::worktrunk::SwitchRequest {
         repo,
         config,
         branch,
@@ -139,6 +163,7 @@ pub(crate) fn move_current_branch_to_worktree(
         base: None,
     })
     .map_err(|failure| failure.to_string())?;
+    verify_switch_outcome(repo, config, branch, &outcome)?;
     let _ = crate::observability::append_runtime_message(
         repo,
         &format!("moved {branch} into Worktrunk worktree and switched checkout to {base}"),
@@ -243,75 +268,8 @@ pub(crate) fn remove_worktree(
     repo: &Repository,
     config: &Config,
     path: &Path,
-) -> Result<(), String> {
-    let remove_result = run_status(
-        Command::new(config.tool("git"))
-            .arg("-C")
-            .arg(&repo.root)
-            .args(["worktree", "remove", "--force"])
-            .arg(path),
-        ProcessPolicy::LocalMutation,
-    );
-    match remove_result {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            if !path.exists() {
-                return prune_worktrees(repo, config).map_err(|prune_error| {
-                    format!("{error}; also failed to prune worktrees: {prune_error}")
-                });
-            }
-            recover_deregistered_worktree_remove_failure(repo, config, path, error)
-        }
-    }
-}
-
-fn recover_deregistered_worktree_remove_failure(
-    repo: &Repository,
-    config: &Config,
-    path: &Path,
-    error: String,
-) -> Result<(), String> {
-    if worktree_path_registered(repo, config, path).map_err(|list_error| {
-        format!("{error}; also failed to inspect registered worktrees: {list_error}")
-    })? {
-        return Err(error);
-    }
-    std::fs::remove_dir_all(path).map_err(|remove_error| {
-        format!(
-            "{error}; worktree was deregistered but failed to delete {}: {remove_error}",
-            path.display()
-        )
-    })?;
-    prune_worktrees(repo, config)
-        .map_err(|prune_error| format!("{error}; also failed to prune worktrees: {prune_error}"))
-}
-
-fn worktree_path_registered(
-    repo: &Repository,
-    config: &Config,
-    path: &Path,
-) -> Result<bool, String> {
-    let output = run_capture(
-        Command::new(config.tool("git"))
-            .arg("-C")
-            .arg(&repo.root)
-            .args(["worktree", "list", "--porcelain"]),
-        ProcessPolicy::Metadata,
-    )?;
-    Ok(output.lines().any(|line| {
-        line.strip_prefix("worktree ")
-            .is_some_and(|current| worktree_paths_match(Path::new(current), path))
-    }))
-}
-
-fn worktree_paths_match(registered: &Path, selected: &Path) -> bool {
-    if registered == selected {
-        return true;
-    }
-    matches!(
-        (registered.canonicalize(), selected.canonicalize()),
-        (Ok(registered), Ok(selected)) if registered == selected
-    )
+) -> Result<crate::worktrunk::RemoveOutcome, crate::worktrunk::WorktrunkFailure> {
+    crate::worktrunk::remove_worktree(crate::worktrunk::RemoveRequest { repo, config, path })
 }
 
 pub(crate) fn prune_worktrees(repo: &Repository, config: &Config) -> Result<(), String> {
@@ -326,10 +284,7 @@ pub(crate) fn prune_worktrees(repo: &Repository, config: &Config) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        WorktrunkApprovalStatus, check_worktrunk_approval_status, remove_worktree,
-        switch_checkout_args,
-    };
+    use super::{WorktrunkApprovalStatus, check_worktrunk_approval_status, switch_checkout_args};
     use crate::config::Config;
     use crate::observability;
     use crate::repo::Repository;
@@ -354,7 +309,11 @@ mod tests {
         permissions.set_mode(0o755);
         fs::set_permissions(&wt, permissions).unwrap();
         let git = temp.join("git");
-        fs::write(&git, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(
+            &git,
+            "#!/bin/sh\nprintf 'worktree /repo/prism.feature\\nHEAD abc\\nbranch refs/heads/feature\\n\\n'\n",
+        )
+        .unwrap();
         let mut permissions = fs::metadata(&git).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&git, permissions).unwrap();
@@ -382,6 +341,50 @@ mod tests {
         let hidden = count_rows(&repo, "hidden_session", "feature");
         assert_eq!(hidden, 0);
 
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn create_worktree_session_preserves_metadata_when_switch_result_is_not_in_git_inventory() {
+        let temp = unique_temp_dir("prism-create-verification-failure-test");
+        fs::create_dir_all(&temp).unwrap();
+        let wt = temp.join("wt");
+        write_executable(
+            &wt,
+            "#!/bin/sh\nprintf '%s' '{\"action\":\"created\",\"branch\":\"feature\",\"path\":\"/repo/reported\",\"created_branch\":true}'\n",
+        );
+        let git = temp.join("git");
+        write_executable(
+            &git,
+            "#!/bin/sh\nprintf 'worktree /repo/actual\\nbranch refs/heads/feature\\n\\n'\n",
+        );
+        let mut config = test_config();
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        observability::with_writable_db(&repo, |conn| {
+            conn.execute(
+                "insert into archived_worktree (
+                    branch, repo_root, worktree_path, archived_unix_ms, classification
+                 ) values ('feature', '/repo', '/repo/old', 123, 'work')",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+
+        let outcome = crate::session::create_worktree_session(&repo, &config, "feature").unwrap();
+
+        assert!(matches!(
+            outcome,
+            crate::session::CreateWorktreeOutcome::CreatedMetadataFailed { .. }
+        ));
+        assert_eq!(count_rows(&repo, "archived_worktree", "feature"), 1);
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -552,7 +555,7 @@ mod tests {
         write_executable(
             &git,
             &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\ncase \"$*\" in\n  *\"worktree list --porcelain\"*) printf 'worktree /repo/prism.feat-test\\nbranch refs/heads/feat/test\\n\\n' ;;\nesac\n",
                 git_log.display()
             ),
         );
@@ -585,113 +588,15 @@ mod tests {
     }
 
     #[test]
-    fn remove_worktree_prunes_when_missing_path_cannot_be_removed() {
-        let temp = unique_temp_dir("prism-remove-worktree-prune-test");
-        fs::create_dir_all(&temp).unwrap();
-        let log = temp.join("git.log");
-        let git = temp.join("git");
-        fs::write(
-            &git,
-            format!(
-                r#"#!/bin/sh
-printf '%s\n' "$*" >> '{}'
-case "$*" in
-  *"worktree remove"*)
-    echo "not a working tree" >&2
-    exit 1
-    ;;
-  *"worktree prune"*)
-    exit 0
-    ;;
-esac
-exit 0
-"#,
-                log.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&git).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&git, permissions).unwrap();
-
-        let mut config = test_config();
-        config
-            .tools
-            .insert("git".to_string(), git.display().to_string());
-        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
-        let missing = temp.join("missing");
-
-        remove_worktree(&repo, &config, &missing).unwrap();
-
-        let commands = fs::read_to_string(&log).unwrap();
-        assert!(commands.contains("worktree prune"));
-
-        let _ = fs::remove_dir_all(temp);
-    }
-
-    #[test]
-    fn remove_worktree_does_not_recover_when_equivalent_path_is_registered() {
-        let temp = unique_temp_dir("prism-remove-worktree-registered-path-test");
-        fs::create_dir_all(&temp).unwrap();
-        let actual_path = temp.join("worktree");
-        let alternate_parent = temp.join("alternate-parent");
-        fs::create_dir_all(&actual_path).unwrap();
-        fs::create_dir_all(&alternate_parent).unwrap();
-        fs::write(actual_path.join("leftover.txt"), "leftover\n").unwrap();
-        let selected_path = alternate_parent.join("..").join("worktree");
-        let log = temp.join("git.log");
-        let git = temp.join("git");
-        write_executable(
-            &git,
-            &format!(
-                r#"#!/bin/sh
-printf '%s\n' "$*" >> '{}'
-case "$*" in
-  *"worktree remove --force"*)
-    echo "failed to delete '{}': Directory not empty" >&2
-    exit 1
-    ;;
-  *"worktree list --porcelain"*)
-    printf 'worktree {}\nbranch refs/heads/feature/delete\n\n'
-    exit 0
-    ;;
-  *"worktree prune"*)
-    exit 0
-    ;;
-esac
-exit 0
-"#,
-                log.display(),
-                selected_path.display(),
-                actual_path.display()
-            ),
-        );
-
-        let mut config = test_config();
-        config
-            .tools
-            .insert("git".to_string(), git.display().to_string());
-        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
-
-        let error = remove_worktree(&repo, &config, &selected_path).unwrap_err();
-
-        assert!(error.contains("Directory not empty"));
-        assert!(actual_path.exists());
-        let commands = fs::read_to_string(&log).unwrap();
-        assert!(commands.contains("worktree list --porcelain"));
-        assert!(!commands.contains("worktree prune"));
-
-        let _ = fs::remove_dir_all(temp);
-    }
-
-    #[test]
     fn complete_delete_removes_all_owned_state_and_preserves_auto_flow_audit() {
         let temp = unique_temp_dir("prism-delete-kills-tmux-test");
         fs::create_dir_all(&temp).unwrap();
         let tmux_log = temp.join("tmux.log");
         let git_log = temp.join("git.log");
+        let wt_log = temp.join("wt.log");
         let tmux = temp.join("tmux");
         let git = temp.join("git");
+        let wt = temp.join("wt");
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
         let branch = "feature/delete";
         let runtime = crate::tmux::TmuxAgentSession::for_worktree_session(&repo, branch, 3);
@@ -748,6 +653,10 @@ exit 0
             .insert("git".to_string(), git.display().to_string());
         let path = temp.join("worktree");
         fs::create_dir_all(&path).unwrap();
+        write_successful_remove_wt(&wt, &wt_log, &path, branch);
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
         observability::with_writable_db(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
@@ -839,8 +748,12 @@ exit 0
         assert!(tmux_commands.contains(&format!("kill-session -t {}", runtime.name())));
         assert!(!tmux_commands.contains(&format!("kill-session -t {}", other_runtime.name())));
         let git_commands = fs::read_to_string(&git_log).unwrap();
-        assert!(git_commands.contains("worktree remove --force"));
         assert!(git_commands.contains("branch -D feature/delete"));
+        let wt_commands = fs::read_to_string(&wt_log).unwrap();
+        assert!(
+            wt_commands.contains("remove --foreground --force --no-delete-branch --format=json --")
+        );
+        assert!(wt_commands.ends_with(&path.display().to_string()));
         for table in [
             "task_metadata",
             "hidden_session",
@@ -867,13 +780,15 @@ exit 0
     }
 
     #[test]
-    fn delete_worktree_session_recovers_after_deregistered_remove_failure() {
+    fn delete_worktree_session_cleans_only_the_removed_session_runtime() {
         let temp = unique_temp_dir("prism-delete-deregistered-failure-test");
         fs::create_dir_all(&temp).unwrap();
         let tmux_log = temp.join("tmux.log");
         let git_log = temp.join("git.log");
         let tmux = temp.join("tmux");
         let git = temp.join("git");
+        let wt = temp.join("wt");
+        let wt_log = temp.join("wt.log");
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
         let branch = "feature/delete";
         let stale_branch = "feature/old-delete";
@@ -943,6 +858,10 @@ exit 0
         config
             .tools
             .insert("git".to_string(), git.display().to_string());
+        write_successful_remove_wt(&wt, &wt_log, &path, branch);
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
         observability::with_writable_db(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
@@ -989,10 +908,13 @@ exit 0
             .unwrap();
 
         let git_commands = fs::read_to_string(&git_log).unwrap();
-        assert!(git_commands.contains("worktree remove --force"));
         assert!(git_commands.contains("worktree list --porcelain"));
-        assert!(git_commands.contains("worktree prune"));
         assert!(git_commands.contains("branch -D feature/delete"));
+        assert!(
+            fs::read_to_string(&wt_log)
+                .unwrap()
+                .contains("--no-delete-branch")
+        );
         assert!(!path.exists());
         assert_eq!(count_rows(&repo, "task_metadata", branch), 0);
         assert_eq!(count_rows(&repo, "opencode_runtime", branch), 0);
@@ -1007,12 +929,13 @@ exit 0
     }
 
     #[test]
-    fn phase_1_failed_git_worktree_removal_preserves_prism_state_and_artifacts() {
+    fn failed_worktrunk_removal_preserves_prism_state_branch_and_artifacts() {
         let temp = unique_temp_dir("prism-phase-1-preserve-failed-delete-test");
         fs::create_dir_all(&temp).unwrap();
         let tmux = temp.join("tmux");
         write_executable(&tmux, "#!/bin/sh\nexit 0\n");
         let git = temp.join("git");
+        let wt = temp.join("wt");
         let branch = "feature/preserve";
         let path = temp.join("worktree");
         fs::create_dir_all(&path).unwrap();
@@ -1042,6 +965,10 @@ exit 0
                 branch
             ),
         );
+        write_executable(
+            &wt,
+            "#!/bin/sh\necho 'pre-remove hook failed' >&2\nexit 1\n",
+        );
 
         let mut config = test_config();
         config
@@ -1050,6 +977,9 @@ exit 0
         config
             .tools
             .insert("git".to_string(), git.display().to_string());
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
         observability::with_writable_db(&repo, |conn| {
             conn.execute(
@@ -1151,7 +1081,7 @@ exit 0
             crate::session::delete_worktree_session_if_current(&repo, &config, &path, branch, None)
                 .unwrap_err();
 
-        assert!(error.contains("failed to remove registered worktree"));
+        assert!(error.contains("pre-remove hook failed"));
         for table in [
             "task_metadata",
             "hidden_session",
@@ -1176,6 +1106,8 @@ exit 0
         let tmux = temp.join("tmux");
         write_executable(&tmux, "#!/bin/sh\nexit 0\n");
         let git = temp.join("git");
+        let wt = temp.join("wt");
+        let wt_log = temp.join("wt.log");
         write_executable(
             &git,
             "#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --verify refs/heads/feature/keep\"*) echo branch-oid; exit 0 ;;\n  *\"branch -D feature/keep\"*) echo retained >&2; exit 1 ;;\n  *\"worktree list --porcelain\"*) exit 0 ;;\nesac\nexit 0\n",
@@ -1190,6 +1122,10 @@ exit 0
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
         let path = temp.join("worktree");
         fs::create_dir_all(&path).unwrap();
+        write_successful_remove_wt(&wt, &wt_log, &path, "feature/keep");
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
         observability::with_writable_db(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
@@ -1292,5 +1228,23 @@ exit 0
             .map_err(|error| error.to_string())
         })
         .unwrap()
+    }
+
+    fn write_successful_remove_wt(
+        wt: &std::path::Path,
+        log: &std::path::Path,
+        path: &std::path::Path,
+        branch: &str,
+    ) {
+        write_executable(
+            wt,
+            &format!(
+                "#!/bin/sh\nprintf '%s' \"$*\" > '{}'\nrm -rf '{}'\nprintf '%s' '[{{\"branch\":\"{}\",\"branch_deleted\":false,\"kind\":\"worktree\",\"path\":\"{}\"}}]'\n",
+                log.display(),
+                path.display(),
+                branch,
+                path.display()
+            ),
+        );
     }
 }

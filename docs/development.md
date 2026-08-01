@@ -27,6 +27,20 @@ PRISM_TEST_TMUX="$(command -v tmux)" \
 
 The full-stack test creates a Git worktree, runs `prism agent ensure`, verifies the OpenCode-backed tmux session, runs ensure again to check reuse, and cleans up the isolated server and socket. It does not invoke a model.
 
+## Worktrunk Compatibility
+
+Prism's Worktrunk support floor is 0.58.0. CI installs and smoke-tests the pinned current version 0.71.0 on Linux and macOS using the versioned installer published with that upstream release. The smoke creates a repository whose path contains spaces, creates the `ci/real-smoke` branch, reads `wt list --format=json`, and removes the worktree while preserving the branch. It sets `WORKTRUNK_CONFIG_PATH` and `WORKTRUNK_WORKTREE_PATH` under a temporary directory so it never reads or mutates user configuration or approvals.
+
+`PRISM_TEST_WORKTRUNK` is the real-tool smoke selector and contains the absolute path to `wt`. To exercise the same binary selection locally:
+
+```sh
+PRISM_TEST_WORKTRUNK="$(command -v wt)"
+test -x "$PRISM_TEST_WORKTRUNK"
+"$PRISM_TEST_WORKTRUNK" --version
+```
+
+Parser coverage does not require Worktrunk. Redacted fixtures under `tests/fixtures/worktrunk` cover the 0.58.0 schema-1 floor and the schema-1/schema-2 output documented for 0.71.0, including absent and null observations. Unknown schemas must fail closed.
+
 To enforce the same gate as a pre-push hook, opt into the versioned hooks:
 
 ```sh

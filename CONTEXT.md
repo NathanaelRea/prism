@@ -55,9 +55,12 @@ should not own tmux lifecycle behavior or GitHub refresh semantics.
 
 Git's live worktree inventory is authoritative for whether a worktree exists and
 which branch is attached. Worktrunk owns physical worktree path policy,
-creation, project hooks, approvals, and its environment observations. Prism
-owns Worktree Session identity and joins Worktrunk observations by repository
-and exact normalized path; branch names are not an identity fallback.
+creation and removal effects, project hooks and approvals, stable template
+values, tethered processes, development URLs, variables, custom columns, and
+hook logs. Prism owns Worktree Session identity, destructive confirmation,
+Prism-resource cleanup, workflow history, and observation freshness. It joins
+Worktrunk observations by repository and exact normalized path; branch names
+are not an identity fallback.
 
 ### Agent Session
 

@@ -46,3 +46,24 @@ worktree but cannot create or resurrect a Prism Worktree Session.
   evaluation.
 - A missing or unsupported Worktrunk capability fails explicitly; Prism does not
   silently fall back to a reduced Git-only implementation.
+
+The supported Worktrunk floor is 0.58.0; the current real-tool CI pin is 0.71.0.
+Schema-1 arrays and schema-2 envelopes normalize into Prism-owned environment
+facts. Unknown schemas fail closed and leave the last successful observation
+stale. Worktrunk owns development URL configuration and listening probes;
+Prism owns whether an observation is fresh enough to present as current.
+
+Worktrunk also owns hook-log files. Prism may present a bounded, sanitized tail
+from a canonical regular file under `.git/wt/logs`, but does not persist log
+bodies or use file presence as process-liveness or hook-success evidence.
+
+## Planned Upstream Topics
+
+No upstream issues were opened as part of this change. The following are
+planned issue topics, deliberately listed without placeholder links:
+
+1. Read-only structured project-command approval status.
+2. Machine-readable error codes for JSON commands, including approval-required failures.
+3. A command-line JSON schema selector independent of repository and user configuration.
+4. Worktree removal or branch-state cleanup guarded by an expected branch OID.
+5. Stable branch identity in structured hook-log entries.

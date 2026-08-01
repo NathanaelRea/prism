@@ -197,7 +197,29 @@ Columns are read from `wt list --format=json`. Common names include `url`, `url_
 columns = ["url", "url_active", "ci.status", "vars.localdev"]
 ```
 
-Use `C` in the TUI to open the selected repository's worktree column selector. The selector lists configured columns first and then discovered `wt` column keys, so you can enable/disable columns and move enabled columns up/down without editing TOML directly.
+Use `W` in the TUI to open the selected repository's worktree column selector. The selector lists configured columns first and then discovered `wt` column keys, so you can enable/disable columns and move enabled columns up/down without editing TOML directly.
+
+## Worktrunk Environments
+
+Prism requires Worktrunk 0.58.0 or newer and currently tests against 0.71.0. Worktrunk project configuration belongs in the managed repository's `.config/wt.toml`; Prism reads the same machine output as standalone `wt list` and does not duplicate that configuration.
+
+Run long-lived development servers from a background `post-start` hook, not a blocking `pre-start` hook. `wt step tether` makes Worktrunk responsible for terminating the process tree when the worktree is removed:
+
+```toml
+[post-start]
+dev = "wt step tether -- pnpm dev -- --port {{ branch | hash_port }}"
+
+[list]
+url = "http://localhost:{{ branch | hash_port }}"
+```
+
+The stable `hash_port` value is owned by Worktrunk. The URL appears in standalone `wt list` and in Prism's Worktree Session details. Prism reports Worktrunk's listening, not-listening, unknown, or stale observation and opens a known HTTP(S) URL with plain `o`; it does not own the server or infer liveness from a hook log. URL columns remain opt-in through `W` and may use `url` and `url_active`.
+
+Worktrunk 0.58.0 emits the schema-1 bare array. Newer Worktrunk can emit schema 1 or the schema-2 envelope according to its `[list] json-schema` setting. Prism normalizes both without changing the user's setting. An unknown schema fails closed: the last successful observation remains visible as stale with a safe error instead of being replaced by empty columns. Facts join a Worktree Session only by repository and exact normalized worktree path, never by branch name.
+
+Worktrunk owns project-command approval. Prism never supplies `--yes`; when commands are new or changed, approve them interactively with the action Prism offers or with `wt config approvals add` after reviewing them.
+
+Press `L` in the Worktrees panel to choose a Worktrunk hook log. Prism displays Worktrunk's branch label, source, hook type, name, size, and modification time, then reads only a bounded sanitized tail from a regular file below `.git/wt/logs`. A branch-label match is only a picker preference, log bodies are not persisted or included in diagnostics, and a log file does not prove that a hook or development process is running.
 
 ## Database Access
 

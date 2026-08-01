@@ -75,10 +75,15 @@
   sessions provide an agent window, lazygit window, and shell window in the same
   worktree.
 - **Constraint**: The installed Worktrunk executable owns physical worktree path
-  policy, creation, project hooks, approvals, and Worktrunk environment state.
+  policy, creation and removal effects, project hooks, approvals, stable
+  templates, tethered processes, URLs, variables, columns, and hook logs.
   Prism integrates through typed machine-format subprocess operations, does not
   embed or fork Worktrunk, and must not depend on changing the caller's shell
   directory.
+- **Support**: Prism supports Worktrunk 0.58.0 and newer and tests the real-tool
+  compatibility path against Worktrunk 0.71.0 on Linux and macOS. Unsupported
+  versions and machine-output schemas fail explicitly rather than appearing as
+  absent environment state.
 - **Invariant**: Git's live worktree inventory is authoritative for worktree
   existence and attached branches. Worktrunk observations decorate that
   inventory and cannot create or resurrect a Prism Worktree Session.

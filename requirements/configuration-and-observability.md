@@ -35,6 +35,9 @@
 - **Behavior**: `prism doctor` reports tool availability and versions, GitHub
   authentication, configured checks, selected harness capabilities, and discovered
   worktrees.
+- **Behavior**: Startup rejects Worktrunk versions below 0.58.0. Diagnostics
+  report the detected Worktrunk version and minimum; observation failures use a
+  bounded safe summary rather than raw command output or development URLs.
 
 ## Verification Commands
 
@@ -130,3 +133,11 @@
 - **Invariant**: Cache observations distinguish never loaded, refreshing, stale,
   failed, confirmed absent, and present states. A transient failure does not
   erase known state, while confirmed absence requires affirmative evidence.
+- **Invariant**: Worktrunk schema 1 and schema 2 observations normalize into the
+  same typed URL, listening, variable, and custom-column facts. Unknown schema
+  versions fail closed and preserve the previous successful observation as
+  stale; they are never interpreted as an empty result.
+- **Invariant**: Worktrunk hook tails are read only from canonical regular files
+  under `.git/wt/logs`, are bounded by bytes and lines, and have terminal control
+  sequences removed. Raw URLs and hook bodies do not enter runtime logs, flight
+  recordings, SQLite, or structured failure summaries.

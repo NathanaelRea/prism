@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
@@ -24,6 +26,11 @@ pub(crate) const REMOVE_PROCESS: ProcessDescriptor = ProcessDescriptor::new("wt.
 pub(crate) const APPROVALS_PROCESS: ProcessDescriptor = ProcessDescriptor::new("wt.approvals");
 #[allow(dead_code)]
 pub(crate) const LOGS_PROCESS: ProcessDescriptor = ProcessDescriptor::new("wt.logs");
+
+pub(crate) const HOOK_LOG_TAIL_BYTES: u64 = 64 * 1024;
+pub(crate) const HOOK_LOG_TAIL_LINES: usize = 200;
+pub(crate) const MINIMUM_VERSION: &str = "0.58.0";
+pub(crate) const TESTED_CURRENT_VERSION: &str = "0.71.0";
 
 static APPROVAL_FAILURE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"(?is)needs\s+approval.*cannot\s+prompt.*non[- ]interactive").unwrap()
@@ -52,6 +59,12 @@ pub(crate) struct SwitchOutcome {
     pub path: PathBuf,
     pub branch: String,
     pub created_branch: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemoveOutcome {
+    pub path: PathBuf,
+    pub branch: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +100,17 @@ pub(crate) struct WorktrunkWorktreeFacts {
 pub(crate) struct DevServerObservation {
     pub url: String,
     pub listening: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HookLogEntry {
+    pub path: PathBuf,
+    pub branch: String,
+    pub source: String,
+    pub hook_type: Option<String>,
+    pub name: String,
+    pub modified_at: String,
+    pub size: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -194,7 +218,7 @@ impl WorktrunkFailure {
     fn with_approval_hint(mut self, repo: &Repository, config: &Config) -> Self {
         if self.approval_required() {
             self.approval_hint = Some(format!(
-                "This repo has Worktrunk project commands that must be approved before Prism can create worktrees.\n\nRun:\n{}",
+                "This repo has Worktrunk project commands that must be approved before Prism can manage worktrees.\n\nRun:\n{}",
                 approval_command_display(repo, config)
             ));
         }
@@ -225,6 +249,13 @@ pub(crate) struct SwitchRequest<'a> {
     pub base: Option<&'a str>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RemoveRequest<'a> {
+    pub repo: &'a Repository,
+    pub config: &'a Config,
+    pub path: &'a Path,
+}
+
 #[derive(Deserialize)]
 struct RawSwitchOutcome {
     action: String,
@@ -232,6 +263,15 @@ struct RawSwitchOutcome {
     path: PathBuf,
     #[serde(default)]
     created_branch: bool,
+}
+
+#[derive(Deserialize)]
+struct RawRemoveOutcome {
+    kind: String,
+    path: PathBuf,
+    #[serde(default)]
+    branch: Option<String>,
+    branch_deleted: bool,
 }
 
 #[derive(Deserialize)]
@@ -284,6 +324,29 @@ struct Schema2Display {
     columns: BTreeMap<String, Value>,
 }
 
+#[derive(Deserialize)]
+struct HookLogEnvelope {
+    #[serde(default)]
+    hook_output: Vec<HookLogJson>,
+}
+
+#[derive(Deserialize)]
+struct HookLogJson {
+    path: PathBuf,
+    #[serde(default)]
+    branch: String,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    hook_type: Option<String>,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    modified_at: Value,
+    #[serde(default)]
+    size: u64,
+}
+
 pub(crate) fn switch_worktree(
     request: SwitchRequest<'_>,
 ) -> Result<SwitchOutcome, WorktrunkFailure> {
@@ -295,6 +358,20 @@ pub(crate) fn switch_worktree(
             .with_approval_hint(request.repo, request.config));
     }
     parse_switch_output(&command, &output)
+}
+
+pub(crate) fn remove_worktree(
+    request: RemoveRequest<'_>,
+) -> Result<RemoveOutcome, WorktrunkFailure> {
+    let expected_path = normalize_path(request.path);
+    let mut command = remove_command(request);
+    let output = run_output_named(&mut command, ProcessPolicy::LocalMutation, REMOVE_PROCESS)
+        .map_err(|error| WorktrunkFailure::process(&command, error))?;
+    if !output.status.success() {
+        return Err(WorktrunkFailure::from_output(&command, &output)
+            .with_approval_hint(request.repo, request.config));
+    }
+    parse_remove_output(&command, &output, &expected_path)
 }
 
 pub(crate) fn approval_status(
@@ -342,6 +419,131 @@ pub(crate) fn observe_repository(
         return Err(WorktrunkFailure::from_output(&command, &output));
     }
     parse_list_output(&command, &output, &config.worktree_columns)
+}
+
+pub(crate) fn observe_hook_logs(
+    repo: &Repository,
+    config: &Config,
+) -> Result<Vec<HookLogEntry>, WorktrunkFailure> {
+    let mut command = logs_command(repo, config);
+    let output = run_output_named(&mut command, ProcessPolicy::Metadata, LOGS_PROCESS)
+        .map_err(|error| WorktrunkFailure::process(&command, error))?;
+    if !output.status.success() {
+        return Err(WorktrunkFailure::from_output(&command, &output));
+    }
+    let envelope = serde_json::from_str::<HookLogEnvelope>(&output.stdout)
+        .map_err(|error| WorktrunkFailure::malformed(&command, &output, error))?;
+    Ok(envelope
+        .hook_output
+        .into_iter()
+        .map(|entry| HookLogEntry {
+            path: entry.path,
+            branch: entry.branch,
+            source: entry.source,
+            hook_type: entry.hook_type,
+            name: entry.name,
+            modified_at: match entry.modified_at {
+                Value::String(value) => value,
+                Value::Number(value) => value.to_string(),
+                Value::Null => String::new(),
+                value => value.to_string(),
+            },
+            size: entry.size,
+        })
+        .collect())
+}
+
+pub(crate) fn read_hook_log_tail(repo: &Repository, path: &Path) -> Result<Vec<String>, String> {
+    let root = repo.root.join(".git/wt/logs");
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("Worktrunk log root is unavailable: {error}"))?;
+    if path
+        .symlink_metadata()
+        .map_err(|error| format!("Worktrunk log is unavailable: {error}"))?
+        .file_type()
+        .is_symlink()
+    {
+        return Err("Worktrunk log path is a symlink".to_string());
+    }
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("Worktrunk log is unavailable: {error}"))?;
+    if !path.starts_with(&root) {
+        return Err("Worktrunk log path is outside the repository log root".to_string());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|error| format!("open Worktrunk log: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("inspect Worktrunk log: {error}"))?;
+    if !metadata.file_type().is_file() {
+        return Err("Worktrunk log is not a regular file".to_string());
+    }
+    let start = metadata.len().saturating_sub(HOOK_LOG_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| format!("seek Worktrunk log: {error}"))?;
+    let mut bytes = Vec::new();
+    file.take(HOOK_LOG_TAIL_BYTES)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("read Worktrunk log: {error}"))?;
+    if start > 0
+        && let Some(first_newline) = bytes.iter().position(|byte| *byte == b'\n')
+    {
+        bytes.drain(..=first_newline);
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    let mut lines = text.lines().map(sanitize_log_line).collect::<Vec<_>>();
+    if lines.len() > HOOK_LOG_TAIL_LINES {
+        lines.drain(..lines.len() - HOOK_LOG_TAIL_LINES);
+    }
+    Ok(lines)
+}
+
+fn sanitize_log_line(line: &str) -> String {
+    let mut clean = String::new();
+    let mut chars = line.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    let mut escaped = false;
+                    for next in chars.by_ref() {
+                        if next == '\u{7}' || escaped && next == '\\' {
+                            break;
+                        }
+                        escaped = next == '\u{1b}';
+                    }
+                }
+                Some(_) => {
+                    chars.next();
+                }
+                None => {}
+            }
+        } else if ch == '\t' {
+            clean.push_str("    ");
+        } else if !ch.is_control() {
+            clean.push(ch);
+        }
+    }
+    clean
 }
 
 #[cfg(test)]
@@ -408,6 +610,10 @@ where
         .collect()
 }
 
+pub(crate) fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    normalize_path(left) == normalize_path(right)
+}
+
 pub(crate) fn projected_columns(facts: &WorktrunkWorktreeFacts) -> BTreeMap<String, String> {
     facts.extra_columns.clone()
 }
@@ -455,12 +661,38 @@ fn switch_command(request: SwitchRequest<'_>) -> Command {
     command
 }
 
+fn remove_command(request: RemoveRequest<'_>) -> Command {
+    let mut command = Command::new(request.config.tool(&request.config.worktree_command));
+    command
+        .arg("-C")
+        .arg(&request.repo.root)
+        .arg("remove")
+        .args([
+            "--foreground",
+            "--force",
+            "--no-delete-branch",
+            "--format=json",
+            "--",
+        ])
+        .arg(request.path);
+    command
+}
+
 fn list_command(repo: &Repository, config: &Config) -> Command {
     let mut command = Command::new(config.tool(&config.worktree_command));
     command
         .arg("-C")
         .arg(&repo.root)
         .args(["list", "--format=json"]);
+    command
+}
+
+fn logs_command(repo: &Repository, config: &Config) -> Command {
+    let mut command = Command::new(config.tool(&config.worktree_command));
+    command
+        .arg("-C")
+        .arg(&repo.root)
+        .args(["config", "state", "logs", "--format=json"]);
     command
 }
 
@@ -707,6 +939,52 @@ fn parse_switch_output(
     })
 }
 
+fn parse_remove_output(
+    command: &Command,
+    output: &ProcessOutput,
+    expected_path: &Path,
+) -> Result<RemoveOutcome, WorktrunkFailure> {
+    let mut raw = serde_json::from_str::<Vec<RawRemoveOutcome>>(&output.stdout)
+        .map_err(|error| WorktrunkFailure::malformed(command, output, error))?;
+    if raw.len() != 1 {
+        return Err(WorktrunkFailure::malformed(
+            command,
+            output,
+            format_args!("expected one removal result, received {}", raw.len()),
+        ));
+    }
+    let raw = raw.pop().expect("length checked");
+    if raw.kind != "worktree" {
+        return Err(WorktrunkFailure::malformed(
+            command,
+            output,
+            format_args!("unsupported removal kind {:?}", raw.kind),
+        ));
+    }
+    if raw.path != expected_path {
+        return Err(WorktrunkFailure::malformed(
+            command,
+            output,
+            format_args!(
+                "removed path {} did not match requested path {}",
+                raw.path.display(),
+                expected_path.display()
+            ),
+        ));
+    }
+    if raw.branch_deleted {
+        return Err(WorktrunkFailure::malformed(
+            command,
+            output,
+            "Worktrunk reported deleting the branch despite --no-delete-branch",
+        ));
+    }
+    Ok(RemoveOutcome {
+        path: raw.path,
+        branch: raw.branch,
+    })
+}
+
 fn classify_failure(output: &str) -> FailureKind {
     if is_approval_failure(output) {
         FailureKind::ApprovalRequired
@@ -751,6 +1029,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hook_log_tail_is_bounded_sanitized_and_confined() {
+        let temp = unique_temp_dir("prism-worktrunk-log-tail");
+        let root = temp.join("repo");
+        let logs = root.join(".git/wt/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let log = logs.join("hook.log");
+        let mut body = (0..250)
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        body.push_str("\n\u{1b}[31mred\u{1b}[0m\tend\u{7}\n");
+        fs::write(&log, body).unwrap();
+        let repo = Repository::with_config_dir_for_test(root, temp.join("config"));
+
+        let tail = read_hook_log_tail(&repo, &log).unwrap();
+
+        assert_eq!(tail.len(), HOOK_LOG_TAIL_LINES);
+        assert_eq!(tail.last().unwrap(), "red    end");
+        assert!(!tail.join("\n").contains('\u{1b}'));
+        let outside = temp.join("outside.log");
+        fs::write(&outside, "secret").unwrap();
+        assert!(
+            read_hook_log_tail(&repo, &outside)
+                .unwrap_err()
+                .contains("outside")
+        );
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, logs.join("escape.log")).unwrap();
+            assert!(
+                read_hook_log_tail(&repo, &logs.join("escape.log"))
+                    .unwrap_err()
+                    .contains("symlink")
+            );
+        }
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn hook_log_inventory_accepts_floor_numeric_timestamps() {
+        let envelope = serde_json::from_str::<HookLogEnvelope>(
+            r#"{"hook_output":[{"path":"/repo/.git/wt/logs/hook.log","modified_at":1720000000}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            envelope.hook_output[0].modified_at,
+            serde_json::json!(1720000000)
+        );
+    }
+
+    #[test]
+    #[ignore = "requires PRISM_TEST_WORKTRUNK pointing to a real Worktrunk binary"]
+    fn real_worktrunk_create_observe_remove_smoke() {
+        let wt = std::env::var("PRISM_TEST_WORKTRUNK")
+            .expect("PRISM_TEST_WORKTRUNK must point to Worktrunk");
+        let temp = unique_temp_dir("prism real worktrunk smoke");
+        let root = temp.join("repo with spaces");
+        fs::create_dir_all(&root).unwrap();
+        for args in [
+            vec!["init", "--initial-branch=main"],
+            vec!["config", "user.name", "Prism Test"],
+            vec!["config", "user.email", "prism@example.invalid"],
+            vec!["commit", "--allow-empty", "-m", "init"],
+        ] {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(args)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let repo = Repository::with_config_dir_for_test(root, temp.join("prism-config"));
+        let mut config = crate::test_support::test_config();
+        config.tools.insert("wt".to_string(), wt);
+        let created = switch_worktree(SwitchRequest {
+            repo: &repo,
+            config: &config,
+            branch: "ci/real-smoke",
+            create: true,
+            base: Some("main"),
+        })
+        .unwrap();
+        let snapshot = observe_repository(&repo, &config).unwrap();
+        assert!(snapshot.by_path.contains_key(&created.path));
+        let removed = remove_worktree(RemoveRequest {
+            repo: &repo,
+            config: &config,
+            path: &created.path,
+        })
+        .unwrap();
+        assert_eq!(removed.path, created.path);
+        assert!(!created.path.exists());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn switch_arguments_preserve_special_values_without_shell_evaluation() {
         let repo = Repository::with_config_dir_for_test(
             PathBuf::from("/repo/space and ünicode"),
@@ -785,6 +1162,39 @@ mod tests {
     }
 
     #[test]
+    fn remove_arguments_use_foreground_force_without_branch_deletion_and_exact_path() {
+        let repo = Repository::with_config_dir_for_test(
+            PathBuf::from("/repo/space and ünicode"),
+            PathBuf::from("/config"),
+        );
+        let config = crate::test_support::test_config();
+        let path = PathBuf::from("/repo/worktrees/--feature λ");
+        let command = remove_command(RemoveRequest {
+            repo: &repo,
+            config: &config,
+            path: &path,
+        });
+
+        assert_eq!(
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec![
+                "-C",
+                "/repo/space and ünicode",
+                "remove",
+                "--foreground",
+                "--force",
+                "--no-delete-branch",
+                "--format=json",
+                "--",
+                "/repo/worktrees/--feature λ",
+            ]
+        );
+    }
+
+    #[test]
     fn parses_created_and_existing_switch_fixtures() {
         let created = parse_fixture(
             r#"{"action":"created","branch":"feat/topic","path":"/repo.feat-topic","created_branch":true,"base_branch":"main"}"#,
@@ -804,6 +1214,68 @@ mod tests {
         assert_eq!(existing.action, SwitchAction::Existing);
         assert!(!existing.created_branch);
         assert_eq!(already_at.action, SwitchAction::Existing);
+    }
+
+    #[test]
+    fn parses_exact_remove_result_and_rejects_unsafe_results() {
+        let path = Path::new("/repo/worktree");
+        let removed = parse_remove_fixture(
+            r#"[{"branch":"feat/topic","branch_deleted":false,"kind":"worktree","path":"/repo/worktree"}]"#,
+            path,
+        )
+        .unwrap();
+        assert_eq!(removed.path, path);
+        assert_eq!(removed.branch.as_deref(), Some("feat/topic"));
+
+        let wrong_path = parse_remove_fixture(
+            r#"[{"branch":"feat/topic","branch_deleted":false,"kind":"worktree","path":"/repo/other"}]"#,
+            path,
+        )
+        .unwrap_err();
+        assert_eq!(wrong_path.kind, FailureKind::MalformedOutput);
+
+        let deleted_branch = parse_remove_fixture(
+            r#"[{"branch":"feat/topic","branch_deleted":true,"kind":"worktree","path":"/repo/worktree"}]"#,
+            path,
+        )
+        .unwrap_err();
+        assert_eq!(deleted_branch.kind, FailureKind::MalformedOutput);
+    }
+
+    #[test]
+    fn remove_failure_classifies_approval_and_preserves_exact_path_argument() {
+        let temp = unique_temp_dir("prism-wt-remove-approval");
+        fs::create_dir_all(&temp).unwrap();
+        let wt = temp.join("wt");
+        let args = temp.join("args");
+        write_executable(
+            &wt,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s\\n' 'repo needs approval to execute commands; cannot prompt in non-interactive mode' >&2\nexit 1\n",
+                args.display()
+            ),
+        );
+        let mut config = crate::test_support::test_config();
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        let path = temp.join("--worktree with space");
+
+        let failure = remove_worktree(RemoveRequest {
+            repo: &repo,
+            config: &config,
+            path: &path,
+        })
+        .unwrap_err();
+
+        assert!(failure.approval_required());
+        assert!(failure.to_string().contains("config approvals add"));
+        assert_eq!(
+            fs::read_to_string(args).unwrap().lines().last(),
+            Some(path.to_string_lossy().as_ref())
+        );
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -1081,6 +1553,24 @@ mod tests {
             stderr_truncated: false,
         };
         parse_list_output(&command, &output, &[])
+    }
+
+    fn parse_remove_fixture(
+        stdout: &str,
+        expected_path: &Path,
+    ) -> Result<RemoveOutcome, WorktrunkFailure> {
+        let mut command = Command::new("wt");
+        command.arg("remove");
+        let output = ProcessOutput {
+            status: success_status(),
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            stdout_total_bytes: stdout.len() as u64,
+            stdout_truncated: false,
+            stderr_total_bytes: 0,
+            stderr_truncated: false,
+        };
+        parse_remove_output(&command, &output, expected_path)
     }
 
     fn run_failure_fixture(body: &str) -> FailureKind {

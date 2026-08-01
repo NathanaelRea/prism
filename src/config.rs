@@ -1316,7 +1316,7 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     print_tool_status("git", &config.tool("git"), true);
     print_tool_status("gh", &config.tool("gh"), true);
     print_tool_status("tmux", &config.tool("tmux"), true);
-    print_worktrunk_status(config);
+    print_worktrunk_status(repo, config);
     print_tool_status("fzf", &config.tool("fzf"), false);
     println!();
 
@@ -1412,7 +1412,7 @@ pub fn ensure_required_tools(
     crate::worktrunk::ensure_supported_version(config)
 }
 
-fn print_worktrunk_status(config: &Config) {
+fn print_worktrunk_status(repo: &Repository, config: &Config) {
     let command = config.tool(&config.worktree_command);
     if !command_exists(&command) {
         println!(
@@ -1429,9 +1429,28 @@ fn print_worktrunk_status(config: &Config) {
                 "unsupported"
             };
             println!(
-                "{status:7} {:12} {command:18} required {} (minimum 0.58.0)",
-                config.worktree_command, version.raw
+                "{status:7} {:12} {command:18} required {} (supported >= {}; tested current {})",
+                config.worktree_command,
+                version.raw,
+                crate::worktrunk::MINIMUM_VERSION,
+                crate::worktrunk::TESTED_CURRENT_VERSION,
             );
+            if version.supported() {
+                match crate::worktrunk::observe_repository(repo, config) {
+                    Ok(snapshot) => println!(
+                        "worktrunk observation: fresh schema={} worktrees={}",
+                        match snapshot.schema {
+                            crate::worktrunk::WorktrunkSchema::V1 => 1,
+                            crate::worktrunk::WorktrunkSchema::V2 => 2,
+                        },
+                        snapshot.by_path.len()
+                    ),
+                    Err(error) => println!(
+                        "worktrunk observation: unavailable (never loaded) {}",
+                        error.safe_summary()
+                    ),
+                }
+            }
         }
         Err(error) => println!(
             "error   {:12} {command:18} required {error}",

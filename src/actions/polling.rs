@@ -588,6 +588,7 @@ impl Tui {
                     }
                     if let Some(managed) = self.repos.get_mut(repo_index) {
                         managed.wt_snapshot = Some(observation.snapshot);
+                        managed.wt_facts = facts;
                         managed.wt_last_success = Some(observation.observed_at);
                         managed.wt_last_error = None;
                         managed.wt_quality = crate::worktrunk::ObservationQuality::Fresh;
@@ -613,29 +614,8 @@ impl Tui {
         log_error: Option<String>,
     ) -> bool {
         let mut changed = false;
-        for session in self
-            .sessions
-            .iter_mut()
-            .filter(|session| session.repo_index == repo_index)
-        {
-            for column in ["url", "dev_server.url"] {
-                if let Some(value) = session.wt_columns.get_mut(column)
-                    && !value.ends_with(" (stale)")
-                {
-                    value.push_str(" (stale)");
-                    changed = true;
-                }
-            }
-            for column in ["url_active", "dev_server.listening"] {
-                if let Some(value) = session.wt_columns.get_mut(column)
-                    && !value.starts_with("stale (")
-                {
-                    *value = format!("stale ({value})");
-                    changed = true;
-                }
-            }
-        }
         if let Some(repo) = self.repos.get_mut(repo_index) {
+            let previous_quality = repo.wt_quality.clone();
             if repo.wt_last_error.as_deref() != Some(&summary)
                 && let Some(error) = log_error
             {
@@ -652,6 +632,7 @@ impl Tui {
                     error: summary,
                 })
                 .unwrap_or(crate::worktrunk::ObservationQuality::NeverLoaded);
+            changed = repo.wt_quality != previous_quality;
         }
         changed
     }

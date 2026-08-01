@@ -320,12 +320,15 @@ fn create_or_checkout_worktree_session(
         unarchive_worktree_session(repo, branch).map_err(CreateWorktreeFailure::Other)?;
         return Ok(CreateWorktreeOutcome::Restored);
     }
-    if checkout {
+    let switch = if checkout {
         crate::lifecycle::checkout_worktree(repo, config, branch)
-            .map_err(CreateWorktreeFailure::Worktrunk)?;
+            .map_err(CreateWorktreeFailure::Worktrunk)?
     } else {
         crate::lifecycle::create_worktree(repo, config, branch)
-            .map_err(CreateWorktreeFailure::Worktrunk)?;
+            .map_err(CreateWorktreeFailure::Worktrunk)?
+    };
+    if let Err(error) = crate::lifecycle::verify_switch_outcome(repo, config, branch, &switch) {
+        return Ok(CreateWorktreeOutcome::CreatedMetadataFailed { error });
     }
     match unarchive_worktree_session(repo, branch) {
         Ok(()) => Ok(CreateWorktreeOutcome::Created),
@@ -358,9 +361,17 @@ pub(crate) fn delete_worktree_session_if_current(
             "worktree {branch} was replaced while deletion was pending; retained the replacement"
         ));
     }
-    if let Some(current) = crate::lifecycle::list_worktrees(repo, config)?
+    let live_before_removal = crate::lifecycle::list_worktrees(repo, config)?;
+    let current = live_before_removal
         .into_iter()
-        .find(|entry| entry.path == path)
+        .find(|entry| crate::worktrunk::paths_equivalent(&entry.path, path));
+    if current.is_none() && expected_incarnation.is_some() {
+        return Err(format!(
+            "worktree {branch} is no longer present at {}; retained its branch and Prism state",
+            path.display()
+        ));
+    }
+    if let Some(current) = current
         && current.branch != branch
     {
         return Err(format!(
@@ -373,7 +384,35 @@ pub(crate) fn delete_worktree_session_if_current(
     } else {
         Some(crate::lifecycle::branch_oid(repo, config, branch)?)
     };
-    crate::lifecycle::remove_worktree(repo, config, path)?;
+    let (removal, removal_warning) = match crate::lifecycle::remove_worktree(repo, config, path) {
+        Ok(removal) => (removal, None),
+        Err(error) => {
+            let live = crate::lifecycle::list_worktrees(repo, config)?;
+            if live
+                .iter()
+                .any(|entry| crate::worktrunk::paths_equivalent(&entry.path, path))
+            {
+                return Err(error.to_string());
+            }
+            (
+                crate::worktrunk::RemoveOutcome {
+                    path: path.to_path_buf(),
+                    branch: (branch != "(detached)").then(|| branch.to_string()),
+                },
+                Some(format!(
+                    "Worktrunk removed the worktree but returned an unusable result: {}",
+                    error.safe_summary()
+                )),
+            )
+        }
+    };
+    if branch != "(detached)" && removal.branch.as_deref() != Some(branch) {
+        return Err(format!(
+            "Worktrunk removed {} but reported branch {:?} instead of {branch:?}; retained the branch and Prism state",
+            removal.path.display(),
+            removal.branch
+        ));
+    }
     let live_after_removal = crate::lifecycle::list_worktrees(repo, config)?;
     if live_after_removal.iter().any(|entry| entry.path == path) {
         return Err(format!(
@@ -420,10 +459,8 @@ pub(crate) fn delete_worktree_session_if_current(
         ));
     }
 
-    let mut errors = remove_deleted_worktree_owned_state(repo, config, path, branch)
-        .err()
-        .into_iter()
-        .collect::<Vec<_>>();
+    let mut errors = removal_warning.into_iter().collect::<Vec<_>>();
+    errors.extend(remove_deleted_worktree_owned_state(repo, config, path, branch).err());
     if let Err(error) = crate::lifecycle::delete_branch_if_same_incarnation(
         repo,
         config,
@@ -1979,6 +2016,17 @@ exit 0
         config
             .tools
             .insert("git".to_string(), git.display().to_string());
+        let wt = temp.join("wt");
+        write_executable(
+            &wt,
+            &format!(
+                "#!/bin/sh\nprintf '%s' '[{{\"branch\":\"{branch}\",\"branch_deleted\":false,\"kind\":\"worktree\",\"path\":\"{}\"}}]'\n",
+                path.display()
+            ),
+        );
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
         observability::with_writable_db(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
@@ -2051,7 +2099,15 @@ exit 0
         write_executable(
             &git,
             &format!(
-                "#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --verify refs/heads/{branch}\"*) printf 'branch-oid\\n'; exit 0 ;;\n  *\"worktree remove --force\"*) printf 'new git link\\n' > '{}/.git'; exit 0 ;;\n  *\"worktree list --porcelain\"*) printf 'worktree {}\\nHEAD branch-oid\\nbranch refs/heads/{branch}\\n\\n'; exit 0 ;;\nesac\nexit 0\n",
+                "#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --verify refs/heads/{branch}\"*) printf 'branch-oid\\n'; exit 0 ;;\n  *\"worktree list --porcelain\"*) printf 'worktree {}\\nHEAD branch-oid\\nbranch refs/heads/{branch}\\n\\n'; exit 0 ;;\nesac\nexit 0\n",
+                path.display()
+            ),
+        );
+        let wt = temp.join("wt");
+        write_executable(
+            &wt,
+            &format!(
+                "#!/bin/sh\nprintf 'new git link\\n' > '{}/.git'\nprintf '%s' '[{{\"branch\":\"{branch}\",\"branch_deleted\":false,\"kind\":\"worktree\",\"path\":\"{}\"}}]'\n",
                 path.display(),
                 path.display()
             ),
@@ -2072,6 +2128,9 @@ exit 0
         config
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
         observability::with_writable_db(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
@@ -2731,6 +2790,14 @@ exit 0
         config
             .tools
             .insert("wt".to_string(), wt.display().to_string());
+        let git = temp.join("git");
+        write_executable(
+            &git,
+            "#!/bin/sh\nprintf 'worktree /repo/worktree\\nbranch refs/heads/feature\\n\\n'\n",
+        );
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
 
         let outcome = create_worktree_session(&repo, &config, "feature").unwrap();
 

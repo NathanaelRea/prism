@@ -643,32 +643,38 @@ pub(super) fn worktree_column_choices(
     sessions: &[crate::session::Session],
     repo_index: usize,
 ) -> Vec<crate::view::OrderedToggleItem> {
-    let configured_set = configured.iter().cloned().collect::<BTreeSet<_>>();
-    let mut discovered = sessions
-        .iter()
-        .filter(|session| session.repo_index == repo_index)
-        .flat_map(|session| session.wt_columns.keys().cloned())
-        .filter(|key| !configured_set.contains(key))
-        .collect::<BTreeSet<_>>();
+    fn semantic_column(key: &str) -> &str {
+        match key {
+            "dev_server.url" => "url",
+            "dev_server.listening" => "url_active",
+            _ => key,
+        }
+    }
+
+    let mut seen = BTreeSet::new();
     let mut choices = configured
         .iter()
+        .filter(|key| seen.insert(semantic_column(key).to_string()))
         .map(|key| crate::view::OrderedToggleItem {
             id: key.clone(),
             label: key.clone(),
             enabled: true,
         })
         .collect::<Vec<_>>();
-    choices.extend(
-        discovered
-            .pop_first()
-            .into_iter()
-            .chain(std::iter::from_fn(move || discovered.pop_first()))
-            .map(|key| crate::view::OrderedToggleItem {
+    let discovered = sessions
+        .iter()
+        .filter(|session| session.repo_index == repo_index)
+        .flat_map(|session| session.wt_columns.keys().cloned())
+        .map(|key| semantic_column(&key).to_string())
+        .collect::<BTreeSet<_>>();
+    choices.extend(discovered.into_iter().filter_map(|key| {
+        seen.insert(key.clone())
+            .then(|| crate::view::OrderedToggleItem {
                 id: key.clone(),
                 label: key,
                 enabled: false,
-            }),
-    );
+            })
+    }));
     choices
 }
 

@@ -59,6 +59,7 @@ use crate::tui_jobs::CoalescedFacet;
 use crate::util::status_count;
 
 mod auto;
+mod logs;
 mod opencode_actions;
 mod plans;
 mod polling;
@@ -98,9 +99,11 @@ use plans::plan_run_mode_from_parallel_confirmation;
 use polling::status_label_with_behind;
 #[cfg(test)]
 use pull_requests::{
-    apply_bulk_review_resolution, pr_target_choice_list, pr_target_repo_for_choice,
-    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
-    should_prompt_pr_target_choice, unresolved_review_thread_ids,
+    apply_bulk_review_resolution, open_http_url_in_browser, pr_target_choice_list,
+    pr_target_repo_for_choice, remote_pr_choice_keys, remote_pr_worktree_branch,
+    run_browser_opener, should_prompt_pr_target_choice, unresolved_review_thread_ids,
 };
+#[cfg(test)]
+use repositories::worktree_column_choices;
 #[cfg(test)]
 use worktrees::archived_picker_overflow_message;

@@ -2568,6 +2568,75 @@ fn cleanup_after_restart_rejects_replaced_worktree_incarnation() {
     assert!(worktree.join(".git").exists());
 }
 
+#[test]
+fn cleanup_escalates_pending_worktrunk_approval_without_retiring_metadata() {
+    let temp = TempDir::new("cleanup-worktrunk-approval");
+    let worktree = temp.path().join("worktree");
+    fs::create_dir_all(&worktree).unwrap();
+    fs::write(
+        worktree.join(".git"),
+        "gitdir: /repo/.git/worktrees/feature\n",
+    )
+    .unwrap();
+    let repo = Repository::with_config_dir_for_test(
+        temp.path().join("repo"),
+        temp.path().join("prism-config"),
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let mut persisted = AutoLaunch::new(&repo.root, &worktree, "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+    persisted.steps.clear();
+    persisted.steps.push(AutoStepRun::queued(
+        &persisted.run.id,
+        1,
+        AutoStepKey::Cleanup,
+        1,
+        Some("cleanup".to_string()),
+    ));
+    save_auto_run(&conn, &mut persisted).unwrap();
+    start_non_agent_step(&conn, &mut persisted, 0).unwrap();
+    crate::observability::with_writable_db(&repo, |db| {
+        db.execute(
+            "insert into task_metadata (
+                branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
+             ) values (?1, '', '', ?2, 0)",
+            rusqlite::params!["feat/auto", worktree.display().to_string()],
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(())
+    })
+    .unwrap();
+    let wt = temp.path().join("wt");
+    write_executable(
+        &wt,
+        "#!/bin/sh\nprintf '%s\\n' 'repo needs approval to execute commands; cannot prompt in non-interactive mode' >&2\nexit 1\n",
+    );
+    let mut config = test_config();
+    config.auto.cleanup_after_merge = true;
+    config
+        .tools
+        .insert("wt".to_string(), wt.display().to_string());
+
+    let error = execute_cleanup_step(&conn, &repo, &config, &mut persisted, 0, 100)
+        .expect_err("pending approval must stop cleanup");
+
+    assert!(error.contains("requires interactive approval"));
+    assert!(error.contains("config approvals add"));
+    let retained = crate::observability::with_writable_db(&repo, |db| {
+        db.query_row(
+            "select count(*) from task_metadata where branch = 'feat/auto'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| error.to_string())
+    })
+    .unwrap();
+    assert_eq!(retained, 1);
+    assert!(worktree.exists());
+}
+
 fn push_test_step(
     persisted: &mut PersistedAutoRun,
     sequence: usize,

@@ -21,6 +21,7 @@ It's a local dashboard to manage code change lifecycles. From planning, implemen
 - Isolate tasks with git worktrees and tmux sessions
 - See repo, worktree, PR, CI, and agent state in one TUI.
 - Kick off repeatable agent flows for implementing a plan, or fixing from reviews, ci failures, or merge issues
+- See and open Worktrunk-configured development URLs, and inspect bounded hook-log tails, without giving up the standalone `wt list` workflow
 
 ## Prerequisites
 
@@ -29,7 +30,7 @@ Core runtime requirements:
 - `git`
 - GitHub CLI (`gh`)
 - `tmux`
-- WorkTrunk (`wt`)
+- Worktrunk (`wt`) 0.58.0 or newer. Prism currently tests against 0.71.0.
 
 Agent harnesses are optional individually. Install and select whichever harness you want Prism to manage:
 
