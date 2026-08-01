@@ -296,12 +296,8 @@ impl Tui {
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
-        let Some(dashboard) = self.current_auto_dashboard() else {
+        if self.current_auto_dashboard().is_none() {
             return self.show_standalone_plan_actions_dialog(raw);
-        };
-        if dashboard.run.run.implementation_source == AutoImplementationSource::Prompt {
-            self.show_message("selected Auto Flow run is not using plan mode")?;
-            return Ok(());
         }
 
         self.show_auto_plan_actions_dialog(raw)
@@ -450,7 +446,7 @@ impl Tui {
         let answer = self.prompt_choice_dialog(
             raw,
             Self::plan_action_choices(
-                "Auto Plan Actions",
+                "Auto Flow Actions",
                 "skip linked phase",
                 false,
                 availability,

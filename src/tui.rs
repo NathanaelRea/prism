@@ -5435,8 +5435,15 @@ impl Tui {
             self.selected_auto_step_by_run
                 .insert(run_id.clone(), selected_step);
         }
-        self.active_auto_runs
-            .insert(run.run.worktree_path.clone(), run_id.clone());
+        if matches!(
+            run.run.status,
+            AutoRunStatus::Queued | AutoRunStatus::Running | AutoRunStatus::Paused
+        ) {
+            self.active_auto_runs
+                .insert(run.run.worktree_path.clone(), run_id.clone());
+        } else if self.active_auto_runs.get(&run.run.worktree_path) == Some(&run_id) {
+            self.active_auto_runs.remove(&run.run.worktree_path);
+        }
         if self.selected_auto_run.is_none() {
             self.selected_auto_run = Some(run_id.clone());
         }
@@ -8795,6 +8802,24 @@ esac
             dashboard.run.run.worktree_path,
             PathBuf::from("/repo-one/z-worktree")
         );
+    }
+
+    #[test]
+    fn terminal_auto_run_remains_in_history_but_is_no_longer_active() {
+        let mut tui = test_tui();
+        let mut run = test_auto_run("run", "/repo-one/feature-one", 10);
+
+        tui.remember_auto_run(run.clone());
+        assert_eq!(
+            tui.active_auto_runs.get(&run.run.worktree_path),
+            Some(&run.run.id)
+        );
+
+        run.run.status = AutoRunStatus::Aborted;
+        tui.remember_auto_run(run.clone());
+
+        assert!(!tui.active_auto_runs.contains_key(&run.run.worktree_path));
+        assert_eq!(tui.auto_runs.get(&run.run.id), Some(&run));
     }
 
     #[test]

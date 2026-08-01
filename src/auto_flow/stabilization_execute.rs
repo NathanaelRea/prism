@@ -651,6 +651,7 @@ pub(crate) fn queue_standalone_repair(
             reason: "standalone PR repair requested from a trustworthy observation".to_string(),
         },
     );
+    persisted.run.pause_requested = false;
     let result = super::append_step_run_with_work_guard(
         conn,
         persisted,
@@ -2131,6 +2132,8 @@ mod tests {
             .unwrap()
             .create_run();
             persisted.run.variant = "repair".to_string();
+            persisted.run.status = super::super::AutoRunStatus::Paused;
+            persisted.run.pause_requested = true;
             persisted.steps.clear();
             super::super::save_auto_run(&conn, &mut persisted).unwrap();
 
@@ -2147,6 +2150,7 @@ mod tests {
 
             assert_eq!(persisted.steps.len(), 1);
             assert_eq!(persisted.steps[0].step_key, expected);
+            assert!(!persisted.run.pause_requested);
             assert_eq!(
                 persisted.run.stabilization_status,
                 Some(super::super::stabilization_model::StabilizationStatus::Blocked)
