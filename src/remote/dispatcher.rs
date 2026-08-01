@@ -7,35 +7,42 @@ use crate::repo::Repository;
 
 #[cfg(test)]
 use super::HostIdentity;
-use super::forgejo::ForgejoAdapter;
-use super::github::{
+use super::cache::{
     self, CiFailure as LegacyCiFailure, PrCache, PrCheckContext, PrCheckState, PrComment, PrReview,
     PrReviewComment, PrSummary, ProviderDetailsObservation, RepoPolicyCache,
 };
+#[cfg(test)]
+use super::cache::{PrDetails, PrObservationQuality};
+use super::forgejo::ForgejoAdapter;
+use super::github::GitHubAdapter;
 use super::gitlab::GitLabAdapter;
 use super::{
     CanonicalChangeRequestIdentity, Capabilities, ChangeRequest, ChangeRequestDetails,
-    ChangeRequestSummary, CheckState, CreateChangeRequest, DiscoveredRemote, GuardedMerge,
-    LifecycleState, MergeMethod, MergeMutationResult, MergeabilityState, NativeReviewThreadId,
-    Observation, ProviderKind, QueueState, RemoteRepositoryId, RemoteUrlKind, ResolveReviewThread,
-    ReviewDecision, discover_git_remote,
+    ChangeRequestId, ChangeRequestSummary, CheckState, CreateChangeRequest, DiscoveredRemote,
+    GuardedMerge, LifecycleState, MergeMethod, MergeMutationResult, MergeabilityState,
+    NativeReviewThreadId, Observation, ProviderKind, QueueState, RemoteError, RemoteRepositoryId,
+    RemoteUrlKind, RepositoryPolicy, ResolveReviewThread, ReviewDecision, ReviewSubmissionKind,
+    SubmitReview, discover_git_remote,
 };
 
 const MERGE_VERIFY_ATTEMPTS: usize = 6;
 const MERGE_VERIFY_INTERVAL: Duration = Duration::from_millis(500);
 
-enum Adapter {
-    GitHub,
+enum Adapter<'a> {
+    GitHub(GitHubAdapter<'a>),
     GitLab(GitLabAdapter),
     Forgejo(Box<ForgejoAdapter>),
 }
 
-impl Adapter {
-    fn resolve(path: &Path, config: &Config) -> Result<(Self, DiscoveredRemote), String> {
+impl<'a> Adapter<'a> {
+    fn resolve(path: &'a Path, config: &'a Config) -> Result<(Self, DiscoveredRemote), String> {
         let discovered = discover_git_remote(path, config, "origin", RemoteUrlKind::Fetch)
             .map_err(|error| error.to_string())?;
         let adapter = match discovered.repository.id.provider() {
-            ProviderKind::GitHub => Self::GitHub,
+            ProviderKind::GitHub => Self::GitHub(
+                GitHubAdapter::new(path, config, discovered.repository.id.clone())
+                    .map_err(|error| error.to_string())?,
+            ),
             ProviderKind::GitLab => Self::GitLab(
                 GitLabAdapter::new(config, discovered.repository.id.clone())
                     .map_err(|error| error.to_string())?,
@@ -58,15 +65,21 @@ impl Adapter {
 
     fn capabilities(&self) -> Capabilities {
         match self {
-            Self::GitHub => Capabilities::for_provider(ProviderKind::GitHub),
+            Self::GitHub(adapter) => adapter.capabilities(),
             Self::GitLab(adapter) => adapter.capabilities(),
             Self::Forgejo(adapter) => adapter.capabilities(),
         }
     }
 
-    fn for_repository(config: &Config, repository: &RemoteRepositoryId) -> Result<Self, String> {
+    fn for_repository(
+        path: &'a Path,
+        config: &'a Config,
+        repository: &RemoteRepositoryId,
+    ) -> Result<Self, String> {
         match repository.provider() {
-            ProviderKind::GitHub => Ok(Self::GitHub),
+            ProviderKind::GitHub => GitHubAdapter::new(path, config, repository.clone())
+                .map(Self::GitHub)
+                .map_err(|error| error.to_string()),
             ProviderKind::GitLab => GitLabAdapter::new(config, repository.clone())
                 .map(Self::GitLab)
                 .map_err(|error| error.to_string()),
@@ -80,6 +93,101 @@ impl Adapter {
                     .map(|adapter| Self::Forgejo(Box::new(adapter)))
                     .map_err(|error| error.to_string())
             }
+        }
+    }
+
+    fn list_change_requests(
+        &self,
+        repository: &RemoteRepositoryId,
+        head_ref: Option<&str>,
+    ) -> Result<Vec<ChangeRequestSummary>, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.list_change_requests(head_ref),
+            Self::GitLab(adapter) => adapter.list_change_requests(),
+            Self::Forgejo(adapter) => adapter.list_change_requests(repository),
+        }
+    }
+
+    fn observe_change_request(
+        &self,
+        id: &ChangeRequestId,
+    ) -> Result<ChangeRequestSummary, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.observe_change_request(id),
+            Self::GitLab(adapter) => adapter.observe_change_request(id),
+            Self::Forgejo(adapter) => adapter.change_request_summary(id),
+        }
+    }
+
+    fn lookup_change_request(
+        &self,
+        id: &ChangeRequestId,
+    ) -> Result<Option<ChangeRequestSummary>, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.lookup_change_request(id),
+            Self::GitLab(adapter) => adapter.observe_change_request(id).map(Some),
+            Self::Forgejo(adapter) => adapter.change_request_summary(id).map(Some),
+        }
+    }
+
+    fn change_request_details(
+        &self,
+        change_request: &ChangeRequest,
+    ) -> Result<ChangeRequestDetails, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.change_request_details(change_request),
+            Self::GitLab(adapter) => adapter.change_request_details(change_request),
+            Self::Forgejo(adapter) => adapter.change_request_details(change_request),
+        }
+    }
+
+    fn repository_policy(
+        &self,
+        repository: &RemoteRepositoryId,
+        target_branch: &str,
+    ) -> Result<RepositoryPolicy, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.repository_policy(target_branch),
+            Self::GitLab(adapter) => adapter.repository_policy(target_branch),
+            Self::Forgejo(adapter) => adapter.repository_policy(repository, target_branch),
+        }
+    }
+
+    fn create_change_request(
+        &self,
+        request: &CreateChangeRequest,
+    ) -> Result<ChangeRequestSummary, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.create_change_request(request),
+            Self::GitLab(adapter) => adapter.create_change_request(request),
+            Self::Forgejo(adapter) => adapter.create_change_request(request.clone()),
+        }
+    }
+
+    fn merge_change_request(
+        &self,
+        request: &GuardedMerge,
+    ) -> Result<MergeMutationResult, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.merge_change_request(request),
+            Self::GitLab(adapter) => adapter.merge_change_request(request),
+            Self::Forgejo(adapter) => adapter.merge_change_request(request.clone()),
+        }
+    }
+
+    fn resolve_review_thread(&self, request: &ResolveReviewThread) -> Result<(), RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.resolve_review_thread(request),
+            Self::GitLab(adapter) => adapter.resolve_review_thread(request).map(|_| ()),
+            Self::Forgejo(adapter) => adapter.resolve_review_thread(request.clone()),
+        }
+    }
+
+    fn submit_review(&self, request: &SubmitReview) -> Result<(), RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.submit_review(request),
+            Self::GitLab(adapter) => adapter.submit_review(request),
+            Self::Forgejo(adapter) => adapter.submit_review(request),
         }
     }
 }
@@ -298,47 +406,26 @@ pub(crate) fn submit_review(
     path: &Path,
     config: &Config,
     summary: &PrSummary,
-    flag: &str,
-    body: &str,
+    kind: ReviewSubmissionKind,
+    body: String,
 ) -> Result<(), String> {
     let change_request = change_request_from_legacy(summary)?;
     let target = &change_request.target_repository;
-    if target.provider() != ProviderKind::GitHub {
-        return Err(
-            "review submission is not supported by the selected provider adapter".to_string(),
-        );
+    if change_request.id.repository() != target {
+        return Err("change request identity has an inconsistent target repository".to_string());
     }
     configured_remote_repositories(path, config)?
         .validate_target_repository(target)
         .map_err(|_| "change request target changed before review submission".to_string())?;
-    if !matches!(flag, "--approve" | "--comment" | "--request-changes") {
-        return Err("review submission type is invalid".to_string());
-    }
-    let canonical_repository = format!("{}/{}", target.host(), target.project_path());
-    let mut command = Command::new(config.tool("gh"));
-    command
-        .arg("pr")
-        .arg("review")
-        .arg(summary.number.to_string())
-        .arg("--repo")
-        .arg(canonical_repository)
-        .arg(flag)
-        .current_dir(path);
-    if !body.trim().is_empty() {
-        command.arg("--body").arg(body.trim());
-    }
-    let output = crate::process::run_output_allow_failure_named(
-        &mut command,
-        crate::process::ProcessPolicy::NetworkQuery,
-        crate::process::ProcessDescriptor::new("gh.pr.review"),
-    )?;
-    if output.status.success() {
-        Ok(())
-    } else if output.stderr.trim().is_empty() {
-        Err(format!("gh pr review exited with {}", output.status))
-    } else {
-        Err(output.stderr.trim().to_string())
-    }
+    let adapter = Adapter::for_repository(path, config, target)?;
+    adapter
+        .submit_review(&SubmitReview {
+            id: change_request.id,
+            expected_head_sha: change_request.head_sha,
+            kind,
+            body,
+        })
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn capabilities(path: &Path, config: &Config) -> Result<Capabilities, String> {
@@ -354,7 +441,7 @@ pub(crate) fn capabilities(path: &Path, config: &Config) -> Result<Capabilities,
 pub(crate) fn authentication_status(path: &Path, config: &Config) -> Result<String, String> {
     let (adapter, remote) = Adapter::resolve(path, config)?;
     match adapter {
-        Adapter::GitHub => crate::process::run_capture_named(
+        Adapter::GitHub(_) => crate::process::run_capture_named(
             Command::new(config.tool("gh"))
                 .arg("auth")
                 .arg("status")
@@ -401,7 +488,7 @@ pub(crate) fn server_version(path: &Path, config: &Config) -> Result<Option<Stri
             .discover_instance()
             .map(|instance| Some(instance.version))
             .map_err(|error| error.to_string()),
-        Adapter::GitHub | Adapter::GitLab(_) => Ok(None),
+        Adapter::GitHub(_) | Adapter::GitLab(_) => Ok(None),
     }
 }
 
@@ -453,30 +540,13 @@ fn list_change_requests_for_head(
     let repositories = configured_change_request_repositories(path, config)?;
     let mut summaries = Vec::new();
     for repository in repositories {
-        let adapter = Adapter::for_repository(config, &repository)?;
-        let observed = match adapter {
-            Adapter::GitHub => match head_ref {
-                Some(head_ref) => github::fetch_open_pr_summaries_for_repository_head(
-                    path,
-                    config,
-                    &repository,
-                    head_ref,
-                )?,
-                None => github::fetch_pr_summary_index_for_repository(path, config, &repository)?,
-            },
-            Adapter::GitLab(adapter) => adapter
-                .list_change_requests()
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .map(to_legacy_summary)
-                .collect::<Result<Vec<_>, _>>()?,
-            Adapter::Forgejo(adapter) => adapter
-                .list_change_requests(&repository)
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .map(to_legacy_summary)
-                .collect::<Result<Vec<_>, _>>()?,
-        };
+        let adapter = Adapter::for_repository(path, config, &repository)?;
+        let observed = adapter
+            .list_change_requests(&repository, head_ref)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(to_legacy_summary)
+            .collect::<Result<Vec<_>, _>>()?;
         for summary in observed {
             if !summaries.iter().any(|existing: &PrSummary| {
                 existing.change_request_identity == summary.change_request_identity
@@ -487,27 +557,6 @@ fn list_change_requests_for_head(
         }
     }
     Ok(summaries)
-}
-
-fn exact_github_summary(
-    path: &Path,
-    config: &Config,
-    repository: &RemoteRepositoryId,
-    number: u64,
-    expected_identity: &CanonicalChangeRequestIdentity,
-) -> Result<Option<PrSummary>, String> {
-    let observed =
-        github::fetch_pr_summary_for_repository_number(path, config, repository, number)?;
-    match observed {
-        Some(summary)
-            if summary.change_request_identity.as_ref() == Some(expected_identity)
-                && summary.number == number =>
-        {
-            Ok(Some(summary))
-        }
-        Some(_) => Err("GitHub returned a different change request identity".to_string()),
-        None => Ok(None),
-    }
 }
 
 fn configured_change_request_repositories(
@@ -840,32 +889,16 @@ pub(crate) fn refresh_change_request_cache(
         if let Err(error) = remotes.validate_target_repository(&change_request.target_repository) {
             Err(error)
         } else {
-            let target_adapter = Adapter::for_repository(config, change_request.id.repository())?;
-            match target_adapter {
-                Adapter::GitHub => exact_github_summary(
-                    path,
-                    config,
-                    change_request.id.repository(),
-                    summary.number,
-                    summary
-                        .change_request_identity
-                        .as_ref()
-                        .expect("change request conversion requires identity"),
-                )
-                .and_then(|observed| observed.map_or(Ok(None), authoritative_active_summary)),
-                Adapter::GitLab(adapter) => adapter
-                    .observe_change_request(&change_request.id)
-                    .map(to_legacy_summary)
-                    .map_err(|error| error.to_string())
-                    .and_then(|summary| summary)
-                    .and_then(authoritative_active_summary),
-                Adapter::Forgejo(adapter) => adapter
-                    .change_request_summary(&change_request.id)
-                    .map(to_legacy_summary)
-                    .map_err(|error| error.to_string())
-                    .and_then(|summary| summary)
-                    .and_then(authoritative_active_summary),
-            }
+            let target_adapter =
+                Adapter::for_repository(path, config, change_request.id.repository())?;
+            target_adapter
+                .lookup_change_request(&change_request.id)
+                .map_err(|error| error.to_string())
+                .and_then(|summary| summary.map(to_legacy_summary).transpose())
+                .and_then(|summary| match summary {
+                    Some(summary) => authoritative_active_summary(summary),
+                    None => Ok(None),
+                })
         }
     } else {
         let local_head = crate::git::current_head_sha(path, config)?;
@@ -895,10 +928,10 @@ pub(crate) fn refresh_change_request_cache(
             unknown_lifecycle
         })
     };
-    github::record_provider_summary_refresh(repo, branch, cache, observation)?;
+    super::store::record_provider_summary_refresh(repo, branch, cache, observation)?;
     if force_details && cache.summary().is_some() {
         refresh_change_request_details_state(branch, cache, path, config);
-        github::persist_pr_cache_snapshot(repo, branch, cache)?;
+        super::store::persist_pr_cache_snapshot(repo, branch, cache)?;
     }
     Ok(())
 }
@@ -917,67 +950,21 @@ pub(crate) fn refresh_change_request_details_state(
         let change_request = change_request_from_legacy(&summary)?;
         configured_remote_repositories(path, config)?
             .validate_target_repository(&change_request.target_repository)?;
-        let adapter = Adapter::for_repository(config, change_request.id.repository())?;
-        let details = match adapter {
-            Adapter::GitHub => {
-                let observed = exact_github_summary(
-                    path,
-                    config,
-                    change_request.id.repository(),
-                    summary.number,
-                    summary
-                        .change_request_identity
-                        .as_ref()
-                        .expect("change request conversion requires identity"),
-                )?
-                .ok_or_else(|| {
-                    "canonical change request was not returned while details were loaded"
-                        .to_string()
-                })?;
-                if observed.head_sha != summary.head_sha {
-                    return Err("change request head changed while details were loaded".to_string());
-                }
-                github::fetch_pr_details_for_repository_number(
-                    path,
-                    config,
-                    change_request.id.repository(),
-                    summary.number,
-                    &change_request.source_branch,
-                    &summary.head_sha,
-                )?
-            }
-            Adapter::GitLab(adapter) => adapter
-                .change_request_details(&change_request)
-                .map_err(|error| error.to_string())
-                .and_then(|details| {
-                    if !details.association.as_ref().is_some_and(|association| {
-                        association.matches(&change_request.id, &change_request.head_sha)
-                    }) {
-                        return Err(
-                            "change request head changed while details were loaded".to_string()
-                        );
-                    }
-                    Ok(to_legacy_details(details))
-                })?,
-            Adapter::Forgejo(adapter) => adapter
-                .change_request_details(&change_request)
-                .map_err(|error| error.to_string())
-                .and_then(|details| {
-                    if !details.association.as_ref().is_some_and(|association| {
-                        association.matches(&change_request.id, &change_request.head_sha)
-                    }) {
-                        return Err(
-                            "change request head changed while details were loaded".to_string()
-                        );
-                    }
-                    Ok(to_legacy_details(details))
-                })?,
-        };
+        let adapter = Adapter::for_repository(path, config, change_request.id.repository())?;
+        let details = adapter
+            .change_request_details(&change_request)
+            .map_err(|error| error.to_string())?;
+        if !details.association.as_ref().is_some_and(|association| {
+            association.matches(&change_request.id, &change_request.head_sha)
+        }) {
+            return Err("change request head changed while details were loaded".to_string());
+        }
+        let details = to_legacy_details(details);
         Ok(details)
     })();
     match result {
-        Ok(details) => github::record_provider_details_refresh(cache, Ok(details)),
-        Err(error) => github::record_provider_details_refresh(cache, Err(error)),
+        Ok(details) => cache::record_provider_details_refresh(cache, Ok(details)),
+        Err(error) => cache::record_provider_details_refresh(cache, Err(error)),
     }
 }
 
@@ -1000,7 +987,7 @@ pub(crate) fn refresh_repository_policy_for(
         .cloned()
         .unwrap_or_else(|| remote.repository.id.clone());
     let adapter = if target_repository.is_some() {
-        Adapter::for_repository(config, &repository)?
+        Adapter::for_repository(path, config, &repository)?
     } else {
         origin_adapter
     };
@@ -1009,20 +996,7 @@ pub(crate) fn refresh_repository_policy_for(
         .as_deref()
         .or(config.default_base.as_deref())
         .unwrap_or("main");
-    if matches!(adapter, Adapter::GitHub) {
-        return github::refresh_repo_policy_cache_for_repository(
-            repo,
-            path,
-            config,
-            &repository,
-            target,
-        );
-    }
-    let policy = match adapter {
-        Adapter::GitLab(adapter) => adapter.repository_policy(target),
-        Adapter::Forgejo(adapter) => adapter.repository_policy(&repository, target),
-        Adapter::GitHub => unreachable!(),
-    };
+    let policy = adapter.repository_policy(&repository, target);
     let mut cache = RepoPolicyCache {
         repo_remote: repository.project_path().to_string(),
         provider: Some(repository.provider()),
@@ -1070,7 +1044,7 @@ pub(crate) fn refresh_repository_policy_for(
         }
         Err(error) => {
             if let Some(mut stale) =
-                github::load_repo_policy_cache_for_identity(repo, &repository, target)
+                super::store::load_repo_policy_cache_for_identity(repo, &repository, target)
             {
                 stale.error = Some(error.to_string());
                 cache = stale;
@@ -1080,7 +1054,7 @@ pub(crate) fn refresh_repository_policy_for(
             }
         }
     }
-    github::save_repo_policy_cache(repo, &cache)?;
+    super::store::save_repo_policy_cache(repo, &cache)?;
     Ok(cache)
 }
 
@@ -1093,7 +1067,7 @@ fn observed_policy_target_branch(
     let branch = crate::git::current_branch_name(path, config)
         .ok()
         .flatten()?;
-    let cache = github::load_pr_cache(repo, &branch);
+    let cache = super::store::load_pr_cache(repo, &branch);
     let summary = cache.summary()?;
     let identity = summary.change_request_identity.as_ref()?;
     (identity.target_repository().ok().as_ref() == Some(repository)
@@ -1133,49 +1107,7 @@ pub(crate) fn create_change_request(
     validate_create_change_request_guard(guard, &fresh)?;
     let source = guard.source_repository.clone();
     let target = guard.target_repository.clone();
-    let adapter = Adapter::for_repository(config, &target)?;
-    if matches!(adapter, Adapter::GitHub) {
-        let github_head = if guard.source_repository == guard.target_repository {
-            guard.source_branch.clone()
-        } else {
-            let owner = guard
-                .source_repository
-                .project_path()
-                .split('/')
-                .next()
-                .ok_or_else(|| "GitHub source repository has no owner".to_string())?;
-            format!("{owner}:{}", guard.source_branch)
-        };
-        github::run_create_pull_request(
-            config,
-            path,
-            body,
-            Some(target.project_path()),
-            Some(&guard.target_branch),
-            Some(&github_head),
-        )?;
-        let summary = github::fetch_open_pr_summaries_for_repository_head(
-            path,
-            config,
-            &target,
-            &guard.source_branch,
-        )?
-        .into_iter()
-        .find(|summary| {
-            summary.head_ref == guard.source_branch
-                && summary.base_ref == guard.target_branch
-                && summary.head_sha == guard.expected_head_sha
-                && summary
-                    .change_request_identity
-                    .as_ref()
-                    .and_then(|identity| identity.source_repository().ok())
-                    .as_ref()
-                    == Some(&source)
-        })
-        .ok_or_else(|| "created pull request was not returned by GitHub".to_string())?;
-        github::record_pr_summary(repo, &guard.local_branch, cache, summary);
-        return refresh_change_request_cache(repo, &guard.local_branch, cache, path, config, true);
-    }
+    let adapter = Adapter::for_repository(path, config, &target)?;
     let request = CreateChangeRequest {
         source_repository: source,
         target_repository: target.clone(),
@@ -1186,17 +1118,10 @@ pub(crate) fn create_change_request(
         body: body.to_string(),
         draft: false,
     };
-    let summary = match adapter {
-        Adapter::GitLab(_) => GitLabAdapter::new(config, target)
-            .map_err(|error| error.to_string())?
-            .create_change_request(&request)
-            .map_err(|error| error.to_string())?,
-        Adapter::Forgejo(adapter) => adapter
-            .create_change_request(request)
-            .map_err(|error| error.to_string())?,
-        Adapter::GitHub => unreachable!(),
-    };
-    github::record_pr_summary(
+    let summary = adapter
+        .create_change_request(&request)
+        .map_err(|error| error.to_string())?;
+    super::store::record_pr_summary(
         repo,
         &guard.local_branch,
         cache,
@@ -1216,9 +1141,6 @@ pub(crate) fn merge_change_request(
     let authorized_id = authorized_identity
         .change_request_id(Some(display_number))
         .map_err(|error| error.to_string())?;
-    let authorized_source = authorized_identity
-        .source_repository()
-        .map_err(|error| error.to_string())?;
     let authorized_target = authorized_identity
         .target_repository()
         .map_err(|error| error.to_string())?;
@@ -1228,63 +1150,16 @@ pub(crate) fn merge_change_request(
     remotes
         .validate_target_repository(&authorized_target)
         .map_err(|_| "change request repository changed since authorization".to_string())?;
-    let adapter = Adapter::for_repository(config, &authorized_target)?;
+    let adapter = Adapter::for_repository(path, config, &authorized_target)?;
     let capabilities = adapter.capabilities();
     if capabilities.guarded_merge == super::SupportLevel::Unsupported {
         return Err(capabilities.guarded_merge_reason.unwrap_or_else(|| {
             "guarded merge is unsupported by the provider adapter".to_string()
         }));
     }
-    if matches!(adapter, Adapter::GitHub) {
-        let observed = exact_github_summary(
-            path,
-            config,
-            &authorized_target,
-            display_number,
-            authorized_identity,
-        )?
-        .ok_or_else(|| "authorized change request is no longer present".to_string())?;
-        if observed.head_sha != expected_head_sha {
-            return Err("change request head changed since authorization".to_string());
-        }
-        if !observed.state.eq_ignore_ascii_case("OPEN") || observed.merged {
-            return Err("change request lifecycle is not authoritatively open".to_string());
-        }
-        let target_project =
-            (authorized_target != authorized_source).then_some(authorized_target.project_path());
-        github::merge_pull_request(
-            config,
-            path,
-            display_number,
-            expected_head_sha,
-            target_project,
-        )?;
-        let observed = exact_github_summary(
-            path,
-            config,
-            &authorized_target,
-            display_number,
-            authorized_identity,
-        )?
-        .ok_or_else(|| "mutated change request was not returned by GitHub".to_string())?;
-        if observed.head_sha != expected_head_sha {
-            return Err("change request head changed during merge".to_string());
-        }
-        let native_state = observed.state.clone();
-        return Ok(MergeMutationResult::from_summary(
-            change_request_summary_from_legacy(observed)?,
-            native_state,
-        ));
-    }
-    let summary = match &adapter {
-        Adapter::GitLab(adapter) => adapter
-            .observe_change_request(&authorized_id)
-            .map_err(|error| error.to_string())?,
-        Adapter::Forgejo(adapter) => adapter
-            .change_request_summary(&authorized_id)
-            .map_err(|error| error.to_string())?,
-        Adapter::GitHub => unreachable!(),
-    };
+    let summary = adapter
+        .observe_change_request(&authorized_id)
+        .map_err(|error| error.to_string())?;
     if summary.change_request.id != authorized_id {
         return Err("provider returned a different change request identity".to_string());
     }
@@ -1306,15 +1181,9 @@ pub(crate) fn merge_change_request(
     request
         .validate_observation(&summary)
         .map_err(|error| error.to_string())?;
-    match adapter {
-        Adapter::GitLab(adapter) => adapter
-            .merge_change_request(&request)
-            .map_err(|error| error.to_string()),
-        Adapter::Forgejo(adapter) => adapter
-            .merge_change_request(request)
-            .map_err(|error| error.to_string()),
-        Adapter::GitHub => unreachable!(),
-    }
+    adapter
+        .merge_change_request(&request)
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn resolve_review_thread(
@@ -1327,31 +1196,16 @@ pub(crate) fn resolve_review_thread(
     configured_remote_repositories(path, config)?
         .validate_target_repository(&change_request.target_repository)
         .map_err(|_| "change request repository changed before thread resolution".to_string())?;
-    let adapter = Adapter::for_repository(config, change_request.id.repository())?;
-    if matches!(adapter, Adapter::GitHub) {
-        return github::resolve_review_thread(
-            path,
-            config,
-            change_request.id.repository().host(),
-            thread_id,
-        );
-    }
+    let adapter = Adapter::for_repository(path, config, change_request.id.repository())?;
     let request = ResolveReviewThread {
         id: change_request.id,
         thread_id: NativeReviewThreadId::new(thread_id.to_string())
             .map_err(|error| error.to_string())?,
         expected_head_sha: summary.head_sha.clone(),
     };
-    match adapter {
-        Adapter::GitLab(adapter) => adapter
-            .resolve_review_thread(&request)
-            .map(|_| ())
-            .map_err(|error| error.to_string()),
-        Adapter::Forgejo(adapter) => adapter
-            .resolve_review_thread(request)
-            .map_err(|error| error.to_string()),
-        Adapter::GitHub => unreachable!(),
-    }
+    adapter
+        .resolve_review_thread(&request)
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn wait_for_change_request_merged(
@@ -1385,35 +1239,10 @@ fn observe_exact_change_request(
     expected: &ChangeRequest,
     config: &Config,
 ) -> Result<ChangeRequestSummary, String> {
-    let adapter = Adapter::for_repository(config, expected.id.repository())?;
-    let observed = match adapter {
-        Adapter::GitHub => {
-            let identity = CanonicalChangeRequestIdentity::new(
-                expected.id.repository(),
-                expected.id.native_id(),
-                &expected.source_repository,
-                &expected.target_repository,
-            );
-            let summary = exact_github_summary(
-                path,
-                config,
-                expected.id.repository(),
-                expected
-                    .id
-                    .display_number()
-                    .ok_or_else(|| "GitHub change request has no display number".to_string())?,
-                &identity,
-            )?
-            .ok_or_else(|| "canonical change request was not returned by GitHub".to_string())?;
-            change_request_summary_from_legacy(summary)?
-        }
-        Adapter::GitLab(adapter) => adapter
-            .observe_change_request(&expected.id)
-            .map_err(|error| error.to_string())?,
-        Adapter::Forgejo(adapter) => adapter
-            .change_request_summary(&expected.id)
-            .map_err(|error| error.to_string())?,
-    };
+    let adapter = Adapter::for_repository(path, config, expected.id.repository())?;
+    let observed = adapter
+        .observe_change_request(&expected.id)
+        .map_err(|error| error.to_string())?;
     let request = &observed.change_request;
     if request.id != expected.id
         || request.source_repository != expected.source_repository
@@ -1501,7 +1330,7 @@ fn to_legacy_summary(summary: ChangeRequestSummary) -> Result<PrSummary, String>
         check_status: check_label(&summary.check_state).to_string(),
         merge_state_status: mergeability_label(&summary.mergeability).to_string(),
         queue_state: queue_label(&summary.queue_state).to_string(),
-        comment_count: 0,
+        comment_count: summary.comment_count,
         merged: matches!(summary.lifecycle, LifecycleState::Merged),
         draft: summary.draft,
     })
@@ -1562,6 +1391,7 @@ fn change_request_summary_from_legacy(summary: PrSummary) -> Result<ChangeReques
         check_state: CheckState::from_native(summary.check_status),
         queue_state: QueueState::from_native(summary.queue_state),
         native_state_evidence: summary.native_state_evidence,
+        comment_count: summary.comment_count,
         draft: summary.draft,
         updated_at: (!summary.updated_at.trim().is_empty()).then_some(summary.updated_at),
     })
@@ -1573,7 +1403,7 @@ pub(crate) fn record_change_request_summary(
     cache: &mut PrCache,
     summary: ChangeRequestSummary,
 ) -> Result<(), String> {
-    github::record_pr_summary(repo, branch, cache, to_legacy_summary(summary)?);
+    super::store::record_pr_summary(repo, branch, cache, to_legacy_summary(summary)?);
     Ok(())
 }
 
@@ -1703,13 +1533,11 @@ fn review_label(state: &ReviewDecision) -> &str {
 
 fn check_label(state: &CheckState) -> &str {
     match state {
-        CheckState::Pending => "pending",
-        CheckState::Passed => "success",
-        CheckState::Failed => "failure",
-        CheckState::Cancelled => "cancelled",
-        CheckState::Skipped => "skipped",
+        CheckState::Pending => "running",
+        CheckState::Passed | CheckState::Skipped => "passed",
+        CheckState::Failed | CheckState::Cancelled => "failed",
         CheckState::Mixed => "mixed",
-        CheckState::Unknown(native) => native,
+        CheckState::Unknown(_) => "unknown",
     }
 }
 
@@ -1920,7 +1748,21 @@ esac
             &mut config,
             &directory,
             "gh",
-            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+            &format!(
+                r#"#!/bin/sh
+case "$*" in
+  "api graphql"*)
+    printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_42","number":42,"title":"Change","state":"OPEN","headRefName":"topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}}}}}}}}}}'
+    ;;
+  *"/repos/acme/widget/pulls/42/reviews"*)
+    printf '%s\n' "$*" > '{}'
+    printf '%s\n' '{{"commit_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}'
+    ;;
+  *) exit 1 ;;
+esac
+"#,
+                log.display()
+            ),
         );
         let source = repository(ProviderKind::GitHub, "contributor/widget");
         let target = repository(ProviderKind::GitHub, "acme/widget");
@@ -1932,11 +1774,18 @@ esac
             &target,
         ));
 
-        submit_review(&directory, &config, &summary, "--approve", "looks good").unwrap();
+        submit_review(
+            &directory,
+            &config,
+            &summary,
+            ReviewSubmissionKind::Approve,
+            "looks good".to_string(),
+        )
+        .unwrap();
 
         assert_eq!(
             std::fs::read_to_string(&log).unwrap().trim(),
-            "pr review 42 --repo github.com/acme/widget --approve --body looks good"
+            "api /repos/acme/widget/pulls/42/reviews --hostname github.com --method POST -H Accept: application/vnd.github+json -f commit_id=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -f event=APPROVE -f body=looks good"
         );
         std::fs::remove_dir_all(directory).unwrap();
     }
@@ -2310,7 +2159,7 @@ esac
             &format!(
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> '{}'
-printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_fork","number":42,"title":"Fork change","state":"OPEN","merged":false,"headRefName":"topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}}}}],"pageInfo":{{"hasNextPage":false}}}}}}}}}}'
+printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_fork","number":42,"title":"Fork change","state":"OPEN","merged":false,"headRefName":"topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}},"comments":{{"totalCount":4}},"reviewThreads":{{"totalCount":2}}}}],"pageInfo":{{"hasNextPage":false}}}}}}}}}}'
 "#,
                 gh_log.display()
             ),
@@ -2332,6 +2181,7 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_fo
             identity.source_repository().unwrap(),
             repository(ProviderKind::GitHub, "contributor/widget")
         );
+        assert_eq!(cache.summary().unwrap().comment_count, 6);
         let commands = std::fs::read_to_string(&gh_log).unwrap();
         assert_eq!(commands.matches("api graphql").count(), 1);
         assert!(commands.contains("headRefName=topic"));
@@ -2444,7 +2294,24 @@ esac
             &directory,
             "gh",
             r#"#!/bin/sh
-printf '%s\n' '{"data":{"resolveReviewThread":{"thread":{"id":"PRRT_1","isResolved":true}}}}'
+case "$*" in
+  *"resolveReviewThread(input:"*)
+    printf '%s\n' '{"data":{"resolveReviewThread":{"thread":{"id":"PRRT_1","isResolved":true}}}}'
+    ;;
+  *"reviewThreads(first: 100"*)
+    printf '%s\n' '[{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":1,"pageInfo":{"hasNextPage":false},"nodes":[{"id":"PRRT_1","isResolved":false,"comments":{"totalCount":1,"pageInfo":{"hasNextPage":false},"nodes":[{"id":"PRRC_1","author":{"login":"reviewer"},"path":"src/lib.rs","line":7,"body":"review","createdAt":"2026-01-01T00:00:00Z"}]}}]}}}}}]'
+    ;;
+  *"/issues/42/comments"*|*"/pulls/42/reviews"*|*"/pulls/42/files"*|*"/statuses"*)
+    printf '%s\n' '[[]]'
+    ;;
+  *"/check-runs"*)
+    printf '%s\n' '[{"total_count":0,"check_runs":[]}]'
+    ;;
+  *"api graphql"*)
+    printf '%s\n' '{"data":{"repository":{"pullRequest":{"id":"PR_42","number":42,"title":"Fork change","state":"OPEN","headRefName":"topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{"nameWithOwner":"contributor/widget"},"baseRepository":{"nameWithOwner":"acme/widget"}}}}}'
+    ;;
+  *) exit 1 ;;
+esac
 "#,
         );
         let source = repository(ProviderKind::GitHub, "contributor/widget");
@@ -2507,6 +2374,93 @@ printf '%s\n' '{"data":{"resolveReviewThread":{"thread":{"id":"PRRT_1","isResolv
         let round_trip = to_legacy_summary(normalized).unwrap();
         assert_eq!(round_trip.queue_state, "preparing_merged_result");
         assert_eq!(round_trip.native_state_evidence.queue, ["PREPARING"]);
+    }
+
+    #[test]
+    fn compatibility_conversion_preserves_comment_count_and_ui_check_labels() {
+        let labels = [
+            ("pending", "running"),
+            ("running", "running"),
+            ("passed", "passed"),
+            ("failed", "failed"),
+            ("mixed", "mixed"),
+            ("unknown", "unknown"),
+        ];
+
+        for (legacy, expected) in labels {
+            let mut summary = legacy_summary();
+            summary.comment_count = 17;
+            summary.check_status = legacy.to_string();
+
+            let normalized = change_request_summary_from_legacy(summary).unwrap();
+            assert_eq!(normalized.comment_count, 17);
+            let round_trip = to_legacy_summary(normalized).unwrap();
+            assert_eq!(round_trip.comment_count, 17);
+            assert_eq!(round_trip.check_status, expected);
+            assert_eq!(
+                round_trip.check_state(),
+                PrCheckState::from_label(expected),
+                "{legacy}"
+            );
+        }
+
+        let mut unknown = legacy_summary();
+        unknown.check_status = "unknown".to_string();
+        let round_trip =
+            to_legacy_summary(change_request_summary_from_legacy(unknown).unwrap()).unwrap();
+        assert_eq!(round_trip.check_state(), PrCheckState::Unknown);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cached_github_exact_lookup_absence_clears_stale_summary_authoritatively() {
+        let directory = std::env::temp_dir().join(format!(
+            "prism-github-exact-absence-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let mut config = crate::test_support::test_config();
+        crate::test_support::install_tool(
+            &mut config,
+            &directory,
+            "git",
+            r#"#!/bin/sh
+case "$*" in
+  *"remote get-url --push --all origin"*|*"remote get-url origin --push"*|*"remote get-url origin"*)
+    printf '%s\n' 'https://github.com/example/repo.git'
+    ;;
+  *"remote get-url"*"upstream"*) exit 2 ;;
+  *) exit 1 ;;
+esac
+"#,
+        );
+        crate::test_support::install_tool(
+            &mut config,
+            &directory,
+            "gh",
+            r#"#!/bin/sh
+printf '%s\n' '{"data":{"repository":{"pullRequest":null}}}'
+"#,
+        );
+        let repo =
+            Repository::with_config_dir_for_test(directory.clone(), directory.join("config"));
+        let mut cache = PrCache::observed(legacy_summary(), None);
+
+        refresh_change_request_cache(&repo, "topic", &mut cache, &directory, &config, false)
+            .unwrap();
+
+        assert!(cache.summary().is_none());
+        assert_eq!(
+            cache.summary_observation_quality(),
+            PrObservationQuality::AuthoritativeAbsence
+        );
+        assert_eq!(cache.trusted_summary().unwrap(), None);
+        assert_eq!(cache.display_error(), None);
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[cfg(unix)]
@@ -2577,11 +2531,11 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_fork","number"
             ci_failures: Observation::Unsupported,
         };
 
-        github::record_provider_details_refresh(&mut cache, Ok(to_legacy_details(details)));
+        cache::record_provider_details_refresh(&mut cache, Ok(to_legacy_details(details)));
 
         assert_eq!(
             cache.details_observation_quality(),
-            github::PrObservationQuality::PreservedStale
+            PrObservationQuality::PreservedStale
         );
         assert!(cache.trusted_details().is_err());
 
@@ -2594,11 +2548,11 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_fork","number"
             checks: Observation::Known(Vec::new()),
             ci_failures: Observation::Unsupported,
         };
-        github::record_provider_details_refresh(&mut cache, Ok(to_legacy_details(details)));
+        cache::record_provider_details_refresh(&mut cache, Ok(to_legacy_details(details)));
 
         assert_eq!(
             cache.details_observation_quality(),
-            github::PrObservationQuality::Fresh
+            PrObservationQuality::Fresh
         );
         assert_eq!(
             cache.trusted_details().unwrap().unwrap().files,
@@ -2615,13 +2569,13 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_fork","number"
     fn stale_current_details_update_display_but_remain_untrusted() {
         let mut cache = PrCache::observed(
             legacy_summary(),
-            Some(github::PrDetails {
+            Some(PrDetails {
                 comments: vec![PrComment {
                     body: "previous comment".to_string(),
                     ..PrComment::default()
                 }],
                 files: vec!["src/previous.rs".to_string()],
-                ..github::PrDetails::default()
+                ..PrDetails::default()
             }),
         );
         let error = crate::remote::RemoteError::new(
@@ -2644,14 +2598,14 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_fork","number"
             ci_failures: Observation::Unsupported,
         };
 
-        github::record_provider_details_refresh(&mut cache, Ok(to_legacy_details(details)));
+        cache::record_provider_details_refresh(&mut cache, Ok(to_legacy_details(details)));
 
         let displayed = cache.details().unwrap();
         assert_eq!(displayed.files, ["src/current.rs"]);
         assert_eq!(displayed.comments[0].body, "previous comment");
         assert_eq!(
             cache.details_observation_quality(),
-            github::PrObservationQuality::PreservedStale
+            PrObservationQuality::PreservedStale
         );
         assert!(
             cache
@@ -2904,7 +2858,7 @@ exit 17
                 .as_deref()
                 .is_some_and(|error| error.contains(expected))
         );
-        let persisted = github::load_repo_policy_cache_for_repository(
+        let persisted = crate::remote::store::load_repo_policy_cache_for_repository(
             &repo,
             &repository(ProviderKind::GitLab, "acme/widget"),
         )

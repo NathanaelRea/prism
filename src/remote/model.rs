@@ -822,6 +822,7 @@ pub(crate) struct ChangeRequestSummary {
     pub(crate) check_state: CheckState,
     pub(crate) queue_state: QueueState,
     pub(crate) native_state_evidence: NativeStateEvidence,
+    pub(crate) comment_count: u64,
     pub(crate) draft: bool,
     pub(crate) updated_at: Option<String>,
 }
@@ -923,6 +924,21 @@ pub(crate) struct ResolveReviewThread {
     pub(crate) id: ChangeRequestId,
     pub(crate) thread_id: NativeReviewThreadId,
     pub(crate) expected_head_sha: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReviewSubmissionKind {
+    Approve,
+    Comment,
+    RequestChanges,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SubmitReview {
+    pub(crate) id: ChangeRequestId,
+    pub(crate) expected_head_sha: String,
+    pub(crate) kind: ReviewSubmissionKind,
+    pub(crate) body: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

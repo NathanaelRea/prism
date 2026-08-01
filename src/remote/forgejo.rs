@@ -13,7 +13,7 @@ use super::{
     NativeChangeRequestId, NativeReviewThreadId, NativeStateEvidence, Observation, PolicyFacts,
     ProviderKind, QueueState, RemoteError, RemoteErrorClass, RemoteOperation, RemoteRepositoryId,
     RepositoryPolicy, ResolveReviewThread, RetryHint, Retryability, Review, ReviewDecision,
-    ReviewThread, SupportLevel,
+    ReviewThread, SubmitReview, SupportLevel,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -101,6 +101,7 @@ impl ForgejoAdapter {
             repository_policy: SupportLevel::Conditional,
             fetch_change_request: SupportLevel::Supported,
             create_change_request: SupportLevel::Conditional,
+            submit_review: SupportLevel::Unsupported,
             guarded_merge: SupportLevel::Conditional,
             guarded_merge_reason: None,
             merge_queue: SupportLevel::Unsupported,
@@ -486,6 +487,13 @@ impl ForgejoAdapter {
         ))
     }
 
+    pub(crate) fn submit_review(&self, _request: &SubmitReview) -> Result<(), RemoteError> {
+        Err(unsupported(
+            RemoteOperation::SubmitReview,
+            "Forgejo review submission is not supported",
+        ))
+    }
+
     pub(crate) fn resolve_review_thread(
         &self,
         _request: ResolveReviewThread,
@@ -628,6 +636,7 @@ impl ForgejoAdapter {
                 mergeability: NativeStateEvidence::retain(native_mergeability),
                 ..NativeStateEvidence::default()
             },
+            comment_count: 0,
             draft: pull.draft,
             updated_at: nonempty(pull.updated_at),
         })

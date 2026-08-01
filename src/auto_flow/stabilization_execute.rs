@@ -2463,10 +2463,10 @@ mod tests {
             &temp,
             "gh",
             &format!(
-                "#!/bin/sh\nif [ \"$1\" = api ]; then if [ -e '{}/observed-open' ]; then state=MERGED; merged=true; else state=OPEN; merged=false; touch '{}/observed-open'; fi; printf '%s\\n' \"{{\\\"data\\\":{{\\\"repository\\\":{{\\\"pullRequest\\\":{{\\\"id\\\":\\\"PR_test\\\",\\\"number\\\":42,\\\"headRefName\\\":\\\"feature\\\",\\\"baseRefName\\\":\\\"main\\\",\\\"headRefOid\\\":\\\"head\\\",\\\"headRepository\\\":{{\\\"nameWithOwner\\\":\\\"example/repo\\\"}},\\\"baseRepository\\\":{{\\\"nameWithOwner\\\":\\\"example/repo\\\"}},\\\"state\\\":\\\"$state\\\",\\\"merged\\\":$merged}}}}}}}}\"; exit 0; fi\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                "#!/bin/sh\nif [ \"$1\" = api ]; then if [ -e '{}/merged' ]; then state=MERGED; merged=true; else state=OPEN; merged=false; fi; printf '%s\\n' \"{{\\\"data\\\":{{\\\"repository\\\":{{\\\"pullRequest\\\":{{\\\"id\\\":\\\"PR_test\\\",\\\"number\\\":42,\\\"headRefName\\\":\\\"feature\\\",\\\"baseRefName\\\":\\\"main\\\",\\\"headRefOid\\\":\\\"head\\\",\\\"headRepository\\\":{{\\\"nameWithOwner\\\":\\\"example/repo\\\"}},\\\"baseRepository\\\":{{\\\"nameWithOwner\\\":\\\"example/repo\\\"}},\\\"state\\\":\\\"$state\\\",\\\"merged\\\":$merged}}}}}}}}\"; exit 0; fi\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = \"pr merge\" ]; then touch '{}/merged'; fi\n",
                 temp.display(),
-                temp.display(),
-                log.display()
+                log.display(),
+                temp.display()
             ),
         );
         crate::test_support::install_tool(

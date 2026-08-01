@@ -249,6 +249,56 @@ fn capability_support_is_independent_from_observation_quality() {
 }
 
 #[test]
+fn gitlab_and_forgejo_review_submission_is_explicitly_unsupported() {
+    let config = crate::test_support::test_config();
+    let gitlab_repository = repository(ProviderKind::GitLab, "gitlab.com", "group/repo");
+    let gitlab = super::gitlab::GitLabAdapter::new(&config, gitlab_repository.clone()).unwrap();
+    let gitlab_error = gitlab
+        .submit_review(&SubmitReview {
+            id: change_request(
+                ProviderKind::GitLab,
+                "gitlab.com",
+                "group/repo",
+                "123",
+                Some(7),
+            ),
+            expected_head_sha: "head".to_string(),
+            kind: ReviewSubmissionKind::Approve,
+            body: String::new(),
+        })
+        .unwrap_err();
+
+    let forgejo = super::forgejo::ForgejoAdapter::new(
+        HostProfile::new(
+            HostIdentity::new("codeberg.org", None).unwrap(),
+            ProviderKind::Forgejo,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let forgejo_error = forgejo
+        .submit_review(&SubmitReview {
+            id: change_request(
+                ProviderKind::Forgejo,
+                "codeberg.org",
+                "group/repo",
+                "456",
+                Some(8),
+            ),
+            expected_head_sha: "head".to_string(),
+            kind: ReviewSubmissionKind::Comment,
+            body: "comment".to_string(),
+        })
+        .unwrap_err();
+
+    for error in [gitlab_error, forgejo_error] {
+        assert_eq!(error.operation(), RemoteOperation::SubmitReview);
+        assert_eq!(error.class(), RemoteErrorClass::Unsupported);
+        assert_eq!(error.retryability(), Retryability::NotRetryable);
+    }
+}
+
+#[test]
 fn observation_absence_empty_stale_failed_and_unavailable_states_are_distinct() {
     let error = RemoteError::new(
         ProviderKind::Forgejo,
@@ -353,6 +403,7 @@ fn guarded_merge_requires_exact_identity_head_target_and_open_lifecycle() {
         check_state: CheckState::Passed,
         queue_state: QueueState::NotQueued,
         native_state_evidence: NativeStateEvidence::default(),
+        comment_count: 0,
         draft: false,
         updated_at: None,
     };

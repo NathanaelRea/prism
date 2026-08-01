@@ -3119,6 +3119,7 @@ fn waiting_merge_observation(
         check_state: crate::remote::CheckState::Passed,
         queue_state,
         native_state_evidence: crate::remote::NativeStateEvidence::default(),
+        comment_count: 0,
         draft: false,
         updated_at: Some("2026-01-01T00:00:00Z".to_string()),
     }

@@ -525,10 +525,22 @@ impl Tui {
         else {
             return Ok(());
         };
-        let (flag, label, body_required) = match choice.as_str() {
-            "a" => ("--approve", "approved", false),
-            "c" => ("--comment", "commented on", true),
-            "r" => ("--request-changes", "requested changes on", true),
+        let (kind, label, body_required) = match choice.as_str() {
+            "a" => (
+                crate::remote::ReviewSubmissionKind::Approve,
+                "approved",
+                false,
+            ),
+            "c" => (
+                crate::remote::ReviewSubmissionKind::Comment,
+                "commented on",
+                true,
+            ),
+            "r" => (
+                crate::remote::ReviewSubmissionKind::RequestChanges,
+                "requested changes on",
+                true,
+            ),
             _ => return Ok(()),
         };
         let prompt = if body_required {
@@ -573,11 +585,10 @@ impl Tui {
                         .change_request_identity
                         .clone()
                         .ok_or_else(|| "pull request identity is unavailable".to_string())?,
-                    expected_state: match flag {
-                        "--approve" => "APPROVED",
-                        "--comment" => "COMMENTED",
-                        "--request-changes" => "CHANGES_REQUESTED",
-                        _ => unreachable!(),
+                    expected_state: match kind {
+                        crate::remote::ReviewSubmissionKind::Approve => "APPROVED",
+                        crate::remote::ReviewSubmissionKind::Comment => "COMMENTED",
+                        crate::remote::ReviewSubmissionKind::RequestChanges => "CHANGES_REQUESTED",
                     }
                     .to_string(),
                     expected_body: body.clone(),
@@ -589,8 +600,8 @@ impl Tui {
                     &path,
                     &config,
                     &selected_summary,
-                    flag,
-                    &body,
+                    kind,
+                    body,
                 )?;
                 Ok(RemoteActionValue::Complete)
             },

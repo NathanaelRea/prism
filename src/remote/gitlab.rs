@@ -16,7 +16,7 @@ use super::{
     NativeChangeRequestId, NativeReviewThreadId, NativeStateEvidence, Observation, PolicyFacts,
     ProviderKind, QueueState, RemoteError, RemoteErrorClass, RemoteOperation, RemoteRepositoryId,
     RepositoryPolicy, ResolveReviewThread, RetryHint, Retryability, Review, ReviewDecision,
-    ReviewThread, SupportLevel,
+    ReviewThread, SubmitReview, SupportLevel,
 };
 
 const PAGE_SIZE: usize = 50;
@@ -77,6 +77,7 @@ impl GitLabAdapter {
             repository_policy: SupportLevel::Conditional,
             fetch_change_request: SupportLevel::Supported,
             create_change_request: SupportLevel::Supported,
+            submit_review: SupportLevel::Unsupported,
             guarded_merge: SupportLevel::Supported,
             guarded_merge_reason: None,
             merge_queue: SupportLevel::Conditional,
@@ -515,6 +516,15 @@ impl GitLabAdapter {
             RemoteOperation::ResolveReviewThread,
         )?;
         self.change_request_details(&observed.change_request)
+    }
+
+    pub(super) fn submit_review(&self, _request: &SubmitReview) -> Result<(), RemoteError> {
+        Err(remote_error(
+            RemoteOperation::SubmitReview,
+            RemoteErrorClass::Unsupported,
+            Retryability::NotRetryable,
+            "GitLab review submission is not supported",
+        ))
     }
 
     pub(super) fn merge_change_request(
@@ -1381,6 +1391,7 @@ fn summary_from_merge_request(
         check_state,
         queue_state,
         native_state_evidence,
+        comment_count: 0,
         draft: merge_request.draft || merge_request.work_in_progress,
         updated_at: merge_request.updated_at,
     })
@@ -2342,6 +2353,7 @@ fn descriptor_for(operation: RemoteOperation) -> ProcessDescriptor {
         RemoteOperation::ObserveRepositoryPolicy => "glab.repository.policy",
         RemoteOperation::FetchChangeRequest => "glab.mr.fetch_metadata",
         RemoteOperation::CreateChangeRequest => "glab.mr.create",
+        RemoteOperation::SubmitReview => "glab.mr.review",
         RemoteOperation::MergeChangeRequest => "glab.mr.merge",
         RemoteOperation::ObserveMergeQueue => "glab.mr.merge_train",
         RemoteOperation::DiscoverRepository => "glab.repository.metadata",

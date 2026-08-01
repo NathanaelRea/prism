@@ -1295,12 +1295,11 @@ impl Tui {
                 && self.selected_repo_pr_summary().is_some_and(|summary| {
                     !summary.merged
                         && summary.state.eq_ignore_ascii_case("OPEN")
-                        && summary
-                            .change_request_identity
-                            .as_ref()
-                            .is_some_and(|identity| {
-                                identity.provider() == crate::remote::ProviderKind::GitHub
-                            })
+                        && summary.change_request_identity.as_ref().is_some_and(|_| {
+                            crate::remote::dispatcher::capabilities_for_summary(&summary)
+                                .submit_review
+                                == crate::remote::SupportLevel::Supported
+                        })
                 });
         }
         if self.focused_panel != PanelFocus::Worktrees {

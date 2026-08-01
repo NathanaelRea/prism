@@ -16,6 +16,7 @@ pub(crate) enum RemoteOperation {
     ObserveRepositoryPolicy,
     FetchChangeRequest,
     CreateChangeRequest,
+    SubmitReview,
     MergeChangeRequest,
     ObserveMergeQueue,
 }
@@ -184,6 +185,7 @@ impl RemoteOperation {
             Self::ObserveRepositoryPolicy => "observe_repository_policy",
             Self::FetchChangeRequest => "fetch_change_request",
             Self::CreateChangeRequest => "create_change_request",
+            Self::SubmitReview => "submit_review",
             Self::MergeChangeRequest => "merge_change_request",
             Self::ObserveMergeQueue => "observe_merge_queue",
         }
