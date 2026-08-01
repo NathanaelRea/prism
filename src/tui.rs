@@ -1345,7 +1345,9 @@ impl Tui {
                 .unwrap_or(crate::remote::SupportLevel::Unknown);
             let has_input = session.pr.trusted_details().is_ok_and(|details| {
                 details.is_some_and(|details| match action {
-                    GitAction::CiFix => !details.ci_failures.is_empty(),
+                    GitAction::CiFix => {
+                        !details.ci_failures.is_empty() || !details.failing_checks.is_empty()
+                    }
                     GitAction::ReviewFix => {
                         !details.reviews.is_empty() || !details.review_comments.is_empty()
                     }
@@ -7602,6 +7604,14 @@ esac
         assert!(tui.git_action_enabled(GitAction::OpenPr));
         assert!(tui.git_action_enabled(GitAction::Merge));
         assert!(!tui.git_action_enabled(GitAction::CiFix));
+        tui.sessions[0].pr = PrCache::observed(
+            test_pr_summary(false),
+            Some(PrDetails {
+                failing_checks: vec!["external-ci".to_string()],
+                ..PrDetails::default()
+            }),
+        );
+        assert!(tui.git_action_enabled(GitAction::CiFix));
         tui.sessions[0].pr = PrCache::observed(
             test_pr_summary(false),
             Some(PrDetails {
