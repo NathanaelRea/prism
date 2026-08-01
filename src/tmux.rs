@@ -388,6 +388,13 @@ pub(crate) fn named_session_exists(config: &Config, expected: &str) -> Result<bo
 }
 
 fn agent_session_names_with_prefix(config: &Config, prefix: &str) -> Result<Vec<String>, String> {
+    Ok(tmux_session_names(config)?
+        .into_iter()
+        .filter(|name| name.starts_with(prefix))
+        .collect())
+}
+
+fn tmux_session_names(config: &Config) -> Result<Vec<String>, String> {
     let output = run_tmux_output_allow_failure(
         Command::new(config.tool("tmux")).env_remove("TMUX").args([
             "list-sessions",
@@ -407,18 +414,70 @@ fn agent_session_names_with_prefix(config: &Config, prefix: &str) -> Result<Vec<
             stderr.to_string()
         });
     }
-    Ok(output
-        .stdout
-        .lines()
-        .filter(|name| name.starts_with(prefix))
-        .map(str::to_string)
-        .collect())
+    Ok(output.stdout.lines().map(str::to_string).collect())
 }
 
 fn agent_session_prefix(repo: &Repository, branch: &str) -> String {
     let hash = stable_hash(repo.root.as_path());
     let branch = safe_tmux_name(&safe_branch_filename(branch));
-    format!("prism-{hash:016x}-{branch}-")
+    format!("prism-{branch}-{hash:016x}-")
+}
+
+fn legacy_agent_session_repo_prefix(repo: &Repository) -> String {
+    let hash = stable_hash(repo.root.as_path());
+    format!("prism-{hash:016x}-")
+}
+
+pub(crate) fn migrate_legacy_agent_sessions(
+    repo: &Repository,
+    config: &Config,
+) -> Result<(), String> {
+    let sessions = tmux_session_names(config)?;
+    let hash = stable_hash(repo.root.as_path());
+    let legacy_prefix = legacy_agent_session_repo_prefix(repo);
+    for legacy_name in &sessions {
+        let Some(suffix) = legacy_name.strip_prefix(&legacy_prefix) else {
+            continue;
+        };
+        let Some((branch, generation)) = suffix.rsplit_once('-') else {
+            continue;
+        };
+        if branch.is_empty() || generation.parse::<u64>().is_err() {
+            continue;
+        }
+        if is_repository_hash(branch)
+            || branch
+                .rsplit_once('-')
+                .is_some_and(|(_, possible_hash)| is_repository_hash(possible_hash))
+        {
+            continue;
+        }
+        // Legacy workers use this namespace with a fixed-width hash suffix.
+        if matches!(branch, "worker-auto" | "worker-plan") && generation.len() == 16 {
+            continue;
+        }
+        let name = format!("prism-{branch}-{hash:016x}-{generation}");
+        if legacy_name == &name {
+            continue;
+        }
+        if sessions.iter().any(|session| session == &name) {
+            return Err(format!(
+                "cannot migrate tmux session '{legacy_name}': '{name}' already exists"
+            ));
+        }
+        run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
+            "rename-session",
+            "-t",
+            legacy_name,
+            &name,
+        ]))
+        .map_err(|error| format!("migrate tmux session '{legacy_name}' to '{name}': {error}"))?;
+    }
+    Ok(())
+}
+
+fn is_repository_hash(value: &str) -> bool {
+    value.len() == 16 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 fn attach(config: &Config, runtime: &TmuxAgentSession, window: TmuxWindow) -> Result<(), String> {
@@ -1060,7 +1119,7 @@ mod tests {
     use super::{
         TmuxAgentSession, TmuxWindow, attach_or_create_agent, attach_or_create_plan_mode,
         attach_or_create_window, capture_agent_pane, ensure_agent_session,
-        latest_agent_session_generation, pane_command_matches_agent,
+        latest_agent_session_generation, migrate_legacy_agent_sessions, pane_command_matches_agent,
         pane_start_command_matches_agent, paste_agent_prompt, shell_quote,
     };
 
@@ -1073,8 +1132,13 @@ mod tests {
         let runtime = TmuxAgentSession::for_worktree_session(&repo, "feature/foo:bar", 3);
         let name = runtime.name();
 
-        assert!(name.starts_with("prism-"));
-        assert!(name.ends_with("-feature_foo_bar-3"));
+        assert_eq!(
+            name,
+            format!(
+                "prism-feature_foo_bar-{:016x}-3",
+                crate::util::stable_hash(repo.root.as_path())
+            )
+        );
         assert!(!name.contains('/'));
         assert!(!name.contains(':'));
     }
@@ -1401,6 +1465,111 @@ exit 1
         let generation = latest_agent_session_generation(&repo, &config, "feature");
 
         assert_eq!(generation, Some(7));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn startup_migration_renames_legacy_agent_sessions() {
+        let temp = unique_temp_dir("prism-tmux-legacy-generation-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let tmux = temp.join("tmux");
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let prefix = super::agent_session_prefix(&repo, "feature");
+        let legacy_repo_prefix = super::legacy_agent_session_repo_prefix(&repo);
+        let legacy_prefix = format!("{legacy_repo_prefix}feature-");
+        let hash_like_branch = legacy_repo_prefix
+            .trim_start_matches("prism-")
+            .trim_end_matches('-');
+        let current_other_repo = format!("prism-{hash_like_branch}-0123456789abcdef-6");
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  list-sessions)
+    echo '{}4'
+    echo '{}worker-auto-1234567890123456'
+    echo '{}'
+    exit 0
+    ;;
+  rename-session)
+    exit 0
+    ;;
+esac
+exit 1
+"#,
+                log.display(),
+                legacy_prefix,
+                legacy_repo_prefix,
+                current_other_repo,
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+
+        let result = migrate_legacy_agent_sessions(&repo, &config);
+
+        assert_eq!(result, Ok(()));
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(commands.contains(&format!("rename-session -t {legacy_prefix}4 {prefix}4")));
+        assert!(!commands.contains(&format!(
+            "rename-session -t {legacy_repo_prefix}worker-auto-1234567890123456"
+        )));
+        assert!(!commands.contains(&format!("rename-session -t {current_other_repo}")));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn startup_migration_propagates_rename_failures() {
+        let temp = unique_temp_dir("prism-tmux-legacy-migration-failure-test");
+        fs::create_dir_all(&temp).unwrap();
+        let tmux = temp.join("tmux");
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let legacy_prefix = format!("{}feature-", super::legacy_agent_session_repo_prefix(&repo));
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+case "$1" in
+  list-sessions)
+    echo '{}2'
+    exit 0
+    ;;
+  rename-session)
+    echo 'rename failed' >&2
+    exit 1
+    ;;
+esac
+exit 1
+"#,
+                legacy_prefix,
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+
+        let error = migrate_legacy_agent_sessions(&repo, &config).unwrap_err();
+
+        assert!(error.contains("migrate tmux session"));
+        assert!(error.contains("rename failed"));
 
         let _ = fs::remove_dir_all(temp);
     }

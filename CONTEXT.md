@@ -59,9 +59,10 @@ An agent session is a persistent tmux session for a worktree session. The agent
 window runs the configured interactive agent command, and companion windows
 provide lazygit and a shell in the same worktree.
 
-Agent session names are derived from a stable repository hash, a safe branch
-name, and a generation number. Prism can reattach to an existing agent session,
-create one when needed, or replace one that is not running the expected agent.
+Agent sessions are named `prism-<branch>-<repository-hash>-<generation>` so the
+branch is visible before the internal repository identity. Prism can reattach to
+an existing agent session, create one when needed, or replace one that is not
+running the expected agent.
 
 The Agent Session module owns lifecycle decisions around generation freshness,
 warmup jobs, observed running state, attach outcomes, delayed rewarm, and prompt

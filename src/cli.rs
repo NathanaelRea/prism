@@ -69,6 +69,7 @@ pub fn run() -> Result<(), String> {
         CommandKind::Agent(command) => {
             let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;
             config::ensure_default_agent_noninteractive(&mut config)?;
+            crate::tmux::migrate_legacy_agent_sessions(&repo, &config)?;
             run_agent_command(command, &repo, &config)
         }
         CommandKind::RunPlan(path) => {
@@ -348,6 +349,12 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
                 setup::maybe_prompt_startup_setup(&repo.repo, &repo.config)
             })?;
         }
+        observability::phase("migrate_tmux_session_names", || {
+            for managed in &repos {
+                crate::tmux::migrate_legacy_agent_sessions(&managed.repo, &managed.config)?;
+            }
+            Ok(())
+        })?;
         observability::phase("reconcile_worktrees", || {
             for managed in &repos {
                 session::reconcile_worktree_state(&managed.repo, &managed.config)?;
