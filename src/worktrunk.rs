@@ -363,7 +363,8 @@ pub(crate) fn switch_worktree(
 pub(crate) fn remove_worktree(
     request: RemoveRequest<'_>,
 ) -> Result<RemoveOutcome, WorktrunkFailure> {
-    let expected_path = normalize_path(request.path);
+    let requested_path = normalize_path_lexically(request.path);
+    let canonical_path = normalize_path(request.path);
     let mut command = remove_command(request);
     let output = run_output_named(&mut command, ProcessPolicy::LocalMutation, REMOVE_PROCESS)
         .map_err(|error| WorktrunkFailure::process(&command, error))?;
@@ -371,7 +372,7 @@ pub(crate) fn remove_worktree(
         return Err(WorktrunkFailure::from_output(&command, &output)
             .with_approval_hint(request.repo, request.config));
     }
-    parse_remove_output(&command, &output, &expected_path)
+    parse_remove_output(&command, &output, &requested_path, &canonical_path)
 }
 
 pub(crate) fn approval_status(
@@ -919,6 +920,10 @@ fn normalize_path(path: &Path) -> PathBuf {
     if let Ok(path) = path.canonicalize() {
         return path;
     }
+    normalize_path_lexically(path)
+}
+
+fn normalize_path_lexically(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -992,7 +997,8 @@ fn parse_switch_output(
 fn parse_remove_output(
     command: &Command,
     output: &ProcessOutput,
-    expected_path: &Path,
+    requested_path: &Path,
+    canonical_path: &Path,
 ) -> Result<RemoveOutcome, WorktrunkFailure> {
     let mut raw = serde_json::from_str::<Vec<RawRemoveOutcome>>(&output.stdout)
         .map_err(|error| WorktrunkFailure::malformed(command, output, error))?;
@@ -1011,14 +1017,15 @@ fn parse_remove_output(
             format_args!("unsupported removal kind {:?}", raw.kind),
         ));
     }
-    if raw.path != expected_path {
+    let removed_path = normalize_path_lexically(&raw.path);
+    if removed_path != requested_path && removed_path != canonical_path {
         return Err(WorktrunkFailure::malformed(
             command,
             output,
             format_args!(
                 "removed path {} did not match requested path {}",
                 raw.path.display(),
-                expected_path.display()
+                requested_path.display()
             ),
         ));
     }
@@ -1347,6 +1354,41 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(deleted_branch.kind, FailureKind::MalformedOutput);
+    }
+
+    #[test]
+    fn remove_accepts_requested_symlink_path_after_worktree_disappears() {
+        let temp = unique_temp_dir("prism-wt-remove-symlink-path");
+        let real_parent = temp.join("real");
+        let alias_parent = temp.join("alias");
+        let worktree = alias_parent.join("worktree");
+        fs::create_dir_all(real_parent.join("worktree")).unwrap();
+        std::os::unix::fs::symlink(&real_parent, &alias_parent).unwrap();
+        let wt = temp.join("wt");
+        write_executable(
+            &wt,
+            &format!(
+                "#!/bin/sh\nrm -rf '{}'\nprintf '%s' '[{{\"branch\":\"feat/test\",\"branch_deleted\":false,\"kind\":\"worktree\",\"path\":\"{}\"}}]'\n",
+                worktree.display(),
+                worktree.display()
+            ),
+        );
+        let mut config = crate::test_support::test_config();
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+
+        let removed = remove_worktree(RemoveRequest {
+            repo: &repo,
+            config: &config,
+            path: &worktree,
+        })
+        .unwrap();
+
+        assert_eq!(removed.path, worktree);
+        assert!(!real_parent.join("worktree").exists());
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -1700,7 +1742,7 @@ mod tests {
             stderr_total_bytes: 0,
             stderr_truncated: false,
         };
-        parse_remove_output(&command, &output, expected_path)
+        parse_remove_output(&command, &output, expected_path, expected_path)
     }
 
     fn run_failure_fixture(body: &str) -> FailureKind {
