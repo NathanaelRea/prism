@@ -1315,9 +1315,7 @@ impl Tui {
             return false;
         }
         if action == GitAction::Push {
-            return session.pr.summary().is_some()
-                || self.remote_support_for_action(action, None)
-                    == Some(crate::remote::SupportLevel::Supported);
+            return true;
         }
         let Some(summary) = session.pr.summary() else {
             return false;
@@ -7580,7 +7578,7 @@ esac
     }
 
     #[test]
-    fn git_actions_disable_pr_operations_until_a_pr_is_known() {
+    fn git_actions_allow_push_before_remote_capabilities_or_a_pr_are_known() {
         let repo = Repository {
             root: PathBuf::from("/tmp/repo"),
         };
@@ -7591,7 +7589,7 @@ esac
         );
         tui.focused_panel = PanelFocus::Worktrees;
 
-        assert!(!tui.git_action_enabled(GitAction::Push));
+        assert!(tui.git_action_enabled(GitAction::Push));
         assert!(!tui.git_action_enabled(GitAction::OpenPr));
         assert!(!tui.git_action_enabled(GitAction::Merge));
 
