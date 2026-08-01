@@ -851,7 +851,12 @@ fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
     let mut session = test_session(temp.join("worktree"), "feature");
     session.agent_state = AgentState::Running;
     session.opencode_status = Some(test_opencode_status(OpencodeState::Busy));
-    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    let mut config = test_config();
+    config.notifications.enabled = true;
+    let mut tui = Tui::new_single(repo, config, vec![session]);
+    let (notifier, notifications) = crate::desktop_notification::DesktopNotifier::recording();
+    tui.desktop_notifier = notifier;
+    tui.reseed_desktop_notifications();
 
     tui.opencode_poll_tx
         .send(OpencodePollResult {
@@ -885,6 +890,8 @@ fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
         OpencodeState::Done
     );
     assert_eq!(tui.sessions[0].agent_state, AgentState::ExitedOk);
+    tui.desktop_notifier.flush();
+    assert_eq!(notifications.lock().unwrap().len(), 1);
 
     tui.opencode_event_tx
         .send(OpencodeEventResult {
@@ -924,6 +931,8 @@ fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
         OpencodeState::Done
     );
     assert_eq!(tui.sessions[0].agent_state, AgentState::ExitedOk);
+    tui.desktop_notifier.flush();
+    assert_eq!(notifications.lock().unwrap().len(), 2);
 
     let _ = fs::remove_dir_all(temp);
 }
@@ -935,7 +944,12 @@ fn opencode_poll_does_not_mark_reconnected_running_session_done_before_completed
     let mut session = test_session(temp.join("worktree"), "feature");
     session.agent_state = AgentState::Running;
     session.opencode_status = Some(test_opencode_status(OpencodeState::Unknown));
-    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    let mut config = test_config();
+    config.notifications.enabled = true;
+    let mut tui = Tui::new_single(repo, config, vec![session]);
+    let (notifier, notifications) = crate::desktop_notification::DesktopNotifier::recording();
+    tui.desktop_notifier = notifier;
+    tui.reseed_desktop_notifications();
 
     tui.opencode_poll_tx
         .send(OpencodePollResult {
@@ -978,6 +992,8 @@ fn opencode_poll_does_not_mark_reconnected_running_session_done_before_completed
             .as_deref(),
         Some("MessageAbortedError")
     );
+    tui.desktop_notifier.flush();
+    assert!(notifications.lock().unwrap().is_empty());
 
     let _ = fs::remove_dir_all(temp);
 }
@@ -989,7 +1005,12 @@ fn opencode_permission_event_marks_session_as_needing_input() {
     let mut session = test_session(temp.join("worktree"), "feature");
     session.agent_state = AgentState::Running;
     session.opencode_status = Some(test_opencode_status(OpencodeState::Busy));
-    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    let mut config = test_config();
+    config.notifications.enabled = true;
+    let mut tui = Tui::new_single(repo, config, vec![session]);
+    let (notifier, notifications) = crate::desktop_notification::DesktopNotifier::recording();
+    tui.desktop_notifier = notifier;
+    tui.reseed_desktop_notifications();
 
     tui.opencode_event_tx
         .send(OpencodeEventResult {
@@ -1008,6 +1029,35 @@ fn opencode_permission_event_marks_session_as_needing_input() {
         OpencodeState::NeedsInput
     );
     assert_eq!(tui.sessions[0].agent_state, AgentState::NeedsInput);
+    tui.desktop_notifier.flush();
+    assert_eq!(
+        notifications.lock().unwrap().as_slice(),
+        ["repo: feature is waiting for input"]
+    );
+
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn opencode_event_from_stale_generation_is_rejected() {
+    let temp = unique_temp_dir("prism-opencode-stale-generation-test");
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut session = test_session(temp.join("worktree"), "feature");
+    session.agent_state = AgentState::Running;
+    session.opencode_status = Some(test_opencode_status(OpencodeState::Busy));
+    let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+    let mut stream = test_opencode_stream(&tui);
+    stream.generation = stream.generation.saturating_add(1);
+
+    assert!(!tui.apply_opencode_event_result(OpencodeEventResult {
+        stream,
+        received_at: Instant::now(),
+        event: Ok(parse_event_payload(
+            r#"{"type":"message.updated","properties":{"info":{"sessionID":"ses_1","role":"assistant","time":{"created":1,"completed":2},"finish":"stop"}}}"#,
+        )
+        .unwrap()),
+    }));
+    assert_eq!(tui.sessions[0].agent_state, AgentState::Running);
 
     let _ = fs::remove_dir_all(temp);
 }
