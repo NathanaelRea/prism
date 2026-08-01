@@ -22,6 +22,7 @@ use crate::{observability, workspace};
 const PROTOCOL_VERSION: u32 = 1;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const DAEMON_TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
 const GLOBAL_CONCURRENCY: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -54,11 +55,23 @@ impl DaemonHealth {
 }
 
 pub fn probe_health() -> Result<DaemonHealth, String> {
-    match health_response() {
-        Ok(response) => parse_health_response(&response),
-        Err(_) if !socket_path().exists() => Ok(DaemonHealth::stopped()),
-        Err(error) => Err(error),
-    }
+    probe_health_at(&socket_path())
+}
+
+fn probe_health_at(path: &Path) -> Result<DaemonHealth, String> {
+    let stream = match UnixStream::connect(path) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            return Ok(DaemonHealth::stopped());
+        }
+        Err(error) => return Err(format!("connect to Prism worker: {error}")),
+    };
+    parse_health_response(&request_on_stream(stream, "health")?)
 }
 
 fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
@@ -103,22 +116,8 @@ fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
 }
 
 pub fn ensure_running() -> Result<(), String> {
-    loop {
-        match probe_health() {
-            Ok(DaemonHealth {
-                state: DaemonState::Running,
-                ..
-            }) => return Ok(()),
-            Ok(DaemonHealth {
-                state: DaemonState::Draining,
-                ..
-            }) => thread::sleep(Duration::from_millis(25)),
-            Ok(DaemonHealth {
-                state: DaemonState::Stopped,
-                ..
-            })
-            | Err(_) => break,
-        }
+    if wait_for_existing_daemon(DAEMON_TRANSITION_TIMEOUT, probe_health)? {
+        return Ok(());
     }
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve Prism worker executable: {error}"))?;
@@ -131,7 +130,7 @@ pub fn ensure_running() -> Result<(), String> {
     )
     .map_err(|error| format!("start Prism worker daemon: {error}"))?;
 
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + DAEMON_TRANSITION_TIMEOUT;
     let mut last_error = "worker did not become ready".to_string();
     while Instant::now() < deadline {
         match health() {
@@ -141,6 +140,38 @@ pub fn ensure_running() -> Result<(), String> {
         thread::sleep(Duration::from_millis(25));
     }
     Err(last_error)
+}
+
+fn wait_for_existing_daemon(
+    timeout: Duration,
+    mut probe: impl FnMut() -> Result<DaemonHealth, String>,
+) -> Result<bool, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match probe() {
+            Ok(DaemonHealth {
+                state: DaemonState::Running,
+                ..
+            }) => return Ok(true),
+            Ok(DaemonHealth {
+                state: DaemonState::Draining,
+                active,
+                ..
+            }) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "timed out waiting for Prism worker daemon to finish draining ({active} active)"
+                    ));
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Ok(DaemonHealth {
+                state: DaemonState::Stopped,
+                ..
+            })
+            | Err(_) => return Ok(false),
+        }
+    }
 }
 
 pub fn wake() -> Result<(), String> {
@@ -160,17 +191,31 @@ pub fn shutdown() -> Result<(), String> {
     if !response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
         return Err(format!("Prism worker rejected shutdown: {response}"));
     }
+    wait_for_socket_to_close(&socket_path(), DAEMON_TRANSITION_TIMEOUT)
+}
+
+fn wait_for_socket_to_close(path: &Path, timeout: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
     loop {
-        if UnixStream::connect(socket_path()).is_err() {
-            return Ok(());
+        match fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(format!("inspect Prism worker socket: {error}")),
+            Ok(_) => {}
+        }
+        if Instant::now() >= deadline {
+            return Err("timed out waiting for Prism worker daemon to stop".to_string());
         }
         thread::sleep(Duration::from_millis(25));
     }
 }
 
 fn request(command: &str) -> Result<String, String> {
-    let mut stream = UnixStream::connect(socket_path())
+    let stream = UnixStream::connect(socket_path())
         .map_err(|error| format!("connect to Prism worker: {error}"))?;
+    request_on_stream(stream, command)
+}
+
+fn request_on_stream(mut stream: UnixStream, command: &str) -> Result<String, String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(1)))
         .map_err(|error| format!("configure Prism worker socket: {error}"))?;
@@ -768,6 +813,7 @@ pub fn socket_path() -> PathBuf {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn socket_and_lock_share_a_private_runtime_directory() {
@@ -809,6 +855,67 @@ mod tests {
                 Path::new("/fallback"),
             ),
             PathBuf::from("/override")
+        );
+    }
+
+    #[test]
+    fn probe_health_treats_a_stale_socket_as_stopped() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let runtime = std::env::temp_dir().join(format!(
+            "prism-worker-stale-socket-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&runtime).unwrap();
+        let socket = runtime.join("worker.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        drop(listener);
+
+        assert_eq!(probe_health_at(&socket).unwrap(), DaemonHealth::stopped());
+
+        fs::remove_file(socket).unwrap();
+        fs::remove_dir(runtime).unwrap();
+    }
+
+    #[test]
+    fn waiting_for_a_live_socket_to_close_times_out() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let runtime = std::env::temp_dir().join(format!(
+            "prism-worker-live-socket-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&runtime).unwrap();
+        let socket = runtime.join("worker.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+
+        assert_eq!(
+            wait_for_socket_to_close(&socket, Duration::ZERO),
+            Err("timed out waiting for Prism worker daemon to stop".to_string())
+        );
+
+        fs::remove_file(socket).unwrap();
+        fs::remove_dir(runtime).unwrap();
+    }
+
+    #[test]
+    fn waiting_for_a_draining_daemon_times_out() {
+        assert_eq!(
+            wait_for_existing_daemon(Duration::ZERO, || Ok(DaemonHealth {
+                state: DaemonState::Draining,
+                protocol_version: Some(PROTOCOL_VERSION),
+                instance_id: Some("test".to_string()),
+                pid: Some(std::process::id()),
+                active: 2,
+            })),
+            Err(
+                "timed out waiting for Prism worker daemon to finish draining (2 active)"
+                    .to_string()
+            )
         );
     }
 }
