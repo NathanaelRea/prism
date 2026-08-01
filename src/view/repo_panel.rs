@@ -47,6 +47,7 @@ pub(super) fn repo_overview_lines(
         crate::view::RepoMainView::Github => lines.extend(repo_github_panel_lines(
             model.config,
             &model.repo_prs,
+            width,
             remaining_rows,
         )),
         crate::view::RepoMainView::Kanban => lines.extend(kanban_panel_lines(
@@ -107,9 +108,10 @@ pub(super) fn repo_github_summary(
 pub(super) fn repo_github_panel_lines(
     config: &crate::config::Config,
     repo_prs: &[crate::view::RepoPrRow],
+    width: usize,
     visible_rows: usize,
 ) -> Vec<Line<'static>> {
-    let mut lines = repo_pr_table_lines(config, repo_prs, visible_rows);
+    let mut lines = repo_pr_table_lines(config, repo_prs, width, visible_rows);
     lines.truncate(visible_rows);
     lines
 }
@@ -117,22 +119,36 @@ pub(super) fn repo_github_panel_lines(
 pub(super) fn repo_pr_table_lines(
     _config: &crate::config::Config,
     repo_prs: &[crate::view::RepoPrRow],
+    width: usize,
     visible_rows: usize,
 ) -> Vec<Line<'static>> {
+    const PR_WIDTH: usize = 8;
+    const DETAIL_WIDTH: usize = 73;
+
     let open_prs = repo_prs
         .iter()
         .filter(|pr| !pr.merged && pr.state.eq_ignore_ascii_case("OPEN"))
         .collect::<Vec<_>>();
-    let mut lines = vec![Line::from(vec![
-        Span::styled(format!("{:<8}", "PR"), muted_style()),
-        Span::styled(format!("{:<13}", "repo"), muted_style()),
-        Span::styled(format!("{:<9}", "ci"), muted_style()),
-        Span::styled(format!("{:<10}", "review"), muted_style()),
-        Span::styled(format!("{:<13}", "author"), muted_style()),
-        Span::styled(format!("{:<16}", "requested"), muted_style()),
-        Span::styled(format!("{:<4}", "wt"), muted_style()),
-        Span::styled("title", muted_style()),
-    ])];
+    let detailed = width > DETAIL_WIDTH;
+    let mut header = vec![Span::styled(format!("{:<PR_WIDTH$}", "PR"), muted_style())];
+    if detailed {
+        header.extend([
+            Span::styled(format!("{:<13}", "repo"), muted_style()),
+            Span::styled(format!("{:<9}", "ci"), muted_style()),
+            Span::styled(format!("{:<10}", "review"), muted_style()),
+            Span::styled(format!("{:<13}", "author"), muted_style()),
+            Span::styled(format!("{:<16}", "requested"), muted_style()),
+            Span::styled(format!("{:<4}", "wt"), muted_style()),
+        ]);
+    }
+    let prefix_width = if detailed { DETAIL_WIDTH } else { PR_WIDTH };
+    if width > prefix_width {
+        header.push(Span::styled(
+            truncate_to_width("title", width - prefix_width),
+            muted_style(),
+        ));
+    }
+    let mut lines = vec![Line::from(header)];
     if open_prs.is_empty() {
         lines.push(Line::from(Span::styled(
             "No open pull requests discovered",
@@ -153,56 +169,93 @@ pub(super) fn repo_pr_table_lines(
             pr.requested_reviewers.join(",")
         };
         let wt = if pr.has_worktree { "yes" } else { "no" };
-        lines.push(Line::from(vec![
-            Span::styled(
-                fixed_cell(&pr_cell, 8),
-                if pr.selected {
-                    title_style(true)
-                } else {
-                    muted_style()
-                },
-            ),
-            Span::styled(fixed_cell(&pr.repo_label, 13), muted_style()),
-            Span::styled(
-                fixed_cell(&pr.check_status, 9),
-                pr_check_style(&pr.check_status),
-            ),
-            Span::styled(
-                fixed_cell(&review, 10),
-                review_color_style(&pr.review_decision),
-            ),
-            Span::styled(fixed_cell(&empty_label(&pr.author), 13), muted_style()),
-            Span::styled(
-                fixed_cell(&requested, 16),
-                if pr.requested_reviewers.is_empty() {
-                    muted_style()
-                } else {
-                    attention_style()
-                },
-            ),
-            Span::styled(fixed_cell(wt, 4), muted_style()),
-            Span::styled(
-                pr.title.clone(),
+        let mut spans = vec![Span::styled(
+            fixed_cell(&pr_cell, PR_WIDTH),
+            if pr.selected {
+                title_style(true)
+            } else {
+                muted_style()
+            },
+        )];
+        if detailed {
+            spans.extend([
+                Span::styled(fixed_cell(&pr.repo_label, 13), muted_style()),
+                Span::styled(
+                    fixed_cell(&pr.check_status, 9),
+                    pr_check_style(&pr.check_status),
+                ),
+                Span::styled(
+                    fixed_cell(&review, 10),
+                    review_color_style(&pr.review_decision),
+                ),
+                Span::styled(fixed_cell(&empty_label(&pr.author), 13), muted_style()),
+                Span::styled(
+                    fixed_cell(&requested, 16),
+                    if pr.requested_reviewers.is_empty() {
+                        muted_style()
+                    } else {
+                        attention_style()
+                    },
+                ),
+                Span::styled(fixed_cell(wt, 4), muted_style()),
+            ]);
+        }
+        let remaining = width.saturating_sub(prefix_width);
+        if remaining > 0 {
+            let title = truncate_to_width(&pr.title, remaining);
+            let title_width = Span::raw(title.as_str()).width();
+            spans.push(Span::styled(
+                title,
                 if pr.selected {
                     selected_text_style()
                 } else {
                     Style::default()
                 },
-            ),
-            Span::styled(
-                format!(
-                    "  {} -> {}  #{}",
-                    pr.head_ref, pr.base_ref, pr.comment_count
-                ),
-                muted_style(),
-            ),
-        ]));
+            ));
+            let suffix_width = remaining.saturating_sub(title_width);
+            if detailed && suffix_width > 0 {
+                spans.push(Span::styled(
+                    truncate_to_width(
+                        &format!(
+                            "  {} -> {}  #{}",
+                            pr.head_ref, pr.base_ref, pr.comment_count
+                        ),
+                        suffix_width,
+                    ),
+                    muted_style(),
+                ));
+            }
+        }
+        lines.push(Line::from(spans));
     }
     lines
 }
 
 fn fixed_cell(value: &str, width: usize) -> String {
-    format!("{:<width$}", truncate(value, width.saturating_sub(1)))
+    let value = truncate_to_width(value, width.saturating_sub(1));
+    let padding = width.saturating_sub(Span::raw(value.as_str()).width());
+    format!("{value}{}", " ".repeat(padding))
+}
+
+fn truncate_to_width(value: &str, max_width: usize) -> String {
+    if Span::raw(value).width() <= max_width {
+        return value.to_string();
+    }
+    if max_width <= 1 {
+        return "~".to_string();
+    }
+    let mut result = String::new();
+    let mut width = 0;
+    for ch in value.chars() {
+        let ch_width = Span::raw(ch.to_string()).width();
+        if width + ch_width > max_width - 1 {
+            break;
+        }
+        result.push(ch);
+        width += ch_width;
+    }
+    result.push('~');
+    result
 }
 
 fn empty_label(value: &str) -> String {
