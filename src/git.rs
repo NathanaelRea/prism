@@ -111,21 +111,18 @@ fn default_base(repo: &Repository, config: &Config) -> Option<String> {
     config
         .default_base
         .clone()
-        .or_else(|| local_branch_exists(repo, config, "main").then(|| "main".to_string()))
-        .or_else(|| local_branch_exists(repo, config, "master").then(|| "master".to_string()))
+        .or_else(|| local_branch_exists(&repo.root, config, "main").then(|| "main".to_string()))
+        .or_else(|| local_branch_exists(&repo.root, config, "master").then(|| "master".to_string()))
 }
 
-fn local_branch_exists(repo: &Repository, config: &Config, branch: &str) -> bool {
+fn local_branch_exists(path: &std::path::Path, config: &Config, branch: &str) -> bool {
     run_output_allow_failure(
-        Command::new(config.tool("git"))
-            .arg("-C")
-            .arg(&repo.root)
-            .args([
-                "show-ref",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ]),
+        Command::new(config.tool("git")).arg("-C").arg(path).args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ]),
         ProcessPolicy::Metadata,
     )
     .map(|output| output.status.success())

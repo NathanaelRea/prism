@@ -138,6 +138,9 @@ pub(crate) fn fetch_change_request_branch(
     let destination_ref = format!("refs/heads/{branch}");
     validate_git_ref(path, config, &destination_ref)?;
     let destination_old_oid = read_git_ref_or_zero(path, config, &destination_ref)?;
+    if destination_old_oid != "0000000000000000000000000000000000000000" {
+        return Ok(());
+    }
     let mut configured = Vec::new();
     for remote_name in ["origin", "upstream"] {
         if let Ok(remote) = discover_git_remote(path, config, remote_name, RemoteUrlKind::Fetch) {
@@ -2668,7 +2671,7 @@ exit 1
 
     #[cfg(unix)]
     #[test]
-    fn existing_destination_branch_is_published_with_its_observed_old_oid() {
+    fn existing_destination_branch_is_preserved() {
         let directory = std::env::temp_dir().join(format!(
             "prism-fetch-existing-{}-{}",
             std::process::id(),
@@ -2692,10 +2695,6 @@ case "$*" in
   *"remote get-url upstream"*) exit 2 ;;
   *"check-ref-format"*) exit 0 ;;
   *"rev-parse --verify refs/heads/pr/42"*) printf '%s\n' '1111111111111111111111111111111111111111'; exit 0 ;;
-  *"fetch origin"*) exit 0 ;;
-  *"rev-parse --verify refs/prism/change-requests/"*) printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; exit 0 ;;
-  *"update-ref refs/heads/pr/42 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1111111111111111111111111111111111111111"*) exit 0 ;;
-  *"update-ref -d refs/prism/change-requests/"*) exit 0 ;;
 esac
 exit 1
 "#,
@@ -2706,9 +2705,8 @@ exit 1
         fetch_change_request_branch(&directory, &config, &legacy_summary(), "pr/42").unwrap();
 
         let commands = std::fs::read_to_string(&log).unwrap();
-        assert!(commands.contains(
-            "update-ref refs/heads/pr/42 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1111111111111111111111111111111111111111"
-        ));
+        assert!(!commands.contains("fetch origin"));
+        assert!(!commands.contains("update-ref refs/heads/pr/42"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
@@ -2737,7 +2735,7 @@ case "$*" in
   *"remote get-url origin"*) printf '%s\n' 'https://github.com/example/repo.git'; exit 0 ;;
   *"remote get-url upstream"*) exit 2 ;;
   *"check-ref-format"*) exit 0 ;;
-  *"rev-parse --verify refs/heads/pr/42"*) printf '%s\n' '1111111111111111111111111111111111111111'; exit 0 ;;
+  *"rev-parse --verify refs/heads/pr/42"*) exit 1 ;;
   *"fetch origin"*) exit 0 ;;
   *"rev-parse --verify refs/prism/change-requests/"*) printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; exit 0 ;;
   *"update-ref refs/heads/pr/42 "*) printf '%s\n' 'cannot lock ref: is at raced oid' >&2; exit 1 ;;
@@ -2755,7 +2753,7 @@ exit 1
         assert!(error.contains("update-ref"));
         let commands = std::fs::read_to_string(&log).unwrap();
         assert!(commands.contains(
-            "update-ref refs/heads/pr/42 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 1111111111111111111111111111111111111111"
+            "update-ref refs/heads/pr/42 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 0000000000000000000000000000000000000000"
         ));
         assert!(commands.contains("update-ref -d refs/prism/change-requests/"));
         std::fs::remove_dir_all(directory).unwrap();

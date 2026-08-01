@@ -44,19 +44,8 @@ pub(super) fn remote_pr_choice_keys() -> Vec<String> {
         .collect()
 }
 
-pub(super) fn remote_pr_worktree_branch(number: u64) -> String {
-    format!("pr/{number}")
-}
-
-fn remote_pr_worktree_branch_for_summary(summary: &crate::remote::PrSummary) -> String {
-    let Some(identity) = summary.change_request_identity.as_ref() else {
-        return remote_pr_worktree_branch(summary.number);
-    };
-    format!(
-        "pr/{}-{:08x}",
-        summary.number,
-        identity.stable_hash() as u32
-    )
+pub(super) fn remote_pr_worktree_branch(head_ref: &str) -> String {
+    head_ref.to_string()
 }
 
 fn remote_pr_choice_label(summary: &crate::remote::PrSummary) -> String {
@@ -384,7 +373,7 @@ impl Tui {
             return Ok(Some(index));
         }
 
-        let branch = remote_pr_worktree_branch_for_summary(&summary);
+        let branch = remote_pr_worktree_branch(&summary.head_ref);
         let path = context.repo.root.clone();
         let config = context.config.clone();
         let job_summary = summary.clone();
@@ -467,7 +456,7 @@ impl Tui {
         }) {
             return Some(index);
         }
-        let branch = remote_pr_worktree_branch_for_summary(summary);
+        let branch = remote_pr_worktree_branch(&summary.head_ref);
         let index = self.sessions.iter().position(|session| {
             !session.hidden && session.repo_index == repo_index && session.branch == branch
         })?;
