@@ -170,6 +170,7 @@ impl Tui {
             self.opencode_listeners.insert(target.stream.clone());
             let stream = target.stream;
             let listener_url = stream.server_url.clone();
+            let listener_directory = stream.worktree.path.clone();
             let job_stream = stream.clone();
             self.spawn_tui_job(
                 TuiJobKind::OpencodeListener,
@@ -185,6 +186,7 @@ impl Tui {
                         }
                         let result = opencode::listen_classified_events_until(
                             &listener_url,
+                            &listener_directory,
                             || context.is_canceled(),
                             |event, snapshot_facet| {
                                 let facet = match snapshot_facet {
