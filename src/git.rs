@@ -7,6 +7,112 @@ use crate::process::{
 };
 use crate::repo::Repository;
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct GitStatus {
+    pub dirty: usize,
+    pub ahead: usize,
+    pub behind: usize,
+    pub conflicts: usize,
+    pub operation: Option<String>,
+    pub error: Option<String>,
+}
+
+impl GitStatus {
+    pub fn label(&self) -> String {
+        if let Some(error) = &self.error {
+            return format!("error:{error}");
+        }
+        let mut parts = Vec::new();
+        if self.dirty > 0 {
+            parts.push(format!("dirty:{}", self.dirty));
+        }
+        if self.ahead > 0 {
+            parts.push(format!("ahead:{}", self.ahead));
+        }
+        if self.behind > 0 {
+            parts.push(format!("behind:{}", self.behind));
+        }
+        if self.conflicts > 0 {
+            parts.push(format!("conflicts:{}", self.conflicts));
+        }
+        if let Some(operation) = &self.operation {
+            parts.push(operation.clone());
+        }
+        if parts.is_empty() {
+            "clean".to_string()
+        } else {
+            parts.join(" ")
+        }
+    }
+}
+
+pub fn inspect_status(path: &std::path::Path, config: &Config) -> GitStatus {
+    let output = run_capture(
+        Command::new(config.tool("git"))
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .arg("-C")
+            .arg(path)
+            .args(["status", "--porcelain=v1", "--branch"]),
+        ProcessPolicy::Metadata,
+    );
+    let mut status = match output {
+        Ok(output) => parse_git_status(&output),
+        Err(error) => GitStatus {
+            error: Some(error),
+            ..GitStatus::default()
+        },
+    };
+    for (name, marker) in [
+        ("merge", "MERGE_HEAD"),
+        ("rebase", "rebase-merge"),
+        ("rebase", "rebase-apply"),
+        ("cherry_pick", "CHERRY_PICK_HEAD"),
+    ] {
+        if git_path_exists(path, config, marker) {
+            status.operation = Some(name.to_string());
+            break;
+        }
+    }
+    status
+}
+
+fn parse_git_status(output: &str) -> GitStatus {
+    let mut status = GitStatus::default();
+    for line in output.lines() {
+        if let Some(branch) = line.strip_prefix("## ") {
+            status.ahead = parse_branch_count(branch, "ahead").unwrap_or(0);
+            status.behind = parse_branch_count(branch, "behind").unwrap_or(0);
+        } else if line.len() >= 2 {
+            status.dirty += 1;
+            if matches!(&line[..2], "DD" | "AU" | "UD" | "UA" | "DU" | "AA" | "UU") {
+                status.conflicts += 1;
+            }
+        }
+    }
+    status
+}
+
+fn git_path_exists(path: &std::path::Path, config: &Config, marker: &str) -> bool {
+    run_capture(
+        Command::new(config.tool("git"))
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .arg("-C")
+            .arg(path)
+            .args(["rev-parse", "--git-path", marker]),
+        ProcessPolicy::Metadata,
+    )
+    .map(|value| {
+        let value = std::path::PathBuf::from(value.trim());
+        let value = if value.is_absolute() {
+            value
+        } else {
+            path.join(value)
+        };
+        value.exists()
+    })
+    .unwrap_or(false)
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct RepositoryCheckout {
     pub current_branch: Option<String>,
@@ -30,6 +136,7 @@ pub(crate) fn inspect_repository_checkout(
 pub fn git_status_label(path: &std::path::Path, config: &Config) -> String {
     match run_capture(
         Command::new(config.tool("git"))
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .arg("-C")
             .arg(path)
             .args(["status", "--short", "--branch"]),
@@ -83,6 +190,7 @@ fn parse_branch_count(branch: &str, key: &str) -> Option<usize> {
 pub fn worktree_dirty(repo: &Repository, config: &Config) -> Result<bool, String> {
     let status = run_capture(
         Command::new(config.tool("git"))
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .arg("-C")
             .arg(&repo.root)
             .args(["status", "--short"]),

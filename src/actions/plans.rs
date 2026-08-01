@@ -554,13 +554,21 @@ impl Tui {
             return Ok(true);
         };
         if answer == "a" {
-            crate::observability::with_writable_db(&repo, |conn| {
-                let mut run = load_plan_run(conn, &run_id)?
-                    .ok_or_else(|| format!("plan run not found: {run_id}"))?;
-                abort_plan_run(conn, &mut run)
-            })?;
+            let receipt = crate::workspace_state::control_repository_workflow(
+                &repo,
+                crate::workspace_state::ControlAction::Stop,
+                "plan",
+                &run_id,
+            )?;
             self.load_plan_run_snapshot(&repo.root, &run_id);
-            self.show_message("abort requested for plan run")?;
+            if receipt.warnings.is_empty() {
+                self.show_message("abort requested for plan run")?;
+            } else {
+                self.show_message(&format!(
+                    "abort requested for plan run with warnings: {}",
+                    receipt.warnings.join("; ")
+                ))?;
+            }
             return Ok(true);
         }
         crate::observability::with_writable_db(&repo, |conn| {
@@ -715,31 +723,28 @@ impl Tui {
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
-        let config = Config::load(&repo);
         let run_id = dashboard.run.run.id.clone();
-        let mut should_execute = false;
-        let persisted = crate::observability::with_writable_db(&repo, |conn| {
-            let mut run = load_plan_run(conn, &run_id)?
-                .ok_or_else(|| format!("plan run not found: {run_id}"))?;
-            if run.run.pause_requested || run.run.status == PlanRunStatus::Paused {
-                resume_paused_plan_run(conn, &mut run)?;
-                should_execute =
-                    prepare_plan_run_for_resume(conn, &mut run, DEFAULT_OUTPUT_LINES_PER_STEP)?;
-            } else {
-                request_plan_run_pause(conn, &mut run)?;
-            }
-            Ok(run)
-        })?;
-        self.remember_plan_run(persisted.clone());
-        if persisted.run.pause_requested || persisted.run.status == PlanRunStatus::Paused {
+        let resuming =
+            dashboard.run.run.pause_requested || dashboard.run.run.status == PlanRunStatus::Paused;
+        let action = if resuming {
+            crate::workspace_state::ControlAction::Resume
+        } else {
+            crate::workspace_state::ControlAction::Pause
+        };
+        let receipt =
+            crate::workspace_state::control_repository_workflow(&repo, action, "plan", &run_id)?;
+        self.load_plan_run_snapshot(&repo.root, &run_id);
+        if !resuming {
             self.show_message("plan run will pause before the next phase")?;
             return Ok(true);
         }
-        if should_execute {
-            self.spawn_plan_run_executor(repo, config, persisted)?;
+        if receipt.warnings.is_empty() {
             self.show_message("resumed plan run")?;
         } else {
-            self.show_message("plan run is already running")?;
+            self.show_message(&format!(
+                "resumed plan run with warnings: {}",
+                receipt.warnings.join("; ")
+            ))?;
         }
         Ok(true)
     }

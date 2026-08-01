@@ -163,6 +163,131 @@ fn version_prints_package_version_without_repo() {
 }
 
 #[test]
+fn list_json_inspects_git_without_creating_prism_state() {
+    let temp = TempDir::new("list-json-readonly");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+    fs::write(repo.join("untracked.txt"), "dirty\n").unwrap();
+
+    let output = run(["list", "--json"], &repo, &config_home);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["repositories"][0]["root"], canonical_display(&repo));
+    assert_eq!(value["repositories"][0]["worktrees"][0]["git"]["dirty"], 1);
+    assert!(!contains_file_named(&config_home, "prism.db"));
+    assert!(!contains_file_named(&config_home, "run-markers"));
+}
+
+#[test]
+fn status_defaults_to_current_worktree() {
+    let temp = TempDir::new("status-current-worktree");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+
+    let output = run(["status"], &repo, &config_home);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains(&format!("worktree = {}", canonical_display(&repo))));
+    assert!(!contains_file_named(&config_home, "prism.db"));
+}
+
+#[test]
+fn daemon_status_reports_stopped_without_starting_it() {
+    let temp = TempDir::new("daemon-status-stopped");
+    let output = prism()
+        .args(["daemon", "status", "--json"])
+        .current_dir(temp.path())
+        .env("XDG_CONFIG_HOME", temp.path())
+        .env("HOME", temp.path())
+        .env("XDG_RUNTIME_DIR", temp.path())
+        .output()
+        .expect("run daemon status");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(value["daemon"]["state"], "stopped");
+}
+
+#[test]
+fn list_and_control_project_and_mutate_managed_plan_state() {
+    let temp = TempDir::new("managed-plan-control");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+    let repo = fs::canonicalize(repo).unwrap();
+    let path_output = run(["db", "path"], &repo, &config_home);
+    assert!(path_output.status.success(), "{}", stderr(&path_output));
+    let db_path = stdout(&path_output).trim().to_string();
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "insert into plan_run (
+           id, harness_id, adapter_id, repo_root, scope_path, plan_path, plan_display,
+           step_name, start_step, total_steps, mode, status, pause_requested,
+           selected_step, created_unix_ms, updated_unix_ms
+         ) values ('plan-control-12345678', 'opencode', 'opencode', ?1, ?1, ?2,
+                   'plan.md', 'phase', 1, 2, 'sequential', 'queued', 0, 1, 10, 20)",
+        rusqlite::params![
+            repo.display().to_string(),
+            repo.join("plan.md").display().to_string()
+        ],
+    )
+    .unwrap();
+    for step in 1..=2 {
+        conn.execute(
+            "insert into plan_step_run (run_id, step, prompt, status, todos_json)
+             values ('plan-control-12345678', ?1, 'prompt', 'queued', '[]')",
+            [step],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "insert into workflow_execution (
+           workflow_kind, run_id, dispatch_state, fencing_token,
+           interruption_generation, created_unix_ms, updated_unix_ms
+         ) values ('plan', 'plan-control-12345678', 'queued', 0, 0, 10, 20)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let listed = run(["list", "--json"], &repo, &config_home);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&listed)).unwrap();
+    assert_eq!(
+        value["repositories"][0]["workflows"][0]["identity"]["run_id"],
+        "plan-control-12345678"
+    );
+    assert_eq!(
+        value["repositories"][0]["workflows"][0]["dispatch"]["state"],
+        "queued"
+    );
+
+    let paused = run(["pause", "plan:plan-control-12345678"], &repo, &config_home);
+    assert!(paused.status.success(), "{}", stderr(&paused));
+    assert!(stdout(&paused).contains("state = paused"));
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let state: (String, i64, String) = conn
+        .query_row(
+            "select p.status, p.pause_requested, e.dispatch_state
+         from plan_run p join workflow_execution e on e.run_id = p.id
+         where p.id = 'plan-control-12345678'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(state, ("paused".to_string(), 1, "paused".to_string()));
+    drop(conn);
+
+    let stopped = run(["stop", "p:plan-con"], &repo, &config_home);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    assert!(stdout(&stopped).contains("state = aborted"));
+}
+
+#[test]
 fn config_prints_effective_repo_config() {
     let temp = TempDir::new("config");
     let repo = temp.path().join("repo");

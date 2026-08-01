@@ -28,6 +28,32 @@ pub enum CommandKind {
     Debug(DebugCommand),
     Db(DbCommand),
     Worker(WorkerCommand),
+    List(InspectOptions),
+    Status(StatusOptions),
+    Pause(Option<String>),
+    Resume(Option<String>),
+    Stop(Option<String>),
+    Recover(Option<String>),
+    Daemon(DaemonCommand),
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct InspectOptions {
+    pub all: bool,
+    pub json: bool,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct StatusOptions {
+    pub selector: Option<String>,
+    pub json: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum DaemonCommand {
+    Status { json: bool },
+    Start,
+    Stop,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -275,6 +301,80 @@ impl Args {
                     command = CommandKind::Worker(worker_command);
                     break;
                 }
+                "list" => {
+                    let mut options = InspectOptions::default();
+                    for flag in iter.by_ref() {
+                        match flag.to_string_lossy().as_ref() {
+                            "--all" => options.all = true,
+                            "--json" => options.json = true,
+                            other => return Err(format!("unknown list argument: {other}")),
+                        }
+                    }
+                    command = CommandKind::List(options);
+                    break;
+                }
+                "status" => {
+                    let mut options = StatusOptions::default();
+                    for value in iter.by_ref() {
+                        let value = value.to_string_lossy().to_string();
+                        if value == "--json" {
+                            options.json = true;
+                        } else if options.selector.is_none() {
+                            options.selector = Some(value);
+                        } else {
+                            return Err(format!("unknown status argument: {value}"));
+                        }
+                    }
+                    command = CommandKind::Status(options);
+                    break;
+                }
+                "pause" | "resume" | "stop" | "recover" => {
+                    let name = text.into_owned();
+                    let selector = iter.next().map(|value| value.to_string_lossy().to_string());
+                    if let Some(extra) = iter.next() {
+                        return Err(format!(
+                            "unknown {name} argument: {}",
+                            extra.to_string_lossy()
+                        ));
+                    }
+                    command = match name.as_str() {
+                        "pause" => CommandKind::Pause(selector),
+                        "resume" => CommandKind::Resume(selector),
+                        "stop" => CommandKind::Stop(selector),
+                        _ => CommandKind::Recover(selector),
+                    };
+                    break;
+                }
+                "daemon" => {
+                    let subcommand = iter
+                        .next()
+                        .ok_or_else(|| "daemon requires a subcommand".to_string())?;
+                    command = match subcommand.to_string_lossy().as_ref() {
+                        "status" => {
+                            let json = match iter.next() {
+                                None => false,
+                                Some(flag) if flag == "--json" => true,
+                                Some(flag) => {
+                                    return Err(format!(
+                                        "unknown daemon status argument: {}",
+                                        flag.to_string_lossy()
+                                    ));
+                                }
+                            };
+                            CommandKind::Daemon(DaemonCommand::Status { json })
+                        }
+                        "start" => CommandKind::Daemon(DaemonCommand::Start),
+                        "stop" => CommandKind::Daemon(DaemonCommand::Stop),
+                        other => return Err(format!("unknown daemon subcommand: {other}")),
+                    };
+                    if let Some(extra) = iter.next() {
+                        return Err(format!(
+                            "unknown daemon argument: {}",
+                            extra.to_string_lossy()
+                        ));
+                    }
+                    break;
+                }
                 "-h" | "--help" => command = CommandKind::Help,
                 "--version" => command = CommandKind::Version,
                 other => return Err(format!("unknown argument: {other}")),
@@ -292,7 +392,7 @@ impl Args {
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config [show|example|schema|paths]\n  prism [--repo <path>] agent ensure --branch <branch>\n  prism [--repo <path>] auto [prompt]\n  prism [--repo <path>] auto run-plan <plan.md>\n  prism [--repo <path>] auto plan [prompt]\n  prism [--repo <path>] auto plan-first [prompt]\n  prism [--repo <path>] auto intensive [prompt]\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup|integrity\n  prism [--repo <path>] debug record [--before <seconds>] [--after <seconds>]\n  prism [--repo <path>] debug --help\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n  prism [--repo <path>] db --help\n\nDebugging:\n  Use `debug record` while Prism is running to capture its in-memory flight recorder,\n  `debug paths` to find Prism state, `debug logs` to tail the runtime log, and\n  `debug integrity` for read-only database checks. Use `db path` or\n  `db <read-only-sql>` to inspect persisted repo state.\n  Use `--print-logs --log-level trace` to print detailed subprocess logs.\n\nAliases:\n  auto plan-first and auto intensive are aliases for auto plan."
+    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] list [--all] [--json]\n  prism [--repo <path>] status [<selector>] [--json]\n  prism [--repo <path>] pause|resume|stop [<workflow-selector>]\n  prism [--repo <path>] recover [<workflow-selector>]\n  prism daemon status [--json]\n  prism daemon start|stop\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config [show|example|schema|paths]\n  prism [--repo <path>] agent ensure --branch <branch>\n  prism [--repo <path>] auto [prompt]\n  prism [--repo <path>] auto run-plan <plan.md>\n  prism [--repo <path>] auto plan [prompt]\n  prism [--repo <path>] auto plan-first [prompt]\n  prism [--repo <path>] auto intensive [prompt]\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup|integrity\n  prism [--repo <path>] debug record [--before <seconds>] [--after <seconds>]\n  prism [--repo <path>] debug --help\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n  prism [--repo <path>] db --help\n\nSelectors:\n  a:<short-id>, p:<short-id>, auto:<full-id>, plan:<full-id>, repo:<name>,\n  wt:<branch>, or an absolute repository/worktree path.\n\nDebugging:\n  Use `debug record` while Prism is running to capture its in-memory flight recorder,\n  `debug paths` to find Prism state, `debug logs` to tail the runtime log, and\n  `debug integrity` for read-only database checks. Use `db path` or\n  `db <read-only-sql>` to inspect persisted repo state.\n  Use `--print-logs --log-level trace` to print detailed subprocess logs.\n\nAliases:\n  auto plan-first and auto intensive are aliases for auto plan."
 }
 
 pub fn debug_help_text() -> &'static str {
@@ -447,6 +547,50 @@ mod tests {
         ] {
             assert_eq!(parse(&["worker", name]), CommandKind::Worker(expected));
         }
+    }
+
+    #[test]
+    fn inspection_and_control_commands_parse() {
+        assert_eq!(
+            parse(&["list", "--all", "--json"]),
+            CommandKind::List(InspectOptions {
+                all: true,
+                json: true
+            })
+        );
+        assert_eq!(
+            parse(&["status", "a:12345678", "--json"]),
+            CommandKind::Status(StatusOptions {
+                selector: Some("a:12345678".to_string()),
+                json: true
+            })
+        );
+        assert_eq!(parse(&["pause"]), CommandKind::Pause(None));
+        assert_eq!(
+            parse(&["resume", "p:12345678"]),
+            CommandKind::Resume(Some("p:12345678".to_string()))
+        );
+        assert_eq!(
+            parse(&["stop", "auto:run-1"]),
+            CommandKind::Stop(Some("auto:run-1".to_string()))
+        );
+        assert_eq!(parse(&["recover"]), CommandKind::Recover(None));
+    }
+
+    #[test]
+    fn daemon_commands_parse() {
+        assert_eq!(
+            parse(&["daemon", "status", "--json"]),
+            CommandKind::Daemon(DaemonCommand::Status { json: true })
+        );
+        assert_eq!(
+            parse(&["daemon", "start"]),
+            CommandKind::Daemon(DaemonCommand::Start)
+        );
+        assert_eq!(
+            parse(&["daemon", "stop"]),
+            CommandKind::Daemon(DaemonCommand::Stop)
+        );
     }
 
     #[test]

@@ -24,9 +24,101 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const GLOBAL_CONCURRENCY: usize = 4;
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DaemonState {
+    Running,
+    Draining,
+    Stopped,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct DaemonHealth {
+    pub state: DaemonState,
+    pub protocol_version: Option<u32>,
+    pub instance_id: Option<String>,
+    pub pid: Option<u32>,
+    pub active: usize,
+}
+
+impl DaemonHealth {
+    pub fn stopped() -> Self {
+        Self {
+            state: DaemonState::Stopped,
+            protocol_version: None,
+            instance_id: None,
+            pid: None,
+            active: 0,
+        }
+    }
+}
+
+pub fn probe_health() -> Result<DaemonHealth, String> {
+    match health_response() {
+        Ok(response) => parse_health_response(&response),
+        Err(_) if !socket_path().exists() => Ok(DaemonHealth::stopped()),
+        Err(error) => Err(error),
+    }
+}
+
+fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
+    let mut fields = response.split_whitespace();
+    if fields.next() != Some("ok") {
+        return Err(format!("invalid Prism daemon response: {response}"));
+    }
+    let version = fields
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| format!("invalid Prism daemon protocol: {response}"))?;
+    if version != PROTOCOL_VERSION {
+        return Err(format!("incompatible Prism daemon protocol {version}"));
+    }
+    let instance_id = fields
+        .next()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("missing Prism daemon instance ID: {response}"))?;
+    let mut pid: Option<u32> = None;
+    let mut state = None;
+    let mut active = None;
+    for field in fields {
+        if let Some(value) = field.strip_prefix("pid=") {
+            pid = value.parse().ok();
+        } else if let Some(value) = field.strip_prefix("state=") {
+            state = Some(match value {
+                "running" => DaemonState::Running,
+                "draining" => DaemonState::Draining,
+                _ => return Err(format!("unknown Prism daemon state: {value}")),
+            });
+        } else if let Some(value) = field.strip_prefix("active=") {
+            active = value.parse().ok();
+        }
+    }
+    Ok(DaemonHealth {
+        state: state.ok_or_else(|| format!("missing Prism daemon state: {response}"))?,
+        protocol_version: Some(version),
+        instance_id: Some(instance_id.to_string()),
+        pid: Some(pid.ok_or_else(|| format!("missing Prism daemon PID: {response}"))?),
+        active: active.ok_or_else(|| format!("missing Prism daemon active count: {response}"))?,
+    })
+}
+
 pub fn ensure_running() -> Result<(), String> {
-    if health().is_ok() {
-        return Ok(());
+    loop {
+        match probe_health() {
+            Ok(DaemonHealth {
+                state: DaemonState::Running,
+                ..
+            }) => return Ok(()),
+            Ok(DaemonHealth {
+                state: DaemonState::Draining,
+                ..
+            }) => thread::sleep(Duration::from_millis(25)),
+            Ok(DaemonHealth {
+                state: DaemonState::Stopped,
+                ..
+            })
+            | Err(_) => break,
+        }
     }
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve Prism worker executable: {error}"))?;
@@ -56,13 +148,7 @@ pub fn wake() -> Result<(), String> {
 }
 
 pub fn health() -> Result<(), String> {
-    let response = health_response()?;
-    let expected = format!("ok {PROTOCOL_VERSION} ");
-    if response.starts_with(&expected) {
-        Ok(())
-    } else {
-        Err(format!("incompatible Prism worker response: {response}"))
-    }
+    parse_health_response(&health_response()?).map(|_| ())
 }
 
 pub fn health_response() -> Result<String, String> {
@@ -74,14 +160,12 @@ pub fn shutdown() -> Result<(), String> {
     if !response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
         return Err(format!("Prism worker rejected shutdown: {response}"));
     }
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline {
+    loop {
         if UnixStream::connect(socket_path()).is_err() {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(25));
     }
-    Err("Prism worker did not shut down before the timeout".to_string())
 }
 
 fn request(command: &str) -> Result<String, String> {
