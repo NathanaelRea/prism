@@ -42,6 +42,12 @@ opencode_plan_plugin = false
 [ui]
 icon_style = "unicode" # or "nerd-font"
 
+[notifications]
+enabled = false
+needs_input = true
+completed = true
+failed = true
+
 [worktrees]
 columns = []
 
@@ -132,6 +138,25 @@ pub struct AutoConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LayoutConfig {
     pub sidebar_width: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotificationConfig {
+    pub enabled: bool,
+    pub needs_input: bool,
+    pub completed: bool,
+    pub failed: bool,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            needs_input: true,
+            completed: true,
+            failed: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -254,6 +279,7 @@ pub struct Config {
     pub icon_style_configured: bool,
     pub auto: AutoConfig,
     pub layout: LayoutConfig,
+    pub notifications: NotificationConfig,
     pub checks: Checks,
     pub worktree_columns: Vec<String>,
     pub tools: BTreeMap<String, String>,
@@ -283,6 +309,7 @@ struct RawConfig {
     checks: Option<RawChecks>,
     auto: Option<RawAutoConfig>,
     layout: Option<RawLayoutConfig>,
+    notifications: Option<RawNotificationConfig>,
     worktrees: Option<RawWorktrees>,
     tools: Option<BTreeMap<String, String>>,
     agents: Option<BTreeMap<String, RawAgentConfig>>,
@@ -321,6 +348,14 @@ struct RawAutoConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 struct RawLayoutConfig {
     sidebar_width: Option<u16>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct RawNotificationConfig {
+    enabled: Option<bool>,
+    needs_input: Option<bool>,
+    completed: Option<bool>,
+    failed: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -612,6 +647,7 @@ impl Config {
             icon_style_configured: false,
             auto: AutoConfig::default(),
             layout: LayoutConfig::default(),
+            notifications: NotificationConfig::default(),
             checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools,
@@ -782,6 +818,20 @@ impl Config {
             && let Some(width) = layout.sidebar_width
         {
             self.layout.sidebar_width = Some(width.clamp(20, 120));
+        }
+        if let Some(notifications) = raw.notifications {
+            if let Some(enabled) = notifications.enabled {
+                self.notifications.enabled = enabled;
+            }
+            if let Some(enabled) = notifications.needs_input {
+                self.notifications.needs_input = enabled;
+            }
+            if let Some(enabled) = notifications.completed {
+                self.notifications.completed = enabled;
+            }
+            if let Some(enabled) = notifications.failed {
+                self.notifications.failed = enabled;
+            }
         }
         if let Some(worktrees) = raw.worktrees
             && let Some(values) = worktrees.columns
@@ -1144,6 +1194,16 @@ pub fn print_config(repo: &Repository, config: &Config) {
     println!("escape_key = {}", config.escape_key.label());
     println!("merge_method = {}", config.merge_method.label());
     println!("ui.icon_style = {}", config.icon_style.label());
+    println!("notifications.enabled = {}", config.notifications.enabled);
+    println!(
+        "notifications.needs_input = {}",
+        config.notifications.needs_input
+    );
+    println!(
+        "notifications.completed = {}",
+        config.notifications.completed
+    );
+    println!("notifications.failed = {}", config.notifications.failed);
     println!(
         "layout.sidebar_width = {}",
         config
@@ -1540,6 +1600,7 @@ mod tests {
         assert_eq!(config.icon_style, IconStyle::Unicode);
         assert!(!config.icon_style_configured);
         assert_eq!(config.layout.sidebar_width, None);
+        assert_eq!(config.notifications, NotificationConfig::default());
         assert!(config.worktree_columns.is_empty());
         assert_eq!(config.opencode_port_base, 41_000);
         assert_eq!(config.opencode_port_span, 1_000);
@@ -1573,6 +1634,46 @@ mod tests {
         assert!(!config.is_default_branch("main"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn notification_config_merges_field_by_field() {
+        let mut config = Config::defaults(
+            PathBuf::from("/tmp/user.toml"),
+            PathBuf::from("/tmp/repo.toml"),
+        );
+        config.apply_raw_config(
+            RawConfig {
+                notifications: Some(RawNotificationConfig {
+                    enabled: Some(true),
+                    completed: Some(false),
+                    ..RawNotificationConfig::default()
+                }),
+                ..RawConfig::default()
+            },
+            true,
+        );
+        config.apply_raw_config(
+            RawConfig {
+                notifications: Some(RawNotificationConfig {
+                    completed: Some(true),
+                    failed: Some(false),
+                    ..RawNotificationConfig::default()
+                }),
+                ..RawConfig::default()
+            },
+            false,
+        );
+
+        assert_eq!(
+            config.notifications,
+            NotificationConfig {
+                enabled: true,
+                needs_input: true,
+                completed: true,
+                failed: false,
+            }
+        );
     }
 
     #[test]
