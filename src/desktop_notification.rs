@@ -230,7 +230,7 @@ impl DesktopNotifier {
         if self
             .sender
             .as_ref()
-            .is_some_and(|sender| sender.send(DispatchMessage::Barrier(tx)).is_ok())
+            .is_some_and(|sender| sender.try_send(DispatchMessage::Barrier(tx)).is_ok())
         {
             let _ = rx.recv_timeout(Duration::from_secs(1));
         }

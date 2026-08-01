@@ -2114,14 +2114,12 @@ impl Tui {
             return;
         };
         let key = session.identity_key(&managed.identity);
-        let repo_label = session.repo_label.clone();
-        let branch = session.branch.clone();
         let state = session.agent_state;
         let config = managed.config.notifications;
         let observation = AgentObservation {
             session: &key,
-            repo_label: &repo_label,
-            branch: &branch,
+            repo_label: &session.repo_label,
+            branch: &session.branch,
             state,
             config,
         };
