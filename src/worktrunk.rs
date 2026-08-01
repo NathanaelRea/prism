@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::LazyLock;
+use std::time::Instant;
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -10,12 +11,13 @@ use serde_json::Value;
 use crate::config::Config;
 use crate::observability;
 use crate::process::{
-    ProcessDescriptor, ProcessOutput, ProcessPolicy, run_capture_named,
-    run_output_allow_failure_named, run_output_named, run_status_inherited_named,
+    ProcessDescriptor, ProcessOutput, ProcessPolicy, run_output_allow_failure_named,
+    run_output_named, run_status_inherited_named,
 };
 use crate::repo::Repository;
 
 pub(crate) const LIST_PROCESS: ProcessDescriptor = ProcessDescriptor::new("wt.list");
+pub(crate) const VERSION_PROCESS: ProcessDescriptor = ProcessDescriptor::new("wt.version");
 pub(crate) const SWITCH_PROCESS: ProcessDescriptor = ProcessDescriptor::new("wt.switch");
 #[allow(dead_code)]
 pub(crate) const REMOVE_PROCESS: ProcessDescriptor = ProcessDescriptor::new("wt.remove");
@@ -58,7 +60,60 @@ pub(crate) enum FailureKind {
     Hook,
     Git,
     MalformedOutput,
+    UnsupportedSchema,
     Process,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorktrunkSchema {
+    V1,
+    V2,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct WorktrunkSnapshot {
+    pub schema: WorktrunkSchema,
+    pub by_path: BTreeMap<PathBuf, WorktrunkWorktreeFacts>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct WorktrunkWorktreeFacts {
+    pub dev_server: Option<DevServerObservation>,
+    pub vars: BTreeMap<String, Value>,
+    pub extra_columns: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DevServerObservation {
+    pub url: String,
+    pub listening: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ObservationQuality {
+    NeverLoaded,
+    Refreshing,
+    Fresh,
+    Stale {
+        last_success: Instant,
+        error: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorktrunkVersion {
+    pub raw: String,
+    pub major: u64,
+    pub minor: u64,
+    pub patch: u64,
+    pre_release: bool,
+}
+
+impl WorktrunkVersion {
+    pub(crate) fn supported(&self) -> bool {
+        (self.major, self.minor, self.patch) > (0, 58, 0)
+            || (self.major, self.minor, self.patch) == (0, 58, 0) && !self.pre_release
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,6 +176,21 @@ impl WorktrunkFailure {
         }
     }
 
+    fn unsupported_schema(command: &Command, output: &ProcessOutput, schema: &Value) -> Self {
+        Self {
+            kind: FailureKind::UnsupportedSchema,
+            command: observability::command_display(command),
+            summary: format!("unsupported Worktrunk JSON schema {schema}"),
+            stdout: bounded_context(&output.stdout),
+            stderr: bounded_context(&output.stderr),
+            approval_hint: None,
+        }
+    }
+
+    pub(crate) fn safe_summary(&self) -> String {
+        self.summary.clone()
+    }
+
     fn with_approval_hint(mut self, repo: &Repository, config: &Config) -> Self {
         if self.approval_required() {
             self.approval_hint = Some(format!(
@@ -162,6 +232,56 @@ struct RawSwitchOutcome {
     path: PathBuf,
     #[serde(default)]
     created_branch: bool,
+}
+
+#[derive(Deserialize)]
+struct Schema2Envelope {
+    schema: Value,
+    items: Vec<Value>,
+}
+
+#[derive(Deserialize)]
+struct Schema1Item {
+    path: PathBuf,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    url_active: Option<bool>,
+    #[serde(default)]
+    vars: BTreeMap<String, Value>,
+    #[serde(default)]
+    columns: BTreeMap<String, Value>,
+    #[serde(flatten)]
+    fields: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+struct Schema2Item {
+    worktree: Schema2Worktree,
+    #[serde(default)]
+    dev_server: Option<Schema2DevServer>,
+    #[serde(default)]
+    vars: BTreeMap<String, Value>,
+    #[serde(default)]
+    display: Option<Schema2Display>,
+}
+
+#[derive(Deserialize)]
+struct Schema2Worktree {
+    path: PathBuf,
+}
+
+#[derive(Deserialize)]
+struct Schema2DevServer {
+    url: String,
+    #[serde(default)]
+    listening: Option<bool>,
+}
+
+#[derive(Default, Deserialize)]
+struct Schema2Display {
+    #[serde(default)]
+    columns: BTreeMap<String, Value>,
 }
 
 pub(crate) fn switch_worktree(
@@ -211,31 +331,20 @@ pub(crate) fn is_approval_failure(output: &str) -> bool {
     APPROVAL_FAILURE_RE.is_match(output)
 }
 
-pub(crate) fn list_columns(
+pub(crate) fn observe_repository(
     repo: &Repository,
     config: &Config,
-) -> Result<BTreeMap<PathBuf, BTreeMap<String, String>>, String> {
-    let raw = run_capture_named(
-        &mut list_command(repo, config),
-        ProcessPolicy::Metadata,
-        LIST_PROCESS,
-    )?;
-    let mut by_path = BTreeMap::new();
-    for object in crate::json::json_top_level_objects(&raw) {
-        let Some(path) = crate::json::json_string_field(object, "path") else {
-            continue;
-        };
-        let mut columns = discover_columns(object);
-        for column in &config.worktree_columns {
-            if let Some(value) = column_value(object, column) {
-                columns.insert(column.clone(), value);
-            }
-        }
-        by_path.insert(PathBuf::from(path), columns);
+) -> Result<WorktrunkSnapshot, WorktrunkFailure> {
+    let mut command = list_command(repo, config);
+    let output = run_output_named(&mut command, ProcessPolicy::Metadata, LIST_PROCESS)
+        .map_err(|error| WorktrunkFailure::process(&command, error))?;
+    if !output.status.success() {
+        return Err(WorktrunkFailure::from_output(&command, &output));
     }
-    Ok(by_path)
+    parse_list_output(&command, &output, &config.worktree_columns)
 }
 
+#[cfg(test)]
 pub(crate) fn discover_columns(object: &str) -> BTreeMap<String, String> {
     let Ok(value) = serde_json::from_str::<Value>(object) else {
         return BTreeMap::new();
@@ -272,33 +381,64 @@ fn collect_column(columns: &mut BTreeMap<String, String>, key: &str, value: &Val
     }
 }
 
-fn column_value(object: &str, column: &str) -> Option<String> {
-    if let Some(key) = column.strip_prefix("vars.") {
-        return crate::json::json_object_field(object, "vars")
-            .and_then(|vars| crate::json::json_string_field(vars, key));
+pub(crate) fn associate_snapshot<T>(
+    snapshot: &WorktrunkSnapshot,
+    sessions: impl IntoIterator<Item = (PathBuf, T)>,
+) -> BTreeMap<T, WorktrunkWorktreeFacts>
+where
+    T: Ord,
+{
+    let mut normalized = BTreeMap::<PathBuf, Option<&WorktrunkWorktreeFacts>>::new();
+    for (path, facts) in &snapshot.by_path {
+        let path = normalize_path(path);
+        normalized
+            .entry(path)
+            .and_modify(|entry| *entry = None)
+            .or_insert(Some(facts));
     }
-    if let Some((object_key, field_key)) = column.split_once('.') {
-        return crate::json::json_object_field(object, object_key)
-            .and_then(|inner| crate::json::json_string_field(inner, field_key));
-    }
-    crate::json::json_string_field(object, column)
-        .or_else(|| crate::json::json_bool_field(object, column).map(|value| value.to_string()))
-        .or_else(|| {
-            (column == "ci")
-                .then(|| crate::json::json_object_field(object, "ci"))
-                .flatten()
-                .map(|ci| {
-                    let status = crate::json::json_string_field(ci, "status").unwrap_or_default();
-                    let number = crate::json::json_u64_field(ci, "number")
-                        .map(|number| format!("#{number}"))
-                        .unwrap_or_else(|| "ci".to_string());
-                    if status.is_empty() {
-                        number
-                    } else {
-                        format!("{number}:{status}")
-                    }
-                })
+    sessions
+        .into_iter()
+        .filter_map(|(path, key)| {
+            normalized
+                .get(&normalize_path(&path))
+                .and_then(|facts| *facts)
+                .cloned()
+                .map(|facts| (key, facts))
         })
+        .collect()
+}
+
+pub(crate) fn projected_columns(facts: &WorktrunkWorktreeFacts) -> BTreeMap<String, String> {
+    facts.extra_columns.clone()
+}
+
+pub(crate) fn detect_version(config: &Config) -> Result<WorktrunkVersion, WorktrunkFailure> {
+    let mut command = version_command(config);
+    let output = run_output_named(&mut command, ProcessPolicy::Metadata, VERSION_PROCESS)
+        .map_err(|error| WorktrunkFailure::process(&command, error))?;
+    if !output.status.success() {
+        return Err(WorktrunkFailure::from_output(&command, &output));
+    }
+    parse_version(&output.stdout).ok_or_else(|| WorktrunkFailure {
+        kind: FailureKind::MalformedOutput,
+        command: observability::command_display(&command),
+        summary: "could not parse Worktrunk version".to_string(),
+        stdout: bounded_context(&output.stdout),
+        stderr: bounded_context(&output.stderr),
+        approval_hint: None,
+    })
+}
+
+pub(crate) fn ensure_supported_version(config: &Config) -> Result<WorktrunkVersion, String> {
+    let version = detect_version(config).map_err(|error| error.to_string())?;
+    if version.supported() {
+        Ok(version)
+    } else {
+        Err(format!(
+            "Worktrunk {} is unsupported; Prism requires Worktrunk 0.58.0 or newer. Upgrade Worktrunk and retry",
+            version.raw
+        ))
+    }
 }
 
 fn switch_command(request: SwitchRequest<'_>) -> Command {
@@ -322,6 +462,215 @@ fn list_command(repo: &Repository, config: &Config) -> Command {
         .arg(&repo.root)
         .args(["list", "--format=json"]);
     command
+}
+
+fn version_command(config: &Config) -> Command {
+    let mut command = Command::new(config.tool(&config.worktree_command));
+    command.arg("--version");
+    command
+}
+
+fn parse_list_output(
+    command: &Command,
+    output: &ProcessOutput,
+    configured_columns: &[String],
+) -> Result<WorktrunkSnapshot, WorktrunkFailure> {
+    let value = serde_json::from_str::<Value>(&output.stdout)
+        .map_err(|error| WorktrunkFailure::malformed(command, output, error))?;
+    match value {
+        Value::Array(items) => parse_schema1_items(items, configured_columns)
+            .map(|by_path| WorktrunkSnapshot {
+                schema: WorktrunkSchema::V1,
+                by_path,
+            })
+            .map_err(|error| WorktrunkFailure::malformed(command, output, error)),
+        Value::Object(_) => {
+            let envelope = serde_json::from_value::<Schema2Envelope>(value)
+                .map_err(|error| WorktrunkFailure::malformed(command, output, error))?;
+            if envelope.schema != 2 {
+                return Err(WorktrunkFailure::unsupported_schema(
+                    command,
+                    output,
+                    &envelope.schema,
+                ));
+            }
+            parse_schema2_items(envelope.items, configured_columns)
+                .map(|by_path| WorktrunkSnapshot {
+                    schema: WorktrunkSchema::V2,
+                    by_path,
+                })
+                .map_err(|error| WorktrunkFailure::malformed(command, output, error))
+        }
+        _ => Err(WorktrunkFailure::malformed(
+            command,
+            output,
+            "expected a schema-1 array or schema-2 envelope",
+        )),
+    }
+}
+
+fn parse_schema1_items(
+    items: Vec<Value>,
+    configured_columns: &[String],
+) -> Result<BTreeMap<PathBuf, WorktrunkWorktreeFacts>, serde_json::Error> {
+    let mut by_path = BTreeMap::new();
+    let mut ambiguous = std::collections::BTreeSet::new();
+    for value in items {
+        if value.get("path").is_none() {
+            continue;
+        }
+        let raw = serde_json::from_value::<Schema1Item>(value)?;
+        let mut columns = BTreeMap::new();
+        for (key, value) in &raw.fields {
+            collect_column(&mut columns, key, value);
+        }
+        if configured_columns.iter().any(|column| column == "ci")
+            && let Some(ci) = raw.fields.get("ci").and_then(Value::as_object)
+        {
+            let status = ci.get("status").and_then(Value::as_str).unwrap_or_default();
+            let number = ci
+                .get("number")
+                .and_then(Value::as_u64)
+                .map(|number| format!("#{number}"))
+                .unwrap_or_else(|| "ci".to_string());
+            columns.insert(
+                "ci".to_string(),
+                if status.is_empty() {
+                    number
+                } else {
+                    format!("{number}:{status}")
+                },
+            );
+        }
+        for (key, value) in &raw.columns {
+            collect_column(&mut columns, key, value);
+        }
+        let dev_server = raw
+            .url
+            .filter(|url| !url.is_empty())
+            .map(|url| DevServerObservation {
+                url,
+                listening: raw.url_active,
+            });
+        project_canonical_columns(&mut columns, dev_server.as_ref(), &raw.vars);
+        insert_unique_path(
+            &mut by_path,
+            &mut ambiguous,
+            raw.path,
+            WorktrunkWorktreeFacts {
+                dev_server,
+                vars: raw.vars,
+                extra_columns: columns,
+            },
+        );
+    }
+    Ok(by_path)
+}
+
+fn parse_schema2_items(
+    items: Vec<Value>,
+    _configured_columns: &[String],
+) -> Result<BTreeMap<PathBuf, WorktrunkWorktreeFacts>, serde_json::Error> {
+    let mut by_path = BTreeMap::new();
+    let mut ambiguous = std::collections::BTreeSet::new();
+    for value in items {
+        if value.get("worktree").is_none() {
+            continue;
+        }
+        let raw = serde_json::from_value::<Schema2Item>(value)?;
+        let dev_server = raw.dev_server.map(|server| DevServerObservation {
+            url: server.url,
+            listening: server.listening,
+        });
+        let mut columns = BTreeMap::new();
+        for (key, value) in raw.display.unwrap_or_default().columns {
+            collect_column(&mut columns, &key, &value);
+        }
+        project_canonical_columns(&mut columns, dev_server.as_ref(), &raw.vars);
+        insert_unique_path(
+            &mut by_path,
+            &mut ambiguous,
+            raw.worktree.path,
+            WorktrunkWorktreeFacts {
+                dev_server,
+                vars: raw.vars,
+                extra_columns: columns,
+            },
+        );
+    }
+    Ok(by_path)
+}
+
+fn insert_unique_path(
+    by_path: &mut BTreeMap<PathBuf, WorktrunkWorktreeFacts>,
+    ambiguous: &mut std::collections::BTreeSet<PathBuf>,
+    path: PathBuf,
+    facts: WorktrunkWorktreeFacts,
+) {
+    if ambiguous.contains(&path) || by_path.remove(&path).is_some() {
+        ambiguous.insert(path);
+    } else {
+        by_path.insert(path, facts);
+    }
+}
+
+fn project_canonical_columns(
+    columns: &mut BTreeMap<String, String>,
+    dev_server: Option<&DevServerObservation>,
+    vars: &BTreeMap<String, Value>,
+) {
+    if let Some(server) = dev_server {
+        columns.insert("url".to_string(), server.url.clone());
+        columns.insert("dev_server.url".to_string(), server.url.clone());
+        if let Some(listening) = server.listening {
+            let value = listening.to_string();
+            columns.insert("url_active".to_string(), value.clone());
+            columns.insert("dev_server.listening".to_string(), value);
+        }
+    }
+    for (key, value) in vars {
+        collect_column(columns, &format!("vars.{key}"), value);
+    }
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    if let Ok(path) = path.canonicalize() {
+        return path;
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            component => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn parse_version(output: &str) -> Option<WorktrunkVersion> {
+    let raw = output.lines().find(|line| !line.trim().is_empty())?.trim();
+    let token = raw.split_whitespace().find_map(|token| {
+        let token = token.trim_start_matches('v');
+        token
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_digit())
+            .then_some(token)
+    })?;
+    let mut parts = token.split(|character: char| !character.is_ascii_digit());
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    Some(WorktrunkVersion {
+        raw: raw.to_string(),
+        major,
+        minor,
+        patch,
+        pre_release: token.contains('-'),
+    })
 }
 
 fn approvals_command(repo: &Repository, config: &Config) -> Command {
@@ -455,6 +804,123 @@ mod tests {
         assert_eq!(existing.action, SwitchAction::Existing);
         assert!(!existing.created_branch);
         assert_eq!(already_at.action, SwitchAction::Existing);
+    }
+
+    #[test]
+    fn parses_and_normalizes_schema_1_fixtures() {
+        let full = parse_list_fixture(include_str!(
+            "../tests/fixtures/worktrunk/schema1-full.json"
+        ))
+        .unwrap();
+        let minimal = parse_list_fixture(include_str!(
+            "../tests/fixtures/worktrunk/schema1-minimal.json"
+        ))
+        .unwrap();
+
+        assert_eq!(full.schema, WorktrunkSchema::V1);
+        let facts = &full.by_path[Path::new("/redacted/repo.feat-typed-observation")];
+        assert_eq!(
+            facts.dev_server,
+            Some(DevServerObservation {
+                url: "http://localhost:43117".to_string(),
+                listening: Some(true),
+            })
+        );
+        assert_eq!(facts.vars["attempt"], Value::from(3));
+        assert_eq!(facts.extra_columns["url_active"], "true");
+        assert_eq!(facts.extra_columns["ci.status"], "passed");
+        assert_eq!(facts.extra_columns["Ticket"], "PRISM-42");
+        assert_eq!(minimal.by_path.len(), 1);
+    }
+
+    #[test]
+    fn parses_and_normalizes_schema_2_fixtures() {
+        let full = parse_list_fixture(include_str!(
+            "../tests/fixtures/worktrunk/schema2-full.json"
+        ))
+        .unwrap();
+        let minimal = parse_list_fixture(include_str!(
+            "../tests/fixtures/worktrunk/schema2-minimal.json"
+        ))
+        .unwrap();
+
+        assert_eq!(full.schema, WorktrunkSchema::V2);
+        let facts = &full.by_path[Path::new("/redacted/repo.feat-typed-observation")];
+        assert_eq!(facts.extra_columns["url"], "http://localhost:43117");
+        assert_eq!(facts.extra_columns["dev_server.listening"], "true");
+        assert_eq!(facts.extra_columns["vars.enabled"], "true");
+        assert_eq!(facts.extra_columns["Ticket"], "PRISM-42");
+        assert_eq!(minimal.by_path.len(), 3);
+        assert!(
+            minimal
+                .by_path
+                .values()
+                .all(|facts| facts.dev_server.is_none())
+        );
+    }
+
+    #[test]
+    fn unknown_schema_and_malformed_items_fail_closed() {
+        let unsupported = parse_list_fixture(r#"{"schema":3,"items":[]}"#).unwrap_err();
+        assert_eq!(unsupported.kind, FailureKind::UnsupportedSchema);
+
+        let malformed = parse_list_fixture(
+            r#"[{"path":"/valid","url":"http://localhost:3000"},{"path":42},{"kind":"branch"}]"#,
+        )
+        .unwrap_err();
+        assert_eq!(malformed.kind, FailureKind::MalformedOutput);
+    }
+
+    #[test]
+    fn duplicate_exact_paths_are_omitted_as_ambiguous() {
+        let snapshot = parse_list_fixture(
+            r#"[{"path":"/same","url":"http://localhost:3000"},{"path":"/same","url":"http://localhost:4000"}]"#,
+        )
+        .unwrap();
+        assert!(snapshot.by_path.is_empty());
+    }
+
+    #[test]
+    fn path_association_uses_canonical_paths_and_rejects_ambiguity() {
+        let temp = unique_temp_dir("prism-wt-path-association");
+        let real = temp.join("real");
+        let alias = temp.join("alias");
+        fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let facts = WorktrunkWorktreeFacts {
+            extra_columns: BTreeMap::from([("url".to_string(), "one".to_string())]),
+            ..WorktrunkWorktreeFacts::default()
+        };
+        let snapshot = WorktrunkSnapshot {
+            schema: WorktrunkSchema::V1,
+            by_path: BTreeMap::from([(real.clone(), facts.clone())]),
+        };
+        assert_eq!(
+            associate_snapshot(&snapshot, [(alias.clone(), "session")])["session"],
+            facts
+        );
+
+        let ambiguous = WorktrunkSnapshot {
+            schema: WorktrunkSchema::V1,
+            by_path: BTreeMap::from([(real, facts.clone()), (alias.clone(), facts)]),
+        };
+        assert!(associate_snapshot(&ambiguous, [(alias, "session")]).is_empty());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn parses_supported_worktrunk_versions() {
+        let floor = parse_version("worktrunk 0.58.0\n").unwrap();
+        let current = parse_version("wt 1.2.3-beta.1\n").unwrap();
+        assert!(floor.supported());
+        assert!(current.supported());
+        assert!(!parse_version("worktrunk 0.57.9").unwrap().supported());
+        assert!(
+            !parse_version("worktrunk 0.58.0-alpha.1")
+                .unwrap()
+                .supported()
+        );
+        assert!(parse_version("worktrunk development").is_none());
     }
 
     #[test]
@@ -600,6 +1066,21 @@ mod tests {
             stderr_truncated: false,
         };
         parse_switch_output(&command, &output)
+    }
+
+    fn parse_list_fixture(stdout: &str) -> Result<WorktrunkSnapshot, WorktrunkFailure> {
+        let mut command = Command::new("wt");
+        command.arg("list");
+        let output = ProcessOutput {
+            status: success_status(),
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            stdout_total_bytes: stdout.len() as u64,
+            stdout_truncated: false,
+            stderr_total_bytes: 0,
+            stderr_truncated: false,
+        };
+        parse_list_output(&command, &output, &[])
     }
 
     fn run_failure_fixture(body: &str) -> FailureKind {

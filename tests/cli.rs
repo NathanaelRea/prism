@@ -829,7 +829,9 @@ fn install_shim(bin: &Path, name: &str) {
     let path = bin.join(name);
     fs::write(
         &path,
-        format!("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"{name} test\"; fi\n"),
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then [ \"{name}\" = wt ] && echo \"worktrunk 0.58.0\" || echo \"{name} test\"; fi\n"
+        ),
     )
     .expect("write shim");
     let mut permissions = fs::metadata(&path).expect("shim metadata").permissions();

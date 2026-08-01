@@ -14,7 +14,7 @@ use crate::session::{DeleteWorktreeOutcome, Session};
 use crate::tui::{
     DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, OpencodeEventResult,
     OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PanelFocus, PrPollKey, Tui,
-    TuiJobKey, TuiJobKind, WtPollResult,
+    TuiJobKey, TuiJobKind, WtObservation, WtPollResult,
 };
 
 use super::{
@@ -1835,21 +1835,96 @@ fn worktrunk_columns_reject_deleted_and_recreated_session_result() {
     let mut tui = Tui::new_single(repo, test_config(), vec![session]);
     let stale_key = tui.sessions[0].identity_key(&tui.repos[0].identity);
     tui.sessions[0].incarnation = "new".to_string();
-    let columns = BTreeMap::from([(
+    let facts = BTreeMap::from([(
         stale_key,
-        BTreeMap::from([("ci".to_string(), "passed".to_string())]),
+        crate::worktrunk::WorktrunkWorktreeFacts {
+            extra_columns: BTreeMap::from([("ci".to_string(), "passed".to_string())]),
+            ..crate::worktrunk::WorktrunkWorktreeFacts::default()
+        },
     )]);
 
     tui.wt_poll_tx
         .send(WtPollResult {
             repository: tui.repos[0].identity.clone(),
-            columns: Ok(columns),
+            observation: Ok(WtObservation {
+                snapshot: crate::worktrunk::WorktrunkSnapshot {
+                    schema: crate::worktrunk::WorktrunkSchema::V1,
+                    by_path: BTreeMap::new(),
+                },
+                facts,
+                observed_at: std::time::Instant::now(),
+            }),
         })
         .unwrap();
 
     assert!(!tui.poll_wt_columns());
     assert!(tui.sessions[0].wt_columns.is_empty());
     let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn worktrunk_failure_preserves_successful_columns_as_stale() {
+    let temp = unique_temp_dir("prism-wt-stale-observation-test");
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(temp.join("worktree"), "feature");
+    let mut config = test_config();
+    config
+        .tools
+        .insert("wt".to_string(), "/definitely/missing/wt".to_string());
+    let failure = crate::worktrunk::observe_repository(&repo, &config).unwrap_err();
+    let mut tui = Tui::new_single(repo, config, vec![session]);
+    let key = tui.sessions[0].identity_key(&tui.repos[0].identity);
+    let observed_at = std::time::Instant::now();
+    let facts = crate::worktrunk::WorktrunkWorktreeFacts {
+        extra_columns: BTreeMap::from([("url".to_string(), "http://localhost:3000".to_string())]),
+        ..crate::worktrunk::WorktrunkWorktreeFacts::default()
+    };
+    tui.wt_poll_tx
+        .send(WtPollResult {
+            repository: tui.repos[0].identity.clone(),
+            observation: Ok(WtObservation {
+                snapshot: crate::worktrunk::WorktrunkSnapshot {
+                    schema: crate::worktrunk::WorktrunkSchema::V1,
+                    by_path: BTreeMap::from([(tui.sessions[0].path.clone(), facts.clone())]),
+                },
+                facts: BTreeMap::from([(key, facts)]),
+                observed_at,
+            }),
+        })
+        .unwrap();
+    assert!(tui.poll_wt_columns());
+
+    tui.wt_poll_tx
+        .send(WtPollResult {
+            repository: tui.repos[0].identity.clone(),
+            observation: Err(failure),
+        })
+        .unwrap();
+
+    assert!(tui.poll_wt_columns());
+    assert_eq!(
+        tui.sessions[0].wt_columns["url"],
+        "http://localhost:3000 (stale)"
+    );
+    assert!(matches!(
+        tui.repos[0].wt_quality,
+        crate::worktrunk::ObservationQuality::Stale { last_success, .. }
+            if last_success == observed_at
+    ));
+}
+
+#[test]
+fn worktrunk_refresh_requests_coalesce_while_poll_is_in_flight() {
+    let temp = unique_temp_dir("prism-wt-coalesced-refresh-test");
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut tui = Tui::new_single(repo, test_config(), Vec::new());
+    tui.repos[0].wt_poll_in_flight = true;
+
+    tui.start_wt_column_poll();
+    tui.start_wt_column_poll();
+
+    assert!(tui.repos[0].wt_poll_pending);
+    assert!(tui.repos[0].wt_poll_in_flight);
 }
 
 #[test]

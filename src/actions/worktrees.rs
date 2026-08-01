@@ -350,13 +350,14 @@ impl Tui {
         };
         if let CreateWorktreeOutcome::CreatedMetadataFailed { error } = creation {
             self.refresh_sessions()?;
+            self.request_wt_poll(context.repo_index);
             self.show_message(&format!(
                 "worktree created, but restoring Prism metadata failed: {error}"
             ))?;
             return Ok(true);
         }
         self.refresh_sessions()?;
-        self.start_wt_column_poll();
+        self.request_wt_poll(context.repo_index);
         let index = self
             .sessions
             .iter()
@@ -789,6 +790,13 @@ impl Tui {
                     self.ensure_navigation_valid();
                     let _ = self.show_message(&format!("delete failed: {error}"));
                 }
+            }
+            if let Some(repo_index) = self
+                .repos
+                .iter()
+                .position(|repo| repo.identity == result.key.worktree.repository)
+            {
+                self.request_wt_poll(repo_index);
             }
         }
         changed

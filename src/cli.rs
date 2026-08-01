@@ -323,7 +323,17 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
         for entry in discovered_entries {
             let repo = entry.repo;
             let mut config = Config::load(&repo);
-            observability::phase("ensure_tools", || config::ensure_required_tools(&config))?;
+            let worktrunk_version =
+                observability::phase("ensure_tools", || config::ensure_required_tools(&config))?;
+            crate::flight_recorder::record(
+                "startup",
+                "worktrunk_version",
+                None,
+                vec![crate::flight_recorder::text(
+                    "version",
+                    &worktrunk_version.raw,
+                )],
+            );
             if observability::phase("initial_harness_setup", || {
                 setup::maybe_prompt_harness(&config)
             })?
@@ -698,7 +708,9 @@ fn run_debug_command(
 
 fn run_debug_startup(repo: &Repository, config: &mut Config) -> Result<(), String> {
     let result: Result<(), String> = (|| {
-        observability::phase("ensure_tools", || config::ensure_required_tools(config))?;
+        let worktrunk_version =
+            observability::phase("ensure_tools", || config::ensure_required_tools(config))?;
+        println!("worktrunk_version = {}", worktrunk_version.raw);
         observability::phase("ensure_default_agent", || {
             config::ensure_default_agent_noninteractive(config)
         })?;

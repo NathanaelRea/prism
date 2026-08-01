@@ -1,0 +1,13 @@
+[
+  {
+    "branch": "feat/typed-observation",
+    "path": "/redacted/repo.feat-typed-observation",
+    "kind": "worktree",
+    "url": "http://localhost:43117",
+    "url_active": true,
+    "vars": {"ticket": "PRISM-42", "attempt": 3, "enabled": true},
+    "columns": {"Ticket": "PRISM-42"},
+    "ci": {"status": "passed", "number": 42},
+    "symbols": "↑"
+  }
+]

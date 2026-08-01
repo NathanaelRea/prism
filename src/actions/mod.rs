@@ -52,7 +52,7 @@ use crate::tui::{
     OpencodeEventResult, OpencodeListenerKey, OpencodePollKey, OpencodePollResult,
     PrPersistenceRequest, PrPollKey, PrPollResult, PrSummarySessionResult, SessionRefreshResult,
     SessionRefreshSnapshot, TUI_ACTION_JOB_TIMEOUT, Tui, TuiJobKey, TuiJobKind, TuiJobPayload,
-    WtPollResult,
+    WtObservation, WtPollResult,
 };
 use crate::tui_jobs::CoalescedFacet;
 

@@ -1316,11 +1316,7 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     print_tool_status("git", &config.tool("git"), true);
     print_tool_status("gh", &config.tool("gh"), true);
     print_tool_status("tmux", &config.tool("tmux"), true);
-    print_tool_status(
-        &config.worktree_command,
-        &config.tool(&config.worktree_command),
-        true,
-    );
+    print_worktrunk_status(config);
     print_tool_status("fzf", &config.tool("fzf"), false);
     println!();
 
@@ -1388,7 +1384,9 @@ fn resolve_executable(program: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-pub fn ensure_required_tools(config: &Config) -> Result<(), String> {
+pub fn ensure_required_tools(
+    config: &Config,
+) -> Result<crate::worktrunk::WorktrunkVersion, String> {
     let required = [
         ("git", config.tool("git")),
         ("gh", config.tool("gh")),
@@ -1403,15 +1401,42 @@ pub fn ensure_required_tools(config: &Config) -> Result<(), String> {
         .filter(|(_, command)| !command_exists(command))
         .map(|(label, command)| format!("{label} ({command})"))
         .collect::<Vec<_>>();
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
+    if !missing.is_empty() {
+        return Err(format!(
             "missing required tool(s): {}. Install them or configure [tools] in {} or {}",
             missing.join(", "),
             config.user_path.display(),
             config.repo_config_path.display()
-        ))
+        ));
+    }
+    crate::worktrunk::ensure_supported_version(config)
+}
+
+fn print_worktrunk_status(config: &Config) {
+    let command = config.tool(&config.worktree_command);
+    if !command_exists(&command) {
+        println!(
+            "missing {:12} {:18} required -",
+            config.worktree_command, command
+        );
+        return;
+    }
+    match crate::worktrunk::detect_version(config) {
+        Ok(version) => {
+            let status = if version.supported() {
+                "ok"
+            } else {
+                "unsupported"
+            };
+            println!(
+                "{status:7} {:12} {command:18} required {} (minimum 0.58.0)",
+                config.worktree_command, version.raw
+            );
+        }
+        Err(error) => println!(
+            "error   {:12} {command:18} required {error}",
+            config.worktree_command
+        ),
     }
 }
 

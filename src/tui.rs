@@ -162,6 +162,12 @@ pub(crate) struct ManagedRepo {
     pub pr_summary_last_polled: Option<std::time::Instant>,
     pub pr_summaries: Vec<PrSummary>,
     pub wt_poll_in_flight: bool,
+    pub wt_poll_pending: bool,
+    pub wt_last_polled: Option<std::time::Instant>,
+    pub wt_last_success: Option<std::time::Instant>,
+    pub wt_last_error: Option<String>,
+    pub wt_snapshot: Option<crate::worktrunk::WorktrunkSnapshot>,
+    pub wt_quality: crate::worktrunk::ObservationQuality,
     pub default_branch_poll_in_flight: bool,
     pub default_branch_last_polled: Option<std::time::Instant>,
 }
@@ -245,6 +251,12 @@ impl ManagedRepo {
             pr_summary_last_polled: None,
             pr_summaries: Vec::new(),
             wt_poll_in_flight: false,
+            wt_poll_pending: false,
+            wt_last_polled: None,
+            wt_last_success: None,
+            wt_last_error: None,
+            wt_snapshot: None,
+            wt_quality: crate::worktrunk::ObservationQuality::NeverLoaded,
             default_branch_poll_in_flight: false,
             default_branch_last_polled: None,
         }
@@ -414,7 +426,13 @@ pub(crate) struct NavigationSnapshot {
 
 pub(crate) struct WtPollResult {
     pub repository: WorktreeRepositoryKey,
-    pub columns: Result<BTreeMap<WorktreeSessionKey, BTreeMap<String, String>>, String>,
+    pub observation: Result<WtObservation, crate::worktrunk::WorktrunkFailure>,
+}
+
+pub(crate) struct WtObservation {
+    pub snapshot: crate::worktrunk::WorktrunkSnapshot,
+    pub facts: BTreeMap<WorktreeSessionKey, crate::worktrunk::WorktrunkWorktreeFacts>,
+    pub observed_at: Instant,
 }
 
 pub(crate) struct DefaultBranchPollResult {
@@ -1162,6 +1180,7 @@ impl Tui {
                     continue;
                 }
                 RuntimeEvent::FocusGained => {
+                    self.start_wt_column_poll();
                     self.start_default_branch_status_poll(true);
                     self.poll_pull_requests(true);
                     self.draw(runtime)?;
@@ -1372,6 +1391,7 @@ impl Tui {
                             self.show_error("reorder repositories failed", &error)?;
                         }
                     } else {
+                        self.start_wt_column_poll();
                         self.refresh_sessions_after_tmux()?;
                     }
                 }
@@ -1611,6 +1631,7 @@ impl Tui {
             delete_sessions: self.poll_delete_sessions(),
             status_message: self.expire_status_message(),
         };
+        self.start_scheduled_wt_polls();
         self.start_default_branch_status_poll(false);
         self.start_opencode_status_poll(false);
         self.start_opencode_event_listeners();
@@ -2248,6 +2269,16 @@ impl Tui {
     fn recover_failed_tui_job(&mut self, metadata: &JobMetadata<TuiJobKind, TuiJobKey>) {
         if metadata.kind == TuiJobKind::SessionRefresh {
             self.session_refresh_pending = true;
+        }
+        if let (TuiJobKind::WorktreeColumns, TuiJobKey::Repository(repository)) =
+            (&metadata.kind, &metadata.key)
+            && let Some(repo_index) = self
+                .repos
+                .iter()
+                .position(|repo| &repo.identity == repository)
+        {
+            let error = "Worktrunk observation job failed or timed out".to_string();
+            self.mark_wt_observation_stale(repo_index, error, None);
         }
         if let (TuiJobKind::DeleteSession, TuiJobKey::Delete(key)) = (&metadata.kind, &metadata.key)
             && let Some(session) = self.sessions.iter_mut().find(|session| {
