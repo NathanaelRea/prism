@@ -1142,14 +1142,14 @@ mod tests {
         }
         let mut child = command.spawn().unwrap();
         let pid = child.id();
-        let start = crate::harness::process_start_time_ticks(pid).unwrap();
+        let start = crate::harness::process_start_time_ticks(pid);
         let reaper = std::thread::spawn(move || child.wait().unwrap());
         conn.execute(
             "insert into plan_step_run (
                run_id, step, status, execution_process_id,
                execution_process_start_time_ticks
              ) values ('plan-1', 1, 'running', ?1, ?2)",
-            params![pid, i64::try_from(start).unwrap()],
+            params![pid, start.map(|value| i64::try_from(value).unwrap())],
         )
         .unwrap();
         conn.execute(
@@ -1168,7 +1168,11 @@ mod tests {
         .unwrap();
 
         reaper.join().unwrap();
-        assert_ne!(crate::harness::process_start_time_ticks(pid), Some(start));
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
         assert_eq!(
             dispatch_state(&conn, &WorkflowIdentity::new(WorkflowKind::Auto, "auto-1")).unwrap(),
             Some(DispatchState::Queued)

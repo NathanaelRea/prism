@@ -815,6 +815,17 @@ mod tests {
     use std::ffi::OsStr;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn test_socket_path(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        Path::new("/tmp").join(format!(
+            "prism-{label}-{}-{unique}.sock",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn socket_and_lock_share_a_private_runtime_directory() {
         assert_eq!(socket_path().parent(), Some(runtime_dir().as_path()));
@@ -860,37 +871,18 @@ mod tests {
 
     #[test]
     fn probe_health_treats_a_stale_socket_as_stopped() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let runtime = std::env::temp_dir().join(format!(
-            "prism-worker-stale-socket-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir(&runtime).unwrap();
-        let socket = runtime.join("worker.sock");
+        let socket = test_socket_path("stale");
         let listener = UnixListener::bind(&socket).unwrap();
         drop(listener);
 
         assert_eq!(probe_health_at(&socket).unwrap(), DaemonHealth::stopped());
 
         fs::remove_file(socket).unwrap();
-        fs::remove_dir(runtime).unwrap();
     }
 
     #[test]
     fn waiting_for_a_live_socket_to_close_times_out() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let runtime = std::env::temp_dir().join(format!(
-            "prism-worker-live-socket-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir(&runtime).unwrap();
-        let socket = runtime.join("worker.sock");
+        let socket = test_socket_path("live");
         let _listener = UnixListener::bind(&socket).unwrap();
 
         assert_eq!(
@@ -899,7 +891,6 @@ mod tests {
         );
 
         fs::remove_file(socket).unwrap();
-        fs::remove_dir(runtime).unwrap();
     }
 
     #[test]

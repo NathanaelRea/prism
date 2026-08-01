@@ -2094,13 +2094,13 @@ mod tests {
         }
         let mut child = command.spawn().unwrap();
         let pid = child.id();
-        let start = crate::harness::process_start_time_ticks(pid).unwrap();
+        let start = crate::harness::process_start_time_ticks(pid);
         conn.execute(
             "insert into plan_step_run (
                run_id, step, prompt, status, execution_process_id,
                execution_process_start_time_ticks
              ) values ('plan-1', 1, 'phase', 'running', ?1, ?2)",
-            params![pid, i64::try_from(start).unwrap()],
+            params![pid, start.map(|value| i64::try_from(value).unwrap())],
         )
         .unwrap();
 
@@ -2123,7 +2123,11 @@ mod tests {
             .unwrap();
         assert_eq!(process, (None, None));
         let _ = child.wait();
-        assert_ne!(crate::harness::process_start_time_ticks(pid), Some(start));
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 
     #[test]
