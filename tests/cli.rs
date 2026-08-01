@@ -312,7 +312,7 @@ fn daemon_status_reports_stopped_without_starting_it() {
         .current_dir(temp.path())
         .env("XDG_CONFIG_HOME", temp.path())
         .env("HOME", temp.path())
-        .env("XDG_RUNTIME_DIR", temp.path())
+        .env("PRISM_RUNTIME_DIR", temp.path().join("runtime"))
         .output()
         .expect("run daemon status");
 
