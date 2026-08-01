@@ -400,6 +400,15 @@ pub(crate) fn fetch_remote_branch(
     branch: &str,
     config: &Config,
 ) -> Result<(), String> {
+    let remote = remote.trim();
+    if remote.is_empty() {
+        return Err("cannot fetch from an empty remote name".to_string());
+    }
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "(detached)" {
+        return Err("cannot fetch an empty or detached branch name".to_string());
+    }
+
     run_status_named(
         Command::new(config.tool("git"))
             .arg("-C")
@@ -500,6 +509,25 @@ mod tests {
             ),
             "dirty 2 ahead 3 behind 2"
         );
+    }
+
+    #[test]
+    fn fetch_remote_branch_rejects_invalid_names_before_running_git() {
+        let missing_path = Path::new("/path/that/does/not/exist");
+        let config = test_config();
+
+        for remote in ["", " \t"] {
+            assert_eq!(
+                fetch_remote_branch(missing_path, remote, "main", &config),
+                Err("cannot fetch from an empty remote name".to_string())
+            );
+        }
+        for branch in ["", " \t", "(detached)", " (detached) "] {
+            assert_eq!(
+                fetch_remote_branch(missing_path, "origin", branch, &config),
+                Err("cannot fetch an empty or detached branch name".to_string())
+            );
+        }
     }
 
     #[test]
