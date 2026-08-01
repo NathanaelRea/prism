@@ -1,15 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::LazyLock;
 
 use crate::config::Config;
-use crate::observability;
 use crate::process::{
-    ProcessDescriptor, ProcessOutput, ProcessPolicy, run_capture, run_capture_named,
-    run_configured_commands, run_output, run_output_allow_failure, run_status,
-    run_status_inherited,
+    ProcessDescriptor, ProcessPolicy, run_capture, run_capture_named, run_configured_commands,
+    run_status,
 };
 use crate::repo::Repository;
+pub(crate) use crate::worktrunk::ApprovalStatus as WorktrunkApprovalStatus;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct WorktreeInventoryEntry {
@@ -61,31 +59,18 @@ fn parse_worktree_inventory(output: &str) -> Vec<WorktreeInventoryEntry> {
     entries
 }
 
-static WORKTRUNK_APPROVAL_FAILURE_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
-    regex::Regex::new(r"(?is)needs\s+approval.*cannot\s+prompt.*non[- ]interactive").unwrap()
-});
-
 pub(crate) fn create_worktree(
     repo: &Repository,
     config: &Config,
     branch: &str,
-) -> Result<(), String> {
-    let mut command = Command::new(config.tool(&config.worktree_command));
-    command.args(create_worktree_args(
-        &repo.root,
+) -> Result<(), crate::worktrunk::WorktrunkFailure> {
+    crate::worktrunk::switch_worktree(crate::worktrunk::SwitchRequest {
+        repo,
+        config,
         branch,
-        config.default_base.as_deref(),
-    ));
-    let command_display = observability::command_display(&command);
-    let output = run_output(&mut command, ProcessPolicy::LocalMutation)?;
-    if !output.status.success() {
-        return Err(worktree_command_failure_message(
-            &command_display,
-            &output,
-            repo,
-            config,
-        ));
-    }
+        create: true,
+        base: config.default_base.as_deref(),
+    })?;
     Ok(())
 }
 
@@ -93,70 +78,29 @@ pub(crate) fn checkout_worktree(
     repo: &Repository,
     config: &Config,
     branch: &str,
-) -> Result<(), String> {
-    let mut command = Command::new(config.tool(&config.worktree_command));
-    command.args(checkout_worktree_args(&repo.root, branch));
-    let command_display = observability::command_display(&command);
-    let output = run_output(&mut command, ProcessPolicy::LocalMutation)?;
-    if !output.status.success() {
-        return Err(worktree_command_failure_message(
-            &command_display,
-            &output,
-            repo,
-            config,
-        ));
-    }
+) -> Result<(), crate::worktrunk::WorktrunkFailure> {
+    crate::worktrunk::switch_worktree(crate::worktrunk::SwitchRequest {
+        repo,
+        config,
+        branch,
+        create: false,
+        base: None,
+    })?;
     Ok(())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WorktrunkApprovalStatus {
-    NotWorktrunk,
-    Approved,
-    Pending,
 }
 
 pub(crate) fn check_worktrunk_approval_status(
     repo: &Repository,
     config: &Config,
 ) -> Result<WorktrunkApprovalStatus, String> {
-    if config.worktree_command != "wt" {
-        return Ok(WorktrunkApprovalStatus::NotWorktrunk);
-    }
-    let output = run_output_allow_failure(
-        Command::new(config.tool(&config.worktree_command))
-            .arg("-C")
-            .arg(&repo.root)
-            .args(["config", "approvals", "add"]),
-        ProcessPolicy::Metadata,
-    )?;
-    if output.status.success() {
-        return Ok(WorktrunkApprovalStatus::Approved);
-    }
-    if is_worktrunk_approval_failure(&process_output_text(&output)) {
-        return Ok(WorktrunkApprovalStatus::Pending);
-    }
-    Err(format!(
-        "{}: {}",
-        worktrunk_approval_command_display(repo, config),
-        process_failure_message(&output)
-    ))
+    crate::worktrunk::approval_status(repo, config).map_err(|error| error.to_string())
 }
 
 pub(crate) fn run_worktrunk_approval_prompt(
     repo: &Repository,
     config: &Config,
 ) -> Result<(), String> {
-    run_status_inherited(
-        Command::new(config.tool(&config.worktree_command))
-            .arg("-C")
-            .arg(&repo.root)
-            .args(["config", "approvals", "add"]),
-    )
-}
-
-pub(crate) fn is_worktrunk_approval_failure(output: &str) -> bool {
-    WORKTRUNK_APPROVAL_FAILURE_RE.is_match(output)
+    crate::worktrunk::run_approval_prompt(repo, config)
 }
 
 pub(crate) fn branch_has_worktree(
@@ -187,11 +131,14 @@ pub(crate) fn move_current_branch_to_worktree(
         Command::new(config.tool("git")).args(switch_checkout_args(&repo.root, base)),
         ProcessPolicy::LocalMutation,
     )?;
-    run_status(
-        Command::new(config.tool(&config.worktree_command))
-            .args(move_branch_to_worktree_args(&repo.root, branch)),
-        ProcessPolicy::LocalMutation,
-    )?;
+    crate::worktrunk::switch_worktree(crate::worktrunk::SwitchRequest {
+        repo,
+        config,
+        branch,
+        create: false,
+        base: None,
+    })
+    .map_err(|failure| failure.to_string())?;
     let _ = crate::observability::append_runtime_message(
         repo,
         &format!("moved {branch} into Worktrunk worktree and switched checkout to {base}"),
@@ -234,119 +181,11 @@ pub(crate) fn run_pre_pr_checks(config: &Config, path: &Path) -> Result<(), Stri
     run_configured_commands(&config.checks.pre_pr, path, "pre_pr")
 }
 
-fn create_worktree_args(repo_root: &Path, branch: &str, default_base: Option<&str>) -> Vec<String> {
-    let mut args = vec![
-        "-C".to_string(),
-        repo_root.display().to_string(),
-        "switch".to_string(),
-        "--create".to_string(),
-        "--no-cd".to_string(),
-        "--format".to_string(),
-        "json".to_string(),
-    ];
-    if let Some(base) = default_base.map(str::trim).filter(|base| !base.is_empty()) {
-        args.push("--base".to_string());
-        args.push(base.to_string());
-    }
-    args.push(branch.to_string());
-    args
-}
-
-fn checkout_worktree_args(repo_root: &Path, branch: &str) -> Vec<String> {
-    vec![
-        "-C".to_string(),
-        repo_root.display().to_string(),
-        "switch".to_string(),
-        "--no-cd".to_string(),
-        "--format".to_string(),
-        "json".to_string(),
-        branch.to_string(),
-    ]
-}
-
-fn worktree_command_failure_message(
-    command_display: &str,
-    output: &ProcessOutput,
-    repo: &Repository,
-    config: &Config,
-) -> String {
-    if is_worktrunk_approval_failure(&process_output_text(output)) {
-        let message = format!("{command_display}: {}", process_output_text(output).trim());
-        format!("{message}\n\n{}", worktrunk_approval_hint(repo, config))
-    } else {
-        let message = format!("{command_display}: {}", process_failure_message(output));
-        message
-    }
-}
-
-fn worktrunk_approval_hint(repo: &Repository, config: &Config) -> String {
-    format!(
-        "This repo has Worktrunk project commands that must be approved before Prism can create worktrees.\n\nRun:\n{}",
-        worktrunk_approval_command_display(repo, config)
-    )
-}
-
-fn worktrunk_approval_command_display(repo: &Repository, config: &Config) -> String {
-    format!(
-        "{} -C {} config approvals add",
-        shell_quote(&config.tool(&config.worktree_command)),
-        shell_quote(&repo.root.display().to_string())
-    )
-}
-
-fn process_failure_message(output: &ProcessOutput) -> String {
-    let stderr = first_non_empty_line(&output.stderr);
-    let stdout = first_non_empty_line(&output.stdout);
-    if !stderr.is_empty() {
-        stderr
-    } else if !stdout.is_empty() {
-        stdout
-    } else {
-        format!("exited with {}", output.status)
-    }
-}
-
-fn process_output_text(output: &ProcessOutput) -> String {
-    format!("{}\n{}", output.stdout, output.stderr)
-}
-
-fn first_non_empty_line(output: &str) -> String {
-    output
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("")
-        .to_string()
-}
-
-fn shell_quote(value: &str) -> String {
-    if !value.is_empty()
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':'))
-    {
-        return value.to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
 fn switch_checkout_args(repo_root: &Path, branch: &str) -> Vec<String> {
     vec![
         "-C".to_string(),
         repo_root.display().to_string(),
         "switch".to_string(),
-        branch.to_string(),
-    ]
-}
-
-fn move_branch_to_worktree_args(repo_root: &Path, branch: &str) -> Vec<String> {
-    vec![
-        "-C".to_string(),
-        repo_root.display().to_string(),
-        "switch".to_string(),
-        "--no-cd".to_string(),
-        "--format".to_string(),
-        "json".to_string(),
         branch.to_string(),
     ]
 }
@@ -488,8 +327,7 @@ pub(crate) fn prune_worktrees(repo: &Repository, config: &Config) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::{
-        WorktrunkApprovalStatus, check_worktrunk_approval_status, create_worktree_args,
-        is_worktrunk_approval_failure, move_branch_to_worktree_args, remove_worktree,
+        WorktrunkApprovalStatus, check_worktrunk_approval_status, remove_worktree,
         switch_checkout_args,
     };
     use crate::config::Config;
@@ -503,36 +341,15 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn create_worktree_uses_worktrunk_without_changing_directory() {
-        let args = create_worktree_args(
-            PathBuf::from("/repo/prism").as_path(),
-            "feat/test",
-            Some("main"),
-        );
-
-        assert_eq!(
-            args,
-            vec![
-                "-C",
-                "/repo/prism",
-                "switch",
-                "--create",
-                "--no-cd",
-                "--format",
-                "json",
-                "--base",
-                "main",
-                "feat/test",
-            ]
-        );
-    }
-
-    #[test]
     fn create_worktree_session_clears_stale_hidden_marker() {
         let temp = unique_temp_dir("prism-create-clears-hidden-test");
         fs::create_dir_all(&temp).unwrap();
         let wt = temp.join("wt");
-        fs::write(&wt, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::write(
+            &wt,
+            "#!/bin/sh\nprintf '%s' '{\"action\":\"created\",\"branch\":\"feature\",\"path\":\"/repo/prism.feature\",\"created_branch\":true}'\n",
+        )
+        .unwrap();
         let mut permissions = fs::metadata(&wt).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&wt, permissions).unwrap();
@@ -664,19 +481,6 @@ mod tests {
     }
 
     #[test]
-    fn detects_worktrunk_approval_failure() {
-        let output = "mock-repo needs approval before running commands:\ncannot prompt for approval in non-interactive environment";
-
-        assert!(is_worktrunk_approval_failure(output));
-        assert!(!is_worktrunk_approval_failure(
-            "All commands already approved"
-        ));
-        assert!(!is_worktrunk_approval_failure(
-            "mock-repo cannot prompt in non-interactive mode before it needs approval"
-        ));
-    }
-
-    #[test]
     fn check_worktrunk_approval_status_reports_pending() {
         let temp = unique_temp_dir("prism-wt-approval-status-test");
         fs::create_dir_all(&temp).unwrap();
@@ -715,7 +519,9 @@ mod tests {
             .insert("wt".to_string(), wt.display().to_string());
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
 
-        let error = crate::session::create_worktree_session(&repo, &config, "feature").unwrap_err();
+        let error = crate::session::create_worktree_session(&repo, &config, "feature")
+            .unwrap_err()
+            .to_string();
 
         assert!(error.contains("repo needs approval to execute 1 command"));
         assert!(error.contains("Cannot prompt for approval in non-interactive environment"));
@@ -726,25 +532,56 @@ mod tests {
     }
 
     #[test]
-    fn move_current_branch_args_switch_checkout_then_worktrunk_session() {
+    fn move_current_branch_args_switches_checkout_first() {
         let repo = PathBuf::from("/repo/prism");
 
         assert_eq!(
             switch_checkout_args(&repo, "main"),
             vec!["-C", "/repo/prism", "switch", "main"]
         );
-        assert_eq!(
-            move_branch_to_worktree_args(&repo, "feat/test"),
-            vec![
-                "-C",
-                "/repo/prism",
-                "switch",
-                "--no-cd",
-                "--format",
-                "json",
-                "feat/test",
-            ]
+    }
+
+    #[test]
+    fn move_current_branch_uses_typed_worktrunk_switch() {
+        let temp = unique_temp_dir("prism-move-current-branch-test");
+        fs::create_dir_all(&temp).unwrap();
+        let git_log = temp.join("git.log");
+        let wt_log = temp.join("wt.log");
+        let git = temp.join("git");
+        let wt = temp.join("wt");
+        write_executable(
+            &git,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n",
+                git_log.display()
+            ),
         );
+        write_executable(
+            &wt,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf '%s' '{{\"action\":\"existing\",\"branch\":\"feat/test\",\"path\":\"/repo/prism.feat-test\"}}'\n",
+                wt_log.display()
+            ),
+        );
+        let mut config = test_config();
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+
+        super::move_current_branch_to_worktree(&repo, &config, "feat/test", "main").unwrap();
+
+        assert!(
+            fs::read_to_string(git_log)
+                .unwrap()
+                .contains("switch\nmain")
+        );
+        let wt_args = fs::read_to_string(wt_log).unwrap();
+        assert!(wt_args.contains("switch\n--no-cd\n--format=json\nfeat/test"));
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]

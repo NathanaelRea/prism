@@ -15,66 +15,7 @@ pub(super) fn fetch_wt_columns(
     repo: &crate::repo::Repository,
     config: &crate::config::Config,
 ) -> Result<BTreeMap<PathBuf, BTreeMap<String, String>>, String> {
-    let raw = run_capture(
-        Command::new(config.tool(&config.worktree_command))
-            .arg("-C")
-            .arg(&repo.root)
-            .args(["list", "--format=json"]),
-        crate::process::ProcessPolicy::Metadata,
-    )?;
-    let mut by_path = BTreeMap::new();
-    for object in json_top_level_objects(&raw) {
-        let Some(path) = json_string_field(object, "path") else {
-            continue;
-        };
-        let mut columns = discover_wt_columns(object);
-        for column in &config.worktree_columns {
-            if let Some(value) = wt_column_value(object, column) {
-                columns.insert(column.clone(), value);
-            }
-        }
-        by_path.insert(PathBuf::from(path), columns);
-    }
-    Ok(by_path)
-}
-
-pub(super) fn discover_wt_columns(object: &str) -> BTreeMap<String, String> {
-    let Ok(value) = serde_json::from_str::<Value>(object) else {
-        return BTreeMap::new();
-    };
-    let mut columns = BTreeMap::new();
-    let Some(fields) = value.as_object() else {
-        return columns;
-    };
-    for (key, value) in fields {
-        if key == "path" {
-            continue;
-        }
-        collect_wt_column(&mut columns, key, value);
-    }
-    columns
-}
-
-pub(super) fn collect_wt_column(columns: &mut BTreeMap<String, String>, key: &str, value: &Value) {
-    match value {
-        Value::String(value) => {
-            if !value.is_empty() {
-                columns.insert(key.to_string(), value.clone());
-            }
-        }
-        Value::Bool(value) => {
-            columns.insert(key.to_string(), value.to_string());
-        }
-        Value::Number(value) => {
-            columns.insert(key.to_string(), value.to_string());
-        }
-        Value::Object(fields) => {
-            for (field, value) in fields {
-                collect_wt_column(columns, &format!("{key}.{field}"), value);
-            }
-        }
-        Value::Array(_) | Value::Null => {}
-    }
+    crate::worktrunk::list_columns(repo, config)
 }
 
 pub(super) fn default_branch_status_label(
@@ -110,35 +51,6 @@ pub(super) fn status_label_with_behind(label: &str, behind: usize) -> String {
     } else {
         label.to_string()
     }
-}
-
-pub(super) fn wt_column_value(object: &str, column: &str) -> Option<String> {
-    if let Some(key) = column.strip_prefix("vars.") {
-        return json_object_field(object, "vars").and_then(|vars| json_string_field(vars, key));
-    }
-    if let Some((object_key, field_key)) = column.split_once('.') {
-        return json_object_field(object, object_key)
-            .and_then(|inner| json_string_field(inner, field_key));
-    }
-    json_string_field(object, column)
-        .or_else(|| json_bool_field(object, column).map(|value| value.to_string()))
-        .or_else(|| {
-            if column == "ci" {
-                json_object_field(object, "ci").map(|ci| {
-                    let status = json_string_field(ci, "status").unwrap_or_default();
-                    let number = crate::json::json_u64_field(ci, "number")
-                        .map(|number| format!("#{number}"))
-                        .unwrap_or_else(|| "ci".to_string());
-                    if status.is_empty() {
-                        number
-                    } else {
-                        format!("{number}:{status}")
-                    }
-                })
-            } else {
-                None
-            }
-        })
 }
 
 impl Tui {

@@ -334,17 +334,18 @@ impl Tui {
         {
             Ok(outcome) => outcome,
             Err(error) => {
-                if !is_worktrunk_approval_failure(&error)
+                if !error.approval_required()
                     || !self.offer_worktrunk_approval(raw, &context.repo, &context.config)?
                 {
-                    return Err(error);
+                    return Err(error.to_string());
                 }
                 self.show_loading_dialog(
                     raw,
                     "Create Session",
                     &format!("Creating worktree for {}", branch.trim()),
                 )?;
-                create_worktree_session(&context.repo, &context.config, branch.trim())?
+                create_worktree_session(&context.repo, &context.config, branch.trim())
+                    .map_err(|error| error.to_string())?
             }
         };
         if let CreateWorktreeOutcome::CreatedMetadataFailed { error } = creation {
@@ -565,7 +566,9 @@ impl Tui {
             "Unarchive Worktree",
             &format!("Restoring {}", worktree.branch),
         )?;
-        match create_worktree_session(&context.repo, &context.config, &worktree.branch)? {
+        match create_worktree_session(&context.repo, &context.config, &worktree.branch)
+            .map_err(|error| error.to_string())?
+        {
             CreateWorktreeOutcome::Created | CreateWorktreeOutcome::Restored => {}
             CreateWorktreeOutcome::CreatedMetadataFailed { error } => {
                 self.refresh_sessions()?;

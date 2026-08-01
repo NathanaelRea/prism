@@ -5,6 +5,10 @@
 
 ## Creation
 
+- **Invariant**: Prism owns persistent Worktree Session identity and incarnation;
+  Worktrunk owns physical worktree creation, path policy, hook execution, and
+  approvals. Observed Worktrunk state is associated only by repository and exact
+  normalized worktree path, never by branch-name fallback.
 - **Behavior**: `c` creates a Worktree Session from the repositories panel using
   the currently selected repository.
 - **Behavior**: Creation opens a dialog that identifies the target repository and

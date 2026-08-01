@@ -534,7 +534,7 @@ impl Tui {
         repo: &Repository,
         config: &Config,
     ) -> Result<bool, String> {
-        let command = format!("wt -C {} config approvals add", repo.root.display());
+        let command = crate::worktrunk::approval_command_display(repo, config);
         let lines = vec![
             crate::view::DialogLine {
                 text: "This repo has Worktrunk project commands that must be approved before Prism can create worktrees.".to_string(),

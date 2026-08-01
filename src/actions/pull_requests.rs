@@ -264,17 +264,18 @@ impl Tui {
         let creation = match checkout_worktree_session(&context.repo, &context.config, &branch) {
             Ok(outcome) => outcome,
             Err(error) => {
-                if !is_worktrunk_approval_failure(&error)
+                if !error.approval_required()
                     || !self.offer_worktrunk_approval(raw, &context.repo, &context.config)?
                 {
-                    return Err(error);
+                    return Err(error.to_string());
                 }
                 self.show_loading_dialog(
                     raw,
                     "Remote Pull Requests",
                     &format!("Opening worktree for PR #{}", summary.number),
                 )?;
-                checkout_worktree_session(&context.repo, &context.config, &branch)?
+                checkout_worktree_session(&context.repo, &context.config, &branch)
+                    .map_err(|error| error.to_string())?
             }
         };
         if let CreateWorktreeOutcome::CreatedMetadataFailed { error } = creation {

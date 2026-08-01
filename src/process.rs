@@ -862,11 +862,6 @@ pub fn run_status_named(
     }
 }
 
-pub fn run_output(command: &mut Command, policy: ProcessPolicy) -> Result<ProcessOutput, String> {
-    let descriptor = infer_descriptor(command);
-    run_output_named(command, policy, descriptor)
-}
-
 pub fn run_output_named(
     command: &mut Command,
     policy: ProcessPolicy,

@@ -74,8 +74,14 @@
 - **Constraint**: Tmux is the sole interactive Agent Session runtime. Agent
   sessions provide an agent window, lazygit window, and shell window in the same
   worktree.
-- **Constraint**: Worktrunk provides worktree creation and its configured project
-  hooks; Prism must not depend on changing the caller's shell directory.
+- **Constraint**: The installed Worktrunk executable owns physical worktree path
+  policy, creation, project hooks, approvals, and Worktrunk environment state.
+  Prism integrates through typed machine-format subprocess operations, does not
+  embed or fork Worktrunk, and must not depend on changing the caller's shell
+  directory.
+- **Invariant**: Git's live worktree inventory is authoritative for worktree
+  existence and attached branches. Worktrunk observations decorate that
+  inventory and cannot create or resurrect a Prism Worktree Session.
 - **Constraint**: Harness activity and completion are obtained from supported
   adapter data, not by scraping rendered terminal lines.
 - **Constraint**: Generic harnesses expose process liveness and bounded headless

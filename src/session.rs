@@ -270,11 +270,32 @@ pub(crate) enum CreateWorktreeOutcome {
     CreatedMetadataFailed { error: String },
 }
 
+#[derive(Debug)]
+pub(crate) enum CreateWorktreeFailure {
+    Worktrunk(crate::worktrunk::WorktrunkFailure),
+    Other(String),
+}
+
+impl CreateWorktreeFailure {
+    pub(crate) fn approval_required(&self) -> bool {
+        matches!(self, Self::Worktrunk(failure) if failure.approval_required())
+    }
+}
+
+impl std::fmt::Display for CreateWorktreeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Worktrunk(failure) => failure.fmt(formatter),
+            Self::Other(error) => formatter.write_str(error),
+        }
+    }
+}
+
 pub(crate) fn create_worktree_session(
     repo: &Repository,
     config: &Config,
     branch: &str,
-) -> Result<CreateWorktreeOutcome, String> {
+) -> Result<CreateWorktreeOutcome, CreateWorktreeFailure> {
     create_or_checkout_worktree_session(repo, config, branch, false)
 }
 
@@ -282,7 +303,7 @@ pub(crate) fn checkout_worktree_session(
     repo: &Repository,
     config: &Config,
     branch: &str,
-) -> Result<CreateWorktreeOutcome, String> {
+) -> Result<CreateWorktreeOutcome, CreateWorktreeFailure> {
     create_or_checkout_worktree_session(repo, config, branch, true)
 }
 
@@ -291,17 +312,20 @@ fn create_or_checkout_worktree_session(
     config: &Config,
     branch: &str,
     checkout: bool,
-) -> Result<CreateWorktreeOutcome, String> {
-    if hidden_session_exists(repo, branch)?
-        && crate::lifecycle::branch_has_worktree(repo, config, branch)?
+) -> Result<CreateWorktreeOutcome, CreateWorktreeFailure> {
+    if hidden_session_exists(repo, branch).map_err(CreateWorktreeFailure::Other)?
+        && crate::lifecycle::branch_has_worktree(repo, config, branch)
+            .map_err(CreateWorktreeFailure::Other)?
     {
-        unarchive_worktree_session(repo, branch)?;
+        unarchive_worktree_session(repo, branch).map_err(CreateWorktreeFailure::Other)?;
         return Ok(CreateWorktreeOutcome::Restored);
     }
     if checkout {
-        crate::lifecycle::checkout_worktree(repo, config, branch)?;
+        crate::lifecycle::checkout_worktree(repo, config, branch)
+            .map_err(CreateWorktreeFailure::Worktrunk)?;
     } else {
-        crate::lifecycle::create_worktree(repo, config, branch)?;
+        crate::lifecycle::create_worktree(repo, config, branch)
+            .map_err(CreateWorktreeFailure::Worktrunk)?;
     }
     match unarchive_worktree_session(repo, branch) {
         Ok(()) => Ok(CreateWorktreeOutcome::Created),
@@ -2698,7 +2722,10 @@ exit 0
         let wt = temp.join("wt");
         write_executable(
             &wt,
-            &format!("#!/bin/sh\nmkdir -p '{}'\nexit 0\n", db.display()),
+            &format!(
+                "#!/bin/sh\nmkdir -p '{}'\nprintf '%s' '{{\"action\":\"created\",\"branch\":\"feature\",\"path\":\"/repo/worktree\",\"created_branch\":true}}'\n",
+                db.display()
+            ),
         );
         let mut config = test_config();
         config
