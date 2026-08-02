@@ -25,12 +25,17 @@ mod agent_state;
 mod attach;
 mod dialog;
 mod git_actions;
+pub(crate) mod input;
 mod job_orchestration;
 mod job_protocol;
+pub(crate) mod jobs;
 mod navigation;
 mod presentation;
 mod remote_action;
 mod repository;
+pub(crate) mod runtime;
+pub(crate) mod signal;
+pub(crate) mod state;
 mod workflow;
 
 #[cfg(test)]

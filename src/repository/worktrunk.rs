@@ -1430,11 +1430,11 @@ mod tests {
     #[test]
     fn parses_and_normalizes_schema_1_fixtures() {
         let full = parse_list_fixture(include_str!(
-            "../tests/fixtures/worktrunk/schema1-full.json"
+            "../../tests/fixtures/worktrunk/schema1-full.json"
         ))
         .unwrap();
         let minimal = parse_list_fixture(include_str!(
-            "../tests/fixtures/worktrunk/schema1-minimal.json"
+            "../../tests/fixtures/worktrunk/schema1-minimal.json"
         ))
         .unwrap();
 
@@ -1457,11 +1457,11 @@ mod tests {
     #[test]
     fn parses_and_normalizes_schema_2_fixtures() {
         let full = parse_list_fixture(include_str!(
-            "../tests/fixtures/worktrunk/schema2-full.json"
+            "../../tests/fixtures/worktrunk/schema2-full.json"
         ))
         .unwrap();
         let minimal = parse_list_fixture(include_str!(
-            "../tests/fixtures/worktrunk/schema2-minimal.json"
+            "../../tests/fixtures/worktrunk/schema2-minimal.json"
         ))
         .unwrap();
 

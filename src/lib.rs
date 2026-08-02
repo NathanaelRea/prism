@@ -2,55 +2,31 @@
 compile_error!("unsupported Prism target OS; Prism supports only Linux and macOS");
 
 mod actions;
-mod agent;
-mod agent_session;
-mod args;
+mod agent_runtime;
+pub(crate) use agent_runtime::{agent, agent_session, harness, opencode, tmux};
+mod application;
+pub use application::cli;
+pub(crate) use application::{args, config, setup};
 pub mod auto_flow;
-mod ci;
-pub mod cli;
-#[cfg(test)]
-#[path = "../test-support/compact_runtime.rs"]
-mod compact_runtime;
-mod config;
-mod desktop_notification;
-mod durability;
-mod execution;
-pub mod file_persistence;
-mod flight_recorder;
-mod git;
-mod harness;
-mod input;
-mod json;
-mod lifecycle;
-mod observability;
-mod opencode;
-mod plan;
 pub mod plan_run;
-mod platform;
-mod process;
 mod remote;
-mod repo;
-mod review;
-mod run_marker;
-mod session;
-mod setup;
-pub mod storage;
-mod terminal;
+mod repository;
+pub(crate) use repository::{git, lifecycle, repo, session, workspace, workspace_state, worktrunk};
+mod system;
+pub(crate) use system::{
+    desktop_notification, durability, json, platform, process, terminal, util,
+};
+pub use system::{file_persistence, storage};
+mod telemetry;
+pub(crate) use telemetry::{flight_recorder, observability, run_marker};
 #[cfg(test)]
-mod test_support;
-mod tmux;
+mod testing;
+#[cfg(test)]
+pub(crate) use testing::{compact_runtime, test_support};
 mod tui;
-mod tui_jobs;
-mod tui_runtime;
-mod tui_signal;
-mod ui_state;
-mod util;
-mod verify;
+pub(crate) use tui::{
+    input, jobs as tui_jobs, runtime as tui_runtime, signal as tui_signal, state as ui_state,
+};
 mod view;
-mod worker;
-mod workspace;
-mod workspace_state;
-mod worktrunk;
-
-#[cfg(test)]
-mod platform_contract_tests;
+mod workflow;
+pub(crate) use workflow::{ci, execution, plan, review, verify, worker};

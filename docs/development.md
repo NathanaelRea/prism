@@ -43,7 +43,7 @@ CI also runs a no-model smoke test against a pinned real OpenCode binary on Linu
 
 ```sh
 PRISM_TEST_OPENCODE="$(command -v opencode)" \
-  cargo test opencode::tests::real_opencode_server_round_trips_prism_session_api \
+  cargo test agent_runtime::opencode::tests::real_opencode_server_round_trips_prism_session_api \
     -- --ignored --exact
 ```
 
@@ -110,14 +110,14 @@ git config core.hooksPath .githooks
 
 Prism's TUI is split between local application state and Ratatui/Crossterm terminal mechanics:
 
-- `src/tui.rs` owns Prism UI state, panel focus, selection, modal state, background polling, and action dispatch.
-- `src/tui_runtime.rs` owns terminal lifecycle through Crossterm and Ratatui: raw mode, alternate screen, cursor visibility, event polling, resize events, drawing, and suspend/resume around tmux, lazygit, and shell handoff.
-- `src/input.rs` maps typed Crossterm key events into Prism-level `Key` values. It should not read raw stdin bytes or inspect repository/worktree domain state.
+- `src/tui/mod.rs` owns Prism UI state, panel focus, selection, modal state, background polling, and action dispatch.
+- `src/tui/runtime.rs` owns terminal lifecycle through Crossterm and Ratatui: raw mode, alternate screen, cursor visibility, event polling, resize events, drawing, and suspend/resume around tmux, lazygit, and shell handoff.
+- `src/tui/input.rs` maps typed Crossterm key events into Prism-level `Key` values. It should not read raw stdin bytes or inspect repository/worktree domain state.
 - `src/view/` defines terminal-backend-independent view models and the Ratatui renderer that translates them into layouts, widgets, styles, overlays, and test buffers.
 
 Keep domain behavior out of renderer widgets. Rendering should consume view models, while state transitions and command decisions remain testable through `Tui` methods without a real terminal.
 
-Dialogs currently use typed nested loops in `src/tui.rs` instead of a single explicit `UiMode` state machine. This is an intentional Ratatui migration deviation: raw byte parsing is gone, dialog input uses Crossterm `KeyEvent`s, and those loops continue to tick background polling and redraw on resize. Consolidating help, prompt, confirm, and progress dialogs into a shared `UiMode` remains a future refactor if Prism adds richer modal editing or more dialog types.
+Dialogs currently use typed nested loops in `src/tui/mod.rs` instead of a single explicit `UiMode` state machine. This is an intentional Ratatui migration deviation: raw byte parsing is gone, dialog input uses Crossterm `KeyEvent`s, and those loops continue to tick background polling and redraw on resize. Consolidating help, prompt, confirm, and progress dialogs into a shared `UiMode` remains a future refactor if Prism adds richer modal editing or more dialog types.
 
 ## Prism Database Tables
 
