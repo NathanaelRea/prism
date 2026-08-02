@@ -1612,14 +1612,8 @@ mod tests {
                     .as_mut()
                     .unwrap()
                     .review
-                    .actionable_reviews
-                    .push(ActionableReviewItem::ReviewBody {
-                        review_id: "review".to_string(),
-                        author: "reviewer".to_string(),
-                        state: "CHANGES_REQUESTED".to_string(),
-                        body: "fix this".to_string(),
-                        submitted_at: "now".to_string(),
-                    });
+                    .unresolved_threads
+                    .push(unresolved_review_thread());
                 snapshot
             },
             {
@@ -2447,14 +2441,8 @@ mod tests {
             .as_mut()
             .unwrap()
             .review
-            .actionable_reviews
-            .push(ActionableReviewItem::ReviewBody {
-                review_id: "new-review".to_string(),
-                author: "reviewer".to_string(),
-                state: "CHANGES_REQUESTED".to_string(),
-                body: "please revise".to_string(),
-                submitted_at: "later".to_string(),
-            });
+            .unresolved_threads
+            .push(unresolved_review_thread());
         cases.push(review);
         let mut ci = ready.clone();
         ci.pull_request.as_mut().unwrap().ci.aggregate = PrCheckState::Failed;
@@ -2570,6 +2558,19 @@ mod tests {
                 cleanup_after_merge: false,
             },
             pending_push: None,
+        }
+    }
+
+    fn unresolved_review_thread() -> ReviewThreadFact {
+        ReviewThreadFact {
+            thread_id: "thread-1".to_string(),
+            comment_id: "comment-1".to_string(),
+            path: "src/lib.rs".to_string(),
+            line: Some(12),
+            body: "please fix".to_string(),
+            author: "reviewer".to_string(),
+            resolved: false,
+            created_at: "now".to_string(),
         }
     }
 

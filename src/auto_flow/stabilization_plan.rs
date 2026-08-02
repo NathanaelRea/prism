@@ -66,9 +66,7 @@ pub(crate) fn derive_blockers(snapshot: &StabilizationSnapshot) -> Vec<Stabiliza
     } else if matches!(pull_request.mergeability, MergeabilityFacts::Unknown) {
         blockers.push(StabilizationBlocker::Escalate);
     }
-    if !pull_request.review.actionable_reviews.is_empty()
-        || !pull_request.review.unresolved_threads.is_empty()
-    {
+    if !pull_request.review.unresolved_threads.is_empty() {
         blockers.push(StabilizationBlocker::ReviewFeedbackFound);
     }
 
@@ -85,12 +83,6 @@ pub(crate) fn derive_blockers(snapshot: &StabilizationSnapshot) -> Vec<Stabiliza
             PrCheckState::Pending => blockers.push(StabilizationBlocker::CiPending),
             PrCheckState::Success | PrCheckState::Unknown => {}
         }
-    }
-
-    if pull_request.review.approval_required
-        && !pull_request.review.approval_requirement_satisfied()
-    {
-        blockers.push(StabilizationBlocker::ReviewApprovalMissing);
     }
 
     match &snapshot.policy {
@@ -618,6 +610,24 @@ mod tests {
     }
 
     #[test]
+    fn review_body_without_unresolved_threads_does_not_block_readiness() {
+        let mut pr = clean_pr();
+        pr.review
+            .actionable_reviews
+            .push(ActionableReviewItem::ReviewBody {
+                review_id: "review-1".to_string(),
+                author: "reviewer".to_string(),
+                state: "CHANGES_REQUESTED".to_string(),
+                body: "historical feedback".to_string(),
+                submitted_at: "now".to_string(),
+            });
+
+        let work = plan(&snapshot(Some(pr)));
+
+        assert_eq!(work.blocker, StabilizationBlocker::ReadyForManualMerge);
+    }
+
+    #[test]
     fn top_level_comment_only_does_not_block_readiness() {
         let mut pr = clean_pr();
         pr.review.top_level_comments = 1;
@@ -755,19 +765,18 @@ mod tests {
     }
 
     #[test]
-    fn review_approval_missing_plans_wait_after_ci() {
+    fn review_approval_state_without_unresolved_threads_does_not_block() {
         let mut pr = clean_pr();
         pr.review.approval_required = true;
         pr.review.decision = "REVIEW_REQUIRED".to_string();
 
         let work = plan(&snapshot(Some(pr)));
 
-        assert_eq!(work.blocker, StabilizationBlocker::ReviewApprovalMissing);
-        assert_eq!(work.kind, StabilizationWorkKind::WaitForReview);
+        assert_eq!(work.blocker, StabilizationBlocker::ReadyForManualMerge);
     }
 
     #[test]
-    fn numeric_approval_threshold_blocks_planning_despite_approved_aggregate() {
+    fn numeric_approval_metadata_is_enforced_by_policy_not_the_review_gate() {
         let mut pr = clean_pr();
         pr.review.approval_required = true;
         pr.review.required_approvals = 2;
@@ -775,12 +784,7 @@ mod tests {
 
         let work = plan(&snapshot(Some(pr)));
 
-        assert_eq!(work.blocker, StabilizationBlocker::ReviewApprovalMissing);
-        assert_eq!(work.kind, StabilizationWorkKind::WaitForReview);
-        assert_eq!(
-            work.reason,
-            "1 of 2 required review approvals are satisfied"
-        );
+        assert_eq!(work.blocker, StabilizationBlocker::ReadyForManualMerge);
     }
 
     #[test]
