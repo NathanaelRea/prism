@@ -1005,7 +1005,7 @@ impl Tui {
         let job_branch = branch.clone();
         let expected_push_guard =
             crate::remote::dispatcher::prepare_push(&path, &context.config, &branch)?;
-        let expected_pushed_head = expected_push_guard.expected_head_sha.clone();
+        let expected_pushed_head_sha = expected_push_guard.expected_head_sha.clone();
         let expected_push_target = remote_push_mutation_target(&expected_push_guard);
         let reconciliation_target = expected_push_target.clone();
         let RemoteActionValue::PushPrepared(prepared) = self.run_remote_action(
@@ -1079,7 +1079,7 @@ impl Tui {
                 selected,
                 &follow_up_repo,
                 &follow_up_config,
-                Some(expected_pushed_head),
+                Some(expected_pushed_head_sha),
             )?;
         }
         if !self.sessions[selected].pr.has_summary() {

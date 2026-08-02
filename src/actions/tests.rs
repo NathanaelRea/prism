@@ -115,7 +115,7 @@ fn review_resolution_uses_only_unresolved_threads_in_the_observed_details() {
 }
 
 #[test]
-fn review_resolution_waits_until_the_pushed_commit_is_observed() {
+fn review_resolution_checks_that_the_pushed_commit_is_observed() {
     let mut summary = phase_1_pr_summary("old-head");
 
     assert!(ensure_review_resolution_head(&summary, "new-head").is_err());
