@@ -18,12 +18,12 @@ use crate::{
         stabilization_model::{StabilizationBlocker, StabilizationWorkKind},
     },
     config::{Config, IconStyle},
-    github::{PrCache, PrSummary},
     opencode::OpencodeState,
     plan_run::{
         PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRunMode, PlanRunStatus, PlanStepRun,
         PlanStepStatus, plan_output_block_key,
     },
+    remote::{PrCache, PrSummary},
     session::{Session, SessionClassification},
     tui::{PanelFocus, WorktreeListMode},
     util::{status_count, truncate},
@@ -222,6 +222,7 @@ impl From<&crate::worktrunk::ObservationQuality> for DevelopmentEnvironmentQuali
 }
 
 pub(crate) struct RepoPrRow {
+    pub provider_noun: &'static str,
     pub repo_label: String,
     pub number: u64,
     pub title: String,
@@ -232,6 +233,7 @@ pub(crate) struct RepoPrRow {
     pub head_ref: String,
     pub base_ref: String,
     pub check_status: String,
+    pub queue_state: String,
     pub comment_count: u64,
     pub merged: bool,
     pub draft: bool,
@@ -247,6 +249,7 @@ impl RepoPrRow {
         selected: bool,
     ) -> Self {
         Self {
+            provider_noun: summary.provider_noun(),
             repo_label,
             number: summary.number,
             title: summary.title.clone(),
@@ -257,6 +260,7 @@ impl RepoPrRow {
             head_ref: summary.head_ref.clone(),
             base_ref: summary.base_ref.clone(),
             check_status: summary.check_status.clone(),
+            queue_state: summary.queue_state.clone(),
             comment_count: summary.comment_count,
             merged: summary.merged,
             draft: summary.draft,
@@ -287,6 +291,7 @@ pub(crate) struct AutoDashboard {
     pub linked_plan_dashboard: Option<PlanDashboard>,
     pub output_lines: Vec<AutoOutputLine>,
     pub output_state: AutoOutputViewerState,
+    pub worker_status: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -304,7 +309,7 @@ pub(crate) struct PlanOutputViewerState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RepoMainView {
-    Github,
+    ChangeRequests,
     Kanban,
 }
 
@@ -317,7 +322,7 @@ pub(crate) enum WorktreeMainView {
 impl RepoMainView {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::Github => "github",
+            Self::ChangeRequests => "requests",
             Self::Kanban => "kanban",
         }
     }
@@ -353,6 +358,7 @@ pub(crate) fn sidebar_width_for(cols: u16, configured_width: Option<u16>) -> u16
     layout::sidebar_width(cols, configured_width)
 }
 
+use auto_dashboard::*;
 use dialog::*;
 use format::*;
 use layout::*;

@@ -1,8 +1,15 @@
 # Auto Flow
 
-Auto Flow automates one clean, non-default Worktree Session through implementation, local verification, commit, and pull request creation. After a PR exists, Auto Flow delegates gate decisions to PR Stabilization.
+Auto Flow automates one clean, non-default Worktree Session through
+implementation, local verification, commit, and change-request creation. After
+a change request exists, Auto Flow delegates gate decisions to Change Request
+Stabilization.
 
-PR Stabilization observes local Git state, cached GitHub pull request state, repository policy, and Auto Flow configuration. It is authoritative for post-PR liveness, derives one status and blocker, and chooses one safe next work item instead of following a fixed review-to-CI checklist.
+Change Request Stabilization observes local Git state, cached provider state,
+repository policy, provider capabilities, and Auto Flow configuration. It is
+authoritative for post-request liveness, derives one status and blocker, and
+chooses one safe next work item instead of following a fixed review-to-CI
+checklist.
 
 Start or focus it from the TUI with `A` on a selected non-default worktree. New runs ask how to source implementation work:
 
@@ -20,7 +27,7 @@ prism --repo /work/project auto plan "draft and review a plan before coding"
 
 Compatibility notes:
 
-- `P` remains standalone Plan Mode for running plan phases without the Auto Flow PR pipeline.
+- `P` remains standalone Plan Mode for running plan phases without the Auto Flow change-request pipeline.
 - `A` is the TUI Auto Flow shortcut; the former leader-based Auto Flow shortcut has been removed.
 - `auto plan` drafts, reviews, and waits for approval, then executes the approved `plan.md` by phase; `auto plan-first` and `auto intensive` are aliases.
 
@@ -33,9 +40,9 @@ Safety defaults:
 - implementation continues through local verification and commit, then pauses before push; other agent and approval boundaries still pause for review
 - worktrees with active Auto Flow runs are highlighted in the worktree list so paused/running/failed runs are visible from the sidebar
 - local verification runs `checks.pre_push`, `checks.pre_pr`, and a non-mutating merge-conflict check
-- PR Stabilization handles review feedback, CI failures, pending checks, review approval, repository policy, mergeability, manual readiness, and auto-merge readiness as derived blockers
+- Change Request Stabilization handles review feedback, CI failures, pending checks, review approval, repository policy, mergeability, manual readiness, and auto-merge readiness as derived blockers
 - managed review and CI repairs verify locally, create a repair commit, and enter guarded pending-push by default
-- review bodies and unresolved inline review threads can authorize review repair; top-level PR comments remain advisory
+- review bodies and unresolved inline review threads can authorize review repair; top-level change-request comments remain advisory
 - pending repair commits are not pushed automatically unless `auto.push_repairs = true`; inspect the commit diff and use `Space g P` to push through the guard
 - `auto.merge = false` and `auto.cleanup_after_merge = false` by default
 
@@ -71,25 +78,28 @@ repair_commit_merge = "fix: merge"
 
 Auto Flow prompt templates support `{{task}}`, `{{plan_path}}`, `{{mode}}`, `{{variant}}`, `{{agent_profile}}`, `{{context}}`, and `{{branch}}` where applicable.
 
-The selected Worktree Session main panel shows the derived PR Stabilization state: blocker, next work, CI/review/merge/policy gates, guard state, and any pending repair commit. The Auto Flow dashboard remains the audit view for persisted step attempts and output.
+The selected Worktree Session main panel shows the derived Change Request
+Stabilization state: blocker, next work, CI/review/merge/policy gates, guard
+state, and any pending repair commit. The Auto Flow dashboard remains the audit
+view for persisted step attempts and output.
 
 Pending push behavior:
 
 - `PendingPush` means Prism created a local repair commit and is waiting for user inspection.
 - `Space g P` reobserves the selected Worktree Session before pushing.
-- If the PR branch already contains the guarded commit, Prism marks the push satisfied and replans.
+- If the change-request branch already contains the guarded commit, Prism marks the push satisfied and replans.
 - If local or remote branch state moved away from the guard, Prism invalidates the pending push and replans instead of pushing blindly.
 - Review repair pushes resolve only the guarded review thread IDs captured when the repair work was planned.
 - The guarded obligation is persisted before either an automatic or user-approved repair push, so a restart cannot lose an in-flight effect.
 
-PR Cache refresh behavior:
+Change Request Cache refresh behavior:
 
-- Cached PR data can remain visible during a transient GitHub or persistence failure, but it is marked stale and cannot authorize repair, readiness, merge, or guarded-thread resolution.
-- Forced actions report the refresh failure instead of treating stale details or malformed GitHub output as authoritative absence.
-- Summary and detail observations are associated with the pull request number and head SHA; details from an earlier head are rejected.
-- PR Stabilization requires trustworthy observations and blocks readiness when local, remote, and pull-request heads diverge.
+- Cached change-request data can remain visible during a transient provider or persistence failure, but it is marked stale and cannot authorize repair, readiness, merge, or guarded-thread resolution.
+- Forced actions report the refresh failure instead of treating stale details or malformed provider output as authoritative absence.
+- Summary and detail observations are associated with canonical change-request identity and head SHA; details from an earlier head are rejected.
+- Change Request Stabilization requires trustworthy observations and blocks readiness when local, remote, and change-request heads diverge.
 
-Auto Flow runs execute in the on-demand per-user Prism Worker, so closing and reopening the TUI does not interrupt them. If the daemon or machine stops, the abandoned claim becomes recovery-pending and does not restart automatically. The next interactive Prism startup shows interrupted runs in an all-unchecked recovery dialog; select only the runs that should restart, or leave them paused for an explicit dashboard resume. A persisted pending guarded push keeps the run active even if older step aggregation recorded it as done. Prism restores the pending guard, reobserves the branch and PR, and either completes the matching effect or replans without pushing.
+Auto Flow runs execute in the on-demand per-user Prism Worker, so closing and reopening the TUI does not interrupt them. If the daemon or machine stops, the abandoned claim becomes recovery-pending and does not restart automatically. The next interactive Prism startup shows interrupted runs in an all-unchecked recovery dialog; select only the runs that should restart, or leave them paused for an explicit dashboard resume. A persisted pending guarded push keeps the run active even if older step aggregation recorded it as done. Prism restores the pending guard, reobserves the branch and change request, and either completes the matching effect or replans without pushing.
 
 Troubleshooting:
 

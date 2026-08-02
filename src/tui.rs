@@ -8,29 +8,31 @@ use crossterm::event::{
 };
 use ratatui::layout::Rect;
 use ratatui::text::Line;
+use rusqlite::OptionalExtension;
 
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{
     AutoOutputLine, AutoRunStatus, PersistedAutoRun, load_auto_run_snapshot,
     load_output_lines as load_auto_output_lines, load_recent_active_run_snapshots_for_repo,
+    load_terminal_repair_run_snapshots_for_repo,
 };
 use crate::config::Config;
 use crate::desktop_notification::{AgentObservation, DesktopNotifier};
-use crate::github::{PrCache, PrSummary};
 use crate::input::{Key, KeyInput};
 use crate::opencode::{OpencodeEvent, OpencodeStatus};
 use crate::plan_run::{
     PersistedPlanRun, PlanOutputLine, PlanRunStatus, PlanStepStatus, load_output_lines,
     load_plan_run, load_recent_plan_runs_for_repo,
 };
+use crate::remote::{PrCache, PrSummary};
 use crate::repo::Repository;
 use crate::session::{Session, WorktreeRepositoryKey, WorktreeSessionKey};
 use crate::terminal::stdin_is_tty;
 use crate::tmux::TmuxWindow;
 use crate::tui_jobs::{
-    JobContext, JobMessage, JobMetadata, JobOutcome, JobRegistry, LatestReceiver, LatestSender,
-    latest_channel,
+    JobContext, JobId, JobMessage, JobMetadata, JobOutcome, JobRegistry, LatestReceiver,
+    LatestSender, latest_channel,
 };
 use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
 use crate::tui_signal::{ShutdownNotification, ShutdownSignal};
@@ -80,13 +82,22 @@ pub struct Tui {
     ui_state_path: Option<PathBuf>,
     pub(crate) selected_comment: usize,
     pub(crate) selected_worktree_by_repo: BTreeMap<PathBuf, PathBuf>,
-    pub(crate) selected_pr_by_repo: BTreeMap<PathBuf, u64>,
+    pub(crate) selected_pr_by_repo:
+        BTreeMap<PathBuf, crate::remote::CanonicalChangeRequestIdentity>,
     pub(crate) pr_poll_tx: LatestSender<PrDeliveryKey, PrPollResult>,
     pub(crate) pr_poll_rx: LatestReceiver<PrDeliveryKey, PrPollResult>,
     pub(crate) pr_polls_in_flight: BTreeSet<PrPollKey>,
     pub(crate) pr_persistence_in_flight: BTreeSet<PrPollKey>,
     pub(crate) pr_persistence_pending: BTreeMap<PrPollKey, PrPersistenceRequest>,
     pub(crate) pr_persistence_versions: BTreeMap<PrPollKey, u64>,
+    remote_action_tx: LatestSender<JobId, RemoteActionDelivery>,
+    remote_action_rx: LatestReceiver<JobId, RemoteActionDelivery>,
+    remote_action_failures: BTreeMap<JobId, String>,
+    remote_actions_requiring_reconciliation: BTreeSet<JobId>,
+    remote_action_reconciliation_contexts: BTreeMap<JobId, RemoteActionReconciliationContext>,
+    remote_mutations_requiring_reconciliation:
+        BTreeMap<PathBuf, Vec<RemoteMutationReconciliationMarker>>,
+    shutdown_remote_action_errors: Vec<String>,
     pub(crate) delete_session_tx: LatestSender<(DeleteSessionKey, u64), DeleteSessionResult>,
     pub(crate) delete_session_rx: LatestReceiver<(DeleteSessionKey, u64), DeleteSessionResult>,
     pub(crate) delete_sessions_in_flight: BTreeSet<DeleteSessionKey>,
@@ -144,6 +155,7 @@ pub struct Tui {
     workflow_polls_in_flight: BTreeSet<WorktreeRepositoryKey>,
     workflow_last_polled: BTreeMap<WorktreeRepositoryKey, Instant>,
     workflow_revision: u64,
+    worker_health: Option<Result<(), String>>,
     workspace_repositories: BTreeMap<WorktreeRepositoryKey, RepositorySnapshot>,
     linked_plan_runs: BTreeMap<String, PersistedPlanRun>,
     dashboard_output_tx: LatestSender<DashboardOutputKey, DashboardOutputResult>,
@@ -164,6 +176,8 @@ const STATUS_MESSAGE_DURATION: Duration = Duration::from_secs(5);
 const WORKFLOW_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 pub(crate) const TUI_ACTION_JOB_TIMEOUT: Duration = Duration::from_secs(120);
 const TUI_JOB_SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+const TUI_MUTATION_SHUTDOWN_BOUND: Duration = Duration::from_secs(30 * 60);
+const REMOTE_MUTATION_RECONCILIATION_KEY: &str = "tui.remote_mutation_reconciliation_required";
 const TUI_TICK_ITEM_BUDGET: usize = 32;
 const TUI_TICK_TIME_BUDGET: Duration = Duration::from_millis(8);
 #[derive(Clone, Debug)]
@@ -176,6 +190,8 @@ pub(crate) struct ManagedRepo {
     pub pr_summary_poll_in_flight: bool,
     pub pr_summary_last_polled: Option<std::time::Instant>,
     pub pr_summaries: Vec<PrSummary>,
+    pub remote_capabilities: Option<crate::remote::Capabilities>,
+    pub remote_capability_error: Option<String>,
     pub wt_poll_in_flight: bool,
     pub wt_poll_pending: bool,
     pub wt_last_polled: Option<std::time::Instant>,
@@ -290,6 +306,8 @@ impl ManagedRepo {
             pr_summary_poll_in_flight: false,
             pr_summary_last_polled: None,
             pr_summaries: Vec::new(),
+            remote_capabilities: None,
+            remote_capability_error: None,
             wt_poll_in_flight: false,
             wt_poll_pending: false,
             wt_last_polled: None,
@@ -316,8 +334,10 @@ pub(crate) enum PrPollResult {
         repository: WorktreeRepositoryKey,
         sessions: Vec<WorktreeSessionKey>,
         github_remote_configured: bool,
+        capabilities: Option<crate::remote::Capabilities>,
         summaries: Result<Vec<PrSummary>, String>,
         observations: Result<Vec<PrSummarySessionResult>, String>,
+        remote_branch_heads: BTreeMap<(String, String), String>,
         refreshed: String,
         poll_started_at: Instant,
     },
@@ -372,6 +392,7 @@ pub(crate) struct WorkflowPollSnapshot {
     plan_runs: Result<Vec<PersistedPlanRun>, String>,
     auto_runs: Result<Vec<PersistedAutoRun>, String>,
     linked_plan_runs: Result<Vec<PersistedPlanRun>, String>,
+    worker_health: Result<(), String>,
 }
 
 pub(crate) struct WorkflowPollResult {
@@ -423,7 +444,7 @@ pub(crate) enum LeaderHint {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GitAction {
+pub(crate) enum GitAction {
     LazyGit,
     OpenPr,
     SubmitReview,
@@ -558,6 +579,7 @@ pub(crate) enum TuiJobKind {
     DefaultBranch,
     OpencodePoll,
     OpencodeListener,
+    RemoteAction,
 }
 
 impl TuiJobKind {
@@ -579,6 +601,7 @@ impl TuiJobKind {
             Self::DefaultBranch => "default_branch",
             Self::OpencodePoll => "opencode_poll",
             Self::OpencodeListener => "opencode_listener",
+            Self::RemoteAction => "remote_action",
         }
     }
 }
@@ -635,6 +658,274 @@ pub(crate) enum TuiJobPayload {
     DefaultBranch(DefaultBranchPollResult),
     OpencodePoll(OpencodePollResult),
     OpencodeEvent(OpencodeEventResult),
+    RemoteAction(Box<RemoteActionDelivery>),
+}
+
+pub(crate) struct RemoteActionDelivery {
+    pub id: JobId,
+    pub result: Result<RemoteActionValue, String>,
+}
+
+pub(crate) struct RemoteActionRequest<'a> {
+    pub key: TuiJobKey,
+    pub generation: u64,
+    pub name: &'static str,
+    pub title: &'a str,
+    pub message: &'a str,
+    pub abandon_cancelable: bool,
+    pub mutation: Option<RemoteMutationTarget>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub(crate) enum RemoteMutationTarget {
+    Unknown {
+        marker_id: String,
+    },
+    Push {
+        remote: String,
+        branch: String,
+        expected_head_sha: String,
+        #[serde(default)]
+        repository_provider: Option<crate::remote::ProviderKind>,
+        #[serde(default)]
+        repository_host: String,
+        #[serde(default)]
+        repository_project: String,
+    },
+    Create {
+        source_provider: crate::remote::ProviderKind,
+        source_host: String,
+        source_project: String,
+        source_branch: String,
+        expected_head_sha: String,
+        #[serde(default)]
+        target_provider: Option<crate::remote::ProviderKind>,
+        #[serde(default)]
+        target_host: String,
+        #[serde(default)]
+        target_project: String,
+        #[serde(default)]
+        target_branch: String,
+        #[serde(default)]
+        expected_base_sha: String,
+    },
+    Review {
+        change_request: crate::remote::CanonicalChangeRequestIdentity,
+        expected_state: String,
+        expected_body: String,
+        prior_review_ids: Vec<String>,
+    },
+    Resolve {
+        change_request: crate::remote::CanonicalChangeRequestIdentity,
+        thread_ids: Vec<String>,
+    },
+    Merge {
+        change_request: crate::remote::CanonicalChangeRequestIdentity,
+        expected_head_sha: String,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct RemoteMutationReconciliationMarker {
+    target: RemoteMutationTarget,
+    job_id: JobId,
+    reason: String,
+    recorded_unix_ms: u64,
+}
+
+#[derive(Clone)]
+struct RemoteActionReconciliationContext {
+    key: TuiJobKey,
+    target: RemoteMutationTarget,
+}
+
+fn remote_action_abandon_requested(abandon_cancelable: bool, event: KeyEvent) -> bool {
+    abandon_cancelable
+        && event.kind == KeyEventKind::Press
+        && (event.code == KeyCode::Esc || (event.code == KeyCode::Char('c') && ctrl_key(event)))
+}
+
+fn remote_action_timeout(abandon_cancelable: bool) -> Option<Duration> {
+    abandon_cancelable.then_some(TUI_ACTION_JOB_TIMEOUT)
+}
+
+pub(crate) enum RemoteActionValue {
+    ChangeRequests(Vec<PrSummary>),
+    Cache(Box<PrCache>),
+    Resolved {
+        cache: Box<PrCache>,
+        count: usize,
+    },
+    PushPrepared(Box<RemotePushPrepared>),
+    CreatePrepared(Box<crate::remote::dispatcher::CreateChangeRequestGuard>),
+    GuardedPush {
+        persisted: Box<PersistedAutoRun>,
+        cache: Box<PrCache>,
+        progress: Option<crate::auto_flow::stabilization_execute::GuardedPushProgress>,
+    },
+    ReviewResolutionPrepared {
+        persisted: Box<PersistedAutoRun>,
+        cache: Box<PrCache>,
+        thread_ids: Vec<String>,
+        summary: Box<PrSummary>,
+    },
+    ReviewResolutionFinished {
+        persisted: Box<PersistedAutoRun>,
+        cache: Box<PrCache>,
+        resolved: usize,
+    },
+    MergeAuthorization {
+        session: Box<Session>,
+        authorization: Box<crate::auto_flow::stabilization_execute::MergeAuthorization>,
+    },
+    MergeExecution {
+        session: Box<Session>,
+        result: Result<RemoteMergeOutcome, String>,
+    },
+    NotApplicable,
+    Complete,
+}
+
+pub(crate) struct RemotePushPrepared {
+    pub cache: PrCache,
+    pub origin_repository: Option<crate::remote::RemoteRepositoryId>,
+    pub upstream_repository: Option<crate::remote::RemoteRepositoryId>,
+    pub push_guard: Option<crate::remote::dispatcher::PushGuard>,
+}
+
+pub(crate) struct RemoteMergeOutcome {
+    pub execution: crate::auto_flow::stabilization_execute::ManualMergeExecution,
+    pub verification: Option<Result<bool, String>>,
+}
+
+fn remote_mutation_targets_overlap(
+    existing: &RemoteMutationTarget,
+    requested: &RemoteMutationTarget,
+) -> bool {
+    match (existing, requested) {
+        (
+            RemoteMutationTarget::Push {
+                remote: existing_remote,
+                branch: existing_branch,
+                expected_head_sha: existing_head,
+                repository_provider: existing_provider,
+                repository_host: existing_host,
+                repository_project: existing_project,
+            },
+            RemoteMutationTarget::Push {
+                remote: requested_remote,
+                branch: requested_branch,
+                expected_head_sha: requested_head,
+                repository_provider: requested_provider,
+                repository_host: requested_host,
+                repository_project: requested_project,
+            },
+        ) => {
+            existing_remote == requested_remote
+                && existing_branch == requested_branch
+                && existing_head == requested_head
+                && optional_repository_fields_match(
+                    *existing_provider,
+                    existing_host,
+                    existing_project,
+                    *requested_provider,
+                    requested_host,
+                    requested_project,
+                )
+        }
+        (
+            RemoteMutationTarget::Create {
+                source_provider: existing_source_provider,
+                source_host: existing_source_host,
+                source_project: existing_source_project,
+                source_branch: existing_source_branch,
+                expected_head_sha: existing_head,
+                target_provider: existing_target_provider,
+                target_host: existing_target_host,
+                target_project: existing_target_project,
+                target_branch: existing_target_branch,
+                expected_base_sha: existing_base,
+            },
+            RemoteMutationTarget::Create {
+                source_provider: requested_source_provider,
+                source_host: requested_source_host,
+                source_project: requested_source_project,
+                source_branch: requested_source_branch,
+                expected_head_sha: requested_head,
+                target_provider: requested_target_provider,
+                target_host: requested_target_host,
+                target_project: requested_target_project,
+                target_branch: requested_target_branch,
+                expected_base_sha: requested_base,
+            },
+        ) => {
+            existing_source_provider == requested_source_provider
+                && existing_source_host == requested_source_host
+                && existing_source_project == requested_source_project
+                && existing_source_branch == requested_source_branch
+                && existing_head == requested_head
+                && optional_repository_fields_match(
+                    *existing_target_provider,
+                    existing_target_host,
+                    existing_target_project,
+                    *requested_target_provider,
+                    requested_target_host,
+                    requested_target_project,
+                )
+                && (existing_target_branch.is_empty()
+                    || requested_target_branch.is_empty()
+                    || existing_target_branch == requested_target_branch)
+                && (existing_base.is_empty()
+                    || requested_base.is_empty()
+                    || existing_base == requested_base)
+        }
+        _ => existing == requested,
+    }
+}
+
+fn optional_repository_fields_match(
+    left_provider: Option<crate::remote::ProviderKind>,
+    left_host: &str,
+    left_project: &str,
+    right_provider: Option<crate::remote::ProviderKind>,
+    right_host: &str,
+    right_project: &str,
+) -> bool {
+    left_provider.is_none()
+        || right_provider.is_none()
+        || (left_provider == right_provider
+            && left_host == right_host
+            && left_project == right_project)
+}
+
+fn uncertain_remote_mutation_error(result: &Result<RemoteActionValue, String>) -> Option<&str> {
+    match result {
+        Err(error) => Some(error),
+        Ok(RemoteActionValue::MergeExecution {
+            result: Err(error), ..
+        }) => Some(error),
+        Ok(RemoteActionValue::MergeExecution {
+            result:
+                Ok(RemoteMergeOutcome {
+                    verification: Some(Err(error)),
+                    ..
+                }),
+            ..
+        }) => Some(error),
+        Ok(RemoteActionValue::MergeExecution {
+            result:
+                Ok(RemoteMergeOutcome {
+                    execution:
+                        crate::auto_flow::stabilization_execute::ManualMergeExecution::Uncertain {
+                            ..
+                        },
+                    ..
+                }),
+            ..
+        }) => Some("provider did not confirm that the merge was accepted"),
+        Ok(_) => None,
+    }
 }
 
 impl OpencodePollKey {
@@ -876,6 +1167,8 @@ fn move_enabled_ordered_item(
 impl Tui {
     pub fn new(repos: Vec<ManagedRepo>, current_repo: usize, sessions: Vec<Session>) -> Self {
         let (pr_poll_tx, pr_poll_rx) = latest_channel(pr_delivery_key);
+        let (remote_action_tx, remote_action_rx) =
+            latest_channel(|result: &RemoteActionDelivery| result.id);
         let (workflow_poll_tx, workflow_poll_rx) =
             latest_channel(|result: &WorkflowPollResult| result.repository.clone());
         let (dashboard_output_tx, dashboard_output_rx) =
@@ -951,7 +1244,7 @@ impl Tui {
             focused_panel: PanelFocus::Repos,
             main_focused: false,
             main_scroll: 0,
-            repo_main_view: view::RepoMainView::Github,
+            repo_main_view: view::RepoMainView::ChangeRequests,
             worktree_main_view: view::WorktreeMainView::Details,
             worktree_list_mode: WorktreeListMode::Repo,
             ui_state_path: None,
@@ -964,6 +1257,13 @@ impl Tui {
             pr_persistence_in_flight: BTreeSet::new(),
             pr_persistence_pending: BTreeMap::new(),
             pr_persistence_versions: BTreeMap::new(),
+            remote_action_tx,
+            remote_action_rx,
+            remote_action_failures: BTreeMap::new(),
+            remote_actions_requiring_reconciliation: BTreeSet::new(),
+            remote_action_reconciliation_contexts: BTreeMap::new(),
+            remote_mutations_requiring_reconciliation: BTreeMap::new(),
+            shutdown_remote_action_errors: Vec::new(),
             delete_session_tx,
             delete_session_rx,
             delete_sessions_in_flight: BTreeSet::new(),
@@ -1020,6 +1320,7 @@ impl Tui {
             workflow_polls_in_flight: BTreeSet::new(),
             workflow_last_polled: BTreeMap::new(),
             workflow_revision: 0,
+            worker_health: None,
             workspace_repositories: BTreeMap::new(),
             linked_plan_runs: BTreeMap::new(),
             dashboard_output_tx,
@@ -1039,6 +1340,7 @@ impl Tui {
             .repos
             .get(tui.current_repo)
             .map(|repo| repo.repo.root.clone());
+        tui.load_remote_mutation_reconciliation_markers();
         tui.ensure_navigation_valid();
         tui.reseed_desktop_notifications();
         tui
@@ -1113,7 +1415,15 @@ impl Tui {
                 .is_some_and(|context| crate::process::command_exists(&context.config.tool("gh")))
                 && self.focused_panel == PanelFocus::Repos
                 && self.main_focused
-                && self.selected_repo_pr_summary().is_some();
+                && self.selected_repo_pr_summary().is_some_and(|summary| {
+                    !summary.merged
+                        && summary.state.eq_ignore_ascii_case("OPEN")
+                        && summary.change_request_identity.as_ref().is_some_and(|_| {
+                            crate::remote::dispatcher::capabilities_for_summary(&summary)
+                                .submit_review
+                                == crate::remote::SupportLevel::Supported
+                        })
+                });
         }
         if self.focused_panel != PanelFocus::Worktrees {
             return false;
@@ -1134,13 +1444,16 @@ impl Tui {
             return false;
         };
         if action == GitAction::OpenPr {
-            return true;
+            return self.remote_support_for_action(action, Some(summary))
+                == Some(crate::remote::SupportLevel::Supported);
         }
         if summary.merged || !summary.state.eq_ignore_ascii_case("OPEN") {
             return false;
         }
         if action == GitAction::ResolveAllComments {
-            return self.main_focused
+            return self.remote_support_for_action(action, Some(summary))
+                == Some(crate::remote::SupportLevel::Supported)
+                && self.main_focused
                 && session.pr.trusted_details().is_ok_and(|details| {
                     details.is_some_and(|details| {
                         details.review_comments.iter().any(|comment| {
@@ -1150,19 +1463,119 @@ impl Tui {
                 });
         }
         if matches!(action, GitAction::CiFix | GitAction::ReviewFix) {
-            return context
-                .config
-                .selected_harness()
-                .is_ok_and(|harness| harness.describe().headless);
+            let supported = self
+                .remote_support_for_action(action, Some(summary))
+                .unwrap_or(crate::remote::SupportLevel::Unknown);
+            let has_input = session.pr.trusted_details().is_ok_and(|details| {
+                details.is_some_and(|details| match action {
+                    GitAction::CiFix => {
+                        !details.ci_failures.is_empty() || !details.failing_checks.is_empty()
+                    }
+                    GitAction::ReviewFix => {
+                        !details.reviews.is_empty() || !details.review_comments.is_empty()
+                    }
+                    _ => unreachable!(),
+                })
+            });
+            let capability_enabled = supported == crate::remote::SupportLevel::Supported
+                || (action == GitAction::CiFix
+                    && supported == crate::remote::SupportLevel::Conditional
+                    && has_input);
+            return capability_enabled
+                && has_input
+                && context
+                    .config
+                    .selected_harness()
+                    .is_ok_and(|harness| harness.describe().headless);
+        }
+        if action == GitAction::Merge {
+            return self.remote_support_for_action(action, Some(summary))
+                == Some(crate::remote::SupportLevel::Supported);
         }
         true
+    }
+
+    pub(crate) fn remote_support_for_action(
+        &self,
+        action: GitAction,
+        summary: Option<&PrSummary>,
+    ) -> Option<crate::remote::SupportLevel> {
+        let runtime = self
+            .selected_worktree_context()
+            .and_then(|context| self.sessions.get(context.session_index))
+            .and_then(|session| self.repos.get(session.repo_index))
+            .and_then(|repo| repo.remote_capabilities.as_ref());
+        let capabilities = runtime
+            .cloned()
+            .or_else(|| summary.map(crate::remote::dispatcher::capabilities_for_summary))?;
+        Some(match action {
+            GitAction::OpenPr => capabilities.fetch_change_request,
+            GitAction::Push => capabilities.create_change_request,
+            GitAction::Merge => capabilities.guarded_merge,
+            GitAction::CiFix => capabilities.ci_logs,
+            GitAction::ReviewFix => capabilities.review_threads,
+            GitAction::ResolveAllComments => capabilities.resolve_review_thread,
+            GitAction::LazyGit | GitAction::SubmitReview => return None,
+        })
+    }
+
+    fn remote_action_reason(&self, action: GitAction) -> Option<String> {
+        let summary = self
+            .selected_worktree_context()
+            .and_then(|context| self.sessions.get(context.session_index))
+            .and_then(|session| session.pr.summary());
+        if action == GitAction::Merge
+            && let Some(reason) = self
+                .selected_worktree_context()
+                .and_then(|context| self.sessions.get(context.session_index))
+                .and_then(|session| self.repos.get(session.repo_index))
+                .and_then(|repo| repo.remote_capabilities.as_ref())
+                .and_then(|capabilities| capabilities.guarded_merge_reason.clone())
+        {
+            return Some(reason);
+        }
+        match self.remote_support_for_action(action, summary) {
+            Some(crate::remote::SupportLevel::Conditional) => {
+                Some("conditional support not established".to_string())
+            }
+            Some(crate::remote::SupportLevel::Unknown) => Some("support unknown".to_string()),
+            Some(crate::remote::SupportLevel::Unsupported) => {
+                Some("unsupported by provider".to_string())
+            }
+            None => None,
+            Some(crate::remote::SupportLevel::Supported) => None,
+        }
     }
 
     fn git_choice(&self, action: GitAction, key: &str, label: &str) -> view::KeyChoice {
         if self.git_action_enabled(action) {
             view::KeyChoice::new(key, label)
         } else {
+            let label = self
+                .remote_action_reason(action)
+                .map(|reason| format!("{label} ({reason})"))
+                .unwrap_or_else(|| label.to_string());
             view::KeyChoice::disabled(key, label)
+        }
+    }
+
+    fn selected_repo_list_support(&self) -> Option<crate::remote::SupportLevel> {
+        self.repos
+            .get(self.current_repo)
+            .and_then(|repo| repo.remote_capabilities.as_ref())
+            .map(|capabilities| capabilities.list_change_requests)
+    }
+
+    fn remote_pr_list_choice(&self) -> view::KeyChoice {
+        match self.selected_repo_list_support() {
+            Some(crate::remote::SupportLevel::Supported) => {
+                view::KeyChoice::new("C", "open remote PR")
+            }
+            Some(level) => view::KeyChoice::disabled(
+                "C",
+                format!("open remote PR ({} support)", level.label()),
+            ),
+            None => view::KeyChoice::disabled("C", "open remote PR (adapter unavailable)"),
         }
     }
 
@@ -1640,6 +2053,10 @@ impl Tui {
                     pending_g = false;
                     if self.focused_panel != PanelFocus::Repos {
                         self.show_message("focus repos to open a remote PR worktree")?;
+                    } else if self.selected_repo_list_support()
+                        != Some(crate::remote::SupportLevel::Supported)
+                    {
+                        self.show_message("remote PR listing is unavailable for this provider")?;
                     } else if let Err(error) = self.open_remote_pr_worktree(runtime) {
                         self.show_error("open remote PR worktree failed", &error)?;
                     }
@@ -1828,14 +2245,15 @@ impl Tui {
         timeout: Option<Duration>,
         name: String,
         job: F,
-    ) where
+    ) -> JobId
+    where
         F: FnOnce(
                 JobContext<TuiJobKind, TuiJobKey, TuiJobPayload>,
             ) -> Result<Option<TuiJobPayload>, String>
             + Send
             + 'static,
     {
-        if kind == TuiJobKind::DeleteSession {
+        if matches!(kind, TuiJobKind::DeleteSession | TuiJobKind::RemoteAction) {
             let label = kind.label();
             self.jobs.spawn_reliable_diagnostic(
                 kind,
@@ -1847,7 +2265,7 @@ impl Tui {
                     kind: label,
                 },
                 job,
-            );
+            )
         } else {
             let label = kind.label();
             self.jobs.spawn_diagnostic(
@@ -1860,7 +2278,481 @@ impl Tui {
                     kind: label,
                 },
                 job,
+            )
+        }
+    }
+
+    fn repository_root_for_job_key(&self, key: &TuiJobKey) -> Option<PathBuf> {
+        match key {
+            TuiJobKey::Repository(repository) => Some(repository.root.clone()),
+            TuiJobKey::WorktrunkHookLogs(repository) => Some(repository.root.clone()),
+            TuiJobKey::Worktree(worktree) | TuiJobKey::AgentStatePersistence(worktree) => {
+                Some(worktree.repository.root.clone())
+            }
+            TuiJobKey::Pr(key) | TuiJobKey::PrPersistence(key) => {
+                Some(key.worktree.repository.root.clone())
+            }
+            TuiJobKey::Delete(key) => Some(key.worktree.repository.root.clone()),
+            TuiJobKey::Tmux(key) => Some(key.slot.worktree.repository.root.clone()),
+            TuiJobKey::Opencode(key) => Some(key.worktree.repository.root.clone()),
+            TuiJobKey::OpencodeListener(key) => Some(key.worktree.repository.root.clone()),
+            TuiJobKey::WorkflowRepository(repository) => Some(repository.root.clone()),
+            TuiJobKey::DashboardOutput(key) => Some(match key {
+                DashboardOutputKey::Plan { repository, .. }
+                | DashboardOutputKey::Auto { repository, .. } => repository.root.clone(),
+            }),
+            TuiJobKey::None => None,
+        }
+    }
+
+    fn load_remote_mutation_reconciliation_markers(&mut self) {
+        let marked = self
+            .repos
+            .iter()
+            .filter_map(|managed| {
+                let markers = crate::observability::with_writable_db(&managed.repo, |conn| {
+                    let value = conn
+                        .query_row(
+                            "select value from metadata where key = ?1",
+                            [REMOTE_MUTATION_RECONCILIATION_KEY],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(|error| {
+                            format!("read remote mutation reconciliation marker: {error}")
+                        })?;
+                    value
+                        .map(|value| {
+                            serde_json::from_str::<Vec<RemoteMutationReconciliationMarker>>(&value)
+                                .map_err(|error| {
+                                    format!("decode remote mutation reconciliation marker: {error}")
+                                })
+                        })
+                        .transpose()
+                        .map(|markers| markers.unwrap_or_default())
+                })
+                .unwrap_or_else(|error| {
+                    vec![RemoteMutationReconciliationMarker {
+                        target: RemoteMutationTarget::Unknown {
+                            marker_id: "unreadable-persisted-marker".to_string(),
+                        },
+                        job_id: 0,
+                        reason: error,
+                        recorded_unix_ms: crate::auto_flow::unix_ms(),
+                    }]
+                });
+                (!markers.is_empty()).then(|| (managed.repo.root.clone(), markers))
+            })
+            .collect::<BTreeMap<_, _>>();
+        if marked.is_empty() {
+            return;
+        }
+        for session in &mut self.sessions {
+            if self
+                .repos
+                .get(session.repo_index)
+                .is_some_and(|managed| marked.contains_key(&managed.repo.root))
+            {
+                session.pr.require_reconciliation(
+                    "remote mutation completion is unknown; authoritative re-observation required",
+                );
+            }
+        }
+        self.remote_mutations_requiring_reconciliation = marked;
+    }
+
+    fn record_remote_mutation_reconciliation(
+        &mut self,
+        key: &TuiJobKey,
+        job_id: JobId,
+        reason: &str,
+        target: &RemoteMutationTarget,
+    ) -> Result<(), String> {
+        let root = self
+            .repository_root_for_job_key(key)
+            .ok_or_else(|| "remote mutation has no repository reconciliation target".to_string())?;
+        let repo = self
+            .repos
+            .iter()
+            .find(|managed| managed.repo.root == root)
+            .map(|managed| managed.repo.clone())
+            .ok_or_else(|| {
+                format!(
+                    "remote mutation repository is no longer managed: {}",
+                    root.display()
+                )
+            })?;
+        let markers = self
+            .remote_mutations_requiring_reconciliation
+            .entry(root.clone())
+            .or_default();
+        let marker = RemoteMutationReconciliationMarker {
+            target: target.clone(),
+            job_id,
+            reason: reason.to_string(),
+            recorded_unix_ms: crate::auto_flow::unix_ms(),
+        };
+        if let Some(existing) = markers
+            .iter_mut()
+            .find(|existing| existing.target == marker.target)
+        {
+            *existing = marker;
+        } else {
+            markers.push(marker);
+        }
+        let value = serde_json::to_string(markers)
+            .map_err(|error| format!("encode remote mutation reconciliation marker: {error}"))?;
+        for session in &mut self.sessions {
+            if self
+                .repos
+                .get(session.repo_index)
+                .is_some_and(|managed| managed.repo.root == root)
+            {
+                session.pr.require_reconciliation(
+                    "remote mutation completion is unknown; authoritative re-observation required",
+                );
+            }
+        }
+        crate::observability::with_writable_db(&repo, |conn| {
+            conn.execute(
+                "insert into metadata (key, value) values (?1, ?2)\n                 on conflict(key) do update set value = excluded.value",
+                rusqlite::params![REMOTE_MUTATION_RECONCILIATION_KEY, value],
+            )
+            .map_err(|error| format!("write remote mutation reconciliation marker: {error}"))?;
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    fn persist_remote_mutation_reconciliation_markers(
+        &mut self,
+        repository: &WorktreeRepositoryKey,
+    ) -> Result<(), String> {
+        let Some(managed) = self
+            .repos
+            .iter()
+            .find(|managed| managed.identity == *repository)
+        else {
+            return Ok(());
+        };
+        let markers = self
+            .remote_mutations_requiring_reconciliation
+            .get(&repository.root)
+            .cloned()
+            .unwrap_or_default();
+        crate::observability::with_writable_db(&managed.repo, |conn| {
+            if markers.is_empty() {
+                conn.execute(
+                    "delete from metadata where key = ?1",
+                    [REMOTE_MUTATION_RECONCILIATION_KEY],
+                )
+                .map_err(|error| format!("clear remote mutation reconciliation marker: {error}"))?;
+            } else {
+                let value = serde_json::to_string(&markers).map_err(|error| {
+                    format!("encode remote mutation reconciliation marker: {error}")
+                })?;
+                conn.execute(
+                    "insert into metadata (key, value) values (?1, ?2)\n                     on conflict(key) do update set value = excluded.value",
+                    rusqlite::params![REMOTE_MUTATION_RECONCILIATION_KEY, value],
+                )
+                .map_err(|error| {
+                    format!("write remote mutation reconciliation marker: {error}")
+                })?;
+            }
+            Ok(())
+        })?;
+        if markers.is_empty() {
+            self.remote_mutations_requiring_reconciliation
+                .remove(&repository.root);
+        }
+        Ok(())
+    }
+
+    pub(super) fn remote_push_reconciliation_refs(
+        &self,
+        repository: &WorktreeRepositoryKey,
+    ) -> Vec<(String, String)> {
+        self.remote_mutations_requiring_reconciliation
+            .get(&repository.root)
+            .into_iter()
+            .flatten()
+            .filter_map(|marker| match &marker.target {
+                RemoteMutationTarget::Push { remote, branch, .. } => {
+                    Some((remote.clone(), branch.clone()))
+                }
+                RemoteMutationTarget::Unknown { .. }
+                | RemoteMutationTarget::Create { .. }
+                | RemoteMutationTarget::Review { .. }
+                | RemoteMutationTarget::Resolve { .. }
+                | RemoteMutationTarget::Merge { .. } => None,
+            })
+            .collect()
+    }
+
+    pub(super) fn reconcile_remote_mutation_summaries(
+        &mut self,
+        repository: &WorktreeRepositoryKey,
+        summaries: &[PrSummary],
+        remote_branch_heads: &BTreeMap<(String, String), String>,
+    ) {
+        self.retain_remote_mutation_markers(repository, |target| match target {
+            RemoteMutationTarget::Unknown { .. } => true,
+            RemoteMutationTarget::Push {
+                remote,
+                branch,
+                expected_head_sha,
+                ..
+            } => {
+                remote_branch_heads.get(&(remote.clone(), branch.clone()))
+                    != Some(expected_head_sha)
+            }
+            RemoteMutationTarget::Create {
+                source_provider,
+                source_host,
+                source_project,
+                source_branch,
+                expected_head_sha,
+                target_provider,
+                target_host,
+                target_project,
+                target_branch,
+                ..
+            } => !summaries.iter().any(|summary| {
+                summary.head_ref == *source_branch
+                    && summary.head_sha == *expected_head_sha
+                    && (target_branch.is_empty() || summary.base_ref == *target_branch)
+                    && summary
+                        .change_request_identity
+                        .as_ref()
+                        .is_some_and(|identity| {
+                            identity.source_provider() == *source_provider
+                                && identity.source_canonical_host() == source_host
+                                && identity.source_project_path() == source_project
+                                && target_provider.is_none_or(|provider| {
+                                    identity.target_provider() == provider
+                                        && identity.target_canonical_host() == target_host
+                                        && identity.target_project_path() == target_project
+                                })
+                        })
+            }),
+            RemoteMutationTarget::Merge {
+                change_request,
+                expected_head_sha,
+            } => !summaries.iter().any(|summary| {
+                summary.change_request_identity.as_ref() == Some(change_request)
+                    && summary.head_sha == *expected_head_sha
+                    && (summary.merged || merge_is_authoritatively_pending(&summary.queue_state))
+            }),
+            RemoteMutationTarget::Review { .. } | RemoteMutationTarget::Resolve { .. } => true,
+        });
+    }
+
+    pub(super) fn reconcile_remote_mutation_details(
+        &mut self,
+        repository: &WorktreeRepositoryKey,
+        cache: &PrCache,
+    ) {
+        let Ok(Some(summary)) = cache.trusted_summary() else {
+            return;
+        };
+        let Ok(Some(details)) = cache.trusted_details() else {
+            return;
+        };
+        self.retain_remote_mutation_markers(repository, |target| match target {
+            RemoteMutationTarget::Review {
+                change_request,
+                expected_state,
+                expected_body,
+                prior_review_ids,
+            } => {
+                summary.change_request_identity.as_ref() != Some(change_request)
+                    || !details.reviews.iter().any(|review| {
+                        review.state.eq_ignore_ascii_case(expected_state)
+                            && review.body.trim() == expected_body.trim()
+                            && !review.id.trim().is_empty()
+                            && !prior_review_ids.contains(&review.id)
+                    })
+            }
+            RemoteMutationTarget::Resolve {
+                change_request,
+                thread_ids,
+            } => {
+                summary.change_request_identity.as_ref() != Some(change_request)
+                    || thread_ids.iter().any(|thread_id| {
+                        !details
+                            .review_comments
+                            .iter()
+                            .any(|comment| comment.thread_id == *thread_id && comment.resolved)
+                    })
+            }
+            _ => true,
+        });
+    }
+
+    fn retain_remote_mutation_markers(
+        &mut self,
+        repository: &WorktreeRepositoryKey,
+        mut retain: impl FnMut(&RemoteMutationTarget) -> bool,
+    ) {
+        let Some(previous) = self
+            .remote_mutations_requiring_reconciliation
+            .get(&repository.root)
+            .cloned()
+        else {
+            return;
+        };
+        let retained = previous
+            .iter()
+            .filter(|marker| retain(&marker.target))
+            .cloned()
+            .collect::<Vec<_>>();
+        if retained.len() == previous.len() {
+            return;
+        }
+        self.remote_mutations_requiring_reconciliation
+            .insert(repository.root.clone(), retained);
+        if self
+            .persist_remote_mutation_reconciliation_markers(repository)
+            .is_err()
+        {
+            self.remote_mutations_requiring_reconciliation
+                .insert(repository.root.clone(), previous);
+        }
+    }
+
+    fn retain_uncertain_remote_action_result(
+        &mut self,
+        key: &TuiJobKey,
+        job_id: JobId,
+        result: &Result<RemoteActionValue, String>,
+        target: &RemoteMutationTarget,
+    ) -> Result<(), String> {
+        if let Some(error) = uncertain_remote_mutation_error(result) {
+            self.record_remote_mutation_reconciliation(key, job_id, error, target)?;
+        }
+        Ok(())
+    }
+
+    fn remote_action_reconciliation_blocked(
+        &self,
+        key: &TuiJobKey,
+        target: &RemoteMutationTarget,
+    ) -> bool {
+        self.repository_root_for_job_key(key).is_some_and(|root| {
+            self.remote_mutations_requiring_reconciliation
+                .get(&root)
+                .is_some_and(|markers| {
+                    markers.iter().any(|marker| {
+                        matches!(marker.target, RemoteMutationTarget::Unknown { .. })
+                            || remote_mutation_targets_overlap(&marker.target, target)
+                    })
+                })
+        })
+    }
+
+    pub(crate) fn run_remote_action<F>(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        request: RemoteActionRequest<'_>,
+        action: F,
+    ) -> Result<RemoteActionValue, String>
+    where
+        F: FnOnce() -> Result<RemoteActionValue, String> + Send + 'static,
+    {
+        if request
+            .mutation
+            .as_ref()
+            .is_some_and(|target| self.remote_action_reconciliation_blocked(&request.key, target))
+        {
+            return Err(
+                "remote mutation blocked until the previous uncertain mutation is re-observed"
+                    .to_string(),
             );
+        }
+        self.dialog = Some(view::DialogModel::Progress {
+            title: request.title.to_string(),
+            message: request.message.to_string(),
+        });
+        self.draw(runtime)?;
+        let timeout = remote_action_timeout(request.abandon_cancelable);
+        let reconciliation =
+            request
+                .mutation
+                .clone()
+                .map(|target| RemoteActionReconciliationContext {
+                    key: request.key.clone(),
+                    target,
+                });
+        let id = self.spawn_tui_job(
+            TuiJobKind::RemoteAction,
+            request.key,
+            request.generation,
+            timeout,
+            request.name.to_string(),
+            move |context| {
+                Ok(Some(TuiJobPayload::RemoteAction(Box::new(
+                    RemoteActionDelivery {
+                        id: context.id(),
+                        result: action(),
+                    },
+                ))))
+            },
+        );
+        if let Some(reconciliation) = reconciliation.clone() {
+            self.remote_actions_requiring_reconciliation.insert(id);
+            self.remote_action_reconciliation_contexts
+                .insert(id, reconciliation);
+        }
+        loop {
+            self.tick_tui_action_jobs();
+            while let Ok(delivery) = self.remote_action_rx.try_recv() {
+                if delivery.id == id {
+                    let result = delivery.result;
+                    let reconciliation_error = if let Some(reconciliation) = &reconciliation {
+                        self.retain_uncertain_remote_action_result(
+                            &reconciliation.key,
+                            id,
+                            &result,
+                            &reconciliation.target,
+                        )
+                        .err()
+                    } else {
+                        None
+                    };
+                    self.remote_actions_requiring_reconciliation.remove(&id);
+                    self.remote_action_reconciliation_contexts.remove(&id);
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return match (result, reconciliation_error) {
+                        (Err(error), Some(marker_error)) => Err(format!("{error}; {marker_error}")),
+                        (result, _) => result,
+                    };
+                }
+            }
+            if let Some(error) = self.remote_action_failures.remove(&id) {
+                self.remote_actions_requiring_reconciliation.remove(&id);
+                self.remote_action_reconciliation_contexts.remove(&id);
+                self.dialog = None;
+                self.draw(runtime)?;
+                return Err(error);
+            }
+            if let Some(event) = runtime.poll_event(Duration::from_millis(100))? {
+                match event {
+                    RuntimeEvent::Key(event)
+                        if remote_action_abandon_requested(request.abandon_cancelable, event) =>
+                    {
+                        self.jobs.cancel(id);
+                        self.dialog = None;
+                        self.draw(runtime)?;
+                        return Err("remote action canceled".to_string());
+                    }
+                    RuntimeEvent::Resize => self.draw(runtime)?,
+                    RuntimeEvent::Key(_)
+                    | RuntimeEvent::Mouse(_)
+                    | RuntimeEvent::FocusGained
+                    | RuntimeEvent::FocusLost => {}
+                }
+            }
         }
     }
 
@@ -1877,7 +2769,11 @@ impl Tui {
 
     fn route_tui_job_messages_with_budget(&mut self, limit: usize, deadline: Instant) -> usize {
         for metadata in self.jobs.active_metadata() {
-            if !self.job_generation_is_current(&metadata) {
+            if !self.job_generation_is_current(&metadata)
+                && !self
+                    .remote_actions_requiring_reconciliation
+                    .contains(&metadata.id)
+            {
                 self.jobs.cancel(metadata.id);
             }
         }
@@ -1895,6 +2791,44 @@ impl Tui {
             self.record_tui_job_terminal(&metadata, &outcome);
             let delete_needs_recovery_refresh = metadata.kind == TuiJobKind::DeleteSession
                 && !matches!(outcome, JobOutcome::Completed);
+            if metadata.kind == TuiJobKind::RemoteAction
+                && !matches!(outcome, JobOutcome::Completed)
+            {
+                let error = outcome.error_message().unwrap_or_else(|| {
+                    if matches!(outcome, JobOutcome::Canceled) {
+                        "remote action canceled".to_string()
+                    } else if matches!(outcome, JobOutcome::DeadlineExceeded) {
+                        "remote action timed out".to_string()
+                    } else {
+                        "remote action failed".to_string()
+                    }
+                });
+                self.remote_action_failures
+                    .insert(metadata.id, error.clone());
+                if self
+                    .remote_actions_requiring_reconciliation
+                    .contains(&metadata.id)
+                    && !matches!(outcome, JobOutcome::SpawnFailed(_))
+                    && let Some(reconciliation) = self
+                        .remote_action_reconciliation_contexts
+                        .get(&metadata.id)
+                        .cloned()
+                    && let Err(marker_error) = self.record_remote_mutation_reconciliation(
+                        &reconciliation.key,
+                        metadata.id,
+                        &error,
+                        &reconciliation.target,
+                    )
+                {
+                    self.remote_action_failures
+                        .insert(metadata.id, format!("{error}; {marker_error}"));
+                    self.shutdown_remote_action_errors.push(marker_error);
+                }
+                self.remote_actions_requiring_reconciliation
+                    .remove(&metadata.id);
+                self.remote_action_reconciliation_contexts
+                    .remove(&metadata.id);
+            }
             match outcome {
                 JobOutcome::Completed | JobOutcome::Canceled => {}
                 JobOutcome::Failed(_) | JobOutcome::SpawnFailed(_) => {
@@ -1965,8 +2899,12 @@ impl Tui {
                 break;
             };
             processed += 1;
-            if self.job_generation_is_current(&metadata) {
-                self.route_tui_job_payload(payload);
+            if self.job_generation_is_current(&metadata)
+                || self
+                    .remote_actions_requiring_reconciliation
+                    .contains(&metadata.id)
+            {
+                self.route_tui_job_payload_for_metadata(&metadata, payload);
             }
         }
 
@@ -1992,8 +2930,12 @@ impl Tui {
                 break;
             };
             processed += 1;
-            if self.job_generation_is_current(&metadata) {
-                self.route_tui_job_payload(payload);
+            if self.job_generation_is_current(&metadata)
+                || self
+                    .remote_actions_requiring_reconciliation
+                    .contains(&metadata.id)
+            {
+                self.route_tui_job_payload_for_metadata(&metadata, payload);
             }
         }
 
@@ -2044,6 +2986,204 @@ impl Tui {
         processed
     }
 
+    fn session_index_for_job_key(&self, key: &TuiJobKey) -> Option<usize> {
+        let TuiJobKey::Worktree(worktree) = key else {
+            return None;
+        };
+        self.sessions.iter().position(|session| {
+            self.repos
+                .get(session.repo_index)
+                .is_some_and(|managed| session.identity_key(&managed.identity) == *worktree)
+        })
+    }
+
+    fn persist_shutdown_remote_cache(
+        &mut self,
+        key: &TuiJobKey,
+        cache: &PrCache,
+    ) -> Result<(), String> {
+        let index = self
+            .session_index_for_job_key(key)
+            .ok_or_else(|| "remote mutation worktree no longer exists".to_string())?;
+        let managed = self
+            .repos
+            .get(self.sessions[index].repo_index)
+            .ok_or_else(|| "remote mutation repository no longer exists".to_string())?;
+        crate::remote::persist_pr_cache_snapshot(
+            &managed.repo,
+            &self.sessions[index].branch,
+            cache,
+        )?;
+        self.sessions[index].pr = cache.clone();
+        Ok(())
+    }
+
+    fn persist_shutdown_auto_run(&mut self, persisted: &PersistedAutoRun) -> Result<(), String> {
+        let managed = self
+            .repos
+            .iter()
+            .find(|managed| managed.repo.root == Path::new(&persisted.run.repo_root))
+            .ok_or_else(|| {
+                format!(
+                    "remote mutation Auto Flow repository no longer exists: {}",
+                    persisted.run.repo_root
+                )
+            })?;
+        let mut persisted = persisted.clone();
+        crate::observability::with_writable_db(&managed.repo, |conn| {
+            crate::auto_flow::save_auto_run(conn, &mut persisted)
+        })?;
+        self.remember_auto_run(persisted);
+        Ok(())
+    }
+
+    fn apply_shutdown_remote_action_result(
+        &mut self,
+        key: &TuiJobKey,
+        result: &Result<RemoteActionValue, String>,
+    ) -> Result<(), String> {
+        let value = result
+            .as_ref()
+            .map_err(|error| format!("remote mutation result requires reconciliation: {error}"))?;
+        match value {
+            RemoteActionValue::Cache(cache) => self.persist_shutdown_remote_cache(key, cache),
+            RemoteActionValue::Resolved { cache, .. } => {
+                self.persist_shutdown_remote_cache(key, cache)
+            }
+            RemoteActionValue::PushPrepared(prepared) => {
+                self.persist_shutdown_remote_cache(key, &prepared.cache)
+            }
+            RemoteActionValue::GuardedPush {
+                persisted, cache, ..
+            }
+            | RemoteActionValue::ReviewResolutionFinished {
+                persisted, cache, ..
+            } => {
+                self.persist_shutdown_remote_cache(key, cache)?;
+                self.persist_shutdown_auto_run(persisted)
+            }
+            RemoteActionValue::ReviewResolutionPrepared {
+                persisted, cache, ..
+            } => {
+                self.persist_shutdown_remote_cache(key, cache)?;
+                self.persist_shutdown_auto_run(persisted)
+            }
+            RemoteActionValue::MergeExecution { session, result: _ } => {
+                let managed = self
+                    .repos
+                    .get(session.repo_index)
+                    .ok_or_else(|| "merged worktree repository no longer exists".to_string())?;
+                crate::remote::persist_pr_cache_snapshot(
+                    &managed.repo,
+                    &session.branch,
+                    &session.pr,
+                )?;
+                if let Some(index) = self.sessions.iter().position(|current| {
+                    current.repo_index == session.repo_index && current.path == session.path
+                }) {
+                    self.sessions[index].pr = session.pr.clone();
+                }
+                Ok(())
+            }
+            RemoteActionValue::ChangeRequests(_)
+            | RemoteActionValue::CreatePrepared(_)
+            | RemoteActionValue::MergeAuthorization { .. }
+            | RemoteActionValue::NotApplicable
+            | RemoteActionValue::Complete => Ok(()),
+        }?;
+        uncertain_remote_mutation_error(result).map_or(Ok(()), |error| {
+            Err(format!(
+                "remote mutation completion requires reconciliation: {error}"
+            ))
+        })
+    }
+
+    fn apply_routed_remote_actions_for_shutdown(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        while let Ok(delivery) = self.remote_action_rx.try_recv() {
+            if !self
+                .remote_actions_requiring_reconciliation
+                .contains(&delivery.id)
+            {
+                continue;
+            }
+            let Some(reconciliation) = self
+                .remote_action_reconciliation_contexts
+                .get(&delivery.id)
+                .cloned()
+            else {
+                errors.push(format!(
+                    "remote mutation {} was routed without its reconciliation key",
+                    delivery.id
+                ));
+                continue;
+            };
+            if let Err(error) =
+                self.apply_shutdown_remote_action_result(&reconciliation.key, &delivery.result)
+                && let Err(marker_error) = self.record_remote_mutation_reconciliation(
+                    &reconciliation.key,
+                    delivery.id,
+                    &error,
+                    &reconciliation.target,
+                )
+            {
+                errors.push(format!("{error}; {marker_error}"));
+            }
+            self.remote_actions_requiring_reconciliation
+                .remove(&delivery.id);
+            self.remote_action_reconciliation_contexts
+                .remove(&delivery.id);
+        }
+        errors
+    }
+
+    fn route_tui_job_payload_for_metadata(
+        &mut self,
+        metadata: &JobMetadata<TuiJobKind, TuiJobKey>,
+        payload: TuiJobPayload,
+    ) {
+        if self.scheduling_stopped
+            && self
+                .remote_actions_requiring_reconciliation
+                .contains(&metadata.id)
+            && let TuiJobPayload::RemoteAction(delivery) = &payload
+        {
+            if let Err(error) =
+                self.apply_shutdown_remote_action_result(&metadata.key, &delivery.result)
+            {
+                let marker = self
+                    .remote_action_reconciliation_contexts
+                    .get(&metadata.id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        "remote mutation is missing its reconciliation target".to_string()
+                    })
+                    .and_then(|reconciliation| {
+                        self.record_remote_mutation_reconciliation(
+                            &reconciliation.key,
+                            metadata.id,
+                            &error,
+                            &reconciliation.target,
+                        )
+                    });
+                let error = match marker {
+                    Ok(()) => error,
+                    Err(marker_error) => {
+                        self.shutdown_remote_action_errors
+                            .push(marker_error.clone());
+                        format!("{error}; {marker_error}")
+                    }
+                };
+                self.remote_action_failures.insert(metadata.id, error);
+            }
+            self.remote_actions_requiring_reconciliation
+                .remove(&metadata.id);
+            self.remote_action_reconciliation_contexts
+                .remove(&metadata.id);
+        }
+        self.route_tui_job_payload(payload);
+    }
+
     fn route_tui_job_payload(&self, payload: TuiJobPayload) {
         match payload {
             TuiJobPayload::SessionRefresh(result) => {
@@ -2087,6 +3227,9 @@ impl Tui {
                 let _ = self.opencode_event_tx.send(result);
                 #[cfg(not(test))]
                 let _ = result;
+            }
+            TuiJobPayload::RemoteAction(result) => {
+                let _ = self.remote_action_tx.send(*result);
             }
         }
     }
@@ -2567,33 +3710,70 @@ impl Tui {
     fn cleanup_tui_jobs(&mut self, reason: ShutdownReason) -> Result<(), String> {
         let mut errors = Vec::new();
         let started = Instant::now();
-        while (!self.pr_persistence_in_flight.is_empty()
-            || !self.pr_persistence_pending.is_empty()
-            || !self.agent_state_persistence_in_flight.is_empty()
-            || !self.agent_state_persistence_pending.is_empty())
-            && started.elapsed() < TUI_JOB_SHUTDOWN_GRACE
-        {
-            self.route_tui_job_messages();
-            self.drain_pr_poll_results();
-            self.start_agent_state_persistence_jobs();
-            std::thread::sleep(Duration::from_millis(5));
-        }
         let active_jobs = self.jobs.active_metadata().len();
-        let shutdown_started = Instant::now();
         self.scheduling_stopped = true;
+        errors.extend(self.apply_routed_remote_actions_for_shutdown());
         self.jobs.stop_accepting();
-        self.jobs.cancel_all();
+        let protected = self.remote_actions_requiring_reconciliation.clone();
+        self.jobs.cancel_all_except(&protected);
         if let Err(error) = self.shutdown_owned_opencode_servers() {
             errors.push(error);
         }
-        while self.jobs.has_jobs() && shutdown_started.elapsed() < TUI_JOB_SHUTDOWN_GRACE {
+
+        let mutation_wait_started = Instant::now();
+        while !self.remote_actions_requiring_reconciliation.is_empty()
+            && mutation_wait_started.elapsed() < TUI_MUTATION_SHUTDOWN_BOUND
+        {
+            self.route_tui_job_messages();
+            if !self.remote_actions_requiring_reconciliation.is_empty() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        if !self.remote_actions_requiring_reconciliation.is_empty() {
+            let unfinished_mutations = self.remote_actions_requiring_reconciliation.clone();
+            for metadata in self.jobs.active_metadata() {
+                if !unfinished_mutations.contains(&metadata.id) {
+                    continue;
+                }
+                let reason = format!(
+                    "remote mutation exceeded the {:?} TUI shutdown bound",
+                    TUI_MUTATION_SHUTDOWN_BOUND
+                );
+                let marker = self
+                    .remote_action_reconciliation_contexts
+                    .get(&metadata.id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        "remote mutation is missing its reconciliation target".to_string()
+                    })
+                    .and_then(|reconciliation| {
+                        self.record_remote_mutation_reconciliation(
+                            &reconciliation.key,
+                            metadata.id,
+                            &reason,
+                            &reconciliation.target,
+                        )
+                    });
+                if let Err(error) = marker {
+                    errors.push(error);
+                }
+                self.jobs.cancel(metadata.id);
+            }
+        }
+
+        let cancellation_started = Instant::now();
+        while self.jobs.has_jobs() && cancellation_started.elapsed() < TUI_JOB_SHUTDOWN_GRACE {
             self.route_tui_job_messages();
             if self.jobs.has_jobs() {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
-        self.route_tui_job_messages();
+        while self.route_tui_job_messages() > 0 {}
+        errors.append(&mut self.shutdown_remote_action_errors);
         let unfinished = self.jobs.abandon_unfinished();
+        self.remote_actions_requiring_reconciliation.clear();
+        self.remote_action_reconciliation_contexts.clear();
         if unfinished > 0 {
             errors.push(format!(
                 "detached {unfinished} uncooperative job(s) after shutdown grace period"
@@ -3536,6 +4716,10 @@ impl Tui {
             if self.move_repo_pr_selection(1) {
                 return;
             }
+            if self.move_auto_step_selection(1) {
+                self.main_scroll = self.main_scroll.saturating_add(1);
+                return;
+            }
             let moved_comment = self.move_comment_selection(1);
             self.main_scroll = self.main_scroll.saturating_add(1);
             if !moved_comment {
@@ -3553,6 +4737,10 @@ impl Tui {
     fn move_up(&mut self) {
         if self.main_focused {
             if self.move_repo_pr_selection(-1) {
+                return;
+            }
+            if self.move_auto_step_selection(-1) {
+                self.main_scroll = self.main_scroll.saturating_sub(1);
                 return;
             }
             let moved_comment = self.move_comment_selection(-1);
@@ -3578,7 +4766,7 @@ impl Tui {
                 self.move_plan_step_selection(-1);
             }
             PanelFocus::Repos => {
-                self.repo_main_view = view::RepoMainView::Github;
+                self.repo_main_view = view::RepoMainView::ChangeRequests;
             }
             PanelFocus::Worktrees => {}
         }
@@ -3732,70 +4920,94 @@ impl Tui {
 
     fn move_repo_pr_selection(&mut self, direction: isize) -> bool {
         if self.focused_panel != PanelFocus::Repos
-            || self.repo_main_view != view::RepoMainView::Github
+            || self.repo_main_view != view::RepoMainView::ChangeRequests
         {
             return false;
         }
-        let prs = self.current_repo_open_pr_summaries();
+        let prs = self.current_repo_change_request_summaries();
         if prs.is_empty() {
             return false;
         }
-        let current_number = self.selected_repo_pr_number();
-        let current = current_number
-            .and_then(|number| prs.iter().position(|summary| summary.number == number))
+        let current_identity = self.selected_repo_pr_identity();
+        let current = current_identity
+            .and_then(|identity| {
+                prs.iter()
+                    .position(|summary| summary.change_request_identity.as_ref() == Some(identity))
+            })
             .unwrap_or(0);
         let next = current as isize + direction;
         if next < 0 {
             return true;
         }
-        if let Some(summary) = prs.get(next as usize)
+        if let Some(identity) = prs
+            .get(next as usize)
+            .and_then(|summary| summary.change_request_identity.clone())
             && let Some(repo) = self.repos.get(self.current_repo)
         {
             self.selected_pr_by_repo
-                .insert(repo.repo.root.clone(), summary.number);
+                .insert(repo.repo.root.clone(), identity);
         }
         true
     }
 
-    fn current_repo_open_pr_summaries(&self) -> Vec<crate::github::PrSummary> {
+    fn current_repo_change_request_summaries(&self) -> Vec<crate::remote::PrSummary> {
         self.repos
             .get(self.current_repo)
             .map(|managed| {
                 managed
                     .pr_summaries
                     .iter()
-                    .filter(|summary| !summary.merged && summary.state.eq_ignore_ascii_case("OPEN"))
+                    .filter(|summary| {
+                        !summary.merged
+                            && !matches!(
+                                summary.state.trim().to_ascii_uppercase().as_str(),
+                                "CLOSED" | "MERGED"
+                            )
+                            && summary.change_request_identity.is_some()
+                    })
                     .cloned()
                     .collect()
             })
             .unwrap_or_default()
     }
 
-    fn selected_repo_pr_number(&self) -> Option<u64> {
+    fn selected_repo_pr_identity(&self) -> Option<&crate::remote::CanonicalChangeRequestIdentity> {
         let root = &self.repos.get(self.current_repo)?.repo.root;
-        self.selected_pr_by_repo.get(root).copied()
+        self.selected_pr_by_repo.get(root)
     }
 
-    pub(crate) fn selected_repo_pr_summary(&self) -> Option<crate::github::PrSummary> {
-        let prs = self.current_repo_open_pr_summaries();
-        let selected = self.selected_repo_pr_number();
+    pub(crate) fn selected_repo_pr_summary(&self) -> Option<crate::remote::PrSummary> {
+        let prs = self.current_repo_change_request_summaries();
+        let selected = self.selected_repo_pr_identity();
         selected
-            .and_then(|number| prs.iter().find(|summary| summary.number == number).cloned())
+            .and_then(|identity| {
+                prs.iter()
+                    .find(|summary| summary.change_request_identity.as_ref() == Some(identity))
+                    .cloned()
+            })
             .or_else(|| prs.first().cloned())
     }
 
-    fn ensure_selected_repo_pr(&mut self) {
-        let prs = self.current_repo_open_pr_summaries();
+    pub(crate) fn ensure_selected_repo_pr(&mut self) {
+        let prs = self.current_repo_change_request_summaries();
         let Some(first) = prs.first() else {
+            if let Some(repo) = self.repos.get(self.current_repo) {
+                self.selected_pr_by_repo.remove(&repo.repo.root);
+            }
             return;
         };
-        let selected = self.selected_repo_pr_number();
-        if selected.is_some_and(|number| prs.iter().any(|summary| summary.number == number)) {
+        let selected = self.selected_repo_pr_identity();
+        if selected.is_some_and(|identity| {
+            prs.iter()
+                .any(|summary| summary.change_request_identity.as_ref() == Some(identity))
+        }) {
             return;
         }
-        if let Some(repo) = self.repos.get(self.current_repo) {
+        if let Some(identity) = first.change_request_identity.clone()
+            && let Some(repo) = self.repos.get(self.current_repo)
+        {
             self.selected_pr_by_repo
-                .insert(repo.repo.root.clone(), first.number);
+                .insert(repo.repo.root.clone(), identity);
         }
     }
 
@@ -4297,6 +5509,8 @@ impl Tui {
             changed = true;
             self.workspace_repositories
                 .insert(result.repository.clone(), snapshot.repository);
+            changed |= self.worker_health.as_ref() != Some(&snapshot.worker_health);
+            self.worker_health = Some(snapshot.worker_health.clone());
             if let Ok(runs) = snapshot.plan_runs {
                 for run in runs {
                     changed |= self.remember_plan_run_snapshot(run);
@@ -4355,6 +5569,17 @@ impl Tui {
                 Some(TUI_ACTION_JOB_TIMEOUT),
                 "prism-workflow-poll".to_string(),
                 move |_| {
+                    let worker_health =
+                        crate::worker::probe_health().and_then(|health| match health.state {
+                            crate::worker::DaemonState::Running => Ok(()),
+                            crate::worker::DaemonState::Draining => Err(format!(
+                                "Prism worker is draining ({} active)",
+                                health.active
+                            )),
+                            crate::worker::DaemonState::Stopped => {
+                                Err("Prism worker is stopped".to_string())
+                            }
+                        });
                     let repository_snapshot = WorkspaceState::open(WorkspaceContext {
                         repo: Some(repo.root.clone()),
                         cwd: repo.root.clone(),
@@ -4372,8 +5597,20 @@ impl Tui {
                         "tui.workflow.refresh",
                         |conn| {
                             let plan_runs = load_recent_plan_runs_for_repo(conn, &repo.root, 8);
-                            let auto_runs =
-                                load_recent_active_run_snapshots_for_repo(conn, &repo.root, 8);
+                            let auto_runs = (|| {
+                                let mut runs =
+                                    load_recent_active_run_snapshots_for_repo(conn, &repo.root, 8)?;
+                                let active_ids = runs
+                                    .iter()
+                                    .map(|run| run.run.id.clone())
+                                    .collect::<BTreeSet<_>>();
+                                runs.extend(
+                                    load_terminal_repair_run_snapshots_for_repo(conn, &repo.root)?
+                                        .into_iter()
+                                        .filter(|run| !active_ids.contains(&run.run.id)),
+                                );
+                                Ok(runs)
+                            })();
                             let linked_plan_runs = match &auto_runs {
                                 Ok(runs) => {
                                     let plan_ids = runs
@@ -4395,6 +5632,7 @@ impl Tui {
                                 plan_runs,
                                 auto_runs,
                                 linked_plan_runs,
+                                worker_health,
                             })
                         },
                     );
@@ -4604,16 +5842,27 @@ impl Tui {
             self.selected_auto_step_by_run
                 .insert(run_id.clone(), selected_step);
         }
-        let replace_active = self
-            .active_auto_runs
-            .get(&run.run.worktree_path)
-            .and_then(|active| self.auto_runs.get(active))
-            .is_none_or(|active| {
-                auto_run_priority(run.run.status) < auto_run_priority(active.run.status)
-            });
-        if replace_active {
-            self.active_auto_runs
-                .insert(run.run.worktree_path.clone(), run_id.clone());
+        let is_active = matches!(
+            run.run.status,
+            AutoRunStatus::Queued | AutoRunStatus::Running | AutoRunStatus::Paused
+        );
+        if is_active {
+            let replace_active = self
+                .active_auto_runs
+                .get(&run.run.worktree_path)
+                .and_then(|active| self.auto_runs.get(active))
+                .is_none_or(|active| {
+                    !matches!(
+                        active.run.status,
+                        AutoRunStatus::Queued | AutoRunStatus::Running | AutoRunStatus::Paused
+                    ) || auto_run_priority(run.run.status) < auto_run_priority(active.run.status)
+                });
+            if replace_active {
+                self.active_auto_runs
+                    .insert(run.run.worktree_path.clone(), run_id.clone());
+            }
+        } else if self.active_auto_runs.get(&run.run.worktree_path) == Some(&run_id) {
+            self.active_auto_runs.remove(&run.run.worktree_path);
         }
         if self.selected_auto_run.is_none() {
             self.selected_auto_run = Some(run_id.clone());
@@ -4720,7 +5969,7 @@ impl Tui {
             );
         }
         if let Some((repo, worktree_path)) = self.selected_auto_scope()
-            && let Some(run_id) = self.active_auto_runs.get(&worktree_path)
+            && let Some(run_id) = self.auto_run_id_for_worktree(&worktree_path)
             && let Some(run) = self.auto_runs.get(run_id)
         {
             let selected_step_run_id = self
@@ -4764,7 +6013,7 @@ impl Tui {
 
     pub(crate) fn current_auto_dashboard(&self) -> Option<view::AutoDashboard> {
         let (repo, worktree_path) = self.selected_auto_scope()?;
-        let run_id = self.active_auto_runs.get(&worktree_path)?;
+        let run_id = self.auto_run_id_for_worktree(&worktree_path)?;
         let mut run = self.auto_runs.get(run_id)?.clone();
         if let Some(selected_step) = self.selected_auto_step_by_run.get(run_id).copied() {
             run.run.selected_step_run_id = Some(selected_step);
@@ -4802,7 +6051,37 @@ impl Tui {
             linked_plan_dashboard,
             output_lines,
             output_state,
+            worker_status: match &self.worker_health {
+                Some(Ok(())) => "healthy".to_string(),
+                Some(Err(_)) => "unavailable".to_string(),
+                None => "checking".to_string(),
+            },
         })
+    }
+
+    fn auto_run_id_for_worktree(&self, worktree_path: &Path) -> Option<&String> {
+        if let Some(run_id) = self.active_auto_runs.get(worktree_path) {
+            return Some(run_id);
+        }
+        if self.plan_runs.values().any(|run| {
+            run.run.scope_path == worktree_path
+                && run.run.archived_unix_ms.is_none()
+                && matches!(
+                    run.run.status,
+                    PlanRunStatus::Queued | PlanRunStatus::Running | PlanRunStatus::Paused
+                )
+        }) {
+            return None;
+        }
+        self.auto_runs
+            .iter()
+            .filter(|(_, run)| {
+                run.run.worktree_path == worktree_path
+                    && run.run.archived_unix_ms.is_none()
+                    && run.run.variant == "repair"
+            })
+            .max_by_key(|(_, run)| run.run.updated_unix_ms)
+            .map(|(run_id, _)| run_id)
     }
 
     fn linked_plan_dashboard(
@@ -4967,6 +6246,45 @@ impl Tui {
         true
     }
 
+    fn move_auto_step_selection(&mut self, direction: isize) -> bool {
+        let Some(dashboard) = self.current_auto_dashboard() else {
+            return false;
+        };
+        if dashboard.run.run.variant != "repair" {
+            return false;
+        }
+        let run_id = dashboard.run.run.id.clone();
+        let steps = dashboard
+            .run
+            .steps
+            .iter()
+            .filter_map(|step| step.id)
+            .collect::<Vec<_>>();
+        if steps.is_empty() {
+            return false;
+        }
+        let current_step = self
+            .selected_auto_step_by_run
+            .get(&run_id)
+            .copied()
+            .or(dashboard.run.run.selected_step_run_id)
+            .unwrap_or(steps[0]);
+        let current = steps
+            .iter()
+            .position(|step| *step == current_step)
+            .unwrap_or(0);
+        let next = current as isize + direction;
+        let Some(step) = usize::try_from(next)
+            .ok()
+            .and_then(|next| steps.get(next))
+            .copied()
+        else {
+            return false;
+        };
+        self.selected_auto_step_by_run.insert(run_id, step);
+        true
+    }
+
     fn workflow_snapshot(
         &self,
         repository: &Path,
@@ -5108,28 +6426,32 @@ impl Tui {
                 })
             })
             .collect::<Vec<_>>();
-        let selected_pr_number = self.selected_repo_pr_number();
+        let selected_pr_identity = self.selected_repo_pr_identity();
+        let repo_pr_summaries = self.current_repo_change_request_summaries();
         let repo_prs = self
             .repos
             .get(self.current_repo)
             .map(|managed| {
-                managed
-                    .pr_summaries
+                repo_pr_summaries
                     .iter()
-                    .filter(|summary| !summary.merged && summary.state.eq_ignore_ascii_case("OPEN"))
                     .map(|summary| {
                         let has_worktree = self.sessions.iter().any(|session| {
                             session.repo_index == self.current_repo
-                                && session
-                                    .pr
-                                    .summary()
-                                    .is_some_and(|pr| pr.number == summary.number)
+                                && session.pr.summary().is_some_and(|pr| {
+                                    pr.change_request_identity.as_ref()
+                                        == summary.change_request_identity.as_ref()
+                                })
                         });
+                        let repo_label = summary
+                            .change_request_identity
+                            .as_ref()
+                            .map(|identity| identity.project_path().to_string())
+                            .unwrap_or_else(|| managed.label.clone());
                         view::RepoPrRow::from_summary(
-                            managed.label.clone(),
+                            repo_label,
                             summary,
                             has_worktree,
-                            selected_pr_number == Some(summary.number),
+                            selected_pr_identity == summary.change_request_identity.as_ref(),
                         )
                     })
                     .collect::<Vec<_>>()
@@ -5423,16 +6745,16 @@ impl Tui {
                     ("0", "focus main"),
                 ],
             )),
-            (Some(LeaderHint::Root), PanelFocus::Repos) => Some(choice_list(
-                "Shortcuts",
-                &[
-                    ("g", "git actions"),
-                    ("C", "open remote PR"),
-                    ("W", "worktree columns"),
-                    ("0", "focus main"),
-                    ("space/enter", "open default tmux"),
+            (Some(LeaderHint::Root), PanelFocus::Repos) => Some(view::ChoiceList {
+                title: "Shortcuts".to_string(),
+                choices: vec![
+                    view::KeyChoice::new("g", "git actions"),
+                    self.remote_pr_list_choice(),
+                    view::KeyChoice::new("W", "worktree columns"),
+                    view::KeyChoice::new("0", "focus main"),
+                    view::KeyChoice::new("space/enter", "open default tmux"),
                 ],
-            )),
+            }),
             (Some(LeaderHint::Root), PanelFocus::Worktrees) => Some(choice_list(
                 "Shortcuts",
                 &[
@@ -5475,6 +6797,13 @@ impl Tui {
             (None, _) => None,
         }
     }
+}
+
+fn merge_is_authoritatively_pending(queue_state: &str) -> bool {
+    matches!(
+        queue_state.trim().to_ascii_lowercase().as_str(),
+        "queued" | "running" | "blocked"
+    )
 }
 
 fn selectable_choice_key(choices: &view::ChoiceList, key: &str) -> Option<String> {
@@ -5542,12 +6871,13 @@ fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::text::Line;
 
     use crate::agent::AgentState;
@@ -5557,12 +6887,12 @@ mod tests {
     };
     use crate::config::Config;
     use crate::execution::{DispatchState, WorkflowKind};
-    use crate::github::{PrCache, PrDetails, PrReviewComment, PrSummary};
     use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
     use crate::plan_run::{
         PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRun, PlanRunMode, PlanRunStatus,
         PlanStepRun, PlanStepStatus,
     };
+    use crate::remote::{PrCache, PrDetails, PrReview, PrReviewComment, PrSummary};
     use crate::repo::Repository;
     use crate::session::{Session, WorktreeRepositoryKey};
     use crate::tui_jobs::{CoalescedFacet, JobRegistry};
@@ -5574,9 +6904,12 @@ mod tests {
 
     use super::{
         GitAction, ManagedRepo, OpenTmuxSessionTarget, OpencodePollKey, OpencodePollResult,
-        PanelFocus, PrPollKey, PrPollResult, PrSummarySessionResult, TmuxPortalCapture,
-        TmuxPortalResult, TmuxPortalSnapshot, Tui, TuiJobKey, TuiJobKind, WorktreeListMode,
-        confirmation_result, move_enabled_ordered_item, selectable_choice_key,
+        PanelFocus, PrPollKey, PrPollResult, PrSummarySessionResult, RemoteActionDelivery,
+        RemoteActionReconciliationContext, RemoteActionValue, RemoteMergeOutcome,
+        RemoteMutationTarget, RemotePushPrepared, TmuxPortalCapture, TmuxPortalResult,
+        TmuxPortalSnapshot, Tui, TuiJobKey, TuiJobKind, TuiJobPayload, WorktreeListMode,
+        confirmation_result, move_enabled_ordered_item, remote_action_abandon_requested,
+        remote_action_timeout, remote_mutation_targets_overlap, selectable_choice_key,
         toggle_item_in_place, toggle_ordered_item,
     };
 
@@ -6054,6 +7387,416 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_finishes_and_persists_accepted_remote_mutations() {
+        let temp = unique_temp_dir("prism-tui-mutation-shutdown-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let branches = ["create", "resolve", "push", "merge"];
+        let sessions = branches
+            .iter()
+            .map(|branch| test_session(0, &temp.join(branch).display().to_string(), branch))
+            .collect::<Vec<_>>();
+        let mut tui = Tui::new_single(repo.clone(), test_config(), sessions);
+        let mut releases = Vec::new();
+
+        for (index, branch) in branches.iter().enumerate() {
+            let worktree = tui.sessions[index].identity_key(&tui.repos[0].identity);
+            let key = TuiJobKey::Worktree(worktree);
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            releases.push(release_tx);
+            let mut summary = test_pr_summary(false);
+            summary.number = index as u64 + 10;
+            summary.head_ref = (*branch).to_string();
+            let cache = PrCache::observed(summary, None);
+            let payload_session = if *branch == "merge" {
+                let mut session = test_session(0, &temp.join(branch).display().to_string(), branch);
+                session.pr = cache.clone();
+                Some(session)
+            } else {
+                None
+            };
+            let branch = *branch;
+            let id = tui.spawn_tui_job(
+                TuiJobKind::RemoteAction,
+                key,
+                0,
+                None,
+                format!("accepted-{branch}"),
+                move |context| {
+                    release_rx.recv().unwrap();
+                    let value = match branch {
+                        "create" => RemoteActionValue::Cache(Box::new(cache)),
+                        "resolve" => RemoteActionValue::Resolved {
+                            cache: Box::new(cache),
+                            count: 1,
+                        },
+                        "push" => RemoteActionValue::PushPrepared(Box::new(RemotePushPrepared {
+                            cache,
+                            origin_repository: None,
+                            upstream_repository: None,
+                            push_guard: None,
+                        })),
+                        "merge" => RemoteActionValue::MergeExecution {
+                            session: Box::new(payload_session.unwrap()),
+                            result: Ok(RemoteMergeOutcome {
+                                execution: crate::auto_flow::stabilization_execute::ManualMergeExecution::Blocked(
+                                    crate::auto_flow::stabilization_model::StabilizationState {
+                                        status: crate::auto_flow::stabilization_model::StabilizationStatus::Blocked,
+                                        blocker: crate::auto_flow::stabilization_model::StabilizationBlocker::MergeBlocked,
+                                        next_work: crate::auto_flow::stabilization_model::StabilizationWorkKind::Escalate,
+                                        reason: "test terminal merge payload".to_string(),
+                                    },
+                                ),
+                                verification: None,
+                            }),
+                        },
+                        _ => unreachable!(),
+                    };
+                    Ok(Some(TuiJobPayload::RemoteAction(Box::new(
+                        RemoteActionDelivery {
+                            id: context.id(),
+                            result: Ok(value),
+                        },
+                    ))))
+                },
+            );
+            tui.remote_actions_requiring_reconciliation.insert(id);
+        }
+
+        let (ordinary_stopped_tx, ordinary_stopped_rx) = std::sync::mpsc::channel();
+        tui.spawn_tui_job(
+            TuiJobKind::PrSummary,
+            TuiJobKey::Repository(tui.repos[0].identity.clone()),
+            0,
+            None,
+            "ordinary-shutdown-poll".to_string(),
+            move |context| {
+                while !context.wait(Duration::from_secs(60)) {}
+                ordinary_stopped_tx.send(()).unwrap();
+                Ok(None)
+            },
+        );
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            for release in releases {
+                release.send(()).unwrap();
+            }
+        });
+
+        tui.cleanup_tui_jobs(super::ShutdownReason::Sigterm)
+            .unwrap();
+        releaser.join().unwrap();
+
+        ordinary_stopped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert!(tui.remote_actions_requiring_reconciliation.is_empty());
+        assert!(!tui.jobs.has_jobs());
+        let mut delivered = BTreeSet::new();
+        while let Ok(delivery) = tui.remote_action_rx.try_recv() {
+            assert!(delivery.result.is_ok());
+            delivered.insert(delivery.id);
+        }
+        assert_eq!(delivered.len(), 4);
+        for (index, branch) in branches.iter().enumerate() {
+            let persisted = crate::remote::load_pr_cache(&repo, branch);
+            assert_eq!(persisted.summary().unwrap().number, index as u64 + 10);
+        }
+
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn empty_list_retains_persisted_create_marker_until_matching_summary_is_observed() {
+        let temp = unique_temp_dir("prism-tui-mutation-reconciliation-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+        let mut tui = Tui::new_single(repo.clone(), test_config(), vec![session]);
+        let worktree = tui.sessions[0].identity_key(&tui.repos[0].identity);
+        let target = RemoteMutationTarget::Create {
+            source_provider: crate::remote::ProviderKind::GitHub,
+            source_host: "github.com".to_string(),
+            source_project: "example/repo".to_string(),
+            source_branch: "feature".to_string(),
+            expected_head_sha: "abc123".to_string(),
+            target_provider: Some(crate::remote::ProviderKind::GitHub),
+            target_host: "github.com".to_string(),
+            target_project: "example/repo".to_string(),
+            target_branch: "main".to_string(),
+            expected_base_sha: "base123".to_string(),
+        };
+        let legacy_target = RemoteMutationTarget::Create {
+            source_provider: crate::remote::ProviderKind::GitHub,
+            source_host: "github.com".to_string(),
+            source_project: "example/repo".to_string(),
+            source_branch: "feature".to_string(),
+            expected_head_sha: "abc123".to_string(),
+            target_provider: None,
+            target_host: String::new(),
+            target_project: String::new(),
+            target_branch: String::new(),
+            expected_base_sha: String::new(),
+        };
+        assert!(remote_mutation_targets_overlap(&legacy_target, &target));
+        tui.record_remote_mutation_reconciliation(
+            &TuiJobKey::Worktree(worktree),
+            7,
+            "shutdown bound exceeded",
+            &target,
+        )
+        .unwrap();
+        drop(tui);
+
+        let mut session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+        let mut observed = test_pr_summary(false);
+        observed.change_request_identity = Some(test_change_request_identity(
+            crate::remote::ProviderKind::GitHub,
+        ));
+        session.pr = PrCache::observed(observed.clone(), None);
+        let mut restarted = Tui::new_single(repo.clone(), test_config(), vec![session]);
+        let repository = restarted.repos[0].identity.clone();
+        let key = TuiJobKey::Worktree(restarted.sessions[0].identity_key(&repository));
+
+        assert!(restarted.remote_action_reconciliation_blocked(&key, &target));
+        assert!(restarted.sessions[0].pr.trusted_summary().is_err());
+
+        restarted.reconcile_remote_mutation_summaries(&repository, &[], &BTreeMap::new());
+        assert!(restarted.remote_action_reconciliation_blocked(&key, &target));
+
+        let mut wrong_base = observed.clone();
+        wrong_base.base_ref = "release".to_string();
+        restarted.reconcile_remote_mutation_summaries(&repository, &[wrong_base], &BTreeMap::new());
+        assert!(restarted.remote_action_reconciliation_blocked(&key, &target));
+
+        restarted.reconcile_remote_mutation_summaries(&repository, &[observed], &BTreeMap::new());
+
+        assert!(!restarted.remote_action_reconciliation_blocked(&key, &target));
+        let marker_exists = crate::observability::with_writable_db(&repo, |conn| {
+            conn.query_row(
+                "select exists(select 1 from metadata where key = ?1)",
+                [super::REMOTE_MUTATION_RECONCILIATION_KEY],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| error.to_string())
+        })
+        .unwrap();
+        assert!(!marker_exists);
+
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn accepted_then_transport_error_remains_reconciliation_required() {
+        let temp = unique_temp_dir("prism-tui-accepted-transport-error-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+        session.pr = PrCache::observed(test_pr_summary(false), None);
+        let mut tui = Tui::new_single(repo.clone(), test_config(), vec![session]);
+        let repository = tui.repos[0].identity.clone();
+        let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&repository));
+        let mut summary = test_pr_summary(false);
+        summary.change_request_identity = Some(test_change_request_identity(
+            crate::remote::ProviderKind::GitHub,
+        ));
+        let target = RemoteMutationTarget::Merge {
+            change_request: summary.change_request_identity.clone().unwrap(),
+            expected_head_sha: summary.head_sha.clone(),
+        };
+        let result = Ok(RemoteActionValue::MergeExecution {
+            session: Box::new(tui.sessions[0].background_job_snapshot()),
+            result: Err("provider accepted mutation before transport failed".to_string()),
+        });
+
+        tui.retain_uncertain_remote_action_result(&key, 17, &result, &target)
+            .unwrap();
+
+        assert!(tui.remote_action_reconciliation_blocked(&key, &target));
+        assert!(tui.sessions[0].pr.trusted_summary().is_err());
+        drop(tui);
+
+        let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+        let restarted = Tui::new_single(repo, test_config(), vec![session]);
+        let restarted_key =
+            TuiJobKey::Worktree(restarted.sessions[0].identity_key(&restarted.repos[0].identity));
+        assert!(restarted.remote_action_reconciliation_blocked(&restarted_key, &target));
+
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn reconciliation_clears_only_markers_with_matched_authoritative_evidence() {
+        let temp = unique_temp_dir("prism-tui-matched-mutation-evidence-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let session = test_session(0, &temp.join("worktree").display().to_string(), "feature");
+        let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+        let repository = tui.repos[0].identity.clone();
+        let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&repository));
+        let identity = test_change_request_identity(crate::remote::ProviderKind::GitHub);
+        let targets = [
+            RemoteMutationTarget::Push {
+                remote: "origin".to_string(),
+                branch: "feature".to_string(),
+                expected_head_sha: "abc123".to_string(),
+                repository_provider: None,
+                repository_host: String::new(),
+                repository_project: String::new(),
+            },
+            RemoteMutationTarget::Create {
+                source_provider: crate::remote::ProviderKind::GitHub,
+                source_host: "github.com".to_string(),
+                source_project: "example/repo".to_string(),
+                source_branch: "feature".to_string(),
+                expected_head_sha: "abc123".to_string(),
+                target_provider: None,
+                target_host: String::new(),
+                target_project: String::new(),
+                target_branch: String::new(),
+                expected_base_sha: String::new(),
+            },
+            RemoteMutationTarget::Review {
+                change_request: identity.clone(),
+                expected_state: "APPROVED".to_string(),
+                expected_body: "looks good".to_string(),
+                prior_review_ids: vec!["review-1".to_string()],
+            },
+            RemoteMutationTarget::Resolve {
+                change_request: identity.clone(),
+                thread_ids: vec!["thread-1".to_string()],
+            },
+            RemoteMutationTarget::Merge {
+                change_request: identity.clone(),
+                expected_head_sha: "abc123".to_string(),
+            },
+        ];
+        for (job_id, target) in targets.iter().enumerate() {
+            tui.record_remote_mutation_reconciliation(&key, job_id as u64 + 1, "uncertain", target)
+                .unwrap();
+        }
+
+        tui.reconcile_remote_mutation_summaries(&repository, &[], &BTreeMap::new());
+        let mut empty_summary = test_pr_summary(false);
+        empty_summary.change_request_identity = Some(identity.clone());
+        tui.reconcile_remote_mutation_details(
+            &repository,
+            &PrCache::observed(empty_summary, Some(PrDetails::default())),
+        );
+        assert_eq!(
+            tui.remote_mutations_requiring_reconciliation[&repository.root].len(),
+            5
+        );
+
+        let mut create = test_pr_summary(false);
+        create.change_request_identity = Some(identity.clone());
+        let mut pending_merge = create.clone();
+        pending_merge.queue_state = "queued".to_string();
+        tui.reconcile_remote_mutation_summaries(
+            &repository,
+            &[create, pending_merge.clone()],
+            &BTreeMap::from([(
+                ("origin".to_string(), "feature".to_string()),
+                "abc123".to_string(),
+            )]),
+        );
+        assert_eq!(
+            tui.remote_mutations_requiring_reconciliation[&repository.root].len(),
+            2
+        );
+
+        let details = PrDetails {
+            reviews: vec![PrReview {
+                id: "review-2".to_string(),
+                state: "APPROVED".to_string(),
+                body: "looks good".to_string(),
+                ..PrReview::default()
+            }],
+            review_comments: vec![PrReviewComment {
+                thread_id: "thread-1".to_string(),
+                resolved: true,
+                ..PrReviewComment::default()
+            }],
+            ..PrDetails::default()
+        };
+        tui.reconcile_remote_mutation_details(
+            &repository,
+            &PrCache::observed(pending_merge, Some(details)),
+        );
+        assert!(
+            !tui.remote_mutations_requiring_reconciliation
+                .contains_key(&repository.root)
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn cleanup_applies_a_mutation_payload_routed_before_shutdown_started() {
+        let temp = unique_temp_dir("prism-tui-routed-mutation-shutdown-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let branch = "feature";
+        let session = test_session(0, &temp.join("worktree").display().to_string(), branch);
+        let mut tui = Tui::new_single(repo.clone(), test_config(), vec![session]);
+        let key = TuiJobKey::Worktree(tui.sessions[0].identity_key(&tui.repos[0].identity));
+        let job_key = key.clone();
+        let target = RemoteMutationTarget::Push {
+            remote: "origin".to_string(),
+            branch: branch.to_string(),
+            expected_head_sha: "abc123".to_string(),
+            repository_provider: None,
+            repository_host: String::new(),
+            repository_project: String::new(),
+        };
+        let mut summary = test_pr_summary(false);
+        summary.number = 42;
+        summary.head_ref = branch.to_string();
+        let cache = PrCache::observed(summary, None);
+        let id = tui.spawn_tui_job(
+            TuiJobKind::RemoteAction,
+            key,
+            0,
+            None,
+            "already-routed-mutation".to_string(),
+            move |context| {
+                Ok(Some(TuiJobPayload::RemoteAction(Box::new(
+                    RemoteActionDelivery {
+                        id: context.id(),
+                        result: Ok(RemoteActionValue::Cache(Box::new(cache))),
+                    },
+                ))))
+            },
+        );
+        tui.remote_actions_requiring_reconciliation.insert(id);
+        tui.remote_action_reconciliation_contexts.insert(
+            id,
+            RemoteActionReconciliationContext {
+                key: job_key,
+                target,
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while tui.jobs.has_jobs() {
+            tui.route_tui_job_messages();
+            assert!(Instant::now() < deadline);
+        }
+        tui.route_tui_job_messages();
+
+        tui.cleanup_tui_jobs(super::ShutdownReason::Sigterm)
+            .unwrap();
+
+        assert!(tui.remote_actions_requiring_reconciliation.is_empty());
+        assert_eq!(
+            crate::remote::load_pr_cache(&repo, branch)
+                .summary()
+                .unwrap()
+                .number,
+            42
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
     fn run_error_path_cleans_up_active_listener() {
         let (mut tui, stopped_rx) = tui_with_active_listener("run-error");
 
@@ -6169,11 +7912,15 @@ mod tests {
                 repository: repository.clone(),
                 sessions: vec![session_key.clone()],
                 github_remote_configured: true,
+                capabilities: Some(crate::remote::Capabilities::for_provider(
+                    crate::remote::ProviderKind::GitHub,
+                )),
                 summaries: Ok(vec![test_pr_summary(false)]),
                 observations: Ok(vec![PrSummarySessionResult {
                     key: session_key,
                     summary: Some(test_pr_summary(false)),
                 }]),
+                remote_branch_heads: BTreeMap::new(),
                 refreshed: "now".to_string(),
                 poll_started_at,
             })
@@ -6236,7 +7983,7 @@ mod tests {
         tui.focused_panel = PanelFocus::Worktrees;
         tui.sessions[0].pr = PrCache::observed(test_pr_summary(false), None);
         let mut failed_poll = tui.sessions[0].pr.begin_details_poll();
-        crate::github::refresh_pr_details_cache_state(
+        crate::remote::dispatcher::refresh_change_request_details_state(
             "feature",
             &mut failed_poll,
             &tui.sessions[0].path,
@@ -6412,7 +8159,7 @@ esac
     }
 
     #[test]
-    fn git_actions_disable_pr_operations_until_a_pr_is_known() {
+    fn git_actions_allow_push_before_remote_capabilities_or_a_pr_are_known() {
         let repo = Repository {
             root: PathBuf::from("/tmp/repo"),
         };
@@ -6427,9 +8174,33 @@ esac
         assert!(!tui.git_action_enabled(GitAction::OpenPr));
         assert!(!tui.git_action_enabled(GitAction::Merge));
 
+        tui.repos[0].remote_capabilities = Some(crate::remote::Capabilities::for_provider(
+            crate::remote::ProviderKind::GitHub,
+        ));
+        assert!(tui.git_action_enabled(GitAction::Push));
+
         tui.sessions[0].pr = PrCache::observed(test_pr_summary(false), None);
         assert!(tui.git_action_enabled(GitAction::OpenPr));
         assert!(tui.git_action_enabled(GitAction::Merge));
+        assert!(!tui.git_action_enabled(GitAction::CiFix));
+        tui.sessions[0].pr = PrCache::observed(
+            test_pr_summary(false),
+            Some(PrDetails {
+                failing_checks: vec!["external-ci".to_string()],
+                ..PrDetails::default()
+            }),
+        );
+        assert!(tui.git_action_enabled(GitAction::CiFix));
+        tui.sessions[0].pr = PrCache::observed(
+            test_pr_summary(false),
+            Some(PrDetails {
+                ci_failures: vec![crate::remote::CachedCiFailure {
+                    name: "failed".to_string(),
+                    ..crate::remote::CachedCiFailure::default()
+                }],
+                ..PrDetails::default()
+            }),
+        );
         assert!(tui.git_action_enabled(GitAction::CiFix));
 
         tui.sessions[0].pr = PrCache::observed(test_pr_summary(true), None);
@@ -6460,9 +8231,219 @@ esac
         crate::test_support::install_tool(&mut config, &temp, "gh", "#!/bin/sh\nexit 0\n");
         tui.repos[0].config = config;
 
+        assert!(!tui.git_action_enabled(GitAction::SubmitReview));
+
+        tui.repos[0].pr_summaries[0].change_request_identity = Some(test_change_request_identity(
+            crate::remote::ProviderKind::GitHub,
+        ));
         assert!(tui.git_action_enabled(GitAction::SubmitReview));
 
+        tui.repos[0].pr_summaries[0].state = "SUPERSEDED_BY_TRAIN".to_string();
+        assert!(!tui.git_action_enabled(GitAction::SubmitReview));
+        tui.repos[0].pr_summaries[0].state = "OPEN".to_string();
+
+        for provider in [
+            crate::remote::ProviderKind::GitLab,
+            crate::remote::ProviderKind::Forgejo,
+        ] {
+            tui.repos[0].pr_summaries[0].change_request_identity =
+                Some(test_change_request_identity(provider));
+            assert!(!tui.git_action_enabled(GitAction::SubmitReview));
+        }
+
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn repository_change_request_selection_uses_canonical_identity_across_reordering() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let mut tui = Tui::new_single(repo, test_config(), Vec::new());
+        tui.focused_panel = PanelFocus::Repos;
+        tui.repo_main_view = RepoMainView::ChangeRequests;
+
+        let origin_identity = test_change_request_identity_for(
+            crate::remote::ProviderKind::GitHub,
+            "fork/widget",
+            "PR_origin_42",
+        );
+        let upstream_identity = test_change_request_identity_for(
+            crate::remote::ProviderKind::GitHub,
+            "upstream/widget",
+            "PR_upstream_42",
+        );
+        let mut origin = test_pr_summary(false);
+        origin.number = 42;
+        origin.title = "origin change".to_string();
+        origin.change_request_identity = Some(origin_identity.clone());
+        let mut upstream = origin.clone();
+        upstream.title = "upstream change".to_string();
+        upstream.change_request_identity = Some(upstream_identity.clone());
+        tui.repos[0].pr_summaries = vec![origin.clone(), upstream.clone()];
+
+        tui.ensure_selected_repo_pr();
+        assert_eq!(
+            tui.selected_repo_pr_summary()
+                .unwrap()
+                .change_request_identity,
+            Some(origin_identity)
+        );
+
+        assert!(tui.move_repo_pr_selection(1));
+        let selected_for_action = tui.selected_repo_pr_summary().unwrap();
+        assert_eq!(selected_for_action.title, "upstream change");
+        assert_eq!(
+            selected_for_action.change_request_identity.as_ref(),
+            Some(&upstream_identity)
+        );
+
+        let repository = tui.repos[0].identity.clone();
+        tui.pr_poll_tx
+            .send(PrPollResult::Summary {
+                repository,
+                sessions: Vec::new(),
+                github_remote_configured: true,
+                capabilities: Some(crate::remote::Capabilities::for_provider(
+                    crate::remote::ProviderKind::GitHub,
+                )),
+                summaries: Ok(vec![upstream, origin]),
+                observations: Ok(Vec::new()),
+                remote_branch_heads: BTreeMap::new(),
+                refreshed: "now".to_string(),
+                poll_started_at: Instant::now(),
+            })
+            .unwrap();
+        tui.drain_pr_poll_results();
+
+        assert_eq!(
+            tui.selected_repo_pr_summary().unwrap().title,
+            "upstream change"
+        );
+        let rows = tui.frame_model().repo_prs;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().filter(|row| row.number == 42).count(), 2);
+        assert_eq!(rows.iter().filter(|row| row.selected).count(), 1);
+        assert!(rows.iter().any(|row| {
+            row.selected && row.title == "upstream change" && row.repo_label == "upstream/widget"
+        }));
+    }
+
+    #[test]
+    fn conditional_ci_repair_requires_loaded_failure_evidence() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let mut tui = Tui::new_single(
+            repo,
+            test_config(),
+            vec![test_session(0, "/tmp/repo", "feature")],
+        );
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.repos[0].remote_capabilities = Some(crate::remote::Capabilities::for_provider(
+            crate::remote::ProviderKind::Forgejo,
+        ));
+        tui.sessions[0].pr = PrCache::observed(test_pr_summary(false), None);
+
+        assert!(!tui.git_action_enabled(GitAction::CiFix));
+
+        tui.sessions[0].pr = PrCache::observed(
+            test_pr_summary(false),
+            Some(PrDetails {
+                ci_failures: vec![crate::remote::CachedCiFailure {
+                    name: "failed".to_string(),
+                    log_tail: "failure evidence".to_string(),
+                    ..crate::remote::CachedCiFailure::default()
+                }],
+                ..PrDetails::default()
+            }),
+        );
+        assert!(tui.git_action_enabled(GitAction::CiFix));
+
+        tui.repos[0].remote_capabilities.as_mut().unwrap().ci_logs =
+            crate::remote::SupportLevel::Unsupported;
+        assert!(!tui.git_action_enabled(GitAction::CiFix));
+    }
+
+    #[test]
+    fn mutation_remote_action_jobs_cannot_be_abandoned_or_timed_out() {
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let interrupt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+
+        for mutation in [
+            "branch push",
+            "guarded push",
+            "review submission",
+            "change request creation",
+            "thread resolution",
+            "merge",
+        ] {
+            assert!(
+                !remote_action_abandon_requested(false, escape),
+                "{mutation} must ignore Escape"
+            );
+            assert!(
+                !remote_action_abandon_requested(false, interrupt),
+                "{mutation} must ignore Ctrl-C"
+            );
+            assert_eq!(remote_action_timeout(false), None, "{mutation}");
+        }
+
+        assert!(remote_action_abandon_requested(true, escape));
+        assert!(remote_action_abandon_requested(true, interrupt));
+        assert_eq!(
+            remote_action_timeout(true),
+            Some(super::TUI_ACTION_JOB_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn push_remote_action_cannot_be_abandoned_and_reconciles_after_generation_change() {
+        let abandon_cancelable = false;
+        let escape = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        let interrupt = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!remote_action_abandon_requested(abandon_cancelable, escape));
+        assert!(!remote_action_abandon_requested(
+            abandon_cancelable,
+            interrupt
+        ));
+        assert_eq!(remote_action_timeout(abandon_cancelable), None);
+
+        let mut tui = test_tui();
+        let key = TuiJobKey::Repository(tui.repos[0].identity.clone());
+        let id = tui.spawn_tui_job(
+            TuiJobKind::RemoteAction,
+            key,
+            tui.session_inventory_generation,
+            remote_action_timeout(abandon_cancelable),
+            "push-reconciliation-test".to_string(),
+            |context| {
+                Ok(Some(TuiJobPayload::RemoteAction(Box::new(
+                    RemoteActionDelivery {
+                        id: context.id(),
+                        result: Ok(RemoteActionValue::Complete),
+                    },
+                ))))
+            },
+        );
+        if !abandon_cancelable {
+            tui.remote_actions_requiring_reconciliation.insert(id);
+        }
+        tui.session_inventory_generation += 1;
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let delivery = loop {
+            tui.route_tui_job_messages();
+            if let Ok(delivery) = tui.remote_action_rx.try_recv() {
+                break delivery;
+            }
+            assert!(Instant::now() < deadline, "push result was discarded");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+
+        assert_eq!(delivery.id, id);
+        assert!(matches!(delivery.result, Ok(RemoteActionValue::Complete)));
+        tui.remote_actions_requiring_reconciliation.remove(&id);
     }
 
     #[test]
@@ -6522,6 +8503,93 @@ esac
             }),
         );
         assert!(!tui.git_action_enabled(GitAction::ResolveAllComments));
+    }
+
+    #[test]
+    fn conditional_remote_operations_are_disabled_and_not_selectable() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let mut tui = Tui::new_single(
+            repo,
+            test_config(),
+            vec![test_session(0, "/tmp/repo", "feature")],
+        );
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.sessions[0].pr = PrCache::observed(test_pr_summary(false), None);
+        let mut capabilities =
+            crate::remote::Capabilities::for_provider(crate::remote::ProviderKind::GitHub);
+        capabilities.guarded_merge = crate::remote::SupportLevel::Conditional;
+        tui.repos[0].remote_capabilities = Some(capabilities);
+
+        let choice = tui.git_choice(GitAction::Merge, "M", "merge");
+        let choices = ChoiceList {
+            title: "Git Actions".to_string(),
+            choices: vec![choice.clone()],
+        };
+
+        assert!(choice.disabled);
+        assert!(choice.label.contains("conditional support not established"));
+        assert_eq!(selectable_choice_key(&choices, "M"), None);
+        assert!(!tui.git_action_enabled(GitAction::Merge));
+    }
+
+    #[test]
+    fn gitlab_rebase_merge_choice_uses_adapter_capability_reason() {
+        let repo = Repository {
+            root: PathBuf::from("/tmp/repo"),
+        };
+        let mut tui = Tui::new_single(
+            repo,
+            test_config(),
+            vec![test_session(0, "/tmp/repo", "feature")],
+        );
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.sessions[0].pr = PrCache::observed(test_pr_summary(false), None);
+        let mut capabilities =
+            crate::remote::Capabilities::for_provider(crate::remote::ProviderKind::GitLab);
+        capabilities.guarded_merge = crate::remote::SupportLevel::Unsupported;
+        capabilities.guarded_merge_reason =
+            Some("GitLab adapter does not support rebase merges".to_string());
+        tui.repos[0].remote_capabilities = Some(capabilities);
+
+        let choice = tui.git_choice(GitAction::Merge, "M", "merge");
+
+        assert!(choice.disabled);
+        assert!(
+            choice
+                .label
+                .contains("GitLab adapter does not support rebase merges")
+        );
+    }
+
+    #[test]
+    fn applying_remote_action_results_performs_no_provider_or_database_io() {
+        let temp = unique_temp_dir("prism-tui-remote-action-result-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        crate::observability::with_writable_db(&repo, |_| Ok(())).unwrap();
+        let session = test_session(0, &temp.display().to_string(), "feature");
+        let mut tui = Tui::new_single(repo, test_config(), vec![session]);
+        let cache = PrCache::observed(test_pr_summary(false), None);
+
+        crate::flight_recorder::deny_external_calls_on_current_thread(|| {
+            crate::observability::deny_database_access_on_current_thread(|| {
+                tui.apply_remote_cache_result(0, cache);
+                tui.route_tui_job_payload(TuiJobPayload::RemoteAction(Box::new(
+                    RemoteActionDelivery {
+                        id: 42,
+                        result: Ok(RemoteActionValue::Complete),
+                    },
+                )));
+            });
+        });
+
+        assert_eq!(tui.sessions[0].pr.summary().unwrap().number, 1);
+        let delivery = tui.remote_action_rx.try_recv().unwrap();
+        assert_eq!(delivery.id, 42);
+        assert!(matches!(delivery.result, Ok(RemoteActionValue::Complete)));
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -7064,7 +9132,7 @@ esac
         tui.move_right();
 
         assert_eq!(tui.focused_panel, PanelFocus::Repos);
-        assert_eq!(tui.repo_main_view, RepoMainView::Github);
+        assert_eq!(tui.repo_main_view, RepoMainView::ChangeRequests);
 
         tui.focus_main();
         tui.move_right();
@@ -7075,14 +9143,14 @@ esac
         tui.move_left();
 
         assert_eq!(tui.focused_panel, PanelFocus::Repos);
-        assert_eq!(tui.repo_main_view, RepoMainView::Github);
+        assert_eq!(tui.repo_main_view, RepoMainView::ChangeRequests);
 
         tui.focused_panel = PanelFocus::Worktrees;
         tui.main_focused = false;
         tui.move_left();
 
         assert_eq!(tui.focused_panel, PanelFocus::Worktrees);
-        assert_eq!(tui.repo_main_view, RepoMainView::Github);
+        assert_eq!(tui.repo_main_view, RepoMainView::ChangeRequests);
     }
 
     #[test]
@@ -7092,18 +9160,18 @@ esac
         tui.select_worktree(1);
         tui.sessions[1].pr = PrCache::observed(
             test_pr_summary(false),
-            Some(crate::github::PrDetails {
+            Some(crate::remote::PrDetails {
                 comments: vec![
-                    crate::github::PrComment {
+                    crate::remote::PrComment {
                         body: "first comment".to_string(),
-                        ..crate::github::PrComment::default()
+                        ..crate::remote::PrComment::default()
                     },
-                    crate::github::PrComment {
+                    crate::remote::PrComment {
                         body: "second comment".to_string(),
-                        ..crate::github::PrComment::default()
+                        ..crate::remote::PrComment::default()
                     },
                 ],
-                ..crate::github::PrDetails::default()
+                ..crate::remote::PrDetails::default()
             }),
         );
         tui.focus_main();
@@ -7324,6 +9392,32 @@ esac
             dashboard.run.run.worktree_path,
             PathBuf::from("/repo-one/z-worktree")
         );
+    }
+
+    #[test]
+    fn terminal_auto_run_remains_in_history_but_is_no_longer_active() {
+        let mut tui = test_tui();
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.select_worktree(1);
+        let mut run = test_auto_run("run", "/repo-one/feature-one", 10);
+        run.run.variant = "repair".to_string();
+
+        tui.remember_auto_run(run.clone());
+        assert_eq!(
+            tui.active_auto_runs.get(&run.run.worktree_path),
+            Some(&run.run.id)
+        );
+
+        run.run.status = AutoRunStatus::Aborted;
+        tui.remember_auto_run(run.clone());
+
+        assert!(!tui.active_auto_runs.contains_key(&run.run.worktree_path));
+        assert_eq!(tui.auto_runs.get(&run.run.id), Some(&run));
+        assert_eq!(tui.current_auto_dashboard().unwrap().run.run.id, run.run.id);
+
+        tui.remember_plan_run(test_plan_run("plan", "/repo-one/feature-one"));
+        assert!(tui.current_auto_dashboard().is_none());
+        assert_eq!(tui.current_plan_dashboard().unwrap().run.run.id, "plan");
     }
 
     #[test]
@@ -7738,6 +9832,8 @@ esac
     fn test_pr_summary(merged: bool) -> PrSummary {
         PrSummary {
             number: 1,
+            change_request_identity: None,
+            native_state_evidence: crate::remote::NativeStateEvidence::default(),
             title: "PR".to_string(),
             author: "author".to_string(),
             body: String::new(),
@@ -7751,10 +9847,38 @@ esac
             updated_at: String::new(),
             check_status: String::new(),
             merge_state_status: String::new(),
+            queue_state: String::new(),
             comment_count: 0,
             merged,
             draft: false,
         }
+    }
+
+    fn test_change_request_identity(
+        provider: crate::remote::ProviderKind,
+    ) -> crate::remote::CanonicalChangeRequestIdentity {
+        test_change_request_identity_for(provider, "example/repo", "change-request-1")
+    }
+
+    fn test_change_request_identity_for(
+        provider: crate::remote::ProviderKind,
+        project_path: &str,
+        native_id: &str,
+    ) -> crate::remote::CanonicalChangeRequestIdentity {
+        let host = match provider {
+            crate::remote::ProviderKind::GitHub => "github.com",
+            crate::remote::ProviderKind::GitLab => "gitlab.com",
+            crate::remote::ProviderKind::Forgejo => "codeberg.org",
+        };
+        let host = crate::remote::HostIdentity::new(host, None).unwrap();
+        let repository =
+            crate::remote::RemoteRepositoryId::new(provider, host, project_path).unwrap();
+        crate::remote::CanonicalChangeRequestIdentity::new(
+            &repository,
+            &crate::remote::NativeChangeRequestId::new(native_id).unwrap(),
+            &repository,
+            &repository,
+        )
     }
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {

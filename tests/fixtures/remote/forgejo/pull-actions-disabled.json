@@ -1,0 +1,25 @@
+{
+  "id": 99,
+  "number": 7,
+  "title": "External CI only",
+  "state": "open",
+  "merged": false,
+  "mergeable": true,
+  "requested_reviewers": [],
+  "head": {
+    "ref": "topic",
+    "sha": "abc123",
+    "repo": {
+      "full_name": "acme/widget",
+      "has_actions": false
+    }
+  },
+  "base": {
+    "ref": "main",
+    "sha": "def456",
+    "repo": {
+      "full_name": "acme/widget",
+      "has_actions": false
+    }
+  }
+}

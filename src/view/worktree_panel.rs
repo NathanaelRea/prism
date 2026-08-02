@@ -3,6 +3,7 @@ use super::*;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StabilizationPanelModel {
     pub icon_style: IconStyle,
+    pub provider_noun: &'static str,
     pub pr_number: String,
     pub pr_merged: bool,
     pub pr_name: String,
@@ -173,6 +174,7 @@ pub(crate) fn stabilization_panel_model(
     if summary.is_none() {
         return StabilizationPanelModel {
             icon_style: model.config.icon_style,
+            provider_noun: "CR",
             pr_number: String::new(),
             pr_merged: false,
             pr_name: String::new(),
@@ -187,6 +189,9 @@ pub(crate) fn stabilization_panel_model(
 
     StabilizationPanelModel {
         icon_style: model.config.icon_style,
+        provider_noun: summary
+            .map(|summary| summary.provider_noun())
+            .unwrap_or("CR"),
         pr_number: summary
             .map(|summary| summary.number.to_string())
             .unwrap_or_default(),
@@ -219,7 +224,7 @@ pub(crate) fn stabilization_panel_lines(model: &StabilizationPanelModel) -> Vec<
     }
 
     let mut lines = vec![
-        heading_line("PR"),
+        heading_line(model.provider_noun),
         pr_number_line(model),
         stabilization_value_line("name", &model.pr_name, selected_text_style()),
     ];
@@ -414,7 +419,12 @@ fn merge_gate_label(session: &Session) -> String {
     let Some(summary) = session.pr.summary() else {
         return String::new();
     };
-    if merge_blocked(summary) {
+    if !matches!(
+        summary.queue_state.trim().to_ascii_lowercase().as_str(),
+        "" | "not_queued" | "none"
+    ) {
+        format!("queue ({})", summary.queue_state)
+    } else if merge_blocked(summary) {
         if summary.merge_state_status.trim().is_empty() {
             "blocked".to_string()
         } else {
@@ -435,7 +445,7 @@ fn policy_gate_label(blocker: &StabilizationBlocker) -> String {
     }
 }
 
-fn merge_blocked(summary: &crate::github::PrSummary) -> bool {
+fn merge_blocked(summary: &crate::remote::PrSummary) -> bool {
     matches!(
         summary
             .merge_state_status

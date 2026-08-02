@@ -3,7 +3,6 @@ use std::error::Error;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use serde::Deserialize;
 use toml_edit::{Array, DocumentMut, Item, Table, value};
@@ -13,7 +12,8 @@ use crate::file_persistence::{self, BoxError, FileContents, UpdateOptions};
 use crate::harness::{
     BUILTIN_HARNESS_IDS, Harness, HarnessConfig, OutputFormat, PromptTransport, builtin_adapter,
 };
-use crate::process::{ProcessPolicy, command_exists, command_version};
+use crate::process::{command_exists, command_version};
+use crate::remote::{HostIdentity, HostProfile, ProviderKind, RemoteBase, RemoteDiscovery};
 use crate::repo::Repository;
 use crate::session::discover_sessions;
 use crate::util::prism_config_dir;
@@ -56,11 +56,18 @@ program = "opencode"
 
 [tools]
 gh = "gh"
+glab = "glab"
 git = "git"
 tmux = "tmux"
 wt = "wt"
 lazygit = "lazygit"
 fzf = "fzf"
+
+# Self-hosted remotes must be mapped explicitly. github.com, gitlab.com, and
+# codeberg.org have built-in profiles.
+# [remote_hosts."git.example.com"]
+# provider = "forgejo"
+# credential_env = "FORGEJO_TOKEN" # variable name only; never put a token here
 
 [checks]
 pre_pr = []
@@ -283,6 +290,7 @@ pub struct Config {
     pub checks: Checks,
     pub worktree_columns: Vec<String>,
     pub tools: BTreeMap<String, String>,
+    pub(crate) remote_hosts: BTreeMap<String, RemoteHostConfig>,
     pub agent_commands: BTreeMap<String, String>,
     pub agent_prompt_modes: BTreeMap<String, PromptMode>,
     pub prompt_templates: BTreeMap<String, String>,
@@ -312,8 +320,28 @@ struct RawConfig {
     notifications: Option<RawNotificationConfig>,
     worktrees: Option<RawWorktrees>,
     tools: Option<BTreeMap<String, String>>,
+    remote_hosts: Option<BTreeMap<String, RawRemoteHostConfig>>,
     agents: Option<BTreeMap<String, RawAgentConfig>>,
     prompt_templates: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RemoteHostConfig {
+    pub(crate) provider: ProviderKind,
+    pub(crate) web_url: Option<String>,
+    pub(crate) api_url: Option<String>,
+    pub(crate) credential_env: Option<String>,
+    pub(crate) allow_http: bool,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRemoteHostConfig {
+    provider: String,
+    web_url: Option<String>,
+    api_url: Option<String>,
+    credential_env: Option<String>,
+    allow_http: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -508,6 +536,11 @@ fn validate_config_values(raw: &RawConfig, is_user_config: bool) -> Result<(), S
             harness_config_from_raw(id, harness.clone())?;
         }
     }
+    if let Some(hosts) = &raw.remote_hosts {
+        for (hostname, host) in hosts {
+            remote_host_from_raw(hostname, host.clone())?;
+        }
+    }
     if !is_user_config && (raw.default_harness.is_some() || raw.harnesses.is_some()) {
         return Err(
             "repository config cannot contain default_harness or [harnesses.*]".to_string(),
@@ -609,6 +642,7 @@ impl Config {
         let tools = [
             ("wt", "wt"),
             ("gh", "gh"),
+            ("glab", "glab"),
             ("git", "git"),
             ("tmux", "tmux"),
             ("lazygit", "lazygit"),
@@ -651,6 +685,7 @@ impl Config {
             checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools,
+            remote_hosts: BTreeMap::new(),
             agent_commands: BTreeMap::new(),
             agent_prompt_modes: BTreeMap::new(),
             prompt_templates: BTreeMap::new(),
@@ -841,6 +876,16 @@ impl Config {
         if let Some(tools) = raw.tools {
             self.tools.extend(tools);
         }
+        if let Some(hosts) = raw.remote_hosts {
+            for (hostname, host) in hosts {
+                match remote_host_from_raw(&hostname, host) {
+                    Ok(host) => {
+                        self.remote_hosts.insert(hostname, host);
+                    }
+                    Err(error) => self.config_errors.push(error),
+                }
+            }
+        }
         if let Some(templates) = raw.prompt_templates {
             self.prompt_templates.extend(templates);
         }
@@ -1013,6 +1058,99 @@ impl Config {
 
     pub fn save_user_icon_style(&self, style: IconStyle) -> Result<(), String> {
         save_user_icon_style(&self.user_path, style)
+    }
+
+    pub(crate) fn remote_discovery(&self) -> Result<RemoteDiscovery, String> {
+        let profiles = self
+            .remote_hosts
+            .iter()
+            .map(|(hostname, host)| host.profile(hostname))
+            .collect::<Result<Vec<_>, _>>()?;
+        RemoteDiscovery::new(profiles).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn remote_api_override(&self, host: &HostIdentity) -> Option<String> {
+        self.remote_hosts
+            .get(host.hostname())
+            .and_then(|config| config.api_url.clone())
+    }
+}
+
+fn remote_host_from_raw(
+    hostname: &str,
+    raw: RawRemoteHostConfig,
+) -> Result<RemoteHostConfig, String> {
+    HostIdentity::new(hostname, None)
+        .map_err(|error| format!("remote host '{hostname}': {error}"))?;
+    let provider = ProviderKind::parse(&raw.provider).ok_or_else(|| {
+        format!(
+            "remote host '{hostname}' has unsupported provider '{}'; expected github, gitlab, or forgejo",
+            raw.provider
+        )
+    })?;
+    let config = RemoteHostConfig {
+        provider,
+        web_url: raw.web_url,
+        api_url: raw.api_url,
+        credential_env: raw.credential_env,
+        allow_http: raw.allow_http.unwrap_or(false),
+    };
+    if config.credential_env.is_some() && provider != ProviderKind::Forgejo {
+        return Err(format!(
+            "remote host '{hostname}' credential_env is supported only by the Forgejo adapter"
+        ));
+    }
+    let profile = config.profile(hostname)?;
+    if provider != ProviderKind::Forgejo {
+        if config.web_url.is_some()
+            && (profile.web_base.host() != &profile.host
+                || !profile.web_base.path_prefix().is_empty()
+                || profile.web_base.scheme() != crate::remote::WebScheme::Https)
+        {
+            return Err(format!(
+                "remote host '{hostname}' web_url cannot be routed safely by the {} CLI; omit it or use https://{hostname}",
+                provider.config_label()
+            ));
+        }
+        if provider == ProviderKind::GitHub
+            && config.api_url.is_some()
+            && !matches!(profile.api_base.path_prefix(), "" | "/api/v3")
+        {
+            return Err(format!(
+                "remote host '{hostname}' GitHub api_url must end at the API root or /api/v3 so Prism can derive the GraphQL endpoint"
+            ));
+        }
+    }
+    Ok(config)
+}
+
+impl RemoteHostConfig {
+    fn profile(&self, hostname: &str) -> Result<HostProfile, String> {
+        let host = HostIdentity::new(hostname, None).map_err(|error| error.to_string())?;
+        let mut profile = HostProfile::new(host, self.provider)
+            .map_err(|error| error.to_string())?
+            .with_http_allowed(self.allow_http);
+        let web_base = self
+            .web_url
+            .as_deref()
+            .map(|url| RemoteBase::parse(url, self.allow_http))
+            .transpose()
+            .map_err(|error| format!("remote host '{hostname}' web_url: {error}"))?
+            .unwrap_or_else(|| profile.web_base.clone());
+        let api_base = self
+            .api_url
+            .as_deref()
+            .map(|url| RemoteBase::parse(url, self.allow_http))
+            .transpose()
+            .map_err(|error| format!("remote host '{hostname}' api_url: {error}"))?
+            .unwrap_or_else(|| profile.api_base.clone());
+        profile = profile.with_bases(web_base, api_base);
+        if let Some(name) = &self.credential_env {
+            profile = profile
+                .with_credential_environment(name)
+                .map_err(|error| format!("remote host '{hostname}' credential_env: {error}"))?;
+        }
+        Ok(profile)
     }
 }
 
@@ -1261,6 +1399,20 @@ pub fn print_config(repo: &Repository, config: &Config) {
     for (key, value) in &config.tools {
         println!("{key} = {value}");
     }
+    println!("[remote_hosts]");
+    for (hostname, host) in &config.remote_hosts {
+        println!("{hostname}.provider = {}", host.provider.config_label());
+        println!("{hostname}.allow_http = {}", host.allow_http);
+        if let Some(web_url) = &host.web_url {
+            println!("{hostname}.web_url = {web_url}");
+        }
+        if let Some(api_url) = &host.api_url {
+            println!("{hostname}.api_url = {api_url}");
+        }
+        if let Some(environment) = &host.credential_env {
+            println!("{hostname}.credential_env = {environment}");
+        }
+    }
     println!("[checks]");
     println!("pre_pr = {:?}", config.checks.pre_pr);
     println!("pre_push = {:?}", config.checks.pre_push);
@@ -1374,21 +1526,15 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     println!();
 
     print_tool_status("git", &config.tool("git"), true);
-    print_tool_status("gh", &config.tool("gh"), true);
+    print_tool_status("gh", &config.tool("gh"), false);
+    print_tool_status("glab", &config.tool("glab"), false);
     print_tool_status("tmux", &config.tool("tmux"), true);
     print_worktrunk_status(repo, config);
     print_tool_status("fzf", &config.tool("fzf"), false);
     println!();
 
     println!();
-    match crate::process::run_capture_named(
-        Command::new(config.tool("gh")).arg("auth").arg("status"),
-        ProcessPolicy::NetworkQuery,
-        crate::process::ProcessDescriptor::new("gh.auth.status"),
-    ) {
-        Ok(_) => println!("gh auth: ok"),
-        Err(error) => println!("gh auth: {error}"),
-    }
+    print_remote_doctor(repo, config);
 
     println!();
     println!(
@@ -1445,17 +1591,29 @@ fn resolve_executable(program: &str) -> Option<PathBuf> {
 }
 
 pub fn ensure_required_tools(
+    repo: &Repository,
     config: &Config,
 ) -> Result<crate::worktrunk::WorktrunkVersion, String> {
-    let required = [
+    let mut required = vec![
         ("git", config.tool("git")),
-        ("gh", config.tool("gh")),
         ("tmux", config.tool("tmux")),
         (
             config.worktree_command.as_str(),
             config.tool(&config.worktree_command),
         ),
     ];
+    if let Ok(remote) = crate::remote::discover_git_remote(
+        &repo.root,
+        config,
+        "origin",
+        crate::remote::RemoteUrlKind::Fetch,
+    ) {
+        match remote.repository.id.provider() {
+            ProviderKind::GitHub => required.push(("gh", config.tool("gh"))),
+            ProviderKind::GitLab => required.push(("glab", config.tool("glab"))),
+            ProviderKind::Forgejo => {}
+        }
+    }
     let missing = required
         .into_iter()
         .filter(|(_, command)| !command_exists(command))
@@ -1517,6 +1675,76 @@ fn print_worktrunk_status(repo: &Repository, config: &Config) {
             config.worktree_command
         ),
     }
+}
+
+fn print_remote_doctor(repo: &Repository, config: &Config) {
+    for line in remote_doctor_lines(repo, config) {
+        println!("{line}");
+    }
+}
+
+fn remote_doctor_lines(repo: &Repository, config: &Config) -> Vec<String> {
+    let mut lines = Vec::new();
+    let remote = crate::remote::discover_git_remote(
+        &repo.root,
+        config,
+        "origin",
+        crate::remote::RemoteUrlKind::Fetch,
+    );
+    let Ok(remote) = remote else {
+        lines.push(format!("remote: unavailable: {}", remote.unwrap_err()));
+        return lines;
+    };
+    let repository = &remote.repository;
+    let provider = repository.id.provider();
+    lines.push(format!("remote provider: {provider}"));
+    lines.push(format!("remote host: {}", repository.id.host()));
+    lines.push(format!("remote project: {}", repository.id.project_path()));
+    lines.push(format!(
+        "remote transport: {}",
+        match repository.api_base.scheme() {
+            crate::remote::WebScheme::Http => "http",
+            crate::remote::WebScheme::Https => "https",
+        }
+    ));
+    let diagnostics = crate::remote::dispatcher::runtime_diagnostics(&repo.root, config);
+    let capabilities = diagnostics
+        .as_ref()
+        .map(|diagnostics| diagnostics.capabilities.clone())
+        .unwrap_or_default();
+    lines.push(format!(
+        "remote capabilities: list={} details={} policy={} create={} resolve={} merge={} ci_logs={} queue={}",
+        capabilities.list_change_requests.label(),
+        capabilities.change_request_details.label(),
+        capabilities.repository_policy.label(),
+        capabilities.create_change_request.label(),
+        capabilities.resolve_review_thread.label(),
+        capabilities.guarded_merge.label(),
+        capabilities.ci_logs.label(),
+        capabilities.merge_queue.label(),
+    ));
+    if let Some(reason) = &capabilities.guarded_merge_reason {
+        lines.push(format!("remote merge unavailable: {reason}"));
+    }
+    if let Err(error) = &diagnostics {
+        lines.push(format!("remote capabilities unavailable: {error}"));
+    }
+    lines.push(format!(
+        "remote authentication: {}",
+        crate::remote::dispatcher::authentication_status(&repo.root, config)
+            .unwrap_or_else(|error| error)
+    ));
+    lines.push(format!(
+        "remote server version: {}",
+        diagnostics
+            .map(|diagnostics| {
+                diagnostics
+                    .server_version
+                    .unwrap_or_else(|| "not applicable".to_string())
+            })
+            .unwrap_or_else(|error| format!("unavailable: {error}"))
+    ));
+    lines
 }
 
 fn print_tool_status(label: &str, command: &str, required: bool) {
@@ -1615,6 +1843,163 @@ fn save_user_default_agent(config: &Config, selected: &str) -> Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn doctor_git_script(directory: &Path, remote: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = directory.join("git-doctor-test");
+        fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{}'\n",
+                remote.replace('\'', "'\\''")
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn forgejo_doctor_server() -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0_u8; 4096];
+                let length = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..length]);
+                let body = if request.starts_with("GET /api/v1/version ") {
+                    r#"{"version":"11.0.1"}"#
+                } else if request.starts_with("GET /api/v1/settings/api ") {
+                    r#"{"max_response_items":50,"default_paging_num":30}"#
+                } else if request.starts_with("GET /api/v1/repos/acme/widget ") {
+                    r#"{"id":1,"full_name":"acme/widget","has_actions":false}"#
+                } else {
+                    panic!("unexpected doctor request: {request}");
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        (format!("http://{address}/api/v1"), worker)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_reports_configured_transport_and_runtime_forgejo_capabilities() {
+        let directory = std::env::temp_dir().join(format!(
+            "prism-doctor-forgejo-{}-{}",
+            std::process::id(),
+            crate::auto_flow::unix_ms()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let git = doctor_git_script(&directory, "http://forge.test/acme/widget.git");
+        let (api_url, worker) = forgejo_doctor_server();
+        let repo =
+            Repository::with_config_dir_for_test(directory.clone(), directory.join("config"));
+        let mut config = Config::defaults(directory.join("user.toml"), directory.join("repo.toml"));
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        config.remote_hosts.insert(
+            "forge.test".to_string(),
+            RemoteHostConfig {
+                provider: ProviderKind::Forgejo,
+                web_url: Some("http://forge.test".to_string()),
+                api_url: Some(api_url),
+                credential_env: None,
+                allow_http: true,
+            },
+        );
+
+        let report = remote_doctor_lines(&repo, &config).join("\n");
+        worker.join().unwrap();
+
+        assert!(report.contains("remote transport: http"));
+        assert!(report.contains("create=supported"));
+        assert!(report.contains("merge=supported"));
+        assert!(report.contains("ci_logs=unsupported"));
+        assert!(report.contains("remote server version: 11.0.1"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_reports_unknown_runtime_capabilities_with_safe_failure_reason() {
+        let directory = std::env::temp_dir().join(format!(
+            "prism-doctor-forgejo-unavailable-{}-{}",
+            std::process::id(),
+            crate::auto_flow::unix_ms()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let git = doctor_git_script(&directory, "ssh://git@forge.test/acme/widget.git");
+        let repo =
+            Repository::with_config_dir_for_test(directory.clone(), directory.join("config"));
+        let mut config = Config::defaults(directory.join("user.toml"), directory.join("repo.toml"));
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        config.remote_hosts.insert(
+            "forge.test".to_string(),
+            RemoteHostConfig {
+                provider: ProviderKind::Forgejo,
+                web_url: None,
+                api_url: Some("https://127.0.0.1:9/api/v1".to_string()),
+                credential_env: Some("FORGEJO_DOCTOR_TOKEN".to_string()),
+                allow_http: false,
+            },
+        );
+
+        let report = remote_doctor_lines(&repo, &config).join("\n");
+
+        assert!(report.contains("remote transport: https"));
+        assert!(report.contains("create=unknown"));
+        assert!(report.contains("remote capabilities unavailable:"));
+        assert!(report.contains("remote server version: unavailable:"));
+        assert!(!report.contains("super-secret-token"));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_reports_gitlab_rebase_merge_as_unavailable() {
+        let directory = std::env::temp_dir().join(format!(
+            "prism-doctor-gitlab-rebase-{}-{}",
+            std::process::id(),
+            crate::auto_flow::unix_ms()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let git = doctor_git_script(&directory, "git@gitlab.com:acme/widget.git");
+        let repo =
+            Repository::with_config_dir_for_test(directory.clone(), directory.join("config"));
+        let mut config = Config::defaults(directory.join("user.toml"), directory.join("repo.toml"));
+        config.merge_method = MergeMethod::Rebase;
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+
+        let report = remote_doctor_lines(&repo, &config).join("\n");
+
+        assert!(report.contains("merge=unsupported"));
+        assert!(
+            report.contains(
+                "remote merge unavailable: GitLab adapter does not support rebase merges"
+            )
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn parses_escape_key() {
@@ -2199,5 +2584,110 @@ review = "fix\nreview"
         assert!(error.contains("default_harness/[harnesses.*]"));
         assert!(error.contains("[harnesses.opencode].program"));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn remote_host_configuration_is_typed_and_inherited_by_hostname() {
+        let mut config = Config::defaults(
+            PathBuf::from("/tmp/user.toml"),
+            PathBuf::from("/tmp/repo.toml"),
+        );
+        let user = parse_and_validate_config(
+            r#"
+[remote_hosts."git.example.com"]
+provider = "forgejo"
+credential_env = "FORGEJO_TOKEN"
+"#,
+            true,
+        )
+        .unwrap();
+        config.apply_raw_config(user, true);
+
+        let repository = config
+            .remote_discovery()
+            .unwrap()
+            .discover("git@git.example.com:Team/Project.git")
+            .unwrap()
+            .repository;
+
+        assert_eq!(repository.id.provider(), ProviderKind::Forgejo);
+        assert_eq!(repository.id.project_path(), "Team/Project");
+        assert_eq!(
+            config.remote_hosts["git.example.com"]
+                .credential_env
+                .as_deref(),
+            Some("FORGEJO_TOKEN")
+        );
+    }
+
+    #[test]
+    fn remote_host_configuration_rejects_secrets_and_insecure_bases_by_shape() {
+        let token_error = parse_and_validate_config(
+            r#"
+[remote_hosts."git.example.com"]
+provider = "forgejo"
+credential_env = "actual token value"
+"#,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(token_error.contains("credential_env"), "{token_error}");
+
+        let http_error = parse_and_validate_config(
+            r#"
+[remote_hosts."git.example.com"]
+provider = "gitlab"
+web_url = "http://git.example.com"
+"#,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(http_error.contains("allow_http"), "{http_error}");
+    }
+
+    #[test]
+    fn github_and_gitlab_api_overrides_validate_supported_cli_shapes() {
+        parse_and_validate_config(
+            r#"
+[remote_hosts."github.example.com"]
+provider = "github"
+api_url = "https://api.example.com/api/v3"
+
+[remote_hosts."gitlab.example.com"]
+provider = "gitlab"
+api_url = "https://api.example.com/gitlab/api/v4"
+"#,
+            true,
+        )
+        .unwrap();
+
+        let github_web = parse_and_validate_config(
+            r#"
+[remote_hosts."github.example.com"]
+provider = "github"
+web_url = "https://proxy.example.com/github"
+"#,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            github_web.contains("cannot be routed safely"),
+            "{github_web}"
+        );
+
+        let github_api = parse_and_validate_config(
+            r#"
+[remote_hosts."github.example.com"]
+provider = "github"
+api_url = "https://api.example.com/custom/rest"
+"#,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(github_api.contains("GraphQL endpoint"), "{github_api}");
     }
 }

@@ -5,8 +5,7 @@ use std::process::Command;
 
 use crate::config::Config;
 use crate::process::{
-    ProcessDescriptor, ProcessPolicy, run_configured_commands, run_output_allow_failure,
-    run_status, run_status_named,
+    ProcessPolicy, run_configured_commands, run_output_allow_failure, run_status,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -94,6 +93,15 @@ pub(crate) fn run_merge_conflict_check_against(
     path: &Path,
     base: &str,
 ) -> VerifyCheckResult {
+    run_merge_conflict_check_against_remote(config, path, "origin", base)
+}
+
+pub(crate) fn run_merge_conflict_check_against_remote(
+    config: &Config,
+    path: &Path,
+    remote: &str,
+    base: &str,
+) -> VerifyCheckResult {
     let base = base.trim();
     if base.is_empty() {
         return VerifyCheckResult {
@@ -104,29 +112,22 @@ pub(crate) fn run_merge_conflict_check_against(
         };
     }
 
-    let fetch = run_status_named(
-        Command::new(config.tool("git"))
-            .arg("-C")
-            .arg(path)
-            .args(["fetch", "origin", base]),
-        ProcessPolicy::NetworkQuery,
-        ProcessDescriptor::new("git.fetch"),
-    );
+    let fetch = crate::git::fetch_remote_branch(path, remote, base, config);
     if let Err(error) = fetch {
         return VerifyCheckResult {
             kind: VerifyCheckKind::MergeConflict,
             label: "merge conflict".to_string(),
             passed: false,
-            message: format!("fetch origin/{base} failed: {error}"),
+            message: format!("fetch {remote}/{base} failed: {error}"),
         };
     }
 
-    match merge_tree_write_tree(config, path, base) {
+    match merge_tree_write_tree(config, path, remote, base) {
         MergeTreeOutcome::Clean => VerifyCheckResult {
             kind: VerifyCheckKind::MergeConflict,
             label: "merge conflict".to_string(),
             passed: true,
-            message: format!("HEAD merges cleanly with origin/{base}"),
+            message: format!("HEAD merges cleanly with {remote}/{base}"),
         },
         MergeTreeOutcome::Conflict(message) => VerifyCheckResult {
             kind: VerifyCheckKind::MergeConflict,
@@ -137,6 +138,7 @@ pub(crate) fn run_merge_conflict_check_against(
         MergeTreeOutcome::Unsupported(message) => fallback_merge_conflict_check(
             config,
             path,
+            remote,
             base,
             &format!("git merge-tree --write-tree unavailable: {message}"),
         ),
@@ -176,13 +178,18 @@ enum MergeTreeOutcome {
     Unsupported(String),
 }
 
-fn merge_tree_write_tree(config: &Config, path: &Path, base: &str) -> MergeTreeOutcome {
+fn merge_tree_write_tree(
+    config: &Config,
+    path: &Path,
+    remote: &str,
+    base: &str,
+) -> MergeTreeOutcome {
     let output = match run_output_allow_failure(
         Command::new(config.tool("git"))
             .arg("-C")
             .arg(path)
             .args(["merge-tree", "--write-tree", "HEAD"])
-            .arg(format!("origin/{base}")),
+            .arg(format!("{remote}/{base}")),
         ProcessPolicy::WorkflowStep,
     ) {
         Ok(output) => output,
@@ -197,7 +204,7 @@ fn merge_tree_write_tree(config: &Config, path: &Path, base: &str) -> MergeTreeO
         MergeTreeOutcome::Unsupported(combined.trim().to_string())
     } else {
         MergeTreeOutcome::Conflict(format!(
-            "HEAD does not merge cleanly with origin/{base}: {}",
+            "HEAD does not merge cleanly with {remote}/{base}: {}",
             combined.trim()
         ))
     }
@@ -206,6 +213,7 @@ fn merge_tree_write_tree(config: &Config, path: &Path, base: &str) -> MergeTreeO
 fn fallback_merge_conflict_check(
     config: &Config,
     path: &Path,
+    remote: &str,
     base: &str,
     reason: &str,
 ) -> VerifyCheckResult {
@@ -238,7 +246,7 @@ fn fallback_merge_conflict_check(
             .arg("-C")
             .arg(&temp)
             .args(["merge", "--no-commit", "--no-ff"])
-            .arg(format!("origin/{base}")),
+            .arg(format!("{remote}/{base}")),
         ProcessPolicy::WorkflowStep,
     );
     let remove = run_status(
@@ -256,7 +264,7 @@ fn fallback_merge_conflict_check(
             kind: VerifyCheckKind::MergeConflict,
             label: "merge conflict".to_string(),
             passed: true,
-            message: format!("{reason}; fallback found HEAD merges cleanly with origin/{base}"),
+            message: format!("{reason}; fallback found HEAD merges cleanly with {remote}/{base}"),
         },
         (Ok(()), Err(error)) => VerifyCheckResult {
             kind: VerifyCheckKind::MergeConflict,
@@ -269,7 +277,7 @@ fn fallback_merge_conflict_check(
             label: "merge conflict".to_string(),
             passed: false,
             message: format!(
-                "{reason}; fallback detected merge conflict with origin/{base}: {error}"
+                "{reason}; fallback detected merge conflict with {remote}/{base}: {error}"
             ),
         },
     }
@@ -419,6 +427,62 @@ mod tests {
             result.message
         );
         assert_eq!(after, before);
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn merge_conflict_check_uses_the_selected_target_remote() {
+        let temp = unique_temp_dir("prism-upstream-merge-conflict-test");
+        let (origin, work, _remote) = setup_remote_repo(&temp);
+        let upstream = temp.join("upstream.git");
+        let upstream_work = temp.join("upstream-work");
+        run(Command::new("git")
+            .arg("clone")
+            .arg("--bare")
+            .arg(&origin)
+            .arg(&upstream));
+        run(Command::new("git")
+            .arg("clone")
+            .arg(&upstream)
+            .arg(&upstream_work));
+        configure_user(&upstream_work);
+
+        run_git(&work, &["switch", "-c", "feature"]);
+        fs::write(work.join("tracked.txt"), "feature\n").unwrap();
+        run_git(&work, &["add", "tracked.txt"]);
+        run_git(&work, &["commit", "-m", "feature"]);
+        fs::write(upstream_work.join("tracked.txt"), "upstream\n").unwrap();
+        run_git(&upstream_work, &["add", "tracked.txt"]);
+        run_git(&upstream_work, &["commit", "-m", "upstream change"]);
+        run_git(&upstream_work, &["push", "origin", "main"]);
+        run_git(
+            &work,
+            &["remote", "add", "upstream", upstream.to_str().unwrap()],
+        );
+
+        let result = run_merge_conflict_check_against_remote(
+            &test_config(Some("main")),
+            &work,
+            "upstream",
+            "main",
+        );
+
+        assert!(!result.passed);
+        assert!(
+            result.message.contains("upstream/main"),
+            "{}",
+            result.message
+        );
+        assert!(
+            run_merge_conflict_check_against_remote(
+                &test_config(Some("main")),
+                &work,
+                "origin",
+                "main",
+            )
+            .passed
+        );
 
         let _ = fs::remove_dir_all(temp);
     }

@@ -17,7 +17,7 @@ pub(super) fn apply_bulk_review_resolution(
     Ok(thread_ids.len())
 }
 
-pub(super) fn unresolved_review_thread_ids(details: &crate::github::PrDetails) -> Vec<String> {
+pub(super) fn unresolved_review_thread_ids(details: &crate::remote::PrDetails) -> Vec<String> {
     crate::review::canonical_review_thread_ids(
         details
             .review_comments
@@ -37,22 +37,6 @@ pub(super) fn pr_target_choice_list(origin: &str, upstream: &str) -> crate::view
     }
 }
 
-pub(super) fn should_prompt_pr_target_choice(origin: &str, upstream: &str) -> bool {
-    origin != upstream
-}
-
-pub(super) fn pr_target_repo_for_choice(
-    choice: &str,
-    origin: &str,
-    upstream: &str,
-) -> Option<String> {
-    match choice {
-        "u" => Some(upstream.to_string()),
-        "o" => Some(origin.to_string()),
-        _ => None,
-    }
-}
-
 pub(super) fn remote_pr_choice_keys() -> Vec<String> {
     ('1'..='9')
         .chain('a'..='z')
@@ -64,11 +48,81 @@ pub(super) fn remote_pr_worktree_branch(head_ref: &str) -> String {
     head_ref.to_string()
 }
 
-fn remote_pr_choice_label(summary: &crate::github::PrSummary) -> String {
+fn remote_pr_choice_label(summary: &crate::remote::PrSummary) -> String {
     format!(
         "#{}  {}  {} -> {}",
         summary.number, summary.title, summary.head_ref, summary.base_ref
     )
+}
+
+fn session_for_remote_action(session: &crate::session::Session) -> crate::session::Session {
+    crate::session::Session {
+        repo_index: session.repo_index,
+        repo_label: session.repo_label.clone(),
+        repo_key: session.repo_key,
+        path: session.path.clone(),
+        incarnation: session.incarnation.clone(),
+        path_display: session.path_display.clone(),
+        branch: session.branch.clone(),
+        prompt_summary: session.prompt_summary.clone(),
+        classification: session.classification,
+        visibility: session.visibility,
+        adopted: session.adopted,
+        hidden: session.hidden,
+        status_label: session.status_label.clone(),
+        agent_state: session.agent_state,
+        opencode_status: session.opencode_status.clone(),
+        pr: session.pr.clone(),
+        wt_columns: session.wt_columns.clone(),
+        unseen_comments: session.unseen_comments,
+    }
+}
+
+fn remote_create_mutation_target(
+    guard: &crate::remote::dispatcher::CreateChangeRequestGuard,
+) -> crate::tui::RemoteMutationTarget {
+    crate::tui::RemoteMutationTarget::Create {
+        source_provider: guard.source_repository.provider(),
+        source_host: guard.source_repository.host().to_string(),
+        source_project: guard.source_repository.project_path().to_string(),
+        source_branch: guard.source_branch.clone(),
+        expected_head_sha: guard.expected_head_sha.clone(),
+        target_provider: Some(guard.target_repository.provider()),
+        target_host: guard.target_repository.host().to_string(),
+        target_project: guard.target_repository.project_path().to_string(),
+        target_branch: guard.target_branch.clone(),
+        expected_base_sha: guard.expected_base_sha.clone(),
+    }
+}
+
+fn remote_push_mutation_target(
+    guard: &crate::remote::dispatcher::PushGuard,
+) -> crate::tui::RemoteMutationTarget {
+    crate::tui::RemoteMutationTarget::Push {
+        remote: guard.remote.clone(),
+        branch: guard.remote_branch.clone(),
+        expected_head_sha: guard.expected_head_sha.clone(),
+        repository_provider: Some(guard.repository.provider()),
+        repository_host: guard.repository.host().to_string(),
+        repository_project: guard.repository.project_path().to_string(),
+    }
+}
+
+pub(super) fn validate_push_target_after_checks(
+    selected_branch: &str,
+    current_branch: &str,
+    expected: &crate::tui::RemoteMutationTarget,
+    current: &crate::tui::RemoteMutationTarget,
+) -> Result<(), String> {
+    if current_branch != selected_branch {
+        return Err(format!(
+            "selected branch changed from {selected_branch} to {current_branch} during pre-push checks"
+        ));
+    }
+    if current != expected {
+        return Err("push remote, branch, or HEAD changed during pre-push checks".to_string());
+    }
+    Ok(())
 }
 
 pub(super) fn open_url_in_browser(url: &str) -> Result<(), String> {
@@ -158,6 +212,30 @@ pub(super) fn run_browser_opener(
 }
 
 impl Tui {
+    pub(crate) fn apply_remote_cache_result(&mut self, session_index: usize, cache: PrCache) {
+        if let Some(session) = self.sessions.get_mut(session_index) {
+            session.pr = cache;
+        }
+    }
+
+    fn apply_remote_summary_result(
+        &mut self,
+        session_index: usize,
+        summary: crate::remote::PrSummary,
+    ) {
+        let started_at = std::time::Instant::now();
+        self.sessions[session_index]
+            .pr
+            .begin_summary_poll(started_at);
+        apply_pr_summary_poll_result(
+            &mut self.sessions[session_index].pr,
+            started_at,
+            Ok(Some(summary)),
+            &crate::util::timestamp_label(),
+        );
+        self.queue_pr_persistence(session_index, false);
+    }
+
     pub(crate) fn resolve_review_comments(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
@@ -166,6 +244,11 @@ impl Tui {
             .selected_worktree_context()
             .ok_or_else(|| "no worktree selected".to_string())?;
         let path = self.sessions[context.session_index].path.clone();
+        let summary = self.sessions[context.session_index]
+            .pr
+            .trusted_summary()?
+            .cloned()
+            .ok_or_else(|| "pull request summary is unavailable".to_string())?;
         let details = self.sessions[context.session_index]
             .pr
             .trusted_details()?
@@ -175,30 +258,51 @@ impl Tui {
             return self.show_message("no unresolved review conversations");
         }
 
-        self.show_loading_dialog(
-            raw,
-            "Resolve Review Conversations",
-            "Resolving observed review conversations",
-        )?;
         let repo = context.repo;
         let config = context.config;
-        let resolution = apply_bulk_review_resolution(true, &thread_ids, |thread_id| {
-            crate::github::resolve_review_thread(&path, &config, thread_id)
-        });
-        let refresh = {
-            let session = &mut self.sessions[context.session_index];
-            refresh_pr_cache(
-                &repo,
-                &session.branch,
-                &mut session.pr,
-                &session.path,
-                &config,
-                true,
-            )
+        let branch = self.sessions[context.session_index].branch.clone();
+        let mut cache = self.sessions[context.session_index].pr.clone();
+        let worktree = self.sessions[context.session_index]
+            .identity_key(&self.repos[self.sessions[context.session_index].repo_index].identity);
+        let generation = self
+            .worktree_generations
+            .get(&worktree)
+            .copied()
+            .unwrap_or_default();
+        let RemoteActionValue::Resolved { cache, count } = self.run_remote_action(
+            raw,
+            crate::tui::RemoteActionRequest {
+                key: TuiJobKey::Worktree(worktree),
+                generation,
+                name: "prism-resolve-review-threads",
+                title: "Resolve Review Conversations",
+                message: "Resolving observed review conversations",
+                abandon_cancelable: false,
+                mutation: Some(crate::tui::RemoteMutationTarget::Resolve {
+                    change_request: summary
+                        .change_request_identity
+                        .clone()
+                        .ok_or_else(|| "pull request identity is unavailable".to_string())?,
+                    thread_ids: thread_ids.clone(),
+                }),
+            },
+            move || {
+                let count = apply_bulk_review_resolution(true, &thread_ids, |thread_id| {
+                    crate::remote::dispatcher::resolve_review_thread(
+                        &path, &config, &summary, thread_id,
+                    )
+                })?;
+                refresh_pr_cache(&repo, &branch, &mut cache, &path, &config, true)?;
+                Ok(RemoteActionValue::Resolved {
+                    cache: Box::new(cache),
+                    count,
+                })
+            },
+        )?
+        else {
+            return Err("review resolution returned an unexpected result".to_string());
         };
-        let count = resolution?;
-        refresh?;
-        self.supersede_pr_persistence(context.session_index, true);
+        self.apply_remote_cache_result(context.session_index, *cache);
         self.show_message(&format!(
             "resolved {count} review conversation{}",
             if count == 1 { "" } else { "s" }
@@ -212,8 +316,24 @@ impl Tui {
         let context = self
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
-        self.show_loading_dialog(raw, "Remote Pull Requests", "Loading open pull requests")?;
-        let mut prs = fetch_pr_summary_index(&context.repo.root, &context.config)?;
+        let path = context.repo.root.clone();
+        let config = context.config.clone();
+        let RemoteActionValue::ChangeRequests(mut prs) = self.run_remote_action(
+            raw,
+            crate::tui::RemoteActionRequest {
+                key: TuiJobKey::Repository(self.repos[context.repo_index].identity.clone()),
+                generation: self.session_inventory_generation,
+                name: "prism-list-change-requests",
+                title: "Remote Pull Requests",
+                message: "Loading open pull requests",
+                abandon_cancelable: true,
+                mutation: None,
+            },
+            move || fetch_pr_summary_index(&path, &config).map(RemoteActionValue::ChangeRequests),
+        )?
+        else {
+            return Err("remote list returned an unexpected result".to_string());
+        };
         prs.retain(|summary| !summary.merged && summary.state.eq_ignore_ascii_case("OPEN"));
         if prs.is_empty() {
             self.show_message("selected repository has no open pull requests")?;
@@ -261,6 +381,10 @@ impl Tui {
         let summary = self
             .selected_repo_pr_summary()
             .ok_or_else(|| "selected repository has no open pull requests".to_string())?;
+        if summary.merged || !summary.state.eq_ignore_ascii_case("OPEN") {
+            self.show_message("review blocked: change request lifecycle is unknown or not open")?;
+            return Ok(());
+        }
         let Some(index) = self.open_repo_pr_worktree(raw, &context, summary)? else {
             return Ok(());
         };
@@ -271,7 +395,7 @@ impl Tui {
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
         context: &crate::tui::SelectedRepoContext,
-        summary: crate::github::PrSummary,
+        summary: crate::remote::PrSummary,
     ) -> Result<Option<usize>, String> {
         if let Some(index) = self.existing_pr_worktree_index(context.repo_index, &summary) {
             self.select_worktree(index);
@@ -284,12 +408,29 @@ impl Tui {
         }
 
         let branch = remote_pr_worktree_branch(&summary.head_ref);
-        self.show_loading_dialog(
+        let path = context.repo.root.clone();
+        let config = context.config.clone();
+        let job_summary = summary.clone();
+        let job_branch = branch.clone();
+        let RemoteActionValue::Complete = self.run_remote_action(
             raw,
-            "Remote Pull Requests",
-            &format!("Fetching PR #{}", summary.number),
-        )?;
-        fetch_pull_request_branch(&context.repo.root, &context.config, summary.number, &branch)?;
+            crate::tui::RemoteActionRequest {
+                key: TuiJobKey::Repository(self.repos[context.repo_index].identity.clone()),
+                generation: self.session_inventory_generation,
+                name: "prism-fetch-change-request",
+                title: "Remote Pull Requests",
+                message: &format!("Fetching PR #{}", summary.number),
+                abandon_cancelable: true,
+                mutation: None,
+            },
+            move || {
+                fetch_pull_request_branch(&path, &config, &job_summary, &job_branch)?;
+                Ok(RemoteActionValue::Complete)
+            },
+        )?
+        else {
+            return Err("remote fetch returned an unexpected result".to_string());
+        };
         self.show_loading_dialog(
             raw,
             "Remote Pull Requests",
@@ -343,12 +484,21 @@ impl Tui {
     fn existing_pr_worktree_index(
         &mut self,
         repo_index: usize,
-        summary: &crate::github::PrSummary,
+        summary: &crate::remote::PrSummary,
     ) -> Option<usize> {
         if let Some(index) = self.sessions.iter().position(|session| {
             !session.hidden
                 && session.repo_index == repo_index
-                && session.pr.is_for_pr(summary.number)
+                && session.pr.summary().is_some_and(|existing| {
+                    match (
+                        existing.change_request_identity.as_ref(),
+                        summary.change_request_identity.as_ref(),
+                    ) {
+                        (Some(existing), Some(selected)) => existing == selected,
+                        (None, None) => existing.number == summary.number,
+                        _ => false,
+                    }
+                })
         }) {
             return Some(index);
         }
@@ -360,10 +510,9 @@ impl Tui {
             .repos
             .get(repo_index)
             .map(|managed| managed.repo.clone());
-        if let (Some(repo), Some(session)) = (repo, self.sessions.get_mut(index)) {
-            record_pr_summary(&repo, &session.branch, &mut session.pr, summary.clone());
+        if repo.is_some() {
+            self.apply_remote_summary_result(index, summary.clone());
         }
-        self.supersede_pr_persistence(index, false);
         Some(index)
     }
 
@@ -371,7 +520,7 @@ impl Tui {
         &mut self,
         repo_index: usize,
         branch: &str,
-        summary: Option<crate::github::PrSummary>,
+        summary: Option<crate::remote::PrSummary>,
     ) {
         if let Some(index) = self
             .sessions
@@ -383,12 +532,10 @@ impl Tui {
                 .get(repo_index)
                 .map(|managed| managed.repo.clone());
             if let Some(summary) = summary
-                && let Some(repo) = repo
-                && let Some(session) = self.sessions.get_mut(index)
+                && repo.is_some()
             {
-                record_pr_summary(&repo, &session.branch, &mut session.pr, summary);
+                self.apply_remote_summary_result(index, summary);
             }
-            self.supersede_pr_persistence(index, false);
             if !self.visible_session_indices().contains(&index) {
                 self.worktree_filter.clear();
             }
@@ -406,6 +553,10 @@ impl Tui {
         let summary = self
             .selected_repo_pr_summary()
             .ok_or_else(|| "selected repository has no open pull requests".to_string())?;
+        if summary.merged || !summary.state.eq_ignore_ascii_case("OPEN") {
+            self.show_message("review blocked: change request lifecycle is unknown or not open")?;
+            return Ok(());
+        }
         let Some(choice) = self.prompt_choice_dialog(
             raw,
             crate::view::ChoiceList {
@@ -420,10 +571,22 @@ impl Tui {
         else {
             return Ok(());
         };
-        let (flag, label, body_required) = match choice.as_str() {
-            "a" => ("--approve", "approved", false),
-            "c" => ("--comment", "commented on", true),
-            "r" => ("--request-changes", "requested changes on", true),
+        let (kind, label, body_required) = match choice.as_str() {
+            "a" => (
+                crate::remote::ReviewSubmissionKind::Approve,
+                "approved",
+                false,
+            ),
+            "c" => (
+                crate::remote::ReviewSubmissionKind::Comment,
+                "commented on",
+                true,
+            ),
+            "r" => (
+                crate::remote::ReviewSubmissionKind::RequestChanges,
+                "requested changes on",
+                true,
+            ),
             _ => return Ok(()),
         };
         let prompt = if body_required {
@@ -439,31 +602,59 @@ impl Tui {
             return Ok(());
         }
 
-        self.show_loading_dialog(
+        let path = context.repo.root.clone();
+        let config = context.config.clone();
+        let body = body.trim().to_string();
+        let selected_summary = summary.clone();
+        let prior_review_ids = self
+            .sessions
+            .iter()
+            .filter(|session| {
+                session.pr.summary().is_some_and(|existing| {
+                    existing.change_request_identity == summary.change_request_identity
+                })
+            })
+            .filter_map(|session| session.pr.trusted_details().ok().flatten())
+            .flat_map(|details| details.reviews.iter().map(|review| review.id.clone()))
+            .collect();
+        let RemoteActionValue::Complete = self.run_remote_action(
             raw,
-            "Submit Review",
-            &format!("Submitting review for PR #{}", summary.number),
-        )?;
-        let mut command = Command::new(context.config.tool("gh"));
-        command
-            .arg("pr")
-            .arg("review")
-            .arg(summary.number.to_string())
-            .arg(flag)
-            .current_dir(&context.repo.root);
-        if !body.trim().is_empty() {
-            command.arg("--body").arg(body.trim());
-        }
-        let output = run_output_allow_failure(&mut command, ProcessPolicy::NetworkQuery)?;
-        if !output.status.success() {
-            let stderr = output.stderr.trim();
-            let message = if stderr.is_empty() {
-                format!("gh pr review exited with {}", output.status)
-            } else {
-                stderr.to_string()
-            };
-            return Err(message);
-        }
+            crate::tui::RemoteActionRequest {
+                key: TuiJobKey::Repository(self.repos[context.repo_index].identity.clone()),
+                generation: self.session_inventory_generation,
+                name: "prism-submit-review",
+                title: "Submit Review",
+                message: &format!("Submitting review for PR #{}", summary.number),
+                abandon_cancelable: false,
+                mutation: Some(crate::tui::RemoteMutationTarget::Review {
+                    change_request: summary
+                        .change_request_identity
+                        .clone()
+                        .ok_or_else(|| "pull request identity is unavailable".to_string())?,
+                    expected_state: match kind {
+                        crate::remote::ReviewSubmissionKind::Approve => "APPROVED",
+                        crate::remote::ReviewSubmissionKind::Comment => "COMMENTED",
+                        crate::remote::ReviewSubmissionKind::RequestChanges => "CHANGES_REQUESTED",
+                    }
+                    .to_string(),
+                    expected_body: body.clone(),
+                    prior_review_ids,
+                }),
+            },
+            move || {
+                crate::remote::dispatcher::submit_review(
+                    &path,
+                    &config,
+                    &selected_summary,
+                    kind,
+                    body,
+                )?;
+                Ok(RemoteActionValue::Complete)
+            },
+        )?
+        else {
+            return Err("review submission returned an unexpected result".to_string());
+        };
         self.show_message(&format!("{label} PR #{}", summary.number))
     }
 
@@ -471,20 +662,20 @@ impl Tui {
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<(), String> {
-        self.show_loading_dialog(
+        self.refresh_selected_pr_for_remote_action(
             raw,
             "Review Fix Prompt",
             "Refreshing pull request review details",
         )?;
-        self.send_review_fix_prompt()
+        self.send_review_fix_prompt(false)
     }
 
-    pub(super) fn send_review_fix_prompt(&mut self) -> Result<(), String> {
+    pub(super) fn send_review_fix_prompt(&mut self, refresh: bool) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
         let selected = context.session_index;
-        {
+        if refresh {
             let session = &mut self.sessions[selected];
             refresh_pr_cache(
                 &context.repo,
@@ -501,14 +692,18 @@ impl Tui {
             &context.config,
             crate::auto_flow::stabilization_model::RepairKind::Review,
         )?;
-        self.start_managed_repair(selected, &context.repo, &context.config, repair)?;
-        self.show_message("started managed review repair; commit will wait for guarded push")?;
+        let queued = self.start_managed_repair(selected, &context.repo, &context.config, repair)?;
+        self.show_message(if queued {
+            "review repair queued on headless worker; commit will wait for guarded push"
+        } else {
+            "review repair is already queued; focused existing managed action"
+        })?;
         Ok(())
     }
 
     #[cfg(test)]
     pub(crate) fn start_review_fix_for_test(&mut self) -> Result<(), String> {
-        self.send_review_fix_prompt()
+        self.send_review_fix_prompt(true)
     }
 
     pub(crate) fn start_ci_fix(
@@ -518,20 +713,20 @@ impl Tui {
         if self.selected_worktree_context().is_none() {
             return Ok(());
         }
-        self.show_loading_dialog(
+        self.refresh_selected_pr_for_remote_action(
             raw,
             "CI Failure Prompt",
             "Refreshing pull request CI details",
         )?;
-        self.send_ci_fix_prompt()
+        self.send_ci_fix_prompt(false)
     }
 
-    pub(super) fn send_ci_fix_prompt(&mut self) -> Result<(), String> {
+    pub(super) fn send_ci_fix_prompt(&mut self, refresh: bool) -> Result<(), String> {
         let Some(context) = self.selected_worktree_context() else {
             return Ok(());
         };
         let selected = context.session_index;
-        {
+        if refresh {
             let session = &mut self.sessions[selected];
             refresh_pr_cache(
                 &context.repo,
@@ -548,8 +743,12 @@ impl Tui {
             &context.config,
             crate::auto_flow::stabilization_model::RepairKind::Ci,
         )?;
-        self.start_managed_repair(selected, &context.repo, &context.config, repair)?;
-        self.show_message("started managed CI repair; commit will wait for guarded push")?;
+        let queued = self.start_managed_repair(selected, &context.repo, &context.config, repair)?;
+        self.show_message(if queued {
+            "CI repair queued on headless worker; commit will wait for guarded push"
+        } else {
+            "CI repair is already queued; focused existing managed action"
+        })?;
         Ok(())
     }
 
@@ -559,7 +758,7 @@ impl Tui {
         repo: &crate::repo::Repository,
         config: &crate::config::Config,
         repair: crate::auto_flow::stabilization_execute::StandaloneRepair,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let session_path = self.sessions[selected].path.clone();
         let session_branch = self.sessions[selected].branch.clone();
         let mut persisted = if let Some(run_id) = self.active_auto_runs.get(&session_path).cloned()
@@ -606,27 +805,91 @@ impl Tui {
             run
         };
 
-        crate::observability::with_writable_db(repo, |conn| {
+        let queue = crate::observability::with_writable_db(repo, |conn| {
             crate::auto_flow::stabilization_execute::queue_standalone_repair(
                 conn,
                 &mut persisted,
                 repair,
-            )?;
-            Ok(())
+            )
         })?;
+        let selected_step = match queue {
+            crate::auto_flow::stabilization_execute::StandaloneRepairQueue::Queued(step_id)
+            | crate::auto_flow::stabilization_execute::StandaloneRepairQueue::AlreadyPending(
+                step_id,
+            ) => step_id,
+        };
         self.remember_auto_run(persisted.clone());
+        self.selected_auto_step_by_run
+            .insert(persisted.run.id.clone(), selected_step);
         self.selected_auto_run = Some(persisted.run.id.clone());
         #[cfg(test)]
         if self.prompt_submissions.is_some() {
-            return Ok(());
+            return Ok(matches!(
+                queue,
+                crate::auto_flow::stabilization_execute::StandaloneRepairQueue::Queued(_)
+            ));
         }
-        self.spawn_auto_run_executor(repo.clone(), config.clone(), persisted)?;
-        Ok(())
+        let queued = matches!(
+            queue,
+            crate::auto_flow::stabilization_execute::StandaloneRepairQueue::Queued(_)
+        );
+        if queued {
+            self.spawn_auto_run_executor(repo.clone(), config.clone(), persisted)?;
+        } else {
+            crate::worker::ensure_running()?;
+            crate::worker::wake()?;
+        }
+        Ok(queued)
     }
 
     #[cfg(test)]
     pub(crate) fn start_ci_fix_for_test(&mut self) -> Result<(), String> {
-        self.send_ci_fix_prompt()
+        self.send_ci_fix_prompt(true)
+    }
+
+    fn refresh_selected_pr_for_remote_action(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+        title: &str,
+        message: &str,
+    ) -> Result<(), String> {
+        let context = self
+            .selected_worktree_context()
+            .ok_or_else(|| "no worktree selected".to_string())?;
+        let selected = context.session_index;
+        let repo = context.repo;
+        let config = context.config;
+        let branch = self.sessions[selected].branch.clone();
+        let path = self.sessions[selected].path.clone();
+        let mut cache = self.sessions[selected].pr.clone();
+        let worktree = self.sessions[selected]
+            .identity_key(&self.repos[self.sessions[selected].repo_index].identity);
+        let generation = self
+            .worktree_generations
+            .get(&worktree)
+            .copied()
+            .unwrap_or_default();
+        let RemoteActionValue::Cache(cache) = self.run_remote_action(
+            raw,
+            crate::tui::RemoteActionRequest {
+                key: TuiJobKey::Worktree(worktree),
+                generation,
+                name: "prism-refresh-change-request-action",
+                title,
+                message,
+                abandon_cancelable: true,
+                mutation: None,
+            },
+            move || {
+                refresh_pr_cache(&repo, &branch, &mut cache, &path, &config, true)?;
+                Ok(RemoteActionValue::Cache(Box::new(cache)))
+            },
+        )?
+        else {
+            return Err("pull request refresh returned an unexpected result".to_string());
+        };
+        self.apply_remote_cache_result(selected, *cache);
+        Ok(())
     }
 
     pub(crate) fn open_selected_pr(
@@ -646,17 +909,38 @@ impl Tui {
             return Ok(());
         }
         if !self.sessions[selected].pr.has_summary() {
-            self.show_loading_dialog(raw, "Open Pull Request", "Refreshing pull request")?;
-            let session = &mut self.sessions[selected];
-            refresh_pr_cache(
-                &context.repo,
-                &session.branch,
-                &mut session.pr,
-                &session.path,
-                &context.config,
-                false,
-            )?;
-            self.supersede_pr_persistence(selected, false);
+            let repo = context.repo.clone();
+            let config = context.config.clone();
+            let branch = self.sessions[selected].branch.clone();
+            let path = self.sessions[selected].path.clone();
+            let mut cache = self.sessions[selected].pr.clone();
+            let repo_index = self.sessions[selected].repo_index;
+            let worktree = self.sessions[selected].identity_key(&self.repos[repo_index].identity);
+            let generation = self
+                .worktree_generations
+                .get(&worktree)
+                .copied()
+                .unwrap_or_default();
+            let RemoteActionValue::Cache(cache) = self.run_remote_action(
+                raw,
+                crate::tui::RemoteActionRequest {
+                    key: TuiJobKey::Worktree(worktree),
+                    generation,
+                    name: "prism-refresh-change-request",
+                    title: "Open Pull Request",
+                    message: "Refreshing pull request",
+                    abandon_cancelable: true,
+                    mutation: None,
+                },
+                move || {
+                    refresh_pr_cache(&repo, &branch, &mut cache, &path, &config, false)?;
+                    Ok(RemoteActionValue::Cache(Box::new(cache)))
+                },
+            )?
+            else {
+                return Err("pull request refresh returned an unexpected result".to_string());
+            };
+            self.apply_remote_cache_result(selected, *cache);
         }
         let Some(summary) = pr_summary_or_error(&self.sessions[selected].pr)? else {
             self.show_message("no pull request found for selected branch")?;
@@ -697,55 +981,176 @@ impl Tui {
             return Ok(());
         }
 
-        run_pre_push_checks(&context.config, &path)?;
-        let set_upstream = !has_upstream(&path, &context.config)?;
-        self.show_loading_dialog(raw, "Push Branch", "Pushing selected branch")?;
-        push_branch(&context.config, &path, &branch, set_upstream)?;
-        {
-            let session = &mut self.sessions[selected];
-            refresh_pr_cache(
-                &context.repo,
-                &session.branch,
-                &mut session.pr,
-                &session.path,
-                &context.config,
-                true,
-            )?;
-        }
-        self.supersede_pr_persistence(selected, true);
-        if !self.sessions[selected].pr.has_summary() {
-            run_pre_pr_checks(&context.config, &path)?;
-            let target_repo =
-                if let Ok(upstream) = github_remote_repo(&path, &context.config, "upstream") {
-                    let origin = github_remote_repo(&path, &context.config, "origin")?;
-                    if !should_prompt_pr_target_choice(&origin, &upstream) {
-                        None
-                    } else {
-                        let Some(choice) = self
-                            .prompt_choice_dialog(raw, pr_target_choice_list(&origin, &upstream))?
-                        else {
-                            return Ok(());
-                        };
-                        pr_target_repo_for_choice(&choice, &origin, &upstream)
-                    }
+        let repo = context.repo.clone();
+        let config = context.config.clone();
+        let mut cache = self.sessions[selected].pr.clone();
+        let worktree = self.sessions[selected]
+            .identity_key(&self.repos[self.sessions[selected].repo_index].identity);
+        let generation = self
+            .worktree_generations
+            .get(&worktree)
+            .copied()
+            .unwrap_or_default();
+        let job_path = path.clone();
+        let job_branch = branch.clone();
+        let expected_push_guard =
+            crate::remote::dispatcher::prepare_push(&path, &context.config, &branch)?;
+        let expected_push_target = remote_push_mutation_target(&expected_push_guard);
+        let reconciliation_target = expected_push_target.clone();
+        let RemoteActionValue::PushPrepared(prepared) = self.run_remote_action(
+            raw,
+            crate::tui::RemoteActionRequest {
+                key: TuiJobKey::Worktree(worktree.clone()),
+                generation,
+                name: "prism-push-branch",
+                title: "Push Branch",
+                message: "Pushing selected branch",
+                abandon_cancelable: false,
+                mutation: Some(reconciliation_target),
+            },
+            move || {
+                run_pre_push_checks(&config, &job_path)?;
+                let current_branch = crate::git::current_branch_name(&job_path, &config)?
+                    .ok_or_else(|| "cannot push detached HEAD".to_string())?;
+                let current_push_guard =
+                    crate::remote::dispatcher::prepare_push(&job_path, &config, &job_branch)?;
+                let current_push_target = remote_push_mutation_target(&current_push_guard);
+                validate_push_target_after_checks(
+                    &job_branch,
+                    &current_branch,
+                    &expected_push_target,
+                    &current_push_target,
+                )?;
+                push_branch(
+                    &config,
+                    &job_path,
+                    &job_branch,
+                    current_push_guard.set_upstream,
+                )?;
+                let pushed_source_guard =
+                    crate::remote::dispatcher::prepare_push(&job_path, &config, &job_branch)?;
+                if !crate::remote::dispatcher::same_push_target(
+                    &current_push_guard,
+                    &pushed_source_guard,
+                ) {
+                    return Err("push destination changed while pushing".to_string());
+                }
+                refresh_pr_cache(&repo, &job_branch, &mut cache, &job_path, &config, true)?;
+                let (origin_repository, upstream_repository) = if cache.has_summary() {
+                    (None, None)
                 } else {
-                    None
+                    let (origin, upstream) =
+                        crate::remote::dispatcher::create_change_request_targets(
+                            &job_path, &config,
+                        )?;
+                    (Some(origin), upstream)
                 };
+                let push_guard = origin_repository
+                    .as_ref()
+                    .map(|_| pushed_source_guard.clone());
+                Ok(RemoteActionValue::PushPrepared(Box::new(
+                    RemotePushPrepared {
+                        cache,
+                        origin_repository,
+                        upstream_repository,
+                        push_guard,
+                    },
+                )))
+            },
+        )?
+        else {
+            return Err("push returned an unexpected result".to_string());
+        };
+        self.apply_remote_cache_result(selected, prepared.cache);
+        if !self.sessions[selected].pr.has_summary() {
+            let source_push = prepared
+                .push_guard
+                .ok_or_else(|| "change request push source is unavailable".to_string())?;
+            let target_repository = match (prepared.origin_repository, prepared.upstream_repository)
+            {
+                (Some(origin), Some(upstream)) => {
+                    let origin_project = origin.project_path();
+                    let upstream_project = upstream.project_path();
+                    let Some(choice) = self.prompt_choice_dialog(
+                        raw,
+                        pr_target_choice_list(origin_project, upstream_project),
+                    )?
+                    else {
+                        return Ok(());
+                    };
+                    match choice.as_str() {
+                        "u" => upstream,
+                        "o" => origin,
+                        _ => return Ok(()),
+                    }
+                }
+                (Some(origin), None) => origin,
+                _ => return Err("change request target is unavailable".to_string()),
+            };
             let Some(pr_body) = self.prompt_pr_description(raw)? else {
                 return Ok(());
             };
-            self.show_loading_dialog(raw, "Create Pull Request", "Creating pull request")?;
-            let session = &mut self.sessions[selected];
-            create_pull_request(
-                &context.repo,
-                &context.config,
-                &session.branch,
-                &session.path,
-                &pr_body,
-                target_repo.as_deref(),
-                &mut session.pr,
-            )?;
-            self.supersede_pr_persistence(selected, false);
+            let repo = context.repo;
+            let config = context.config;
+            let branch = self.sessions[selected].branch.clone();
+            let path = self.sessions[selected].path.clone();
+            let mut cache = self.sessions[selected].pr.clone();
+            let prepare_path = path.clone();
+            let prepare_config = config.clone();
+            let RemoteActionValue::CreatePrepared(create_guard) = self.run_remote_action(
+                raw,
+                crate::tui::RemoteActionRequest {
+                    key: TuiJobKey::Worktree(worktree.clone()),
+                    generation,
+                    name: "prism-prepare-change-request",
+                    title: "Create Pull Request",
+                    message: "Running pre-PR checks",
+                    abandon_cancelable: true,
+                    mutation: None,
+                },
+                move || {
+                    run_pre_pr_checks(&prepare_config, &prepare_path)?;
+                    let guard = crate::remote::dispatcher::prepare_create_change_request(
+                        &prepare_path,
+                        &prepare_config,
+                        &branch,
+                        &target_repository,
+                        &source_push,
+                    )?;
+                    Ok(RemoteActionValue::CreatePrepared(Box::new(guard)))
+                },
+            )?
+            else {
+                return Err("pull request preparation returned an unexpected result".to_string());
+            };
+            let create_mutation = remote_create_mutation_target(&create_guard);
+            let RemoteActionValue::Cache(cache) = self.run_remote_action(
+                raw,
+                crate::tui::RemoteActionRequest {
+                    key: TuiJobKey::Worktree(worktree),
+                    generation,
+                    name: "prism-create-change-request",
+                    title: "Create Pull Request",
+                    message: "Creating pull request",
+                    abandon_cancelable: false,
+                    mutation: Some(create_mutation),
+                },
+                move || {
+                    create_pull_request(
+                        &repo,
+                        &config,
+                        &path,
+                        &pr_body,
+                        &create_guard,
+                        &mut cache,
+                    )?;
+                    Ok(RemoteActionValue::Cache(Box::new(cache)))
+                },
+            )?
+            else {
+                return Err("pull request creation returned an unexpected result".to_string());
+            };
+            self.apply_remote_cache_result(selected, *cache);
             self.show_message("push complete; pull request created")?;
         } else {
             self.show_message("push complete")?;
@@ -765,25 +1170,71 @@ impl Tui {
             return Ok(false);
         };
 
-        let mut persisted =
-            crate::observability::with_writable_db(repo, |conn| load_auto_run(conn, &run_id))?
+        let repo = repo.clone();
+        let config = config.clone();
+        let mut cache = self.sessions[selected].pr.clone();
+        let worktree = self.sessions[selected]
+            .identity_key(&self.repos[self.sessions[selected].repo_index].identity);
+        let generation = self
+            .worktree_generations
+            .get(&worktree)
+            .copied()
+            .unwrap_or_default();
+        let RemoteActionValue::GuardedPush {
+            persisted,
+            cache,
+            progress,
+        } = self.run_remote_action(
+            raw,
+            crate::tui::RemoteActionRequest {
+                key: TuiJobKey::Worktree(worktree),
+                generation,
+                name: "prism-guarded-push",
+                title: "Guarded Push",
+                message: "Reobserving guarded repair push",
+                abandon_cancelable: false,
+                mutation: Some(remote_push_mutation_target(
+                    &crate::remote::dispatcher::prepare_push(
+                        &self.sessions[selected].path,
+                        &config,
+                        &self.sessions[selected].branch,
+                    )?,
+                )),
+            },
+            move || {
+                let mut persisted = crate::observability::with_writable_db(&repo, |conn| {
+                    load_auto_run(conn, &run_id)
+                })?
                 .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?;
-        if persisted.run.pending_push.is_none() {
+                let progress = if persisted.run.pending_push.is_some() {
+                    Some(crate::observability::with_writable_db(&repo, |conn| {
+                        crate::auto_flow::stabilization_execute::progress_pending_push(
+                            conn,
+                            &repo,
+                            &config,
+                            &mut persisted,
+                            &mut cache,
+                            || Ok(()),
+                        )
+                    })?)
+                } else {
+                    None
+                };
+                Ok(RemoteActionValue::GuardedPush {
+                    persisted: Box::new(persisted),
+                    cache: Box::new(cache),
+                    progress,
+                })
+            },
+        )?
+        else {
+            return Err("guarded push returned an unexpected result".to_string());
+        };
+        let Some(progress) = progress else {
             return Ok(false);
-        }
-
-        self.show_loading_dialog(raw, "Guarded Push", "Reobserving guarded repair push")?;
-        let progress = crate::observability::with_writable_db(repo, |conn| {
-            crate::auto_flow::stabilization_execute::progress_pending_push(
-                conn,
-                repo,
-                config,
-                &mut persisted,
-                &mut self.sessions[selected].pr,
-                || run_pre_push_checks(config, &path),
-            )
-        })?;
-        self.remember_auto_run(persisted);
+        };
+        self.apply_remote_cache_result(selected, *cache);
+        self.remember_auto_run(*persisted);
         match progress {
             crate::auto_flow::stabilization_execute::GuardedPushProgress::AlreadySatisfied => {
                 self.show_message(
@@ -813,51 +1264,105 @@ impl Tui {
         let Some(run_id) = self.active_auto_runs.get(&path).cloned() else {
             return Ok(false);
         };
-        let mut persisted =
-            crate::observability::with_writable_db(repo, |conn| load_auto_run(conn, &run_id))?
-                .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?;
-        if persisted.run.stabilization_blocker
-            != Some(
-                crate::auto_flow::stabilization_model::StabilizationBlocker::ReviewFeedbackFound,
-            )
-        {
-            return Ok(false);
-        }
-
-        self.show_loading_dialog(raw, "Review Feedback", "Refreshing review conversations")?;
-        {
-            let session = &mut self.sessions[selected];
-            refresh_pr_cache(
-                repo,
-                &session.branch,
-                &mut session.pr,
-                &session.path,
-                config,
-                true,
-            )?;
-        }
-        self.supersede_pr_persistence(selected, true);
-        let feedback = crate::auto_flow::stabilization_observe::stabilization_review_feedback(
-            self.sessions[selected]
-                .pr
-                .trusted_details()?
-                .ok_or_else(|| "pull request review details are unavailable".to_string())?,
-            persisted.run.review_baseline_json.as_deref(),
-        );
-        let thread_ids = crate::review::review_thread_ids(&feedback);
+        let repo = repo.clone();
+        let config = config.clone();
+        let branch = self.sessions[selected].branch.clone();
+        let mut cache = self.sessions[selected].pr.clone();
+        let worktree = self.sessions[selected]
+            .identity_key(&self.repos[self.sessions[selected].repo_index].identity);
+        let generation = self
+            .worktree_generations
+            .get(&worktree)
+            .copied()
+            .unwrap_or_default();
+        let prepared = self.run_remote_action(
+            raw,
+            crate::tui::RemoteActionRequest {
+                key: TuiJobKey::Worktree(worktree.clone()),
+                generation,
+                name: "prism-prepare-review-resolution",
+                title: "Review Feedback",
+                message: "Refreshing review conversations",
+                abandon_cancelable: true,
+                mutation: None,
+            },
+            {
+                let repo = repo.clone();
+                let config = config.clone();
+                let path = path.clone();
+                let branch = branch.clone();
+                move || {
+                    let mut persisted =
+                        crate::observability::with_writable_db(&repo, |conn| {
+                            load_auto_run(conn, &run_id)
+                        })?
+                        .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?;
+                    if persisted.run.stabilization_blocker
+                        != Some(
+                            crate::auto_flow::stabilization_model::StabilizationBlocker::ReviewFeedbackFound,
+                        )
+                    {
+                        return Ok(RemoteActionValue::NotApplicable);
+                    }
+                    refresh_pr_cache(
+                        &repo, &branch, &mut cache, &path, &config, true,
+                    )?;
+                    let feedback =
+                        crate::auto_flow::stabilization_observe::stabilization_review_feedback(
+                            cache.trusted_details()?.ok_or_else(|| {
+                                "pull request review details are unavailable".to_string()
+                            })?,
+                            persisted.run.review_baseline_json.as_deref(),
+                        );
+                    let thread_ids = crate::review::review_thread_ids(&feedback);
+                    let summary = cache
+                        .trusted_summary()?
+                        .cloned()
+                        .ok_or_else(|| "pull request summary is unavailable".to_string())?;
+                    if thread_ids.is_empty() {
+                        crate::observability::with_writable_db(&repo, |conn| {
+                            crate::auto_flow::stabilization_execute::observe_plan_and_save(
+                                conn,
+                                &repo,
+                                &config,
+                                &mut persisted,
+                            )
+                        })?;
+                    }
+                    Ok(RemoteActionValue::ReviewResolutionPrepared {
+                        persisted: Box::new(persisted),
+                        cache: Box::new(cache),
+                        thread_ids,
+                        summary: Box::new(summary),
+                    })
+                }
+            },
+        )?;
+        let RemoteActionValue::ReviewResolutionPrepared {
+            persisted,
+            cache,
+            thread_ids,
+            summary,
+        } = prepared
+        else {
+            return if matches!(prepared, RemoteActionValue::NotApplicable) {
+                Ok(false)
+            } else {
+                Err("review resolution preparation returned an unexpected result".to_string())
+            };
+        };
+        self.apply_remote_cache_result(selected, *cache);
+        self.remember_auto_run((*persisted).clone());
         if thread_ids.is_empty() {
-            crate::observability::with_writable_db(repo, |conn| {
-                crate::auto_flow::stabilization_execute::observe_plan_and_save(
-                    conn,
-                    repo,
-                    config,
-                    &mut persisted,
-                )
-            })?;
-            self.remember_auto_run(persisted);
             self.show_message(
                 "no unresolved actionable review conversations; reobserved PR Stabilization",
             )?;
+            return Ok(true);
+        }
+        if self.remote_support_for_action(GitAction::ResolveAllComments, Some(summary.as_ref()))
+            != Some(crate::remote::SupportLevel::Supported)
+        {
+            self.show_message("review conversation resolution is unavailable for this provider")?;
             return Ok(true);
         }
 
@@ -873,38 +1378,56 @@ impl Tui {
             return Ok(true);
         }
 
-        self.show_loading_dialog(
+        let mut cache = self.sessions[selected].pr.clone();
+        let RemoteActionValue::ReviewResolutionFinished {
+            persisted,
+            cache,
+            resolved,
+        } = self.run_remote_action(
             raw,
-            "Resolve Review Conversations",
-            "Resolving review conversations",
-        )?;
-        let resolution = apply_bulk_review_resolution(true, &thread_ids, |thread_id| {
-            crate::github::resolve_review_thread(&path, config, thread_id)
-        });
-        let refresh = {
-            let session = &mut self.sessions[selected];
-            refresh_pr_cache(
-                repo,
-                &session.branch,
-                &mut session.pr,
-                &session.path,
-                config,
-                true,
-            )
+            crate::tui::RemoteActionRequest {
+                key: TuiJobKey::Worktree(worktree),
+                generation,
+                name: "prism-resolve-blocking-review-threads",
+                title: "Resolve Review Conversations",
+                message: "Resolving review conversations",
+                abandon_cancelable: false,
+                mutation: Some(crate::tui::RemoteMutationTarget::Resolve {
+                    change_request: summary
+                        .change_request_identity
+                        .clone()
+                        .ok_or_else(|| "pull request identity is unavailable".to_string())?,
+                    thread_ids: thread_ids.clone(),
+                }),
+            },
+            move || {
+                let mut persisted = persisted;
+                let resolved = apply_bulk_review_resolution(true, &thread_ids, |thread_id| {
+                    crate::remote::dispatcher::resolve_review_thread(
+                        &path, &config, &summary, thread_id,
+                    )
+                })?;
+                refresh_pr_cache(&repo, &branch, &mut cache, &path, &config, true)?;
+                crate::observability::with_writable_db(&repo, |conn| {
+                    crate::auto_flow::stabilization_execute::observe_plan_and_save(
+                        conn,
+                        &repo,
+                        &config,
+                        &mut persisted,
+                    )
+                })?;
+                Ok(RemoteActionValue::ReviewResolutionFinished {
+                    persisted,
+                    cache: Box::new(cache),
+                    resolved,
+                })
+            },
+        )?
+        else {
+            return Err("review resolution returned an unexpected result".to_string());
         };
-        let observation = crate::observability::with_writable_db(repo, |conn| {
-            crate::auto_flow::stabilization_execute::observe_plan_and_save(
-                conn,
-                repo,
-                config,
-                &mut persisted,
-            )
-        });
-        self.remember_auto_run(persisted);
-        let resolved = resolution?;
-        refresh?;
-        self.supersede_pr_persistence(selected, true);
-        observation?;
+        self.apply_remote_cache_result(selected, *cache);
+        self.remember_auto_run(*persisted);
         self.show_message(&format!(
             "resolved {resolved} review conversation(s); reobserved PR Stabilization"
         ))?;
@@ -932,15 +1455,60 @@ impl Tui {
         }
         let path = self.sessions[selected].path.clone();
         let branch = self.sessions[selected].branch.clone();
-        run_pre_push_checks(&context.config, &path)?;
-        self.show_loading_dialog(raw, "Merge Pull Request", "Checking pull request gates")?;
-        let initial_authorization =
-            crate::auto_flow::stabilization_execute::observe_manual_merge_authorization(
-                &context.repo,
-                &context.config,
-                &mut self.sessions[selected],
-            );
-        let (initially_observed_pr_number, review_thread_ids) = match &initial_authorization {
+        let worktree = self.sessions[selected]
+            .identity_key(&self.repos[self.sessions[selected].repo_index].identity);
+        let generation = self
+            .worktree_generations
+            .get(&worktree)
+            .copied()
+            .unwrap_or_default();
+        let repo = context.repo.clone();
+        let config = context.config.clone();
+        let mut session = Box::new(session_for_remote_action(&self.sessions[selected]));
+        let authorization_path = path.clone();
+        let initial = self.run_remote_action(
+            raw,
+            crate::tui::RemoteActionRequest {
+                key: TuiJobKey::Worktree(worktree.clone()),
+                generation,
+                name: "prism-authorize-merge",
+                title: "Merge Pull Request",
+                message: "Checking pull request gates",
+                abandon_cancelable: true,
+                mutation: None,
+            },
+            move || {
+                if let Err(error) = run_pre_push_checks(&config, &authorization_path) {
+                    return Ok(RemoteActionValue::MergeExecution {
+                        session,
+                        result: Err(error),
+                    });
+                }
+                let authorization =
+                    crate::auto_flow::stabilization_execute::observe_manual_merge_authorization(
+                        &repo,
+                        &config,
+                        &mut session,
+                    );
+                Ok(RemoteActionValue::MergeAuthorization {
+                    session,
+                    authorization: Box::new(authorization),
+                })
+            },
+        );
+        let (session, initial_authorization) = match initial {
+            Ok(RemoteActionValue::MergeAuthorization {
+                session,
+                authorization,
+            }) => (session, authorization),
+            Ok(RemoteActionValue::MergeExecution { session, result }) => {
+                self.apply_remote_cache_result(selected, session.pr);
+                return result.map(|_| ());
+            }
+            Ok(_) => return Err("merge authorization returned an unexpected result".to_string()),
+            Err(error) => return Err(error),
+        };
+        let (initially_observed_pr_number, review_thread_ids) = match initial_authorization.as_ref() {
             crate::auto_flow::stabilization_execute::MergeAuthorization::Authorized(token) => {
                 (token.pr_number(), Vec::new())
             }
@@ -952,6 +1520,7 @@ impl Tui {
                 (candidate.pr_number(), thread_ids.clone())
             }
             crate::auto_flow::stabilization_execute::MergeAuthorization::Blocked(state) => {
+                self.apply_remote_cache_result(selected, session.pr.clone());
                 if state.blocker
                     == crate::auto_flow::stabilization_model::StabilizationBlocker::Merged
                 {
@@ -966,41 +1535,159 @@ impl Tui {
                 return Ok(());
             }
         };
-        let execution = if review_thread_ids.is_empty() {
-            self.show_loading_dialog(
-                raw,
-                "Merge Pull Request",
-                &format!("Merging PR #{initially_observed_pr_number}"),
+        let initially_observed_summary = session
+            .pr
+            .trusted_summary()?
+            .cloned()
+            .ok_or_else(|| "pull request summary is unavailable".to_string())?;
+        if !review_thread_ids.is_empty()
+            && self.remote_support_for_action(
+                GitAction::ResolveAllComments,
+                Some(&initially_observed_summary),
+            ) != Some(crate::remote::SupportLevel::Supported)
+        {
+            self.apply_remote_cache_result(selected, session.pr);
+            self.show_message(
+                "merge requires review conversation resolution, which is unavailable",
             )?;
-            crate::auto_flow::stabilization_execute::execute_merge_authorization(
-                &context.config,
-                &path,
-                initial_authorization,
-            )?
+            return Ok(());
+        }
+        let repo = context.repo.clone();
+        let config = context.config.clone();
+        let job_path = session.path.clone();
+        let job_branch = branch.clone();
+        let message = if review_thread_ids.is_empty() {
+            format!("Merging PR #{initially_observed_pr_number}")
         } else {
-            self.show_loading_dialog(
-                raw,
-                "Merge Pull Request",
-                "Resolving observed review conversations",
-            )?;
-            apply_bulk_review_resolution(true, &review_thread_ids, |thread_id| {
-                crate::github::resolve_review_thread(&path, &context.config, thread_id)
-            })?;
-            self.show_loading_dialog(
-                raw,
-                "Merge Pull Request",
-                &format!("Verifying gates and merging PR #{initially_observed_pr_number}"),
-            )?;
-            crate::auto_flow::stabilization_execute::reobserve_and_execute_manual_merge(
-                &context.repo,
-                &context.config,
-                &mut self.sessions[selected],
-                initial_authorization,
-            )?
+            format!("Resolving conversations and merging PR #{initially_observed_pr_number}")
         };
-        let pr_number = match execution {
-            crate::auto_flow::stabilization_execute::ManualMergeExecution::Merged { pr_number } => {
-                pr_number
+        let RemoteActionValue::MergeExecution { session, result } = self.run_remote_action(
+            raw,
+            crate::tui::RemoteActionRequest {
+                key: TuiJobKey::Worktree(worktree),
+                generation,
+                name: "prism-merge-change-request",
+                title: "Merge Pull Request",
+                message: &message,
+                abandon_cancelable: false,
+                mutation: Some(crate::tui::RemoteMutationTarget::Merge {
+                    change_request: initially_observed_summary
+                        .change_request_identity
+                        .clone()
+                        .ok_or_else(|| "pull request identity is unavailable".to_string())?,
+                    expected_head_sha: initially_observed_summary.head_sha.clone(),
+                }),
+            },
+            move || {
+                let mut session = session;
+                let result = (|| {
+                    let execution = if review_thread_ids.is_empty() {
+                        crate::auto_flow::stabilization_execute::reobserve_and_execute_manual_merge(
+                            &repo,
+                            &config,
+                            &mut session,
+                            *initial_authorization,
+                        )?
+                    } else {
+                        apply_bulk_review_resolution(true, &review_thread_ids, |thread_id| {
+                            crate::remote::dispatcher::resolve_review_thread(
+                                &job_path,
+                                &config,
+                                &initially_observed_summary,
+                                thread_id,
+                            )
+                        })?;
+                        crate::auto_flow::stabilization_execute::reobserve_and_execute_manual_merge(
+                            &repo,
+                            &config,
+                            &mut session,
+                            *initial_authorization,
+                        )?
+                    };
+                    let verification = match &execution {
+                        crate::auto_flow::stabilization_execute::ManualMergeExecution::Merged {
+                            result,
+                        } => {
+                            crate::remote::dispatcher::record_change_request_summary(
+                                &repo,
+                                &job_branch,
+                                &mut session.pr,
+                                result.summary.clone(),
+                            )?;
+                            let verification = wait_for_pr_merged(
+                                &job_path,
+                                &result.summary.change_request,
+                                &config,
+                            )
+                            .and_then(|summary| {
+                                let merged = summary.lifecycle
+                                    == crate::remote::LifecycleState::Merged;
+                                crate::remote::dispatcher::record_change_request_summary(
+                                    &repo,
+                                    &job_branch,
+                                    &mut session.pr,
+                                    summary,
+                                )?;
+                                Ok(merged)
+                            });
+                            Some(verification)
+                        }
+                        crate::auto_flow::stabilization_execute::ManualMergeExecution::Pending {
+                            result,
+                        } => {
+                            crate::remote::dispatcher::record_change_request_summary(
+                                &repo,
+                                &job_branch,
+                                &mut session.pr,
+                                result.summary.clone(),
+                            )?;
+                            None
+                        }
+                        crate::auto_flow::stabilization_execute::ManualMergeExecution::Uncertain {
+                            result,
+                        } => {
+                            crate::remote::dispatcher::record_change_request_summary(
+                                &repo,
+                                &job_branch,
+                                &mut session.pr,
+                                result.summary.clone(),
+                            )?;
+                            None
+                        }
+                        crate::auto_flow::stabilization_execute::ManualMergeExecution::Blocked(
+                            _,
+                        ) => None,
+                    };
+                    Ok(RemoteMergeOutcome {
+                        execution,
+                        verification,
+                    })
+                })();
+                Ok(RemoteActionValue::MergeExecution { session, result })
+            },
+        )?
+        else {
+            return Err("merge returned an unexpected result".to_string());
+        };
+        self.apply_remote_cache_result(selected, session.pr);
+        let outcome = result?;
+        match outcome.execution {
+            crate::auto_flow::stabilization_execute::ManualMergeExecution::Merged { .. } => {}
+            crate::auto_flow::stabilization_execute::ManualMergeExecution::Pending { result } => {
+                self.refresh_sessions_after_tmux()?;
+                self.show_message(&format!(
+                    "merge accepted and pending (provider state: {})",
+                    result.native_state
+                ))?;
+                return Ok(());
+            }
+            crate::auto_flow::stabilization_execute::ManualMergeExecution::Uncertain { result } => {
+                self.refresh_sessions_after_tmux()?;
+                self.show_message(&format!(
+                    "merge outcome uncertain; refresh to reconcile (provider state: {})",
+                    result.native_state
+                ))?;
+                return Ok(());
             }
             crate::auto_flow::stabilization_execute::ManualMergeExecution::Blocked(state) => {
                 self.show_message(&format!(
@@ -1009,16 +1696,14 @@ impl Tui {
                 ))?;
                 return Ok(());
             }
-        };
-        self.show_loading_dialog(
-            raw,
-            "Merge Pull Request",
-            &format!("Verifying PR #{pr_number} is merged"),
-        )?;
-        let merged = match wait_for_pr_merged(&path, pr_number, &context.config) {
+        }
+        let merged = match outcome
+            .verification
+            .expect("merged result has verification")
+        {
             Ok(merged) => merged,
             Err(error) => {
-                self.refresh_sessions()?;
+                self.refresh_sessions_after_tmux()?;
                 self.show_message(&format!(
                     "merge complete; could not verify PR merged: {error}"
                 ))?;
@@ -1026,20 +1711,17 @@ impl Tui {
             }
         };
         if !merged {
-            self.refresh_sessions()?;
+            self.refresh_sessions_after_tmux()?;
             self.show_message("merge complete; GitHub has not marked the PR merged yet")?;
             return Ok(());
         }
-
-        record_pr_merged(&context.repo, &branch, &mut self.sessions[selected].pr);
-        self.supersede_pr_persistence(selected, false);
         let path_display = self.sessions[selected].path_display.clone();
         let warnings = self.sessions[selected].deletion_warnings();
         if self.confirm_delete_dialog(raw, &branch, &path_display, &warnings, true)? {
             self.start_delete_worktree_session(context.repo, context.config, path, branch)?;
             self.show_message("merge complete; deleting local session data, worktree, and branch")?;
         } else {
-            self.refresh_sessions()?;
+            self.refresh_sessions_after_tmux()?;
             self.show_message("merge complete")?;
         }
         Ok(())

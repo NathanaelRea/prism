@@ -10,7 +10,9 @@ use crate::config::{
 
 static SHIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-const TOOL_NAMES: [&str; 7] = ["wt", "gh", "git", "tmux", "lazygit", "fzf", "opencode"];
+const TOOL_NAMES: [&str; 8] = [
+    "wt", "gh", "glab", "git", "tmux", "lazygit", "fzf", "opencode",
+];
 
 pub(crate) fn test_config() -> Config {
     let tools = TOOL_NAMES
@@ -43,6 +45,7 @@ pub(crate) fn test_config() -> Config {
         checks: Checks::default(),
         worktree_columns: Vec::new(),
         tools,
+        remote_hosts: BTreeMap::new(),
         agent_commands: BTreeMap::from([("ask".to_string(), unconfigured_tool_path("ask"))]),
         agent_prompt_modes: BTreeMap::new(),
         prompt_templates: BTreeMap::new(),

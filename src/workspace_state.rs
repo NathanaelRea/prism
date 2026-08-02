@@ -1041,7 +1041,7 @@ fn load_pr(
                 age_ms,
                 stale: error.is_some()
                     || age_ms
-                        > i64::try_from(crate::github::PR_SUMMARY_POLL_INTERVAL.as_millis() * 2)
+                        > i64::try_from(crate::remote::PR_SUMMARY_POLL_INTERVAL.as_millis() * 2)
                             .unwrap_or(i64::MAX),
                 error,
                 provenance: ObservationProvenance::SqliteCache,

@@ -43,6 +43,12 @@ pub(crate) struct StandaloneRepair {
     guard: WorkGuard,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StandaloneRepairQueue {
+    Queued(i64),
+    AlreadyPending(i64),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WaitDecision {
     KeepWaiting,
@@ -71,19 +77,27 @@ pub(crate) enum MergeAuthorization {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AuthorizedMerge {
-    pr_number: u64,
+    display_number: u64,
     guard: WorkGuard,
 }
 
 impl AuthorizedMerge {
     pub(crate) fn pr_number(&self) -> u64 {
-        self.pr_number
+        self.display_number
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ManualMergeExecution {
-    Merged { pr_number: u64 },
+    Merged {
+        result: Box<crate::remote::MergeMutationResult>,
+    },
+    Pending {
+        result: Box<crate::remote::MergeMutationResult>,
+    },
+    Uncertain {
+        result: Box<crate::remote::MergeMutationResult>,
+    },
     Blocked(super::stabilization_model::StabilizationState),
 }
 
@@ -92,7 +106,7 @@ pub(crate) fn observe_manual_merge_authorization(
     config: &Config,
     session: &mut crate::session::Session,
 ) -> MergeAuthorization {
-    let pr_refresh = crate::github::refresh_pr_cache(
+    let pr_refresh = crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &session.branch,
         &mut session.pr,
@@ -100,7 +114,17 @@ pub(crate) fn observe_manual_merge_authorization(
         config,
         true,
     );
-    let policy_refresh = crate::github::refresh_repo_policy_cache(repo, &session.path, config);
+    let target_repository = session
+        .pr
+        .summary()
+        .and_then(|summary| summary.change_request_identity.as_ref())
+        .and_then(|identity| identity.target_repository().ok());
+    let policy_refresh = crate::remote::dispatcher::refresh_repository_policy_for(
+        repo,
+        &session.path,
+        config,
+        target_repository.as_ref(),
+    );
     let remote_refresh = crate::git::fetch_origin(&session.path, config);
     let worktree_refresh = crate::git::selected_dirty(&session.path, config);
     let snapshot = stabilization_observe::build_stabilization_snapshot(repo, session, None, config);
@@ -136,7 +160,7 @@ pub(crate) fn observe_manual_merge_authorization(
 
     match authorization {
         Ok(work) => MergeAuthorization::Authorized(AuthorizedMerge {
-            pr_number: snapshot
+            display_number: snapshot
                 .pull_request
                 .as_ref()
                 .expect("authorized pull request")
@@ -201,7 +225,7 @@ fn review_resolution_authorization(
         .pull_request
         .as_mut()
         .expect("review threads require a pull request");
-    let pr_number = pull_request.number;
+    let display_number = pull_request.number;
     pull_request.review.unresolved_threads.clear();
     pull_request.review.actionable_reviews.clear();
     if mergeability_is_conversation_blocked {
@@ -224,7 +248,10 @@ fn review_resolution_authorization(
     let mut guard = work.guard;
     guard.review_thread_ids = thread_ids.clone();
     MergeAuthorization::ReviewResolutionRequired {
-        candidate: AuthorizedMerge { pr_number, guard },
+        candidate: AuthorizedMerge {
+            display_number,
+            guard,
+        },
         thread_ids,
         state,
     }
@@ -236,12 +263,36 @@ pub(crate) fn execute_merge_authorization(
     authorization: MergeAuthorization,
 ) -> Result<ManualMergeExecution, String> {
     match authorization {
-        MergeAuthorization::Authorized(AuthorizedMerge { pr_number, guard }) => {
+        MergeAuthorization::Authorized(AuthorizedMerge {
+            display_number,
+            guard,
+        }) => {
+            let identity = guard.change_request_identity.as_ref().ok_or_else(|| {
+                "authorized merge is missing the canonical change request identity".to_string()
+            })?;
             let expected_head_sha = guard.pr_head_sha.as_deref().ok_or_else(|| {
                 "authorized merge is missing the observed pull request head".to_string()
             })?;
-            crate::github::merge_pull_request(config, path, pr_number, expected_head_sha)?;
-            Ok(ManualMergeExecution::Merged { pr_number })
+            let result = crate::remote::dispatcher::merge_change_request(
+                config,
+                path,
+                identity,
+                display_number,
+                expected_head_sha,
+            )?;
+            match result.outcome {
+                crate::remote::MergeMutationOutcome::Merged => Ok(ManualMergeExecution::Merged {
+                    result: Box::new(result),
+                }),
+                crate::remote::MergeMutationOutcome::Pending => Ok(ManualMergeExecution::Pending {
+                    result: Box::new(result),
+                }),
+                crate::remote::MergeMutationOutcome::Uncertain => {
+                    Ok(ManualMergeExecution::Uncertain {
+                        result: Box::new(result),
+                    })
+                }
+            }
         }
         MergeAuthorization::ReviewResolutionRequired { state, .. }
         | MergeAuthorization::Blocked(state) => Ok(ManualMergeExecution::Blocked(state)),
@@ -260,6 +311,7 @@ pub(crate) fn reobserve_and_execute_manual_merge(
         MergeAuthorization::Blocked(state) => return Ok(ManualMergeExecution::Blocked(state)),
     };
     let path = session.path.clone();
+    crate::lifecycle::run_pre_push_checks(config, &path)?;
     let fresh_authorization = observe_manual_merge_authorization(repo, config, session);
     let fresh = match fresh_authorization {
         MergeAuthorization::Authorized(fresh) => fresh,
@@ -275,7 +327,7 @@ fn reauthorize_observed_merge(
     initial: AuthorizedMerge,
     fresh: AuthorizedMerge,
 ) -> MergeAuthorization {
-    if initial.pr_number != fresh.pr_number {
+    if initial.display_number != fresh.display_number {
         return MergeAuthorization::Blocked(changed_merge_state(
             "pull request identity changed during pre-push checks".to_string(),
         ));
@@ -301,7 +353,7 @@ fn changed_merge_state(reason: String) -> super::stabilization_model::Stabilizat
 
 pub(crate) fn authorize_auto_merge(
     snapshot: &super::stabilization_model::StabilizationSnapshot,
-    expected_pr_number: Option<u64>,
+    expected_display_number: Option<u64>,
     expected_guard: &WorkGuard,
 ) -> MergeAuthorization {
     let work = stabilization_plan::plan(snapshot);
@@ -311,7 +363,7 @@ pub(crate) fn authorize_auto_merge(
     if work.kind != super::stabilization_model::StabilizationWorkKind::Merge {
         return MergeAuthorization::Blocked(work.state());
     }
-    if expected_pr_number != Some(pull_request.number) {
+    if expected_display_number != Some(pull_request.number) {
         let mut state = work.state();
         state.status = super::stabilization_model::StabilizationStatus::Escalated;
         state.blocker = super::stabilization_model::StabilizationBlocker::ObservationFailed;
@@ -332,7 +384,7 @@ pub(crate) fn authorize_auto_merge(
         return MergeAuthorization::Blocked(state);
     }
     MergeAuthorization::Authorized(AuthorizedMerge {
-        pr_number: pull_request.number,
+        display_number: pull_request.number,
         guard: work.guard,
     })
 }
@@ -468,15 +520,20 @@ pub(crate) fn prepare_standalone_repair(
     let summary = session.pr.trusted_summary()?;
     let local_head_sha = Some(crate::git::current_head_sha(&session.path, config)?);
     let remote_head_sha =
-        crate::git::remote_branch_head_sha(&session.path, &session.branch, config)?;
+        stabilization_observe::push_remote_head_sha(&session.path, &session.branch, config)?;
     let pr_head_sha = summary.map(|summary| summary.head_sha.clone());
     let base_sha = match summary {
-        Some(summary) => {
-            crate::git::remote_branch_head_sha(&session.path, &summary.base_ref, config)?
-        }
+        Some(summary) => crate::remote::dispatcher::fetch_change_request_base_head_sha(
+            &session.path,
+            config,
+            summary,
+        )?,
         None => None,
     };
     let current_guard = WorkGuard {
+        change_request_identity: summary
+            .and_then(|summary| summary.change_request_identity.clone()),
+        authorized_target_branch: summary.map(|summary| summary.base_ref.clone()),
         local_head_sha,
         remote_head_sha,
         pr_head_sha,
@@ -511,6 +568,23 @@ pub(crate) fn decide_work_guard(
     guard: &WorkGuard,
     current: &WorkGuard,
 ) -> WorkGuardDecision {
+    let Some(expected_identity) = guard.change_request_identity.as_ref() else {
+        return WorkGuardDecision::Invalidated {
+            reason: "persisted work guard has no canonical change request identity".to_string(),
+        };
+    };
+    if current.change_request_identity.as_ref() != Some(expected_identity) {
+        return WorkGuardDecision::Invalidated {
+            reason: "canonical change request identity changed while the repair was in progress"
+                .to_string(),
+        };
+    }
+    if guard.authorized_target_branch != current.authorized_target_branch {
+        return WorkGuardDecision::Invalidated {
+            reason: "change request target branch changed while the repair was in progress"
+                .to_string(),
+        };
+    }
     for (label, expected, actual) in [
         ("local HEAD", &guard.local_head_sha, &current.local_head_sha),
         (
@@ -554,7 +628,7 @@ pub(crate) fn queue_standalone_repair(
     conn: &rusqlite::Connection,
     persisted: &mut PersistedAutoRun,
     repair: StandaloneRepair,
-) -> Result<i64, String> {
+) -> Result<StandaloneRepairQueue, String> {
     let original = persisted.clone();
     let step_key = match &repair.kind {
         super::stabilization_model::RepairKind::Review => AutoStepKey::FixReview,
@@ -574,23 +648,57 @@ pub(crate) fn queue_standalone_repair(
         ),
         super::stabilization_model::RepairKind::Merge => unreachable!(),
     };
-    apply_state(
-        persisted,
-        &super::stabilization_model::StabilizationState {
-            status: super::stabilization_model::StabilizationStatus::Blocked,
-            blocker,
-            next_work,
-            reason: "standalone PR repair requested from a trustworthy observation".to_string(),
-        },
-    );
-    let result = super::append_step_run_with_work_guard(
-        conn,
-        persisted,
-        step_key,
-        Some(repair.prompt),
-        repair.guard,
-        None,
-    );
+    let result = (|| {
+        let transaction =
+            crate::flight_recorder::TransactionTrace::begin("auto_run.queue_standalone_repair");
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| format!("begin standalone repair transaction: {error}"))?;
+        if let Some(latest) = super::load_auto_run(&tx, &persisted.run.id)? {
+            *persisted = latest;
+        }
+        let queue = if let Some(step_id) = persisted.steps.iter().find_map(|step| {
+            (step.step_key == step_key
+                && matches!(
+                    step.status,
+                    AutoStepStatus::Queued
+                        | AutoStepStatus::Starting
+                        | AutoStepStatus::Running
+                        | AutoStepStatus::Waiting
+                ))
+            .then_some(step.id)
+            .flatten()
+        }) {
+            persisted.run.selected_step_run_id = Some(step_id);
+            super::save_run_with_conn(&tx, &persisted.run)?;
+            StandaloneRepairQueue::AlreadyPending(step_id)
+        } else {
+            apply_state(
+                persisted,
+                &super::stabilization_model::StabilizationState {
+                    status: super::stabilization_model::StabilizationStatus::Blocked,
+                    blocker,
+                    next_work,
+                    reason: "standalone PR repair requested from a trustworthy observation"
+                        .to_string(),
+                },
+            );
+            persisted.run.pause_requested = false;
+            let step_id = super::append_step_run_with_work_guard_in_transaction(
+                &tx,
+                persisted,
+                step_key,
+                Some(repair.prompt),
+                repair.guard,
+                None,
+            )?;
+            StandaloneRepairQueue::Queued(step_id)
+        };
+        tx.commit()
+            .map_err(|error| format!("commit standalone repair transaction: {error}"))?;
+        transaction.committed();
+        Ok(queue)
+    })();
     if result.is_err() {
         *persisted = original;
     }
@@ -620,6 +728,11 @@ pub(crate) fn append_planned_work(
     persisted: &mut PersistedAutoRun,
     work: StabilizationWorkItem,
 ) -> Result<bool, String> {
+    super::save_observed_change_request_identity(
+        conn,
+        &persisted.run.id,
+        work.guard.change_request_identity.as_ref(),
+    )?;
     let Some(step_key) = step_for_work(&work.kind) else {
         save_run_with_conn(conn, &persisted.run)?;
         return Ok(false);
@@ -846,6 +959,11 @@ pub(crate) fn observe_plan_and_save(
 ) -> Result<StabilizationWorkItem, String> {
     let work = observe_and_plan(repo, config, persisted);
     save_run_with_conn(conn, &persisted.run)?;
+    super::save_observed_change_request_identity(
+        conn,
+        &persisted.run.id,
+        work.guard.change_request_identity.as_ref(),
+    )?;
     Ok(work)
 }
 
@@ -905,6 +1023,7 @@ pub(crate) fn validate_and_begin_repair_commit(
         .clone()
         .ok_or_else(|| "repair commit observation is missing local HEAD".to_string())?;
     persisted.run.pending_push = Some(PendingPushGuard {
+        change_request_identity: observation.guard.change_request_identity,
         repair_kind: kind.clone(),
         commit_sha: String::new(),
         expected_local_head_sha,
@@ -941,11 +1060,16 @@ pub(crate) fn complete_repair_commit(
     kind: super::stabilization_model::RepairKind,
     result: crate::git::GitCommitResult,
     local_head_sha: Option<String>,
-    pr_summary: Option<crate::github::PrSummary>,
-    cache: &mut crate::github::PrCache,
+    pr_summary: Option<crate::remote::PrSummary>,
+    cache: &mut crate::remote::PrCache,
 ) -> Result<RepairCommitOutcome, String> {
     persisted.run.current_head_sha = local_head_sha.clone();
     if let Some(summary) = &pr_summary {
+        super::save_observed_change_request_identity(
+            conn,
+            &persisted.run.id,
+            summary.change_request_identity.as_ref(),
+        )?;
         persisted.run.pr_number = Some(summary.number);
         persisted.run.pr_url = Some(summary.url.clone());
         persisted.run.review_baseline_json = Some(super::review_baseline_json(summary));
@@ -1035,12 +1159,23 @@ fn repair_label(kind: &super::stabilization_model::RepairKind) -> &'static str {
 
 pub(crate) fn decide_guarded_push(
     guard: &PendingPushGuard,
+    change_request_identity: Option<&crate::remote::CanonicalChangeRequestIdentity>,
     local_head_sha: Option<&str>,
     remote_head_sha: Option<&str>,
     pr_number: Option<u64>,
     pr_head_sha: Option<&str>,
     base_sha: Option<&str>,
 ) -> GuardedPushDecision {
+    let Some(expected_identity) = guard.change_request_identity.as_ref() else {
+        return GuardedPushDecision::Invalidated {
+            reason: "the persisted push guard has no canonical change request identity".to_string(),
+        };
+    };
+    if change_request_identity != Some(expected_identity) {
+        return GuardedPushDecision::Invalidated {
+            reason: "the guarded canonical change request identity changed".to_string(),
+        };
+    }
     if guard.pr_number.is_some() && pr_number != guard.pr_number {
         return GuardedPushDecision::Invalidated {
             reason: "the guarded pull request identity changed".to_string(),
@@ -1115,7 +1250,7 @@ pub(crate) fn progress_pending_push(
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
-    cache: &mut crate::github::PrCache,
+    cache: &mut crate::remote::PrCache,
     before_push: impl FnOnce() -> Result<(), String>,
 ) -> Result<GuardedPushProgress, String> {
     if persisted
@@ -1129,43 +1264,12 @@ pub(crate) fn progress_pending_push(
         observe_plan_and_save(conn, repo, config, persisted)?;
         return Ok(GuardedPushProgress::Invalidated { reason });
     }
-    crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
-    crate::github::refresh_pr_cache(
-        repo,
-        &persisted.run.branch,
-        cache,
-        &persisted.run.worktree_path,
-        config,
-        true,
-    )?;
     let guard = persisted
         .run
         .pending_push
         .clone()
         .ok_or_else(|| "repair push is missing its persisted guard".to_string())?;
-    let summary = cache.trusted_summary()?;
-    let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
-    let remote_head = crate::git::remote_branch_head_sha(
-        &persisted.run.worktree_path,
-        &persisted.run.branch,
-        config,
-    )?;
-    let base_sha = match summary {
-        Some(summary) => crate::git::remote_branch_head_sha(
-            &persisted.run.worktree_path,
-            &summary.base_ref,
-            config,
-        )?,
-        None => None,
-    };
-    let decision = decide_guarded_push(
-        &guard,
-        local_head.as_deref(),
-        remote_head.as_deref(),
-        summary.map(|summary| summary.number),
-        summary.map(|summary| summary.head_sha.as_str()),
-        base_sha.as_deref(),
-    );
+    let decision = observe_guarded_push_decision(conn, repo, config, persisted, cache, &guard)?;
     let progress = match decision {
         GuardedPushDecision::Invalidated { reason } => {
             invalidate_pending_push(conn, repo, config, persisted, &reason)?;
@@ -1173,10 +1277,59 @@ pub(crate) fn progress_pending_push(
         }
         GuardedPushDecision::AlreadySatisfied => GuardedPushProgress::AlreadySatisfied,
         GuardedPushDecision::ValidToPush => {
+            let expected_push = crate::remote::dispatcher::prepare_push(
+                &persisted.run.worktree_path,
+                config,
+                &persisted.run.branch,
+            )?;
+            crate::lifecycle::run_pre_push_checks(config, &persisted.run.worktree_path)?;
             before_push()?;
             crate::execution::validate_installed_claim(conn)?;
-            crate::git::push_current_branch(&persisted.run.worktree_path, config)?;
-            GuardedPushProgress::Pushed
+            match observe_guarded_push_decision(conn, repo, config, persisted, cache, &guard)? {
+                GuardedPushDecision::Invalidated { reason } => {
+                    invalidate_pending_push(conn, repo, config, persisted, &reason)?;
+                    return Ok(GuardedPushProgress::Invalidated { reason });
+                }
+                GuardedPushDecision::AlreadySatisfied => GuardedPushProgress::AlreadySatisfied,
+                GuardedPushDecision::ValidToPush => {
+                    let current_push = crate::remote::dispatcher::prepare_push(
+                        &persisted.run.worktree_path,
+                        config,
+                        &persisted.run.branch,
+                    );
+                    let summary = cache.trusted_summary()?.ok_or_else(|| {
+                        "pull request disappeared before guarded push".to_string()
+                    })?;
+                    let source_repository = summary
+                        .change_request_identity
+                        .as_ref()
+                        .ok_or_else(|| "pull request has no canonical identity".to_string())?
+                        .source_repository()
+                        .map_err(|error| error.to_string())?;
+                    let current_push = match current_push {
+                        Ok(target)
+                            if target == expected_push
+                                && target.repository == source_repository
+                                && target.remote_branch == summary.head_ref =>
+                        {
+                            target
+                        }
+                        Ok(_) | Err(_) => {
+                            let reason =
+                                "the guarded push source changed before mutation".to_string();
+                            invalidate_pending_push(conn, repo, config, persisted, &reason)?;
+                            return Ok(GuardedPushProgress::Invalidated { reason });
+                        }
+                    };
+                    crate::lifecycle::push_branch(
+                        config,
+                        &persisted.run.worktree_path,
+                        &persisted.run.branch,
+                        current_push.set_upstream,
+                    )?;
+                    GuardedPushProgress::Pushed
+                }
+            }
         }
     };
 
@@ -1209,19 +1362,20 @@ pub(crate) fn progress_pending_push(
         let summary = cache
             .trusted_summary()?
             .ok_or_else(|| "pull request disappeared while resolving review threads".to_string())?;
-        let base_sha = crate::git::remote_branch_head_sha(
+        let base_sha = crate::remote::dispatcher::fetch_change_request_base_head_sha(
             &persisted.run.worktree_path,
-            &summary.base_ref,
             config,
+            summary,
         )?;
         let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config)?;
-        let remote_head = crate::git::remote_branch_head_sha(
+        let remote_head = stabilization_observe::push_remote_head_sha(
             &persisted.run.worktree_path,
             &persisted.run.branch,
             config,
         )?;
         if let GuardedPushDecision::Invalidated { reason } = decide_guarded_push(
             guard,
+            summary.change_request_identity.as_ref(),
             Some(local_head.as_str()),
             remote_head.as_deref(),
             Some(summary.number),
@@ -1239,7 +1393,12 @@ pub(crate) fn progress_pending_push(
         });
         if unresolved {
             crate::execution::validate_installed_claim(conn)?;
-            crate::github::resolve_review_thread(&persisted.run.worktree_path, config, &thread_id)?;
+            crate::remote::dispatcher::resolve_review_thread(
+                &persisted.run.worktree_path,
+                config,
+                summary,
+                &thread_id,
+            )?;
         }
         if let Some(guard) = persisted.run.pending_push.as_mut() {
             guard
@@ -1250,8 +1409,16 @@ pub(crate) fn progress_pending_push(
     }
 
     refresh_after_guarded_effect(repo, config, persisted, cache)?;
+    let guarded_work = observe_plan_and_save(conn, repo, config, persisted)?;
     let completed_guard = persisted.run.pending_push.take();
-    if let Err(error) = observe_plan_and_save(conn, repo, config, persisted) {
+    persisted.run.status = persisted.authoritative_status();
+    persisted.run.updated_unix_ms = unix_ms();
+    let replan_result = if guarded_replan_is_terminal(&guarded_work) {
+        save_run_with_conn(conn, &persisted.run)
+    } else {
+        observe_plan_and_save(conn, repo, config, persisted).map(|_| ())
+    };
+    if let Err(error) = replan_result {
         persisted.run.pending_push = completed_guard;
         let _ = save_run_with_conn(conn, &persisted.run);
         return Err(error);
@@ -1259,13 +1426,75 @@ pub(crate) fn progress_pending_push(
     Ok(progress)
 }
 
+fn guarded_replan_is_terminal(work: &StabilizationWorkItem) -> bool {
+    matches!(
+        work.blocker,
+        super::stabilization_model::StabilizationBlocker::Merged
+            | super::stabilization_model::StabilizationBlocker::Escalate
+    )
+}
+
+fn observe_guarded_push_decision(
+    conn: &rusqlite::Connection,
+    repo: &Repository,
+    config: &Config,
+    persisted: &PersistedAutoRun,
+    cache: &mut crate::remote::PrCache,
+    guard: &PendingPushGuard,
+) -> Result<GuardedPushDecision, String> {
+    stabilization_observe::reauthorize_pending_push_cache(
+        cache,
+        &persisted.run.worktree_path,
+        guard,
+        config,
+    );
+    crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
+    crate::remote::dispatcher::refresh_change_request_cache(
+        repo,
+        &persisted.run.branch,
+        cache,
+        &persisted.run.worktree_path,
+        config,
+        true,
+    )?;
+    let summary = cache.trusted_summary()?;
+    super::save_observed_change_request_identity(
+        conn,
+        &persisted.run.id,
+        summary.and_then(|summary| summary.change_request_identity.as_ref()),
+    )?;
+    let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
+    let remote_head = stabilization_observe::push_remote_head_sha(
+        &persisted.run.worktree_path,
+        &persisted.run.branch,
+        config,
+    )?;
+    let base_sha = match summary {
+        Some(summary) => crate::remote::dispatcher::fetch_change_request_base_head_sha(
+            &persisted.run.worktree_path,
+            config,
+            summary,
+        )?,
+        None => None,
+    };
+    Ok(decide_guarded_push(
+        guard,
+        summary.and_then(|summary| summary.change_request_identity.as_ref()),
+        local_head.as_deref(),
+        remote_head.as_deref(),
+        summary.map(|summary| summary.number),
+        summary.map(|summary| summary.head_sha.as_str()),
+        base_sha.as_deref(),
+    ))
+}
+
 fn refresh_after_guarded_effect(
     repo: &Repository,
     config: &Config,
     persisted: &PersistedAutoRun,
-    cache: &mut crate::github::PrCache,
+    cache: &mut crate::remote::PrCache,
 ) -> Result<(), String> {
-    crate::github::refresh_pr_cache(
+    crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &persisted.run.branch,
         cache,
@@ -1310,11 +1539,12 @@ mod tests {
         stabilization_model::{
             ActionableReviewItem, CiFacts, MergeabilityFacts, PolicyBlocker, PolicyFacts,
             PullRequestFacts, PullRequestState, RepairKind, RepositoryFacts, ReviewFacts,
-            ReviewThreadFact, StabilizationGoal, StabilizationSnapshot, WorktreeFacts,
+            ReviewThreadFact, StabilizationBlocker, StabilizationGoal, StabilizationSnapshot,
+            StabilizationWorkKind, WorktreeFacts,
         },
     };
     use crate::config::Config;
-    use crate::github::{CiFailure, PrCheckState};
+    use crate::remote::{CachedCiFailure, PrCheckState};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1397,7 +1627,7 @@ mod tests {
         for snapshot in cases {
             let authorization = match stabilization_plan::manual_merge_authorization(&snapshot) {
                 Ok(work) => MergeAuthorization::Authorized(AuthorizedMerge {
-                    pr_number: 42,
+                    display_number: 42,
                     guard: work.guard,
                 }),
                 Err(state) => MergeAuthorization::Blocked(state),
@@ -1421,13 +1651,16 @@ mod tests {
             &config,
             &temp,
             MergeAuthorization::Authorized(AuthorizedMerge {
-                pr_number: snapshot.pull_request.unwrap().number,
+                display_number: snapshot.pull_request.unwrap().number,
                 guard: authorization.guard,
             }),
         )
         .unwrap();
 
-        assert_eq!(execution, ManualMergeExecution::Merged { pr_number: 42 });
+        let ManualMergeExecution::Merged { result } = execution else {
+            panic!("expected an immediately merged result")
+        };
+        assert_eq!(result.summary.change_request.id.display_number(), Some(42));
         assert_eq!(
             fs::read_to_string(&log).unwrap(),
             "pr merge 42 --squash --match-head-commit head\n"
@@ -1440,8 +1673,37 @@ mod tests {
     }
 
     #[test]
+    fn final_merge_rejects_a_changed_remote_with_the_same_number_and_head() {
+        let (temp, mut config, log) = manual_merge_test_config();
+        crate::test_support::install_tool(
+            &mut config,
+            &temp,
+            "git",
+            "#!/bin/sh\nif [ \"$3\" = remote ] && [ \"$4\" = get-url ]; then printf '%s\\n' 'https://github.com/other/repo.git'; exit 0; fi\nexit 1\n",
+        );
+        let snapshot = ready_manual_merge_snapshot();
+        let work = stabilization_plan::manual_merge_authorization(&snapshot).unwrap();
+
+        let error = execute_merge_authorization(
+            &config,
+            &temp,
+            MergeAuthorization::Authorized(AuthorizedMerge {
+                display_number: 42,
+                guard: work.guard,
+            }),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("repository changed"), "{error}");
+        assert!(!log.exists(), "changed repository must not invoke gh");
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn manual_merge_authorization_cannot_switch_pr_or_guard_after_checks() {
         let guard = WorkGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
+            authorized_target_branch: Some("main".to_string()),
             local_head_sha: Some("head".to_string()),
             remote_head_sha: Some("head".to_string()),
             pr_head_sha: Some("head".to_string()),
@@ -1450,11 +1712,11 @@ mod tests {
         };
         let switched_pr = reauthorize_observed_merge(
             AuthorizedMerge {
-                pr_number: 42,
+                display_number: 42,
                 guard: guard.clone(),
             },
             AuthorizedMerge {
-                pr_number: 43,
+                display_number: 43,
                 guard: guard.clone(),
             },
         );
@@ -1462,24 +1724,24 @@ mod tests {
         changed_guard.local_head_sha = Some("new-head".to_string());
         let moved_head = reauthorize_observed_merge(
             AuthorizedMerge {
-                pr_number: 42,
+                display_number: 42,
                 guard,
             },
             AuthorizedMerge {
-                pr_number: 42,
+                display_number: 42,
                 guard: changed_guard.clone(),
             },
         );
         let resolved_reviews = reauthorize_observed_merge(
             AuthorizedMerge {
-                pr_number: 42,
+                display_number: 42,
                 guard: WorkGuard {
                     review_thread_ids: vec!["thread-1".to_string()],
                     ..changed_guard.clone()
                 },
             },
             AuthorizedMerge {
-                pr_number: 42,
+                display_number: 42,
                 guard: WorkGuard {
                     review_thread_ids: Vec::new(),
                     ..changed_guard
@@ -1591,6 +1853,7 @@ mod tests {
 
         let decision = decide_guarded_push(
             &guard,
+            guard.change_request_identity.as_ref(),
             Some("repair"),
             Some("remote"),
             Some(42),
@@ -1602,11 +1865,166 @@ mod tests {
     }
 
     #[test]
+    fn terminal_guarded_replans_preserve_exact_provider_state() {
+        let work = |blocker| StabilizationWorkItem {
+            kind: StabilizationWorkKind::Escalate,
+            blocker,
+            reason: String::new(),
+            guard: WorkGuard::default(),
+        };
+
+        assert!(guarded_replan_is_terminal(&work(
+            StabilizationBlocker::Merged
+        )));
+        assert!(guarded_replan_is_terminal(&work(
+            StabilizationBlocker::Escalate
+        )));
+        assert!(!guarded_replan_is_terminal(&work(
+            StabilizationBlocker::PolicyUnknown
+        )));
+    }
+
+    #[test]
+    fn legacy_persisted_guards_load_but_cannot_authorize_mutations() {
+        let pending: PendingPushGuard = serde_json::from_str(
+            r#"{
+                "repair_kind":"Review",
+                "commit_sha":"repair",
+                "expected_local_head_sha":"repair",
+                "expected_remote_head_sha":"remote",
+                "pr_number":42,
+                "expected_pr_head_sha":"remote",
+                "expected_base_sha":"base",
+                "guarded_review_thread_ids":[]
+            }"#,
+        )
+        .unwrap();
+        let current_identity = crate::remote::test_change_request_identity();
+        assert!(matches!(
+            decide_guarded_push(
+                &pending,
+                Some(&current_identity),
+                Some("repair"),
+                Some("remote"),
+                Some(42),
+                Some("remote"),
+                Some("base"),
+            ),
+            GuardedPushDecision::Invalidated { .. }
+        ));
+
+        let persisted: WorkGuard = serde_json::from_str(
+            r#"{
+                "local_head_sha":"head",
+                "remote_head_sha":"head",
+                "pr_head_sha":"head",
+                "base_sha":"base",
+                "review_thread_ids":[]
+            }"#,
+        )
+        .unwrap();
+        let fresh = WorkGuard {
+            change_request_identity: Some(current_identity),
+            authorized_target_branch: Some("main".to_string()),
+            local_head_sha: Some("head".to_string()),
+            remote_head_sha: Some("head".to_string()),
+            pr_head_sha: Some("head".to_string()),
+            base_sha: Some("base".to_string()),
+            review_thread_ids: Vec::new(),
+        };
+        assert!(matches!(
+            decide_work_guard(&RepairKind::Merge, &persisted, &fresh),
+            WorkGuardDecision::Invalidated { .. }
+        ));
+
+        let mut legacy_json = serde_json::to_value(&fresh).unwrap();
+        legacy_json
+            .as_object_mut()
+            .unwrap()
+            .remove("authorized_target_branch");
+        let legacy_with_identity: WorkGuard = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy_with_identity.authorized_target_branch, None);
+        assert!(matches!(
+            decide_work_guard(&RepairKind::Merge, &legacy_with_identity, &fresh),
+            WorkGuardDecision::Invalidated { ref reason }
+                if reason.contains("target branch")
+        ));
+    }
+
+    #[test]
+    fn canonical_identity_change_invalidates_work_and_push_guards() {
+        let expected = crate::remote::test_change_request_identity();
+        let changed_repository = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.example.com", None).unwrap(),
+            "example/repo",
+        )
+        .unwrap();
+        let changed = crate::remote::CanonicalChangeRequestIdentity::new(
+            &changed_repository,
+            &crate::remote::NativeChangeRequestId::new("PR_test").unwrap(),
+            &changed_repository,
+            &changed_repository,
+        );
+        let work = WorkGuard {
+            change_request_identity: Some(expected.clone()),
+            ..WorkGuard::default()
+        };
+        let current = WorkGuard {
+            change_request_identity: Some(changed.clone()),
+            ..WorkGuard::default()
+        };
+        assert!(matches!(
+            decide_work_guard(&RepairKind::Ci, &work, &current),
+            WorkGuardDecision::Invalidated { .. }
+        ));
+
+        let pending = PendingPushGuard {
+            change_request_identity: Some(expected),
+            ..guard()
+        };
+        assert!(matches!(
+            decide_guarded_push(
+                &pending,
+                Some(&changed),
+                Some("repair"),
+                Some("remote"),
+                Some(42),
+                Some("remote"),
+                Some("base"),
+            ),
+            GuardedPushDecision::Invalidated { .. }
+        ));
+    }
+
+    #[test]
+    fn changed_target_branch_invalidates_merge_and_repair_guards() {
+        let original = WorkGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
+            authorized_target_branch: Some("main".to_string()),
+            ..WorkGuard::default()
+        };
+        let current = WorkGuard {
+            authorized_target_branch: Some("release".to_string()),
+            ..original.clone()
+        };
+
+        for kind in [RepairKind::Review, RepairKind::Ci, RepairKind::Merge] {
+            assert!(matches!(
+                decide_work_guard(&kind, &original, &current),
+                WorkGuardDecision::Invalidated { ref reason }
+                    if reason.contains("target branch")
+            ));
+        }
+    }
+
+    #[test]
     fn already_pushed_commit_is_satisfied() {
         let guard = guard();
 
         let decision = decide_guarded_push(
             &guard,
+            guard.change_request_identity.as_ref(),
             Some("repair"),
             Some("repair"),
             Some(42),
@@ -1623,6 +2041,7 @@ mod tests {
 
         let decision = decide_guarded_push(
             &guard,
+            guard.change_request_identity.as_ref(),
             Some("other"),
             Some("remote"),
             Some(42),
@@ -1639,6 +2058,7 @@ mod tests {
 
         let decision = decide_guarded_push(
             &guard,
+            guard.change_request_identity.as_ref(),
             Some("repair"),
             Some("other"),
             Some(42),
@@ -1655,6 +2075,7 @@ mod tests {
 
         let decision = decide_guarded_push(
             &guard,
+            guard.change_request_identity.as_ref(),
             Some("repair"),
             Some("remote"),
             Some(42),
@@ -1668,6 +2089,8 @@ mod tests {
     #[test]
     fn changed_original_work_guard_is_invalidated_before_commit() {
         let original = WorkGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
+            authorized_target_branch: Some("main".to_string()),
             local_head_sha: Some("head-a".to_string()),
             remote_head_sha: Some("head-a".to_string()),
             pr_head_sha: Some("head-a".to_string()),
@@ -1686,10 +2109,12 @@ mod tests {
     #[test]
     fn changed_actionable_review_thread_invalidates_commit_guard() {
         let original = WorkGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             review_thread_ids: vec!["thread-1".to_string()],
             ..WorkGuard::default()
         };
         let current = WorkGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             review_thread_ids: vec!["thread-2".to_string()],
             ..WorkGuard::default()
         };
@@ -1703,10 +2128,12 @@ mod tests {
     #[test]
     fn ci_work_guard_ignores_review_thread_changes() {
         let original = WorkGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             review_thread_ids: Vec::new(),
             ..WorkGuard::default()
         };
         let current = WorkGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             review_thread_ids: vec!["unresolved-thread".to_string()],
             ..WorkGuard::default()
         };
@@ -1787,22 +2214,41 @@ mod tests {
             .unwrap()
             .create_run();
             persisted.run.variant = "repair".to_string();
+            persisted.run.status = super::super::AutoRunStatus::Paused;
+            persisted.run.pause_requested = true;
             persisted.steps.clear();
             super::super::save_auto_run(&conn, &mut persisted).unwrap();
 
-            queue_standalone_repair(
+            let first = queue_standalone_repair(
+                &conn,
+                &mut persisted,
+                StandaloneRepair {
+                    kind: kind.clone(),
+                    prompt: "repair this PR".to_string(),
+                    guard: WorkGuard::default(),
+                },
+            )
+            .unwrap();
+            assert!(matches!(first, StandaloneRepairQueue::Queued(_)));
+
+            let duplicate = queue_standalone_repair(
                 &conn,
                 &mut persisted,
                 StandaloneRepair {
                     kind,
-                    prompt: "repair this PR".to_string(),
+                    prompt: "duplicate repair".to_string(),
                     guard: WorkGuard::default(),
                 },
             )
             .unwrap();
 
             assert_eq!(persisted.steps.len(), 1);
+            assert!(matches!(
+                duplicate,
+                StandaloneRepairQueue::AlreadyPending(_)
+            ));
             assert_eq!(persisted.steps[0].step_key, expected);
+            assert!(!persisted.run.pause_requested);
             assert_eq!(
                 persisted.run.stabilization_status,
                 Some(super::super::stabilization_model::StabilizationStatus::Blocked)
@@ -1946,6 +2392,24 @@ mod tests {
         let mut base = ready.clone();
         base.pull_request.as_mut().unwrap().base_ref = "release".to_string();
         cases.push(base);
+        let mut identity = ready.clone();
+        let changed_repository = crate::remote::RemoteRepositoryId::new(
+            crate::remote::ProviderKind::GitHub,
+            crate::remote::HostIdentity::new("github.com", None).unwrap(),
+            "example/repo",
+        )
+        .unwrap();
+        identity
+            .pull_request
+            .as_mut()
+            .unwrap()
+            .change_request_identity = Some(crate::remote::CanonicalChangeRequestIdentity::new(
+            &changed_repository,
+            &crate::remote::NativeChangeRequestId::new("PR_other").unwrap(),
+            &changed_repository,
+            &changed_repository,
+        ));
+        cases.push(identity);
         let mut policy = ready.clone();
         policy.policy = PolicyFacts::Unknown {
             reason: Some("policy refresh failed".to_string()),
@@ -1982,13 +2446,56 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn manual_merge_rechecks_local_gates_in_the_final_execution_job() {
+        let (temp, mut config, log) = manual_merge_test_config();
+        config.checks.pre_push = vec!["false".to_string()];
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let work =
+            stabilization_plan::manual_merge_authorization(&ready_manual_merge_snapshot()).unwrap();
+        let authorization = MergeAuthorization::Authorized(AuthorizedMerge {
+            display_number: 42,
+            guard: work.guard,
+        });
+        let mut session = crate::session::Session {
+            repo_index: 0,
+            repo_label: "repo".to_string(),
+            repo_key: None,
+            path: temp.clone(),
+            incarnation: String::new(),
+            path_display: temp.display().to_string(),
+            branch: "feature".to_string(),
+            prompt_summary: String::new(),
+            classification: crate::session::SessionClassification::Work,
+            visibility: 0,
+            adopted: false,
+            hidden: false,
+            status_label: "clean".to_string(),
+            agent_state: crate::agent::AgentState::Idle,
+            opencode_status: None,
+            pr: crate::remote::PrCache::default(),
+            wt_columns: std::collections::BTreeMap::new(),
+            unseen_comments: false,
+        };
+
+        let error = reobserve_and_execute_manual_merge(&repo, &config, &mut session, authorization)
+            .unwrap_err();
+
+        assert!(error.contains("pre_push check"), "{error}");
+        assert!(
+            !log.exists(),
+            "provider mutation must not run after a late gate failure"
+        );
+        fs::remove_dir_all(temp).unwrap();
+    }
+
     fn ready_manual_merge_snapshot() -> StabilizationSnapshot {
         StabilizationSnapshot {
             run: None,
             repository: RepositoryFacts {
                 root: PathBuf::from("/repo"),
                 default_base: Some("main".to_string()),
-                github_remote: Some("owner/repo".to_string()),
+                remote_project: Some("owner/repo".to_string()),
                 policy_refreshed_unix_ms: Some(1),
                 policy_error: None,
             },
@@ -2003,6 +2510,7 @@ mod tests {
             },
             pull_request: Some(PullRequestFacts {
                 number: 42,
+                change_request_identity: Some(crate::remote::test_change_request_identity()),
                 url: "https://example.test/pr/42".to_string(),
                 state: PullRequestState::Open,
                 draft: false,
@@ -2014,16 +2522,19 @@ mod tests {
                     aggregate: PrCheckState::Success,
                     required: Vec::new(),
                     optional_failures: Vec::new(),
-                    failures: Vec::<CiFailure>::new(),
+                    failures: Vec::<CachedCiFailure>::new(),
                 },
                 review: ReviewFacts {
                     decision: "APPROVED".to_string(),
                     approval_required: false,
+                    approval_count: 0,
+                    required_approvals: 0,
                     actionable_reviews: Vec::new(),
                     unresolved_threads: Vec::new(),
                     top_level_comments: 0,
                 },
                 mergeability: MergeabilityFacts::Clean,
+                queue_state: crate::remote::QueueState::NotQueued,
                 top_level_comment_count: 0,
                 observation_error: None,
             }),
@@ -2053,13 +2564,25 @@ mod tests {
             &mut config,
             &temp,
             "gh",
-            &format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+            &format!(
+                "#!/bin/sh\nif [ \"$1\" = api ]; then if [ -e '{}/merged' ]; then state=MERGED; merged=true; else state=OPEN; merged=false; fi; printf '%s\\n' \"{{\\\"data\\\":{{\\\"repository\\\":{{\\\"pullRequest\\\":{{\\\"id\\\":\\\"PR_test\\\",\\\"number\\\":42,\\\"headRefName\\\":\\\"feature\\\",\\\"baseRefName\\\":\\\"main\\\",\\\"headRefOid\\\":\\\"head\\\",\\\"headRepository\\\":{{\\\"nameWithOwner\\\":\\\"example/repo\\\"}},\\\"baseRepository\\\":{{\\\"nameWithOwner\\\":\\\"example/repo\\\"}},\\\"state\\\":\\\"$state\\\",\\\"merged\\\":$merged}}}}}}}}\"; exit 0; fi\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1 $2\" = \"pr merge\" ]; then touch '{}/merged'; fi\n",
+                temp.display(),
+                log.display(),
+                temp.display()
+            ),
+        );
+        crate::test_support::install_tool(
+            &mut config,
+            &temp,
+            "git",
+            "#!/bin/sh\nif [ \"$3\" = remote ] && [ \"$4\" = get-url ]; then printf '%s\\n' 'https://github.com/example/repo.git'; exit 0; fi\nexit 1\n",
         );
         (temp, config, log)
     }
 
     fn guard() -> PendingPushGuard {
         PendingPushGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             repair_kind: RepairKind::Review,
             commit_sha: "repair".to_string(),
             expected_local_head_sha: "repair".to_string(),

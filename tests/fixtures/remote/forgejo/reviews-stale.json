@@ -1,0 +1,22 @@
+[
+  {
+    "id": 41,
+    "body": "Approved before the latest push",
+    "state": "APPROVED",
+    "dismissed": false,
+    "stale": true,
+    "commit_id": "old-head",
+    "submitted_at": "2026-07-29T10:00:00Z",
+    "user": { "login": "reviewer" }
+  },
+  {
+    "id": 42,
+    "body": "Waiting for another pass",
+    "state": "PENDING",
+    "dismissed": false,
+    "stale": false,
+    "commit_id": "abc123",
+    "submitted_at": "2026-07-29T12:00:00Z",
+    "user": { "login": "reviewer" }
+  }
+]

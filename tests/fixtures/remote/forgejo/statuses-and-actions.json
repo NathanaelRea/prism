@@ -1,0 +1,35 @@
+{
+  "statuses": [
+    {
+      "context": "woodpecker/pr",
+      "status": "success",
+      "target_url": "https://ci.example.test/build/7"
+    },
+    {
+      "context": "future-check",
+      "status": "waiting_for_device",
+      "target_url": ""
+    }
+  ],
+  "actions": {
+    "total_count": 2,
+    "workflow_runs": [
+      {
+        "id": 81,
+        "commit_sha": "abc123",
+        "status": "success",
+        "workflow_id": "test.yaml",
+        "title": "Tests",
+        "html_url": "https://forge.example.test/acme/widget/actions/runs/81"
+      },
+      {
+        "id": 82,
+        "commit_sha": "abc123",
+        "status": "waiting",
+        "workflow_id": "release.yaml",
+        "title": "Release",
+        "html_url": "https://forge.example.test/acme/widget/actions/runs/82"
+      }
+    ]
+  }
+}
