@@ -860,10 +860,10 @@ fn run_auto_command(
             )
         })?;
         if should_execute {
+            crate::worker::ensure_running()?;
             observability::with_writable_db(repo, |conn| {
                 crate::execution::enqueue(conn, &workflow)
             })?;
-            crate::worker::ensure_running()?;
             crate::worker::wake()?;
         }
         println!(
@@ -902,8 +902,8 @@ fn run_auto_command(
             &mut persisted,
         )?;
     }
-    observability::with_writable_db(repo, |conn| submit_auto_run(conn, &mut persisted))?;
     crate::worker::ensure_running()?;
+    observability::with_writable_db(repo, |conn| submit_auto_run(conn, &mut persisted))?;
     crate::worker::wake()?;
     println!(
         "auto_run_id = {}\nstatus = {:?}\nworktree = {}",
