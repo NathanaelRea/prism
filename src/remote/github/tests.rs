@@ -1959,6 +1959,46 @@ fn parses_graphql_pr_summary_index() {
 }
 
 #[test]
+fn github_blocked_merge_state_does_not_override_mergeability() {
+    let raw = r#"{
+        "data": {
+            "repository": {
+                "pullRequests": {
+                    "pageInfo": {"hasNextPage": false},
+                    "nodes": [{
+                        "number": 117,
+                        "mergeable": "MERGEABLE",
+                        "mergeStateStatus": "BLOCKED",
+                        "commits": {
+                            "nodes": [{
+                                "commit": {
+                                    "statusCheckRollup": {
+                                        "contexts": {
+                                            "pageInfo": {"hasNextPage": false},
+                                            "nodes": [{
+                                                "__typename": "CheckRun",
+                                                "name": "test",
+                                                "status": "IN_PROGRESS",
+                                                "conclusion": null
+                                            }]
+                                        }
+                                    }
+                                }
+                            }]
+                        }
+                    }]
+                }
+            }
+        }
+    }"#;
+
+    let summaries = parse_pr_summary_index(raw);
+
+    assert_eq!(summaries[0].check_status, "running");
+    assert_eq!(summaries[0].merge_state_status, "MERGEABLE");
+}
+
+#[test]
 fn graphql_queue_state_distinguishes_native_entry_absence_and_unobserved() {
     let queued = try_parse_pr_summary_index(
             r#"{"data":{"repository":{"pullRequests":{"nodes":[{"number":42,"mergeQueueEntry":{"state":"AWAITING_CHECKS"}}],"pageInfo":{"hasNextPage":false}}}}}"#,

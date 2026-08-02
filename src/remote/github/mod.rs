@@ -108,6 +108,8 @@ struct GithubPullRequest {
     status_check_rollup: GithubStatusCheckRollup,
     #[serde(default, rename = "mergeStateStatus")]
     merge_state_status: String,
+    #[serde(default)]
+    mergeable: String,
     #[serde(
         default,
         rename = "mergeQueueEntry",
@@ -1478,6 +1480,7 @@ query($owner: String!, $name: String!, $headRefName: String, $endCursor: String)
           nameWithOwner
         }
         updatedAt
+        mergeable
         mergeStateStatus
         mergeQueueEntry {
           state
@@ -1558,6 +1561,7 @@ query($owner: String!, $name: String!, $number: Int!) {
         nameWithOwner
       }
       updatedAt
+      mergeable
       mergeStateStatus
       mergeQueueEntry {
         state
@@ -1802,6 +1806,11 @@ fn pr_summary_from_node(
     repository: Option<&crate::remote::RemoteRepositoryId>,
 ) -> Option<PrSummary> {
     let number = node.number?;
+    let mergeability = if node.mergeable.trim().is_empty() {
+        &node.merge_state_status
+    } else {
+        &node.mergeable
+    };
     let queue_evidence = match &node.merge_queue_entry {
         GithubMergeQueueObservation::NotObserved => Vec::new(),
         GithubMergeQueueObservation::NotQueued => vec!["null".to_string()],
@@ -1813,9 +1822,7 @@ fn pr_summary_from_node(
         native_state_evidence: crate::remote::NativeStateEvidence {
             lifecycle: crate::remote::NativeStateEvidence::retain([node.state.clone()]),
             review: crate::remote::NativeStateEvidence::retain(node.review_decision.clone()),
-            mergeability: crate::remote::NativeStateEvidence::retain([node
-                .merge_state_status
-                .clone()]),
+            mergeability: crate::remote::NativeStateEvidence::retain([mergeability.clone()]),
             check: crate::remote::NativeStateEvidence::retain(
                 status_contexts_for_pr(node)
                     .into_iter()
@@ -1844,7 +1851,7 @@ fn pr_summary_from_node(
         head_sha: node.head_ref_oid.clone(),
         updated_at: node.updated_at.clone(),
         check_status: check_status_for_pr(node),
-        merge_state_status: node.merge_state_status.clone(),
+        merge_state_status: mergeability.clone(),
         queue_state: match &node.merge_queue_entry {
             GithubMergeQueueObservation::NotObserved => "unknown".to_string(),
             GithubMergeQueueObservation::NotQueued => "not_queued".to_string(),
