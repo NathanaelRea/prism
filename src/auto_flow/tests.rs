@@ -2145,9 +2145,10 @@ fn transient_base_lookup_failure_retains_pending_push_for_retry() {
     write_executable(
         &git,
         &format!(
-            "#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --verify --quiet refs/remotes/origin/main\"*)\n    if [ ! -e '{}' ]; then touch '{}'; printf 'transient lookup failure\\n' >&2; exit 128; fi\n    ;;\nesac\nif [ \"$3\" = \"remote\" ] && [ \"$4\" = \"get-url\" ]; then printf 'https://github.com/example/repo.git\\n'; exit 0; fi\nexec git \"$@\"\n",
+            "#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --verify --quiet refs/remotes/origin/main\"*)\n    if [ ! -e '{}' ]; then touch '{}'; printf 'transient lookup failure\\n' >&2; exit 128; fi\n    ;;\n  *\"remote get-url\"*) printf 'https://github.com/example/repo.git\\n'; exit 0 ;;\n  *\"ls-remote --exit-code --heads https://github.com/example/repo.git refs/heads/feat/auto\"*) printf '%s\\t%s\\n' '{}' 'refs/heads/feat/auto'; exit 0 ;;\nesac\nexec git \"$@\"\n",
             marker.display(),
-            marker.display()
+            marker.display(),
+            remote_head
         ),
     );
     let mut persisted = AutoLaunch::new(&repo.root, &work, "feat/auto", "Repair")
@@ -2878,7 +2879,9 @@ fn headless_merge_step_refreshes_and_blocks_unknown_policy() {
     let git = temp.path().join("git");
     write_executable(
         &git,
-        "#!/bin/sh\nif [ \"$3\" = \"remote\" ] && [ \"$4\" = \"get-url\" ]; then\n  printf 'https://github.com/example/repo.git\\n'\n  exit 0\nfi\nexec git \"$@\"\n",
+        &format!(
+            "#!/bin/sh\ncase \"$*\" in *\"ls-remote --exit-code --heads https://github.com/example/repo.git refs/heads/feat/auto\"*) printf '%s\\t%s\\n' '{head}' 'refs/heads/feat/auto'; exit 0 ;; esac\nif [ \"$3\" = \"remote\" ] && [ \"$4\" = \"get-url\" ]; then\n  printf 'https://github.com/example/repo.git\\n'\n  exit 0\nfi\nexec git \"$@\"\n"
+        ),
     );
     write_executable(
         &gh,
@@ -3430,7 +3433,9 @@ fn configure_pr_observation(temp: &TempDir, config: &mut Config, branch: &str, h
     let git = temp.path().join("git");
     write_executable(
         &git,
-        "#!/bin/sh\nif [ \"$3\" = \"remote\" ] && [ \"$4\" = \"get-url\" ]; then\n  printf 'https://github.com/example/repo.git\\n'\n  exit 0\nfi\nexec git \"$@\"\n",
+        &format!(
+            "#!/bin/sh\ncase \"$*\" in\n  *\"remote get-url\"*) printf 'https://github.com/example/repo.git\\n'; exit 0 ;;\n  *\"ls-remote --exit-code --heads https://github.com/example/repo.git refs/heads/{branch}\"*) actual=$(git -C \"$2\" remote get-url origin); git ls-remote --exit-code --heads \"$actual\" 'refs/heads/{branch}'; exit $? ;;\nesac\nexec git \"$@\"\n"
+        ),
     );
     let script = format!(
         r#"#!/bin/sh
@@ -3441,6 +3446,9 @@ case "$*" in
   *"/repos/example/repo/commits/{head_sha}/check-runs?per_page=100"*) printf '%s\n' '[{{"total_count":1,"check_runs":[{{"name":"ci","status":"completed","conclusion":"success"}}]}}]' ;;
   *"reviewThreads(first: 100"*)
     printf '%s\n' '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":0,"pageInfo":{{"hasNextPage":false}},"nodes":[]}}}}}}}}}}]'
+    ;;
+  *"pullRequests(first: 100"*)
+    printf '%s\n' '[{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_test","number":42,"title":"Auto","body":"","url":"https://example.com/pr/42","state":"OPEN","reviewDecision":"","reviewRequests":{{"nodes":[]}},"headRefName":"{branch}","baseRefName":"main","headRefOid":"{head_sha}","headRepository":{{"nameWithOwner":"example/repo"}},"baseRepository":{{"nameWithOwner":"example/repo"}},"updatedAt":"2026-01-01T00:00:00Z","comments":{{"totalCount":0}},"commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{{"contexts":{{"pageInfo":{{"hasNextPage":false}},"nodes":[{{"context":"ci","state":"SUCCESS"}}]}}}}}}}}]}},"mergeStateStatus":"CLEAN","isDraft":false}}],"pageInfo":{{"hasNextPage":false}}}}}}}}}}]'
     ;;
   api\ graphql*)
     printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_test","number":42,"title":"Auto","state":"OPEN","headRefName":"{branch}","baseRefName":"main","headRefOid":"{head_sha}","headRepository":{{"nameWithOwner":"example/repo"}},"baseRepository":{{"nameWithOwner":"example/repo"}},"mergeStateStatus":"CLEAN","commits":{{"nodes":[{{"commit":{{"statusCheckRollup":{{"contexts":{{"pageInfo":{{"hasNextPage":false}},"nodes":[{{"context":"ci","state":"SUCCESS"}}]}}}}}}}}]}}}}}}}}}}'

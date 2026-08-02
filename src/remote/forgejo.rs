@@ -198,7 +198,7 @@ impl ForgejoAdapter {
             RemoteOperation::ListChangeRequests,
             &format!("repos/{project}/pulls"),
             &[
-                ("state", "all".to_string()),
+                ("state", "open".to_string()),
                 ("limit", pagination.limit),
                 ("page", "1".to_string()),
             ],
@@ -1762,7 +1762,9 @@ mod tests {
         second.list_change_requests(&repository).unwrap();
         let requests = server.requests();
         assert_eq!(requests.len(), 4);
+        assert!(requests[2].contains("state=open"));
         assert!(requests[2].contains("limit=7"));
+        assert!(requests[3].contains("state=open"));
         assert!(requests[3].contains("limit=7"));
     }
 

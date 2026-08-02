@@ -92,7 +92,7 @@ impl GitLabAdapter {
 
     pub(super) fn list_change_requests(&self) -> Result<Vec<ChangeRequestSummary>, RemoteError> {
         let endpoint = format!(
-            "projects/{}/merge_requests?scope=all&state=all&order_by=updated_at&sort=desc&with_merge_status_recheck=true",
+            "projects/{}/merge_requests?scope=all&state=opened&order_by=updated_at&sort=desc&with_merge_status_recheck=true",
             encode_path_segment(self.repository.project_path())
         );
         let page =
@@ -3316,7 +3316,13 @@ mod tests {
         .unwrap();
         summary.lifecycle = LifecycleState::Unknown("preparing".to_string());
         summary.queue_state = QueueState::NotQueued;
-        summary.native_state_evidence.queue.clear();
+        assert_eq!(
+            summary.native_state_evidence.queue,
+            [
+                "merge_when_pipeline_succeeds=false",
+                "auto_merge_enabled=null"
+            ]
+        );
 
         let result = merge_mutation_result(summary, &accepted);
 
@@ -3360,6 +3366,40 @@ mod tests {
             args.windows(2)
                 .any(|pair| pair == ["--raw-field", "squash=true"])
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_change_requests_queries_only_open_requests() {
+        let directory = std::env::temp_dir().join(format!(
+            "prism-gitlab-open-list-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let log = directory.join("glab.log");
+        let glab = directory.join("glab");
+        crate::test_support::write_executable(
+            &glab,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" > '{}'
+printf 'HTTP/2.0 200 OK\r\nX-Page: 1\r\nX-Per-Page: 50\r\nX-Next-Page: \r\nX-Total: 0\r\nX-Total-Pages: 1\r\n\r\n[]'
+"#,
+                log.display()
+            ),
+        );
+        let adapter = GitLabAdapter::with_glab_path(glab.to_str().unwrap(), repository("g/p"));
+
+        assert!(adapter.list_change_requests().unwrap().is_empty());
+
+        let command = std::fs::read_to_string(&log).unwrap();
+        assert!(command.contains("state=opened"), "{command}");
+        assert!(!command.contains("state=all"), "{command}");
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

@@ -4,7 +4,6 @@ use std::collections::BTreeSet;
 use std::time::Instant;
 
 use crate::config::Config;
-use crate::git::current_head_sha;
 use crate::repo::Repository;
 use crate::session::Session;
 use crate::util::timestamp_label;
@@ -66,10 +65,17 @@ pub(crate) fn load_pr_cache_for_branch(
     branch: &str,
     path: &std::path::Path,
 ) -> PrCache {
-    if !cache_eligible_for_worktree(branch, path, config) {
+    if config.is_default_branch(branch) || branch == "(detached)" {
         return remove_invalid_pr_cache(repo, branch);
     }
-    let cache = super::store::load_pr_cache(repo, branch);
+    let mut cache = super::store::load_pr_cache(repo, branch);
+    if let Err(error) =
+        super::discover_git_remote(path, config, "origin", super::RemoteUrlKind::Fetch)
+    {
+        cache.record_remote_unavailable(error.to_string());
+        super::store::persist_observation_errors(repo, branch, &mut cache);
+        return cache;
+    }
     if cache.summary.as_ref().is_some_and(|summary| {
         summary.head_ref != branch
             && (summary.change_request_identity.is_none() || summary.head_sha.trim().is_empty())
@@ -88,7 +94,7 @@ fn remove_invalid_pr_cache(repo: &Repository, branch: &str) -> PrCache {
 
 pub(super) fn pr_summary_matches_worktree(
     summary: &PrSummary,
-    branch: &str,
+    source_branch: &str,
     known_summary: Option<&PrSummary>,
     origin_push: Option<&crate::remote::RemoteRepositoryId>,
     local_head: Option<&str>,
@@ -97,7 +103,7 @@ pub(super) fn pr_summary_matches_worktree(
         known.change_request_identity.is_some()
             && known.change_request_identity == summary.change_request_identity
     });
-    let initial_canonical_association = summary.head_ref == branch
+    let initial_canonical_association = summary.head_ref == source_branch
         && local_head == Some(summary.head_sha.as_str())
         && summary
             .change_request_identity
@@ -127,20 +133,26 @@ pub(crate) fn resolve_pr_summary_for_session(
     if !PrCacheEligibility::for_successful_index(session, config).can_observe() {
         return None;
     }
-    let origin_push =
-        super::discover_git_remote(&session.path, config, "origin", super::RemoteUrlKind::Push)
-            .ok()
-            .map(|remote| remote.repository.id);
-    let local_head = current_head_sha(&session.path, config).ok();
+    let source_push = super::dispatcher::prepare_push(&session.path, config, &session.branch).ok();
+    let known_summary = session
+        .pr
+        .summary_observed_in_process
+        .then_some(session.pr.summary.as_ref())
+        .flatten();
     summaries
         .iter()
         .find(|summary| {
             pr_summary_matches_worktree(
                 summary,
-                &session.branch,
-                session.pr.summary.as_ref(),
-                origin_push.as_ref(),
-                local_head.as_deref(),
+                source_push
+                    .as_ref()
+                    .map(|guard| guard.remote_branch.as_str())
+                    .unwrap_or(session.branch.as_str()),
+                known_summary,
+                source_push.as_ref().map(|guard| &guard.repository),
+                source_push
+                    .as_ref()
+                    .map(|guard| guard.expected_head_sha.as_str()),
             )
         })
         .cloned()

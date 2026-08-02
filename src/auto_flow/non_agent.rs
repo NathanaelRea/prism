@@ -2159,7 +2159,7 @@ fn current_work_guard(
     cache: &crate::remote::PrCache,
 ) -> Result<stabilization_model::WorkGuard, String> {
     let summary = cache.trusted_summary()?;
-    let remote_head_sha = crate::git::remote_branch_head_sha(
+    let remote_head_sha = stabilization_observe::push_remote_head_sha(
         &persisted.run.worktree_path,
         &persisted.run.branch,
         config,

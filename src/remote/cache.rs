@@ -132,6 +132,19 @@ impl PrCache {
             .map(PrDetailsAssociation::from_summary)
     }
 
+    pub(crate) fn reauthorize_guarded_summary(
+        &mut self,
+        expected_identity: &crate::remote::CanonicalChangeRequestIdentity,
+        expected_head_sha: &str,
+    ) {
+        if self.summary.as_ref().is_some_and(|summary| {
+            summary.change_request_identity.as_ref() == Some(expected_identity)
+                && summary.head_sha == expected_head_sha
+        }) {
+            self.summary_observed_in_process = true;
+        }
+    }
+
     fn next_generation(&mut self) -> u64 {
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
         self.next_generation

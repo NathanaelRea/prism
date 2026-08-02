@@ -12,6 +12,41 @@ use crate::verify::{VerifyCheckKind, VerifyCheckResult, run_merge_conflict_check
 
 use super::stabilization_model::*;
 
+pub(super) fn push_remote_head_sha(
+    path: &std::path::Path,
+    branch: &str,
+    config: &Config,
+) -> Result<Option<String>, String> {
+    let source_push = crate::remote::dispatcher::prepare_push(path, config, branch)?;
+    git::push_remote_branch_head_sha(
+        path,
+        &source_push.remote,
+        &source_push.remote_branch,
+        config,
+    )
+}
+
+pub(super) fn reauthorize_pending_push_cache(
+    cache: &mut PrCache,
+    path: &std::path::Path,
+    guard: &PendingPushGuard,
+    config: &Config,
+) {
+    let local_head = git::current_head_sha(path, config).ok();
+    if local_head.as_deref() != Some(guard.expected_local_head_sha.as_str()) {
+        return;
+    }
+    let Some(identity) = guard.change_request_identity.as_ref() else {
+        return;
+    };
+    if let Some(pr_head) = guard.expected_pr_head_sha.as_deref() {
+        cache.reauthorize_guarded_summary(identity, pr_head);
+    }
+    if !guard.commit_sha.is_empty() {
+        cache.reauthorize_guarded_summary(identity, &guard.commit_sha);
+    }
+}
+
 pub(crate) fn build_stabilization_snapshot(
     repo: &Repository,
     session: &Session,
@@ -19,7 +54,7 @@ pub(crate) fn build_stabilization_snapshot(
     config: &Config,
 ) -> StabilizationSnapshot {
     let local_head_sha = git::current_head_sha(&session.path, config).ok();
-    let remote_head_sha = git::remote_branch_head_sha(&session.path, &session.branch, config)
+    let remote_head_sha = push_remote_head_sha(&session.path, &session.branch, config)
         .ok()
         .flatten();
     let remote = crate::remote::discover_git_remote(
@@ -120,6 +155,9 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
     config: &Config,
 ) -> StabilizationSnapshot {
     let mut cache = crate::remote::load_pr_cache(repo, &run.branch);
+    if let Some(guard) = run.pending_push.as_ref() {
+        reauthorize_pending_push_cache(&mut cache, &run.worktree_path, guard, config);
+    }
     let _ = crate::remote::dispatcher::refresh_change_request_cache(
         repo,
         &run.branch,
@@ -144,7 +182,7 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
         None
     };
     let local_head_sha = git::current_head_sha(&run.worktree_path, config).ok();
-    let remote_head_sha = git::remote_branch_head_sha(&run.worktree_path, &run.branch, config)
+    let remote_head_sha = push_remote_head_sha(&run.worktree_path, &run.branch, config)
         .ok()
         .flatten();
     let remote = crate::remote::discover_git_remote(
@@ -655,6 +693,126 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn push_remote_head_uses_the_configured_remote_branch() {
+        let temp = unique_temp_dir("prism-push-remote-head-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("git.log");
+        let git = temp.join("git");
+        write_executable(
+            &git,
+            &format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$*" in
+  *"branch --show-current"*) printf '%s\n' 'topic' ;;
+  *"for-each-ref --format=%(push:remotename)%00%(push) refs/heads/topic"*) printf 'publish\000refs/remotes/publish/review/topic\n' ;;
+  *"remote get-url --push --all publish"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
+  *"remote get-url publish --push"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
+  *"rev-parse HEAD"*) printf '%s\n' 'local-head' ;;
+  *"ls-remote --exit-code --heads https://github.com/contributor/widget.git refs/heads/review/topic"*) printf '%s\t%s\n' 'remote-head' 'refs/heads/review/topic' ;;
+  *) exit 1 ;;
+esac
+"#,
+                log.display()
+            ),
+        );
+        let mut config = test_config(false);
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+
+        assert_eq!(
+            push_remote_head_sha(&temp, "topic", &config).unwrap(),
+            Some("remote-head".to_string())
+        );
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(commands.contains("refs/heads/review/topic"));
+        assert!(!commands.contains("refs/remotes/origin/topic"));
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_push_snapshot_keeps_a_freshly_merged_repair_head() {
+        let temp = unique_temp_dir("prism-merged-repair-snapshot-test");
+        fs::create_dir_all(&temp).unwrap();
+        let git = temp.join("git");
+        let gh = temp.join("gh");
+        write_executable(
+            &git,
+            r#"#!/bin/sh
+case "$*" in
+  *"branch --show-current"*) printf '%s\n' 'feature' ;;
+  *"for-each-ref --format=%(push:remotename)%00%(push) refs/heads/feature"*) printf 'origin\000refs/remotes/origin/feature\n' ;;
+  *"remote get-url --push --all origin"*|*"remote get-url origin"*) printf '%s\n' 'https://github.com/example/repo.git' ;;
+  *"rev-parse HEAD"*) printf '%s\n' 'repair-head' ;;
+  *"ls-remote --exit-code --heads https://github.com/example/repo.git refs/heads/feature"*) printf '%s\t%s\n' 'repair-head' 'refs/heads/feature' ;;
+  *"fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main"*) exit 0 ;;
+  *"rev-parse --verify --quiet refs/remotes/origin/main"*) printf '%s\n' 'base-head' ;;
+  *"merge-tree --write-tree HEAD origin/main"*) printf '%s\n' 'tree-head' ;;
+  *"status --short"*) exit 0 ;;
+  *) exit 1 ;;
+esac
+"#,
+        );
+        write_executable(
+            &gh,
+            r#"#!/bin/sh
+case "$*" in
+  *"reviewThreads(first: 100"*) printf '%s\n' '[{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]}}}}}]' ;;
+  *"/issues/42/comments?per_page=100"*|*"/pulls/42/reviews?per_page=100"*|*"/pulls/42/files?per_page=100"*|*"/commits/repair-head/statuses?per_page=100"*) printf '%s\n' '[[]]' ;;
+  *"/commits/repair-head/check-runs?per_page=100"*) printf '%s\n' '[{"total_count":0,"check_runs":[]}]' ;;
+  "run list "*) printf '%s\n' '[]' ;;
+  api\ graphql*) printf '%s\n' '{"data":{"repository":{"pullRequest":{"id":"PR_test","number":42,"title":"Repair","state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","headRefName":"feature","baseRefName":"main","headRefOid":"repair-head","headRepository":{"nameWithOwner":"example/repo"},"baseRepository":{"nameWithOwner":"example/repo"}}}}}' ;;
+  *) exit 1 ;;
+esac
+"#,
+        );
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut config = test_config(false);
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+        let mut summary = test_summary();
+        summary.head_sha = "repair-head".to_string();
+        summary.change_request_identity = Some(crate::remote::test_change_request_identity());
+        save_pr_cache(
+            &repo,
+            "feature",
+            &PrCache::observed(summary, Some(PrDetails::default())),
+        )
+        .unwrap();
+        let mut run = super::super::AutoLaunch::new(&temp, &temp, "feature", "Repair")
+            .unwrap()
+            .create_run()
+            .run;
+        run.pending_push = Some(PendingPushGuard {
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
+            repair_kind: RepairKind::Review,
+            commit_sha: "repair-head".to_string(),
+            expected_local_head_sha: "repair-head".to_string(),
+            expected_remote_head_sha: Some("old-head".to_string()),
+            pr_number: Some(42),
+            expected_pr_head_sha: Some("old-head".to_string()),
+            expected_base_sha: Some("base-head".to_string()),
+            guarded_review_thread_ids: Vec::new(),
+        });
+
+        let snapshot = build_auto_run_stabilization_snapshot(&repo, &run, &config);
+
+        assert_eq!(
+            snapshot.pull_request.map(|request| request.state),
+            Some(PullRequestState::Merged)
+        );
+        let _ = fs::remove_dir_all(repo.prism_dir());
+        let _ = fs::remove_dir_all(temp);
+    }
+
     #[test]
     fn old_review_body_is_not_actionable_after_baseline() {
         let summary = test_summary();
@@ -1093,7 +1251,11 @@ mod tests {
             &git,
             r#"#!/bin/sh
 case "$*" in
+  *"branch --show-current"*) printf '%s\n' 'feature'; exit 0 ;;
+  *"for-each-ref --format=%(push:remotename)%00%(push) refs/heads/feature"*) printf 'origin\000refs/remotes/origin/feature\n'; exit 0 ;;
+  *"remote get-url --push --all origin"*) printf '%s\n' 'git@github.com:owner/repo.git'; exit 0 ;;
   *"remote get-url origin"*) printf '%s\n' 'git@github.com:owner/repo.git'; exit 0 ;;
+  *"ls-remote --exit-code --heads git@github.com:owner/repo.git refs/heads/feature"*) printf '%s\t%s\n' 'remote123' 'refs/heads/feature'; exit 0 ;;
   *"rev-parse HEAD"*) printf '%s\n' 'local123'; exit 0 ;;
   *"rev-parse --verify --quiet refs/remotes/origin/feature"*) printf '%s\n' 'remote123'; exit 0 ;;
   *"rev-parse --verify --quiet refs/remotes/origin/main"*) printf '%s\n' 'base123'; exit 0 ;;

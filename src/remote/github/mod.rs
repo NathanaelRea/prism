@@ -12,7 +12,6 @@ use serde::Deserialize;
 
 use crate::config::Config;
 use crate::config::MergeMethod;
-use crate::git::current_head_sha;
 use crate::process::{
     ProcessDescriptor, ProcessPolicy, run_capture_named, run_output_allow_failure_named,
 };
@@ -471,19 +470,24 @@ pub fn refresh_pr_cache(
         super::store::persist_pr_summary_mutation(repo, branch, cache, mutation);
         return cache.refresh_result();
     }
-    let result = fetch_pr_summary(path, branch, config).map(|observation| {
-        let origin_push =
-            super::discover_git_remote(path, config, "origin", super::RemoteUrlKind::Push)
-                .ok()
-                .map(|remote| remote.repository.id);
-        let local_head = current_head_sha(path, config).ok();
+    let source_push = super::dispatcher::prepare_push(path, config, branch).ok();
+    let source_branch = source_push
+        .as_ref()
+        .map(|guard| guard.remote_branch.as_str())
+        .unwrap_or(branch);
+    let result = fetch_pr_summary(path, source_branch, config).map(|observation| {
         observation.filter(|(summary, _)| {
             super::coordinator::pr_summary_matches_worktree(
                 summary,
-                branch,
-                cache.summary.as_ref(),
-                origin_push.as_ref(),
-                local_head.as_deref(),
+                source_branch,
+                cache
+                    .summary_observed_in_process
+                    .then_some(cache.summary.as_ref())
+                    .flatten(),
+                source_push.as_ref().map(|guard| &guard.repository),
+                source_push
+                    .as_ref()
+                    .map(|guard| guard.expected_head_sha.as_str()),
             )
         })
     });

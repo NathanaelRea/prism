@@ -1493,7 +1493,13 @@ fn pr_summary_index_refresh_updates_sessions_and_pr_cache_storage() {
     config
         .tools
         .insert("git".to_string(), git.display().to_string());
-    let feature_summary = test_summary("feature", "abc123", 2);
+    let mut feature_summary = test_summary("feature", "abc123", 2);
+    feature_summary.change_request_identity = Some(test_identity(
+        crate::remote::ProviderKind::GitHub,
+        "github.com",
+        "example/repo",
+        "PR_feature",
+    ));
     let stale_summary = test_summary("stale", "old", 1);
     let details = PrDetails {
         comments: vec![PrComment {
@@ -1687,7 +1693,7 @@ fn open_pr_from_previous_branch_generation_is_not_reused_even_when_old_head_is_a
 }
 
 #[test]
-fn canonical_cached_pr_survives_restart_on_a_synthetic_local_branch() {
+fn canonical_cached_pr_requires_fresh_reassociation_after_restart() {
     let temp = unique_temp_dir("prism-synthetic-canonical-pr-test");
     fs::create_dir_all(&temp).unwrap();
     let git = temp.join("git");
@@ -1727,9 +1733,108 @@ fn canonical_cached_pr_survives_restart_on_a_synthetic_local_branch() {
     let mut session = test_session("pr-42", loaded);
     session.path = temp.clone();
     assert_eq!(
-        resolve_pr_summary_for_session(&session, &config, &[summary.clone()]),
-        Some(summary)
+        resolve_pr_summary_for_session(&session, &config, &[summary]),
+        None
     );
+
+    let _ = fs::remove_dir_all(repo.prism_dir());
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn guarded_repair_head_uses_exact_lookup_after_restart() {
+    let temp = unique_temp_dir("prism-guarded-repair-restart-test");
+    fs::create_dir_all(&temp).unwrap();
+    let git = temp.join("git");
+    let gh = temp.join("gh");
+    write_executable(
+        &git,
+        "#!/bin/sh\ncase \"$*\" in *\"remote get-url origin\"*) printf '%s\\n' 'https://github.com/example/repo.git' ;; *\"remote get-url upstream\"*) exit 2 ;; *) exit 1 ;; esac\n",
+    );
+    write_executable(
+        &gh,
+        r#"#!/bin/sh
+printf '%s\n' '{"data":{"repository":{"pullRequest":{"id":"PR_test","number":42,"title":"Repair","state":"MERGED","mergedAt":"2026-08-01T00:00:00Z","headRefName":"feature","baseRefName":"main","headRefOid":"repair-head","headRepository":{"nameWithOwner":"example/repo"},"baseRepository":{"nameWithOwner":"example/repo"}}}}}'
+"#,
+    );
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut config = test_config();
+    config
+        .tools
+        .insert("git".to_string(), git.display().to_string());
+    config
+        .tools
+        .insert("gh".to_string(), gh.display().to_string());
+    let identity = test_identity(
+        crate::remote::ProviderKind::GitHub,
+        "github.com",
+        "example/repo",
+        "PR_test",
+    );
+    let mut summary = test_summary("feature", "repair-head", 0);
+    summary.change_request_identity = Some(identity.clone());
+    persist_pr_cache_snapshot(&repo, "feature", &PrCache::observed(summary, None)).unwrap();
+    let mut loaded = load_pr_cache(&repo, "feature");
+    loaded.reauthorize_guarded_summary(&identity, "repair-head");
+
+    crate::remote::dispatcher::refresh_change_request_cache(
+        &repo,
+        "feature",
+        &mut loaded,
+        &temp,
+        &config,
+        false,
+    )
+    .unwrap();
+
+    assert!(loaded.summary().is_some_and(|summary| summary.merged));
+    assert_eq!(
+        loaded.summary_observation_quality(),
+        PrObservationQuality::Fresh
+    );
+    let _ = fs::remove_dir_all(repo.prism_dir());
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn unavailable_remote_discovery_preserves_persisted_cache_as_stale() {
+    let temp = unique_temp_dir("prism-unavailable-remote-cache-test");
+    fs::create_dir_all(&temp).unwrap();
+    let git = temp.join("git");
+    write_executable(&git, "#!/bin/sh\nexit 1\n");
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut config = test_config();
+    config
+        .tools
+        .insert("git".to_string(), git.display().to_string());
+    let summary = test_summary("feature", "head-42", 1);
+    let details = PrDetails {
+        comments: vec![PrComment {
+            body: "cached display state".to_string(),
+            ..PrComment::default()
+        }],
+        ..PrDetails::default()
+    };
+    persist_pr_cache_snapshot(
+        &repo,
+        "feature",
+        &PrCache::observed(summary.clone(), Some(details)),
+    )
+    .unwrap();
+
+    let loaded = load_pr_cache_for_branch(&repo, &config, "feature", &temp);
+
+    assert_eq!(loaded.summary(), Some(&summary));
+    assert_eq!(
+        loaded.details().unwrap().comments[0].body,
+        "cached display state"
+    );
+    assert_eq!(
+        loaded.summary_observation_quality(),
+        PrObservationQuality::PreservedStale
+    );
+    assert!(loaded.display_error().is_some());
+    assert_eq!(load_pr_cache(&repo, "feature").summary(), Some(&summary));
 
     let _ = fs::remove_dir_all(repo.prism_dir());
     let _ = fs::remove_dir_all(temp);
@@ -2905,6 +3010,60 @@ fn initial_association_requires_origin_push_source_and_exact_local_head() {
         Some(&origin_push),
         Some("head-42"),
     ));
+}
+
+#[test]
+fn summary_index_association_uses_the_branch_push_remote() {
+    let temp = unique_temp_dir("prism-branch-push-summary-association");
+    fs::create_dir_all(&temp).unwrap();
+    let git = temp.join("git");
+    write_executable(
+        &git,
+        r#"#!/bin/sh
+case "$*" in
+  *"branch --show-current"*) printf '%s\n' 'topic' ;;
+  *"for-each-ref --format=%(push:remotename)%00%(push) refs/heads/topic"*) printf 'publish\000refs/remotes/publish/review/topic\n' ;;
+  *"remote get-url --push --all publish"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
+  *"remote get-url publish --push"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
+  *"remote get-url origin --push"*) printf '%s\n' 'https://github.com/acme/widget.git' ;;
+  *"rev-parse HEAD"*) printf '%s\n' 'head-42' ;;
+  *) exit 1 ;;
+esac
+"#,
+    );
+    let mut config = test_config();
+    config
+        .tools
+        .insert("git".to_string(), git.display().to_string());
+    let host = crate::remote::HostIdentity::new("github.com", None).unwrap();
+    let source = crate::remote::RemoteRepositoryId::new(
+        crate::remote::ProviderKind::GitHub,
+        host.clone(),
+        "contributor/widget",
+    )
+    .unwrap();
+    let target = crate::remote::RemoteRepositoryId::new(
+        crate::remote::ProviderKind::GitHub,
+        host,
+        "acme/widget",
+    )
+    .unwrap();
+    let mut summary = test_summary("review/topic", "head-42", 0);
+    summary.change_request_identity = Some(crate::remote::CanonicalChangeRequestIdentity::new(
+        &target,
+        &crate::remote::NativeChangeRequestId::new("PR_42").unwrap(),
+        &source,
+        &target,
+    ));
+    let mut session = test_session("topic", PrCache::default());
+    session.path = temp.clone();
+
+    assert_eq!(
+        resolve_pr_summary_for_session(&session, &config, std::slice::from_ref(&summary)),
+        Some(summary)
+    );
+
+    let _ = fs::remove_dir_all(temp);
 }
 
 #[test]

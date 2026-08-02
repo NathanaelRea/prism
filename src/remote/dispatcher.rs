@@ -883,7 +883,8 @@ pub(crate) fn refresh_change_request_cache(
     force_details: bool,
 ) -> Result<(), String> {
     let remotes = configured_remote_repositories(path, config)?;
-    let observation = if let Some(summary) = cache.summary()
+    let observation = if cache.summary_observed_in_process
+        && let Some(summary) = cache.summary()
         && let Ok(change_request) = change_request_from_legacy(summary)
     {
         if let Err(error) = remotes.validate_target_repository(&change_request.target_repository) {
@@ -901,32 +902,35 @@ pub(crate) fn refresh_change_request_cache(
                 })
         }
     } else {
-        let local_head = crate::git::current_head_sha(path, config)?;
-        list_change_requests_for_head(path, config, Some(branch)).map(|summaries| {
-            let matching = summaries.into_iter().filter(|summary| {
-                summary.head_ref == branch
-                    && summary.head_sha == local_head
-                    && summary
-                        .change_request_identity
-                        .as_ref()
-                        .is_some_and(|identity| {
-                            identity.source_repository().ok().as_ref() == Some(&remotes.origin_push)
-                                && identity.target_repository().ok().is_some_and(|target| {
-                                    remotes.validate_target_repository(&target).is_ok()
-                                })
-                        })
-            });
-            let mut unknown_lifecycle = None;
-            for summary in matching {
-                if summary.state.eq_ignore_ascii_case("OPEN") && !summary.merged {
-                    return Some(summary);
+        let source_push = prepare_push(path, config, branch)?;
+        list_change_requests_for_head(path, config, Some(&source_push.remote_branch)).map(
+            |summaries| {
+                let matching = summaries.into_iter().filter(|summary| {
+                    summary.head_ref == source_push.remote_branch
+                        && summary.head_sha == source_push.expected_head_sha
+                        && summary
+                            .change_request_identity
+                            .as_ref()
+                            .is_some_and(|identity| {
+                                identity.source_repository().ok().as_ref()
+                                    == Some(&source_push.repository)
+                                    && identity.target_repository().ok().is_some_and(|target| {
+                                        remotes.validate_target_repository(&target).is_ok()
+                                    })
+                            })
+                });
+                let mut unknown_lifecycle = None;
+                for summary in matching {
+                    if summary.state.eq_ignore_ascii_case("OPEN") && !summary.merged {
+                        return Some(summary);
+                    }
+                    if !known_legacy_lifecycle(&summary) {
+                        unknown_lifecycle = Some(summary);
+                    }
                 }
-                if !known_legacy_lifecycle(&summary) {
-                    unknown_lifecycle = Some(summary);
-                }
-            }
-            unknown_lifecycle
-        })
+                unknown_lifecycle
+            },
+        )
     };
     super::store::record_provider_summary_refresh(repo, branch, cache, observation)?;
     if force_details && cache.summary().is_some() {
@@ -2125,7 +2129,7 @@ esac
 
     #[cfg(unix)]
     #[test]
-    fn triangular_polling_associates_the_origin_push_repository_as_source() {
+    fn polling_associates_the_configured_branch_push_repository_as_source() {
         let directory = std::env::temp_dir().join(format!(
             "prism-triangular-poll-{}-{}",
             std::process::id(),
@@ -2143,10 +2147,14 @@ esac
             "git",
             r#"#!/bin/sh
 case "$*" in
-  *"remote get-url origin --push"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
-  *"remote get-url upstream --push"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
+  *"remote get-url --push --all publish"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
+  *"remote get-url publish --push"*) printf '%s\n' 'https://github.com/contributor/widget.git' ;;
+  *"remote get-url origin --push"*) printf '%s\n' 'https://github.com/acme/widget.git' ;;
+  *"remote get-url upstream --push"*) printf '%s\n' 'https://github.com/acme/widget.git' ;;
   *"remote get-url origin"*) printf '%s\n' 'https://github.com/acme/widget.git' ;;
   *"remote get-url upstream"*) printf '%s\n' 'https://github.com/acme/widget.git' ;;
+  *"branch --show-current"*) printf '%s\n' 'topic' ;;
+  *"for-each-ref --format=%(push:remotename)%00%(push) refs/heads/topic"*) printf 'publish\000refs/remotes/publish/review/topic\n' ;;
   *"rev-parse HEAD"*) printf '%s\n' 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' ;;
   *) exit 1 ;;
 esac
@@ -2159,7 +2167,7 @@ esac
             &format!(
                 r#"#!/bin/sh
 printf '%s\n' "$*" >> '{}'
-printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_fork","number":42,"title":"Fork change","state":"OPEN","merged":false,"headRefName":"topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}},"comments":{{"totalCount":4}},"reviewThreads":{{"totalCount":2}}}}],"pageInfo":{{"hasNextPage":false}}}}}}}}}}'
+printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_fork","number":42,"title":"Fork change","state":"OPEN","merged":false,"headRefName":"review/topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}},"comments":{{"totalCount":4}},"reviewThreads":{{"totalCount":2}}}}],"pageInfo":{{"hasNextPage":false}}}}}}}}}}'
 "#,
                 gh_log.display()
             ),
@@ -2184,7 +2192,7 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_fo
         assert_eq!(cache.summary().unwrap().comment_count, 6);
         let commands = std::fs::read_to_string(&gh_log).unwrap();
         assert_eq!(commands.matches("api graphql").count(), 1);
-        assert!(commands.contains("headRefName=topic"));
+        assert!(commands.contains("headRefName=review/topic"));
         assert!(commands.contains("states: OPEN"));
         std::fs::remove_dir_all(directory).unwrap();
     }

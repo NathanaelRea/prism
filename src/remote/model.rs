@@ -982,12 +982,12 @@ impl MergeMutationResult {
         } else if matches!(
             summary.queue_state,
             QueueState::Queued | QueueState::Running | QueueState::Blocked
-        ) || summary.native_state_evidence.queue.iter().any(|state| {
-            !matches!(
-                state.trim().to_ascii_lowercase().as_str(),
-                "" | "null" | "none" | "not_queued" | "unsupported" | "unknown"
-            )
-        }) {
+        ) || summary
+            .native_state_evidence
+            .queue
+            .iter()
+            .any(|state| native_queue_evidence_is_positive(state))
+        {
             MergeMutationOutcome::Pending
         } else {
             MergeMutationOutcome::Uncertain
@@ -998,6 +998,20 @@ impl MergeMutationResult {
             summary,
         }
     }
+}
+
+fn native_queue_evidence_is_positive(state: &str) -> bool {
+    let state = state.trim().to_ascii_lowercase();
+    if let Some((_, value)) = state.split_once('=') {
+        return matches!(
+            value.trim(),
+            "true" | "queued" | "pending" | "running" | "active" | "blocked"
+        );
+    }
+    !matches!(
+        state.as_str(),
+        "" | "false" | "null" | "none" | "not_queued" | "not queued" | "unsupported" | "unknown"
+    )
 }
 
 impl GuardedMerge {

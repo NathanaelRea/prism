@@ -520,7 +520,7 @@ pub(crate) fn prepare_standalone_repair(
     let summary = session.pr.trusted_summary()?;
     let local_head_sha = Some(crate::git::current_head_sha(&session.path, config)?);
     let remote_head_sha =
-        crate::git::remote_branch_head_sha(&session.path, &session.branch, config)?;
+        stabilization_observe::push_remote_head_sha(&session.path, &session.branch, config)?;
     let pr_head_sha = summary.map(|summary| summary.head_sha.clone());
     let base_sha = match summary {
         Some(summary) => crate::remote::dispatcher::fetch_change_request_base_head_sha(
@@ -1368,7 +1368,7 @@ pub(crate) fn progress_pending_push(
             summary,
         )?;
         let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config)?;
-        let remote_head = crate::git::remote_branch_head_sha(
+        let remote_head = stabilization_observe::push_remote_head_sha(
             &persisted.run.worktree_path,
             &persisted.run.branch,
             config,
@@ -1409,13 +1409,29 @@ pub(crate) fn progress_pending_push(
     }
 
     refresh_after_guarded_effect(repo, config, persisted, cache)?;
+    let guarded_work = observe_plan_and_save(conn, repo, config, persisted)?;
     let completed_guard = persisted.run.pending_push.take();
-    if let Err(error) = observe_plan_and_save(conn, repo, config, persisted) {
+    persisted.run.status = persisted.authoritative_status();
+    persisted.run.updated_unix_ms = unix_ms();
+    let replan_result = if guarded_replan_is_terminal(&guarded_work) {
+        save_run_with_conn(conn, &persisted.run)
+    } else {
+        observe_plan_and_save(conn, repo, config, persisted).map(|_| ())
+    };
+    if let Err(error) = replan_result {
         persisted.run.pending_push = completed_guard;
         let _ = save_run_with_conn(conn, &persisted.run);
         return Err(error);
     }
     Ok(progress)
+}
+
+fn guarded_replan_is_terminal(work: &StabilizationWorkItem) -> bool {
+    matches!(
+        work.blocker,
+        super::stabilization_model::StabilizationBlocker::Merged
+            | super::stabilization_model::StabilizationBlocker::Escalate
+    )
 }
 
 fn observe_guarded_push_decision(
@@ -1426,6 +1442,12 @@ fn observe_guarded_push_decision(
     cache: &mut crate::remote::PrCache,
     guard: &PendingPushGuard,
 ) -> Result<GuardedPushDecision, String> {
+    stabilization_observe::reauthorize_pending_push_cache(
+        cache,
+        &persisted.run.worktree_path,
+        guard,
+        config,
+    );
     crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
     crate::remote::dispatcher::refresh_change_request_cache(
         repo,
@@ -1442,7 +1464,7 @@ fn observe_guarded_push_decision(
         summary.and_then(|summary| summary.change_request_identity.as_ref()),
     )?;
     let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
-    let remote_head = crate::git::remote_branch_head_sha(
+    let remote_head = stabilization_observe::push_remote_head_sha(
         &persisted.run.worktree_path,
         &persisted.run.branch,
         config,
@@ -1517,7 +1539,8 @@ mod tests {
         stabilization_model::{
             ActionableReviewItem, CiFacts, MergeabilityFacts, PolicyBlocker, PolicyFacts,
             PullRequestFacts, PullRequestState, RepairKind, RepositoryFacts, ReviewFacts,
-            ReviewThreadFact, StabilizationGoal, StabilizationSnapshot, WorktreeFacts,
+            ReviewThreadFact, StabilizationBlocker, StabilizationGoal, StabilizationSnapshot,
+            StabilizationWorkKind, WorktreeFacts,
         },
     };
     use crate::config::Config;
@@ -1839,6 +1862,26 @@ mod tests {
         );
 
         assert_eq!(decision, GuardedPushDecision::ValidToPush);
+    }
+
+    #[test]
+    fn terminal_guarded_replans_preserve_exact_provider_state() {
+        let work = |blocker| StabilizationWorkItem {
+            kind: StabilizationWorkKind::Escalate,
+            blocker,
+            reason: String::new(),
+            guard: WorkGuard::default(),
+        };
+
+        assert!(guarded_replan_is_terminal(&work(
+            StabilizationBlocker::Merged
+        )));
+        assert!(guarded_replan_is_terminal(&work(
+            StabilizationBlocker::Escalate
+        )));
+        assert!(!guarded_replan_is_terminal(&work(
+            StabilizationBlocker::PolicyUnknown
+        )));
     }
 
     #[test]

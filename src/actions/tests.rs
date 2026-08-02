@@ -309,7 +309,7 @@ case "$*" in
   *"/repos/example/repo/commits/abc123/statuses?per_page=100"*) echo '[[]]' ;;
   *"pullRequests(first: 100"*)
 cat <<'JSON'
-[{"data":{"repository":{"pullRequests":{"nodes":[{"id":"PR_review","number":42,"title":"Review refresh","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"CHANGES_REQUESTED","reviewRequests":{"nodes":[]},"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","headRepository":{"nameWithOwner":"example/repo"},"baseRepository":{"nameWithOwner":"example/repo"},"updatedAt":"2026-06-14T12:02:00Z","comments":{"totalCount":2},"commits":{"nodes":[]},"isDraft":false}],"pageInfo":{"hasNextPage":false}}}}}]
+[{"data":{"repository":{"pullRequests":{"nodes":[{"id":"PR_test","number":42,"title":"Review refresh","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"CHANGES_REQUESTED","reviewRequests":{"nodes":[]},"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","headRepository":{"nameWithOwner":"example/repo"},"baseRepository":{"nameWithOwner":"example/repo"},"updatedAt":"2026-06-14T12:02:00Z","comments":{"totalCount":2},"commits":{"nodes":[]},"isDraft":false}],"pageInfo":{"hasNextPage":false}}}}}]
 JSON
 ;;
   *"reviewThreads(first: 100"*)
@@ -319,12 +319,12 @@ JSON
 ;;
   api\ graphql*)
 cat <<'JSON'
-{"data":{"repository":{"pullRequest":{"id":"PR_review","number":42,"title":"Review refresh","state":"OPEN","reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","headRepository":{"nameWithOwner":"example/repo"},"baseRepository":{"nameWithOwner":"example/repo"},"commits":{"nodes":[]}}}}}
+{"data":{"repository":{"pullRequest":{"id":"PR_test","number":42,"title":"Review refresh","state":"OPEN","reviewDecision":"CHANGES_REQUESTED","headRefName":"feature","baseRefName":"main","headRefOid":"abc123","headRepository":{"nameWithOwner":"example/repo"},"baseRepository":{"nameWithOwner":"example/repo"},"commits":{"nodes":[]}}}}}
 JSON
 ;;
   *)
 cat <<'JSON'
-{"id":"PR_review","number":42,"title":"Review refresh","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"CHANGES_REQUESTED","reviewRequests":{"nodes":[]},"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","headRepository":{"nameWithOwner":"example/repo"},"updatedAt":"2026-06-14T12:02:00Z","comments":{"totalCount":2},"statusCheckRollup":{"contexts":{"nodes":[]}},"isDraft":false}
+{"id":"PR_test","number":42,"title":"Review refresh","body":"","url":"https://github.com/example/repo/pull/42","state":"OPEN","reviewDecision":"CHANGES_REQUESTED","reviewRequests":{"nodes":[]},"headRefName":"feature","baseRefName":"main","headRefOid":"abc123","headRepository":{"nameWithOwner":"example/repo"},"updatedAt":"2026-06-14T12:02:00Z","comments":{"totalCount":2},"statusCheckRollup":{"contexts":{"nodes":[]}},"isDraft":false}
 JSON
 ;;
 esac
@@ -335,9 +335,13 @@ esac
         &git,
         r#"#!/bin/sh
 case "$*" in
+  *"branch --show-current"*) echo "feature" ;;
+  *"for-each-ref --format=%(push:remotename)%00%(push) refs/heads/feature"*) printf 'origin\000refs/remotes/origin/feature\n' ;;
+  *"remote get-url --push --all origin"*) echo "https://github.com/example/repo.git" ;;
   *"remote get-url origin"*)
 echo "https://github.com/example/repo.git"
 ;;
+  *"ls-remote --exit-code --heads https://github.com/example/repo.git refs/heads/feature"*) printf '%s\t%s\n' 'abc123' 'refs/heads/feature' ;;
   *"rev-parse HEAD"*)
 echo "abc123"
 ;;
@@ -369,7 +373,7 @@ esac
     session.pr = PrCache::observed(
         PrSummary {
             number: 42,
-            change_request_identity: None,
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             native_state_evidence: crate::remote::NativeStateEvidence::default(),
             title: "Stale review".to_string(),
             author: "author".to_string(),
@@ -473,6 +477,10 @@ case "$*" in
       echo '[{{"data":{{"repository":{{"pullRequest":{{"reviewThreads":{{"totalCount":1,"pageInfo":{{"hasNextPage":false}},"nodes":[{{"id":"PRRT_guarded_1","isResolved":false,"comments":{{"totalCount":1,"pageInfo":{{"hasNextPage":false}},"nodes":[{{"id":"PRRC_guarded","path":"src/lib.rs","originalLine":12,"body":"address guarded feedback","createdAt":"2026-07-13T12:00:30Z","author":{{"login":"reviewer"}}}}]}}}}]}}}}}}}}}}]'
     fi
     ;;
+  *"pullRequests(first: 100"*)
+    if [ -f '{}' ]; then decision=APPROVED; else decision=CHANGES_REQUESTED; fi
+    echo "[{{\"data\":{{\"repository\":{{\"pullRequests\":{{\"nodes\":[{{\"id\":\"PR_test\",\"number\":42,\"title\":\"Guarded repair\",\"state\":\"OPEN\",\"reviewDecision\":\"$decision\",\"headRefName\":\"feature\",\"baseRefName\":\"main\",\"headRefOid\":\"repair-sha\",\"headRepository\":{{\"nameWithOwner\":\"example/repo\"}},\"baseRepository\":{{\"nameWithOwner\":\"example/repo\"}},\"commits\":{{\"nodes\":[{{\"commit\":{{\"statusCheckRollup\":{{\"contexts\":{{\"pageInfo\":{{\"hasNextPage\":false}},\"nodes\":[{{\"context\":\"ci\",\"state\":\"SUCCESS\"}}]}}}}}}}}]}}}}],\"pageInfo\":{{\"hasNextPage\":false}}}}}}}}}}]"
+    ;;
   api\ graphql*)
     if [ -f '{}' ]; then decision=APPROVED; else decision=CHANGES_REQUESTED; fi
     echo "{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"id\":\"PR_test\",\"number\":42,\"title\":\"Guarded repair\",\"state\":\"OPEN\",\"reviewDecision\":\"$decision\",\"headRefName\":\"feature\",\"baseRefName\":\"main\",\"headRefOid\":\"repair-sha\",\"headRepository\":{{\"nameWithOwner\":\"example/repo\"}},\"baseRepository\":{{\"nameWithOwner\":\"example/repo\"}},\"commits\":{{\"nodes\":[{{\"commit\":{{\"statusCheckRollup\":{{\"contexts\":{{\"pageInfo\":{{\"hasNextPage\":false}},\"nodes\":[{{\"context\":\"ci\",\"state\":\"SUCCESS\"}}]}}}}}}}}]}}}}}}}}}}"
@@ -489,6 +497,7 @@ esac
             resolved.display(),
             resolved.display(),
             resolved.display(),
+            resolved.display(),
         ),
     )
     .unwrap();
@@ -496,7 +505,11 @@ esac
         &git,
         r#"#!/bin/sh
 case "$*" in
+  *"branch --show-current"*) echo "feature" ;;
+  *"for-each-ref --format=%(push:remotename)%00%(push) refs/heads/feature"*) printf 'origin\000refs/remotes/origin/feature\n' ;;
+  *"remote get-url --push --all origin"*) echo "https://github.com/example/repo.git" ;;
   *"remote get-url origin"*) echo "https://github.com/example/repo.git" ;;
+  *"ls-remote --exit-code --heads https://github.com/example/repo.git refs/heads/feature"*) printf '%s\t%s\n' 'repair-sha' 'refs/heads/feature' ;;
   *"rev-parse HEAD"*) echo "repair-sha" ;;
   *"refs/remotes/origin/feature"*) echo "repair-sha" ;;
   *"refs/remotes/origin/main"*) echo "base-sha" ;;
@@ -706,7 +719,11 @@ esac
         &git,
         r#"#!/bin/sh
 case "$*" in
+  *"branch --show-current"*) echo "feature" ;;
+  *"for-each-ref --format=%(push:remotename)%00%(push) refs/heads/feature"*) printf 'origin\000refs/remotes/origin/feature\n' ;;
+  *"remote get-url --push --all origin"*) echo "https://github.com/example/repo.git" ;;
   *"remote get-url origin"*) echo "https://github.com/example/repo.git" ;;
+  *"ls-remote --exit-code --heads https://github.com/example/repo.git refs/heads/feature"*) printf '%s\t%s\n' 'repair-sha' 'refs/heads/feature' ;;
   *"rev-parse HEAD"*|*"refs/remotes/origin/feature"*) echo "repair-sha" ;;
   *"refs/remotes/origin/main"*) echo "base-sha" ;;
   *"status --porcelain"*|*"fetch origin"*) exit 0 ;;
@@ -896,9 +913,13 @@ esac
         &git,
         r#"#!/bin/sh
 case "$*" in
+  *"branch --show-current"*) echo "feature" ;;
+  *"for-each-ref --format=%(push:remotename)%00%(push) refs/heads/feature"*) printf 'origin\000refs/remotes/origin/feature\n' ;;
+  *"remote get-url --push --all origin"*) echo "https://github.com/example/repo.git" ;;
   *"remote get-url origin"*)
 echo "https://github.com/example/repo.git"
 ;;
+  *"ls-remote --exit-code --heads https://github.com/example/repo.git refs/heads/feature"*) printf '%s\t%s\n' 'abc123' 'refs/heads/feature' ;;
   *"rev-parse HEAD"*)
 echo "abc123"
 ;;
