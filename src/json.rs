@@ -11,10 +11,12 @@ pub fn json_string_field(text: &str, key: &str) -> Option<String> {
     json_field(text, key).and_then(|value| value.as_str().map(str::to_string))
 }
 
+#[cfg(test)]
 pub fn json_u64_field(text: &str, key: &str) -> Option<u64> {
     json_field(text, key).and_then(|value| value.as_u64())
 }
 
+#[cfg(test)]
 pub fn json_bool_field(text: &str, key: &str) -> Option<bool> {
     json_field(text, key).and_then(|value| value.as_bool())
 }
@@ -38,6 +40,7 @@ fn find_json_field<'a>(value: &'a serde_json::Value, key: &str) -> Option<&'a se
     }
 }
 
+#[cfg(test)]
 pub fn json_object_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let needle = format!("\"{key}\"");
     let start = text.find(&needle)?;
@@ -76,47 +79,6 @@ pub fn json_object_field<'a>(text: &'a str, key: &str) -> Option<&'a str> {
         }
     }
     None
-}
-
-pub fn json_top_level_objects(text: &str) -> Vec<&str> {
-    let mut objects = Vec::new();
-    let mut start = None;
-    let mut depth = 0_i32;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (index, ch) in text.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if in_string {
-            if ch == '\\' {
-                escaped = true;
-            } else if ch == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        match ch {
-            '"' => in_string = true,
-            '{' => {
-                if depth == 0 {
-                    start = Some(index);
-                }
-                depth += 1;
-            }
-            '}' => {
-                depth -= 1;
-                if depth == 0
-                    && let Some(object_start) = start.take()
-                {
-                    objects.push(&text[object_start..=index]);
-                }
-            }
-            _ => {}
-        }
-    }
-    objects
 }
 
 #[cfg(test)]

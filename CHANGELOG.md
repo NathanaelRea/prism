@@ -7,10 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-
-- Opt-in desktop notifications for Agent Sessions that need input, complete, fail, or need restart.
-
 ## [0.1.4](https://github.com/NathanaelRea/prism/compare/v0.1.3...v0.1.4) - 2026-07-31
 
 ### Added

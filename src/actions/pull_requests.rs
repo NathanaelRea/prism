@@ -79,6 +79,49 @@ pub(super) fn open_url_in_browser(url: &str) -> Result<(), String> {
     .map(|_| ())
 }
 
+pub(super) fn open_http_url_in_browser(url: &str) -> Result<(), String> {
+    let scheme = url.split_once(':').map(|(scheme, _)| scheme);
+    if !scheme.is_some_and(|scheme| {
+        scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https")
+    }) {
+        return Err("development URL must use http or https".to_string());
+    }
+    run_browser_opener_private(
+        crate::platform::browser_candidates(crate::platform::current_os()),
+        url,
+    )
+    .map(|_| ())
+}
+
+fn run_browser_opener_private(
+    candidates: &[crate::platform::CommandCandidate<'_>],
+    url: &str,
+) -> Result<String, String> {
+    for candidate in candidates {
+        if !command_exists(candidate.program) {
+            continue;
+        }
+        let mut command = Command::new(candidate.program);
+        command
+            .args(candidate.args)
+            .arg(url)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        match command.spawn() {
+            Ok(mut child) => {
+                let program = candidate.program.to_string();
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Ok(program);
+            }
+            Err(_) => continue,
+        }
+    }
+    Err("no usable browser opener found".to_string())
+}
+
 pub(super) fn run_browser_opener(
     candidates: &[crate::platform::CommandCandidate<'_>],
     url: &str,
@@ -252,24 +295,36 @@ impl Tui {
             "Remote Pull Requests",
             &format!("Opening worktree for PR #{}", summary.number),
         )?;
-        let creation = match checkout_worktree_session(&context.repo, &context.config, &branch) {
+        let first_attempt = checkout_worktree_session(&context.repo, &context.config, &branch);
+        self.request_wt_hook_log_refresh(context.repo_index);
+        let creation = match first_attempt {
             Ok(outcome) => outcome,
             Err(error) => {
-                if !is_worktrunk_approval_failure(&error)
+                if !error.approval_required()
                     || !self.offer_worktrunk_approval(raw, &context.repo, &context.config)?
                 {
-                    return Err(error);
+                    self.request_wt_poll(context.repo_index);
+                    return Err(error.to_string());
                 }
                 self.show_loading_dialog(
                     raw,
                     "Remote Pull Requests",
                     &format!("Opening worktree for PR #{}", summary.number),
                 )?;
-                checkout_worktree_session(&context.repo, &context.config, &branch)?
+                let retry = checkout_worktree_session(&context.repo, &context.config, &branch);
+                self.request_wt_hook_log_refresh(context.repo_index);
+                match retry {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        self.request_wt_poll(context.repo_index);
+                        return Err(error.to_string());
+                    }
+                }
             }
         };
         if let CreateWorktreeOutcome::CreatedMetadataFailed { error } = creation {
             self.refresh_sessions()?;
+            self.request_wt_poll(context.repo_index);
             self.show_message(&format!(
                 "worktree opened, but restoring Prism metadata failed: {error}"
             ))?;
@@ -277,8 +332,8 @@ impl Tui {
         }
 
         self.refresh_sessions()?;
+        self.request_wt_poll(context.repo_index);
         self.start_tmux_agent_warmup();
-        self.start_wt_column_poll();
         self.select_pr_worktree_by_branch(context.repo_index, &branch, Some(summary.clone()));
         self.focus_worktrees();
         self.show_message(&format!("opened worktree for PR #{}", summary.number))?;

@@ -32,10 +32,27 @@ jobs:
       - name: Install macOS integration dependencies
         if: runner.os == 'macOS'
         run: brew install tmux
+      - name: Install Worktrunk 0.71.0
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/max-sixty/worktrunk/releases/download/v0.71.0/worktrunk-installer.sh \
+            | sh
+          wt --version
       - name: Native macOS platform smoke
         if: runner.os == 'macOS'
         run: scripts/platform-smoke.sh
       - run: scripts/full-check.sh
+      - name: Smoke-test Prism's real Worktrunk integration
+        run: |
+          set -eu
+          smoke_root="$(mktemp -d)"
+          trap 'rm -rf "$smoke_root"' EXIT
+          export WORKTRUNK_CONFIG_PATH="$smoke_root/worktrunk.toml"
+          export WORKTRUNK_WORKTREE_PATH="$smoke_root/worktrees/{{ branch | sanitize }}"
+          export PRISM_TEST_WORKTRUNK="$(command -v wt)"
+          : > "$WORKTRUNK_CONFIG_PATH"
+          cargo test worktrunk::tests::real_worktrunk_create_observe_remove_smoke \
+            -- --ignored --exact
       - name: Test real OpenCode integration
         if: runner.os == 'Linux'
         run: |

@@ -19,7 +19,38 @@ pub(super) fn archived_picker_overflow_message(
 }
 
 impl Tui {
+    pub(crate) fn open_selected_development_url(&mut self) -> Result<(), String> {
+        if self.focused_panel != crate::tui::PanelFocus::Worktrees {
+            return Err("focus worktrees to open a development URL".to_string());
+        }
+        let context = self
+            .selected_worktree_context()
+            .ok_or_else(|| "no worktree selected".to_string())?;
+        let session = self
+            .sessions
+            .get(context.session_index)
+            .ok_or_else(|| "no worktree selected".to_string())?;
+        let managed = self
+            .repos
+            .get(session.repo_index)
+            .ok_or_else(|| "repository is no longer available".to_string())?;
+        let stale = matches!(
+            &managed.wt_quality,
+            crate::worktrunk::ObservationQuality::Stale { .. }
+        );
+        let key = session.identity_key(&managed.identity);
+        let url = managed
+            .wt_facts
+            .get(&key)
+            .and_then(|facts| facts.dev_server.as_ref())
+            .map(|server| server.url.clone())
+            .ok_or_else(|| "selected worktree has no development URL".to_string())?;
+        super::pull_requests::open_http_url_in_browser(&url)?;
+        self.show_message(development_url_opened_message(stale))
+    }
+
     pub(crate) fn refresh_sessions_after_tmux(&mut self) -> Result<(), String> {
+        self.start_wt_column_poll();
         self.route_tui_job_messages();
         self.poll_session_refresh();
         if self.session_refresh_in_flight {
@@ -338,32 +369,43 @@ impl Tui {
             "Create Session",
             &format!("Creating worktree for {}", branch.trim()),
         )?;
-        let creation = match create_worktree_session(&context.repo, &context.config, branch.trim())
-        {
+        let first_attempt = create_worktree_session(&context.repo, &context.config, branch.trim());
+        self.request_wt_hook_log_refresh(context.repo_index);
+        let creation = match first_attempt {
             Ok(outcome) => outcome,
             Err(error) => {
-                if !is_worktrunk_approval_failure(&error)
+                if !error.approval_required()
                     || !self.offer_worktrunk_approval(raw, &context.repo, &context.config)?
                 {
-                    return Err(error);
+                    self.request_wt_poll(context.repo_index);
+                    return Err(error.to_string());
                 }
                 self.show_loading_dialog(
                     raw,
                     "Create Session",
                     &format!("Creating worktree for {}", branch.trim()),
                 )?;
-                create_worktree_session(&context.repo, &context.config, branch.trim())?
+                let retry = create_worktree_session(&context.repo, &context.config, branch.trim());
+                self.request_wt_hook_log_refresh(context.repo_index);
+                match retry {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        self.request_wt_poll(context.repo_index);
+                        return Err(error.to_string());
+                    }
+                }
             }
         };
         if let CreateWorktreeOutcome::CreatedMetadataFailed { error } = creation {
             self.refresh_sessions()?;
+            self.request_wt_poll(context.repo_index);
             self.show_message(&format!(
                 "worktree created, but restoring Prism metadata failed: {error}"
             ))?;
             return Ok(true);
         }
         self.refresh_sessions()?;
-        self.start_wt_column_poll();
+        self.request_wt_poll(context.repo_index);
         let index = self
             .sessions
             .iter()
@@ -573,10 +615,20 @@ impl Tui {
             "Unarchive Worktree",
             &format!("Restoring {}", worktree.branch),
         )?;
-        match create_worktree_session(&context.repo, &context.config, &worktree.branch)? {
+        let restoration = create_worktree_session(&context.repo, &context.config, &worktree.branch);
+        self.request_wt_hook_log_refresh(context.repo_index);
+        let restoration = match restoration {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.request_wt_poll(context.repo_index);
+                return Err(error.to_string());
+            }
+        };
+        match restoration {
             CreateWorktreeOutcome::Created | CreateWorktreeOutcome::Restored => {}
             CreateWorktreeOutcome::CreatedMetadataFailed { error } => {
                 self.refresh_sessions()?;
+                self.request_wt_poll(context.repo_index);
                 self.show_message(&format!(
                     "worktree restored, but Prism metadata restoration failed: {error}"
                 ))?;
@@ -584,8 +636,8 @@ impl Tui {
             }
         }
         self.refresh_sessions()?;
+        self.request_wt_poll(context.repo_index);
         self.start_tmux_agent_warmup();
-        self.start_wt_column_poll();
         if let Some(index) = self
             .sessions
             .iter()
@@ -617,9 +669,29 @@ impl Tui {
         }
         let path = self.sessions[selected].path.clone();
         let path_display = self.sessions[selected].path_display.clone();
+        let removal_complete = crate::session::worktree_removal_is_complete(
+            &context.repo,
+            &path,
+            &branch,
+            &self.sessions[selected].incarnation,
+        )?;
         let warnings = self.sessions[selected].deletion_warnings();
         if !self.confirm_delete_dialog(raw, &branch, &path_display, &warnings, false)? {
             return Ok(());
+        }
+        if !removal_complete
+            && check_worktrunk_approval_status(&context.repo, &context.config)?
+                == WorktrunkApprovalStatus::Pending
+        {
+            if !self.offer_worktrunk_approval(raw, &context.repo, &context.config)? {
+                return Ok(());
+            }
+            if check_worktrunk_approval_status(&context.repo, &context.config)?
+                == WorktrunkApprovalStatus::Pending
+            {
+                self.show_message("Worktrunk approvals still pending; deletion was not started")?;
+                return Ok(());
+            }
         }
         self.start_delete_worktree_session(context.repo, context.config, path, branch)?;
         Ok(())
@@ -747,18 +819,21 @@ impl Tui {
                     let _ = self.refresh_sessions_after_tmux();
                     let _ = self.show_message("deleted local session data, worktree, and branch");
                 }
-                Ok(DeleteWorktreeOutcome::BranchRetained { error, .. }) => {
-                    self.sessions.retain(|session| {
-                        session.path != result.key.worktree.path
-                            || session.branch != result.key.worktree.branch
-                    });
-                    if self
-                        .selected_worktree_by_repo
-                        .get(&result.key.worktree.repository.root)
-                        == Some(&result.key.worktree.path)
-                    {
-                        self.selected_worktree_by_repo
-                            .remove(&result.key.worktree.repository.root);
+                Ok(DeleteWorktreeOutcome::BranchRetained {
+                    error,
+                    owned_state_removed,
+                }) => {
+                    if owned_state_removed {
+                        self.sessions.retain(|session| {
+                            session.path != result.key.worktree.path
+                                || session.branch != result.key.worktree.branch
+                        });
+                    } else if let Some(session) = self.sessions.iter_mut().find(|session| {
+                        session.path == result.key.worktree.path
+                            && session.branch == result.key.worktree.branch
+                    }) {
+                        session.hidden = false;
+                        session.status_label = "deletion pending".to_string();
                     }
                     self.ensure_navigation_valid();
                     self.session_inventory_generation =
@@ -769,11 +844,22 @@ impl Tui {
                         "worktree removed, but branch deletion failed: {error}"
                     ));
                 }
-                Ok(DeleteWorktreeOutcome::DeletedWithWarnings { errors, .. }) => {
-                    self.sessions.retain(|session| {
-                        session.path != result.key.worktree.path
-                            || session.branch != result.key.worktree.branch
-                    });
+                Ok(DeleteWorktreeOutcome::DeletedWithWarnings {
+                    errors,
+                    owned_state_removed,
+                }) => {
+                    if owned_state_removed {
+                        self.sessions.retain(|session| {
+                            session.path != result.key.worktree.path
+                                || session.branch != result.key.worktree.branch
+                        });
+                    } else if let Some(session) = self.sessions.iter_mut().find(|session| {
+                        session.path == result.key.worktree.path
+                            && session.branch == result.key.worktree.branch
+                    }) {
+                        session.hidden = false;
+                        session.status_label = "deletion pending".to_string();
+                    }
                     self.ensure_navigation_valid();
                     self.session_inventory_generation =
                         self.session_inventory_generation.saturating_add(1);
@@ -795,6 +881,13 @@ impl Tui {
                     let _ = self.show_message(&format!("delete failed: {error}"));
                 }
             }
+            if let Some(repo_index) = self
+                .repos
+                .iter()
+                .position(|repo| repo.identity == result.key.worktree.repository)
+            {
+                self.request_worktrunk_refreshes(repo_index);
+            }
         }
         changed
     }
@@ -814,5 +907,13 @@ impl Tui {
             session.path.clone(),
             session.branch.clone(),
         )
+    }
+}
+
+pub(super) fn development_url_opened_message(stale: bool) -> &'static str {
+    if stale {
+        "opened development URL from stale Worktrunk observation"
+    } else {
+        "opened development URL in browser"
     }
 }

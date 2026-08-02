@@ -753,7 +753,8 @@ fn apply_additive_schema_migrations(conn: &Connection) -> Result<(), StorageErro
 }
 
 fn additive_schema_current(conn: &Connection) -> Result<bool, StorageError> {
-    table_has_column(conn, "pr_cache", "author")
+    Ok(table_has_column(conn, "pr_cache", "author")?
+        && table_has_column(conn, "pending_worktree_deletion", "branch_deleted")?)
 }
 
 fn table_has_column(
@@ -1560,6 +1561,30 @@ mod tests {
             .unwrap();
 
         assert!(has_author);
+        drop(conn);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn current_schema_reopen_creates_pending_worktree_deletion_table_additively() {
+        let path = test_path("current-additive-worktree-deletion");
+        {
+            let conn = open_writable(&path).unwrap();
+            conn.execute("drop table pending_worktree_deletion", [])
+                .unwrap();
+        }
+
+        let conn = open_writable(&path).unwrap();
+        let table_count: i64 = conn
+            .query_row(
+                "select count(*) from sqlite_master
+                 where type = 'table' and name = 'pending_worktree_deletion'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(table_count, 1);
         drop(conn);
         let _ = fs::remove_file(path);
     }

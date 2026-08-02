@@ -50,6 +50,7 @@ mod view;
 mod worker;
 mod workspace;
 mod workspace_state;
+mod worktrunk;
 
 #[cfg(test)]
 mod platform_contract_tests;

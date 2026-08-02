@@ -5,6 +5,10 @@
 
 ## Creation
 
+- **Invariant**: Prism owns persistent Worktree Session identity and incarnation;
+  Worktrunk owns physical worktree creation, path policy, hook execution, and
+  approvals. Observed Worktrunk state is associated only by repository and exact
+  normalized worktree path, never by branch-name fallback.
 - **Behavior**: `c` creates a Worktree Session from the repositories panel using
   the currently selected repository.
 - **Behavior**: Creation opens a dialog that identifies the target repository and
@@ -20,6 +24,10 @@
   session without synthesizing or submitting text.
 - **Behavior**: Successful creation attaches to the resulting tmux session so
   the user can inspect or edit the agent interaction immediately.
+- **Behavior**: Worktrunk-configured development URLs and listening observations
+  decorate a live Worktree Session. Prism opens known HTTP(S) URLs but does not
+  own or infer the development process; long-running servers remain Worktrunk
+  `post-start`/`tether` responsibilities.
 
 ## Agent Session Lifecycle
 
@@ -66,6 +74,19 @@
 - **Behavior**: Deletion preflights risks, records progress, and is retryable.
   Partial failure reports which resources were removed or preserved and retains
   enough identity and history to retry without applying cleanup to a new session.
+- **Invariant**: Permanent deletion delegates physical removal and pre/post
+  removal hooks to Worktrunk with branch deletion disabled. Prism separately
+  retains its expected-incarnation and expected-branch-OID guard before deleting
+  the branch or retiring Prism-owned state.
+
+## Worktrunk Evidence
+
+- **Behavior**: Users can inspect a bounded, sanitized tail of Worktrunk hook
+  output for a selected repository. Branch labels affect display preference
+  only and never establish Worktree Session identity.
+- **Invariant**: Hook-log presence is not evidence that a process is running or
+  that a hook succeeded. Log bodies are not persisted in Prism state or copied
+  into structured diagnostics; URL listening is the reachability observation.
 
 ## Process Safety
 

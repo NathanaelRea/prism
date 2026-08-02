@@ -91,6 +91,7 @@ pub(crate) enum DialogModel {
     Notice {
         title: String,
         lines: Vec<DialogLine>,
+        scroll: usize,
     },
     Prompt {
         title: String,
@@ -184,6 +185,7 @@ pub(crate) struct WorktreeRow {
     pub status_label: String,
     pub pr: PrCache,
     pub wt_columns: BTreeMap<String, String>,
+    pub development: Option<DevelopmentEnvironment>,
     pub auto_status: Option<AutoRunStatus>,
     pub plan_status: Option<PlanRunStatus>,
     pub updated_label: String,
@@ -191,6 +193,32 @@ pub(crate) struct WorktreeRow {
     pub prompt_summary: String,
     pub classification: SessionClassification,
     pub selected: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DevelopmentEnvironment {
+    pub url: String,
+    pub listening: Option<bool>,
+    pub quality: DevelopmentEnvironmentQuality,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DevelopmentEnvironmentQuality {
+    NeverLoaded,
+    Refreshing,
+    Fresh,
+    Stale,
+}
+
+impl From<&crate::worktrunk::ObservationQuality> for DevelopmentEnvironmentQuality {
+    fn from(value: &crate::worktrunk::ObservationQuality) -> Self {
+        match value {
+            crate::worktrunk::ObservationQuality::NeverLoaded => Self::NeverLoaded,
+            crate::worktrunk::ObservationQuality::Refreshing => Self::Refreshing,
+            crate::worktrunk::ObservationQuality::Fresh => Self::Fresh,
+            crate::worktrunk::ObservationQuality::Stale { .. } => Self::Stale,
+        }
+    }
 }
 
 pub(crate) struct RepoPrRow {

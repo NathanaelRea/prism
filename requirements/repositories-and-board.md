@@ -63,6 +63,10 @@
 - **Customization**: Users can change worktree priority and enable, disable, and
   reorder worktree columns with a reusable ordering dialog. No URL column is
   enabled implicitly.
+- **Behavior**: Worktree details show a known Worktrunk development URL and a
+  non-color listening/unknown/stale cue even when no URL row column is enabled.
+  Plain `o` opens that URL; `L` opens the repository's bounded Worktrunk hook-log
+  picker. `Space g o` remains the pull-request URL action.
 - **Behavior**: Worktree rows use stable compact columns and state-dependent
   symbols/colors for configured facts such as activity, pull request, CI,
   review comments, merge conflicts, and Worktrunk data. Success indicators are

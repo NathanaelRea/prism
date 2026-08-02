@@ -53,6 +53,15 @@ classification, branch metadata facts, background-safe snapshots, and deletion
 warnings. It may carry Agent Session and PR Cache facts for callers, but it
 should not own tmux lifecycle behavior or GitHub refresh semantics.
 
+Git's live worktree inventory is authoritative for whether a worktree exists and
+which branch is attached. Worktrunk owns physical worktree path policy,
+creation and removal effects, project hooks and approvals, stable template
+values, tethered processes, development URLs, variables, custom columns, and
+hook logs. Prism owns Worktree Session identity, destructive confirmation,
+Prism-resource cleanup, workflow history, and observation freshness. It joins
+Worktrunk observations by repository and exact normalized path; branch names
+are not an identity fallback.
+
 ### Agent Session
 
 An agent session is a persistent tmux session for a worktree session. The agent

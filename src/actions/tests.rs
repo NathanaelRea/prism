@@ -15,14 +15,16 @@ use crate::session::{DeleteWorktreeOutcome, Session, adopt_worktree_session};
 use crate::tui::{
     DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, OpencodeEventResult,
     OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PanelFocus, PrPollKey, Tui,
-    TuiJobKey, TuiJobKind, WtPollResult,
+    TuiJobKey, TuiJobKind, WtObservation, WtPollResult,
 };
 
+use super::worktrees::development_url_opened_message;
 use super::{
     apply_bulk_review_resolution, archived_picker_overflow_message, discover_wt_columns,
-    plan_run_mode_from_parallel_confirmation, pr_target_choice_list, pr_target_repo_for_choice,
-    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
-    should_prompt_pr_target_choice, status_label_with_behind, unresolved_review_thread_ids,
+    open_http_url_in_browser, plan_run_mode_from_parallel_confirmation, pr_target_choice_list,
+    pr_target_repo_for_choice, remote_pr_choice_keys, remote_pr_worktree_branch,
+    run_browser_opener, should_prompt_pr_target_choice, status_label_with_behind,
+    unresolved_review_thread_ids, worktree_column_choices,
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -153,6 +155,48 @@ exit 0
     assert_eq!(
         fs::read_to_string(&log).unwrap(),
         "--flag\nhttps://example.test/pr/42\n"
+    );
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn development_browser_rejects_non_http_urls_without_exposing_the_value() {
+    let secret_url = "file:///tmp/private-token-123";
+    let error = open_http_url_in_browser(secret_url).unwrap_err();
+    assert_eq!(error, "development URL must use http or https");
+    assert!(!error.contains(secret_url));
+}
+
+#[test]
+fn worktree_url_column_choices_are_unconditional_and_semantically_deduplicated() {
+    let unconditional = worktree_column_choices(&[], &[], 0);
+    assert_eq!(
+        unconditional
+            .iter()
+            .map(|choice| choice.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["url", "url_active"]
+    );
+
+    let temp = unique_temp_dir("prism-column-alias-test");
+    let mut session = test_session(temp.join("feature"), "feature");
+    for key in [
+        "url",
+        "dev_server.url",
+        "url_active",
+        "dev_server.listening",
+    ] {
+        session
+            .wt_columns
+            .insert(key.to_string(), "value".to_string());
+    }
+    let choices = worktree_column_choices(&["dev_server.url".to_string()], &[session], 0);
+    assert_eq!(
+        choices
+            .iter()
+            .map(|choice| choice.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["dev_server.url", "url_active"]
     );
     let _ = fs::remove_dir_all(temp);
 }
@@ -1226,7 +1270,10 @@ fn delete_session_does_not_block_input_loop() {
     fs::create_dir_all(&temp).unwrap();
     let git_log = temp.join("git.log");
     let git = temp.join("git");
+    let wt_log = temp.join("wt.log");
+    let wt = temp.join("wt");
     let tmux = temp.join("tmux");
+    let worktree = temp.join("worktree");
     fs::write(
         &git,
         format!(
@@ -1242,6 +1289,9 @@ case "$*" in
     exit 0
     ;;
   *"worktree list --porcelain"*)
+    if [ -d '{}' ]; then
+      printf 'worktree %s\nHEAD branch-oid\nbranch refs/heads/feature/delete\n\n' '{}'
+    fi
     exit 0
     ;;
   *"branch -D feature/delete"*)
@@ -1250,7 +1300,19 @@ case "$*" in
 esac
 exit 0
 "#,
-            git_log.display()
+            git_log.display(),
+            worktree.display(),
+            worktree.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &wt,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nsleep 1\nrm -rf '{}'\nprintf '%s' '[{{\"branch\":\"feature/delete\",\"branch_deleted\":false,\"kind\":\"worktree\",\"path\":\"{}\"}}]'\n",
+            wt_log.display(),
+            worktree.display(),
+            worktree.display()
         ),
     )
     .unwrap();
@@ -1266,7 +1328,7 @@ exit 0
 "#,
     )
     .unwrap();
-    for executable in [&git, &tmux] {
+    for executable in [&git, &wt, &tmux] {
         let mut permissions = fs::metadata(executable).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(executable, permissions).unwrap();
@@ -1279,8 +1341,11 @@ exit 0
     config
         .tools
         .insert("tmux".to_string(), tmux.display().to_string());
+    config
+        .tools
+        .insert("wt".to_string(), wt.display().to_string());
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
-    let session = test_session(temp.join("worktree"), "feature/delete");
+    let session = test_session(worktree, "feature/delete");
     let mut tui = Tui::new_single(repo, config, vec![session]);
 
     let started = Instant::now();
@@ -1306,9 +1371,16 @@ exit 0
 
     assert!(tui.delete_sessions_in_flight.is_empty());
     assert!(tui.sessions.is_empty());
-    let commands = fs::read_to_string(&git_log).unwrap();
-    assert!(commands.contains("worktree remove --force"));
-    assert!(commands.contains("branch -D feature/delete"));
+    assert!(
+        fs::read_to_string(&wt_log)
+            .unwrap()
+            .contains("--no-delete-branch")
+    );
+    assert!(
+        fs::read_to_string(&git_log)
+            .unwrap()
+            .contains("branch -D feature/delete")
+    );
 
     let _ = fs::remove_dir_all(temp);
 }
@@ -1370,6 +1442,7 @@ fn failed_async_delete_restores_hidden_worktree() {
     let worktree = temp.join("worktree");
     fs::create_dir_all(&worktree).unwrap();
     let git = temp.join("git");
+    let wt = temp.join("wt");
     let tmux = temp.join("tmux");
     fs::write(
         &git,
@@ -1395,6 +1468,11 @@ exit 0
     )
     .unwrap();
     fs::write(
+        &wt,
+        "#!/bin/sh\nprintf '%s\\n' 'pre-remove hook failed' >&2\nexit 1\n",
+    )
+    .unwrap();
+    fs::write(
         &tmux,
         r#"#!/bin/sh
 case "$1" in
@@ -1406,7 +1484,7 @@ exit 0
 "#,
     )
     .unwrap();
-    for executable in [&git, &tmux] {
+    for executable in [&git, &wt, &tmux] {
         let mut permissions = fs::metadata(executable).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(executable, permissions).unwrap();
@@ -1419,6 +1497,9 @@ exit 0
     config
         .tools
         .insert("tmux".to_string(), tmux.display().to_string());
+    config
+        .tools
+        .insert("wt".to_string(), wt.display().to_string());
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let session = test_session(worktree, "feature/delete");
     let mut tui = Tui::new_single(repo, config, vec![session]);
@@ -1451,18 +1532,37 @@ fn phase_1_branch_delete_failure_reconciles_without_vanished_worktree_path() {
     let worktree = temp.join("worktree");
     fs::create_dir_all(&worktree).unwrap();
     let git = temp.join("git");
+    let wt = temp.join("wt");
     let tmux = temp.join("tmux");
     fs::write(
         &git,
-        r#"#!/bin/sh
+        format!(
+            r#"#!/bin/sh
 case "$*" in
   *"rev-parse --verify refs/heads/feature/delete"*) echo branch-oid; exit 0 ;;
   *"worktree remove --force"*) exit 0 ;;
   *"branch -D feature/delete"*) exit 1 ;;
-  *"worktree list --porcelain"*) exit 0 ;;
+  *"worktree list --porcelain"*)
+    if [ -d '{}' ]; then
+      printf 'worktree %s\nHEAD branch-oid\nbranch refs/heads/feature/delete\n\n' '{}'
+    fi
+    exit 0
+    ;;
 esac
 exit 0
 "#,
+            worktree.display(),
+            worktree.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        &wt,
+        format!(
+            "#!/bin/sh\nrm -rf '{}'\nprintf '%s' '[{{\"branch\":\"feature/delete\",\"branch_deleted\":false,\"kind\":\"worktree\",\"path\":\"{}\"}}]'\n",
+            worktree.display(),
+            worktree.display()
+        ),
     )
     .unwrap();
     fs::write(
@@ -1475,7 +1575,7 @@ exit 0
 "#,
     )
     .unwrap();
-    for executable in [&git, &tmux] {
+    for executable in [&git, &wt, &tmux] {
         let mut permissions = fs::metadata(executable).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(executable, permissions).unwrap();
@@ -1488,6 +1588,9 @@ exit 0
     config
         .tools
         .insert("tmux".to_string(), tmux.display().to_string());
+    config
+        .tools
+        .insert("wt".to_string(), wt.display().to_string());
     let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
     let session = test_session(worktree.clone(), "feature/delete");
     let mut tui = Tui::new_single(repo, config, vec![session]);
@@ -1505,8 +1608,13 @@ exit 0
     }
 
     assert!(tui.delete_sessions_in_flight.is_empty());
-    assert!(tui.sessions.iter().all(|session| session.path != worktree));
-    assert!(tui.visible_session_indices().is_empty());
+    let pending = tui
+        .sessions
+        .iter()
+        .find(|session| session.path == worktree)
+        .expect("partial deletion remains selectable for retry");
+    assert_eq!(pending.status_label, "deletion pending");
+    assert_eq!(tui.visible_session_indices(), vec![0]);
 
     let _ = fs::remove_dir_all(temp);
 }
@@ -1898,20 +2006,163 @@ fn worktrunk_columns_reject_deleted_and_recreated_session_result() {
     let mut tui = Tui::new_single(repo, test_config(), vec![session]);
     let stale_key = tui.sessions[0].identity_key(&tui.repos[0].identity);
     tui.sessions[0].incarnation = "new".to_string();
-    let columns = BTreeMap::from([(
+    let facts = BTreeMap::from([(
         stale_key,
-        BTreeMap::from([("ci".to_string(), "passed".to_string())]),
+        crate::worktrunk::WorktrunkWorktreeFacts {
+            extra_columns: BTreeMap::from([("ci".to_string(), "passed".to_string())]),
+            ..crate::worktrunk::WorktrunkWorktreeFacts::default()
+        },
     )]);
 
     tui.wt_poll_tx
         .send(WtPollResult {
             repository: tui.repos[0].identity.clone(),
-            columns: Ok(columns),
+            observation: Ok(WtObservation {
+                snapshot: crate::worktrunk::WorktrunkSnapshot {
+                    schema: crate::worktrunk::WorktrunkSchema::V1,
+                    by_path: BTreeMap::new(),
+                },
+                facts,
+                observed_at: std::time::Instant::now(),
+            }),
         })
         .unwrap();
 
     assert!(!tui.poll_wt_columns());
     assert!(tui.sessions[0].wt_columns.is_empty());
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn worktrunk_failure_preserves_successful_columns_as_stale() {
+    let temp = unique_temp_dir("prism-wt-stale-observation-test");
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let session = test_session(temp.join("worktree"), "feature");
+    let mut config = test_config();
+    config
+        .tools
+        .insert("wt".to_string(), "/definitely/missing/wt".to_string());
+    let failure = crate::worktrunk::observe_repository(&repo, &config).unwrap_err();
+    let mut tui = Tui::new_single(repo, config, vec![session]);
+    let key = tui.sessions[0].identity_key(&tui.repos[0].identity);
+    let observed_at = std::time::Instant::now();
+    let facts = crate::worktrunk::WorktrunkWorktreeFacts {
+        extra_columns: BTreeMap::from([("url".to_string(), "http://localhost:3000".to_string())]),
+        ..crate::worktrunk::WorktrunkWorktreeFacts::default()
+    };
+    tui.wt_poll_tx
+        .send(WtPollResult {
+            repository: tui.repos[0].identity.clone(),
+            observation: Ok(WtObservation {
+                snapshot: crate::worktrunk::WorktrunkSnapshot {
+                    schema: crate::worktrunk::WorktrunkSchema::V1,
+                    by_path: BTreeMap::from([(tui.sessions[0].path.clone(), facts.clone())]),
+                },
+                facts: BTreeMap::from([(key, facts)]),
+                observed_at,
+            }),
+        })
+        .unwrap();
+    assert!(tui.poll_wt_columns());
+
+    tui.wt_poll_tx
+        .send(WtPollResult {
+            repository: tui.repos[0].identity.clone(),
+            observation: Err(failure),
+        })
+        .unwrap();
+
+    assert!(tui.poll_wt_columns());
+    assert_eq!(tui.sessions[0].wt_columns["url"], "http://localhost:3000");
+    assert!(matches!(
+        tui.repos[0].wt_quality,
+        crate::worktrunk::ObservationQuality::Stale { last_success, .. }
+            if last_success == observed_at
+    ));
+}
+
+#[test]
+fn stale_development_url_reports_generic_feedback_without_the_cached_url() {
+    let cached_url = "http://localhost:3000/private-token-123";
+    let message = development_url_opened_message(true);
+    assert_eq!(
+        message,
+        "opened development URL from stale Worktrunk observation"
+    );
+    assert!(!message.contains(cached_url));
+}
+
+#[test]
+fn worktrunk_refresh_requests_coalesce_while_poll_is_in_flight() {
+    let temp = unique_temp_dir("prism-wt-coalesced-refresh-test");
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut tui = Tui::new_single(repo, test_config(), Vec::new());
+    tui.repos[0].wt_poll_in_flight = true;
+
+    tui.start_wt_column_poll();
+    tui.start_wt_column_poll();
+
+    assert!(tui.repos[0].wt_poll_pending);
+    assert!(tui.repos[0].wt_poll_in_flight);
+}
+
+#[test]
+fn worktrunk_hook_log_inventory_is_repository_scoped_and_preserves_stale_entries() {
+    let temp = unique_temp_dir("prism-wt-hook-log-cache-test");
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut tui = Tui::new_single(repo, test_config(), Vec::new());
+    assert!(matches!(
+        tui.repos[0].wt_hook_logs.quality,
+        crate::worktrunk::ObservationQuality::NeverLoaded
+    ));
+    let repository = tui.repos[0].identity.clone();
+    let entry = crate::worktrunk::HookLogEntry {
+        path: temp.join(".git/wt/logs/dev.log"),
+        branch: "feature/cache".to_string(),
+        source: "project".to_string(),
+        hook_type: Some("post-start".to_string()),
+        name: "dev".to_string(),
+        modified_at: "2026-01-01T00:00:00Z".to_string(),
+        size: 12,
+    };
+    tui.wt_hook_log_poll_tx
+        .send(crate::tui::WtHookLogPollResult {
+            repository,
+            observation: Ok(crate::tui::WtHookLogObservation {
+                entries: vec![entry.clone()],
+                observed_at: Instant::now(),
+            }),
+        })
+        .unwrap();
+
+    assert!(tui.poll_wt_hook_logs());
+    assert_eq!(tui.repos[0].wt_hook_logs.entries, vec![entry]);
+    assert!(matches!(
+        tui.repos[0].wt_hook_logs.quality,
+        crate::worktrunk::ObservationQuality::Fresh
+    ));
+
+    assert!(tui.mark_wt_hook_logs_stale(0, "refresh failed".to_string()));
+    assert_eq!(tui.repos[0].wt_hook_logs.entries.len(), 1);
+    assert!(matches!(
+        tui.repos[0].wt_hook_logs.quality,
+        crate::worktrunk::ObservationQuality::Stale { .. }
+    ));
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn worktrunk_hook_log_refresh_coalesces_while_in_flight() {
+    let temp = unique_temp_dir("prism-wt-hook-log-coalesce-test");
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut tui = Tui::new_single(repo, test_config(), Vec::new());
+    tui.repos[0].wt_hook_logs.refresh_in_flight = true;
+
+    tui.request_wt_hook_log_refresh(0);
+    tui.request_wt_hook_log_refresh(0);
+
+    assert!(tui.repos[0].wt_hook_logs.refresh_in_flight);
+    assert!(tui.repos[0].wt_hook_logs.refresh_pending);
     let _ = fs::remove_dir_all(temp);
 }
 

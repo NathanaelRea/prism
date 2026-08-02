@@ -3,8 +3,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use serde_json::Value;
-
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{
@@ -26,10 +24,9 @@ use crate::github::{
     resolve_pr_summary_for_session, wait_for_pr_merged,
 };
 use crate::harness::{HarnessConfig, OutputFormat, PromptTransport};
-use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::lifecycle::{
-    WorktrunkApprovalStatus, check_worktrunk_approval_status, is_worktrunk_approval_failure,
-    push_branch, run_pre_pr_checks, run_pre_push_checks, run_worktrunk_approval_prompt,
+    WorktrunkApprovalStatus, check_worktrunk_approval_status, push_branch, run_pre_pr_checks,
+    run_pre_push_checks, run_worktrunk_approval_prompt,
 };
 use crate::observability::append_runtime_message;
 use crate::opencode::{self, OpencodeStatus, load_runtime};
@@ -40,7 +37,7 @@ use crate::plan_run::{
     retry_from_step, save_plan_run, skip_plan_step,
 };
 use crate::process::{
-    ProcessPolicy, command_exists, parse_command_words, run_capture, run_output_allow_failure,
+    ProcessPolicy, command_exists, parse_command_words, run_output_allow_failure,
 };
 use crate::repo::Repository;
 use crate::session::{
@@ -53,13 +50,14 @@ use crate::tui::{
     OpencodeEventResult, OpencodeListenerKey, OpencodePollKey, OpencodePollResult,
     PrPersistenceRequest, PrPollKey, PrPollResult, PrSummarySessionResult, SessionRefreshResult,
     SessionRefreshSnapshot, TUI_ACTION_JOB_TIMEOUT, Tui, TuiJobKey, TuiJobKind, TuiJobPayload,
-    WtPollResult,
+    WtObservation, WtPollResult,
 };
 use crate::tui_jobs::CoalescedFacet;
 
 use crate::util::status_count;
 
 mod auto;
+mod logs;
 mod opencode_actions;
 mod plans;
 mod polling;
@@ -92,14 +90,18 @@ fn reject_claimed_control(
 mod tests;
 
 #[cfg(test)]
+use crate::worktrunk::discover_columns as discover_wt_columns;
+#[cfg(test)]
 use plans::plan_run_mode_from_parallel_confirmation;
 #[cfg(test)]
-use polling::{discover_wt_columns, status_label_with_behind};
+use polling::status_label_with_behind;
 #[cfg(test)]
 use pull_requests::{
-    apply_bulk_review_resolution, pr_target_choice_list, pr_target_repo_for_choice,
-    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
-    should_prompt_pr_target_choice, unresolved_review_thread_ids,
+    apply_bulk_review_resolution, open_http_url_in_browser, pr_target_choice_list,
+    pr_target_repo_for_choice, remote_pr_choice_keys, remote_pr_worktree_branch,
+    run_browser_opener, should_prompt_pr_target_choice, unresolved_review_thread_ids,
 };
+#[cfg(test)]
+use repositories::worktree_column_choices;
 #[cfg(test)]
 use worktrees::archived_picker_overflow_message;
