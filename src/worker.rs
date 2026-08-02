@@ -861,22 +861,12 @@ fn validated_socket_path() -> Result<WorkerSocketPath, String> {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn test_socket_path(label: &str) -> WorkerSocketPath {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let runtime =
-            Path::new("/tmp").join(format!("pw-{label}-{:x}-{unique:x}", std::process::id()));
-        fs::create_dir(&runtime).unwrap();
-        WorkerSocketPath::for_runtime(&runtime).unwrap()
-    }
-
-    fn remove_test_socket(socket: &WorkerSocketPath) {
-        fs::remove_file(socket.as_path()).unwrap();
-        fs::remove_dir(socket.as_path().parent().unwrap()).unwrap();
+    fn test_socket_path() -> (crate::compact_runtime::CompactTempDir, WorkerSocketPath) {
+        let runtime = crate::compact_runtime::CompactTempDir::new("worker-socket");
+        fs::create_dir(runtime.runtime_path()).unwrap();
+        let socket = WorkerSocketPath::for_runtime(runtime.runtime_path()).unwrap();
+        (runtime, socket)
     }
 
     #[test]
@@ -985,6 +975,7 @@ mod tests {
                 Some(long),
                 Path::new("/fallback"),
             ),
+            runtime_dir_for(SupportedOs::Linux, None, None, None, Path::new(long)),
         ] {
             assert!(WorkerSocketPath::for_runtime(&runtime).is_err());
         }
@@ -992,7 +983,7 @@ mod tests {
 
     #[test]
     fn platform_smoke_native_worker_socket_bind_and_connect() {
-        let socket = test_socket_path("native");
+        let (_runtime, socket) = test_socket_path();
         let listener = UnixListener::bind(socket.as_path()).unwrap();
 
         let client = UnixStream::connect(socket.as_path()).unwrap();
@@ -1000,7 +991,6 @@ mod tests {
 
         drop(client);
         drop(listener);
-        remove_test_socket(&socket);
     }
 
     #[test]
@@ -1028,26 +1018,22 @@ mod tests {
 
     #[test]
     fn platform_smoke_native_probe_health_treats_a_stale_socket_as_stopped() {
-        let socket = test_socket_path("stale");
+        let (_runtime, socket) = test_socket_path();
         let listener = UnixListener::bind(socket.as_path()).unwrap();
         drop(listener);
 
         assert_eq!(probe_health_at(&socket).unwrap(), DaemonHealth::stopped());
-
-        remove_test_socket(&socket);
     }
 
     #[test]
     fn platform_smoke_native_waiting_for_a_live_socket_to_close_times_out() {
-        let socket = test_socket_path("live");
+        let (_runtime, socket) = test_socket_path();
         let _listener = UnixListener::bind(socket.as_path()).unwrap();
 
         assert_eq!(
             wait_for_socket_to_close(&socket, Duration::ZERO),
             Err("timed out waiting for Prism worker daemon to stop".to_string())
         );
-
-        remove_test_socket(&socket);
     }
 
     #[test]

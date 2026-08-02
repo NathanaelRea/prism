@@ -2512,7 +2512,7 @@ mod tests {
     }
 
     #[test]
-    fn platform_smoke_native_process_probe_treats_permission_denied_as_existing() {
+    fn platform_contract_process_probe_treats_permission_denied_as_existing() {
         assert!(probe_result(-1, Some(libc::EPERM)).unwrap());
         assert!(!probe_result(-1, Some(libc::ESRCH)).unwrap());
     }

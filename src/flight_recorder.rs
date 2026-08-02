@@ -942,7 +942,11 @@ impl RecorderState {
             .filter(|event| event.monotonic_us >= start_us && event.monotonic_us <= end_us)
             .cloned()
             .collect::<Vec<_>>();
-        fs::create_dir_all(&capture.output_dir).map_err(|error| {
+        crate::durability::create_dir_all(
+            &capture.output_dir,
+            crate::durability::DurabilityIntent::Maximum,
+        )
+        .map_err(|error| {
             format!(
                 "create recording directory {}: {error}",
                 capture.output_dir.display()
@@ -981,12 +985,31 @@ impl RecorderState {
         writer
             .flush()
             .map_err(|error| format!("flush {}: {error}", temporary.display()))?;
-        writer
-            .get_ref()
-            .sync_all()
-            .map_err(|error| format!("sync {}: {error}", temporary.display()))?;
+        crate::durability::sync_file(
+            writer.get_ref(),
+            crate::durability::DurabilityIntent::Maximum,
+        )
+        .map_err(|error| {
+            let stage = match error.stage() {
+                crate::durability::FileSyncStage::File => "sync",
+                crate::durability::FileSyncStage::FullFile => "fully sync",
+            };
+            format!("{stage} {}: {}", temporary.display(), error.into_source())
+        })?;
+        drop(writer);
         fs::rename(&temporary, &path)
             .map_err(|error| format!("commit debug recording {}: {error}", path.display()))?;
+        crate::durability::sync_directory(
+            &capture.output_dir,
+            crate::durability::DurabilityIntent::Maximum,
+        )
+        .map_err(|error| {
+            format!(
+                "sync debug recording directory {} after committing {}: {error}",
+                capture.output_dir.display(),
+                path.display()
+            )
+        })?;
         Ok(path)
     }
 
@@ -1121,12 +1144,16 @@ fn create_recording_file(path: &Path) -> Result<File, String> {
 }
 
 fn bind_server(endpoint: ServerEndpoint) -> Result<ServerSocket, String> {
+    bind_server_in(endpoint, &control_runtime_dir())
+}
+
+fn bind_server_in(endpoint: ServerEndpoint, runtime_dir: &Path) -> Result<ServerSocket, String> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::UnixDatagram;
 
     validate_recorder_socket_path(&endpoint.socket_path, "recorder control")?;
-    let runtime_dir = ensure_control_runtime_dir()?;
+    let runtime_dir = ensure_control_runtime_dir_at(runtime_dir)?;
     if endpoint.socket_path.parent() != Some(runtime_dir.as_path()) {
         return Err("recorder socket is outside its private runtime directory".to_string());
     }
@@ -1215,12 +1242,15 @@ fn control_runtime_dir() -> PathBuf {
 }
 
 fn ensure_control_runtime_dir() -> Result<PathBuf, String> {
+    ensure_control_runtime_dir_at(&control_runtime_dir())
+}
+
+fn ensure_control_runtime_dir_at(path: &Path) -> Result<PathBuf, String> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
-    let path = control_runtime_dir();
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
-    match builder.create(&path) {
+    match builder.create(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => {
@@ -1230,7 +1260,7 @@ fn ensure_control_runtime_dir() -> Result<PathBuf, String> {
             ));
         }
     }
-    let metadata = fs::symlink_metadata(&path)
+    let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("inspect recorder runtime directory: {error}"))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(format!(
@@ -1244,9 +1274,9 @@ fn ensure_control_runtime_dir() -> Result<PathBuf, String> {
             path.display()
         ));
     }
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("secure recorder runtime directory: {error}"))?;
-    Ok(path)
+    Ok(path.to_path_buf())
 }
 
 fn remove_socket_if_present(path: &Path) -> Result<(), String> {
@@ -1450,11 +1480,8 @@ mod tests {
     fn trigger_writes_an_atomic_jsonl_capture_without_sqlite() {
         use std::os::unix::fs::PermissionsExt;
 
-        let base = std::env::temp_dir().join(format!(
-            "prism-flight-test-{}-{}",
-            std::process::id(),
-            unix_ms()
-        ));
+        let temp = crate::compact_runtime::CompactTempDir::new("flight-recorder");
+        let base = temp.path().to_path_buf();
         let repo = Repository::with_config_dir_for_test(base.join("repo"), base.join("config"));
         let server = serve_repositories([&repo]);
         let mut in_flight = ExternalCallTrace::begin(
@@ -1507,6 +1534,13 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        assert!(!fs::read_dir(path.parent().unwrap()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
 
         in_flight.finish(ExternalCallOutcome::Success, Vec::new());
         let secret = "flight-secret-argv-env-output-stderr";
@@ -1597,28 +1631,22 @@ mod tests {
         }));
         assert!(!completed.contains(secret));
         drop(server);
-        let _ = fs::remove_dir_all(base);
     }
 
     #[cfg(unix)]
     #[test]
     fn platform_smoke_native_recorder_lock_prevents_socket_ownership_races() {
-        let socket_path = ensure_control_runtime_dir().unwrap().join(format!(
-            "lock-test-{}-{}.sock",
-            std::process::id(),
-            unix_ms()
-        ));
+        let runtime = crate::compact_runtime::CompactTempDir::new("recorder-lock");
+        let socket_path = runtime.runtime_path().join("lock.sock");
         let endpoint = || ServerEndpoint {
             socket_path: socket_path.clone(),
-            output_dir: std::env::temp_dir(),
+            output_dir: runtime.path().to_path_buf(),
         };
-        let server = bind_server(endpoint()).unwrap();
+        let server = bind_server_in(endpoint(), runtime.runtime_path()).unwrap();
 
-        assert!(bind_server(endpoint()).is_err());
+        assert!(bind_server_in(endpoint(), runtime.runtime_path()).is_err());
 
         drop(server);
-        let _ = fs::remove_file(&socket_path);
-        let _ = fs::remove_file(socket_path.with_extension("lock"));
     }
 
     #[cfg(unix)]

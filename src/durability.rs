@@ -1,4 +1,4 @@
-use std::fs::File;
+use std::fs::{self, File};
 use std::io;
 use std::path::Path;
 
@@ -90,7 +90,7 @@ fn full_sync(file: &File) -> io::Result<()> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
 fn full_sync(_file: &File) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -98,17 +98,23 @@ fn full_sync(_file: &File) -> io::Result<()> {
     ))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sync_directory_native(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn sync_directory_native(_path: &Path) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "directory sync is not supported on this platform",
-    ))
+pub(crate) fn create_dir_all(path: &Path, intent: DurabilityIntent) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let mut parents = absolute.ancestors().skip(1).collect::<Vec<_>>();
+    parents.reverse();
+    for parent in parents {
+        sync_directory(parent, intent)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn sync_directory(path: &Path, intent: DurabilityIntent) -> io::Result<()> {
@@ -165,9 +171,11 @@ mod tests {
 
     #[test]
     fn platform_smoke_native_durability_syncs_file_and_directory() {
-        let path =
+        let root =
             std::env::temp_dir().join(format!("prism-durability-smoke-{}", std::process::id()));
-        std::fs::create_dir_all(&path).unwrap();
+        let path = root.join("nested/state");
+        create_dir_all(&path, DurabilityIntent::Maximum).unwrap();
+        create_dir_all(&path, DurabilityIntent::Maximum).unwrap();
         let file_path = path.join("state");
         let file = File::create(&file_path).unwrap();
 
@@ -175,6 +183,6 @@ mod tests {
         sync_directory(&path, DurabilityIntent::Maximum).unwrap();
 
         drop(file);
-        std::fs::remove_dir_all(path).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

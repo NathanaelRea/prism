@@ -8,6 +8,9 @@ mod args;
 pub mod auto_flow;
 mod ci;
 pub mod cli;
+#[cfg(test)]
+#[path = "../test-support/compact_runtime.rs"]
+mod compact_runtime;
 mod config;
 mod durability;
 mod execution;

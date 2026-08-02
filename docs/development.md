@@ -21,10 +21,11 @@ scripts/full-check.sh
 ```
 
 The smoke command requires real `opencode` and `tmux` executables. It selects the
-shared `platform_smoke_native_` test group, the process-native smoke group, and
-the two real OpenCode/tmux integration tests. It covers native process,
-durability, Unix-socket, worker, OpenCode, and tmux contracts without invoking a
-model.
+`platform_smoke_native_` tests and the two real OpenCode/tmux integration tests.
+The selected tests exercise native process, durability, Unix-socket, worker,
+OpenCode, and tmux contracts without invoking a model. Deterministic policy,
+errno classification, and fault-injection tests remain in the full suite except
+where a staging test also proves a native durability primitive.
 
 To synchronize the current worktree, including uncommitted files, to an
 SSH-accessible Mac and run that smoke command without pushing a branch:

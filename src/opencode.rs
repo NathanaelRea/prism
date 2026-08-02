@@ -201,7 +201,7 @@ pub fn ensure_opencode_server_with_program(
 ) -> Result<OpencodeRuntime, String> {
     let existing = load_runtime(repo, harness_id, branch, worktree)?;
     if let Some(runtime) = existing.as_ref()
-        && stored_runtime_is_healthy(runtime)
+        && stored_runtime_is_healthy(runtime)?
     {
         return Ok(runtime.clone());
     }
@@ -461,13 +461,25 @@ pub fn shutdown_owned_server(runtime: &OpencodeRuntime) -> Result<(), String> {
 }
 
 pub(crate) fn shutdown_stored_server(runtime: &OpencodeRuntime) -> Result<(), String> {
+    shutdown_stored_server_with(runtime, crate::process::process_arguments)
+}
+
+fn shutdown_stored_server_with(
+    runtime: &OpencodeRuntime,
+    inspect_arguments: impl FnOnce(
+        u32,
+    )
+        -> Result<Option<Vec<String>>, crate::process::ProcessLifecycleError>,
+) -> Result<(), String> {
     if runtime.server_pid.is_some_and(owned_server_process) {
         return shutdown_owned_server(runtime);
     }
     let Some(pid) = runtime.server_pid else {
         return Ok(());
     };
-    if !stored_server_process_matches(pid, runtime.server_port) {
+    if !stored_server_process_matches_with(pid, runtime.server_port, inspect_arguments)
+        .map_err(|error| format!("inspect stored opencode server {pid} before shutdown: {error}"))?
+    {
         return Ok(());
     }
     let recorded =
@@ -484,40 +496,54 @@ pub(crate) fn shutdown_stored_server(runtime: &OpencodeRuntime) -> Result<(), St
     }
 }
 
-fn stored_server_process_matches(pid: u32, port: u16) -> bool {
-    crate::process::process_arguments(pid)
-        .ok()
-        .flatten()
-        .is_some_and(|args| {
-            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
-            stored_server_args_match(&args, port)
-        })
+fn stored_server_process_matches(
+    pid: u32,
+    port: u16,
+) -> Result<bool, crate::process::ProcessLifecycleError> {
+    stored_server_process_matches_with(pid, port, crate::process::process_arguments)
 }
 
-fn stored_runtime_is_healthy(runtime: &OpencodeRuntime) -> bool {
+fn stored_server_process_matches_with(
+    pid: u32,
+    port: u16,
+    inspect_arguments: impl FnOnce(
+        u32,
+    )
+        -> Result<Option<Vec<String>>, crate::process::ProcessLifecycleError>,
+) -> Result<bool, crate::process::ProcessLifecycleError> {
+    Ok(inspect_arguments(pid)?.is_some_and(|args| {
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+        stored_server_args_match(&args, port)
+    }))
+}
+
+fn stored_runtime_is_healthy(runtime: &OpencodeRuntime) -> Result<bool, String> {
     if !check_health(&runtime.server_url) {
-        return false;
+        return Ok(false);
     }
     let Some(pid) = runtime.server_pid else {
-        return false;
+        return Ok(false);
     };
     let recorded =
         crate::process::RecordedProcess::from_stored(pid, runtime.server_process_identity);
-    if crate::process::observe_process(recorded).ok()
-        != Some(crate::process::ProcessObservation::RunningSameProcess)
-        || !stored_server_process_matches(pid, runtime.server_port)
+    if crate::process::observe_process(recorded)
+        .map_err(|error| format!("inspect stored opencode server {pid} before reuse: {error}"))?
+        != crate::process::ProcessObservation::RunningSameProcess
+        || !stored_server_process_matches(pid, runtime.server_port).map_err(|error| {
+            format!("inspect stored opencode server {pid} before reuse: {error}")
+        })?
     {
-        return false;
+        return Ok(false);
     }
     if let Some(session_id) = runtime.opencode_session_id.as_deref() {
-        return get_session(&runtime.server_url, session_id)
+        return Ok(get_session(&runtime.server_url, session_id)
             .ok()
             .flatten()
             .is_some_and(|session| {
                 session.directory.as_deref() == Some(runtime.worktree_path.as_str())
-            });
+            }));
     }
-    true
+    Ok(true)
 }
 
 fn stored_server_args_match(args: &[&str], port: u16) -> bool {
@@ -2745,6 +2771,34 @@ mod tests {
             ],
             41_234,
         ));
+    }
+
+    #[test]
+    fn stored_server_shutdown_reports_argument_inspection_failure() {
+        let runtime = OpencodeRuntime {
+            repo_root: "/repo".to_string(),
+            harness_id: "opencode".to_string(),
+            branch: "feature/test".to_string(),
+            worktree_path: "/repo/worktree".to_string(),
+            server_port: 41_234,
+            server_url: "http://127.0.0.1:41234".to_string(),
+            server_pid: Some(42),
+            server_process_identity: Some(7),
+            opencode_session_id: None,
+            generation: 0,
+            updated_unix_ms: 0,
+        };
+
+        let error = shutdown_stored_server_with(&runtime, |pid| {
+            Err(crate::process::ProcessLifecycleError::Inspect {
+                pid,
+                source: std::io::Error::other("injected argument inspection failure"),
+            })
+        })
+        .unwrap_err();
+
+        assert!(error.contains("inspect stored opencode server 42 before shutdown"));
+        assert!(error.contains("injected argument inspection failure"));
     }
 
     #[test]

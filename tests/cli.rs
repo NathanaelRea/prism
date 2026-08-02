@@ -286,7 +286,7 @@ fn daemon_status_reports_stopped_without_starting_it() {
         .current_dir(temp.path())
         .env("XDG_CONFIG_HOME", temp.path())
         .env("HOME", temp.path())
-        .env("PRISM_RUNTIME_DIR", temp.path().join("runtime"))
+        .env("PRISM_RUNTIME_DIR", temp.runtime_path())
         .output()
         .expect("run daemon status");
 
@@ -328,7 +328,7 @@ fn daemon_status_reports_invalid_runtime_configuration_distinctly() {
 fn daemon_status_with_long_tmpdir_uses_the_explicit_compact_runtime() {
     let temp = TempDir::new("daemon-status-long-tmpdir");
     let long_tmpdir = temp.path().join("x".repeat(160));
-    let runtime = temp.path().join("runtime");
+    let runtime = temp.runtime_path().to_path_buf();
     let output = prism()
         .args(["daemon", "status", "--json"])
         .current_dir(temp.path())

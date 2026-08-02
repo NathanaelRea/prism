@@ -36,7 +36,7 @@ fn serial_worker_test() -> MutexGuard<'static, ()> {
 fn platform_smoke_native_worker_starts_once_reports_health_and_shuts_down() {
     let _serial = serial_worker_test();
     let temp = TempDir::new("worker-start");
-    let runtime = temp.path.join("runtime");
+    let runtime = temp.runtime_path().to_path_buf();
     let home = temp.path.join("home");
     fs::create_dir_all(&home).unwrap();
 
@@ -77,7 +77,7 @@ fn platform_smoke_native_worker_recovers_stale_socket_and_lock_files() {
     use std::os::unix::net::UnixListener;
 
     let temp = TempDir::new("worker-stale");
-    let runtime = temp.path.join("runtime");
+    let runtime = temp.runtime_path().to_path_buf();
     let home = temp.path.join("home");
     fs::create_dir_all(&runtime).unwrap();
     fs::create_dir_all(&home).unwrap();
@@ -120,7 +120,7 @@ fn worker_ensure_rejects_an_invalid_socket_path_before_startup_side_effects() {
 fn real_worker_executes_a_queued_plan_and_persists_lifecycle() {
     let _serial = serial_worker_test();
     let temp = TempDir::new("worker-plan");
-    let runtime = temp.path.join("runtime");
+    let runtime = temp.runtime_path().to_path_buf();
     let home = temp.path.join("home");
     let repo = temp.path.join("repo");
     fs::create_dir_all(home.join("prism")).unwrap();
@@ -246,7 +246,7 @@ fn real_worker_executes_a_queued_plan_and_persists_lifecycle() {
 fn daemon_crash_leaves_claimed_work_recovery_pending() {
     let _serial = serial_worker_test();
     let temp = TempDir::new("worker-crash");
-    let runtime = temp.path.join("runtime");
+    let runtime = temp.runtime_path().to_path_buf();
     let home = temp.path.join("home");
     let repo = temp.path.join("repo");
     fs::create_dir_all(home.join("prism")).unwrap();

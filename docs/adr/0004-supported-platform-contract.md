@@ -76,9 +76,12 @@ scripts/platform-smoke.sh
 scripts/full-check.sh
 ```
 
-The focused gate selects `platform_smoke_native_` contracts plus native process
-and real OpenCode/tmux integration filters. The real integrations are ignored by
-ordinary `cargo test` and are enabled only by this prepared-host command.
+The focused gate selects `platform_smoke_native_` syscall and lifecycle
+contracts plus the real OpenCode/tmux integration filters. Deterministic policy,
+errno classification, and fault-injection tests remain in the full suite. The
+native persistence-staging test is retained because it also executes the host's
+strong sync primitive. The real integrations are ignored by ordinary
+`cargo test` and are enabled only by this prepared-host command.
 
 Run the focused gate on a Mac over SSH without publishing a branch:
 
