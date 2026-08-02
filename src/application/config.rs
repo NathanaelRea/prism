@@ -21,7 +21,7 @@ use crate::util::prism_config_dir;
 pub const AGENT_CANDIDATES: [&str; 1] = ["opencode"];
 pub const CONFIG_SCHEMA_URL: &str =
     "https://raw.githubusercontent.com/NathanaelRea/prism/main/schemas/config.schema.json";
-pub const CONFIG_SCHEMA_JSON: &str = include_str!("../schemas/config.schema.json");
+pub const CONFIG_SCHEMA_JSON: &str = include_str!("../../schemas/config.schema.json");
 
 pub fn config_example() -> String {
     format!("#:schema {CONFIG_SCHEMA_URL}\n")

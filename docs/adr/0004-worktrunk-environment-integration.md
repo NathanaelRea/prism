@@ -18,7 +18,7 @@ state that Worktrunk does not own.
 
 ## Decision
 
-The installed `wt` executable is the integration seam. `src/worktrunk.rs` is the
+The installed `wt` executable is the integration seam. `src/repository/worktrunk.rs` is the
 only production module that constructs Worktrunk commands, parses their machine
 output, or classifies compatibility errors. Callers use typed requests,
 outcomes, and failures. Each operation has a distinct static process descriptor

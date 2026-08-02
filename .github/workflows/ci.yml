@@ -51,13 +51,13 @@ jobs:
           export WORKTRUNK_WORKTREE_PATH="$smoke_root/worktrees/{{ branch | sanitize }}"
           export PRISM_TEST_WORKTRUNK="$(command -v wt)"
           : > "$WORKTRUNK_CONFIG_PATH"
-          cargo test worktrunk::tests::real_worktrunk_create_observe_remove_smoke \
+          cargo test repository::worktrunk::tests::real_worktrunk_create_observe_remove_smoke \
             -- --ignored --exact
       - name: Test real OpenCode integration
         if: runner.os == 'Linux'
         run: |
           PRISM_TEST_OPENCODE="$(command -v opencode)" \
-            cargo test opencode::tests::real_opencode_server_round_trips_prism_session_api \
+            cargo test agent_runtime::opencode::tests::real_opencode_server_round_trips_prism_session_api \
               -- --ignored --exact
       - name: Test real Prism, OpenCode, and tmux stack
         if: runner.os == 'Linux'

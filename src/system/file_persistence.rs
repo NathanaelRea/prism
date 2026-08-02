@@ -736,12 +736,12 @@ mod tests {
             fs::create_dir_all(&dir).unwrap();
             let path = dir.join("config.toml");
             fs::write(&path, "value = 'old'\n").unwrap();
+            let module = module_path!()
+                .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
+                .unwrap_or(module_path!());
+            let helper = format!("{module}::atomic_crash_helper");
             let status = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--ignored",
-                    "--exact",
-                    "file_persistence::tests::atomic_crash_helper",
-                ])
+                .args(["--ignored", "--exact", &helper])
                 .env("PRISM_ATOMIC_CRASH_PATH", &path)
                 .env("PRISM_ATOMIC_CRASH_STAGE", stage)
                 .status()
