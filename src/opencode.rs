@@ -3553,11 +3553,28 @@ mod tests {
             updated_unix_ms: 42,
         };
 
-        shutdown_stored_server(&runtime).unwrap();
-
-        assert!(child.try_wait().unwrap().is_none());
+        let result = shutdown_stored_server_with(&runtime, |_| {
+            Ok(Some(vec![
+                "legacy-opencode-fixture".to_string(),
+                "serve".to_string(),
+                "--hostname".to_string(),
+                "127.0.0.1".to_string(),
+                "--port".to_string(),
+                "41222".to_string(),
+            ]))
+        });
+        let child_was_running = child.try_wait().unwrap().is_none();
         child.kill().unwrap();
         child.wait().unwrap();
+
+        assert_eq!(
+            result.unwrap_err(),
+            format!(
+                "refusing to stop opencode server {}: reusable process identity is unavailable",
+                child.id()
+            )
+        );
+        assert!(child_was_running);
     }
 
     #[test]
