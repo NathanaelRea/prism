@@ -58,6 +58,8 @@ impl KeyInput {
             KeyCode::Char('[') if plain_char(event) => Key::PreviousView,
             KeyCode::Char(']') if plain_char(event) => Key::NextView,
             KeyCode::Char('r') if plain_char(event) => Key::Refresh,
+            KeyCode::Char('o') if plain_char(event) => Key::OpenDevelopmentUrl,
+            KeyCode::Char('L') if plain_char(event) => Key::WorktrunkLogs,
             KeyCode::Char('+') if plain_char(event) => Key::VisibilityUp,
             KeyCode::Char('-') if plain_char(event) => Key::VisibilityDown,
             KeyCode::Char('0') if plain_char(event) => Key::FocusMain,
@@ -175,6 +177,8 @@ pub enum Key {
     LazyGit,
     AutoFlow,
     OpenPr,
+    OpenDevelopmentUrl,
+    WorktrunkLogs,
     SubmitReview,
     Terminal,
     Help,
@@ -335,6 +339,18 @@ mod tests {
     #[test]
     fn key_input_handles_leader_open_pr() {
         let mut input = KeyInput::default();
+        assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
+        assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
+        assert_eq!(map(&mut input, key(KeyCode::Char('o'))), Key::OpenPr);
+    }
+
+    #[test]
+    fn plain_o_opens_development_url_without_changing_leader_pr_action() {
+        let mut input = KeyInput::default();
+        assert_eq!(
+            map(&mut input, key(KeyCode::Char('o'))),
+            Key::OpenDevelopmentUrl
+        );
         assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
         assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
         assert_eq!(map(&mut input, key(KeyCode::Char('o'))), Key::OpenPr);

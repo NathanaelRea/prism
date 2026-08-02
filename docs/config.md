@@ -4,6 +4,18 @@ Tracked repositories live in `~/.config/prism/repos.toml`.
 
 Global Prism settings live in `~/.config/prism/config.toml`. Press `E` in the TUI to edit this file and reload configuration.
 
+Prism uses the first non-empty value of `VISUAL` and `EDITOR` when opening
+configuration files. These values use Prism's command-word grammar, so quoted
+arguments retain their boundaries and are launched directly rather than through
+a shell. For example, `VISUAL='code --wait --profile "Prism Work"'` launches
+`code` with those three arguments followed by the configuration path. Without
+either variable, Prism tries `nvim`, `vim`, then `vi`.
+
+Repository terminals and tmux terminal windows use a non-empty `SHELL`, falling
+back to `/bin/sh`. Shell command strings that Prism must pass to tmux use POSIX
+single-argument quoting; configurable tools and editors remain direct-argv
+integrations.
+
 Run `prism config example` to print the complete default config with active values, `prism config schema` to print the JSON Schema used by TOML editor tooling, and `prism config paths` to inspect the active config paths and schema URL.
 
 Each repository entry has a path and may have a digit key. Digit keys are used as `Space <digit>` shortcuts in the TUI.
@@ -26,7 +38,7 @@ Use `R` from Prism to edit repository order, keys, and tracked repositories.
 default_base = "main"
 merge_method = "squash"
 
-# Prism starts local OpenCode servers on deterministic ports in this range.
+# Prism starts shared repository OpenCode servers on deterministic ports in this range.
 opencode_port_base = 41000
 opencode_port_span = 1000
 
@@ -38,6 +50,12 @@ sidebar_width = 56
 
 [ui]
 icon_style = "unicode" # or "nerd-font"
+
+[notifications]
+enabled = false
+needs_input = true
+completed = true
+failed = true
 
 [worktrees]
 columns = []
@@ -101,6 +119,16 @@ Current capability exceptions are intentional:
 See [Remote Hosting](remote-hosting.md) for the full capability matrix,
 qualified server versions, authentication commands, Codeberg CI limitations,
 and doctor/debug troubleshooting.
+
+## Desktop notifications
+
+Desktop notifications are opt-in. Set `notifications.enabled = true` globally or in a repository config. The category switches control sessions waiting for input, successful completion, and failures; `failed` also covers sessions that need to be restarted. Reloading config with `E` or `e` changes subsequent notifications without reporting sessions that are already blocked or finished.
+
+Prism uses the desktop notification service directly and does not run `notify-send` or detect a desktop environment. GNOME, KDE, and similar Linux desktops normally provide a notification server. Minimal Wayland compositors such as Hyprland and Sway require a daemon such as `mako`, `swaync`, or `dunst`. A missing server is non-fatal.
+
+On macOS, Notification Center owns permission prompts, Focus mode, and display preferences. Headless, container, and SSH sessions may have no graphical notification service; Prism does not forward notifications to the SSH client.
+
+Notifications are best effort and contain only the repository label, branch, and state description. They are emitted while the Prism dashboard event loop is running. Delivery can be delayed while Prism is blocked in an attached tmux client, and stops after Prism exits.
 
 ## Harnesses
 
@@ -224,7 +252,7 @@ repair_commit_ci = "fix: ci"
 repair_commit_merge = "fix: merge"
 ```
 
-Prism manages one local OpenCode server per worktree session. `opencode_port_base` and `opencode_port_span` define the deterministic local port range used for those servers. By default Prism keeps servers warm after the TUI exits; set `opencode_shutdown_owned_servers = true` to send SIGTERM to OpenCode servers that Prism spawned during the session.
+Prism shares one local OpenCode server across worktree sessions that use the same harness in a repository. Each worktree keeps an independent native OpenCode session and tmux client. `opencode_port_base` and `opencode_port_span` define the deterministic local port range used for repository servers. By default Prism keeps servers warm after the TUI exits; set `opencode_shutdown_owned_servers = true` to send SIGTERM to shared OpenCode servers that this Prism process spawned, disconnecting every worktree client using them.
 
 `[layout] sidebar_width` controls the Status/Repos/Worktrees sidebar width in terminal columns. Values are bounded to `20..=120`. When the terminal is too narrow, Prism reduces the configured width so the main panel keeps usable space; this preserves the board layout instead of strictly honoring a width that would hide the main panel.
 
@@ -239,7 +267,29 @@ Columns are read from `wt list --format=json`. Common names include `url`, `url_
 columns = ["url", "url_active", "ci.status", "vars.localdev"]
 ```
 
-Use `C` in the TUI to open the selected repository's worktree column selector. The selector lists configured columns first and then discovered `wt` column keys, so you can enable/disable columns and move enabled columns up/down without editing TOML directly.
+Use `W` in the TUI to open the selected repository's worktree column selector. The selector lists configured columns first and then discovered `wt` column keys, so you can enable/disable columns and move enabled columns up/down without editing TOML directly.
+
+## Worktrunk Environments
+
+Prism requires Worktrunk 0.58.0 or newer and currently tests against 0.71.0. Worktrunk project configuration belongs in the managed repository's `.config/wt.toml`; Prism reads the same machine output as standalone `wt list` and does not duplicate that configuration.
+
+Run long-lived development servers from a background `post-start` hook, not a blocking `pre-start` hook. `wt step tether` makes Worktrunk responsible for terminating the process tree when the worktree is removed:
+
+```toml
+[post-start]
+dev = "wt step tether -- pnpm dev -- --port {{ branch | hash_port }}"
+
+[list]
+url = "http://localhost:{{ branch | hash_port }}"
+```
+
+The stable `hash_port` value is owned by Worktrunk. The URL appears in standalone `wt list` and in Prism's Worktree Session details. Prism reports Worktrunk's listening, not-listening, unknown, or stale observation and opens a known HTTP(S) URL with plain `o`; it does not own the server or infer liveness from a hook log. URL columns remain opt-in through `W` and may use `url` and `url_active`.
+
+Worktrunk 0.58.0 emits the schema-1 bare array. Newer Worktrunk can emit schema 1 or the schema-2 envelope according to its `[list] json-schema` setting. Prism normalizes both without changing the user's setting. An unknown schema fails closed: the last successful observation remains visible as stale with a safe error instead of being replaced by empty columns. Facts join a Worktree Session only by repository and exact normalized worktree path, never by branch name.
+
+Worktrunk owns project-command approval. Prism never supplies `--yes`; when commands are new or changed, approve them interactively with the action Prism offers or with `wt config approvals add` after reviewing them.
+
+Press `L` in the Worktrees panel to choose a Worktrunk hook log. Prism displays Worktrunk's branch label, source, hook type, name, size, and modification time, then reads only a bounded sanitized tail from a regular file below `.git/wt/logs`. A branch-label match is only a picker preference, log bodies are not persisted or included in diagnostics, and a log file does not prove that a hook or development process is running.
 
 ## Database Access
 

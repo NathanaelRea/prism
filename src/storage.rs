@@ -563,24 +563,16 @@ fn future_version_error(path: &Path, version: u32) -> StorageError {
 }
 
 fn database_identity(path: &Path) -> Result<Option<DatabaseIdentity>, StorageError> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::MetadataExt;
 
-        let metadata = fs::metadata(path).map_err(|error| {
-            StorageError::from_io(format!("identify database {}", path.display()), error)
-        })?;
-        Ok(Some(DatabaseIdentity {
-            path: path.to_path_buf(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = path;
-        Ok(None)
-    }
+    let metadata = fs::metadata(path).map_err(|error| {
+        StorageError::from_io(format!("identify database {}", path.display()), error)
+    })?;
+    Ok(Some(DatabaseIdentity {
+        path: path.to_path_buf(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }))
 }
 
 fn database_identity_is_validated(identity: &DatabaseIdentity) -> Result<bool, StorageError> {
@@ -761,7 +753,8 @@ fn apply_additive_schema_migrations(conn: &Connection) -> Result<(), StorageErro
 }
 
 fn additive_schema_current(conn: &Connection) -> Result<bool, StorageError> {
-    table_has_column(conn, "pr_cache", "author")
+    Ok(table_has_column(conn, "pr_cache", "author")?
+        && table_has_column(conn, "pending_worktree_deletion", "branch_deleted")?)
 }
 
 fn table_has_column(
@@ -1568,6 +1561,30 @@ mod tests {
             .unwrap();
 
         assert!(has_author);
+        drop(conn);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn current_schema_reopen_creates_pending_worktree_deletion_table_additively() {
+        let path = test_path("current-additive-worktree-deletion");
+        {
+            let conn = open_writable(&path).unwrap();
+            conn.execute("drop table pending_worktree_deletion", [])
+                .unwrap();
+        }
+
+        let conn = open_writable(&path).unwrap();
+        let table_count: i64 = conn
+            .query_row(
+                "select count(*) from sqlite_master
+                 where type = 'table' and name = 'pending_worktree_deletion'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(table_count, 1);
         drop(conn);
         let _ = fs::remove_file(path);
     }

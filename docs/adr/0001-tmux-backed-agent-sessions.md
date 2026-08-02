@@ -16,8 +16,10 @@ interactive terminal protocol.
 
 Prism uses tmux as the backing runtime for interactive agent sessions.
 
-Each agent session is a tmux session named from the repository hash, branch, and
-generation. Window 1 runs the configured interactive agent command, window 2 is
+Each agent session is a tmux session named
+`prism-<branch>-<repository-hash>-<generation>`. Prism recognizes the previous
+hash-first convention and renames those sessions during startup migration.
+Window 1 runs the configured interactive agent command, window 2 is
 lazygit, and window 3 is a shell in the same worktree. Prism attaches to these
 windows instead of embedding the interactive agent inside the TUI process.
 

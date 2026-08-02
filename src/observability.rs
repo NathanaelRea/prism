@@ -492,13 +492,12 @@ pub fn command_data_json(
     json_object(fields)
 }
 
-pub struct ProcessObservation<'a> {
+pub struct ProcessExecutionObservation<'a> {
     pub policy: &'a str,
     pub elapsed_ms: i64,
     pub deadline_ms: i64,
     pub child_pid: u32,
-    #[cfg(unix)]
-    pub process_group: libc::pid_t,
+    pub process_group: Option<u32>,
     pub status: &'a str,
     pub completion: &'a str,
     pub termination_stage: &'a str,
@@ -524,7 +523,7 @@ pub fn process_start_data_json(
 pub fn process_data_json(
     command: &Command,
     include_argv: bool,
-    observation: ProcessObservation<'_>,
+    observation: ProcessExecutionObservation<'_>,
 ) -> String {
     let mut fields = command_data_fields(command, include_argv);
     fields.extend([
@@ -546,11 +545,9 @@ pub fn process_data_json(
         ),
         format!("\"stderr_truncated\":{}", observation.stderr_truncated),
     ]);
-    #[cfg(unix)]
-    fields.push(json_number_field(
-        "process_group",
-        i64::from(observation.process_group),
-    ));
+    if let Some(process_group) = observation.process_group {
+        fields.push(json_number_field("process_group", i64::from(process_group)));
+    }
     if let Some(error) = observation.error {
         fields.push(json_string_field("error", &redact_freeform(error, 500)));
     }

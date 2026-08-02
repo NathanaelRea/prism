@@ -6,6 +6,39 @@ Run the local CI gate before pushing:
 scripts/full-check.sh
 ```
 
+Prism supports Linux and macOS. On Linux, the gate runs native tests and clippy,
+the host-independent policy tests for both supported operating systems, and
+Darwin cross-clippy for Apple Silicon. There are no architecture-specific code
+paths warranting a duplicate Intel cross-check. Cross-compilation does not
+replace native macOS verification.
+
+Run the focused native contracts on a prepared macOS host before the complete
+suite:
+
+```sh
+scripts/platform-smoke.sh
+scripts/full-check.sh
+```
+
+The smoke command requires real `opencode` and `tmux` executables. It selects the
+`platform_smoke_native_` tests and the two real OpenCode/tmux integration tests.
+The selected tests exercise native process, durability, Unix-socket, worker,
+OpenCode, and tmux contracts without invoking a model. Deterministic policy,
+errno classification, and fault-injection tests remain in the full suite except
+where a staging test also proves a native durability primitive.
+
+To synchronize the current worktree, including uncommitted files, to an
+SSH-accessible Mac and run that smoke command without pushing a branch:
+
+```sh
+scripts/remote-macos-smoke.sh mac-builder prism-platform-smoke
+```
+
+`PRISM_MAC_HOST` and `PRISM_MAC_DIR` provide the same values without arguments.
+The destination must already be a Git checkout or worktree. Its working files
+are treated as a dedicated mirror: rsync deletes stale files while excluding
+`.git` and `target`.
+
 CI also runs a no-model smoke test against a pinned real OpenCode binary on Linux and macOS. To run it locally with an installed OpenCode:
 
 ```sh
@@ -52,6 +85,20 @@ The scripts print `SKIP` and succeed when a required tool, Docker daemon, or
 pinned image is unavailable. A service that starts but violates its expected API
 shape fails the compatibility run. See [Remote Hosting](remote-hosting.md) for
 the recorded metadata and security boundaries.
+
+## Worktrunk Compatibility
+
+Prism's Worktrunk support floor is 0.58.0. CI installs and smoke-tests the pinned current version 0.71.0 on Linux and macOS using the versioned installer published with that upstream release. The smoke creates a repository whose path contains spaces, creates the `ci/real-smoke` branch, reads `wt list --format=json`, and removes the worktree while preserving the branch. It sets `WORKTRUNK_CONFIG_PATH` and `WORKTRUNK_WORKTREE_PATH` under a temporary directory so it never reads or mutates user configuration or approvals.
+
+`PRISM_TEST_WORKTRUNK` is the real-tool smoke selector and contains the absolute path to `wt`. To exercise the same binary selection locally:
+
+```sh
+PRISM_TEST_WORKTRUNK="$(command -v wt)"
+test -x "$PRISM_TEST_WORKTRUNK"
+"$PRISM_TEST_WORKTRUNK" --version
+```
+
+Parser coverage does not require Worktrunk. Redacted fixtures under `tests/fixtures/worktrunk` cover the 0.58.0 schema-1 floor and the schema-1/schema-2 output documented for 0.71.0, including absent and null observations. Unknown schemas must fail closed.
 
 To enforce the same gate as a pre-push hook, opt into the versioned hooks:
 

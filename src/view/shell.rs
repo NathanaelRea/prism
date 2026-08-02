@@ -51,6 +51,8 @@ const REPOS_FOOTER_ACTIONS: &[(&str, &str)] = &[
 const WORKTREES_FOOTER_ACTIONS: &[(&str, &str)] = &[
     ("Select", "j/k"),
     ("Open", "Enter"),
+    ("URL", "o"),
+    ("Logs", "L"),
     ("Visibility", "+/-"),
     ("Search", "/"),
     ("Info", "?"),

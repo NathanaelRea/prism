@@ -3,35 +3,30 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use serde_json::Value;
-
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{
     AutoExecutorDecision, AutoImplementationSource, AutoLaunch, AutoLaunchOptions,
-    AutoRunControlIntent, AutoRunMode, AutoRunStatus, AutoStepKey, AutoStepStatus,
-    PersistedAutoRun, apply_auto_run_control, archive_auto_run, load_auto_run,
-    prepare_auto_run_for_resume,
+    AutoRunControlIntent, AutoRunMode, AutoStepKey, AutoStepStatus, PersistedAutoRun,
+    apply_auto_run_control, archive_auto_run, load_auto_run, prepare_auto_run_for_resume,
 };
 use crate::config::Config;
 use crate::git::{branch_behind, git_status_label, pull_branch, selected_dirty};
 use crate::harness::{HarnessConfig, OutputFormat, PromptTransport};
-use crate::json::{json_bool_field, json_object_field, json_string_field, json_top_level_objects};
 use crate::lifecycle::{
-    WorktrunkApprovalStatus, check_worktrunk_approval_status, is_worktrunk_approval_failure,
-    push_branch, run_pre_pr_checks, run_pre_push_checks, run_worktrunk_approval_prompt,
+    WorktrunkApprovalStatus, check_worktrunk_approval_status, push_branch, run_pre_pr_checks,
+    run_pre_push_checks, run_worktrunk_approval_prompt,
 };
 use crate::observability::append_runtime_message;
 use crate::opencode::{self, OpencodeStatus, load_runtime};
 use crate::plan::{PlanExecution, infer_total_phases, open_plan_mode, select_plan_path};
 use crate::plan_run::{
-    DEFAULT_OUTPUT_LINES_PER_STEP, PlanRunMode, PlanRunStatus, PlanStepStatus, abort_plan_run,
-    abort_plan_step, archive_plan_run, load_plan_run, load_resumable_plan_run,
-    prepare_plan_run_for_resume, request_plan_run_pause, resume_paused_plan_run,
-    retry_failed_steps, retry_from_step, save_plan_run, skip_plan_step,
+    DEFAULT_OUTPUT_LINES_PER_STEP, PlanRunMode, PlanStepStatus, abort_plan_step, archive_plan_run,
+    load_plan_run, load_resumable_plan_run, prepare_plan_run_for_resume, retry_failed_steps,
+    retry_from_step, save_plan_run, skip_plan_step,
 };
 use crate::process::{
-    ProcessPolicy, command_exists, parse_command_words, run_capture, run_output_allow_failure,
+    ProcessPolicy, command_exists, parse_command_words, run_output_allow_failure,
 };
 use crate::remote::dispatcher::{
     create_change_request as create_pull_request,
@@ -58,13 +53,14 @@ use crate::tui::{
     OpencodeEventResult, OpencodeListenerKey, OpencodePollKey, OpencodePollResult,
     PrPersistenceRequest, PrPollKey, PrPollResult, PrSummarySessionResult, RemoteActionValue,
     RemoteMergeOutcome, RemotePushPrepared, SessionRefreshResult, SessionRefreshSnapshot,
-    TUI_ACTION_JOB_TIMEOUT, Tui, TuiJobKey, TuiJobKind, TuiJobPayload, WtPollResult,
+    TUI_ACTION_JOB_TIMEOUT, Tui, TuiJobKey, TuiJobKind, TuiJobPayload, WtObservation, WtPollResult,
 };
 use crate::tui_jobs::CoalescedFacet;
 
 use crate::util::status_count;
 
 mod auto;
+mod logs;
 mod opencode_actions;
 mod plans;
 mod polling;
@@ -97,14 +93,18 @@ fn reject_claimed_control(
 mod tests;
 
 #[cfg(test)]
+use crate::worktrunk::discover_columns as discover_wt_columns;
+#[cfg(test)]
 use plans::plan_run_mode_from_parallel_confirmation;
 #[cfg(test)]
-use polling::{discover_wt_columns, status_label_with_behind};
+use polling::status_label_with_behind;
 #[cfg(test)]
 use pull_requests::{
-    apply_bulk_review_resolution, pr_target_choice_list, remote_pr_choice_keys,
-    remote_pr_worktree_branch, run_browser_opener, unresolved_review_thread_ids,
-    validate_push_target_after_checks,
+    apply_bulk_review_resolution, open_http_url_in_browser, pr_target_choice_list,
+    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
+    unresolved_review_thread_ids, validate_push_target_after_checks,
 };
+#[cfg(test)]
+use repositories::worktree_column_choices;
 #[cfg(test)]
 use worktrees::archived_picker_overflow_message;

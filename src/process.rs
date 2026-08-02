@@ -4,6 +4,8 @@ use std::error::Error;
 use std::fmt;
 use std::io::{self, Read, Write};
 use std::ops::{Deref, DerefMut};
+use std::os::fd::AsRawFd;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -16,6 +18,426 @@ use crate::observability::{self, LogLevel};
 
 thread_local! {
     static CURRENT_CANCELLATION: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProcessIdentity(u64);
+
+impl ProcessIdentity {
+    pub const fn from_stored_value(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn stored_value(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RecordedProcess {
+    pub pid: u32,
+    pub identity: Option<ProcessIdentity>,
+}
+
+impl RecordedProcess {
+    pub fn from_stored(pid: u32, identity: Option<u64>) -> Self {
+        Self {
+            pid,
+            identity: identity.map(ProcessIdentity::from_stored_value),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProcessObservation {
+    RunningSameProcess,
+    Missing,
+    IdentityReused,
+    RunningUnverifiable,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminationOutcome {
+    Terminated,
+    AlreadyExited,
+    IdentityReused,
+    Unverifiable,
+}
+
+#[derive(Debug)]
+pub enum ProcessLifecycleError {
+    Inspect { pid: u32, source: io::Error },
+    Signal { pid: u32, source: io::Error },
+    TerminationTimedOut { pid: u32 },
+}
+
+impl fmt::Display for ProcessLifecycleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inspect { pid, source } => write!(formatter, "inspect process {pid}: {source}"),
+            Self::Signal { pid, source } => {
+                write!(formatter, "signal process group {pid}: {source}")
+            }
+            Self::TerminationTimedOut { pid } => {
+                write!(
+                    formatter,
+                    "process group {pid} survived bounded termination"
+                )
+            }
+        }
+    }
+}
+
+impl Error for ProcessLifecycleError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Inspect { source, .. } | Self::Signal { source, .. } => Some(source),
+            Self::TerminationTimedOut { .. } => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeProcessObservation {
+    Missing,
+    Running(Option<ProcessIdentity>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessRequest {
+    Observe,
+    Terminate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessDecision {
+    Observation(ProcessObservation),
+    Terminate,
+    TerminationOutcome(TerminationOutcome),
+}
+
+fn decide_process_request(
+    recorded_identity: Option<ProcessIdentity>,
+    native: NativeProcessObservation,
+    request: ProcessRequest,
+) -> ProcessDecision {
+    let observation = match native {
+        NativeProcessObservation::Missing => ProcessObservation::Missing,
+        NativeProcessObservation::Running(None) => ProcessObservation::RunningUnverifiable,
+        NativeProcessObservation::Running(Some(observed)) => match recorded_identity {
+            Some(recorded) if recorded == observed => ProcessObservation::RunningSameProcess,
+            Some(_) => ProcessObservation::IdentityReused,
+            None => ProcessObservation::RunningUnverifiable,
+        },
+    };
+    match (request, observation) {
+        (ProcessRequest::Observe, observation) => ProcessDecision::Observation(observation),
+        (ProcessRequest::Terminate, ProcessObservation::RunningSameProcess) => {
+            ProcessDecision::Terminate
+        }
+        (ProcessRequest::Terminate, ProcessObservation::Missing) => {
+            ProcessDecision::TerminationOutcome(TerminationOutcome::AlreadyExited)
+        }
+        (ProcessRequest::Terminate, ProcessObservation::IdentityReused) => {
+            ProcessDecision::TerminationOutcome(TerminationOutcome::IdentityReused)
+        }
+        (ProcessRequest::Terminate, ProcessObservation::RunningUnverifiable) => {
+            ProcessDecision::TerminationOutcome(TerminationOutcome::Unverifiable)
+        }
+    }
+}
+
+pub fn record_process(pid: u32) -> Result<RecordedProcess, ProcessLifecycleError> {
+    let identity = match native_process_observation(pid)? {
+        NativeProcessObservation::Missing => None,
+        NativeProcessObservation::Running(identity) => identity,
+    };
+    Ok(RecordedProcess { pid, identity })
+}
+
+pub fn observe_process(
+    process: RecordedProcess,
+) -> Result<ProcessObservation, ProcessLifecycleError> {
+    let native = native_process_observation(process.pid)?;
+    match decide_process_request(process.identity, native, ProcessRequest::Observe) {
+        ProcessDecision::Observation(observation) => Ok(observation),
+        _ => unreachable!("observation request always produces an observation"),
+    }
+}
+
+pub fn terminate_recorded_process(
+    process: RecordedProcess,
+    grace: Duration,
+) -> Result<TerminationOutcome, ProcessLifecycleError> {
+    let native = native_process_observation(process.pid)?;
+    match decide_process_request(process.identity, native, ProcessRequest::Terminate) {
+        ProcessDecision::TerminationOutcome(outcome) => return Ok(outcome),
+        ProcessDecision::Terminate => {}
+        ProcessDecision::Observation(_) => unreachable!("termination request cannot observe"),
+    }
+
+    if !send_process_group_signal(process.pid, libc::SIGTERM).map_err(|source| {
+        ProcessLifecycleError::Signal {
+            pid: process.pid,
+            source,
+        }
+    })? {
+        return Ok(TerminationOutcome::AlreadyExited);
+    }
+    let term_deadline = Instant::now() + grace;
+    while Instant::now() < term_deadline {
+        if !probe_process_group(process.pid).map_err(|source| ProcessLifecycleError::Inspect {
+            pid: process.pid,
+            source,
+        })? {
+            return Ok(TerminationOutcome::Terminated);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !send_process_group_signal(process.pid, libc::SIGKILL).map_err(|source| {
+        ProcessLifecycleError::Signal {
+            pid: process.pid,
+            source,
+        }
+    })? {
+        return Ok(TerminationOutcome::Terminated);
+    }
+    let kill_deadline = Instant::now() + grace;
+    while Instant::now() < kill_deadline {
+        if !probe_process_group(process.pid).map_err(|source| ProcessLifecycleError::Inspect {
+            pid: process.pid,
+            source,
+        })? {
+            return Ok(TerminationOutcome::Terminated);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if probe_process_group(process.pid).map_err(|source| ProcessLifecycleError::Inspect {
+        pid: process.pid,
+        source,
+    })? {
+        Err(ProcessLifecycleError::TerminationTimedOut { pid: process.pid })
+    } else {
+        Ok(TerminationOutcome::Terminated)
+    }
+}
+
+pub fn process_arguments(pid: u32) -> Result<Option<Vec<String>>, ProcessLifecycleError> {
+    native_process_arguments(pid).map_err(|source| ProcessLifecycleError::Inspect { pid, source })
+}
+
+fn native_process_observation(pid: u32) -> Result<NativeProcessObservation, ProcessLifecycleError> {
+    if !probe_process(pid).map_err(|source| ProcessLifecycleError::Inspect { pid, source })? {
+        return Ok(NativeProcessObservation::Missing);
+    }
+    let identity = native_process_identity(pid)
+        .map_err(|source| ProcessLifecycleError::Inspect { pid, source })?;
+    if identity.is_none()
+        && !probe_process(pid).map_err(|source| ProcessLifecycleError::Inspect { pid, source })?
+    {
+        return Ok(NativeProcessObservation::Missing);
+    }
+    Ok(NativeProcessObservation::Running(identity))
+}
+
+fn probe_result(result: libc::c_int, error: Option<i32>) -> io::Result<bool> {
+    if result == 0 {
+        return Ok(true);
+    }
+    match error {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        Some(code) => Err(io::Error::from_raw_os_error(code)),
+        None => Err(io::Error::other("process probe failed without an OS error")),
+    }
+}
+
+fn native_pid(pid: u32) -> io::Result<libc::pid_t> {
+    let pid = libc::pid_t::try_from(pid)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "process id is out of range"))?;
+    if pid == 0 {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "process id must not be zero",
+        ))
+    } else {
+        Ok(pid)
+    }
+}
+
+fn probe_process(pid: u32) -> io::Result<bool> {
+    let result = unsafe { libc::kill(native_pid(pid)?, 0) };
+    probe_result(
+        result,
+        (result != 0)
+            .then(|| io::Error::last_os_error().raw_os_error())
+            .flatten(),
+    )
+}
+
+fn probe_process_group(pid: u32) -> io::Result<bool> {
+    let result = unsafe { libc::kill(-native_pid(pid)?, 0) };
+    probe_result(
+        result,
+        (result != 0)
+            .then(|| io::Error::last_os_error().raw_os_error())
+            .flatten(),
+    )
+}
+
+fn send_process_group_signal(pid: u32, signal: libc::c_int) -> io::Result<bool> {
+    let result = unsafe { libc::kill(-native_pid(pid)?, signal) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn native_process_identity(pid: u32) -> io::Result<Option<ProcessIdentity>> {
+    let stat = match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => stat,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(parse_linux_process_start_time(&stat).map(ProcessIdentity))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_process_start_time(stat: &str) -> Option<u64> {
+    let fields_after_comm = stat.rsplit_once(") ")?.1;
+    fields_after_comm.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(target_os = "macos")]
+fn native_process_identity(pid: u32) -> io::Result<Option<ProcessIdentity>> {
+    let pid = native_pid(pid)?;
+    let mut info = unsafe { std::mem::zeroed::<libc::proc_bsdinfo>() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let result = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size as libc::c_int,
+        )
+    };
+    if result != size as libc::c_int {
+        return Ok(None);
+    }
+    let Some(seconds) = info.pbi_start_tvsec.checked_shl(20) else {
+        return Ok(None);
+    };
+    if info.pbi_start_tvusec >= (1 << 20) {
+        return Ok(None);
+    }
+    Ok(Some(ProcessIdentity(seconds | info.pbi_start_tvusec)))
+}
+
+#[cfg(target_os = "linux")]
+fn native_process_arguments(pid: u32) -> io::Result<Option<Vec<String>>> {
+    let bytes = match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    Ok(Some(
+        bytes
+            .split(|byte| *byte == 0)
+            .filter(|argument| !argument.is_empty())
+            .map(|argument| String::from_utf8_lossy(argument).into_owned())
+            .collect(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn native_process_arguments(pid: u32) -> io::Result<Option<Vec<String>>> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, native_pid(pid)?];
+    let mut size = 0;
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    let mut bytes = vec![0_u8; size];
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(None)
+        } else {
+            Err(error)
+        };
+    }
+    bytes.truncate(size);
+    parse_macos_process_arguments(&bytes).map(Some)
+}
+
+#[cfg(target_os = "macos")]
+fn parse_macos_process_arguments(bytes: &[u8]) -> io::Result<Vec<String>> {
+    let argc_bytes: [u8; 4] = bytes
+        .get(..4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing process argc"))?;
+    let argc = i32::from_ne_bytes(argc_bytes);
+    if argc < 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "negative process argc",
+        ));
+    }
+    let mut cursor = 4;
+    while cursor < bytes.len() && bytes[cursor] != 0 {
+        cursor += 1;
+    }
+    while cursor < bytes.len() && bytes[cursor] == 0 {
+        cursor += 1;
+    }
+    let mut arguments = Vec::with_capacity(argc as usize);
+    for _ in 0..argc {
+        let start = cursor;
+        while cursor < bytes.len() && bytes[cursor] != 0 {
+            cursor += 1;
+        }
+        if cursor == bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unterminated process argument",
+            ));
+        }
+        arguments.push(String::from_utf8_lossy(&bytes[start..cursor]).into_owned());
+        cursor += 1;
+    }
+    Ok(arguments)
 }
 
 pub(crate) fn with_cancellation<T>(canceled: Arc<AtomicBool>, operation: impl FnOnce() -> T) -> T {
@@ -168,12 +590,8 @@ fn append_status_fields(fields: &mut Vec<flight_recorder::Field>, status: ExitSt
     if let Some(code) = status.code() {
         fields.push(flight_recorder::unsigned("exit_code", code));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(signal) = status.signal() {
-            fields.push(flight_recorder::unsigned("signal", signal));
-        }
+    if let Some(signal) = status.signal() {
+        fields.push(flight_recorder::unsigned("signal", signal));
     }
 }
 
@@ -204,7 +622,7 @@ fn infer_descriptor(command: &Command) -> ProcessDescriptor {
         "lazygit" => "lazygit.open",
         "sqlite3" => "sqlite.shell",
         "date" => "system.time.format",
-        "open" | "xdg-open" | "cmd.exe" => "browser.open",
+        "open" | "xdg-open" => "browser.open",
         _ => "process.other",
     };
     ProcessDescriptor::new(name)
@@ -331,11 +749,7 @@ impl SupervisedChild {
         } else {
             Stdio::null()
         });
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
+        command.process_group(0);
 
         let started = Instant::now();
         let mut child = match command.spawn() {
@@ -622,8 +1036,7 @@ pub struct ProcessOutcome {
     pub elapsed: Duration,
     pub deadline: Duration,
     pub child_pid: u32,
-    #[cfg(unix)]
-    pub process_group: libc::pid_t,
+    pub process_group: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -756,10 +1169,7 @@ pub fn spawn_detached_named(
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
-            #[cfg(unix)]
             unsafe {
-                use std::os::unix::process::CommandExt;
-
                 // Daemons deliberately escape the normal supervised process group.
                 command.pre_exec(|| {
                     if libc::setsid() == -1 {
@@ -860,11 +1270,6 @@ pub fn run_status_named(
             process_failure_message(&output)
         ))
     }
-}
-
-pub fn run_output(command: &mut Command, policy: ProcessPolicy) -> Result<ProcessOutput, String> {
-    let descriptor = infer_descriptor(command);
-    run_output_named(command, policy, descriptor)
 }
 
 pub fn run_output_named(
@@ -1012,12 +1417,11 @@ fn run_output_with_settings(
         Some(observability::process_data_json(
             command,
             include_argv,
-            observability::ProcessObservation {
+            observability::ProcessExecutionObservation {
                 policy: policy.label(),
                 elapsed_ms,
                 deadline_ms: outcome.deadline.as_millis() as i64,
                 child_pid: outcome.child_pid,
-                #[cfg(unix)]
                 process_group: outcome.process_group,
                 status: &process_output.status.to_string(),
                 completion: outcome.completion.label(),
@@ -1097,17 +1501,11 @@ fn supervise_with_settings(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    command.process_group(0);
 
     let started = Instant::now();
     let mut child = command.spawn().map_err(ProcessError::Spawn)?;
     let child_pid = child.id();
-    #[cfg(unix)]
-    let process_group = child_pid as libc::pid_t;
     let stop_readers = Arc::new(AtomicBool::new(false));
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -1204,8 +1602,6 @@ fn supervise_with_settings(
                 let _ = child.kill();
             }
         }
-        #[cfg(not(unix))]
-        let _ = child.kill();
     } else {
         let drain_deadline = Instant::now() + settings.termination_grace;
         while (!stdout_reader.is_finished() || !stderr_reader.is_finished())
@@ -1238,8 +1634,6 @@ fn supervise_with_settings(
                         let _ = child.kill();
                     }
                 }
-                #[cfg(not(unix))]
-                let _ = child.kill();
             }
         }
     }
@@ -1286,49 +1680,30 @@ fn supervise_with_settings(
         elapsed: started.elapsed(),
         deadline: settings.deadline,
         child_pid,
-        #[cfg(unix)]
-        process_group,
+        process_group: Some(child_pid),
     })
 }
 
 fn completion_from_status(status: ExitStatus) -> ProcessCompletion {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if status.signal().is_some() {
-            return ProcessCompletion::Signaled;
-        }
+    if status.signal().is_some() {
+        return ProcessCompletion::Signaled;
     }
     ProcessCompletion::Exited
 }
 
-#[cfg(unix)]
 fn spawn_capture_reader<R>(
     reader: R,
     max_bytes: usize,
     stop: Arc<AtomicBool>,
 ) -> JoinHandle<io::Result<CapturedTail>>
 where
-    R: Read + std::os::fd::AsRawFd + Send + 'static,
+    R: Read + AsRawFd + Send + 'static,
 {
     std::thread::spawn(move || read_captured_tail(reader, max_bytes, &stop))
 }
 
-#[cfg(not(unix))]
-fn spawn_capture_reader<R>(
-    reader: R,
-    max_bytes: usize,
-    stop: Arc<AtomicBool>,
-) -> JoinHandle<io::Result<CapturedTail>>
-where
-    R: Read + Send + 'static,
-{
-    std::thread::spawn(move || read_captured_tail(reader, max_bytes, &stop))
-}
-
-#[cfg(unix)]
 fn read_captured_tail(
-    mut reader: impl Read + std::os::fd::AsRawFd,
+    mut reader: impl Read + AsRawFd,
     max_bytes: usize,
     stop: &AtomicBool,
 ) -> io::Result<CapturedTail> {
@@ -1360,23 +1735,6 @@ fn read_captured_tail(
             }
             Err(error) => return Err(error),
         }
-    }
-}
-
-#[cfg(not(unix))]
-fn read_captured_tail(
-    mut reader: impl Read,
-    max_bytes: usize,
-    _stop: &AtomicBool,
-) -> io::Result<CapturedTail> {
-    let mut tail = TailBuffer::new(max_bytes);
-    let mut buffer = [0_u8; 8192];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            return Ok(tail.finish());
-        }
-        tail.push(&buffer[..read]);
     }
 }
 
@@ -1443,56 +1801,27 @@ fn join_stdin(writer: Option<JoinHandle<io::Result<()>>>) -> Result<(), ProcessE
         .map_err(ProcessError::Stdin)
 }
 
-#[cfg(unix)]
 fn signal_term(process_id: u32) -> Result<TerminationStage, ProcessError> {
     signal_process_group(process_id, libc::SIGTERM).map(|_| TerminationStage::Term)
 }
 
-#[cfg(not(unix))]
-fn signal_term(_process_id: u32) -> Result<TerminationStage, ProcessError> {
-    Ok(TerminationStage::Term)
-}
-
-#[cfg(unix)]
 fn signal_kill(process_id: u32) -> Result<bool, ProcessError> {
     signal_process_group(process_id, libc::SIGKILL)
 }
 
-#[cfg(not(unix))]
-fn signal_kill(_process_id: u32) -> Result<bool, ProcessError> {
-    Ok(true)
-}
-
-#[cfg(unix)]
 fn signal_process_group(process_id: u32, signal: libc::c_int) -> Result<bool, ProcessError> {
-    let result = unsafe { libc::kill(-(process_id as libc::pid_t), signal) };
-    if result == 0 {
-        return Ok(true);
-    }
-    let error = io::Error::last_os_error();
-    if error.raw_os_error() == Some(libc::ESRCH) {
-        Ok(false)
-    } else {
-        Err(ProcessError::Signal {
-            signal: match signal {
-                libc::SIGTERM => "SIGTERM",
-                libc::SIGKILL => "SIGKILL",
-                _ => "signal",
-            },
-            source: error,
-        })
-    }
+    send_process_group_signal(process_id, signal).map_err(|error| ProcessError::Signal {
+        signal: match signal {
+            libc::SIGTERM => "SIGTERM",
+            libc::SIGKILL => "SIGKILL",
+            _ => "signal",
+        },
+        source: error,
+    })
 }
 
-#[cfg(unix)]
 fn process_group_exists(process_id: u32) -> bool {
-    let result = unsafe { libc::kill(-(process_id as libc::pid_t), 0) };
-    result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(not(unix))]
-fn process_group_exists(_process_id: u32) -> bool {
-    false
+    probe_process_group(process_id).unwrap_or(true)
 }
 
 pub fn terminate_active_child(
@@ -1538,8 +1867,6 @@ pub fn terminate_active_child(
             let _ = child.kill();
         }
     }
-    #[cfg(not(unix))]
-    let _ = child.kill();
     if status.is_none()
         && let Err(error) = child.wait()
     {
@@ -1722,11 +2049,7 @@ fn run_interactive_inner(
                 .stderr(Stdio::inherit());
         }
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+    command.process_group(0);
     let mut child = command.spawn().map_err(|error| {
         trace.finish(
             ExternalCallOutcome::SpawnFailed,
@@ -1878,14 +2201,12 @@ fn run_interactive_inner(
 
 struct InteractiveSignalCancellation {
     flag: Arc<AtomicBool>,
-    #[cfg(unix)]
     registrations: Vec<signal_hook::SigId>,
 }
 
 impl InteractiveSignalCancellation {
     fn install() -> io::Result<Self> {
         let flag = Arc::new(AtomicBool::new(false));
-        #[cfg(unix)]
         let registrations = {
             let mut registrations = Vec::new();
             for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
@@ -1903,13 +2224,11 @@ impl InteractiveSignalCancellation {
         };
         Ok(Self {
             flag,
-            #[cfg(unix)]
             registrations,
         })
     }
 }
 
-#[cfg(unix)]
 impl Drop for InteractiveSignalCancellation {
     fn drop(&mut self) {
         for registration in self.registrations.drain(..) {
@@ -1919,35 +2238,25 @@ impl Drop for InteractiveSignalCancellation {
 }
 
 struct ForegroundProcessGroup {
-    #[cfg(unix)]
     original: Option<libc::pid_t>,
 }
 
 impl ForegroundProcessGroup {
     fn give_to(process_id: u32) -> io::Result<Self> {
-        #[cfg(unix)]
-        {
-            if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
-                return Ok(Self { original: None });
-            }
-            let original = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
-            if original == -1 {
-                return Err(io::Error::last_os_error());
-            }
-            set_foreground_process_group(process_id as libc::pid_t)?;
-            Ok(Self {
-                original: Some(original),
-            })
+        if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+            return Ok(Self { original: None });
         }
-        #[cfg(not(unix))]
-        {
-            let _ = process_id;
-            Ok(Self {})
+        let original = unsafe { libc::tcgetpgrp(libc::STDIN_FILENO) };
+        if original == -1 {
+            return Err(io::Error::last_os_error());
         }
+        set_foreground_process_group(process_id as libc::pid_t)?;
+        Ok(Self {
+            original: Some(original),
+        })
     }
 }
 
-#[cfg(unix)]
 impl Drop for ForegroundProcessGroup {
     fn drop(&mut self) {
         if let Some(original) = self.original {
@@ -1956,7 +2265,6 @@ impl Drop for ForegroundProcessGroup {
     }
 }
 
-#[cfg(unix)]
 fn set_foreground_process_group(process_group: libc::pid_t) -> io::Result<()> {
     unsafe {
         let mut blocked = std::mem::zeroed::<libc::sigset_t>();
@@ -2132,6 +2440,146 @@ mod tests {
     use super::*;
 
     #[test]
+    fn process_observation_and_termination_decision_table_is_complete() {
+        let first = ProcessIdentity(10);
+        let second = ProcessIdentity(20);
+        let cases = [
+            (
+                None,
+                NativeProcessObservation::Missing,
+                ProcessObservation::Missing,
+                ProcessDecision::TerminationOutcome(TerminationOutcome::AlreadyExited),
+            ),
+            (
+                None,
+                NativeProcessObservation::Running(None),
+                ProcessObservation::RunningUnverifiable,
+                ProcessDecision::TerminationOutcome(TerminationOutcome::Unverifiable),
+            ),
+            (
+                None,
+                NativeProcessObservation::Running(Some(first)),
+                ProcessObservation::RunningUnverifiable,
+                ProcessDecision::TerminationOutcome(TerminationOutcome::Unverifiable),
+            ),
+            (
+                None,
+                NativeProcessObservation::Running(Some(second)),
+                ProcessObservation::RunningUnverifiable,
+                ProcessDecision::TerminationOutcome(TerminationOutcome::Unverifiable),
+            ),
+            (
+                Some(first),
+                NativeProcessObservation::Missing,
+                ProcessObservation::Missing,
+                ProcessDecision::TerminationOutcome(TerminationOutcome::AlreadyExited),
+            ),
+            (
+                Some(first),
+                NativeProcessObservation::Running(None),
+                ProcessObservation::RunningUnverifiable,
+                ProcessDecision::TerminationOutcome(TerminationOutcome::Unverifiable),
+            ),
+            (
+                Some(first),
+                NativeProcessObservation::Running(Some(first)),
+                ProcessObservation::RunningSameProcess,
+                ProcessDecision::Terminate,
+            ),
+            (
+                Some(first),
+                NativeProcessObservation::Running(Some(second)),
+                ProcessObservation::IdentityReused,
+                ProcessDecision::TerminationOutcome(TerminationOutcome::IdentityReused),
+            ),
+        ];
+
+        for (recorded, native, observation, termination) in cases {
+            assert_eq!(
+                decide_process_request(recorded, native, ProcessRequest::Observe),
+                ProcessDecision::Observation(observation)
+            );
+            assert_eq!(
+                decide_process_request(recorded, native, ProcessRequest::Terminate),
+                termination
+            );
+        }
+    }
+
+    #[test]
+    fn platform_contract_process_probe_treats_permission_denied_as_existing() {
+        assert!(probe_result(-1, Some(libc::EPERM)).unwrap());
+        assert!(!probe_result(-1, Some(libc::ESRCH)).unwrap());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linux_process_stat_parser_handles_spaces_and_parentheses_in_name() {
+        let mut fields = vec!["S"; 19];
+        fields.push("4242");
+        let stat = format!("12 (a process) name) {}", fields.join(" "));
+
+        assert_eq!(parse_linux_process_start_time(&stat), Some(4242));
+    }
+
+    #[test]
+    fn platform_smoke_native_process_identity_observes_current_process() {
+        let recorded = record_process(std::process::id()).unwrap();
+
+        assert!(recorded.identity.is_some());
+        assert_eq!(
+            observe_process(recorded).unwrap(),
+            ProcessObservation::RunningSameProcess
+        );
+    }
+
+    #[test]
+    fn platform_smoke_native_absent_process_and_group_are_missing() {
+        let process = RecordedProcess::from_stored(i32::MAX as u32, Some(1));
+
+        assert_eq!(
+            observe_process(process).unwrap(),
+            ProcessObservation::Missing
+        );
+        assert_eq!(
+            terminate_recorded_process(process, Duration::from_millis(10)).unwrap(),
+            TerminationOutcome::AlreadyExited
+        );
+        assert!(!probe_process_group(process.pid).unwrap());
+    }
+
+    #[test]
+    fn platform_smoke_native_identity_checked_termination_rejects_reuse() {
+        use std::os::unix::process::CommandExt;
+
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let recorded = record_process(child.id()).unwrap();
+        let reused = RecordedProcess {
+            pid: recorded.pid,
+            identity: recorded
+                .identity
+                .map(|identity| ProcessIdentity(identity.0.wrapping_add(1))),
+        };
+
+        assert_eq!(
+            terminate_recorded_process(reused, Duration::from_millis(50)).unwrap(),
+            TerminationOutcome::IdentityReused
+        );
+        assert!(child.try_wait().unwrap().is_none());
+
+        let reaper = std::thread::spawn(move || child.wait().unwrap());
+        assert_eq!(
+            terminate_recorded_process(recorded, Duration::from_secs(1)).unwrap(),
+            TerminationOutcome::Terminated
+        );
+        reaper.join().unwrap();
+    }
+
+    #[test]
     fn process_descriptors_use_only_finite_known_command_labels() {
         assert_eq!(
             infer_descriptor(
@@ -2273,7 +2721,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn interactive_cancellation_kills_process_group_and_reaps_leader() {
+    fn platform_smoke_native_interactive_cancellation_kills_process_group_and_reaps_leader() {
         let temp = std::env::temp_dir().join(format!(
             "prism-interactive-process-{}-{}",
             std::process::id(),
@@ -2402,7 +2850,7 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn supervisor_kills_term_ignoring_pipe_descendant_and_bounds_each_capture() {
+    fn platform_smoke_native_supervisor_kills_term_ignoring_descendant_and_bounds_capture() {
         let temp = std::env::temp_dir().join(format!(
             "prism-process-tree-{}-{}",
             std::process::id(),

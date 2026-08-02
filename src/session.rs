@@ -270,11 +270,32 @@ pub(crate) enum CreateWorktreeOutcome {
     CreatedMetadataFailed { error: String },
 }
 
+#[derive(Debug)]
+pub(crate) enum CreateWorktreeFailure {
+    Worktrunk(crate::worktrunk::WorktrunkFailure),
+    Other(String),
+}
+
+impl CreateWorktreeFailure {
+    pub(crate) fn approval_required(&self) -> bool {
+        matches!(self, Self::Worktrunk(failure) if failure.approval_required())
+    }
+}
+
+impl std::fmt::Display for CreateWorktreeFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Worktrunk(failure) => failure.fmt(formatter),
+            Self::Other(error) => formatter.write_str(error),
+        }
+    }
+}
+
 pub(crate) fn create_worktree_session(
     repo: &Repository,
     config: &Config,
     branch: &str,
-) -> Result<CreateWorktreeOutcome, String> {
+) -> Result<CreateWorktreeOutcome, CreateWorktreeFailure> {
     create_or_checkout_worktree_session(repo, config, branch, false)
 }
 
@@ -282,7 +303,7 @@ pub(crate) fn checkout_worktree_session(
     repo: &Repository,
     config: &Config,
     branch: &str,
-) -> Result<CreateWorktreeOutcome, String> {
+) -> Result<CreateWorktreeOutcome, CreateWorktreeFailure> {
     create_or_checkout_worktree_session(repo, config, branch, true)
 }
 
@@ -291,17 +312,23 @@ fn create_or_checkout_worktree_session(
     config: &Config,
     branch: &str,
     checkout: bool,
-) -> Result<CreateWorktreeOutcome, String> {
-    if hidden_session_exists(repo, branch)?
-        && crate::lifecycle::branch_has_worktree(repo, config, branch)?
+) -> Result<CreateWorktreeOutcome, CreateWorktreeFailure> {
+    if hidden_session_exists(repo, branch).map_err(CreateWorktreeFailure::Other)?
+        && crate::lifecycle::branch_has_worktree(repo, config, branch)
+            .map_err(CreateWorktreeFailure::Other)?
     {
-        unarchive_worktree_session(repo, branch)?;
+        unarchive_worktree_session(repo, branch).map_err(CreateWorktreeFailure::Other)?;
         return Ok(CreateWorktreeOutcome::Restored);
     }
-    if checkout {
-        crate::lifecycle::checkout_worktree(repo, config, branch)?;
+    let switch = if checkout {
+        crate::lifecycle::checkout_worktree(repo, config, branch)
+            .map_err(CreateWorktreeFailure::Worktrunk)?
     } else {
-        crate::lifecycle::create_worktree(repo, config, branch)?;
+        crate::lifecycle::create_worktree(repo, config, branch)
+            .map_err(CreateWorktreeFailure::Worktrunk)?
+    };
+    if let Err(error) = crate::lifecycle::verify_switch_outcome(repo, config, branch, &switch) {
+        return Ok(CreateWorktreeOutcome::CreatedMetadataFailed { error });
     }
     match unarchive_worktree_session(repo, branch) {
         Ok(()) => Ok(CreateWorktreeOutcome::Created),
@@ -322,6 +349,142 @@ pub(crate) enum DeleteWorktreeOutcome {
     },
 }
 
+#[derive(Clone, Debug)]
+struct PendingWorktreeDeletion {
+    worktree_path: String,
+    worktree_incarnation: String,
+    branch_oid: Option<String>,
+    worktree_removed: bool,
+    branch_deleted: bool,
+}
+
+fn load_pending_worktree_deletion(
+    repo: &Repository,
+    branch: &str,
+) -> Result<Option<PendingWorktreeDeletion>, String> {
+    observability::with_writable_db(repo, |conn| {
+        conn.query_row(
+            "select worktree_path, worktree_incarnation, branch_oid, worktree_removed, branch_deleted
+             from pending_worktree_deletion where branch = ?1",
+            params![branch],
+            |row| {
+                Ok(PendingWorktreeDeletion {
+                    worktree_path: row.get(0)?,
+                    worktree_incarnation: row.get(1)?,
+                    branch_oid: row.get(2)?,
+                    worktree_removed: row.get(3)?,
+                    branch_deleted: row.get(4)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|error| format!("load pending worktree deletion: {error}"))
+    })
+}
+
+fn load_pending_worktree_deletions(
+    repo: &Repository,
+) -> Result<Vec<(String, PendingWorktreeDeletion)>, String> {
+    observability::with_writable_db(repo, |conn| {
+        let mut statement = conn
+            .prepare(
+                "select branch, worktree_path, worktree_incarnation, branch_oid,
+                        worktree_removed, branch_deleted
+                 from pending_worktree_deletion",
+            )
+            .map_err(|error| format!("prepare pending worktree deletions: {error}"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    PendingWorktreeDeletion {
+                        worktree_path: row.get(1)?,
+                        worktree_incarnation: row.get(2)?,
+                        branch_oid: row.get(3)?,
+                        worktree_removed: row.get(4)?,
+                        branch_deleted: row.get(5)?,
+                    },
+                ))
+            })
+            .map_err(|error| format!("query pending worktree deletions: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read pending worktree deletions: {error}"))
+    })
+}
+
+fn save_pending_worktree_deletion(
+    repo: &Repository,
+    path: &Path,
+    branch: &str,
+    incarnation: &str,
+    branch_oid: Option<&str>,
+) -> Result<(), String> {
+    observability::with_writable_db(repo, |conn| {
+        conn.execute(
+            "insert into pending_worktree_deletion (
+                branch, worktree_path, worktree_incarnation, branch_oid,
+                worktree_removed, branch_deleted, updated_unix_ms
+             ) values (?1, ?2, ?3, ?4, 0, 0, ?5)",
+            params![
+                branch,
+                path.display().to_string(),
+                incarnation,
+                branch_oid,
+                unix_seconds(),
+            ],
+        )
+        .map_err(|error| format!("save pending worktree deletion: {error}"))?;
+        Ok(())
+    })
+}
+
+fn mark_pending_deletion_phase(
+    repo: &Repository,
+    branch: &str,
+    column: &str,
+) -> Result<(), String> {
+    observability::with_writable_db(repo, |conn| {
+        conn.execute(
+            &format!(
+                "update pending_worktree_deletion
+                 set {column} = 1, updated_unix_ms = ?1 where branch = ?2"
+            ),
+            params![unix_seconds(), branch],
+        )
+        .map_err(|error| format!("record pending worktree deletion phase: {error}"))?;
+        Ok(())
+    })
+}
+
+pub(crate) fn worktree_deletion_is_pending(
+    repo: &Repository,
+    path: &Path,
+    branch: &str,
+    expected_incarnation: &str,
+) -> Result<bool, String> {
+    Ok(
+        load_pending_worktree_deletion(repo, branch)?.is_some_and(|pending| {
+            pending.worktree_path == path.display().to_string()
+                && pending.worktree_incarnation == expected_incarnation
+        }),
+    )
+}
+
+pub(crate) fn worktree_removal_is_complete(
+    repo: &Repository,
+    path: &Path,
+    branch: &str,
+    expected_incarnation: &str,
+) -> Result<bool, String> {
+    Ok(
+        load_pending_worktree_deletion(repo, branch)?.is_some_and(|pending| {
+            pending.worktree_path == path.display().to_string()
+                && pending.worktree_incarnation == expected_incarnation
+                && pending.worktree_removed
+        }),
+    )
+}
+
 pub(crate) fn delete_worktree_session_if_current(
     repo: &Repository,
     config: &Config,
@@ -329,14 +492,40 @@ pub(crate) fn delete_worktree_session_if_current(
     branch: &str,
     expected_incarnation: Option<&str>,
 ) -> Result<DeleteWorktreeOutcome, String> {
-    if expected_incarnation.is_some_and(|expected| worktree_incarnation(path) != expected) {
+    let path_display = path.display().to_string();
+    let pending = load_pending_worktree_deletion(repo, branch)?;
+    if let Some(pending) = &pending
+        && (pending.worktree_path != path_display
+            || expected_incarnation
+                .is_some_and(|expected| pending.worktree_incarnation != expected))
+    {
+        return Err(format!(
+            "deletion of branch {branch} belongs to a different worktree identity; retained the current worktree"
+        ));
+    }
+    let deletion_incarnation = pending
+        .as_ref()
+        .map(|pending| pending.worktree_incarnation.as_str())
+        .or(expected_incarnation);
+    let current_incarnation = worktree_incarnation(path);
+    if !current_incarnation.is_empty()
+        && deletion_incarnation.is_some_and(|expected| current_incarnation != expected)
+    {
         return Err(format!(
             "worktree {branch} was replaced while deletion was pending; retained the replacement"
         ));
     }
-    if let Some(current) = crate::lifecycle::list_worktrees(repo, config)?
+    let live_before_removal = crate::lifecycle::list_worktrees(repo, config)?;
+    let current = live_before_removal
         .into_iter()
-        .find(|entry| entry.path == path)
+        .find(|entry| crate::worktrunk::paths_equivalent(&entry.path, path));
+    if current.is_none() && expected_incarnation.is_some() && pending.is_none() {
+        return Err(format!(
+            "worktree {branch} is no longer present at {}; retained its branch and Prism state",
+            path.display()
+        ));
+    }
+    if let Some(current) = &current
         && current.branch != branch
     {
         return Err(format!(
@@ -344,14 +533,64 @@ pub(crate) fn delete_worktree_session_if_current(
             current.branch
         ));
     }
-    let branch_incarnation = if branch == "(detached)" {
-        None
-    } else {
-        Some(crate::lifecycle::branch_oid(repo, config, branch)?)
+    let branch_incarnation = match &pending {
+        Some(pending) => pending.branch_oid.clone(),
+        None if branch == "(detached)" => None,
+        None => Some(crate::lifecycle::branch_oid(repo, config, branch)?),
     };
-    crate::lifecycle::remove_worktree(repo, config, path)?;
+    if pending.is_none() {
+        save_pending_worktree_deletion(
+            repo,
+            path,
+            branch,
+            deletion_incarnation.unwrap_or(&current_incarnation),
+            branch_incarnation.as_deref(),
+        )?;
+    }
+    let already_removed = pending.is_some() && current.is_none() && current_incarnation.is_empty();
+    let (removal, removal_warning) = if already_removed {
+        (
+            crate::worktrunk::RemoveOutcome {
+                path: path.to_path_buf(),
+                branch: (branch != "(detached)").then(|| branch.to_string()),
+            },
+            None,
+        )
+    } else {
+        match crate::lifecycle::remove_worktree(repo, config, path) {
+            Ok(removal) => (removal, None),
+            Err(error) => {
+                let live = crate::lifecycle::list_worktrees(repo, config)?;
+                if live
+                    .iter()
+                    .any(|entry| crate::worktrunk::paths_equivalent(&entry.path, path))
+                {
+                    return Err(error.to_string());
+                }
+                let warning = format!(
+                    "Worktrunk removed the worktree but reported failure; retained the branch and Prism state: {}",
+                    error.safe_summary()
+                );
+                mark_pending_deletion_phase(repo, branch, "worktree_removed")?;
+                return Ok(DeleteWorktreeOutcome::BranchRetained {
+                    error: warning,
+                    owned_state_removed: false,
+                });
+            }
+        }
+    };
+    if branch != "(detached)" && removal.branch.as_deref() != Some(branch) {
+        return Err(format!(
+            "Worktrunk removed {} but reported branch {:?} instead of {branch:?}; retained the branch and Prism state",
+            removal.path.display(),
+            removal.branch
+        ));
+    }
     let live_after_removal = crate::lifecycle::list_worktrees(repo, config)?;
-    if live_after_removal.iter().any(|entry| entry.path == path) {
+    if live_after_removal
+        .iter()
+        .any(|entry| crate::worktrunk::paths_equivalent(&entry.path, path))
+    {
         return Err(format!(
             "worktree {branch} was recreated at {} during deletion; retained its resources and state",
             path.display()
@@ -367,28 +606,6 @@ pub(crate) fn delete_worktree_session_if_current(
             owned_state_removed: false,
         });
     }
-    if let Some(expected_oid) = branch_incarnation.as_deref() {
-        match crate::lifecycle::branch_oid(repo, config, branch) {
-            Ok(current_oid) if current_oid == expected_oid => {}
-            Ok(_) => {
-                return Ok(DeleteWorktreeOutcome::BranchRetained {
-                    error: format!(
-                        "branch {branch} changed while deletion was in progress; retained its Prism state"
-                    ),
-                    owned_state_removed: false,
-                });
-            }
-            Err(error) => {
-                return Ok(DeleteWorktreeOutcome::BranchRetained {
-                    error: format!(
-                        "could not verify branch {branch} after worktree removal; retained its Prism state: {error}"
-                    ),
-                    owned_state_removed: false,
-                });
-            }
-        }
-    }
-
     if !worktree_incarnation(path).is_empty() {
         return Err(format!(
             "worktree {branch} was recreated at {} during deletion; retained its resources and state",
@@ -396,30 +613,53 @@ pub(crate) fn delete_worktree_session_if_current(
         ));
     }
 
-    let mut errors = remove_deleted_worktree_owned_state(repo, config, path, branch)
-        .err()
-        .into_iter()
-        .collect::<Vec<_>>();
-    if let Err(error) = crate::lifecycle::delete_branch_if_same_incarnation(
-        repo,
-        config,
-        branch,
-        branch_incarnation.as_deref(),
-    ) {
+    let mut errors = removal_warning.into_iter().collect::<Vec<_>>();
+    errors.extend(mark_pending_deletion_phase(repo, branch, "worktree_removed").err());
+    let mut branch_deleted = pending
+        .as_ref()
+        .is_some_and(|pending| pending.branch_deleted);
+    if !branch_deleted
+        && pending
+            .as_ref()
+            .is_some_and(|pending| pending.worktree_removed)
+        && branch != "(detached)"
+        && !crate::lifecycle::branch_exists(repo, config, branch)?
+    {
+        mark_pending_deletion_phase(repo, branch, "branch_deleted")?;
+        branch_deleted = true;
+    }
+    if !branch_deleted
+        && let Err(error) = crate::lifecycle::delete_branch_if_same_incarnation(
+            repo,
+            config,
+            branch,
+            branch_incarnation.as_deref(),
+        )
+    {
         if errors.is_empty() {
             return Ok(DeleteWorktreeOutcome::BranchRetained {
                 error,
-                owned_state_removed: true,
+                owned_state_removed: false,
             });
         }
         errors.push(error);
+        return Ok(DeleteWorktreeOutcome::DeletedWithWarnings {
+            errors,
+            owned_state_removed: false,
+        });
     }
+    if !branch_deleted {
+        errors.extend(mark_pending_deletion_phase(repo, branch, "branch_deleted").err());
+    }
+    let cleanup_error = remove_deleted_worktree_owned_state(repo, config, path, branch).err();
+    let owned_state_removed = cleanup_error.is_none();
+    errors.extend(cleanup_error);
     if errors.is_empty() {
         Ok(DeleteWorktreeOutcome::Deleted)
     } else {
         Ok(DeleteWorktreeOutcome::DeletedWithWarnings {
             errors,
-            owned_state_removed: false,
+            owned_state_removed,
         })
     }
 }
@@ -434,7 +674,9 @@ fn shutdown_worktree_session_resources(
     if let Err(error) = crate::agent_session::shutdown(repo, config, branch) {
         errors.push(error);
     }
-    if let Err(error) = crate::opencode::shutdown_worktree_session_runtime_processes(runtimes) {
+    if let Err(error) =
+        crate::opencode::shutdown_worktree_session_runtime_processes_with_lock_held(repo, runtimes)
+    {
         errors.push(error);
     }
     if let Err(error) = crate::agent_session::remove_owned_log(repo, branch) {
@@ -495,6 +737,29 @@ pub(crate) fn refresh_worktree_sessions(
         }
         refreshed.extend(discovered);
     }
+    for (identity, mut session) in previous {
+        let Some(repository) = repositories
+            .iter()
+            .find(|repository| *repository.identity == identity.repository)
+        else {
+            continue;
+        };
+        if worktree_deletion_is_pending(
+            repository.repo,
+            &session.path,
+            &session.branch,
+            &session.incarnation,
+        )? {
+            session.apply_repo_identity(
+                repository.repo_index,
+                repository.label.to_string(),
+                repository.key,
+            );
+            session.hidden = false;
+            session.status_label = "deletion pending".to_string();
+            refreshed.push(session);
+        }
+    }
     *current = refreshed;
     Ok(())
 }
@@ -542,6 +807,46 @@ pub(crate) fn discover_sessions(
         }
     }
 
+    for (branch, pending) in load_pending_worktree_deletions(repo)? {
+        let path = PathBuf::from(&pending.worktree_path);
+        if sessions
+            .iter()
+            .any(|session| session.path == path && session.branch == branch)
+        {
+            continue;
+        }
+        let metadata = load_task_metadata(repo, &branch)?;
+        sessions.push(Session {
+            repo_index: 0,
+            repo_label: String::new(),
+            repo_key: None,
+            path: path.clone(),
+            incarnation: pending.worktree_incarnation,
+            path_display: pending.worktree_path,
+            branch: branch.clone(),
+            prompt_summary: metadata
+                .as_ref()
+                .map(|metadata| metadata.prompt_summary.clone())
+                .unwrap_or_default(),
+            classification: metadata
+                .as_ref()
+                .map(|metadata| metadata.classification)
+                .unwrap_or_default(),
+            visibility: metadata
+                .as_ref()
+                .map(|metadata| metadata.visibility)
+                .unwrap_or_default(),
+            adopted: metadata.is_some(),
+            hidden: false,
+            status_label: "deletion pending".to_string(),
+            agent_state: load_agent_state(repo, &branch).unwrap_or(AgentState::Idle),
+            opencode_status: None,
+            pr: PrCache::default(),
+            wt_columns: BTreeMap::new(),
+            unseen_comments: false,
+        });
+    }
+
     sessions.sort_by(|a, b| session_discovery_order(config, a, b));
     Ok(sessions)
 }
@@ -574,6 +879,9 @@ pub(crate) fn reconcile_worktree_state(repo: &Repository, config: &Config) -> Re
         persisted_by_branch.entry(branch).or_default().push(path);
     }
     for (branch, paths) in persisted_by_branch {
+        if load_pending_worktree_deletion(repo, &branch)?.is_some() {
+            continue;
+        }
         let exact_live = live
             .iter()
             .any(|entry| entry.branch == branch && paths.contains(&entry.path));
@@ -714,6 +1022,7 @@ fn remove_worktree_owned_state(
     observability::with_writable_db(repo, |conn| {
         ensure_cleanup_ownership(conn, branch, &worktree_path)
     })?;
+    let _server_lock = crate::opencode::lock_repository_server(repo)?;
     let runtimes = crate::opencode::load_runtimes_for_worktree_session(repo, branch, path)?;
     shutdown_worktree_session_resources(repo, config, branch, &runtimes)?;
     observability::with_writable_db(repo, |conn| {
@@ -742,6 +1051,11 @@ fn remove_worktree_owned_state(
                 params![branch, worktree_path],
             )
             .map_err(|error| format!("remove archived worktree metadata: {error}"))?;
+            conn.execute(
+                "delete from pending_worktree_deletion where branch = ?1 and worktree_path = ?2",
+                params![branch, worktree_path],
+            )
+            .map_err(|error| format!("complete pending worktree deletion: {error}"))?;
             Ok(())
         })();
         match result {
@@ -858,21 +1172,8 @@ pub(crate) fn worktree_incarnation(path: &Path) -> String {
         return String::new();
     };
     if metadata.is_dir() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            return format!("directory:{}:{}", metadata.dev(), metadata.ino());
-        }
-        #[cfg(not(unix))]
-        {
-            let created = metadata
-                .created()
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default();
-            return format!("directory:{created}");
-        }
+        use std::os::unix::fs::MetadataExt;
+        return format!("directory:{}:{}", metadata.dev(), metadata.ino());
     }
     let modified = metadata
         .modified()
@@ -881,13 +1182,10 @@ pub(crate) fn worktree_incarnation(path: &Path) -> String {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     let target = fs::read_to_string(&git_link).unwrap_or_default();
-    #[cfg(unix)]
     let file_id = {
         use std::os::unix::fs::MetadataExt;
         metadata.ino()
     };
-    #[cfg(not(unix))]
-    let file_id = 0;
     format!("{file_id}:{modified}:{}:{target}", metadata.len())
 }
 
@@ -1013,6 +1311,16 @@ pub(crate) fn migrate_worktree_session_schema(conn: &rusqlite::Connection) -> Re
           migration_policy text not null default 'ask',
           updated_unix_ms integer not null
         );
+
+        create table if not exists pending_worktree_deletion (
+          branch text primary key,
+          worktree_path text not null,
+          worktree_incarnation text not null,
+          branch_oid text,
+          worktree_removed integer not null default 0,
+          branch_deleted integer not null default 0,
+          updated_unix_ms integer not null
+        );
         ",
     )
     .map_err(|error| format!("create worktree session schema: {error}"))?;
@@ -1027,6 +1335,12 @@ pub(crate) fn migrate_worktree_session_schema(conn: &rusqlite::Connection) -> Re
         "task_metadata",
         "visibility",
         "alter table task_metadata add column visibility integer not null default 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "pending_worktree_deletion",
+        "branch_deleted",
+        "alter table pending_worktree_deletion add column branch_deleted integer not null default 0",
     )?;
     Ok(())
 }
@@ -1343,6 +1657,21 @@ fn load_task_metadata(repo: &Repository, branch: &str) -> Result<Option<TaskMeta
         )
         .optional()
         .map_err(|error| format!("read task metadata: {error}"))
+    })
+}
+
+pub(crate) fn load_task_initial_prompt(
+    repo: &Repository,
+    branch: &str,
+) -> Result<Option<String>, String> {
+    observability::with_writable_db(repo, |conn| {
+        conn.query_row(
+            "select initial_prompt from task_metadata where branch = ?1",
+            params![branch],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("read task initial prompt: {error}"))
     })
 }
 
@@ -1955,6 +2284,20 @@ exit 0
         config
             .tools
             .insert("git".to_string(), git.display().to_string());
+        let wt = temp.join("wt");
+        let wt_called = temp.join("wt-called");
+        write_executable(
+            &wt,
+            &format!(
+                "#!/bin/sh\ntest ! -e '{}' || exit 99\ntouch '{}'\nprintf '%s' '[{{\"branch\":\"{branch}\",\"branch_deleted\":false,\"kind\":\"worktree\",\"path\":\"{}\"}}]'\n",
+                wt_called.display(),
+                wt_called.display(),
+                path.display(),
+            ),
+        );
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
         observability::with_writable_db(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
@@ -2001,7 +2344,9 @@ exit 0
         }
 
         fs::remove_file(&fail_marker).unwrap();
-        remove_worktree_owned_state(&repo, &config, &path, branch).unwrap();
+        let retried =
+            delete_worktree_session_if_current(&repo, &config, &path, branch, None).unwrap();
+        assert_eq!(retried, DeleteWorktreeOutcome::Deleted);
 
         for table in ["task_metadata", "agent_state", "opencode_runtime"] {
             assert_eq!(
@@ -2027,7 +2372,15 @@ exit 0
         write_executable(
             &git,
             &format!(
-                "#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --verify refs/heads/{branch}\"*) printf 'branch-oid\\n'; exit 0 ;;\n  *\"worktree remove --force\"*) printf 'new git link\\n' > '{}/.git'; exit 0 ;;\n  *\"worktree list --porcelain\"*) printf 'worktree {}\\nHEAD branch-oid\\nbranch refs/heads/{branch}\\n\\n'; exit 0 ;;\nesac\nexit 0\n",
+                "#!/bin/sh\ncase \"$*\" in\n  *\"rev-parse --verify refs/heads/{branch}\"*) printf 'branch-oid\\n'; exit 0 ;;\n  *\"worktree list --porcelain\"*) printf 'worktree {}\\nHEAD branch-oid\\nbranch refs/heads/{branch}\\n\\n'; exit 0 ;;\nesac\nexit 0\n",
+                path.display()
+            ),
+        );
+        let wt = temp.join("wt");
+        write_executable(
+            &wt,
+            &format!(
+                "#!/bin/sh\nprintf 'new git link\\n' > '{}/.git'\nprintf '%s' '[{{\"branch\":\"{branch}\",\"branch_deleted\":false,\"kind\":\"worktree\",\"path\":\"{}\"}}]'\n",
                 path.display(),
                 path.display()
             ),
@@ -2048,6 +2401,9 @@ exit 0
         config
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
+        config
+            .tools
+            .insert("wt".to_string(), wt.display().to_string());
         observability::with_writable_db(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
@@ -2698,12 +3054,23 @@ exit 0
         let wt = temp.join("wt");
         write_executable(
             &wt,
-            &format!("#!/bin/sh\nmkdir -p '{}'\nexit 0\n", db.display()),
+            &format!(
+                "#!/bin/sh\nmkdir -p '{}'\nprintf '%s' '{{\"action\":\"created\",\"branch\":\"feature\",\"path\":\"/repo/worktree\",\"created_branch\":true}}'\n",
+                db.display()
+            ),
         );
         let mut config = test_config();
         config
             .tools
             .insert("wt".to_string(), wt.display().to_string());
+        let git = temp.join("git");
+        write_executable(
+            &git,
+            "#!/bin/sh\nprintf 'worktree /repo/worktree\\nbranch refs/heads/feature\\n\\n'\n",
+        );
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
 
         let outcome = create_worktree_session(&repo, &config, "feature").unwrap();
 

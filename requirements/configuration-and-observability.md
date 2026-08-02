@@ -19,8 +19,8 @@
   state comparable to `opencode db`.
 - **Constraint**: Normal Prism operation does not require the external `sqlite3`
   executable. Build-time and runtime prerequisites are documented separately.
-- **Customization**: Users can override executable paths for Git, GitHub CLI,
-  tmux, Worktrunk, lazygit, fzf, and configured harnesses.
+- **Customization**: Users can override executable paths for Git, GitHub and
+  GitLab CLIs, tmux, Worktrunk, lazygit, fzf, and configured harnesses.
 - **Behavior**: The TUI provides a global harness chooser for the fixed built-in
   IDs and configured generic harnesses, and can collect interactive and optional
   headless commands when creating a generic harness.
@@ -32,11 +32,23 @@
 - **Behavior**: Startup validates tools required for the selected mode and names
   missing tools and relevant configuration locations. Optional tools are checked
   only when their actions require them.
-- **Behavior**: `prism doctor` reports tool availability and versions, GitHub
-  and GitLab CLI authentication, Forgejo credential-source availability,
-  resolved remote host/provider, remote capabilities and server version when
-  discoverable, configured checks, selected harness capabilities, and discovered
-  worktrees without printing credential values.
+- **Behavior**: `prism doctor` reports tool availability and versions; GitHub
+  and GitLab CLI authentication; Forgejo credential-source availability; the
+  resolved remote host/provider, capabilities, and server version when
+  discoverable; configured checks; selected harness capabilities; and discovered
+  worktrees, without printing credential values.
+- **Behavior**: Startup rejects Worktrunk versions below 0.58.0. Diagnostics
+  report the detected Worktrunk version and minimum; observation failures use a
+  bounded safe summary rather than raw command output or development URLs.
+- **Default**: Desktop notifications are disabled. When enabled, category switches
+  independently control input-required, completed, and failed/restart Agent
+  Session transitions and may be overridden per repository.
+- **Invariant**: Enabling or reloading notifications establishes current Agent
+  Session states as a baseline and never reports persisted attention states.
+- **Constraint**: Desktop notification delivery is best effort, nonblocking, and
+  limited to accepted transitions while the dashboard event loop runs. Missing
+  graphical services, queue pressure, and backend failures never change session
+  state or fail a workflow.
 
 ## Verification Commands
 
@@ -111,6 +123,8 @@
 - **Invariant**: External-call flight events never contain argv, dynamic URLs,
   query values, bodies, headers, environment values, repository paths, session
   IDs, branch names, or raw stderr.
+- **Invariant**: Desktop notification diagnostics are throttled and contain only
+  platform, failure category, and notification kind, never notification text.
 - **Behavior**: Corruption-class SQLite failures trigger best-effort read-only
   `quick_check` and foreign-key diagnostics without replacing the original error
   or modifying the database.
@@ -132,3 +146,11 @@
 - **Invariant**: Cache observations distinguish never loaded, refreshing, stale,
   failed, confirmed absent, and present states. A transient failure does not
   erase known state, while confirmed absence requires affirmative evidence.
+- **Invariant**: Worktrunk schema 1 and schema 2 observations normalize into the
+  same typed URL, listening, variable, and custom-column facts. Unknown schema
+  versions fail closed and preserve the previous successful observation as
+  stale; they are never interpreted as an empty result.
+- **Invariant**: Worktrunk hook tails are read only from canonical regular files
+  under `.git/wt/logs`, are bounded by bytes and lines, and have terminal control
+  sequences removed. Raw URLs and hook bodies do not enter runtime logs, flight
+  recordings, SQLite, or structured failure summaries.

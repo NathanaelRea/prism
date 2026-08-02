@@ -562,7 +562,7 @@ pub(super) fn save_step_with_conn(
                 step.summary.as_deref(),
                 step.error.as_deref(),
                 step.session.adapter_id.as_deref(),
-                step.execution.process_start_time_ticks.map(u64_to_i64),
+                step.execution.process_identity.map(u64_to_i64),
                 id,
             ],
         )
@@ -598,7 +598,7 @@ pub(super) fn save_step_with_conn(
                 step.summary.as_deref(),
                 step.error.as_deref(),
                 step.session.adapter_id.as_deref(),
-                step.execution.process_start_time_ticks.map(u64_to_i64),
+                step.execution.process_identity.map(u64_to_i64),
             ],
         )
         .map_err(|error| format!("write auto step run: {error}"))?;
@@ -753,7 +753,7 @@ pub(super) fn load_steps_with_conn(
                     process_id: row
                         .get::<_, Option<i64>>(12)?
                         .map(|value| value.max(0) as u32),
-                    process_start_time_ticks: row
+                    process_identity: row
                         .get::<_, Option<i64>>(21)?
                         .map(|value| value.max(0) as u64),
                 },

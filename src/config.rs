@@ -42,6 +42,12 @@ opencode_plan_plugin = false
 [ui]
 icon_style = "unicode" # or "nerd-font"
 
+[notifications]
+enabled = false
+needs_input = true
+completed = true
+failed = true
+
 [worktrees]
 columns = []
 
@@ -139,6 +145,25 @@ pub struct AutoConfig {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LayoutConfig {
     pub sidebar_width: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NotificationConfig {
+    pub enabled: bool,
+    pub needs_input: bool,
+    pub completed: bool,
+    pub failed: bool,
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            needs_input: true,
+            completed: true,
+            failed: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -261,6 +286,7 @@ pub struct Config {
     pub icon_style_configured: bool,
     pub auto: AutoConfig,
     pub layout: LayoutConfig,
+    pub notifications: NotificationConfig,
     pub checks: Checks,
     pub worktree_columns: Vec<String>,
     pub tools: BTreeMap<String, String>,
@@ -291,6 +317,7 @@ struct RawConfig {
     checks: Option<RawChecks>,
     auto: Option<RawAutoConfig>,
     layout: Option<RawLayoutConfig>,
+    notifications: Option<RawNotificationConfig>,
     worktrees: Option<RawWorktrees>,
     tools: Option<BTreeMap<String, String>>,
     remote_hosts: Option<BTreeMap<String, RawRemoteHostConfig>>,
@@ -349,6 +376,14 @@ struct RawAutoConfig {
 #[derive(Clone, Debug, Default, Deserialize)]
 struct RawLayoutConfig {
     sidebar_width: Option<u16>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct RawNotificationConfig {
+    enabled: Option<bool>,
+    needs_input: Option<bool>,
+    completed: Option<bool>,
+    failed: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -646,6 +681,7 @@ impl Config {
             icon_style_configured: false,
             auto: AutoConfig::default(),
             layout: LayoutConfig::default(),
+            notifications: NotificationConfig::default(),
             checks: Checks::default(),
             worktree_columns: Vec::new(),
             tools,
@@ -817,6 +853,20 @@ impl Config {
             && let Some(width) = layout.sidebar_width
         {
             self.layout.sidebar_width = Some(width.clamp(20, 120));
+        }
+        if let Some(notifications) = raw.notifications {
+            if let Some(enabled) = notifications.enabled {
+                self.notifications.enabled = enabled;
+            }
+            if let Some(enabled) = notifications.needs_input {
+                self.notifications.needs_input = enabled;
+            }
+            if let Some(enabled) = notifications.completed {
+                self.notifications.completed = enabled;
+            }
+            if let Some(enabled) = notifications.failed {
+                self.notifications.failed = enabled;
+            }
         }
         if let Some(worktrees) = raw.worktrees
             && let Some(values) = worktrees.columns
@@ -1282,6 +1332,16 @@ pub fn print_config(repo: &Repository, config: &Config) {
     println!("escape_key = {}", config.escape_key.label());
     println!("merge_method = {}", config.merge_method.label());
     println!("ui.icon_style = {}", config.icon_style.label());
+    println!("notifications.enabled = {}", config.notifications.enabled);
+    println!(
+        "notifications.needs_input = {}",
+        config.notifications.needs_input
+    );
+    println!(
+        "notifications.completed = {}",
+        config.notifications.completed
+    );
+    println!("notifications.failed = {}", config.notifications.failed);
     println!(
         "layout.sidebar_width = {}",
         config
@@ -1469,11 +1529,7 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
     print_tool_status("gh", &config.tool("gh"), false);
     print_tool_status("glab", &config.tool("glab"), false);
     print_tool_status("tmux", &config.tool("tmux"), true);
-    print_tool_status(
-        &config.worktree_command,
-        &config.tool(&config.worktree_command),
-        true,
-    );
+    print_worktrunk_status(repo, config);
     print_tool_status("fzf", &config.tool("fzf"), false);
     println!();
 
@@ -1534,7 +1590,10 @@ fn resolve_executable(program: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-pub fn ensure_required_tools(repo: &Repository, config: &Config) -> Result<(), String> {
+pub fn ensure_required_tools(
+    repo: &Repository,
+    config: &Config,
+) -> Result<crate::worktrunk::WorktrunkVersion, String> {
     let mut required = vec![
         ("git", config.tool("git")),
         ("tmux", config.tool("tmux")),
@@ -1560,15 +1619,61 @@ pub fn ensure_required_tools(repo: &Repository, config: &Config) -> Result<(), S
         .filter(|(_, command)| !command_exists(command))
         .map(|(label, command)| format!("{label} ({command})"))
         .collect::<Vec<_>>();
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
+    if !missing.is_empty() {
+        return Err(format!(
             "missing required tool(s): {}. Install them or configure [tools] in {} or {}",
             missing.join(", "),
             config.user_path.display(),
             config.repo_config_path.display()
-        ))
+        ));
+    }
+    crate::worktrunk::ensure_supported_version(config)
+}
+
+fn print_worktrunk_status(repo: &Repository, config: &Config) {
+    let command = config.tool(&config.worktree_command);
+    if !command_exists(&command) {
+        println!(
+            "missing {:12} {:18} required -",
+            config.worktree_command, command
+        );
+        return;
+    }
+    match crate::worktrunk::detect_version(config) {
+        Ok(version) => {
+            let status = if version.supported() {
+                "ok"
+            } else {
+                "unsupported"
+            };
+            println!(
+                "{status:7} {:12} {command:18} required {} (supported >= {}; tested current {})",
+                config.worktree_command,
+                version.raw,
+                crate::worktrunk::MINIMUM_VERSION,
+                crate::worktrunk::TESTED_CURRENT_VERSION,
+            );
+            if version.supported() {
+                match crate::worktrunk::observe_repository(repo, config) {
+                    Ok(snapshot) => println!(
+                        "worktrunk observation: fresh schema={} worktrees={}",
+                        match snapshot.schema {
+                            crate::worktrunk::WorktrunkSchema::V1 => 1,
+                            crate::worktrunk::WorktrunkSchema::V2 => 2,
+                        },
+                        snapshot.by_path.len()
+                    ),
+                    Err(error) => println!(
+                        "worktrunk observation: unavailable (never loaded) {}",
+                        error.safe_summary()
+                    ),
+                }
+            }
+        }
+        Err(error) => println!(
+            "error   {:12} {command:18} required {error}",
+            config.worktree_command
+        ),
     }
 }
 
@@ -1924,6 +2029,7 @@ mod tests {
         assert_eq!(config.icon_style, IconStyle::Unicode);
         assert!(!config.icon_style_configured);
         assert_eq!(config.layout.sidebar_width, None);
+        assert_eq!(config.notifications, NotificationConfig::default());
         assert!(config.worktree_columns.is_empty());
         assert_eq!(config.opencode_port_base, 41_000);
         assert_eq!(config.opencode_port_span, 1_000);
@@ -1957,6 +2063,46 @@ mod tests {
         assert!(!config.is_default_branch("main"));
 
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn notification_config_merges_field_by_field() {
+        let mut config = Config::defaults(
+            PathBuf::from("/tmp/user.toml"),
+            PathBuf::from("/tmp/repo.toml"),
+        );
+        config.apply_raw_config(
+            RawConfig {
+                notifications: Some(RawNotificationConfig {
+                    enabled: Some(true),
+                    completed: Some(false),
+                    ..RawNotificationConfig::default()
+                }),
+                ..RawConfig::default()
+            },
+            true,
+        );
+        config.apply_raw_config(
+            RawConfig {
+                notifications: Some(RawNotificationConfig {
+                    completed: Some(true),
+                    failed: Some(false),
+                    ..RawNotificationConfig::default()
+                }),
+                ..RawConfig::default()
+            },
+            false,
+        );
+
+        assert_eq!(
+            config.notifications,
+            NotificationConfig {
+                enabled: true,
+                needs_input: true,
+                completed: true,
+                failed: false,
+            }
+        );
     }
 
     #[test]

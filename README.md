@@ -27,14 +27,17 @@ one place.
 - See repository, worktree, change-request, CI, and agent state in one TUI.
 - Kick off repeatable agent flows for implementing a plan or fixing review, CI,
   and merge issues.
+- See and open Worktrunk-configured development URLs, and inspect bounded
+  hook-log tails, without giving up the standalone `wt list` workflow.
 
 ## Prerequisites
 
 Core runtime requirements:
 
+- Linux or macOS
 - `git`
 - `tmux`
-- WorkTrunk (`wt`)
+- Worktrunk (`wt`) 0.58.0 or newer. Prism currently tests against 0.71.0.
 
 Install the transport required by each repository:
 
@@ -59,6 +62,7 @@ Optional integrations:
 
 - `fzf` for interactive plan selection
 - `lazygit` for the tmux Git window
+- Desktop notifications on Linux or macOS, enabled in [configuration](docs/config.md#desktop-notifications)
 
 On first interactive startup, Prism lists the installed built-in harnesses and saves your selection to `~/.config/prism/config.toml`. OpenCode remains the fallback for non-interactive startup when no harness is configured. To use a generic command, configure it from the `H` chooser; see [Configuration](docs/config.md#harnesses).
 
@@ -69,6 +73,10 @@ Prism provides prebuilt archives for:
 - Linux x86_64 with glibc 2.35 or newer (for example, Ubuntu 22.04)
 - macOS x86_64 (Intel)
 - macOS aarch64 (Apple Silicon)
+
+Linux and macOS are the supported operating systems. Other targets fail during
+the build with an explicit unsupported-platform diagnostic rather than using
+partial Windows or generic Unix fallbacks.
 
 Download the archive for your platform from the
 [latest GitHub Release](https://github.com/NathanaelRea/prism/releases/latest),

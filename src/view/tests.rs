@@ -573,6 +573,7 @@ fn clean_worktree_git_check_is_green() {
         status_label: session.status_label.clone(),
         pr: session.pr.clone(),
         wt_columns: session.wt_columns.clone(),
+        development: None,
         auto_status: None,
         plan_status: None,
         updated_label: "-".to_string(),
@@ -627,6 +628,30 @@ fn worktree_detail_omits_loaded_wt_columns() {
 }
 
 #[test]
+fn worktree_detail_renders_typed_development_url_and_non_color_stale_cue() {
+    let config = crate::test_support::test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.worktrees[0].development = Some(DevelopmentEnvironment {
+        url: "https://localhost:3000/very/long/路径".to_string(),
+        listening: Some(true),
+        quality: DevelopmentEnvironmentQuality::Stale,
+    });
+
+    let buffer = render_to_string(&model, 160, 30);
+    let detail_text = worktree_detail_lines(&model)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(buffer.contains("Development"));
+    assert!(buffer.contains("https://localhost:3000/very/long/"));
+    assert!(detail_text.contains("路径"));
+    assert!(buffer.contains("stale"));
+}
+
+#[test]
 fn main_panel_switches_by_focus() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Running)];
@@ -671,7 +696,7 @@ fn repo_main_panel_lists_indexed_pr_without_worktree() {
         RepoPrRow::from_summary("repo".to_string(), &unknown, false, false),
     ];
 
-    let buffer = render_to_string(&model, 120, 30);
+    let buffer = render_to_string(&model, 200, 30);
 
     assert!(buffer.contains("#12345"));
     assert!(buffer.contains("Remote only"));
@@ -682,6 +707,32 @@ fn repo_main_panel_lists_indexed_pr_without_worktree() {
     assert!(buffer.contains("unknown"));
     assert!(!buffer.contains("#25"));
     assert!(!buffer.contains("Closed PR"));
+}
+
+#[test]
+fn repo_main_panel_keeps_long_pr_titles_on_one_row() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Running)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Repos, None, None);
+    let mut first = test_pr_summary();
+    first.number = 12345;
+    first.title = "A very long pull request title with wide text 界界 ".repeat(8);
+    let mut second = first.clone();
+    second.number = 12346;
+    model.repo_prs = vec![
+        RepoPrRow::from_summary("repo".to_string(), &first, false, false),
+        RepoPrRow::from_summary("repo".to_string(), &second, false, false),
+    ];
+
+    for cols in [80, 120, 200] {
+        let buffer = render_to_buffer(&model, cols, 30);
+
+        assert_eq!(
+            find_line(&buffer, "#12346"),
+            find_line(&buffer, "#12345") + 1,
+            "PR rows wrapped at {cols} columns",
+        );
+    }
 }
 
 #[test]
@@ -1673,6 +1724,7 @@ fn test_model<'a>(
                 status_label: session.status_label.clone(),
                 pr: session.pr.clone(),
                 wt_columns: session.wt_columns.clone(),
+                development: None,
                 auto_status: None,
                 plan_status: None,
                 updated_label: "-".to_string(),
@@ -1749,7 +1801,7 @@ fn test_plan_dashboard(expanded: bool) -> PlanDashboard {
                     execution: crate::harness::ExecutionRef {
                         state: Some("busy".to_string()),
                         process_id: None,
-                        process_start_time_ticks: None,
+                        process_identity: None,
                     },
                     session: crate::harness::SessionRef {
                         adapter_id: Some("opencode".to_string()),

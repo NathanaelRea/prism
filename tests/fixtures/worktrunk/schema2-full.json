@@ -1,0 +1,14 @@
+{
+  "schema": 2,
+  "repo": {"default_branch": "main"},
+  "collected": {"ci": false, "summary": false},
+  "items": [
+    {
+      "branch": "feat/typed-observation",
+      "worktree": {"path": "/redacted/repo.feat-typed-observation", "main": false},
+      "dev_server": {"url": "http://localhost:43117", "listening": true},
+      "vars": {"ticket": "PRISM-42", "attempt": 3, "enabled": true},
+      "display": {"state": "ahead", "columns": {"Ticket": "PRISM-42"}}
+    }
+  ]
+}

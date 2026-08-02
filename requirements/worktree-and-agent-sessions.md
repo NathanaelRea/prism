@@ -5,6 +5,10 @@
 
 ## Creation
 
+- **Invariant**: Prism owns persistent Worktree Session identity and incarnation;
+  Worktrunk owns physical worktree creation, path policy, hook execution, and
+  approvals. Observed Worktrunk state is associated only by repository and exact
+  normalized worktree path, never by branch-name fallback.
 - **Behavior**: `c` creates a Worktree Session from the repositories panel using
   the currently selected repository.
 - **Behavior**: Creation opens a dialog that identifies the target repository and
@@ -20,17 +24,24 @@
   session without synthesizing or submitting text.
 - **Behavior**: Successful creation attaches to the resulting tmux session so
   the user can inspect or edit the agent interaction immediately.
+- **Behavior**: Worktrunk-configured development URLs and listening observations
+  decorate a live Worktree Session. Prism opens known HTTP(S) URLs but does not
+  own or infer the development process; long-running servers remain Worktrunk
+  `post-start`/`tether` responsibilities.
 
 ## Agent Session Lifecycle
 
 - **Behavior**: Enter on a Worktree Session attaches to its persistent tmux Agent
   Session. Prism reuses a healthy matching session and replaces a stale or
   incompatible runtime when necessary.
-- **Invariant**: Prism associates adapter runtime identity with each active
-  Worktree Session. OpenCode servers are never shut down unless Prism owns them.
+- **Invariant**: Prism associates native adapter session identity with each
+  active Worktree Session. Worktrees using the same harness in one repository
+  share one OpenCode server. Worktree deletion shuts that server down only when
+  Prism owns it and no retained Worktree Session references it.
 - **Default**: Prism allocates OpenCode servers from a deterministic range
-  beginning at port 41000 and spanning 1000 ports. Owned servers remain warm
-  when Prism exits unless shutdown is enabled.
+  beginning at port 41000 and spanning 1000 ports. One server is allocated per
+  repository and harness. Owned servers remain warm when Prism exits unless
+  shutdown is enabled, in which case the shared owned server is terminated.
 - **Invariant**: Active harness session association is resolved independently
   per worktree. Creating `/new` or changing activity in one worktree cannot
   retarget prompts or status in another.
@@ -63,6 +74,19 @@
 - **Behavior**: Deletion preflights risks, records progress, and is retryable.
   Partial failure reports which resources were removed or preserved and retains
   enough identity and history to retry without applying cleanup to a new session.
+- **Invariant**: Permanent deletion delegates physical removal and pre/post
+  removal hooks to Worktrunk with branch deletion disabled. Prism separately
+  retains its expected-incarnation and expected-branch-OID guard before deleting
+  the branch or retiring Prism-owned state.
+
+## Worktrunk Evidence
+
+- **Behavior**: Users can inspect a bounded, sanitized tail of Worktrunk hook
+  output for a selected repository. Branch labels affect display preference
+  only and never establish Worktree Session identity.
+- **Invariant**: Hook-log presence is not evidence that a process is running or
+  that a hook succeeded. Log bodies are not persisted in Prism state or copied
+  into structured diagnostics; URL listening is the reachability observation.
 
 ## Process Safety
 

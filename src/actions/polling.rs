@@ -2,6 +2,8 @@ use super::*;
 
 pub(super) const DEFAULT_BRANCH_STATUS_POLL_INTERVAL: Duration = Duration::from_secs(60);
 pub(super) const BACKGROUND_PR_SUMMARY_POLL_INTERVAL: Duration = Duration::from_secs(60);
+pub(super) const ACTIVE_WT_POLL_INTERVAL: Duration = Duration::from_secs(15);
+pub(super) const INACTIVE_WT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
 pub(super) fn pr_poll_key(
     repository: &crate::session::WorktreeRepositoryKey,
@@ -11,70 +13,11 @@ pub(super) fn pr_poll_key(
     PrPollKey::for_repository_session_generation(repository, session, generation)
 }
 
-pub(super) fn fetch_wt_columns(
+pub(super) fn fetch_wt_observation(
     repo: &crate::repo::Repository,
     config: &crate::config::Config,
-) -> Result<BTreeMap<PathBuf, BTreeMap<String, String>>, String> {
-    let raw = run_capture(
-        Command::new(config.tool(&config.worktree_command))
-            .arg("-C")
-            .arg(&repo.root)
-            .args(["list", "--format=json"]),
-        crate::process::ProcessPolicy::Metadata,
-    )?;
-    let mut by_path = BTreeMap::new();
-    for object in json_top_level_objects(&raw) {
-        let Some(path) = json_string_field(object, "path") else {
-            continue;
-        };
-        let mut columns = discover_wt_columns(object);
-        for column in &config.worktree_columns {
-            if let Some(value) = wt_column_value(object, column) {
-                columns.insert(column.clone(), value);
-            }
-        }
-        by_path.insert(PathBuf::from(path), columns);
-    }
-    Ok(by_path)
-}
-
-pub(super) fn discover_wt_columns(object: &str) -> BTreeMap<String, String> {
-    let Ok(value) = serde_json::from_str::<Value>(object) else {
-        return BTreeMap::new();
-    };
-    let mut columns = BTreeMap::new();
-    let Some(fields) = value.as_object() else {
-        return columns;
-    };
-    for (key, value) in fields {
-        if key == "path" {
-            continue;
-        }
-        collect_wt_column(&mut columns, key, value);
-    }
-    columns
-}
-
-pub(super) fn collect_wt_column(columns: &mut BTreeMap<String, String>, key: &str, value: &Value) {
-    match value {
-        Value::String(value) => {
-            if !value.is_empty() {
-                columns.insert(key.to_string(), value.clone());
-            }
-        }
-        Value::Bool(value) => {
-            columns.insert(key.to_string(), value.to_string());
-        }
-        Value::Number(value) => {
-            columns.insert(key.to_string(), value.to_string());
-        }
-        Value::Object(fields) => {
-            for (field, value) in fields {
-                collect_wt_column(columns, &format!("{key}.{field}"), value);
-            }
-        }
-        Value::Array(_) | Value::Null => {}
-    }
+) -> Result<crate::worktrunk::WorktrunkSnapshot, crate::worktrunk::WorktrunkFailure> {
+    crate::worktrunk::observe_repository(repo, config)
 }
 
 pub(super) fn default_branch_status_label(
@@ -110,35 +53,6 @@ pub(super) fn status_label_with_behind(label: &str, behind: usize) -> String {
     } else {
         label.to_string()
     }
-}
-
-pub(super) fn wt_column_value(object: &str, column: &str) -> Option<String> {
-    if let Some(key) = column.strip_prefix("vars.") {
-        return json_object_field(object, "vars").and_then(|vars| json_string_field(vars, key));
-    }
-    if let Some((object_key, field_key)) = column.split_once('.') {
-        return json_object_field(object, object_key)
-            .and_then(|inner| json_string_field(inner, field_key));
-    }
-    json_string_field(object, column)
-        .or_else(|| json_bool_field(object, column).map(|value| value.to_string()))
-        .or_else(|| {
-            if column == "ci" {
-                json_object_field(object, "ci").map(|ci| {
-                    let status = json_string_field(ci, "status").unwrap_or_default();
-                    let number = crate::json::json_u64_field(ci, "number")
-                        .map(|number| format!("#{number}"))
-                        .unwrap_or_else(|| "ci".to_string());
-                    if status.is_empty() {
-                        number
-                    } else {
-                        format!("{number}:{status}")
-                    }
-                })
-            } else {
-                None
-            }
-        })
 }
 
 impl Tui {
@@ -610,25 +524,53 @@ impl Tui {
     }
 
     pub(crate) fn start_wt_column_poll(&mut self) {
+        self.request_wt_poll(self.current_repo);
+    }
+
+    pub(crate) fn request_wt_poll(&mut self, repo_index: usize) {
         self.poll_wt_columns();
+        if let Some(managed) = self.repos.get_mut(repo_index) {
+            managed.wt_poll_pending = true;
+        }
+        self.start_scheduled_wt_polls();
+    }
+
+    pub(crate) fn start_scheduled_wt_polls(&mut self) {
         for repo_index in 0..self.repos.len() {
             let Some(managed) = self.repos.get(repo_index) else {
                 continue;
             };
-            if managed.wt_poll_in_flight || managed.config.worktree_columns.is_empty() {
+            if managed.wt_poll_in_flight {
+                continue;
+            }
+            let interval = if repo_index == self.current_repo {
+                ACTIVE_WT_POLL_INTERVAL
+            } else {
+                INACTIVE_WT_POLL_INTERVAL
+            };
+            let due = wt_poll_due(
+                managed.wt_last_polled,
+                managed.wt_poll_pending,
+                interval,
+                std::time::Instant::now(),
+            );
+            if !due {
                 continue;
             }
             let repo = managed.repo.clone();
             let repository = managed.identity.clone();
-            let requested = self
+            let sessions = self
                 .sessions
                 .iter()
                 .filter(|session| session.repo_index == repo_index)
-                .map(|session| session.identity_key(&repository))
+                .map(|session| (session.path.clone(), session.identity_key(&repository)))
                 .collect::<Vec<_>>();
             let config = managed.config.clone();
             if let Some(managed) = self.repos.get_mut(repo_index) {
                 managed.wt_poll_in_flight = true;
+                managed.wt_poll_pending = false;
+                managed.wt_last_polled = Some(std::time::Instant::now());
+                managed.wt_quality = crate::worktrunk::ObservationQuality::Refreshing;
             }
             let generation = self.session_inventory_generation;
             let job_repository = repository.clone();
@@ -639,19 +581,17 @@ impl Tui {
                 Some(TUI_ACTION_JOB_TIMEOUT),
                 format!("prism-wt-columns-{repo_index}"),
                 move |_| {
-                    let columns = fetch_wt_columns(&repo, &config);
-                    let columns = columns.map(|columns| {
-                        requested
-                            .into_iter()
-                            .map(|key| {
-                                let values = columns.get(&key.path).cloned().unwrap_or_default();
-                                (key, values)
-                            })
-                            .collect()
+                    let observation = fetch_wt_observation(&repo, &config).map(|snapshot| {
+                        let facts = crate::worktrunk::associate_snapshot(&snapshot, sessions);
+                        WtObservation {
+                            snapshot,
+                            facts,
+                            observed_at: std::time::Instant::now(),
+                        }
                     });
                     Ok(Some(TuiJobPayload::WorktreeColumns(WtPollResult {
                         repository: job_repository,
-                        columns,
+                        observation,
                     })))
                 },
             );
@@ -671,31 +611,69 @@ impl Tui {
             else {
                 continue;
             };
-            match result.columns {
-                Ok(columns_by_path) => {
+            match result.observation {
+                Ok(observation) => {
+                    let facts = observation.facts;
                     for session in &mut self.sessions {
                         if session.repo_index != repo_index {
                             continue;
                         }
-                        let next = columns_by_path
+                        let next = facts
                             .get(&session.identity_key(&result.repository))
-                            .cloned()
+                            .map(crate::worktrunk::projected_columns)
                             .unwrap_or_default();
                         if session.wt_columns != next {
                             session.wt_columns = next;
                             changed = true;
                         }
                     }
-                }
-                Err(error) => {
-                    if let Some(repo) = self.repos.get(repo_index) {
-                        let _ = append_runtime_message(
-                            &repo.repo,
-                            &format!("wt column refresh failed: {error}"),
-                        );
+                    if let Some(managed) = self.repos.get_mut(repo_index) {
+                        managed.wt_snapshot = Some(observation.snapshot);
+                        managed.wt_facts = facts;
+                        managed.wt_last_success = Some(observation.observed_at);
+                        managed.wt_last_error = None;
+                        managed.wt_quality = crate::worktrunk::ObservationQuality::Fresh;
                     }
                 }
+                Err(error) => {
+                    let summary = error.safe_summary();
+                    changed |= self.mark_wt_observation_stale(
+                        repo_index,
+                        summary,
+                        Some(error.to_string()),
+                    );
+                }
             }
+        }
+        changed
+    }
+
+    pub(crate) fn mark_wt_observation_stale(
+        &mut self,
+        repo_index: usize,
+        summary: String,
+        log_error: Option<String>,
+    ) -> bool {
+        let mut changed = false;
+        if let Some(repo) = self.repos.get_mut(repo_index) {
+            let previous_quality = repo.wt_quality.clone();
+            if repo.wt_last_error.as_deref() != Some(&summary)
+                && let Some(error) = log_error
+            {
+                let _ = append_runtime_message(
+                    &repo.repo,
+                    &format!("Worktrunk observation refresh failed: {error}"),
+                );
+            }
+            repo.wt_last_error = Some(summary.clone());
+            repo.wt_quality = repo
+                .wt_last_success
+                .map(|last_success| crate::worktrunk::ObservationQuality::Stale {
+                    last_success,
+                    error: summary,
+                })
+                .unwrap_or(crate::worktrunk::ObservationQuality::NeverLoaded);
+            changed = repo.wt_quality != previous_quality;
         }
         changed
     }
@@ -811,4 +789,41 @@ fn remote_branch_head(
     branch: &str,
 ) -> Result<Option<String>, String> {
     crate::git::push_remote_branch_head_sha(path, remote, branch, config)
+}
+
+fn wt_poll_due(
+    last_polled: Option<std::time::Instant>,
+    pending: bool,
+    interval: Duration,
+    now: std::time::Instant,
+) -> bool {
+    pending
+        || last_polled
+            .map(|last| now.saturating_duration_since(last) >= interval)
+            .unwrap_or(true)
+}
+
+#[cfg(test)]
+mod wt_poll_tests {
+    use super::*;
+
+    #[test]
+    fn polling_cadence_distinguishes_active_inactive_and_pending_requests() {
+        let now = std::time::Instant::now();
+        let sixteen_seconds_ago = now - Duration::from_secs(16);
+        assert!(wt_poll_due(
+            Some(sixteen_seconds_ago),
+            false,
+            ACTIVE_WT_POLL_INTERVAL,
+            now
+        ));
+        assert!(!wt_poll_due(
+            Some(sixteen_seconds_ago),
+            false,
+            INACTIVE_WT_POLL_INTERVAL,
+            now
+        ));
+        assert!(wt_poll_due(Some(now), true, INACTIVE_WT_POLL_INTERVAL, now));
+        assert!(wt_poll_due(None, false, INACTIVE_WT_POLL_INTERVAL, now));
+    }
 }

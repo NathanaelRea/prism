@@ -19,6 +19,7 @@ Prism uses a lazygit-style panel model.
 - `Space g g` opens tmux window 2: lazygit.
 - `Space g P` pushes a guarded pending Change Request Stabilization repair commit and continues stabilization. If actionable review conversations block a run without a pending push, Prism offers to mark all freshly observed conversations resolved before reobserving; the confirmation defaults to No.
 - `Space g o` opens the selected change request in a browser.
+- `o` from the Worktrees panel opens the selected Worktree Session's Worktrunk-configured HTTP(S) development URL. It remains available when listening is false, unknown, or stale; the details view reports that state.
 - `Space g M` runs local checks and observes the selected change request's gates. If only unresolved inline review conversations block the merge and the provider supports resolution, Prism resolves the observed conversations, verifies all gates once more, and merges.
 - `Space g c` starts or appends a managed Change Request Stabilization CI repair for the selected worktree.
 - `Space g f` starts or appends a managed Change Request Stabilization review repair for the selected worktree.
@@ -44,6 +45,7 @@ Prism uses a lazygit-style panel model.
 - `E` edits the Prism user config and reloads after save.
 - `C` opens a picker of remote change requests for the selected repository and creates or selects a local worktree using the request's head branch name. An existing local branch is reused without resetting it.
 - `W` opens the in-app worktree column selector for the selected repository. Use `Space` to enable/disable a column, `J`/`K` to move an enabled column down/up, and `Enter` to save.
+- `L` from the Worktrees panel opens the selected repository's Worktrunk hook-log picker and a bounded sanitized log tail. A matching branch label affects ordering only and does not assert session identity or process liveness.
 - `/` filters the focused Repos or Worktrees panel.
 - `?` opens the in-app keybinding dialog.
 - `D` archives the selected non-default worktree/session, hiding it from normal navigation while leaving files and branch intact.

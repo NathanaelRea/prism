@@ -46,7 +46,9 @@ pub(super) fn render_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &crate::v
     let mut paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false });
-    if let crate::view::DialogModel::Help { scroll, .. } = dialog {
+    if let crate::view::DialogModel::Help { scroll, .. }
+    | crate::view::DialogModel::Notice { scroll, .. } = dialog
+    {
         paragraph = paragraph.scroll(((*scroll).min(u16::MAX as usize) as u16, 0));
     }
     frame.render_widget(paragraph, geometry.popup);
