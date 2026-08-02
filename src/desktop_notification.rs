@@ -317,6 +317,7 @@ mod tests {
     fn config() -> NotificationConfig {
         NotificationConfig {
             enabled: true,
+            completed: true,
             ..NotificationConfig::default()
         }
     }
@@ -374,11 +375,9 @@ mod tests {
         ]);
         let running = key("one", "running");
         notifier.seed([observation(&running, AgentState::Running, config())]);
-        notifier.observe(observation(
-            &running,
-            AgentState::ExitedOk,
-            NotificationConfig::default(),
-        ));
+        let mut disabled = NotificationConfig::default();
+        disabled.enabled = false;
+        notifier.observe(observation(&running, AgentState::ExitedOk, disabled));
         notifier.flush();
         assert!(deliveries.lock().unwrap().is_empty());
     }

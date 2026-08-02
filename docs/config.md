@@ -52,9 +52,9 @@ sidebar_width = 56
 icon_style = "unicode" # or "nerd-font"
 
 [notifications]
-enabled = false
+enabled = true
 needs_input = true
-completed = true
+completed = false
 failed = true
 
 [worktrees]
@@ -81,7 +81,7 @@ Prism uses squash merges for pull requests by default. Set `merge_method` to `me
 
 ## Desktop notifications
 
-Desktop notifications are opt-in. Set `notifications.enabled = true` globally or in a repository config. The category switches control sessions waiting for input, successful completion, and failures; `failed` also covers sessions that need to be restarted. Reloading config with `E` or `e` changes subsequent notifications without reporting sessions that are already blocked or finished.
+Desktop notifications are enabled by default for sessions waiting for input and for failures; `failed` also covers sessions that need to be restarted. Successful completion notifications default to off. The global switch and category switches may be overridden globally or in a repository config. Reloading config with `E` or `e` changes subsequent notifications without reporting sessions that are already blocked or finished.
 
 Prism uses the desktop notification service directly and does not run `notify-send` or detect a desktop environment. GNOME, KDE, and similar Linux desktops normally provide a notification server. Minimal Wayland compositors such as Hyprland and Sway require a daemon such as `mako`, `swaync`, or `dunst`. A missing server is non-fatal.
 
