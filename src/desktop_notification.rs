@@ -62,6 +62,7 @@ pub(crate) struct AgentObservation<'a> {
 
 pub(crate) struct DesktopNotifier {
     states: BTreeMap<WorktreeSessionKey, AgentState>,
+    suppressed_returns: BTreeMap<WorktreeSessionKey, AgentState>,
     sender: Option<SyncSender<DispatchMessage>>,
     dispatcher: Option<JoinHandle<()>>,
     last_queue_failures: BTreeMap<(NotificationKind, &'static str), Instant>,
@@ -141,6 +142,7 @@ impl DesktopNotifier {
         }
         Self {
             states: BTreeMap::new(),
+            suppressed_returns: BTreeMap::new(),
             sender,
             dispatcher,
             last_queue_failures: BTreeMap::new(),
@@ -152,6 +154,7 @@ impl DesktopNotifier {
         observations: impl IntoIterator<Item = AgentObservation<'a>>,
     ) {
         for observation in observations {
+            self.suppressed_returns.remove(observation.session);
             self.states
                 .insert(observation.session.clone(), observation.state);
         }
@@ -159,20 +162,40 @@ impl DesktopNotifier {
 
     pub(crate) fn retain(&mut self, live: &BTreeSet<WorktreeSessionKey>) {
         self.states.retain(|session, _| live.contains(session));
+        self.suppressed_returns
+            .retain(|session, _| live.contains(session));
     }
 
     pub(crate) fn baseline(&mut self, observation: AgentObservation<'_>) {
+        self.suppressed_returns.remove(observation.session);
         self.states
             .insert(observation.session.clone(), observation.state);
     }
 
+    pub(crate) fn observe_attached_liveness(&mut self, observation: AgentObservation<'_>) {
+        debug_assert_eq!(observation.state, AgentState::Attached);
+        let previous = self
+            .states
+            .insert(observation.session.clone(), observation.state);
+        if let Some(previous) = previous
+            && previous != AgentState::Attached
+        {
+            self.suppressed_returns
+                .insert(observation.session.clone(), previous);
+        }
+    }
+
     pub(crate) fn observe(&mut self, observation: AgentObservation<'_>) {
+        let suppressed_return = self.suppressed_returns.remove(observation.session);
         let previous = self
             .states
             .insert(observation.session.clone(), observation.state);
         let Some(previous) = previous else {
             return;
         };
+        if suppressed_return == Some(observation.state) {
+            return;
+        }
         let Some(kind) = transition(previous, observation.state) else {
             return;
         };
@@ -317,6 +340,7 @@ mod tests {
     fn config() -> NotificationConfig {
         NotificationConfig {
             enabled: true,
+            completed: true,
             ..NotificationConfig::default()
         }
     }
@@ -374,11 +398,11 @@ mod tests {
         ]);
         let running = key("one", "running");
         notifier.seed([observation(&running, AgentState::Running, config())]);
-        notifier.observe(observation(
-            &running,
-            AgentState::ExitedOk,
-            NotificationConfig::default(),
-        ));
+        let disabled = NotificationConfig {
+            enabled: false,
+            ..NotificationConfig::default()
+        };
+        notifier.observe(observation(&running, AgentState::ExitedOk, disabled));
         notifier.flush();
         assert!(deliveries.lock().unwrap().is_empty());
     }
@@ -440,6 +464,32 @@ mod tests {
         notifier.seed([observation(&session, AgentState::ExitedOk, config())]);
         notifier.flush();
         assert!(deliveries.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn attached_liveness_does_not_hide_a_real_completion() {
+        let session = key("one", "feature");
+        let (mut notifier, deliveries) = notifier();
+        notifier.seed([observation(&session, AgentState::Running, config())]);
+
+        notifier.observe(observation(&session, AgentState::Attached, config()));
+        notifier.observe(observation(&session, AgentState::ExitedOk, config()));
+
+        notifier.flush();
+        assert_eq!(deliveries.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn genuine_attached_state_rearms_a_known_session() {
+        let session = key("one", "feature");
+        let (mut notifier, deliveries) = notifier();
+        notifier.seed([observation(&session, AgentState::ExitedOk, config())]);
+
+        notifier.observe(observation(&session, AgentState::Attached, config()));
+        notifier.observe(observation(&session, AgentState::ExitedError, config()));
+
+        notifier.flush();
+        assert_eq!(deliveries.lock().unwrap().len(), 1);
     }
 
     #[test]
