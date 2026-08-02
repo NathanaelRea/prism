@@ -715,8 +715,9 @@ fn ensure_window(
     let command = match window {
         TmuxWindow::Agent => return Ok(()),
         TmuxWindow::LazyGit => config.tool("lazygit"),
-        TmuxWindow::Terminal => std::env::var("SHELL").unwrap_or_else(|_| "sh".to_string()),
+        TmuxWindow::Terminal => crate::terminal::shell_program_from_env(),
     };
+    let command = crate::terminal::posix_shell_quote(&command);
     run_tmux_status(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
@@ -943,7 +944,7 @@ fn agent_shell_command(
     }
     let command = argv
         .iter()
-        .map(|arg| shell_quote(arg))
+        .map(|arg| crate::terminal::posix_shell_quote(arg))
         .collect::<Vec<_>>()
         .join(" ");
     let command = if invocation.environment.is_empty() {
@@ -952,7 +953,7 @@ fn agent_shell_command(
         let assignments = invocation
             .environment
             .iter()
-            .map(|(key, value)| format!("{}={}", key, shell_quote(value)))
+            .map(|(key, value)| format!("{}={}", key, crate::terminal::posix_shell_quote(value)))
             .collect::<Vec<_>>()
             .join(" ");
         format!("env {assignments} {command}")
@@ -960,7 +961,7 @@ fn agent_shell_command(
     if let Some(path) = invocation.prompt_file {
         Ok(format!(
             "{command}; prism_status=$?; rm -f {}; exit $prism_status",
-            shell_quote(&path.display().to_string())
+            crate::terminal::posix_shell_quote(&path.display().to_string())
         ))
     } else {
         Ok(command)
@@ -1066,7 +1067,6 @@ fn pane_command_matches_agent(config: &Config, pane_command: &str) -> bool {
         .and_then(|name| name.to_str())
         .unwrap_or(&expected);
     pane_command == expected
-        || (selected_adapter_is(config, "opencode") && pane_command == format!("{expected}.exe"))
 }
 
 fn selected_adapter_is(config: &Config, adapter: &str) -> bool {
@@ -1169,19 +1169,6 @@ fn opencode_runtime_marker(runtime: &OpencodeRuntime) -> String {
     )
 }
 
-fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '='))
-    {
-        return value.to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
 fn safe_tmux_name(value: &str) -> String {
     value
         .chars()
@@ -1218,7 +1205,7 @@ mod tests {
         TmuxAgentSession, TmuxWindow, attach_or_create_agent, attach_or_create_plan_mode,
         attach_or_create_window, capture_agent_pane, ensure_agent_session,
         latest_agent_session_generation, migrate_legacy_agent_sessions, pane_command_matches_agent,
-        pane_start_command_matches_agent, paste_agent_prompt, shell_quote,
+        pane_start_command_matches_agent, paste_agent_prompt,
     };
 
     #[test]
@@ -1269,14 +1256,6 @@ mod tests {
             runtime.prompt_buffer_name(),
             format!("{}-prompt", runtime.name())
         );
-    }
-
-    #[test]
-    fn shell_quote_preserves_argument_boundaries() {
-        assert_eq!(shell_quote("opencode"), "opencode");
-        assert_eq!(shell_quote(""), "''");
-        assert_eq!(shell_quote("two words"), "'two words'");
-        assert_eq!(shell_quote("that's"), "'that'\"'\"'s'");
     }
 
     #[test]
@@ -1405,7 +1384,7 @@ exit 0
                 server_port: 41_234,
                 server_url: server_url(41_234),
                 server_pid: Some(123),
-                server_start_time_ticks: None,
+                server_process_identity: None,
                 opencode_session_id: Some("ses_123".to_string()),
                 generation: 1,
                 updated_unix_ms: 42,
@@ -1483,7 +1462,7 @@ exit 0
                 server_port: port,
                 server_url: server_url(port),
                 server_pid: None,
-                server_start_time_ticks: None,
+                server_process_identity: None,
                 opencode_session_id: None,
                 generation: 1,
                 updated_unix_ms: 42,
@@ -1514,7 +1493,7 @@ exit 0
             .insert("opencode".to_string(), "opencode".to_string());
 
         assert!(pane_command_matches_agent(&config, "opencode"));
-        assert!(pane_command_matches_agent(&config, "opencode.exe"));
+        assert!(!pane_command_matches_agent(&config, "opencode.exe"));
         assert!(!pane_command_matches_agent(&config, "bash"));
         assert!(!pane_command_matches_agent(&config, "zsh"));
         assert!(pane_start_command_matches_agent(
@@ -2032,12 +2011,16 @@ exit 1
             .insert("opencode".to_string(), "opencode".to_string());
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
-        let port =
-            match start_fake_opencode_server(session.path.clone(), 204, Some(api_log.clone()), 9) {
-                Ok(port) => port,
-                Err(error) if error.kind() == ErrorKind::PermissionDenied => return,
-                Err(error) => panic!("start fake OpenCode server: {error}"),
-            };
+        let port = match start_fake_opencode_server(
+            session.path.clone(),
+            204,
+            Some(api_log.clone()),
+            11,
+        ) {
+            Ok(port) => port,
+            Err(error) if error.kind() == ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("start fake OpenCode server: {error}"),
+        };
         save_runtime(
             &repo,
             &OpencodeRuntime {
@@ -2048,7 +2031,7 @@ exit 1
                 server_port: port,
                 server_url: server_url(port),
                 server_pid: None,
-                server_start_time_ticks: None,
+                server_process_identity: None,
                 opencode_session_id: Some("ses_123".to_string()),
                 generation: 1,
                 updated_unix_ms: 42,
@@ -2296,7 +2279,7 @@ exit 1
             server_port: 41_234,
             server_url: server_url(41_234),
             server_pid: Some(123),
-            server_start_time_ticks: None,
+            server_process_identity: None,
             opencode_session_id: Some("ses_123".to_string()),
             generation: 1,
             updated_unix_ms: 42,

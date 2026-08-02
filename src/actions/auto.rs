@@ -261,15 +261,22 @@ impl Tui {
                         | AutoStepStatus::Waiting
                 )
             });
-        let run_active = dashboard.run.steps.iter().any(|step| {
-            matches!(
-                step.status,
-                AutoStepStatus::Queued
-                    | AutoStepStatus::Starting
-                    | AutoStepStatus::Running
-                    | AutoStepStatus::Waiting
+        let run_active = self
+            .workflow_controls(
+                Path::new(&dashboard.run.run.repo_root),
+                crate::execution::WorkflowKind::Auto,
+                &dashboard.run.run.id,
             )
-        });
+            .is_some_and(|controls| controls.stop)
+            && dashboard.run.steps.iter().any(|step| {
+                matches!(
+                    step.status,
+                    AutoStepStatus::Queued
+                        | AutoStepStatus::Starting
+                        | AutoStepStatus::Running
+                        | AutoStepStatus::Waiting
+                )
+            });
         let answer = self.prompt_choice_dialog(
             raw,
             crate::view::ChoiceList {
@@ -306,6 +313,24 @@ impl Tui {
                 .ok_or_else(|| "auto flow run has no selected step".to_string())?;
             AutoRunControlIntent::AbortStep { step_run_id }
         };
+        if intent == AutoRunControlIntent::AbortRun {
+            let receipt = crate::workspace_state::control_repository_workflow(
+                &repo,
+                crate::workspace_state::ControlAction::Stop,
+                "auto",
+                &run_id,
+            )?;
+            self.load_auto_run_snapshot(&repo.root, &run_id);
+            if receipt.warnings.is_empty() {
+                self.show_message("abort recorded for Auto Flow")?;
+            } else {
+                self.show_message(&format!(
+                    "abort recorded for Auto Flow with warnings: {}",
+                    receipt.warnings.join("; ")
+                ))?;
+            }
+            return Ok(true);
+        }
         let outcome = crate::observability::with_writable_db(&repo, |conn| {
             apply_auto_run_control(conn, &run_id, intent)
         })?;
@@ -408,32 +433,35 @@ impl Tui {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
         let run_id = dashboard.run.run.id.clone();
-        let resuming =
-            dashboard.run.run.pause_requested || dashboard.run.run.status == AutoRunStatus::Paused;
+        let controls = self
+            .workflow_controls(&repo.root, crate::execution::WorkflowKind::Auto, &run_id)
+            .cloned()
+            .unwrap_or_default();
+        let resuming = controls.resume;
+        if !resuming && !controls.pause {
+            return Err("pause/resume is not available for this Auto Flow run".to_string());
+        }
         if resuming && !self.confirm_resume_auto_step(raw, &dashboard.run)? {
             self.show_message("Auto Flow resume cancelled")?;
             return Ok(true);
         }
-        let intent = if resuming {
-            AutoRunControlIntent::Resume
+        let action = if resuming {
+            crate::workspace_state::ControlAction::Resume
         } else {
-            AutoRunControlIntent::Pause
+            crate::workspace_state::ControlAction::Pause
         };
-        let outcome = crate::observability::with_writable_db(&repo, |conn| {
-            apply_auto_run_control(conn, &run_id, intent)
-        })?;
-        let executor = outcome.executor;
-        let persisted = outcome.run;
-        self.remember_auto_run(persisted.clone());
+        let receipt =
+            crate::workspace_state::control_repository_workflow(&repo, action, "auto", &run_id)?;
+        self.load_auto_run_snapshot(&repo.root, &run_id);
         if !resuming {
             self.show_message("Auto Flow will pause before the next step")?;
-        } else if executor == AutoExecutorDecision::Start {
-            self.spawn_auto_run_executor(repo.clone(), Config::load(&repo), persisted)?;
-            self.show_message("resumed Auto Flow run")?;
-        } else if executor == AutoExecutorDecision::AlreadyRunning {
-            self.show_message("resumed Auto Flow run; work is already running")?;
         } else {
-            self.show_message("Auto Flow has no queued agent step")?;
+            let suffix = if receipt.warnings.is_empty() {
+                String::new()
+            } else {
+                format!("; warnings: {}", receipt.warnings.join("; "))
+            };
+            self.show_message(&format!("resumed Auto Flow run{suffix}"))?;
         }
         Ok(true)
     }

@@ -34,8 +34,11 @@ use crate::tui_jobs::{
 };
 use crate::tui_runtime::{RuntimeEvent, TerminalRuntime};
 use crate::tui_signal::{ShutdownNotification, ShutdownSignal};
-use crate::util::status_count;
 use crate::view;
+use crate::workspace_state::{
+    CiState, InspectRequest, RepositorySnapshot, WorkflowLifecycle, WorkflowSnapshot,
+    WorkspaceContext, WorkspaceState,
+};
 
 pub struct Tui {
     pub(crate) repo: Repository,
@@ -132,6 +135,7 @@ pub struct Tui {
     workflow_polls_in_flight: BTreeSet<WorktreeRepositoryKey>,
     workflow_last_polled: BTreeMap<WorktreeRepositoryKey, Instant>,
     workflow_revision: u64,
+    workspace_repositories: BTreeMap<WorktreeRepositoryKey, RepositorySnapshot>,
     linked_plan_runs: BTreeMap<String, PersistedPlanRun>,
     dashboard_output_tx: LatestSender<DashboardOutputKey, DashboardOutputResult>,
     dashboard_output_rx: LatestReceiver<DashboardOutputKey, DashboardOutputResult>,
@@ -316,6 +320,7 @@ pub(crate) enum DashboardOutputKey {
 }
 
 pub(crate) struct WorkflowPollSnapshot {
+    repository: RepositorySnapshot,
     plan_runs: Result<Vec<PersistedPlanRun>, String>,
     auto_runs: Result<Vec<PersistedAutoRun>, String>,
     linked_plan_runs: Result<Vec<PersistedPlanRun>, String>,
@@ -653,6 +658,41 @@ fn plan_run_status_sort_key(status: PlanRunStatus) -> u8 {
     }
 }
 
+fn auto_status(status: WorkflowLifecycle) -> Option<AutoRunStatus> {
+    match status {
+        WorkflowLifecycle::Queued => Some(AutoRunStatus::Queued),
+        WorkflowLifecycle::Running => Some(AutoRunStatus::Running),
+        WorkflowLifecycle::Paused => Some(AutoRunStatus::Paused),
+        WorkflowLifecycle::Failed => Some(AutoRunStatus::Failed),
+        WorkflowLifecycle::Done => Some(AutoRunStatus::Done),
+        WorkflowLifecycle::Aborted => Some(AutoRunStatus::Aborted),
+        WorkflowLifecycle::Draft => None,
+    }
+}
+
+fn auto_run_priority(status: AutoRunStatus) -> u8 {
+    match status {
+        AutoRunStatus::Running => 0,
+        AutoRunStatus::Queued => 1,
+        AutoRunStatus::Paused => 2,
+        AutoRunStatus::Failed => 3,
+        AutoRunStatus::Aborted => 4,
+        AutoRunStatus::Done => 5,
+    }
+}
+
+fn plan_status(status: WorkflowLifecycle) -> Option<PlanRunStatus> {
+    match status {
+        WorkflowLifecycle::Draft => Some(PlanRunStatus::Draft),
+        WorkflowLifecycle::Queued => Some(PlanRunStatus::Queued),
+        WorkflowLifecycle::Running => Some(PlanRunStatus::Running),
+        WorkflowLifecycle::Paused => Some(PlanRunStatus::Paused),
+        WorkflowLifecycle::Failed => Some(PlanRunStatus::Failed),
+        WorkflowLifecycle::Done => Some(PlanRunStatus::Done),
+        WorkflowLifecycle::Aborted => Some(PlanRunStatus::Aborted),
+    }
+}
+
 #[derive(Default)]
 struct TuiBackgroundChanges {
     sessions: bool,
@@ -906,6 +946,7 @@ impl Tui {
             workflow_polls_in_flight: BTreeSet::new(),
             workflow_last_polled: BTreeMap::new(),
             workflow_revision: 0,
+            workspace_repositories: BTreeMap::new(),
             linked_plan_runs: BTreeMap::new(),
             dashboard_output_tx,
             dashboard_output_rx,
@@ -3050,17 +3091,25 @@ impl Tui {
         &mut self,
         runtime: &mut TerminalRuntime,
     ) -> Result<(), String> {
-        let mut candidates = Vec::new();
-        for (repo_index, managed) in self.repos.iter().enumerate() {
-            let repo_candidates = crate::observability::with_writable_db(&managed.repo, |conn| {
-                crate::execution::recovery_candidates(conn)
-            })?;
-            candidates.extend(
-                repo_candidates
-                    .into_iter()
-                    .map(|candidate| (repo_index, candidate)),
-            );
-        }
+        let state = WorkspaceState::open(WorkspaceContext {
+            repo: None,
+            cwd: self.repo.root.clone(),
+        })?;
+        let snapshot = state.inspect(InspectRequest {
+            include_hidden: true,
+            include_terminal: true,
+        })?;
+        let candidates = snapshot
+            .repositories
+            .iter()
+            .flat_map(|repository| {
+                repository
+                    .workflows
+                    .iter()
+                    .filter(|workflow| workflow.available_controls.recover)
+                    .map(move |workflow| (repository, workflow))
+            })
+            .collect::<Vec<_>>();
         if candidates.is_empty() {
             return Ok(());
         }
@@ -3068,10 +3117,10 @@ impl Tui {
         let items = candidates
             .iter()
             .enumerate()
-            .map(|(index, (repo_index, candidate))| {
-                let repo = &self.repos[*repo_index];
-                let age_ms = candidate
-                    .last_heartbeat_unix_ms
+            .map(|(index, (repository, workflow))| {
+                let age_ms = workflow
+                    .dispatch
+                    .heartbeat_unix_ms
                     .map(|heartbeat| now.saturating_sub(heartbeat))
                     .unwrap_or(0);
                 let age = if age_ms >= 60_000 {
@@ -3079,23 +3128,20 @@ impl Tui {
                 } else {
                     format!("{}s ago", age_ms / 1_000)
                 };
-                let kind = match candidate.workflow.kind {
-                    crate::execution::WorkflowKind::Auto => "Auto Flow",
-                    crate::execution::WorkflowKind::Plan => "Plan",
+                let kind = match workflow.identity.kind.as_str() {
+                    "auto" => "Auto Flow",
+                    _ => "Plan",
                 };
-                let worktree = match candidate.workflow.kind {
-                    crate::execution::WorkflowKind::Auto => candidate.branch.as_str(),
-                    crate::execution::WorkflowKind::Plan => candidate
-                        .worktree
-                        .file_name()
-                        .and_then(|name| name.to_str())
-                        .unwrap_or_else(|| candidate.worktree.to_str().unwrap_or("worktree")),
-                };
+                let step = workflow
+                    .current_step
+                    .as_ref()
+                    .map(|step| step.label.as_str())
+                    .unwrap_or(kind);
                 view::OrderedToggleItem {
                     id: index.to_string(),
                     label: format!(
                         "{} / {}  {}  {}  {}",
-                        repo.label, worktree, kind, candidate.active_step, age
+                        repository.label, workflow.worktree.display, kind, step, age
                     ),
                     enabled: false,
                 }
@@ -3105,44 +3151,20 @@ impl Tui {
             return Ok(());
         };
         let selected = selected.into_iter().collect::<BTreeSet<_>>();
-        for (index, (repo_index, candidate)) in candidates.iter().enumerate() {
-            if !selected.contains(&index.to_string()) {
-                continue;
-            }
-            let managed = &self.repos[*repo_index];
-            if crate::worker::legacy_worker_running(
-                &managed.repo,
-                &managed.config,
-                &candidate.workflow,
-            )? {
-                return Err(format!(
-                    "legacy {} worker for run {} is still active; try recovery after it exits",
-                    candidate.workflow.kind.label(),
-                    candidate.workflow.run_id
-                ));
-            }
-        }
-        for (repo_index, managed) in self.repos.iter().enumerate() {
-            let decisions = candidates
-                .iter()
-                .enumerate()
-                .filter(|(_, (candidate_repo, _))| *candidate_repo == repo_index)
-                .map(|(index, (_, candidate))| {
-                    (
-                        candidate.workflow.clone(),
-                        candidate.interruption_generation,
-                        selected.contains(&index.to_string()),
-                    )
-                })
-                .collect::<Vec<_>>();
-            if !decisions.is_empty() {
-                crate::observability::with_writable_db_mut(&managed.repo, |conn| {
-                    crate::execution::apply_recovery_decision(conn, &decisions)
-                })?;
-            }
-        }
-        if !selected.is_empty() {
-            crate::worker::wake()?;
+        let decisions = candidates
+            .iter()
+            .enumerate()
+            .map(
+                |(index, (_, workflow))| crate::workspace_state::RecoveryDecision {
+                    workflow: workflow.identity.clone(),
+                    interruption_generation: workflow.dispatch.interruption_generation,
+                    restart: selected.contains(&index.to_string()),
+                },
+            )
+            .collect::<Vec<_>>();
+        let receipt = state.recover_batch(&decisions)?;
+        if !receipt.warnings.is_empty() {
+            self.show_message(&receipt.warnings.join("; "))?;
         }
         Ok(())
     }
@@ -4040,6 +4062,9 @@ impl Tui {
             let Ok(snapshot) = result.snapshot else {
                 continue;
             };
+            changed = true;
+            self.workspace_repositories
+                .insert(result.repository.clone(), snapshot.repository);
             if let Ok(runs) = snapshot.plan_runs {
                 for run in runs {
                     changed |= self.remember_plan_run_snapshot(run);
@@ -4058,6 +4083,15 @@ impl Tui {
                 }
             }
         }
+        let repositories = self
+            .repos
+            .iter()
+            .map(|managed| managed.identity.clone())
+            .collect::<BTreeSet<_>>();
+        let previous = self.workspace_repositories.len();
+        self.workspace_repositories
+            .retain(|repository, _| repositories.contains(repository));
+        changed |= previous != self.workspace_repositories.len();
         self.start_workflow_polls(false);
         changed
     }
@@ -4089,6 +4123,18 @@ impl Tui {
                 Some(TUI_ACTION_JOB_TIMEOUT),
                 "prism-workflow-poll".to_string(),
                 move |_| {
+                    let repository_snapshot = WorkspaceState::open(WorkspaceContext {
+                        repo: Some(repo.root.clone()),
+                        cwd: repo.root.clone(),
+                    })?
+                    .inspect(InspectRequest {
+                        include_hidden: true,
+                        include_terminal: true,
+                    })?
+                    .repositories
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "workspace inspection returned no repository".to_string())?;
                     let snapshot = crate::observability::with_nonblocking_read_db_named(
                         &repo,
                         "tui.workflow.refresh",
@@ -4113,6 +4159,7 @@ impl Tui {
                                 Err(_) => Ok(Vec::new()),
                             };
                             Ok(WorkflowPollSnapshot {
+                                repository: repository_snapshot,
                                 plan_runs,
                                 auto_runs,
                                 linked_plan_runs,
@@ -4325,8 +4372,17 @@ impl Tui {
             self.selected_auto_step_by_run
                 .insert(run_id.clone(), selected_step);
         }
-        self.active_auto_runs
-            .insert(run.run.worktree_path.clone(), run_id.clone());
+        let replace_active = self
+            .active_auto_runs
+            .get(&run.run.worktree_path)
+            .and_then(|active| self.auto_runs.get(active))
+            .is_none_or(|active| {
+                auto_run_priority(run.run.status) < auto_run_priority(active.run.status)
+            });
+        if replace_active {
+            self.active_auto_runs
+                .insert(run.run.worktree_path.clone(), run_id.clone());
+        }
         if self.selected_auto_run.is_none() {
             self.selected_auto_run = Some(run_id.clone());
         }
@@ -4679,6 +4735,52 @@ impl Tui {
         true
     }
 
+    fn workflow_snapshot(
+        &self,
+        repository: &Path,
+        kind: crate::execution::WorkflowKind,
+        run_id: &str,
+    ) -> Option<&WorkflowSnapshot> {
+        self.workspace_repositories
+            .iter()
+            .find(|(identity, _)| identity.root == repository)?
+            .1
+            .workflows
+            .iter()
+            .find(|workflow| workflow.identity.kind == kind && workflow.identity.run_id == run_id)
+    }
+
+    fn worktree_workflow_snapshot(
+        &self,
+        repository: &Path,
+        path: &Path,
+        kind: crate::execution::WorkflowKind,
+    ) -> Option<&WorkflowSnapshot> {
+        self.workspace_repositories
+            .iter()
+            .find(|(identity, _)| identity.root == repository)?
+            .1
+            .workflows
+            .iter()
+            .filter(|workflow| workflow.identity.kind == kind && workflow.worktree.path == path)
+            .min_by_key(|workflow| {
+                let historical = workflow.lifecycle.terminal()
+                    && workflow.dispatch.state
+                        != Some(crate::execution::DispatchState::RecoveryPending);
+                (historical, std::cmp::Reverse(workflow.updated_unix_ms))
+            })
+    }
+
+    pub(crate) fn workflow_controls(
+        &self,
+        repository: &Path,
+        kind: crate::execution::WorkflowKind,
+        run_id: &str,
+    ) -> Option<&crate::workspace_state::AvailableControls> {
+        self.workflow_snapshot(repository, kind, run_id)
+            .map(|workflow| &workflow.available_controls)
+    }
+
     fn frame_model(&self) -> view::FrameModel<'_> {
         let repos = self
             .visible_repo_indices()
@@ -4710,15 +4812,29 @@ impl Tui {
                     .map(|repo| repo.label.clone())
                     .unwrap_or_else(|| session.repo_label.clone());
                 let auto_status = self
-                    .active_auto_runs
-                    .get(&session.path)
-                    .and_then(|run_id| self.auto_runs.get(run_id))
-                    .map(|run| run.run.status);
+                    .worktree_workflow_snapshot(
+                        Path::new(&repo_root),
+                        &session.path,
+                        crate::execution::WorkflowKind::Auto,
+                    )
+                    .and_then(|workflow| auto_status(workflow.lifecycle));
                 let plan_status = self
-                    .active_plan_runs
-                    .get(&session.path)
-                    .and_then(|run_id| self.plan_runs.get(run_id))
-                    .map(|run| run.run.status);
+                    .worktree_workflow_snapshot(
+                        Path::new(&repo_root),
+                        &session.path,
+                        crate::execution::WorkflowKind::Plan,
+                    )
+                    .and_then(|workflow| plan_status(workflow.lifecycle));
+                let snapshot_status = self
+                    .workspace_repositories
+                    .get(&WorktreeRepositoryKey::new(PathBuf::from(&repo_root)))
+                    .and_then(|repository| {
+                        repository
+                            .worktrees
+                            .iter()
+                            .find(|worktree| worktree.identity.path == session.path)
+                    })
+                    .map(|worktree| worktree.git.label());
                 Some(view::WorktreeRow {
                     session_index: index,
                     repo_label,
@@ -4738,7 +4854,7 @@ impl Tui {
                         view::WorktreeKind::FeatureWorktree
                     },
                     agent_state: session.agent_state,
-                    status_label: session.status_label.clone(),
+                    status_label: snapshot_status.unwrap_or_else(|| session.status_label.clone()),
                     pr: session.pr.clone(),
                     wt_columns: session.wt_columns.clone(),
                     auto_status,
@@ -4854,38 +4970,40 @@ impl Tui {
         let mut ci_failed = 0;
         let mut ci_running = 0;
         let mut behind = 0;
-        for session in self
-            .sessions
-            .iter()
-            .filter(|session| session.repo_index == repo_index)
+        let snapshot = self
+            .repos
+            .get(repo_index)
+            .and_then(|managed| self.workspace_repositories.get(&managed.identity));
+        for worktree in snapshot
+            .into_iter()
+            .flat_map(|snapshot| &snapshot.worktrees)
         {
             if matches!(
-                session.agent_state,
-                AgentState::NeedsInput | AgentState::NeedsRestart | AgentState::ExitedError
-            ) || session.unseen_comments
-            {
+                worktree.agent.state,
+                Some(AgentState::NeedsInput | AgentState::NeedsRestart | AgentState::ExitedError)
+            ) {
                 attention += 1;
             }
-            if session.pr.has_summary() {
+            if let Some(pr) = &worktree.pull_request {
                 prs += 1;
+                match pr.ci {
+                    Some(CiState::Failed | CiState::Mixed) => ci_failed += 1,
+                    Some(CiState::Pending) => ci_running += 1,
+                    _ => {}
+                }
             }
-            match session
-                .pr
-                .summary()
-                .map(|summary| summary.check_status.as_str())
-            {
-                Some("failed") => ci_failed += 1,
-                Some("running") => ci_running += 1,
-                _ => {}
-            }
-            if self
-                .repos
-                .get(repo_index)
-                .is_some_and(|repo| repo.config.is_default_branch(&session.branch))
-            {
-                behind += status_count(&session.status_label, "behind").unwrap_or(0);
+            if self.repos.get(repo_index).is_some_and(|repo| {
+                matches!(&worktree.branch, crate::workspace_state::BranchState::Named(branch) if repo.config.is_default_branch(branch))
+            }) {
+                behind += worktree.git.behind;
             }
         }
+        attention += snapshot.map_or(0, |snapshot| snapshot.totals.attention);
+        attention += self
+            .sessions
+            .iter()
+            .filter(|session| session.repo_index == repo_index && session.unseen_comments)
+            .count();
 
         let parts = [
             (view::RepoHealthKind::Attention, attention),
@@ -4917,76 +5035,83 @@ impl Tui {
         let mut ci_failed = 0;
         let mut ci_running = 0;
         let mut dirty = 0;
-        let mut behind = 0;
         let mut active_plans = 0;
         let mut failed_plans = 0;
         let mut active_auto = 0;
         let mut failed_auto = 0;
-        for run in self.auto_runs.values() {
-            match run.run.status {
-                AutoRunStatus::Queued | AutoRunStatus::Running | AutoRunStatus::Paused => {
-                    active_auto += 1
-                }
-                AutoRunStatus::Failed | AutoRunStatus::Aborted => failed_auto += 1,
-                AutoRunStatus::Done => {}
+        for workflow in self
+            .workspace_repositories
+            .values()
+            .flat_map(|repository| &repository.workflows)
+        {
+            match (workflow.identity.kind.as_str(), workflow.lifecycle.as_str()) {
+                ("auto", "queued" | "running" | "paused") => active_auto += 1,
+                ("auto", "failed" | "aborted") => failed_auto += 1,
+                ("plan", "queued" | "running" | "paused") => active_plans += 1,
+                ("plan", "failed" | "aborted") => failed_plans += 1,
+                _ => {}
             }
         }
-        for run in self.plan_runs.values() {
-            match run.run.status {
-                PlanRunStatus::Queued | PlanRunStatus::Running | PlanRunStatus::Paused => {
-                    active_plans += 1
-                }
-                PlanRunStatus::Failed | PlanRunStatus::Aborted => failed_plans += 1,
-                PlanRunStatus::Draft | PlanRunStatus::Done => {}
-            }
-        }
-        for session in &self.sessions {
-            if status_count(&session.status_label, "dirty").is_some() {
+        for worktree in self
+            .workspace_repositories
+            .values()
+            .flat_map(|repository| &repository.worktrees)
+        {
+            if worktree.git.dirty > 0 {
                 dirty += 1;
             }
             if matches!(
-                session.agent_state,
-                AgentState::Attached | AgentState::Running
+                worktree.agent.state,
+                Some(AgentState::Attached | AgentState::Running)
             ) {
                 running += 1;
             }
             if matches!(
-                session.agent_state,
-                AgentState::NeedsInput | AgentState::NeedsRestart | AgentState::ExitedError
-            ) || session.unseen_comments
-            {
+                worktree.agent.state,
+                Some(AgentState::NeedsInput | AgentState::NeedsRestart | AgentState::ExitedError)
+            ) {
                 attention += 1;
             }
-            if session.pr.has_summary() {
+            if worktree.pull_request.is_some() {
                 prs += 1;
             }
-            match session
-                .pr
-                .summary()
-                .map(|summary| summary.check_status.as_str())
-            {
-                Some("failed") => ci_failed += 1,
-                Some("running") => ci_running += 1,
+            match worktree.pull_request.as_ref().and_then(|pr| pr.ci) {
+                Some(CiState::Failed | CiState::Mixed) => ci_failed += 1,
+                Some(CiState::Pending) => ci_running += 1,
                 _ => {}
             }
-            if self
-                .repos
-                .get(session.repo_index)
-                .is_some_and(|repo| repo.config.is_default_branch(&session.branch))
-            {
-                behind += status_count(&session.status_label, "behind").unwrap_or(0);
-            }
         }
+        let behind: usize = self
+            .repos
+            .iter()
+            .filter_map(|managed| self.workspace_repositories.get(&managed.identity).map(|snapshot| (managed, snapshot)))
+            .flat_map(|(managed, snapshot)| {
+                snapshot.worktrees.iter().filter_map(move |worktree| {
+                    matches!(&worktree.branch, crate::workspace_state::BranchState::Named(branch) if managed.config.is_default_branch(branch))
+                        .then_some(worktree.git.behind)
+                })
+            })
+            .sum();
+        attention += self
+            .sessions
+            .iter()
+            .filter(|session| session.unseen_comments)
+            .count();
 
         vec![
             view::StatusRow {
                 label: "repos".to_string(),
-                value: self.repos.len().to_string(),
+                value: self.workspace_repositories.len().to_string(),
                 attention: false,
             },
             view::StatusRow {
                 label: "worktrees".to_string(),
-                value: self.sessions.len().to_string(),
+                value: self
+                    .workspace_repositories
+                    .values()
+                    .map(|repository| repository.worktrees.len())
+                    .sum::<usize>()
+                    .to_string(),
                 attention: false,
             },
             view::StatusRow {
@@ -5190,6 +5315,7 @@ mod tests {
         AutoImplementationSource, AutoRun, AutoRunMode, AutoRunStatus, PersistedAutoRun,
     };
     use crate::config::Config;
+    use crate::execution::{DispatchState, WorkflowKind};
     use crate::github::{PrCache, PrDetails, PrReviewComment, PrSummary};
     use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
     use crate::plan_run::{
@@ -5200,6 +5326,10 @@ mod tests {
     use crate::session::{Session, WorktreeRepositoryKey};
     use crate::tui_jobs::{CoalescedFacet, JobRegistry};
     use crate::view::{ChoiceList, KeyChoice, OrderedToggleItem, RepoMainView, WorktreeMainView};
+    use crate::workspace_state::{
+        AvailableControls, DispatchSnapshot, Progress, RepositorySnapshot, RepositoryTotals,
+        WorkflowIdentity, WorkflowLifecycle, WorkflowSnapshot, WorktreeIdentity,
+    };
 
     use super::{
         GitAction, ManagedRepo, OpenTmuxSessionTarget, OpencodePollKey, OpencodePollResult,
@@ -6842,6 +6972,24 @@ esac
     }
 
     #[test]
+    fn historical_auto_run_does_not_replace_active_worktree_owner() {
+        let mut tui = test_tui();
+        let active = test_auto_run("active", "/repo-one/feature-one", 20);
+        let mut historical = test_auto_run("historical", "/repo-one/feature-one", 30);
+        historical.run.status = AutoRunStatus::Failed;
+
+        tui.remember_auto_run(active);
+        tui.remember_auto_run(historical);
+
+        assert_eq!(
+            tui.active_auto_runs
+                .get(std::path::Path::new("/repo-one/feature-one"))
+                .map(String::as_str),
+            Some("active")
+        );
+    }
+
+    #[test]
     fn open_tmux_session_target_opens_repo_default_from_repos() {
         let mut tui = test_tui();
         tui.focused_panel = PanelFocus::Repos;
@@ -6995,6 +7143,187 @@ esac
         tui.remember_plan_run(run);
 
         assert_eq!(tui.selected_plan_step_by_run.get("plan"), Some(&3));
+    }
+
+    #[test]
+    fn workflow_controls_come_from_snapshot_without_replacing_tui_selection() {
+        let mut tui = test_tui();
+        tui.selected_auto_run = Some("selected-run".to_string());
+        let repository = tui.repos[0].identity.clone();
+        tui.workspace_repositories.insert(
+            repository,
+            RepositorySnapshot {
+                root: PathBuf::from("/repo-one"),
+                label: "repo-one".to_string(),
+                shortcut: Some('1'),
+                worktrees: Vec::new(),
+                workflows: vec![WorkflowSnapshot {
+                    identity: WorkflowIdentity {
+                        repository: PathBuf::from("/repo-one"),
+                        kind: WorkflowKind::Auto,
+                        run_id: "snapshot-run".to_string(),
+                        display_id: "a:snapshot".to_string(),
+                    },
+                    owner: None,
+                    worktree: WorktreeIdentity {
+                        path: PathBuf::from("/repo-one/feature-one"),
+                        display: "feature-one".to_string(),
+                    },
+                    lifecycle: WorkflowLifecycle::Paused,
+                    pause_requested: true,
+                    dispatch: DispatchSnapshot {
+                        state: Some(DispatchState::Paused),
+                        daemon_instance_id: None,
+                        worker_id: None,
+                        lease_expires_unix_ms: None,
+                        heartbeat_unix_ms: None,
+                        interruption_generation: 0,
+                        updated_unix_ms: Some(20),
+                    },
+                    current_step: None,
+                    progress: Progress::default(),
+                    available_controls: AvailableControls {
+                        resume: true,
+                        ..AvailableControls::default()
+                    },
+                    updated_unix_ms: 20,
+                }],
+                totals: RepositoryTotals {
+                    workflows: 1,
+                    ..RepositoryTotals::default()
+                },
+            },
+        );
+
+        let controls = tui
+            .workflow_controls(
+                std::path::Path::new("/repo-one"),
+                WorkflowKind::Auto,
+                "snapshot-run",
+            )
+            .unwrap();
+
+        assert!(controls.resume);
+        assert!(!controls.pause);
+        assert_eq!(tui.selected_auto_run.as_deref(), Some("selected-run"));
+
+        let repository = tui.repos[1].identity.clone();
+        tui.workspace_repositories.insert(
+            repository,
+            RepositorySnapshot {
+                root: PathBuf::from("/repo-two"),
+                label: "repo-two".to_string(),
+                shortcut: Some('2'),
+                worktrees: Vec::new(),
+                workflows: vec![WorkflowSnapshot {
+                    identity: WorkflowIdentity {
+                        repository: PathBuf::from("/repo-two"),
+                        kind: WorkflowKind::Auto,
+                        run_id: "snapshot-run".to_string(),
+                        display_id: "a:snapshot".to_string(),
+                    },
+                    owner: None,
+                    worktree: WorktreeIdentity {
+                        path: PathBuf::from("/repo-two/feature-two"),
+                        display: "feature-two".to_string(),
+                    },
+                    lifecycle: WorkflowLifecycle::Running,
+                    pause_requested: false,
+                    dispatch: DispatchSnapshot {
+                        state: Some(DispatchState::Claimed),
+                        daemon_instance_id: None,
+                        worker_id: None,
+                        lease_expires_unix_ms: None,
+                        heartbeat_unix_ms: None,
+                        interruption_generation: 0,
+                        updated_unix_ms: Some(30),
+                    },
+                    current_step: None,
+                    progress: Progress::default(),
+                    available_controls: AvailableControls {
+                        pause: true,
+                        ..AvailableControls::default()
+                    },
+                    updated_unix_ms: 30,
+                }],
+                totals: RepositoryTotals {
+                    workflows: 1,
+                    ..RepositoryTotals::default()
+                },
+            },
+        );
+
+        let repo_two_controls = tui
+            .workflow_controls(
+                std::path::Path::new("/repo-two"),
+                WorkflowKind::Auto,
+                "snapshot-run",
+            )
+            .unwrap();
+        assert!(repo_two_controls.pause);
+        assert!(!repo_two_controls.resume);
+    }
+
+    #[test]
+    fn worktree_snapshot_prefers_active_workflow_over_newer_history() {
+        let mut tui = test_tui();
+        let repository = tui.repos[0].identity.clone();
+        let workflow = |run_id: &str, lifecycle, updated_unix_ms| WorkflowSnapshot {
+            identity: WorkflowIdentity {
+                repository: PathBuf::from("/repo-one"),
+                kind: WorkflowKind::Plan,
+                run_id: run_id.to_string(),
+                display_id: format!("p:{run_id}"),
+            },
+            owner: None,
+            worktree: WorktreeIdentity {
+                path: PathBuf::from("/repo-one/feature-one"),
+                display: "feature-one".to_string(),
+            },
+            lifecycle,
+            pause_requested: false,
+            dispatch: DispatchSnapshot {
+                state: Some(if lifecycle.terminal() {
+                    DispatchState::Terminal
+                } else {
+                    DispatchState::Queued
+                }),
+                daemon_instance_id: None,
+                worker_id: None,
+                lease_expires_unix_ms: None,
+                heartbeat_unix_ms: None,
+                interruption_generation: 0,
+                updated_unix_ms: Some(updated_unix_ms),
+            },
+            current_step: None,
+            progress: Progress::default(),
+            available_controls: AvailableControls::default(),
+            updated_unix_ms,
+        };
+        tui.workspace_repositories.insert(
+            repository,
+            RepositorySnapshot {
+                root: PathBuf::from("/repo-one"),
+                label: "repo-one".to_string(),
+                shortcut: Some('1'),
+                worktrees: Vec::new(),
+                workflows: vec![
+                    workflow("done-newer", WorkflowLifecycle::Done, 30),
+                    workflow("queued-older", WorkflowLifecycle::Queued, 20),
+                ],
+                totals: RepositoryTotals::default(),
+            },
+        );
+
+        let selected = tui
+            .worktree_workflow_snapshot(
+                std::path::Path::new("/repo-one"),
+                std::path::Path::new("/repo-one/feature-one"),
+                WorkflowKind::Plan,
+            )
+            .unwrap();
+
+        assert_eq!(selected.identity.run_id, "queued-older");
     }
 
     fn test_tui() -> Tui {

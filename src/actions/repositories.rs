@@ -27,21 +27,12 @@ pub(super) fn ensure_user_config_file(path: &Path) -> Result<(), String> {
     })
 }
 
-pub(super) fn editor_command() -> Option<String> {
-    std::env::var("VISUAL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| {
-            std::env::var("EDITOR")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-        })
-        .or_else(|| {
-            ["nvim", "vim", "vi"]
-                .into_iter()
-                .find(|editor| command_exists(editor))
-                .map(str::to_string)
-        })
+fn editor_command(path: &Path) -> Result<Command, String> {
+    let argv = crate::terminal::editor_argv_from_env()?
+        .ok_or_else(|| "no editor found; set VISUAL or EDITOR".to_string())?;
+    let mut command = Command::new(&argv[0]);
+    command.args(&argv[1..]).arg(path);
+    Ok(command)
 }
 
 impl Tui {
@@ -256,13 +247,8 @@ impl Tui {
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
         ensure_repo_config_file(&context.config.repo_config_path, false)?;
-        let editor =
-            editor_command().ok_or_else(|| "no editor found; set VISUAL or EDITOR".to_string())?;
-        raw.suspend_for(|| {
-            crate::process::run_status_inherited(
-                Command::new(&editor).arg(&context.config.repo_config_path),
-            )
-        })?;
+        let mut editor = editor_command(&context.config.repo_config_path)?;
+        raw.suspend_for(|| crate::process::run_status_inherited(&mut editor))?;
         let config = crate::config::Config::load(&context.repo);
         if !config.config_errors.is_empty() {
             return Err(config.config_errors.join("\n"));
@@ -288,9 +274,8 @@ impl Tui {
             .map(|repo| repo.config.user_path.clone())
             .ok_or_else(|| "no selected repository".to_string())?;
         ensure_user_config_file(&path)?;
-        let editor =
-            editor_command().ok_or_else(|| "no editor found; set VISUAL or EDITOR".to_string())?;
-        raw.suspend_for(|| crate::process::run_status_inherited(Command::new(&editor).arg(&path)))?;
+        let mut editor = editor_command(&path)?;
+        raw.suspend_for(|| crate::process::run_status_inherited(&mut editor))?;
         let configs = self
             .repos
             .iter()
@@ -397,9 +382,8 @@ impl Tui {
                 .collect::<Vec<_>>();
             crate::workspace::initialize_entries(&entries)?;
         }
-        let editor =
-            editor_command().ok_or_else(|| "no editor found; set VISUAL or EDITOR".to_string())?;
-        raw.suspend_for(|| crate::process::run_status_inherited(Command::new(&editor).arg(&path)))?;
+        let mut editor = editor_command(&path)?;
+        raw.suspend_for(|| crate::process::run_status_inherited(&mut editor))?;
         let entries = crate::workspace::load_entries()?;
         if entries.is_empty() {
             return Err("repository list is empty; add at least one [[repos]] block".to_string());

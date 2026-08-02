@@ -563,24 +563,16 @@ fn future_version_error(path: &Path, version: u32) -> StorageError {
 }
 
 fn database_identity(path: &Path) -> Result<Option<DatabaseIdentity>, StorageError> {
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        use std::os::unix::fs::MetadataExt;
+    use std::os::unix::fs::MetadataExt;
 
-        let metadata = fs::metadata(path).map_err(|error| {
-            StorageError::from_io(format!("identify database {}", path.display()), error)
-        })?;
-        Ok(Some(DatabaseIdentity {
-            path: path.to_path_buf(),
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        }))
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        let _ = path;
-        Ok(None)
-    }
+    let metadata = fs::metadata(path).map_err(|error| {
+        StorageError::from_io(format!("identify database {}", path.display()), error)
+    })?;
+    Ok(Some(DatabaseIdentity {
+        path: path.to_path_buf(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }))
 }
 
 fn database_identity_is_validated(identity: &DatabaseIdentity) -> Result<bool, StorageError> {

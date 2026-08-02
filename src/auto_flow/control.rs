@@ -354,15 +354,29 @@ pub(super) fn abort_auto_step(
     {
         errors.push(error);
     }
-    if let Some(process_id) = step.execution.process_id
-        && let Err(error) =
-            crate::harness::terminate_process(process_id, step.execution.process_start_time_ticks)
-    {
-        errors.push(error);
+    if let Some(process_id) = step.execution.process_id {
+        let recorded = crate::process::RecordedProcess::from_stored(
+            process_id,
+            step.execution.process_identity,
+        );
+        match crate::process::terminate_recorded_process(
+            recorded,
+            std::time::Duration::from_secs(1),
+        ) {
+            Ok(crate::process::TerminationOutcome::Terminated)
+            | Ok(crate::process::TerminationOutcome::AlreadyExited)
+            | Ok(crate::process::TerminationOutcome::IdentityReused) => {}
+            Ok(crate::process::TerminationOutcome::Unverifiable) => errors.push(format!(
+                "refusing to terminate auto step process {process_id}: reusable process identity is unavailable"
+            )),
+            Err(error) => {
+                errors.push(format!("terminate auto step process {process_id}: {error}"))
+            }
+        }
     }
     step.status = AutoStepStatus::Aborted;
     step.execution.process_id = None;
-    step.execution.process_start_time_ticks = None;
+    step.execution.process_identity = None;
     step.finished_unix_ms = Some(unix_ms());
     step.error = if errors.is_empty() {
         Some("aborted".to_string())

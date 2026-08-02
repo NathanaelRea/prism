@@ -1,6 +1,6 @@
 use crate::args::{
     self, AgentCommand, Args, AutoCommand, AutoCommandSource, CommandKind, ConfigCommand,
-    DbCommand, DebugCommand, WorkerCommand,
+    DaemonCommand, DbCommand, DebugCommand, InspectOptions, StatusOptions, WorkerCommand,
 };
 use crate::auto_flow::{
     AutoImplementationSource, AutoLaunch, AutoLaunchOptions, AutoRunMode,
@@ -12,6 +12,10 @@ use crate::observability::{self, LogLevel, ObserverOptions};
 use crate::plan_run::PlanRunMode;
 use crate::repo::Repository;
 use crate::tui::ManagedRepo;
+use crate::workspace_state::{
+    ControlAction, ControlRequest, InspectRequest, Subject, WorkspaceContext, WorkspaceSnapshot,
+    WorkspaceState,
+};
 use crate::{agent_session, config, plan, session, setup, tui, ui_state, workspace};
 use std::process::Command as ProcessCommand;
 
@@ -89,6 +93,19 @@ pub fn run() -> Result<(), String> {
             run_db_command(command, &repo)
         }
         CommandKind::Worker(command) => run_worker_command(command),
+        CommandKind::List(options) => run_list_command(args.repo.as_deref(), options),
+        CommandKind::Status(options) => run_status_command(args.repo.as_deref(), options),
+        CommandKind::Pause(selector) => {
+            run_control_command(args.repo.as_deref(), ControlAction::Pause, selector)
+        }
+        CommandKind::Resume(selector) => {
+            run_control_command(args.repo.as_deref(), ControlAction::Resume, selector)
+        }
+        CommandKind::Stop(selector) => {
+            run_control_command(args.repo.as_deref(), ControlAction::Stop, selector)
+        }
+        CommandKind::Recover(selector) => run_recover_command(args.repo.as_deref(), selector),
+        CommandKind::Daemon(command) => run_daemon_command(command),
         CommandKind::Tui => run_tui(args.repo.as_deref()),
     };
     match &result {
@@ -209,6 +226,417 @@ fn run_static_command(command: CommandKind) -> Result<(), String> {
             Ok(())
         }
         _ => unreachable!("static command runner received a stateful command"),
+    }
+}
+
+fn workspace_state(repo: Option<&std::path::Path>) -> Result<WorkspaceState, String> {
+    WorkspaceState::open(WorkspaceContext {
+        repo: repo.map(std::path::Path::to_path_buf),
+        cwd: std::env::current_dir().map_err(|error| format!("current directory: {error}"))?,
+    })
+}
+
+fn run_list_command(repo: Option<&std::path::Path>, options: InspectOptions) -> Result<(), String> {
+    let snapshot = workspace_state(repo)?.inspect(InspectRequest {
+        include_hidden: options.all,
+        include_terminal: options.all,
+    })?;
+    print_snapshot_warnings(&snapshot);
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&snapshot)
+                .map_err(|error| format!("serialize workspace status: {error}"))?
+        );
+    } else {
+        print_workspace_table(&snapshot);
+    }
+    Ok(())
+}
+
+fn run_status_command(
+    repo: Option<&std::path::Path>,
+    options: StatusOptions,
+) -> Result<(), String> {
+    let state = workspace_state(repo)?;
+    let snapshot = state.inspect(InspectRequest {
+        include_hidden: true,
+        include_terminal: true,
+    })?;
+    let subject = state.resolve_subject(&snapshot, options.selector.as_deref())?;
+    print_snapshot_warnings(&snapshot);
+    if options.json {
+        let value = status_json(&snapshot, &subject);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|error| format!("serialize status: {error}"))?
+        );
+    } else {
+        print_subject(&snapshot, &subject);
+    }
+    Ok(())
+}
+
+fn run_control_command(
+    repo: Option<&std::path::Path>,
+    action: ControlAction,
+    selector: Option<String>,
+) -> Result<(), String> {
+    let receipt = workspace_state(repo)?.control(ControlRequest { action, selector })?;
+    println!(
+        "workflow = {}\nstate = {}",
+        receipt.workflow.display_id, receipt.state
+    );
+    for warning in receipt.warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
+}
+
+fn run_recover_command(
+    repo: Option<&std::path::Path>,
+    selector: Option<String>,
+) -> Result<(), String> {
+    if selector.is_some() {
+        return run_control_command(repo, ControlAction::Recover, selector);
+    }
+    let snapshot = workspace_state(repo)?.inspect(InspectRequest {
+        include_hidden: true,
+        include_terminal: true,
+    })?;
+    print_snapshot_warnings(&snapshot);
+    let candidates = snapshot
+        .repositories
+        .iter()
+        .flat_map(|repo| &repo.workflows)
+        .filter(|workflow| workflow.available_controls.recover)
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        println!("No recovery-pending workflows.");
+    } else {
+        println!("WORKFLOW     REPO       WORKTREE             LAST HEARTBEAT");
+        for workflow in candidates {
+            println!(
+                "{:<12} {:<10} {:<20} {}",
+                workflow.identity.display_id,
+                workspace::label_for_root(&workflow.identity.repository),
+                workflow.worktree.display,
+                workflow
+                    .dispatch
+                    .heartbeat_unix_ms
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "-".to_string())
+            );
+        }
+    }
+    Ok(())
+}
+
+fn run_daemon_command(command: DaemonCommand) -> Result<(), String> {
+    match command {
+        DaemonCommand::Status { json } => {
+            let health = crate::worker::probe_health()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "schema_version": 1, "observed_unix_ms": crate::execution::now_ms(), "daemon": health, "warnings": [] })).map_err(|error| error.to_string())?);
+            } else {
+                println!("state = {}", daemon_state_label(&health.state));
+                if let Some(instance) = health.instance_id {
+                    println!("instance_id = {instance}");
+                }
+                if let Some(pid) = health.pid {
+                    println!("pid = {pid}");
+                }
+                println!("active = {}", health.active);
+            }
+            Ok(())
+        }
+        DaemonCommand::Start => {
+            crate::worker::ensure_running()?;
+            let health = crate::worker::probe_health()?;
+            println!(
+                "state = {}\ninstance_id = {}\npid = {}\nactive = {}",
+                daemon_state_label(&health.state),
+                health.instance_id.unwrap_or_default(),
+                health.pid.map(|pid| pid.to_string()).unwrap_or_default(),
+                health.active
+            );
+            Ok(())
+        }
+        DaemonCommand::Stop => {
+            let health = crate::worker::probe_health()?;
+            if matches!(health.state, crate::worker::DaemonState::Stopped) {
+                println!("state = stopped");
+                return Ok(());
+            }
+            crate::worker::shutdown()?;
+            println!("state = stopped");
+            Ok(())
+        }
+    }
+}
+
+fn print_workspace_table(snapshot: &WorkspaceSnapshot) {
+    println!(
+        "REPO       WORKTREE             GIT                 AGENT          WORKFLOW     STATE              STEP                 CI"
+    );
+    for repo in &snapshot.repositories {
+        let mut rendered_workflows = std::collections::BTreeSet::new();
+        for worktree in &repo.worktrees {
+            let workflows = repo
+                .workflows
+                .iter()
+                .filter(|workflow| workflow.worktree.path == worktree.identity.path)
+                .collect::<Vec<_>>();
+            if workflows.is_empty() {
+                println!(
+                    "{:<10} {:<20} {:<19} {:<14} {:<12} {:<18} {:<20} {}",
+                    repo.label,
+                    worktree.identity.display,
+                    worktree.git.label(),
+                    agent_label(worktree),
+                    "-",
+                    "-",
+                    "-",
+                    ci_label(worktree)
+                );
+            } else {
+                for workflow in workflows {
+                    rendered_workflows.insert((
+                        workflow.identity.kind.as_str(),
+                        workflow.identity.run_id.as_str(),
+                    ));
+                    let state = if workflow.dispatch.state.as_deref() == Some("recovery_pending") {
+                        "recovery_pending"
+                    } else if workflow.pause_requested
+                        && workflow.lifecycle != crate::workspace_state::WorkflowLifecycle::Paused
+                    {
+                        "pause_requested"
+                    } else {
+                        workflow.lifecycle.label()
+                    };
+                    let step = workflow
+                        .current_step
+                        .as_ref()
+                        .map(|step| {
+                            format!(
+                                "{} {}/{}",
+                                step.label, workflow.progress.completed, workflow.progress.total
+                            )
+                        })
+                        .unwrap_or_else(|| "-".to_string());
+                    println!(
+                        "{:<10} {:<20} {:<19} {:<14} {:<12} {:<18} {:<20} {}",
+                        repo.label,
+                        worktree.identity.display,
+                        worktree.git.label(),
+                        agent_label(worktree),
+                        workflow.identity.display_id,
+                        state,
+                        step,
+                        ci_label(worktree)
+                    );
+                }
+            }
+        }
+        for workflow in &repo.workflows {
+            if rendered_workflows.contains(&(
+                workflow.identity.kind.as_str(),
+                workflow.identity.run_id.as_str(),
+            )) {
+                continue;
+            }
+            let state = if workflow.dispatch.state.as_deref() == Some("recovery_pending") {
+                "recovery_pending"
+            } else if workflow.pause_requested
+                && workflow.lifecycle != crate::workspace_state::WorkflowLifecycle::Paused
+            {
+                "pause_requested"
+            } else {
+                workflow.lifecycle.label()
+            };
+            let step = workflow
+                .current_step
+                .as_ref()
+                .map(|step| {
+                    format!(
+                        "{} {}/{}",
+                        step.label, workflow.progress.completed, workflow.progress.total
+                    )
+                })
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "{:<10} {:<20} {:<19} {:<14} {:<12} {:<18} {:<20} -",
+                repo.label,
+                workflow.worktree.display,
+                "unavailable",
+                "unknown",
+                workflow.identity.display_id,
+                state,
+                step
+            );
+        }
+    }
+}
+
+fn print_subject(snapshot: &WorkspaceSnapshot, subject: &Subject) {
+    match *subject {
+        Subject::Repository(repo) => {
+            let repo = &snapshot.repositories[repo];
+            println!(
+                "repository = {}\npath = {}\nworktrees = {}\nworkflows = {}\nattention = {}",
+                repo.label,
+                repo.root.display(),
+                repo.totals.worktrees,
+                repo.totals.workflows,
+                repo.totals.attention
+            );
+            for worktree in &repo.worktrees {
+                println!(
+                    "worktree = {} ({})",
+                    worktree.identity.path.display(),
+                    branch_label(&worktree.branch)
+                );
+            }
+        }
+        Subject::Worktree(repo, worktree) => {
+            let repo = &snapshot.repositories[repo];
+            let worktree = &repo.worktrees[worktree];
+            println!(
+                "repository = {}\nworktree = {}\nbranch = {}\ngit = {}\nagent = {}",
+                repo.label,
+                worktree.identity.path.display(),
+                branch_label(&worktree.branch),
+                worktree.git.label(),
+                worktree
+                    .agent
+                    .state
+                    .map(crate::agent::AgentState::label)
+                    .unwrap_or("unknown")
+            );
+            for workflow in &worktree.workflows {
+                println!("workflow = {}", workflow.display_id);
+            }
+            if let Some(pull_request) = &worktree.pull_request {
+                println!(
+                    "pull_request = {}\nci = {}\nmergeability = {}\nobservation_age_ms = {}\nobservation_stale = {}\nobservation_provenance = sqlite_cache",
+                    pull_request.number,
+                    pull_request
+                        .ci
+                        .map(|state| state.label())
+                        .unwrap_or("unknown"),
+                    pull_request
+                        .mergeability
+                        .map(mergeability_label)
+                        .unwrap_or("unknown"),
+                    pull_request.age_ms,
+                    pull_request.stale,
+                );
+                if let Some(error) = &pull_request.error {
+                    println!("observation_error = {error}");
+                }
+            }
+        }
+        Subject::Workflow(repo, workflow) => {
+            let workflow = &snapshot.repositories[repo].workflows[workflow];
+            println!(
+                "workflow = {}\ncanonical_id = {}:{}:{}\nrepository = {}\nworktree = {}\nlifecycle = {}\ndispatch = {}\npause_requested = {}\nprogress = {}/{}",
+                workflow.identity.display_id,
+                workflow.identity.repository.display(),
+                workflow.identity.kind,
+                workflow.identity.run_id,
+                workflow.identity.repository.display(),
+                workflow.worktree.path.display(),
+                workflow.lifecycle.label(),
+                workflow.dispatch.state.as_deref().unwrap_or("unknown"),
+                workflow.pause_requested,
+                workflow.progress.completed,
+                workflow.progress.total
+            );
+            if let Some(owner) = &workflow.owner {
+                println!("owner = {}", owner.display_id);
+            }
+            if let Some(step) = &workflow.current_step {
+                println!("step = {} ({})", step.label, step.state.label());
+            }
+            println!(
+                "controls = pause:{} resume:{} stop:{} recover:{}",
+                workflow.available_controls.pause,
+                workflow.available_controls.resume,
+                workflow.available_controls.stop,
+                workflow.available_controls.recover
+            );
+        }
+    }
+}
+
+fn status_json(snapshot: &WorkspaceSnapshot, subject: &Subject) -> serde_json::Value {
+    let subject = match *subject {
+        Subject::Repository(repo) => {
+            serde_json::to_value(&snapshot.repositories[repo]).unwrap_or(serde_json::Value::Null)
+        }
+        Subject::Worktree(repo, worktree) => {
+            serde_json::to_value(&snapshot.repositories[repo].worktrees[worktree])
+                .unwrap_or(serde_json::Value::Null)
+        }
+        Subject::Workflow(repo, workflow) => {
+            serde_json::to_value(&snapshot.repositories[repo].workflows[workflow])
+                .unwrap_or(serde_json::Value::Null)
+        }
+    };
+    serde_json::json!({ "schema_version": 1, "observed_unix_ms": snapshot.observed_unix_ms, "daemon": snapshot.daemon, "subject": subject, "warnings": snapshot.warnings })
+}
+
+fn print_snapshot_warnings(snapshot: &WorkspaceSnapshot) {
+    for warning in &snapshot.warnings {
+        eprintln!("warning: {}: {}", warning.scope, warning.message);
+    }
+}
+
+fn branch_label(branch: &crate::workspace_state::BranchState) -> &str {
+    match branch {
+        crate::workspace_state::BranchState::Named(name) => name,
+        crate::workspace_state::BranchState::Detached => "(detached)",
+    }
+}
+
+fn ci_label(worktree: &crate::workspace_state::WorktreeSnapshot) -> String {
+    worktree
+        .pull_request
+        .as_ref()
+        .and_then(|pr| {
+            pr.ci
+                .as_ref()
+                .map(|ci| format!("{} {}s cache", ci.label(), pr.age_ms / 1_000))
+        })
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn agent_label(worktree: &crate::workspace_state::WorktreeSnapshot) -> &'static str {
+    worktree
+        .agent
+        .state
+        .map(crate::agent::AgentState::label)
+        .unwrap_or("unknown")
+}
+
+fn mergeability_label(state: crate::workspace_state::MergeabilityState) -> &'static str {
+    match state {
+        crate::workspace_state::MergeabilityState::Clean => "clean",
+        crate::workspace_state::MergeabilityState::Dirty => "dirty",
+        crate::workspace_state::MergeabilityState::Blocked => "blocked",
+        crate::workspace_state::MergeabilityState::Behind => "behind",
+        crate::workspace_state::MergeabilityState::Unstable => "unstable",
+        crate::workspace_state::MergeabilityState::HasHooks => "has_hooks",
+        crate::workspace_state::MergeabilityState::Unknown => "unknown",
+    }
+}
+
+fn daemon_state_label(state: &crate::worker::DaemonState) -> &'static str {
+    match state {
+        crate::worker::DaemonState::Running => "running",
+        crate::worker::DaemonState::Draining => "draining",
+        crate::worker::DaemonState::Stopped => "stopped",
     }
 }
 

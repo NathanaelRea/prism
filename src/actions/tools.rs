@@ -24,10 +24,7 @@ impl Tui {
         let context = self
             .selected_repo_context()
             .ok_or_else(|| "no selected repository".to_string())?;
-        let shell = std::env::var("SHELL")
-            .ok()
-            .filter(|shell| !shell.trim().is_empty())
-            .unwrap_or_else(|| "/bin/sh".to_string());
+        let shell = crate::terminal::shell_program_from_env();
         raw.suspend_for(|| {
             crate::process::run_status_inherited(
                 Command::new(&shell).current_dir(&context.repo.root),

@@ -9,9 +9,8 @@ use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{
     AutoExecutorDecision, AutoImplementationSource, AutoLaunch, AutoLaunchOptions,
-    AutoRunControlIntent, AutoRunMode, AutoRunStatus, AutoStepKey, AutoStepStatus,
-    PersistedAutoRun, apply_auto_run_control, archive_auto_run, load_auto_run,
-    prepare_auto_run_for_resume,
+    AutoRunControlIntent, AutoRunMode, AutoStepKey, AutoStepStatus, PersistedAutoRun,
+    apply_auto_run_control, archive_auto_run, load_auto_run, prepare_auto_run_for_resume,
 };
 use crate::config::Config;
 use crate::git::{
@@ -36,10 +35,9 @@ use crate::observability::append_runtime_message;
 use crate::opencode::{self, OpencodeStatus, load_runtime};
 use crate::plan::{PlanExecution, infer_total_phases, open_plan_mode, select_plan_path};
 use crate::plan_run::{
-    DEFAULT_OUTPUT_LINES_PER_STEP, PlanRunMode, PlanRunStatus, PlanStepStatus, abort_plan_run,
-    abort_plan_step, archive_plan_run, load_plan_run, load_resumable_plan_run,
-    prepare_plan_run_for_resume, request_plan_run_pause, resume_paused_plan_run,
-    retry_failed_steps, retry_from_step, save_plan_run, skip_plan_step,
+    DEFAULT_OUTPUT_LINES_PER_STEP, PlanRunMode, PlanStepStatus, abort_plan_step, archive_plan_run,
+    load_plan_run, load_resumable_plan_run, prepare_plan_run_for_resume, retry_failed_steps,
+    retry_from_step, save_plan_run, skip_plan_step,
 };
 use crate::process::{
     ProcessPolicy, command_exists, parse_command_words, run_capture, run_output_allow_failure,

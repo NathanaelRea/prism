@@ -289,8 +289,8 @@ fn worktrunk_approval_hint(repo: &Repository, config: &Config) -> String {
 fn worktrunk_approval_command_display(repo: &Repository, config: &Config) -> String {
     format!(
         "{} -C {} config approvals add",
-        shell_quote(&config.tool(&config.worktree_command)),
-        shell_quote(&repo.root.display().to_string())
+        crate::terminal::posix_shell_quote(&config.tool(&config.worktree_command)),
+        crate::terminal::posix_shell_quote(&repo.root.display().to_string())
     )
 }
 
@@ -317,17 +317,6 @@ fn first_non_empty_line(output: &str) -> String {
         .find(|line| !line.is_empty())
         .unwrap_or("")
         .to_string()
-}
-
-fn shell_quote(value: &str) -> String {
-    if !value.is_empty()
-        && value
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '/' | '.' | '_' | '-' | ':'))
-    {
-        return value.to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn switch_checkout_args(repo_root: &Path, branch: &str) -> Vec<String> {

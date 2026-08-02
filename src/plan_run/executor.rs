@@ -378,7 +378,7 @@ pub(super) fn finish_step_after_exit(
     harness_id: &str,
 ) -> Result<(), String> {
     step.execution.process_id = None;
-    step.execution.process_start_time_ticks = None;
+    step.execution.process_identity = None;
     step.finished_unix_ms = Some(unix_ms());
     step.exit_code = Some(exit_code);
     if exit_code == 0 && step.error.is_none() {
@@ -422,7 +422,7 @@ pub(super) fn finish_step_after_exit(
             .map_err(|error| format!("reload plan step status: {error}"))?;
         step.status = PlanStepStatus::parse(&status)?;
         step.execution.process_id = None;
-        step.execution.process_start_time_ticks = None;
+        step.execution.process_identity = None;
         if step.status == PlanStepStatus::Aborted {
             step.error = Some("aborted".to_string());
         }
@@ -436,7 +436,9 @@ pub(super) fn claim_spawned_process(
     child: &mut crate::process::SupervisedChild,
 ) -> Result<bool, String> {
     let process_id = child.id();
-    let start_time_ticks = crate::harness::process_start_time_ticks(process_id);
+    let process_identity = crate::process::record_process(process_id)
+        .map_err(|error| format!("record plan harness process {process_id}: {error}"))?
+        .identity;
     let changed = conn
         .execute(
             "update plan_step_run
@@ -445,7 +447,7 @@ pub(super) fn claim_spawned_process(
              where run_id = ?3 and step = ?4 and status = 'starting'",
             params![
                 i64::from(process_id),
-                start_time_ticks.map(u64_to_i64),
+                process_identity.map(|identity| u64_to_i64(identity.stored_value())),
                 step.run_id,
                 usize_to_i64(step.step),
             ],
@@ -459,7 +461,7 @@ pub(super) fn claim_spawned_process(
     }
     step.status = PlanStepStatus::Running;
     step.execution.process_id = Some(process_id);
-    step.execution.process_start_time_ticks = start_time_ticks;
+    step.execution.process_identity = process_identity.map(|identity| identity.stored_value());
     Ok(true)
 }
 
@@ -683,9 +685,13 @@ fn terminate_plan_child(step: &PlanStepRun, child: &mut crate::process::Supervis
 fn terminate_running_plan_steps(steps: &[PlanStepRun]) {
     for step in steps {
         if let Some(process_id) = step.execution.process_id {
-            let _ = crate::harness::terminate_process(
+            let recorded = crate::process::RecordedProcess::from_stored(
                 process_id,
-                step.execution.process_start_time_ticks,
+                step.execution.process_identity,
+            );
+            let _ = crate::process::terminate_recorded_process(
+                recorded,
+                std::time::Duration::from_secs(1),
             );
         }
     }

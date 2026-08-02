@@ -27,6 +27,7 @@ const SCHEMA_VERSION: u32 = 1;
 const MAX_CONTROL_BATCH: usize = 8;
 const MAX_EVENT_BATCH: usize = 1_024;
 const MAX_REQUEST_BATCH: usize = 64;
+const RECORDER_SOCKET_PATH_BUDGET: usize = 103;
 
 static RECORDER: OnceLock<Recorder> = OnceLock::new();
 static UI_THREAD: OnceLock<ThreadId> = OnceLock::new();
@@ -511,16 +512,12 @@ struct ServerEndpoint {
     output_dir: PathBuf,
 }
 
-#[cfg(unix)]
 struct ServerSocket {
     socket: std::os::unix::net::UnixDatagram,
     socket_path: PathBuf,
     output_dir: PathBuf,
     _lock: File,
 }
-
-#[cfg(not(unix))]
-struct ServerSocket;
 
 pub(crate) struct ServerGuard {
     paths: Vec<PathBuf>,
@@ -642,12 +639,12 @@ pub(crate) fn trigger(repo: &Repository, options: RecordOptions) -> Result<PathB
     trigger_unix(repo, options)
 }
 
-#[cfg(unix)]
 fn trigger_unix(repo: &Repository, options: RecordOptions) -> Result<PathBuf, String> {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixDatagram;
 
     let server_path = control_socket_path(repo);
+    validate_recorder_socket_path(&server_path, "recorder control")?;
     if !server_path.exists() {
         return Err(format!(
             "no running Prism TUI recorder found for {}; start Prism for this repository first",
@@ -690,11 +687,6 @@ fn trigger_unix(repo: &Repository, options: RecordOptions) -> Result<PathBuf, St
     response
         .path
         .ok_or_else(|| "debug recorder returned no artifact path".to_string())
-}
-
-#[cfg(not(unix))]
-fn trigger_unix(_repo: &Repository, _options: RecordOptions) -> Result<PathBuf, String> {
-    Err("debug flight recording requires a Unix platform".to_string())
 }
 
 struct SocketPathGuard(PathBuf);
@@ -814,7 +806,6 @@ impl RecorderState {
         }
     }
 
-    #[cfg(unix)]
     fn handle_control(&mut self, control: Control) {
         match control {
             Control::Serve { endpoints, reply } => {
@@ -838,7 +829,6 @@ impl RecorderState {
         }
     }
 
-    #[cfg(unix)]
     fn add_servers(&mut self, endpoints: Vec<ServerEndpoint>) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         for endpoint in endpoints {
@@ -857,17 +847,6 @@ impl RecorderState {
         paths
     }
 
-    #[cfg(not(unix))]
-    fn handle_control(&mut self, control: Control) {
-        match control {
-            Control::Serve { reply, .. } => {
-                let _ = reply.send(Vec::new());
-            }
-            Control::Register { .. } | Control::Stop { .. } | Control::StopAll => {}
-        }
-    }
-
-    #[cfg(unix)]
     fn poll_servers(&mut self) {
         let mut requests = Vec::new();
         'servers: for server in &self.servers {
@@ -895,9 +874,6 @@ impl RecorderState {
             self.handle_request(output_dir, response_path, &bytes);
         }
     }
-
-    #[cfg(not(unix))]
-    fn poll_servers(&mut self) {}
 
     fn handle_request(&mut self, output_dir: PathBuf, response_path: PathBuf, bytes: &[u8]) {
         let request = match serde_json::from_slice::<CaptureRequest>(bytes) {
@@ -966,7 +942,11 @@ impl RecorderState {
             .filter(|event| event.monotonic_us >= start_us && event.monotonic_us <= end_us)
             .cloned()
             .collect::<Vec<_>>();
-        fs::create_dir_all(&capture.output_dir).map_err(|error| {
+        crate::durability::create_dir_all(
+            &capture.output_dir,
+            crate::durability::DurabilityIntent::Maximum,
+        )
+        .map_err(|error| {
             format!(
                 "create recording directory {}: {error}",
                 capture.output_dir.display()
@@ -1005,24 +985,39 @@ impl RecorderState {
         writer
             .flush()
             .map_err(|error| format!("flush {}: {error}", temporary.display()))?;
-        writer
-            .get_ref()
-            .sync_all()
-            .map_err(|error| format!("sync {}: {error}", temporary.display()))?;
+        crate::durability::sync_file(
+            writer.get_ref(),
+            crate::durability::DurabilityIntent::Maximum,
+        )
+        .map_err(|error| {
+            let stage = match error.stage() {
+                crate::durability::FileSyncStage::File => "sync",
+                crate::durability::FileSyncStage::FullFile => "fully sync",
+            };
+            format!("{stage} {}: {}", temporary.display(), error.into_source())
+        })?;
+        drop(writer);
         fs::rename(&temporary, &path)
             .map_err(|error| format!("commit debug recording {}: {error}", path.display()))?;
+        crate::durability::sync_directory(
+            &capture.output_dir,
+            crate::durability::DurabilityIntent::Maximum,
+        )
+        .map_err(|error| {
+            format!(
+                "sync debug recording directory {} after committing {}: {error}",
+                capture.output_dir.display(),
+                path.display()
+            )
+        })?;
         Ok(path)
     }
 
-    #[cfg(unix)]
     fn remove_all_servers(&mut self) {
         for server in self.servers.drain(..) {
             let _ = fs::remove_file(server.socket_path);
         }
     }
-
-    #[cfg(not(unix))]
-    fn remove_all_servers(&mut self) {}
 }
 
 #[derive(Serialize)]
@@ -1141,23 +1136,24 @@ fn write_json_line(writer: &mut impl Write, value: &impl Serialize) -> Result<()
 fn create_recording_file(path: &Path) -> Result<File, String> {
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
     options
         .open(path)
         .map_err(|error| format!("create debug recording {}: {error}", path.display()))
 }
 
-#[cfg(unix)]
 fn bind_server(endpoint: ServerEndpoint) -> Result<ServerSocket, String> {
+    bind_server_in(endpoint, &control_runtime_dir())
+}
+
+fn bind_server_in(endpoint: ServerEndpoint, runtime_dir: &Path) -> Result<ServerSocket, String> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::UnixDatagram;
 
-    let runtime_dir = ensure_control_runtime_dir()?;
+    validate_recorder_socket_path(&endpoint.socket_path, "recorder control")?;
+    let runtime_dir = ensure_control_runtime_dir_at(runtime_dir)?;
     if endpoint.socket_path.parent() != Some(runtime_dir.as_path()) {
         return Err("recorder socket is outside its private runtime directory".to_string());
     }
@@ -1203,27 +1199,24 @@ fn bind_server(endpoint: ServerEndpoint) -> Result<ServerSocket, String> {
 }
 
 fn send_response(path: &Path, result: Result<PathBuf, String>) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::net::UnixDatagram;
+    use std::os::unix::net::UnixDatagram;
 
-        let response = match result {
-            Ok(path) => CaptureResponse {
-                schema_version: SCHEMA_VERSION,
-                path: Some(path),
-                error: None,
-            },
-            Err(error) => CaptureResponse {
-                schema_version: SCHEMA_VERSION,
-                path: None,
-                error: Some(error),
-            },
-        };
-        if let Ok(bytes) = serde_json::to_vec(&response)
-            && let Ok(socket) = UnixDatagram::unbound()
-        {
-            let _ = socket.send_to(&bytes, path);
-        }
+    let response = match result {
+        Ok(path) => CaptureResponse {
+            schema_version: SCHEMA_VERSION,
+            path: Some(path),
+            error: None,
+        },
+        Err(error) => CaptureResponse {
+            schema_version: SCHEMA_VERSION,
+            path: None,
+            error: Some(error),
+        },
+    };
+    if let Ok(bytes) = serde_json::to_vec(&response)
+        && let Ok(socket) = UnixDatagram::unbound()
+    {
+        let _ = socket.send_to(&bytes, path);
     }
 }
 
@@ -1233,32 +1226,31 @@ pub(crate) fn control_socket_path(repo: &Repository) -> PathBuf {
 }
 
 fn client_socket_path() -> Result<PathBuf, String> {
-    Ok(ensure_control_runtime_dir()?.join(format!(
+    let runtime_dir = control_runtime_dir();
+    let path = runtime_dir.join(format!(
         "prism-flight-client-{}-{}.sock",
         std::process::id(),
         unix_ms()
-    )))
+    ));
+    validate_recorder_socket_path(&path, "recorder response")?;
+    ensure_control_runtime_dir()?;
+    Ok(path)
 }
 
 fn control_runtime_dir() -> PathBuf {
-    #[cfg(unix)]
-    {
-        PathBuf::from("/tmp").join(format!("prism-flight-{}", unsafe { libc::geteuid() }))
-    }
-    #[cfg(not(unix))]
-    {
-        std::env::temp_dir().join("prism-flight")
-    }
+    PathBuf::from("/tmp").join(format!("prism-flight-{}", unsafe { libc::geteuid() }))
 }
 
-#[cfg(unix)]
 fn ensure_control_runtime_dir() -> Result<PathBuf, String> {
+    ensure_control_runtime_dir_at(&control_runtime_dir())
+}
+
+fn ensure_control_runtime_dir_at(path: &Path) -> Result<PathBuf, String> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 
-    let path = control_runtime_dir();
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
-    match builder.create(&path) {
+    match builder.create(path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => {
@@ -1268,7 +1260,7 @@ fn ensure_control_runtime_dir() -> Result<PathBuf, String> {
             ));
         }
     }
-    let metadata = fs::symlink_metadata(&path)
+    let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("inspect recorder runtime directory: {error}"))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {
         return Err(format!(
@@ -1282,9 +1274,9 @@ fn ensure_control_runtime_dir() -> Result<PathBuf, String> {
             path.display()
         ));
     }
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("secure recorder runtime directory: {error}"))?;
-    Ok(path)
+    Ok(path.to_path_buf())
 }
 
 fn remove_socket_if_present(path: &Path) -> Result<(), String> {
@@ -1293,6 +1285,27 @@ fn remove_socket_if_present(path: &Path) -> Result<(), String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(format!("remove stale socket {}: {error}", path.display())),
     }
+}
+
+#[cfg(unix)]
+fn validate_recorder_socket_path(path: &Path, purpose: &str) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let bytes = path.as_os_str().as_bytes();
+    if bytes.contains(&0) {
+        return Err(format!(
+            "{purpose} socket path {} contains a NUL byte",
+            path.display()
+        ));
+    }
+    if bytes.len() > RECORDER_SOCKET_PATH_BUDGET {
+        return Err(format!(
+            "{purpose} socket path {} is {} bytes, exceeding the supported maximum of {RECORDER_SOCKET_PATH_BUDGET} bytes",
+            path.display(),
+            bytes.len()
+        ));
+    }
+    Ok(())
 }
 
 fn duration_us(duration: Duration) -> u64 {
@@ -1467,11 +1480,8 @@ mod tests {
     fn trigger_writes_an_atomic_jsonl_capture_without_sqlite() {
         use std::os::unix::fs::PermissionsExt;
 
-        let base = std::env::temp_dir().join(format!(
-            "prism-flight-test-{}-{}",
-            std::process::id(),
-            unix_ms()
-        ));
+        let temp = crate::compact_runtime::CompactTempDir::new("flight-recorder");
+        let base = temp.path().to_path_buf();
         let repo = Repository::with_config_dir_for_test(base.join("repo"), base.join("config"));
         let server = serve_repositories([&repo]);
         let mut in_flight = ExternalCallTrace::begin(
@@ -1524,6 +1534,13 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        assert!(!fs::read_dir(path.parent().unwrap()).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
 
         in_flight.finish(ExternalCallOutcome::Success, Vec::new());
         let secret = "flight-secret-argv-env-output-stderr";
@@ -1614,27 +1631,42 @@ mod tests {
         }));
         assert!(!completed.contains(secret));
         drop(server);
-        let _ = fs::remove_dir_all(base);
     }
 
     #[cfg(unix)]
     #[test]
-    fn repository_lock_prevents_socket_ownership_races() {
-        let socket_path = ensure_control_runtime_dir().unwrap().join(format!(
-            "lock-test-{}-{}.sock",
-            std::process::id(),
-            unix_ms()
-        ));
+    fn platform_smoke_native_recorder_lock_prevents_socket_ownership_races() {
+        let runtime = crate::compact_runtime::CompactTempDir::new("recorder-lock");
+        let socket_path = runtime.runtime_path().join("lock.sock");
         let endpoint = || ServerEndpoint {
             socket_path: socket_path.clone(),
-            output_dir: std::env::temp_dir(),
+            output_dir: runtime.path().to_path_buf(),
         };
-        let server = bind_server(endpoint()).unwrap();
+        let server = bind_server_in(endpoint(), runtime.runtime_path()).unwrap();
 
-        assert!(bind_server(endpoint()).is_err());
+        assert!(bind_server_in(endpoint(), runtime.runtime_path()).is_err());
 
         drop(server);
-        let _ = fs::remove_file(&socket_path);
-        let _ = fs::remove_file(socket_path.with_extension("lock"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recorder_socket_validation_uses_the_common_raw_byte_budget() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let at_budget = PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'a';
+            RECORDER_SOCKET_PATH_BUDGET
+        ]));
+        let over_budget = PathBuf::from(std::ffi::OsString::from_vec(vec![
+            b'a';
+            RECORDER_SOCKET_PATH_BUDGET
+                + 1
+        ]));
+        let non_utf8 = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/flight-\xff".to_vec()));
+
+        assert!(validate_recorder_socket_path(&at_budget, "test").is_ok());
+        assert!(validate_recorder_socket_path(&over_budget, "test").is_err());
+        assert!(validate_recorder_socket_path(&non_utf8, "test").is_ok());
     }
 }

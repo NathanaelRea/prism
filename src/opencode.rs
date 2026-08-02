@@ -29,7 +29,6 @@ const SERVER_START_POLL: Duration = Duration::from_millis(100);
 static OWNED_SERVER_PROCESSES: OnceLock<Mutex<BTreeMap<u32, OwnedServerProcess>>> = OnceLock::new();
 
 struct OwnedServerProcess {
-    start_time_ticks: Option<u64>,
     child: crate::process::SupervisedChild,
 }
 
@@ -42,7 +41,7 @@ pub struct OpencodeRuntime {
     pub server_port: u16,
     pub server_url: String,
     pub server_pid: Option<u32>,
-    pub server_start_time_ticks: Option<u64>,
+    pub server_process_identity: Option<u64>,
     pub opencode_session_id: Option<String>,
     pub generation: u64,
     pub updated_unix_ms: u64,
@@ -265,6 +264,13 @@ fn ensure_opencode_server_locked(
         Some(pid)
     };
 
+    let server_process_identity = if started_server.is_some() {
+        server_pid.and_then(stored_process_identity)
+    } else {
+        existing
+            .as_ref()
+            .and_then(|runtime| runtime.server_process_identity)
+    };
     let runtime = OpencodeRuntime {
         repo_root: repo.root.display().to_string(),
         harness_id: harness_id.to_string(),
@@ -273,7 +279,7 @@ fn ensure_opencode_server_locked(
         server_port: port,
         server_url,
         server_pid,
-        server_start_time_ticks: server_pid.and_then(crate::harness::process_start_time_ticks),
+        server_process_identity,
         opencode_session_id: existing.and_then(|runtime| runtime.opencode_session_id),
         generation: 0,
         updated_unix_ms: unix_ms(),
@@ -339,19 +345,20 @@ fn stored_server_identity_is_valid(runtime: &OpencodeRuntime) -> bool {
     {
         return false;
     }
-    #[cfg(target_os = "linux")]
     if let Some(pid) = runtime.server_pid {
-        if !stored_server_process_matches(pid, runtime.server_port) {
+        if !stored_server_process_matches(pid, runtime.server_port).unwrap_or(false) {
             return false;
         }
-        return match runtime.server_start_time_ticks {
-            Some(expected) => process_start_time_ticks(pid) == Some(expected),
+        return match runtime.server_process_identity {
+            Some(identity) => crate::process::observe_process(
+                crate::process::RecordedProcess::from_stored(pid, Some(identity)),
+            )
+            .is_ok_and(|observation| {
+                observation == crate::process::ProcessObservation::RunningSameProcess
+            }),
             None => stored_runtime_session_matches(runtime),
         };
     }
-    #[cfg(not(target_os = "linux"))]
-    return true;
-    #[cfg(target_os = "linux")]
     stored_runtime_session_matches(runtime)
 }
 
@@ -382,7 +389,7 @@ fn runtime_for_worktree(
     let unchanged_server = existing.as_ref().is_some_and(|runtime| {
         runtime.server_url == shared.server_url
             && runtime.server_pid == shared.server_pid
-            && runtime.server_start_time_ticks == shared.server_start_time_ticks
+            && runtime.server_process_identity == shared.server_process_identity
     });
     OpencodeRuntime {
         repo_root: repo.root.display().to_string(),
@@ -392,7 +399,7 @@ fn runtime_for_worktree(
         server_port: shared.server_port,
         server_url: shared.server_url.clone(),
         server_pid: shared.server_pid,
-        server_start_time_ticks: shared.server_start_time_ticks,
+        server_process_identity: shared.server_process_identity,
         opencode_session_id: existing
             .as_ref()
             .and_then(|runtime| runtime.opencode_session_id.clone()),
@@ -663,8 +670,12 @@ pub fn shutdown_owned_server(runtime: &OpencodeRuntime) -> Result<(), String> {
     let Some(mut owned) = take_owned_server_process(pid) else {
         return Ok(());
     };
-    if !process_matches_owned_start(pid, owned.start_time_ticks) {
-        let _ = owned.child.try_wait();
+    if owned
+        .child
+        .try_wait()
+        .map_err(|error| format!("inspect owned opencode server {pid} before shutdown: {error}"))?
+        .is_some()
+    {
         return Ok(());
     }
     owned
@@ -675,47 +686,60 @@ pub fn shutdown_owned_server(runtime: &OpencodeRuntime) -> Result<(), String> {
 }
 
 pub(crate) fn shutdown_stored_server(runtime: &OpencodeRuntime) -> Result<(), String> {
+    shutdown_stored_server_with(runtime, crate::process::process_arguments)
+}
+
+fn shutdown_stored_server_with(
+    runtime: &OpencodeRuntime,
+    inspect_arguments: impl FnOnce(
+        u32,
+    )
+        -> Result<Option<Vec<String>>, crate::process::ProcessLifecycleError>,
+) -> Result<(), String> {
     if runtime.server_pid.is_some_and(owned_server_process) {
         return shutdown_owned_server(runtime);
     }
     let Some(pid) = runtime.server_pid else {
         return Ok(());
     };
-    if !stored_server_process_matches(pid, runtime.server_port) {
+    if !stored_server_process_matches_with(pid, runtime.server_port, inspect_arguments)
+        .map_err(|error| format!("inspect stored opencode server {pid} before shutdown: {error}"))?
+    {
         return Ok(());
     }
-    #[cfg(target_os = "linux")]
+    let recorded =
+        crate::process::RecordedProcess::from_stored(pid, runtime.server_process_identity);
+    match crate::process::terminate_recorded_process(recorded, Duration::from_secs(1))
+        .map_err(|error| format!("stop opencode server {pid}: {error}"))?
     {
-        let Some(expected_start) = runtime.server_start_time_ticks else {
-            return Ok(());
-        };
-        match crate::harness::process_start_time_ticks(pid) {
-            None => return Ok(()),
-            Some(actual_start) if actual_start != expected_start => return Ok(()),
-            Some(_) => {}
-        }
-        crate::harness::terminate_process(pid, Some(expected_start))
-            .map_err(|error| format!("stop opencode server {pid}: {error}"))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        Ok(())
+        crate::process::TerminationOutcome::Terminated
+        | crate::process::TerminationOutcome::AlreadyExited
+        | crate::process::TerminationOutcome::IdentityReused => Ok(()),
+        crate::process::TerminationOutcome::Unverifiable => Err(format!(
+            "refusing to stop opencode server {pid}: reusable process identity is unavailable"
+        )),
     }
 }
 
-fn stored_server_process_matches(pid: u32, port: u16) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let cmdline = fs::read_to_string(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-        let args: Vec<&str> = cmdline.split('\0').filter(|arg| !arg.is_empty()).collect();
+fn stored_server_process_matches(
+    pid: u32,
+    port: u16,
+) -> Result<bool, crate::process::ProcessLifecycleError> {
+    stored_server_process_matches_with(pid, port, crate::process::process_arguments)
+}
+
+fn stored_server_process_matches_with(
+    pid: u32,
+    port: u16,
+    inspect_arguments: impl FnOnce(
+        u32,
+    )
+        -> Result<Option<Vec<String>>, crate::process::ProcessLifecycleError>,
+) -> Result<bool, crate::process::ProcessLifecycleError> {
+    Ok(inspect_arguments(pid)?.is_some_and(|args| {
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
         stored_server_args_match(&args, port)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (pid, port);
-        false
-    }
+    }))
 }
 
 fn stored_server_args_match(args: &[&str], port: u16) -> bool {
@@ -735,10 +759,7 @@ fn owned_server_processes() -> &'static Mutex<BTreeMap<u32, OwnedServerProcess>>
 
 fn record_owned_server_process(child: crate::process::SupervisedChild) {
     let pid = child.id();
-    let process = OwnedServerProcess {
-        start_time_ticks: process_start_time_ticks(pid),
-        child,
-    };
+    let process = OwnedServerProcess { child };
     owned_server_processes()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
@@ -759,26 +780,11 @@ fn take_owned_server_process(pid: u32) -> Option<OwnedServerProcess> {
         .remove(&pid)
 }
 
-fn process_matches_owned_start(pid: u32, expected_start_time_ticks: Option<u64>) -> bool {
-    match (expected_start_time_ticks, process_start_time_ticks(pid)) {
-        (Some(expected), Some(actual)) => expected == actual,
-        (Some(_), None) => false,
-        (None, _) => true,
-    }
-}
-
-fn process_start_time_ticks(pid: u32) -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        let fields_after_comm = stat.rsplit_once(") ")?.1;
-        fields_after_comm.split_whitespace().nth(19)?.parse().ok()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        None
-    }
+fn stored_process_identity(pid: u32) -> Option<u64> {
+    crate::process::record_process(pid)
+        .ok()?
+        .identity
+        .map(crate::process::ProcessIdentity::stored_value)
 }
 
 pub fn poll_status(runtime: &OpencodeRuntime) -> Result<OpencodeStatus, String> {
@@ -1762,7 +1768,7 @@ fn runtime_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpencodeRuntime
         server_port: u16::try_from(row.get::<_, i64>(4)?).unwrap_or_default(),
         server_url: row.get(5)?,
         server_pid,
-        server_start_time_ticks: row
+        server_process_identity: row
             .get::<_, Option<i64>>(10)?
             .map(|value| value.max(0) as u64),
         opencode_session_id: row.get(7)?,
@@ -1802,7 +1808,7 @@ fn save_shared_server_runtime(repo: &Repository, runtime: &OpencodeRuntime) -> R
                 runtime.server_url.as_str(),
                 runtime.server_pid.map(i64::from),
                 runtime
-                    .server_start_time_ticks
+                    .server_process_identity
                     .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
                 i64::try_from(runtime.updated_unix_ms).unwrap_or(i64::MAX),
             ],
@@ -1844,7 +1850,7 @@ fn save_runtime_with_conn(
             i64::try_from(runtime.generation).unwrap_or(i64::MAX),
             i64::try_from(runtime.updated_unix_ms).unwrap_or(i64::MAX),
             runtime
-                .server_start_time_ticks
+                .server_process_identity
                 .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
         ],
     )
@@ -3067,6 +3073,34 @@ mod tests {
     }
 
     #[test]
+    fn stored_server_shutdown_reports_argument_inspection_failure() {
+        let runtime = OpencodeRuntime {
+            repo_root: "/repo".to_string(),
+            harness_id: "opencode".to_string(),
+            branch: "feature/test".to_string(),
+            worktree_path: "/repo/worktree".to_string(),
+            server_port: 41_234,
+            server_url: "http://127.0.0.1:41234".to_string(),
+            server_pid: Some(42),
+            server_process_identity: Some(7),
+            opencode_session_id: None,
+            generation: 0,
+            updated_unix_ms: 0,
+        };
+
+        let error = shutdown_stored_server_with(&runtime, |pid| {
+            Err(crate::process::ProcessLifecycleError::Inspect {
+                pid,
+                source: std::io::Error::other("injected argument inspection failure"),
+            })
+        })
+        .unwrap_err();
+
+        assert!(error.contains("inspect stored opencode server 42 before shutdown"));
+        assert!(error.contains("injected argument inspection failure"));
+    }
+
+    #[test]
     fn allocate_port_uses_stored_healthy_port() {
         let port = allocate_port(
             "/repo",
@@ -3152,7 +3186,7 @@ mod tests {
             server_port: 41_222,
             server_url: server_url(41_222),
             server_pid: Some(123),
-            server_start_time_ticks: Some(456),
+            server_process_identity: Some(456),
             opencode_session_id: Some("ses_123".to_string()),
             generation: 7,
             updated_unix_ms: 42,
@@ -3184,7 +3218,7 @@ mod tests {
             server_port,
             server_url: server_url.clone(),
             server_pid: None,
-            server_start_time_ticks: None,
+            server_process_identity: None,
             opencode_session_id: Some("ses_first".to_string()),
             generation: 0,
             updated_unix_ms: 42,
@@ -3227,7 +3261,7 @@ mod tests {
                 server_port: parse_localhost_url(&server_url).unwrap().1,
                 server_url,
                 server_pid: None,
-                server_start_time_ticks: None,
+                server_process_identity: None,
                 opencode_session_id: Some(session_id.to_string()),
                 generation: 0,
                 updated_unix_ms: 42,
@@ -3281,7 +3315,7 @@ mod tests {
             server_port: 41_000,
             server_url: server_url(41_000),
             server_pid: Some(100),
-            server_start_time_ticks: Some(200),
+            server_process_identity: Some(200),
             opencode_session_id: Some(session_id.to_string()),
             generation: 1,
             updated_unix_ms: 42,
@@ -3294,7 +3328,7 @@ mod tests {
             server_port: 41_001,
             server_url: server_url(41_001),
             server_pid: Some(300),
-            server_start_time_ticks: Some(400),
+            server_process_identity: Some(400),
             updated_unix_ms: 84,
             ..first.clone()
         };
@@ -3308,8 +3342,8 @@ mod tests {
             assert_eq!(runtime.server_url, replacement.server_url);
             assert_eq!(runtime.server_pid, replacement.server_pid);
             assert_eq!(
-                runtime.server_start_time_ticks,
-                replacement.server_start_time_ticks
+                runtime.server_process_identity,
+                replacement.server_process_identity
             );
         }
         let sessions = runtimes
@@ -3345,7 +3379,7 @@ mod tests {
             server_port: 41_000,
             server_url: server_url(41_000),
             server_pid: Some(100),
-            server_start_time_ticks: Some(200),
+            server_process_identity: Some(200),
             opencode_session_id: None,
             generation: 1,
             updated_unix_ms: 42,
@@ -3371,7 +3405,7 @@ mod tests {
             server_port: 41_001,
             server_url: server_url(41_001),
             server_pid: Some(300),
-            server_start_time_ticks: Some(400),
+            server_process_identity: Some(400),
             updated_unix_ms: 84,
             ..first.clone()
         };
@@ -3384,8 +3418,8 @@ mod tests {
             assert_eq!(runtime.server_url, first.server_url);
             assert_eq!(runtime.server_pid, first.server_pid);
             assert_eq!(
-                runtime.server_start_time_ticks,
-                first.server_start_time_ticks
+                runtime.server_process_identity,
+                first.server_process_identity
             );
         }
         let _ = fs::remove_dir_all(temp);
@@ -3411,7 +3445,7 @@ mod tests {
                     server_port: port,
                     server_url: server_url(port),
                     server_pid: None,
-                    server_start_time_ticks: None,
+                    server_process_identity: None,
                     opencode_session_id: Some(session_id.to_string()),
                     generation: 1,
                     updated_unix_ms: 42,
@@ -3513,17 +3547,34 @@ mod tests {
             server_port: 41_222,
             server_url: server_url(41_222),
             server_pid: Some(child.id()),
-            server_start_time_ticks: None,
+            server_process_identity: None,
             opencode_session_id: Some("ses_old".to_string()),
             generation: 2,
             updated_unix_ms: 42,
         };
 
-        shutdown_stored_server(&runtime).unwrap();
-
-        assert!(child.try_wait().unwrap().is_none());
+        let result = shutdown_stored_server_with(&runtime, |_| {
+            Ok(Some(vec![
+                "legacy-opencode-fixture".to_string(),
+                "serve".to_string(),
+                "--hostname".to_string(),
+                "127.0.0.1".to_string(),
+                "--port".to_string(),
+                "41222".to_string(),
+            ]))
+        });
+        let child_was_running = child.try_wait().unwrap().is_none();
         child.kill().unwrap();
         child.wait().unwrap();
+
+        assert_eq!(
+            result.unwrap_err(),
+            format!(
+                "refusing to stop opencode server {}: reusable process identity is unavailable",
+                child.id()
+            )
+        );
+        assert!(child_was_running);
     }
 
     #[test]
@@ -3653,7 +3704,7 @@ mod tests {
             server_port: 41_234,
             server_url,
             server_pid: None,
-            server_start_time_ticks: None,
+            server_process_identity: None,
             opencode_session_id: Some("old".to_string()),
             generation: 0,
             updated_unix_ms: 0,
@@ -3681,7 +3732,7 @@ mod tests {
             server_port: port,
             server_url: server_url(port),
             server_pid: None,
-            server_start_time_ticks: None,
+            server_process_identity: None,
             opencode_session_id: Some("stored".to_string()),
             generation: 3,
             updated_unix_ms: 42,
@@ -4162,7 +4213,7 @@ mod tests {
             server_port: 41_000,
             server_url: "http://127.0.0.1:41000".to_string(),
             server_pid: Some(process_id),
-            server_start_time_ticks: process_start_time_ticks(process_id),
+            server_process_identity: stored_process_identity(process_id),
             opencode_session_id: None,
             generation: 0,
             updated_unix_ms: 0,
@@ -4218,6 +4269,7 @@ mod tests {
             .stderr(Stdio::null());
         let child = crate::process::SupervisedChild::spawn(&mut command, None, None).unwrap();
         let process_id = child.id();
+        let recorded_process = crate::process::record_process(process_id).unwrap();
         record_owned_server_process(child);
         let runtime = OpencodeRuntime {
             repo_root: "/repo".to_string(),
@@ -4227,7 +4279,9 @@ mod tests {
             server_port: 41_000,
             server_url: "http://127.0.0.1:41000".to_string(),
             server_pid: Some(process_id),
-            server_start_time_ticks: process_start_time_ticks(process_id),
+            server_process_identity: recorded_process
+                .identity
+                .map(crate::process::ProcessIdentity::stored_value),
             opencode_session_id: None,
             generation: 0,
             updated_unix_ms: 0,
@@ -4240,26 +4294,27 @@ mod tests {
         let descendant_id = fs::read_to_string(&descendant_path)
             .unwrap()
             .trim()
-            .parse::<libc::pid_t>()
+            .parse::<u32>()
             .unwrap();
+        let recorded_descendant = crate::process::record_process(descendant_id).unwrap();
 
         let started = std::time::Instant::now();
         shutdown_owned_server(&runtime).unwrap();
 
         assert!(started.elapsed() < Duration::from_secs(3));
         assert!(!owned_server_process(process_id));
-        for pid in [process_id as libc::pid_t, descendant_id] {
+        for process in [recorded_process, recorded_descendant] {
             let gone_deadline = std::time::Instant::now() + Duration::from_secs(2);
             loop {
-                let result = unsafe { libc::kill(pid, 0) };
-                if result != 0
-                    && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+                if crate::process::observe_process(process).unwrap()
+                    == crate::process::ProcessObservation::Missing
                 {
                     break;
                 }
                 assert!(
                     std::time::Instant::now() < gone_deadline,
-                    "owned server process {pid} survived shutdown"
+                    "owned server process {} survived shutdown",
+                    process.pid
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -4268,10 +4323,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn stored_server_shutdown_uses_verified_bounded_process_group_recovery() {
-        use std::os::unix::process::CommandExt;
-
         let temp = unique_temp_dir("prism-stored-opencode-process");
         fs::create_dir_all(&temp).unwrap();
         let descendant_path = temp.join("descendant.pid");
@@ -4294,9 +4346,9 @@ mod tests {
             .args(["serve", "--hostname", "127.0.0.1", "--port", "41000"])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        command.process_group(0);
-        let mut child = command.spawn().unwrap();
+        let mut child = crate::process::SupervisedChild::spawn(&mut command, None, None).unwrap();
         let process_id = child.id();
+        let recorded_process = crate::process::record_process(process_id).unwrap();
         let runtime = OpencodeRuntime {
             repo_root: "/repo".to_string(),
             harness_id: "opencode".to_string(),
@@ -4305,7 +4357,9 @@ mod tests {
             server_port: 41_000,
             server_url: "http://127.0.0.1:41000".to_string(),
             server_pid: Some(process_id),
-            server_start_time_ticks: process_start_time_ticks(process_id),
+            server_process_identity: recorded_process
+                .identity
+                .map(crate::process::ProcessIdentity::stored_value),
             opencode_session_id: None,
             generation: 0,
             updated_unix_ms: 0,
@@ -4318,24 +4372,20 @@ mod tests {
         let descendant_id = fs::read_to_string(&descendant_path)
             .unwrap()
             .trim()
-            .parse::<libc::pid_t>()
+            .parse::<u32>()
             .unwrap();
+        let recorded_descendant = crate::process::record_process(descendant_id).unwrap();
+        let reaper = std::thread::spawn(move || child.wait().unwrap());
 
         let started = std::time::Instant::now();
         shutdown_stored_server(&runtime).unwrap();
 
         assert!(started.elapsed() < Duration::from_secs(3));
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while child.try_wait().unwrap().is_none() {
-            assert!(std::time::Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        reaper.join().unwrap();
         let gone_deadline = std::time::Instant::now() + Duration::from_secs(2);
-        loop {
-            let result = unsafe { libc::kill(descendant_id, 0) };
-            if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                break;
-            }
+        while crate::process::observe_process(recorded_descendant).unwrap()
+            != crate::process::ProcessObservation::Missing
+        {
             assert!(
                 std::time::Instant::now() < gone_deadline,
                 "stored server descendant {descendant_id} survived shutdown"

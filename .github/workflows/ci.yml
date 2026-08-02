@@ -32,13 +32,18 @@ jobs:
       - name: Install macOS integration dependencies
         if: runner.os == 'macOS'
         run: brew install tmux
+      - name: Native macOS platform smoke
+        if: runner.os == 'macOS'
+        run: scripts/platform-smoke.sh
       - run: scripts/full-check.sh
       - name: Test real OpenCode integration
+        if: runner.os == 'Linux'
         run: |
           PRISM_TEST_OPENCODE="$(command -v opencode)" \
             cargo test opencode::tests::real_opencode_server_round_trips_prism_session_api \
               -- --ignored --exact
       - name: Test real Prism, OpenCode, and tmux stack
+        if: runner.os == 'Linux'
         run: |
           PRISM_TEST_OPENCODE="$(command -v opencode)" \
           PRISM_TEST_TMUX="$(command -v tmux)" \

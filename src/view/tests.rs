@@ -1755,7 +1755,7 @@ fn test_plan_dashboard(expanded: bool) -> PlanDashboard {
                     execution: crate::harness::ExecutionRef {
                         state: Some("busy".to_string()),
                         process_id: None,
-                        process_start_time_ticks: None,
+                        process_identity: None,
                     },
                     session: crate::harness::SessionRef {
                         adapter_id: Some("opencode".to_string()),
