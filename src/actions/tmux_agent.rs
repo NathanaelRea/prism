@@ -131,7 +131,7 @@ impl Tui {
                 running,
             },
         );
-        self.accept_external_agent_state_change(session_index, previous_agent_state);
+        self.accept_external_agent_state_change(session_index, previous_agent_state, true);
         if let Some(warmup) = outcome.delayed_warmup {
             self.start_tmux_agent_warmup_for_key(warmup.key, warmup.delay);
         }
@@ -226,7 +226,7 @@ impl Tui {
             &use_.slot,
             running,
         ) {
-            self.accept_external_agent_state_change(session_index, previous_agent_state);
+            self.accept_external_agent_state_change(session_index, previous_agent_state, true);
         }
         crate::flight_recorder::record(
             "attach",
@@ -394,7 +394,7 @@ impl Tui {
             })
             && let Some(previous) = previous_agent_state
         {
-            self.accept_external_agent_state_change(index, previous);
+            self.accept_external_agent_state_change(index, previous, true);
         }
         changed
     }
@@ -448,7 +448,9 @@ impl Tui {
             &use_.slot,
             running,
         ) {
-            self.accept_external_agent_state_change(index, previous_agent_state);
+            self.accept_external_agent_state_change(index, previous_agent_state, false);
+        } else {
+            self.observe_current_agent_state(index);
         }
         self.mark_opencode_prompt_submitted(index, &config);
         Ok(())
