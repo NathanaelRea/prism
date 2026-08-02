@@ -1504,7 +1504,7 @@ fn supervise_with_settings(
     command.process_group(0);
 
     let started = Instant::now();
-    let mut child = command.spawn().map_err(ProcessError::Spawn)?;
+    let mut child = spawn_supervised(command).map_err(ProcessError::Spawn)?;
     let child_pid = child.id();
     let stop_readers = Arc::new(AtomicBool::new(false));
     let stdout = child.stdout.take();
@@ -1689,6 +1689,22 @@ fn completion_from_status(status: ExitStatus) -> ProcessCompletion {
         return ProcessCompletion::Signaled;
     }
     ProcessCompletion::Exited
+}
+
+fn spawn_supervised(command: &mut Command) -> io::Result<Child> {
+    const BUSY_RETRIES: usize = 4;
+
+    for retry in 0..=BUSY_RETRIES {
+        match command.spawn() {
+            Err(error)
+                if error.kind() == io::ErrorKind::ExecutableFileBusy && retry < BUSY_RETRIES =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded spawn loop always returns")
 }
 
 fn spawn_capture_reader<R>(
@@ -2827,6 +2843,46 @@ mod tests {
         assert_eq!(error.kind(), ProcessErrorKind::Spawn);
         assert_eq!(error.kind().label(), "spawn");
         assert!(error.source().is_some());
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn supervisor_retries_an_executable_that_is_temporarily_busy() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = std::env::temp_dir().join(format!(
+            "prism-busy-executable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&temp).unwrap();
+        let executable = temp.join("command");
+        let mut writer = std::fs::File::create(&executable).unwrap();
+        writer.write_all(b"#!/bin/sh\nprintf ready\n").unwrap();
+        writer.flush().unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let release_writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            drop(writer);
+        });
+
+        let outcome = supervise(
+            &mut Command::new(&executable),
+            ProcessPolicy::Metadata,
+            ProcessInput::Null,
+            None,
+        )
+        .unwrap();
+
+        release_writer.join().unwrap();
+        assert!(outcome.status.success());
+        assert_eq!(outcome.stdout.bytes, b"ready");
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
