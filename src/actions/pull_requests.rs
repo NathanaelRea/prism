@@ -224,8 +224,14 @@ pub(super) fn run_browser_opener(
 
 impl Tui {
     pub(crate) fn apply_remote_cache_result(&mut self, session_index: usize, cache: PrCache) {
+        let remote_update = self.sessions.get(session_index).is_some_and(|session| {
+            session.pr.summary() != cache.summary() || session.pr.details() != cache.details()
+        });
         if let Some(session) = self.sessions.get_mut(session_index) {
             session.pr = cache;
+        }
+        if remote_update {
+            self.queue_pr_persistence(session_index, true, true);
         }
     }
 
@@ -244,7 +250,7 @@ impl Tui {
             Ok(Some(summary)),
             &crate::util::timestamp_label(),
         );
-        self.queue_pr_persistence(session_index, false);
+        self.queue_pr_persistence(session_index, false, true);
     }
 
     pub(crate) fn resolve_review_comments(
