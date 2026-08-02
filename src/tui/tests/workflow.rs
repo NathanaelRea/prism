@@ -1,15 +1,17 @@
 use std::path::PathBuf;
 
-use crate::auto_flow::AutoRunStatus;
+use crate::auto_flow::{AutoOutputKind, AutoOutputLine, AutoRunStatus};
 use crate::execution::{DispatchState, WorkflowKind};
+use crate::git::GitStatus;
 use crate::plan_run::{PlanRunStatus, PlanStepStatus};
 use crate::view::WorktreeMainView;
 use crate::workspace_state::{
-    AvailableControls, DispatchSnapshot, Progress, RepositorySnapshot, RepositoryTotals,
-    WorkflowIdentity, WorkflowLifecycle, WorkflowSnapshot, WorktreeIdentity,
+    AgentStatus, AvailableControls, BranchState, DispatchSnapshot, Progress, RepositorySnapshot,
+    RepositoryTotals, WorkflowIdentity, WorkflowLifecycle, WorkflowSnapshot, WorktreeIdentity,
+    WorktreeSnapshot,
 };
 
-use super::super::PanelFocus;
+use super::super::{DashboardOutputKey, PanelFocus};
 use super::support::{test_auto_run, test_plan_run, test_plan_run_with_steps, test_tui};
 
 #[test]
@@ -294,4 +296,100 @@ fn worktree_snapshot_prefers_active_workflow_over_newer_history() {
         .unwrap();
 
     assert_eq!(selected.identity.run_id, "queued-older");
+}
+
+#[test]
+fn frame_model_uses_managed_repository_identity_for_snapshot_status() {
+    let mut tui = test_tui();
+    let repository = tui.repos[0].identity.clone();
+    tui.workspace_repositories.insert(
+        repository,
+        RepositorySnapshot {
+            root: PathBuf::from("/repo-one"),
+            label: "repo-one".to_string(),
+            shortcut: Some('1'),
+            worktrees: vec![WorktreeSnapshot {
+                identity: WorktreeIdentity {
+                    path: PathBuf::from("/repo-one/feature-one"),
+                    display: "feature-one".to_string(),
+                },
+                branch: BranchState::Named("feature-one".to_string()),
+                git: GitStatus {
+                    dirty: 2,
+                    ..GitStatus::default()
+                },
+                hidden: false,
+                agent: AgentStatus::default(),
+                pull_request: None,
+                workflows: Vec::new(),
+            }],
+            workflows: Vec::new(),
+            totals: RepositoryTotals::default(),
+        },
+    );
+
+    let model = tui.frame_model();
+    let row = model
+        .worktrees
+        .iter()
+        .find(|row| row.worktree_path == "/repo-one/feature-one")
+        .unwrap();
+
+    assert_eq!(row.status_label, "dirty:2");
+}
+
+#[test]
+fn dashboard_output_requests_use_managed_repository_identity() {
+    let mut tui = test_tui();
+    tui.focused_panel = PanelFocus::Worktrees;
+    tui.select_worktree(1);
+    tui.remember_plan_run(test_plan_run("plan", "/repo-one/feature-one"));
+    let repository = tui.repos[0].identity.clone();
+
+    let requests = tui.dashboard_output_requests();
+
+    assert!(requests.keys().any(|key| matches!(
+        key,
+        DashboardOutputKey::Plan {
+            repository: key_repository,
+            ..
+        } if key_repository == &repository
+    )));
+
+    let mut tui = test_tui();
+    tui.focused_panel = PanelFocus::Worktrees;
+    tui.select_worktree(1);
+    let mut run = test_auto_run("auto", "/repo-one/feature-one", 1);
+    run.run.selected_step_run_id = Some(42);
+    tui.remember_auto_run(run);
+    let repository = tui.repos[0].identity.clone();
+
+    let requests = tui.dashboard_output_requests();
+
+    assert!(requests.keys().any(|key| matches!(
+        key,
+        DashboardOutputKey::Auto {
+            repository: key_repository,
+            step_run_id: 42,
+        } if key_repository == &repository
+    )));
+}
+
+#[test]
+fn auto_output_snapshot_uses_managed_repository_identity() {
+    let tui = test_tui();
+    let repository = tui.repos[0].identity.clone();
+    let line = AutoOutputLine {
+        step_run_id: 42,
+        line_number: 1,
+        time_unix_ms: 1,
+        kind: AutoOutputKind::Assistant,
+        text: "cached output".to_string(),
+        block_id: None,
+    };
+    tui.auto_output_cache
+        .borrow_mut()
+        .insert((repository, 42), vec![line.clone()]);
+
+    assert_eq!(tui.auto_output_snapshot(&tui.repos[0].repo, 42), vec![line]);
 }

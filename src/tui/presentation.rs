@@ -1,9 +1,8 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Instant;
 
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey};
-use crate::session::WorktreeRepositoryKey;
 use crate::tui_runtime::TerminalRuntime;
 use crate::view;
 use crate::workspace_state::CiState;
@@ -95,8 +94,9 @@ impl Tui {
                     )
                     .and_then(|workflow| plan_status(workflow.lifecycle));
                 let snapshot_status = self
-                    .workspace_repositories
-                    .get(&WorktreeRepositoryKey::new(PathBuf::from(&repo_root)))
+                    .repos
+                    .get(session.repo_index)
+                    .and_then(|managed| self.workspace_repositories.get(&managed.identity))
                     .and_then(|repository| {
                         repository
                             .worktrees

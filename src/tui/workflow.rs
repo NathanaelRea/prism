@@ -585,10 +585,11 @@ impl Tui {
         let mut requests = BTreeMap::new();
         if let Some((repo, run_id)) = self.selected_plan_run_id()
             && let Some(run) = self.plan_runs.get(&run_id)
+            && let Some(repository) = self.managed_repository_identity(&repo)
         {
             requests.insert(
                 DashboardOutputKey::Plan {
-                    repository: WorktreeRepositoryKey::new(repo.root.clone()),
+                    repository: repository.clone(),
                     run_id,
                     step: self.resolved_plan_step_selection(run),
                 },
@@ -606,7 +607,9 @@ impl Tui {
                 .or(run.run.selected_step_run_id)
                 .or_else(|| run.steps.first().and_then(|step| step.id));
             if let Some(step_run_id) = selected_step_run_id {
-                let repository = WorktreeRepositoryKey::new(repo.root.clone());
+                let Some(repository) = self.managed_repository_identity(&repo).cloned() else {
+                    return requests;
+                };
                 requests.insert(
                     DashboardOutputKey::Auto {
                         repository: repository.clone(),
@@ -767,12 +770,25 @@ impl Tui {
         repo: &Repository,
         step_run_id: i64,
     ) -> Vec<AutoOutputLine> {
-        let key = (WorktreeRepositoryKey::new(repo.root.clone()), step_run_id);
+        let Some(repository) = self.managed_repository_identity(repo) else {
+            return Vec::new();
+        };
+        let key = (repository.clone(), step_run_id);
         self.auto_output_cache
             .borrow()
             .get(&key)
             .cloned()
             .unwrap_or_default()
+    }
+
+    fn managed_repository_identity(
+        &self,
+        repository: &Repository,
+    ) -> Option<&WorktreeRepositoryKey> {
+        self.repos
+            .iter()
+            .find(|managed| managed.repo.root == repository.root)
+            .map(|managed| &managed.identity)
     }
 
     pub(super) fn resolved_plan_step_selection(&self, run: &PersistedPlanRun) -> usize {
