@@ -489,7 +489,7 @@ struct GithubCreatedReview {
     commit_id: String,
 }
 
-fn normalize_summary(
+pub(super) fn normalize_summary(
     summary: PrSummary,
     operation: RemoteOperation,
 ) -> Result<ChangeRequestSummary, RemoteError> {
@@ -520,6 +520,12 @@ fn normalize_summary(
     } else {
         LifecycleState::from_native(summary.state.clone())
     };
+    let mergeability = summary
+        .native_state_evidence
+        .mergeability
+        .first()
+        .cloned()
+        .unwrap_or_else(|| summary.merge_state_status.clone());
     Ok(ChangeRequestSummary {
         change_request,
         title: summary.title,
@@ -529,7 +535,7 @@ fn normalize_summary(
         lifecycle,
         review_decision: ReviewDecision::from_native(summary.review_decision),
         requested_reviewers: summary.requested_reviewers,
-        mergeability: MergeabilityState::from_native(summary.merge_state_status),
+        mergeability: MergeabilityState::from_native(mergeability),
         check_state: CheckState::from_native(summary.check_status),
         queue_state: QueueState::from_native(summary.queue_state),
         native_state_evidence: summary.native_state_evidence,

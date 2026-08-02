@@ -1959,7 +1959,7 @@ fn parses_graphql_pr_summary_index() {
 }
 
 #[test]
-fn github_blocked_merge_state_does_not_override_mergeability() {
+fn github_preserves_merge_state_status_separately_from_mergeability() {
     let raw = r#"{
         "data": {
             "repository": {
@@ -1992,10 +1992,30 @@ fn github_blocked_merge_state_does_not_override_mergeability() {
         }
     }"#;
 
-    let summaries = parse_pr_summary_index(raw);
+    let mut summaries = parse_pr_summary_index(raw);
 
     assert_eq!(summaries[0].check_status, "running");
-    assert_eq!(summaries[0].merge_state_status, "MERGEABLE");
+    assert_eq!(summaries[0].merge_state_status, "BLOCKED");
+    assert_eq!(
+        summaries[0].native_state_evidence.mergeability,
+        vec!["MERGEABLE", "BLOCKED"]
+    );
+
+    let mut summary = summaries.remove(0);
+    summary.change_request_identity = Some(test_identity(
+        crate::remote::ProviderKind::GitHub,
+        "github.com",
+        "example/repo",
+        "117",
+    ));
+    let normalized =
+        adapter::normalize_summary(summary, crate::remote::RemoteOperation::ListChangeRequests)
+            .unwrap();
+
+    assert_eq!(
+        normalized.mergeability,
+        crate::remote::MergeabilityState::Mergeable
+    );
 }
 
 #[test]
