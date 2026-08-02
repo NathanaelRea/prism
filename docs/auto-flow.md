@@ -16,6 +16,7 @@ Start or focus it from the TUI with `A` on a selected non-default worktree. New 
 - prompt: enter an initial prompt and run the current one-shot implementation step
 - plan file: select an existing Markdown plan and run its phases before local verification
 - draft plan: enter a task prompt, draft `plan.md`, pause for review/approval, then run the approved plan phases
+- existing pull request: adopt the selected worktree's open pull request and begin directly at Change Request Stabilization
 
 Start or resume Auto Flow from the CLI with:
 
@@ -23,6 +24,7 @@ Start or resume Auto Flow from the CLI with:
 prism --repo /work/project auto "implement the task"
 prism --repo /work/project auto run-plan plan.md
 prism --repo /work/project auto plan "draft and review a plan before coding"
+prism --repo /work/project auto pr
 ```
 
 Compatibility notes:

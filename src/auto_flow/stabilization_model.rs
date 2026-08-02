@@ -38,6 +38,7 @@ pub(crate) struct StabilizationSnapshot {
 pub(crate) struct AutoRunRef {
     pub id: String,
     pub status: super::AutoRunStatus,
+    pub implementation_source: super::AutoImplementationSource,
     pub pr_number: Option<u64>,
     pub pr_url: Option<String>,
     pub current_head_sha: Option<String>,

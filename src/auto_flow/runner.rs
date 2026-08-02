@@ -20,18 +20,20 @@ pub fn execute_auto_initial_step(
     save_run_with_conn(conn, &persisted.run)?;
 
     complete_queued_prepare(conn, persisted, executor.max_output_lines_per_step)?;
-    if !persisted.steps.iter().any(|step| {
-        matches!(
-            step.step_key,
-            AutoStepKey::CreatePlan
-                | AutoStepKey::ReviewPlan
-                | AutoStepKey::RunPlan
-                | AutoStepKey::Implement
-                | AutoStepKey::FixLocalVerify
-                | AutoStepKey::FixReview
-                | AutoStepKey::FixCi
-        )
-    }) {
+    if persisted.run.implementation_source != AutoImplementationSource::ExistingPullRequest
+        && !persisted.steps.iter().any(|step| {
+            matches!(
+                step.step_key,
+                AutoStepKey::CreatePlan
+                    | AutoStepKey::ReviewPlan
+                    | AutoStepKey::RunPlan
+                    | AutoStepKey::Implement
+                    | AutoStepKey::FixLocalVerify
+                    | AutoStepKey::FixReview
+                    | AutoStepKey::FixCi
+            )
+        })
+    {
         let (step_key, reason) = initial_agent_step(persisted);
         append_step_run(conn, persisted, step_key, Some(reason.to_string()))?;
     }
@@ -163,10 +165,10 @@ pub(super) fn complete_queued_prepare(
 }
 
 pub(super) fn queued_prepare_needs_initial_agent_step(persisted: &PersistedAutoRun) -> bool {
-    persisted
-        .steps
-        .iter()
-        .any(|step| step.step_key == AutoStepKey::Prepare && step.status == AutoStepStatus::Queued)
+    persisted.run.implementation_source != AutoImplementationSource::ExistingPullRequest
+        && persisted.steps.iter().any(|step| {
+            step.step_key == AutoStepKey::Prepare && step.status == AutoStepStatus::Queued
+        })
         && !persisted.steps.iter().any(|step| {
             matches!(
                 step.step_key,

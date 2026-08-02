@@ -503,7 +503,6 @@ impl Tui {
             (Some(LeaderHint::Git), PanelFocus::Worktrees) => Some(view::ChoiceList {
                 title: "Git Actions".to_string(),
                 choices: vec![
-                    view::KeyChoice::new("a", "auto flow"),
                     self.git_choice(GitAction::LazyGit, "g", "lazygit"),
                     self.git_choice(GitAction::Push, "P", "push/create PR"),
                     self.git_choice(GitAction::OpenPr, "o", "open PR"),

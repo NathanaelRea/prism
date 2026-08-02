@@ -136,6 +136,7 @@ pub enum AutoImplementationSource {
     Prompt,
     ExistingPlan,
     DraftPlan,
+    ExistingPullRequest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -232,6 +233,7 @@ impl AutoImplementationSource {
             Self::Prompt => "prompt",
             Self::ExistingPlan => "existing_plan",
             Self::DraftPlan => "draft_plan",
+            Self::ExistingPullRequest => "existing_pull_request",
         }
     }
 
@@ -240,6 +242,7 @@ impl AutoImplementationSource {
             "prompt" => Ok(Self::Prompt),
             "existing_plan" => Ok(Self::ExistingPlan),
             "draft_plan" => Ok(Self::DraftPlan),
+            "existing_pull_request" => Ok(Self::ExistingPullRequest),
             _ => Err(format!("unknown auto implementation source: {value}")),
         }
     }
@@ -429,8 +432,12 @@ impl AutoLaunch {
         if implementation_source == AutoImplementationSource::ExistingPlan && plan_path.is_none() {
             return Err("existing-plan auto flow requires a plan path".to_string());
         }
-        if implementation_source == AutoImplementationSource::Prompt && plan_path.is_some() {
-            return Err("prompt auto flow cannot have a plan path".to_string());
+        if matches!(
+            implementation_source,
+            AutoImplementationSource::Prompt | AutoImplementationSource::ExistingPullRequest
+        ) && plan_path.is_some()
+        {
+            return Err("prompt and existing-PR auto flow cannot have a plan path".to_string());
         }
         if variant.trim().is_empty() {
             return Err("auto flow variant cannot be empty".to_string());

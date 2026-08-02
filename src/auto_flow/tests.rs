@@ -246,6 +246,89 @@ fn existing_plan_queues_run_plan() {
 }
 
 #[test]
+fn existing_pull_request_source_skips_implementation_pipeline() {
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted = AutoLaunch::with_options(
+        &repo,
+        &repo.join("feature"),
+        AutoLaunchOptions {
+            branch: "feat/auto".to_string(),
+            mode: AutoRunMode::Standard,
+            implementation_source: AutoImplementationSource::ExistingPullRequest,
+            plan_path: None,
+            plan_run_mode: PlanRunMode::Sequential,
+            variant: "existing-pr".to_string(),
+            agent_profile: None,
+            initial_prompt: "Stabilize existing pull request".to_string(),
+        },
+    )
+    .unwrap()
+    .create_run();
+    persisted.steps[0].status = AutoStepStatus::Done;
+
+    assert!(next_state_machine_step_needed(&persisted));
+    assert!(!implementation_follow_up_step_needed(&persisted));
+    assert!(persisted.steps.iter().all(|step| !matches!(
+        step.step_key,
+        AutoStepKey::Implement
+            | AutoStepKey::RunPlan
+            | AutoStepKey::LocalVerify
+            | AutoStepKey::CommitImpl
+            | AutoStepKey::PushPr
+    )));
+}
+
+#[test]
+#[cfg(unix)]
+fn existing_pull_request_adoption_allows_stabilization_to_report_head_divergence() {
+    let temp = TempDir::new("adopt-existing-pr-diverged");
+    let origin = temp.path().join("origin.git");
+    let work = temp.path().join("work");
+    setup_git_worktree(&origin, &work);
+    run_git(&work, &["push", "-u", "origin", "feat/auto"]);
+    let repo = Repository::with_config_dir_for_test(work.clone(), temp.path().join("prism-config"));
+    let mut config = Config::load(&repo);
+    let pr_head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    configure_pr_observation(&temp, &mut config, "feat/auto", pr_head);
+    let mut persisted = AutoLaunch::with_options(
+        &work,
+        &work,
+        AutoLaunchOptions {
+            branch: "feat/auto".to_string(),
+            mode: AutoRunMode::Standard,
+            implementation_source: AutoImplementationSource::ExistingPullRequest,
+            plan_path: None,
+            plan_run_mode: PlanRunMode::Sequential,
+            variant: "existing-pr".to_string(),
+            agent_profile: None,
+            initial_prompt: "Stabilize existing pull request".to_string(),
+        },
+    )
+    .unwrap()
+    .create_run();
+
+    stabilization_observe::adopt_existing_pull_request(&repo, &config, &mut persisted).unwrap();
+
+    assert_eq!(persisted.run.pr_number, Some(42));
+    assert_eq!(
+        crate::remote::load_pr_cache(&repo, "feat/auto")
+            .summary()
+            .map(|summary| summary.head_sha.as_str()),
+        Some(pr_head)
+    );
+    let snapshot = stabilization_observe::build_auto_run_stabilization_snapshot(
+        &repo,
+        &persisted.run,
+        &config,
+    );
+    assert!(snapshot.pull_request.is_some());
+    assert!(
+        stabilization_plan::derive_blockers(&snapshot)
+            .contains(&stabilization_model::StabilizationBlocker::HeadDiverged)
+    );
+}
+
+#[test]
 #[cfg(unix)]
 fn prompt_implementation_pr_delegates_to_stabilization_ready_state() {
     let temp = TempDir::new("stabilization-ready-delegation");
@@ -256,6 +339,7 @@ fn prompt_implementation_pr_delegates_to_stabilization_ready_state() {
     let head = git_output(&work, &["rev-parse", "HEAD"]);
     let repo = Repository::with_config_dir_for_test(work.clone(), temp.path().join("prism-config"));
     let mut config = Config::load(&repo);
+    config.auto.require_review_approval = false;
     configure_pr_observation(&temp, &mut config, "feat/auto", &head);
     seed_pr_cache(&repo, "feat/auto", &head);
     crate::remote::save_repo_policy_cache(
@@ -1654,7 +1738,7 @@ fn schema_migration_preserves_and_fails_old_active_auto_runs_once() {
             |row| row.get::<_, i64>(0)
         )
         .unwrap(),
-        7
+        8
     );
 }
 
@@ -1687,7 +1771,7 @@ fn future_auto_schema_version_fails_without_changing_rows() {
            id integer primary key check (id = 1),
            version integer not null
          );
-         insert into auto_schema_version (id, version) values (1, 8);
+         insert into auto_schema_version (id, version) values (1, 9);
          create table auto_run (id text primary key);
          insert into auto_run (id) values ('future');",
     )
@@ -1709,12 +1793,12 @@ fn future_auto_schema_version_fails_without_changing_rows() {
             |row| row.get::<_, i64>(0)
         )
         .unwrap(),
-        8
+        9
     );
 }
 
 #[test]
-fn schema_round_trips_prompt_existing_plan_and_draft_plan_sources() {
+fn schema_round_trips_auto_implementation_sources() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
     let repo = PathBuf::from("/repo/prism");
@@ -1767,16 +1851,36 @@ fn schema_round_trips_prompt_existing_plan_and_draft_plan_sources() {
     )
     .unwrap()
     .create_run();
+    let mut existing_pull_request = AutoLaunch::with_options(
+        &repo,
+        &repo.join("existing-pr"),
+        AutoLaunchOptions {
+            branch: "feat/existing-pr".to_string(),
+            mode: AutoRunMode::Standard,
+            implementation_source: AutoImplementationSource::ExistingPullRequest,
+            plan_path: None,
+            plan_run_mode: PlanRunMode::Sequential,
+            variant: "existing-pr".to_string(),
+            agent_profile: None,
+            initial_prompt: "Stabilize existing pull request".to_string(),
+        },
+    )
+    .unwrap()
+    .create_run();
 
     save_auto_run(&conn, &mut prompt).unwrap();
     save_auto_run(&conn, &mut existing_plan).unwrap();
     save_auto_run(&conn, &mut draft_plan).unwrap();
+    save_auto_run(&conn, &mut existing_pull_request).unwrap();
 
     let prompt = load_auto_run(&conn, &prompt.run.id).unwrap().unwrap();
     let existing_plan = load_auto_run(&conn, &existing_plan.run.id)
         .unwrap()
         .unwrap();
     let draft_plan = load_auto_run(&conn, &draft_plan.run.id).unwrap().unwrap();
+    let existing_pull_request = load_auto_run(&conn, &existing_pull_request.run.id)
+        .unwrap()
+        .unwrap();
 
     assert_eq!(
         prompt.run.implementation_source,
@@ -1795,6 +1899,10 @@ fn schema_round_trips_prompt_existing_plan_and_draft_plan_sources() {
     assert_eq!(
         draft_plan.run.implementation_source,
         AutoImplementationSource::DraftPlan
+    );
+    assert_eq!(
+        existing_pull_request.run.implementation_source,
+        AutoImplementationSource::ExistingPullRequest
     );
     assert_eq!(draft_plan.run.plan_path, Some(repo.join("draft/plan.md")));
 }

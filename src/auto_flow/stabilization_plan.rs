@@ -14,12 +14,18 @@ pub(crate) fn derive_blockers(snapshot: &StabilizationSnapshot) -> Vec<Stabiliza
 
     let Some(pull_request) = &snapshot.pull_request else {
         if snapshot.run.as_ref().is_some_and(|run| {
+            run.implementation_source == super::AutoImplementationSource::ExistingPullRequest
+        }) {
+            blockers.push(StabilizationBlocker::Escalate);
+            return blockers;
+        }
+        if snapshot.run.as_ref().is_some_and(|run| {
             matches!(
                 run.status,
                 super::AutoRunStatus::Queued
                     | super::AutoRunStatus::Running
                     | super::AutoRunStatus::Paused
-            )
+            ) && run.implementation_source != super::AutoImplementationSource::ExistingPullRequest
         }) {
             blockers.push(StabilizationBlocker::NeedsImplementation);
         } else {
@@ -482,6 +488,7 @@ mod tests {
         snapshot.run = Some(AutoRunRef {
             id: "run".to_string(),
             status: super::super::AutoRunStatus::Running,
+            implementation_source: super::super::AutoImplementationSource::Prompt,
             pr_number: None,
             pr_url: None,
             current_head_sha: None,
@@ -491,6 +498,24 @@ mod tests {
 
         assert_eq!(work.blocker, StabilizationBlocker::NeedsImplementation);
         assert_eq!(work.kind, StabilizationWorkKind::RunImplementation);
+    }
+
+    #[test]
+    fn adopted_run_without_pr_does_not_restart_implementation() {
+        let mut snapshot = snapshot(None);
+        snapshot.run = Some(AutoRunRef {
+            id: "run".to_string(),
+            status: super::super::AutoRunStatus::Running,
+            implementation_source: super::super::AutoImplementationSource::ExistingPullRequest,
+            pr_number: Some(42),
+            pr_url: Some("https://example.com/pr/42".to_string()),
+            current_head_sha: Some("abc123".to_string()),
+        });
+
+        let work = plan(&snapshot);
+
+        assert_eq!(work.blocker, StabilizationBlocker::Escalate);
+        assert_eq!(work.kind, StabilizationWorkKind::Escalate);
     }
 
     #[test]

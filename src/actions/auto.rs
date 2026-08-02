@@ -4,6 +4,7 @@ pub(super) enum AutoStartupSource {
     Prompt,
     ExistingPlan,
     DraftPlan,
+    ExistingPullRequest,
 }
 
 pub(super) fn validate_existing_auto_plan(plan_path: &Path) -> Result<(), String> {
@@ -141,6 +142,14 @@ impl Tui {
                     prompt.trim().to_string(),
                 )
             }
+            AutoStartupSource::ExistingPullRequest => (
+                AutoRunMode::Standard,
+                AutoImplementationSource::ExistingPullRequest,
+                None,
+                PlanRunMode::Sequential,
+                "existing-pr".to_string(),
+                format!("Stabilize existing pull request for branch {session_branch}"),
+            ),
         };
         let launch = AutoLaunch::with_options(
             &context.repo.root,
@@ -164,6 +173,13 @@ impl Tui {
         )
         .with_worktree_incarnation(session_incarnation);
         let mut persisted = launch.create_run();
+        if persisted.run.implementation_source == AutoImplementationSource::ExistingPullRequest {
+            crate::auto_flow::stabilization_observe::adopt_existing_pull_request(
+                &context.repo,
+                &context.config,
+                &mut persisted,
+            )?;
+        }
         crate::observability::with_writable_db(&context.repo, |conn| {
             crate::auto_flow::submit_auto_run(conn, &mut persisted)
         })?;
@@ -184,16 +200,22 @@ impl Tui {
             raw,
             crate::view::ChoiceList {
                 title: "Auto Flow: Implementation Source".to_string(),
-                choices: [("p", "prompt"), ("e", "existing plan"), ("d", "draft plan")]
-                    .into_iter()
-                    .map(|(key, label)| crate::view::KeyChoice::new(key, label))
-                    .collect(),
+                choices: [
+                    ("r", "existing pull request"),
+                    ("p", "prompt"),
+                    ("e", "existing plan"),
+                    ("d", "draft plan"),
+                ]
+                .into_iter()
+                .map(|(key, label)| crate::view::KeyChoice::new(key, label))
+                .collect(),
             },
         )?;
         Ok(match answer.as_deref() {
             Some("p") => Some(AutoStartupSource::Prompt),
             Some("e") => Some(AutoStartupSource::ExistingPlan),
             Some("d") => Some(AutoStartupSource::DraftPlan),
+            Some("r") => Some(AutoStartupSource::ExistingPullRequest),
             _ => None,
         })
     }

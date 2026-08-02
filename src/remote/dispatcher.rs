@@ -882,6 +882,36 @@ pub(crate) fn refresh_change_request_cache(
     config: &Config,
     force_details: bool,
 ) -> Result<(), String> {
+    refresh_change_request_cache_with_head_policy(
+        repo,
+        branch,
+        cache,
+        path,
+        config,
+        force_details,
+        true,
+    )
+}
+
+pub(crate) fn refresh_change_request_cache_for_adoption(
+    repo: &Repository,
+    branch: &str,
+    cache: &mut PrCache,
+    path: &Path,
+    config: &Config,
+) -> Result<(), String> {
+    refresh_change_request_cache_with_head_policy(repo, branch, cache, path, config, true, false)
+}
+
+fn refresh_change_request_cache_with_head_policy(
+    repo: &Repository,
+    branch: &str,
+    cache: &mut PrCache,
+    path: &Path,
+    config: &Config,
+    force_details: bool,
+    require_matching_head: bool,
+) -> Result<(), String> {
     let remotes = configured_remote_repositories(path, config)?;
     let observation = if cache.summary_observed_in_process
         && let Some(summary) = cache.summary()
@@ -907,7 +937,8 @@ pub(crate) fn refresh_change_request_cache(
             |summaries| {
                 let matching = summaries.into_iter().filter(|summary| {
                     summary.head_ref == source_push.remote_branch
-                        && summary.head_sha == source_push.expected_head_sha
+                        && (!require_matching_head
+                            || summary.head_sha == source_push.expected_head_sha)
                         && summary
                             .change_request_identity
                             .as_ref()

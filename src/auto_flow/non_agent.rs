@@ -2228,6 +2228,9 @@ pub(super) fn auto_plan_path(run: &AutoRun) -> Result<PathBuf, String> {
             .clone()
             .ok_or_else(|| "existing-plan auto flow requires a plan path".to_string()),
         AutoImplementationSource::DraftPlan => Ok(plan_first_plan_path(run)),
+        AutoImplementationSource::ExistingPullRequest => {
+            Err("existing-PR auto flow does not have a plan path".to_string())
+        }
     }
 }
 

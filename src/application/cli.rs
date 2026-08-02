@@ -895,6 +895,13 @@ fn run_auto_command(
         config.harness_adapter(&config.default_harness)?,
     );
     let mut persisted = launch.create_run();
+    if persisted.run.implementation_source == AutoImplementationSource::ExistingPullRequest {
+        crate::auto_flow::stabilization_observe::adopt_existing_pull_request(
+            repo,
+            config,
+            &mut persisted,
+        )?;
+    }
     observability::with_writable_db(repo, |conn| submit_auto_run(conn, &mut persisted))?;
     crate::worker::ensure_running()?;
     crate::worker::wake()?;
@@ -991,6 +998,16 @@ fn auto_launch_options_for_command(
                 initial_prompt: initial_prompt.to_string(),
             })
         }
+        AutoCommandSource::ExistingPullRequest => Ok(AutoLaunchOptions {
+            branch: branch.clone(),
+            mode: AutoRunMode::Standard,
+            implementation_source: AutoImplementationSource::ExistingPullRequest,
+            plan_path: None,
+            plan_run_mode: PlanRunMode::Sequential,
+            variant: "existing-pr".to_string(),
+            agent_profile: None,
+            initial_prompt: format!("Stabilize existing pull request for branch {branch}"),
+        }),
     }
 }
 

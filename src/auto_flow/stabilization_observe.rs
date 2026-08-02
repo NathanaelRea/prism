@@ -12,6 +12,32 @@ use crate::verify::{VerifyCheckKind, VerifyCheckResult, run_merge_conflict_check
 
 use super::stabilization_model::*;
 
+pub(crate) fn adopt_existing_pull_request(
+    repo: &Repository,
+    config: &Config,
+    persisted: &mut super::PersistedAutoRun,
+) -> Result<(), String> {
+    let mut cache = crate::remote::load_pr_cache(repo, &persisted.run.branch);
+    crate::remote::dispatcher::refresh_change_request_cache_for_adoption(
+        repo,
+        &persisted.run.branch,
+        &mut cache,
+        &persisted.run.worktree_path,
+        config,
+    )?;
+    let summary = cache.summary().ok_or_else(|| {
+        format!(
+            "no open pull request found for branch '{}'",
+            persisted.run.branch
+        )
+    })?;
+    persisted.run.pr_number = Some(summary.number);
+    persisted.run.pr_url = Some(summary.url.clone());
+    persisted.run.current_head_sha =
+        git::current_head_sha(&persisted.run.worktree_path, config).ok();
+    Ok(())
+}
+
 pub(super) fn push_remote_head_sha(
     path: &std::path::Path,
     branch: &str,
@@ -158,14 +184,24 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
     if let Some(guard) = run.pending_push.as_ref() {
         reauthorize_pending_push_cache(&mut cache, &run.worktree_path, guard, config);
     }
-    let _ = crate::remote::dispatcher::refresh_change_request_cache(
-        repo,
-        &run.branch,
-        &mut cache,
-        &run.worktree_path,
-        config,
-        true,
-    );
+    let _ = if run.implementation_source == super::AutoImplementationSource::ExistingPullRequest {
+        crate::remote::dispatcher::refresh_change_request_cache_for_adoption(
+            repo,
+            &run.branch,
+            &mut cache,
+            &run.worktree_path,
+            config,
+        )
+    } else {
+        crate::remote::dispatcher::refresh_change_request_cache(
+            repo,
+            &run.branch,
+            &mut cache,
+            &run.worktree_path,
+            config,
+            true,
+        )
+    };
     let target_repository = cache
         .summary()
         .and_then(|summary| summary.change_request_identity.as_ref())
@@ -428,6 +464,7 @@ impl From<&super::AutoRun> for AutoRunRef {
         Self {
             id: run.id.clone(),
             status: run.status,
+            implementation_source: run.implementation_source,
             pr_number: run.pr_number,
             pr_url: run.pr_url.clone(),
             current_head_sha: run.current_head_sha.clone(),

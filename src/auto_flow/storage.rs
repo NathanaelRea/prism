@@ -1,6 +1,6 @@
 use super::*;
 
-const AUTO_SCHEMA_VERSION: i64 = 7;
+const AUTO_SCHEMA_VERSION: i64 = 8;
 
 pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
     let has_version_table = conn
