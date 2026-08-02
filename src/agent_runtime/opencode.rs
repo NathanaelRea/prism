@@ -4425,6 +4425,7 @@ mod tests {
                     }
                     Err(error) => panic!("accept health request: {error}"),
                 };
+                stream.set_nonblocking(false).unwrap();
                 let mut request = [0_u8; 1024];
                 let count = stream.read(&mut request).unwrap();
                 let request = String::from_utf8_lossy(&request[..count]);
