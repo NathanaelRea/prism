@@ -26,6 +26,7 @@ It's a local dashboard to manage code change lifecycles. From planning, implemen
 
 Core runtime requirements:
 
+- Linux or macOS
 - `git`
 - GitHub CLI (`gh`)
 - `tmux`
@@ -53,6 +54,10 @@ Prism provides prebuilt archives for:
 - Linux x86_64 with glibc 2.35 or newer (for example, Ubuntu 22.04)
 - macOS x86_64 (Intel)
 - macOS aarch64 (Apple Silicon)
+
+Linux and macOS are the supported operating systems. Other targets fail during
+the build with an explicit unsupported-platform diagnostic rather than using
+partial Windows or generic Unix fallbacks.
 
 Download the archive for your platform from the
 [latest GitHub Release](https://github.com/NathanaelRea/prism/releases/latest),

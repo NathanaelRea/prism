@@ -14,49 +14,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 pub type BoxError = Box<dyn Error + Send + Sync + 'static>;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Durability {
-    FileAndDirectory,
-    MacOsFullSync,
-}
-
-impl Durability {
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::FileAndDirectory => "file_and_directory",
-            Self::MacOsFullSync => "macos_full_sync",
-        }
-    }
-}
+pub use crate::durability::DurabilityIntent;
 
 #[derive(Clone, Copy, Debug)]
 pub struct UpdateOptions {
-    pub durability: Durability,
+    pub durability: DurabilityIntent,
     pub lock_timeout: Duration,
 }
 
 impl UpdateOptions {
     pub const fn important_toml() -> Self {
         Self {
-            durability: if cfg!(target_os = "macos") {
-                Durability::MacOsFullSync
-            } else {
-                Durability::FileAndDirectory
-            },
+            durability: DurabilityIntent::Maximum,
             lock_timeout: Duration::from_millis(250),
         }
     }
 
     pub const fn ui_state() -> Self {
         Self {
-            durability: Durability::FileAndDirectory,
+            durability: DurabilityIntent::Standard,
             lock_timeout: Duration::from_millis(100),
         }
     }
@@ -151,7 +132,7 @@ pub struct PersistenceError {
     stage: Stage,
     path: PathBuf,
     committed: bool,
-    durability: Option<Durability>,
+    durability: Option<DurabilityIntent>,
     source: BoxError,
 }
 
@@ -172,7 +153,7 @@ impl PersistenceError {
         self.committed
     }
 
-    pub fn durability(&self) -> Option<Durability> {
+    pub fn durability(&self) -> Option<DurabilityIntent> {
         self.durability
     }
 
@@ -434,28 +415,28 @@ fn update_inner_with_fault<T>(
             PersistenceError::new(Stage::ApplyPermissions, &staging_path, false, error)
         })?;
     }
-    staging_file
-        .sync_all()
-        .map_err(|error| PersistenceError::new(Stage::SyncFile, &staging_path, false, error))?;
+    crate::durability::sync_file(&staging_file, options.durability).map_err(|error| {
+        let stage = match error.stage() {
+            crate::durability::FileSyncStage::File => Stage::SyncFile,
+            crate::durability::FileSyncStage::FullFile => Stage::FullSyncFile,
+        };
+        let source = error.into_source();
+        let kind = if source.kind() == io::ErrorKind::Unsupported {
+            PersistenceErrorKind::Unsupported
+        } else {
+            PersistenceErrorKind::Io
+        };
+        PersistenceError::new_with_kind(kind, stage, &staging_path, false, source)
+    })?;
     fault(Stage::SyncFile)
         .map_err(|error| PersistenceError::new(Stage::SyncFile, &staging_path, false, error))?;
-    if options.durability == Durability::MacOsFullSync {
-        crate::durability::full_sync(&staging_file).map_err(|error| {
-            let kind = if error.kind() == io::ErrorKind::Unsupported {
-                PersistenceErrorKind::Unsupported
-            } else {
-                PersistenceErrorKind::Io
-            };
-            PersistenceError::new_with_kind(kind, Stage::FullSyncFile, &staging_path, false, error)
-        })?;
-    }
     drop(staging_file);
     fs::rename(&staging_path, &target)
         .map_err(|error| PersistenceError::new(Stage::Rename, &target, false, error))?;
     staging.renamed = true;
     fault(Stage::Rename)
         .map_err(|error| PersistenceError::new(Stage::Rename, &target, true, error))?;
-    crate::durability::sync_directory(target_parent).map_err(|error| {
+    crate::durability::sync_directory(target_parent, options.durability).map_err(|error| {
         let kind = if error.kind() == io::ErrorKind::Unsupported {
             PersistenceErrorKind::Unsupported
         } else {
@@ -492,7 +473,6 @@ pub fn adjacent_lock_path(path: &Path) -> PathBuf {
 fn open_lock(path: &Path) -> Result<File, PersistenceError> {
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
-    #[cfg(unix)]
     options.mode(0o600);
     options
         .open(path)
@@ -575,7 +555,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn pre_rename_failure_leaves_old_file_and_removes_staging() {
+    fn platform_smoke_native_persistence_pre_rename_failure_preserves_old_file() {
         let _ = crate::observability::take_captured_events();
         let dir = temp_dir("failure");
         fs::create_dir_all(&dir).unwrap();
@@ -684,28 +664,6 @@ mod tests {
         assert_eq!(error.durability(), Some(options.durability));
         drop(lock);
         assert!(lock_path.exists());
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    #[cfg(not(target_os = "macos"))]
-    fn unsupported_macos_full_sync_is_reported_without_replacing_destination() {
-        let dir = temp_dir("unsupported-full-sync");
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.toml");
-        fs::write(&path, "value = 'old'\n").unwrap();
-        let mut options = UpdateOptions::important_toml();
-        options.durability = Durability::MacOsFullSync;
-
-        let error = update(&path, options, |_| {
-            Ok(((), Some(b"value = 'new'\n".to_vec())))
-        })
-        .unwrap_err();
-
-        assert_eq!(error.kind(), PersistenceErrorKind::Unsupported);
-        assert_eq!(error.stage(), Stage::FullSyncFile);
-        assert!(!error.committed());
-        assert_eq!(fs::read_to_string(&path).unwrap(), "value = 'old'\n");
         fs::remove_dir_all(dir).unwrap();
     }
 

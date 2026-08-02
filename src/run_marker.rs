@@ -133,12 +133,13 @@ fn begin_new(repo: &Repository, version: &str) -> Result<NewRun, String> {
     let mut marker = create_marker(&marker_path)?;
     write_marker(&mut marker, &run_id, "running", None)
         .map_err(|error| format!("write run marker {}: {error}", marker_path.display()))?;
-    crate::durability::sync_directory(&marker_dir).map_err(|error| {
-        format!(
-            "sync run marker directory {}: {error}",
-            marker_dir.display()
-        )
-    })?;
+    crate::durability::sync_directory(&marker_dir, crate::durability::DurabilityIntent::Maximum)
+        .map_err(|error| {
+            format!(
+                "sync run marker directory {}: {error}",
+                marker_dir.display()
+            )
+        })?;
 
     let started = now_ms();
     let transaction = crate::flight_recorder::TransactionTrace::begin("run_marker.begin");
@@ -346,9 +347,8 @@ fn write_marker(
     } else {
         writeln!(marker, "started_unix_ms={}", now_ms())?;
     }
-    marker.sync_all()?;
-    #[cfg(target_os = "macos")]
-    crate::durability::full_sync(marker)?;
+    crate::durability::sync_file(marker, crate::durability::DurabilityIntent::Maximum)
+        .map_err(crate::durability::FileSyncError::into_source)?;
     Ok(())
 }
 

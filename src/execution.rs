@@ -772,35 +772,22 @@ fn terminate_recorded_processes(
             continue;
         };
         let start_time_ticks = start_time_ticks.and_then(|ticks| u64::try_from(ticks).ok());
-        #[cfg(target_os = "linux")]
-        if start_time_ticks.is_none() {
-            let result = unsafe { libc::kill(process_id as libc::pid_t, 0) };
-            if result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM) {
-                return Err(format!(
-                    "interrupted {} run {} is blocked by live process {process_id} without a reusable process identity",
-                    workflow.kind.label(),
-                    workflow.run_id
-                ));
-            }
-            continue;
-        }
-        crate::harness::terminate_process(process_id, start_time_ticks)?;
-        #[cfg(target_os = "linux")]
-        {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while std::time::Instant::now() < deadline {
-                if crate::harness::process_start_time_ticks(process_id) != start_time_ticks {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(25));
-            }
-            if crate::harness::process_start_time_ticks(process_id) == start_time_ticks {
-                return Err(format!(
-                    "interrupted {} run {} is blocked because process {process_id} did not exit",
-                    workflow.kind.label(),
-                    workflow.run_id
-                ));
-            }
+        let recorded = crate::process::RecordedProcess::from_stored(process_id, start_time_ticks);
+        let outcome =
+            crate::process::terminate_recorded_process(recorded, std::time::Duration::from_secs(1))
+                .map_err(|error| {
+                    format!(
+                        "terminate interrupted {} run {} process {process_id}: {error}",
+                        workflow.kind.label(),
+                        workflow.run_id
+                    )
+                })?;
+        if outcome == crate::process::TerminationOutcome::Unverifiable {
+            return Err(format!(
+                "interrupted {} run {} is blocked by live process {process_id} without a reusable process identity",
+                workflow.kind.label(),
+                workflow.run_id
+            ));
         }
     }
     Ok(())
@@ -1118,8 +1105,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn auto_recovery_terminates_recorded_linked_plan_processes() {
-        use std::os::unix::process::CommandExt;
-
         let (path, mut conn, other) = connections("auto-linked-plan-recovery");
         conn.execute(
             "insert into auto_run (id, status, created_unix_ms, updated_unix_ms)
@@ -1135,18 +1120,10 @@ mod tests {
         .unwrap();
         let mut command = std::process::Command::new("sleep");
         command.arg("30");
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
-        let mut child = command.spawn().unwrap();
+        let mut child = crate::process::SupervisedChild::spawn(&mut command, None, None).unwrap();
         let pid = child.id();
-        let start = crate::harness::process_start_time_ticks(pid);
+        let recorded = crate::process::record_process(pid).unwrap();
+        let start = recorded.identity.map(|identity| identity.stored_value());
         let reaper = std::thread::spawn(move || child.wait().unwrap());
         conn.execute(
             "insert into plan_step_run (
@@ -1172,10 +1149,9 @@ mod tests {
         .unwrap();
 
         reaper.join().unwrap();
-        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
         assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
+            crate::process::observe_process(recorded).unwrap(),
+            crate::process::ProcessObservation::Missing
         );
         assert_eq!(
             dispatch_state(&conn, &WorkflowIdentity::new(WorkflowKind::Auto, "auto-1")).unwrap(),

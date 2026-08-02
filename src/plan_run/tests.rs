@@ -1,5 +1,4 @@
 use super::*;
-#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 #[test]
@@ -1154,6 +1153,63 @@ fn reconcile_keeps_running_step_with_live_process() {
 }
 
 #[test]
+fn recovery_classifies_synthetic_process_observations_the_same_on_supported_platforms() {
+    use crate::platform::SupportedOs;
+    use crate::process::ProcessObservation;
+
+    let cases = [
+        (
+            ProcessObservation::RunningSameProcess,
+            PlanStepStatus::Running,
+        ),
+        (ProcessObservation::Missing, PlanStepStatus::Failed),
+        (ProcessObservation::IdentityReused, PlanStepStatus::Failed),
+        (
+            ProcessObservation::RunningUnverifiable,
+            PlanStepStatus::Running,
+        ),
+    ];
+    for _os in [SupportedOs::Linux, SupportedOs::MacOs] {
+        for (observation, expected_status) in cases {
+            let conn = rusqlite::Connection::open_in_memory().unwrap();
+            migrate_schema(&conn).unwrap();
+            let repo = PathBuf::from("/repo/prism");
+            let mut persisted = PlanLaunch::new(
+                &repo,
+                &repo,
+                &repo.join("plan.md"),
+                "phase",
+                1,
+                1,
+                PlanRunMode::Sequential,
+            )
+            .unwrap()
+            .create_run();
+            persisted.run.status = PlanRunStatus::Running;
+            persisted.steps[0].status = PlanStepStatus::Running;
+            persisted.steps[0].execution.process_id = Some(42);
+            persisted.steps[0].execution.process_identity = Some(7);
+            save_plan_run(&conn, &persisted).unwrap();
+
+            reconcile_stale_plan_run_with_observer(
+                &conn,
+                &mut persisted,
+                DEFAULT_OUTPUT_LINES_PER_STEP,
+                |process_id, _| {
+                    Ok(recorded_process_state_from_observation(
+                        process_id.unwrap(),
+                        observation,
+                    ))
+                },
+            )
+            .unwrap();
+
+            assert_eq!(persisted.steps[0].status, expected_status);
+        }
+    }
+}
+
+#[test]
 fn retry_from_step_resets_selected_and_later_steps() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
@@ -1359,12 +1415,8 @@ fn fake_opencode(dir: &Path, body: &str) -> PathBuf {
     path
 }
 
-#[cfg(unix)]
 fn make_executable(path: &Path) {
     let mut permissions = std::fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(path, permissions).unwrap();
 }
-
-#[cfg(not(unix))]
-fn make_executable(_path: &Path) {}

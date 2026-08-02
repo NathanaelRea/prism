@@ -1668,11 +1668,21 @@ fn cancel_recorded_work(cancellation: RecordedCancellation, warnings: &mut Vec<S
             ));
         }
     }
-    for (pid, start) in cancellation.processes {
-        if let Err(error) = crate::harness::terminate_process(pid, start) {
-            warnings.push(format!(
+    for (pid, identity) in cancellation.processes {
+        let recorded = crate::process::RecordedProcess::from_stored(pid, identity);
+        match crate::process::terminate_recorded_process(
+            recorded,
+            std::time::Duration::from_secs(1),
+        ) {
+            Ok(crate::process::TerminationOutcome::Terminated)
+            | Ok(crate::process::TerminationOutcome::AlreadyExited)
+            | Ok(crate::process::TerminationOutcome::IdentityReused) => {}
+            Ok(crate::process::TerminationOutcome::Unverifiable) => warnings.push(format!(
+                "workflow stopped, but external process {pid} has no reusable process identity"
+            )),
+            Err(error) => warnings.push(format!(
                 "workflow stopped, but external process {pid} cancellation failed: {error}"
-            ));
+            )),
         }
     }
 }
@@ -2077,24 +2087,15 @@ mod tests {
 
     #[test]
     fn stop_commits_then_cancels_a_recorded_process() {
-        use std::os::unix::process::CommandExt;
-
         let mut conn = connection();
         insert_run(&conn, "running", false, "claimed");
         let mut command = std::process::Command::new("sleep");
         command.arg("30");
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setpgid(0, 0) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
-        let mut child = command.spawn().unwrap();
+        let mut child = crate::process::SupervisedChild::spawn(&mut command, None, None).unwrap();
         let pid = child.id();
-        let start = crate::harness::process_start_time_ticks(pid);
+        let recorded = crate::process::record_process(pid).unwrap();
+        let start = recorded.identity.map(|identity| identity.stored_value());
+        let reaper = std::thread::spawn(move || child.wait().unwrap());
         conn.execute(
             "insert into plan_step_run (
                run_id, step, prompt, status, execution_process_id,
@@ -2122,11 +2123,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(process, (None, None));
-        let _ = child.wait();
-        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+        reaper.join().unwrap();
         assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
+            crate::process::observe_process(recorded).unwrap(),
+            crate::process::ProcessObservation::Missing
         );
     }
 

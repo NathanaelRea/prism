@@ -72,49 +72,40 @@ fn remote_pr_choice_label(summary: &crate::github::PrSummary) -> String {
 }
 
 pub(super) fn open_url_in_browser(url: &str) -> Result<(), String> {
-    run_browser_opener(&browser_opener_candidates(), url).map(|_| ())
-}
-
-pub(super) const NO_BROWSER_ARGS: &[&str] = &[];
-pub(super) const GIO_BROWSER_ARGS: &[&str] = &["open"];
-pub(super) const WINDOWS_BROWSER_ARGS: &[&str] = &["/C", "start", ""];
-
-pub(super) fn browser_opener_candidates() -> Vec<(&'static str, &'static [&'static str])> {
-    if cfg!(target_os = "macos") {
-        vec![("open", NO_BROWSER_ARGS)]
-    } else if cfg!(target_os = "windows") {
-        vec![("cmd", WINDOWS_BROWSER_ARGS)]
-    } else {
-        vec![
-            ("xdg-open", NO_BROWSER_ARGS),
-            ("gio", GIO_BROWSER_ARGS),
-            ("wslview", NO_BROWSER_ARGS),
-        ]
-    }
+    run_browser_opener(
+        crate::platform::browser_candidates(crate::platform::current_os()),
+        url,
+    )
+    .map(|_| ())
 }
 
 pub(super) fn run_browser_opener(
-    candidates: &[(&str, &[&str])],
+    candidates: &[crate::platform::CommandCandidate<'_>],
     url: &str,
 ) -> Result<String, String> {
     let mut errors = Vec::new();
-    for (program, args) in candidates {
-        if !command_exists(program) {
+    for candidate in candidates {
+        if !command_exists(candidate.program) {
             continue;
         }
         match run_output_allow_failure(
-            Command::new(program).args(*args).arg(url),
+            Command::new(candidate.program)
+                .args(candidate.args)
+                .arg(url),
             ProcessPolicy::LocalMutation,
         ) {
-            Ok(output) if output.status.success() => return Ok((*program).to_string()),
-            Ok(output) => errors.push(format!("{program}: exited with {}", output.status)),
-            Err(error) => errors.push(format!("{program}: {error}")),
+            Ok(output) if output.status.success() => return Ok(candidate.program.to_string()),
+            Ok(output) => errors.push(format!(
+                "{}: exited with {}",
+                candidate.program, output.status
+            )),
+            Err(error) => errors.push(format!("{}: {error}", candidate.program)),
         }
     }
     if errors.is_empty() {
         let names = candidates
             .iter()
-            .map(|(program, _)| *program)
+            .map(|candidate| candidate.program)
             .collect::<Vec<_>>()
             .join(", ");
         Err(format!("no browser opener found; tried {names}"))

@@ -223,9 +223,9 @@ impl Tui {
             server_port,
             server_url: server_url.clone(),
             server_pid: plan_runtime.as_ref().and_then(|runtime| runtime.server_pid),
-            server_start_time_ticks: plan_runtime
+            server_process_identity: plan_runtime
                 .as_ref()
-                .and_then(|runtime| runtime.server_start_time_ticks),
+                .and_then(|runtime| runtime.server_process_identity),
             opencode_session_id: None,
             generation: 0,
             updated_unix_ms: 0,

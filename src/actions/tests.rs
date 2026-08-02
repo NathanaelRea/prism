@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::github::{PrCache, PrComment, PrDetails, PrSummary, pr_summary_or_error};
 use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
 use crate::plan_run::PlanRunMode;
+use crate::platform::CommandCandidate;
 use crate::repo::Repository;
 use crate::session::{DeleteWorktreeOutcome, Session};
 use crate::tui::{
@@ -136,8 +137,14 @@ exit 0
     let no_args: &[&str] = &[];
     let flag_args: &[&str] = &["--flag"];
     let candidates = [
-        ("/definitely/missing", no_args),
-        (opener.as_str(), flag_args),
+        CommandCandidate {
+            program: "/definitely/missing",
+            args: no_args,
+        },
+        CommandCandidate {
+            program: opener.as_str(),
+            args: flag_args,
+        },
     ];
 
     let used = run_browser_opener(&candidates, "https://example.test/pr/42").unwrap();

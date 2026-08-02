@@ -1,38 +1,12 @@
+mod common;
+
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new(name: &str) -> Self {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "prism-cli-test-{name}-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).expect("create temp dir");
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
+use common::CompactTempDir as TempDir;
 
 fn prism() -> Command {
     Command::new(env!("CARGO_BIN_EXE_prism"))
@@ -319,6 +293,56 @@ fn daemon_status_reports_stopped_without_starting_it() {
     assert!(output.status.success(), "{}", stderr(&output));
     let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
     assert_eq!(value["daemon"]["state"], "stopped");
+}
+
+#[test]
+#[cfg(unix)]
+fn daemon_status_reports_invalid_runtime_configuration_distinctly() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = TempDir::new("daemon-status-invalid");
+    let mut runtime = temp.path().join("runtime");
+    while runtime.as_os_str().as_bytes().len() + b"/worker.sock".len() <= 103 {
+        runtime.push("x");
+    }
+    let output = prism()
+        .args(["daemon", "status", "--json"])
+        .current_dir(temp.path())
+        .env("XDG_CONFIG_HOME", temp.path())
+        .env("HOME", temp.path())
+        .env("PRISM_RUNTIME_DIR", &runtime)
+        .output()
+        .expect("run daemon status");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("103 bytes"), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("PRISM_RUNTIME_DIR"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!runtime.exists());
+}
+
+#[test]
+fn daemon_status_with_long_tmpdir_uses_the_explicit_compact_runtime() {
+    let temp = TempDir::new("daemon-status-long-tmpdir");
+    let long_tmpdir = temp.path().join("x".repeat(160));
+    let runtime = temp.path().join("runtime");
+    let output = prism()
+        .args(["daemon", "status", "--json"])
+        .current_dir(temp.path())
+        .env("XDG_CONFIG_HOME", temp.path())
+        .env("HOME", temp.path())
+        .env("TMPDIR", long_tmpdir)
+        .env("PRISM_RUNTIME_DIR", &runtime)
+        .output()
+        .expect("run daemon status");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(value["daemon"]["state"], "stopped");
+    assert!(!runtime.exists());
 }
 
 #[test]

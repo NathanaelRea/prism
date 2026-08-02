@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -14,6 +15,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::execution::{self, DispatchState, ExecutionClaim, WorkflowIdentity, WorkflowKind};
+use crate::platform::SupportedOs;
 use crate::process::DetachedProcessPolicy;
 use crate::repo::Repository;
 use crate::util::stable_hash;
@@ -24,6 +26,39 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const DAEMON_TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
 const GLOBAL_CONCURRENCY: usize = 4;
+const SOCKET_PATH_BUDGET: usize = 103;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkerSocketPath(PathBuf);
+
+impl WorkerSocketPath {
+    fn for_runtime(runtime: &Path) -> Result<Self, String> {
+        let path = runtime.join("worker.sock");
+        let bytes = socket_path_bytes(&path);
+        if bytes.contains(&0) {
+            return Err(format!(
+                "Prism worker runtime directory {} produces a socket path containing a NUL byte; set PRISM_RUNTIME_DIR to a shorter valid private directory",
+                runtime.display()
+            ));
+        }
+        if bytes.len() > SOCKET_PATH_BUDGET {
+            return Err(format!(
+                "Prism worker runtime directory {} produces a {}-byte socket path, exceeding the supported maximum of {SOCKET_PATH_BUDGET} bytes; set PRISM_RUNTIME_DIR to a shorter private directory such as /tmp/prism-$UID",
+                runtime.display(),
+                bytes.len()
+            ));
+        }
+        Ok(Self(path))
+    }
+
+    fn as_path(&self) -> &Path {
+        &self.0
+    }
+}
+
+fn socket_path_bytes(path: &Path) -> &[u8] {
+    path.as_os_str().as_bytes()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -55,11 +90,11 @@ impl DaemonHealth {
 }
 
 pub fn probe_health() -> Result<DaemonHealth, String> {
-    probe_health_at(&socket_path())
+    probe_health_at(&validated_socket_path()?)
 }
 
-fn probe_health_at(path: &Path) -> Result<DaemonHealth, String> {
-    let stream = match UnixStream::connect(path) {
+fn probe_health_at(path: &WorkerSocketPath) -> Result<DaemonHealth, String> {
+    let stream = match UnixStream::connect(path.as_path()) {
         Ok(stream) => stream,
         Err(error)
             if matches!(
@@ -116,7 +151,8 @@ fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
 }
 
 pub fn ensure_running() -> Result<(), String> {
-    if wait_for_existing_daemon(DAEMON_TRANSITION_TIMEOUT, probe_health)? {
+    let socket = validated_socket_path()?;
+    if wait_for_existing_daemon(DAEMON_TRANSITION_TIMEOUT, || probe_health_at(&socket))? {
         return Ok(());
     }
     let executable = std::env::current_exe()
@@ -133,8 +169,14 @@ pub fn ensure_running() -> Result<(), String> {
     let deadline = Instant::now() + DAEMON_TRANSITION_TIMEOUT;
     let mut last_error = "worker did not become ready".to_string();
     while Instant::now() < deadline {
-        match health() {
-            Ok(()) => return Ok(()),
+        match probe_health_at(&socket) {
+            Ok(DaemonHealth {
+                state: DaemonState::Running,
+                ..
+            }) => return Ok(()),
+            Ok(health) => {
+                last_error = format!("worker did not become ready: state={:?}", health.state)
+            }
             Err(error) => last_error = error,
         }
         thread::sleep(Duration::from_millis(25));
@@ -168,8 +210,8 @@ fn wait_for_existing_daemon(
             Ok(DaemonHealth {
                 state: DaemonState::Stopped,
                 ..
-            })
-            | Err(_) => return Ok(false),
+            }) => return Ok(false),
+            Err(error) => return Err(error),
         }
     }
 }
@@ -178,26 +220,23 @@ pub fn wake() -> Result<(), String> {
     request("wake").map(|_| ())
 }
 
-pub fn health() -> Result<(), String> {
-    parse_health_response(&health_response()?).map(|_| ())
-}
-
 pub fn health_response() -> Result<String, String> {
     request("health")
 }
 
 pub fn shutdown() -> Result<(), String> {
-    let response = request("shutdown")?;
+    let socket = validated_socket_path()?;
+    let response = request_at(&socket, "shutdown")?;
     if !response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
         return Err(format!("Prism worker rejected shutdown: {response}"));
     }
-    wait_for_socket_to_close(&socket_path(), DAEMON_TRANSITION_TIMEOUT)
+    wait_for_socket_to_close(&socket, DAEMON_TRANSITION_TIMEOUT)
 }
 
-fn wait_for_socket_to_close(path: &Path, timeout: Duration) -> Result<(), String> {
+fn wait_for_socket_to_close(path: &WorkerSocketPath, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
-        match fs::symlink_metadata(path) {
+        match fs::symlink_metadata(path.as_path()) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(format!("inspect Prism worker socket: {error}")),
             Ok(_) => {}
@@ -210,7 +249,11 @@ fn wait_for_socket_to_close(path: &Path, timeout: Duration) -> Result<(), String
 }
 
 fn request(command: &str) -> Result<String, String> {
-    let stream = UnixStream::connect(socket_path())
+    request_at(&validated_socket_path()?, command)
+}
+
+fn request_at(path: &WorkerSocketPath, command: &str) -> Result<String, String> {
+    let stream = UnixStream::connect(path.as_path())
         .map_err(|error| format!("connect to Prism worker: {error}"))?;
     request_on_stream(stream, command)
 }
@@ -231,6 +274,7 @@ fn request_on_stream(mut stream: UnixStream, command: &str) -> Result<String, St
 
 pub fn serve() -> Result<(), String> {
     let runtime = runtime_dir();
+    let socket = WorkerSocketPath::for_runtime(&runtime)?;
     if let Ok(metadata) = fs::symlink_metadata(&runtime) {
         if metadata.file_type().is_symlink() {
             return Err(format!(
@@ -249,9 +293,8 @@ pub fn serve() -> Result<(), String> {
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("secure worker runtime dir: {error}"))?;
     let _lock = acquire_lock(&runtime.join("worker.lock"))?;
-    let socket = runtime.join("worker.sock");
-    if socket.exists() {
-        match UnixStream::connect(&socket) {
+    if socket.as_path().exists() {
+        match UnixStream::connect(socket.as_path()) {
             Ok(_) => {
                 return Err(
                     "a live Prism worker endpoint already owns the runtime socket".to_string(),
@@ -268,15 +311,20 @@ pub fn serve() -> Result<(), String> {
                 ));
             }
         }
-        fs::remove_file(&socket).map_err(|error| format!("remove stale worker socket: {error}"))?;
+        fs::remove_file(socket.as_path())
+            .map_err(|error| format!("remove stale worker socket: {error}"))?;
     }
 
     let instance_id = execution::new_instance_id("daemon");
     classify_abandoned(&instance_id)?;
     log_daemon_lifecycle("daemon_start", &instance_id);
-    let listener = UnixListener::bind(&socket)
-        .map_err(|error| format!("bind Prism worker socket {}: {error}", socket.display()))?;
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
+    let listener = UnixListener::bind(socket.as_path()).map_err(|error| {
+        format!(
+            "bind Prism worker socket {}: {error}",
+            socket.as_path().display()
+        )
+    })?;
+    fs::set_permissions(socket.as_path(), fs::Permissions::from_mode(0o600))
         .map_err(|error| format!("secure Prism worker socket: {error}"))?;
     listener
         .set_nonblocking(true)
@@ -310,7 +358,7 @@ pub fn serve() -> Result<(), String> {
         thread::sleep(Duration::from_millis(50));
     }
     log_daemon_lifecycle("daemon_stop", &instance_id);
-    fs::remove_file(&socket).map_err(|error| format!("remove worker socket: {error}"))
+    fs::remove_file(socket.as_path()).map_err(|error| format!("remove worker socket: {error}"))
 }
 
 fn respond(
@@ -765,12 +813,8 @@ pub fn runtime_dir() -> PathBuf {
     let override_path = std::env::var_os("PRISM_RUNTIME_DIR").filter(|path| !path.is_empty());
     let xdg_runtime = std::env::var_os("XDG_RUNTIME_DIR").filter(|path| !path.is_empty());
     let home = std::env::var_os("HOME").filter(|home| !home.is_empty());
-    #[cfg(target_os = "linux")]
-    let target = "linux";
-    #[cfg(target_os = "macos")]
-    let target = "macos";
     runtime_dir_for(
-        target,
+        crate::platform::current_os(),
         override_path.as_deref(),
         xdg_runtime.as_deref(),
         home.as_deref(),
@@ -779,7 +823,7 @@ pub fn runtime_dir() -> PathBuf {
 }
 
 fn runtime_dir_for(
-    target: &str,
+    os: SupportedOs,
     override_path: Option<&std::ffi::OsStr>,
     xdg_runtime: Option<&std::ffi::OsStr>,
     home: Option<&std::ffi::OsStr>,
@@ -788,12 +832,12 @@ fn runtime_dir_for(
     if let Some(path) = override_path {
         return PathBuf::from(path);
     }
-    if target == "linux"
+    if os == SupportedOs::Linux
         && let Some(path) = xdg_runtime
     {
         return PathBuf::from(path).join("prism");
     }
-    if target == "macos"
+    if os == SupportedOs::MacOs
         && let Some(home) = home
     {
         return PathBuf::from(home)
@@ -809,37 +853,47 @@ pub fn socket_path() -> PathBuf {
     runtime_dir().join("worker.sock")
 }
 
+fn validated_socket_path() -> Result<WorkerSocketPath, String> {
+    WorkerSocketPath::for_runtime(&runtime_dir())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsStr;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn test_socket_path(label: &str) -> PathBuf {
+    fn test_socket_path(label: &str) -> WorkerSocketPath {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        Path::new("/tmp").join(format!(
-            "prism-{label}-{}-{unique}.sock",
-            std::process::id()
-        ))
+        let runtime =
+            Path::new("/tmp").join(format!("pw-{label}-{:x}-{unique:x}", std::process::id()));
+        fs::create_dir(&runtime).unwrap();
+        WorkerSocketPath::for_runtime(&runtime).unwrap()
+    }
+
+    fn remove_test_socket(socket: &WorkerSocketPath) {
+        fs::remove_file(socket.as_path()).unwrap();
+        fs::remove_dir(socket.as_path().parent().unwrap()).unwrap();
     }
 
     #[test]
     fn socket_and_lock_share_a_private_runtime_directory() {
-        assert_eq!(socket_path().parent(), Some(runtime_dir().as_path()));
+        let socket = socket_path();
+        assert_eq!(socket.parent(), Some(runtime_dir().as_path()));
         assert_eq!(
-            socket_path().file_name().and_then(|name| name.to_str()),
+            socket.file_name().and_then(|name| name.to_str()),
             Some("worker.sock")
         );
     }
 
     #[test]
-    fn runtime_paths_cover_linux_and_macos() {
+    fn platform_contract_runtime_paths_cover_linux_and_macos() {
         assert_eq!(
             runtime_dir_for(
-                "linux",
+                SupportedOs::Linux,
                 None,
                 Some(OsStr::new("/run/user/1000")),
                 Some(OsStr::new("/home/user")),
@@ -849,7 +903,7 @@ mod tests {
         );
         assert_eq!(
             runtime_dir_for(
-                "macos",
+                SupportedOs::MacOs,
                 None,
                 None,
                 Some(OsStr::new("/Users/user")),
@@ -859,7 +913,7 @@ mod tests {
         );
         assert_eq!(
             runtime_dir_for(
-                "linux",
+                SupportedOs::Linux,
                 Some(OsStr::new("/override")),
                 Some(OsStr::new("/ignored")),
                 None,
@@ -870,27 +924,130 @@ mod tests {
     }
 
     #[test]
-    fn probe_health_treats_a_stale_socket_as_stopped() {
+    fn socket_path_budget_accepts_the_boundary_and_rejects_the_next_byte() {
+        for byte_len in [SOCKET_PATH_BUDGET - 1, SOCKET_PATH_BUDGET] {
+            let runtime = runtime_with_socket_path_len(byte_len);
+            let socket = WorkerSocketPath::for_runtime(&runtime).unwrap();
+            assert_eq!(socket_path_bytes(socket.as_path()).len(), byte_len);
+        }
+
+        let runtime = runtime_with_socket_path_len(SOCKET_PATH_BUDGET + 1);
+        let error = WorkerSocketPath::for_runtime(&runtime).unwrap_err();
+        assert!(error.contains("103 bytes"), "{error}");
+        assert!(error.contains("PRISM_RUNTIME_DIR"), "{error}");
+    }
+
+    #[test]
+    fn socket_path_rejects_nul_before_dispatch() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let runtime = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/prism\0bad".to_vec()));
+        let error = WorkerSocketPath::for_runtime(&runtime).unwrap_err();
+
+        assert!(error.contains("NUL byte"), "{error}");
+        assert!(error.contains("PRISM_RUNTIME_DIR"), "{error}");
+    }
+
+    #[test]
+    fn socket_path_accepts_non_utf8_unix_paths() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let runtime = PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/prism-\xff".to_vec()));
+        let socket = WorkerSocketPath::for_runtime(&runtime).unwrap();
+
+        assert_eq!(socket.as_path(), runtime.join("worker.sock"));
+    }
+
+    #[test]
+    fn long_runtime_policy_inputs_are_rejected_by_the_socket_invariant() {
+        let long = OsStr::new(
+            "/runtime/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        for runtime in [
+            runtime_dir_for(
+                SupportedOs::Linux,
+                Some(long),
+                None,
+                None,
+                Path::new("/fallback"),
+            ),
+            runtime_dir_for(
+                SupportedOs::Linux,
+                None,
+                Some(long),
+                None,
+                Path::new("/fallback"),
+            ),
+            runtime_dir_for(
+                SupportedOs::MacOs,
+                None,
+                None,
+                Some(long),
+                Path::new("/fallback"),
+            ),
+        ] {
+            assert!(WorkerSocketPath::for_runtime(&runtime).is_err());
+        }
+    }
+
+    #[test]
+    fn platform_smoke_native_worker_socket_bind_and_connect() {
+        let socket = test_socket_path("native");
+        let listener = UnixListener::bind(socket.as_path()).unwrap();
+
+        let client = UnixStream::connect(socket.as_path()).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+
+        drop(client);
+        drop(listener);
+        remove_test_socket(&socket);
+    }
+
+    #[test]
+    fn platform_smoke_native_worker_socket_binds_at_portable_path_boundary() {
+        let runtime_len = SOCKET_PATH_BUDGET - b"/worker.sock".len();
+        let mut runtime = format!("/tmp/pb-{:x}-", std::process::id());
+        runtime.extend(std::iter::repeat_n('x', runtime_len - runtime.len()));
+        let runtime = PathBuf::from(runtime);
+        fs::create_dir(&runtime).unwrap();
+        let socket = WorkerSocketPath::for_runtime(&runtime).unwrap();
+        assert_eq!(
+            socket_path_bytes(socket.as_path()).len(),
+            SOCKET_PATH_BUDGET
+        );
+
+        let listener = UnixListener::bind(socket.as_path()).unwrap();
+        let client = UnixStream::connect(socket.as_path()).unwrap();
+        let (_server, _) = listener.accept().unwrap();
+
+        drop(client);
+        drop(listener);
+        fs::remove_file(socket.as_path()).unwrap();
+        fs::remove_dir(runtime).unwrap();
+    }
+
+    #[test]
+    fn platform_smoke_native_probe_health_treats_a_stale_socket_as_stopped() {
         let socket = test_socket_path("stale");
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = UnixListener::bind(socket.as_path()).unwrap();
         drop(listener);
 
         assert_eq!(probe_health_at(&socket).unwrap(), DaemonHealth::stopped());
 
-        fs::remove_file(socket).unwrap();
+        remove_test_socket(&socket);
     }
 
     #[test]
-    fn waiting_for_a_live_socket_to_close_times_out() {
+    fn platform_smoke_native_waiting_for_a_live_socket_to_close_times_out() {
         let socket = test_socket_path("live");
-        let _listener = UnixListener::bind(&socket).unwrap();
+        let _listener = UnixListener::bind(socket.as_path()).unwrap();
 
         assert_eq!(
             wait_for_socket_to_close(&socket, Duration::ZERO),
             Err("timed out waiting for Prism worker daemon to stop".to_string())
         );
 
-        fs::remove_file(socket).unwrap();
+        remove_test_socket(&socket);
     }
 
     #[test]
@@ -908,5 +1065,22 @@ mod tests {
                     .to_string()
             )
         );
+    }
+
+    #[test]
+    fn daemon_probe_errors_are_not_treated_as_a_stopped_daemon() {
+        assert_eq!(
+            wait_for_existing_daemon(Duration::ZERO, || Err("permission denied".to_string())),
+            Err("permission denied".to_string())
+        );
+    }
+
+    fn runtime_with_socket_path_len(byte_len: usize) -> PathBuf {
+        use std::os::unix::ffi::OsStringExt;
+
+        const SOCKET_SUFFIX_LEN: usize = b"/worker.sock".len();
+        let mut bytes = vec![b'/'];
+        bytes.extend(std::iter::repeat_n(b'a', byte_len - SOCKET_SUFFIX_LEN - 1));
+        PathBuf::from(std::ffi::OsString::from_vec(bytes))
     }
 }

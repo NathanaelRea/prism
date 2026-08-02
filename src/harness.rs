@@ -276,7 +276,7 @@ pub struct HarnessDescription {
 pub struct ExecutionRef {
     pub state: Option<String>,
     pub process_id: Option<u32>,
-    pub process_start_time_ticks: Option<u64>,
+    pub process_identity: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -370,11 +370,6 @@ impl Invocation {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            command.process_group(0);
-        }
         Ok(command)
     }
 
@@ -739,100 +734,11 @@ pub fn cancel_native_session(session: &SessionRef) -> Result<bool, String> {
     }
 }
 
-pub fn process_start_time_ticks(process_id: u32) -> Option<u64> {
-    #[cfg(target_os = "linux")]
-    {
-        let stat = std::fs::read_to_string(format!("/proc/{process_id}/stat")).ok()?;
-        let fields_after_comm = stat.rsplit_once(") ")?.1;
-        fields_after_comm.split_whitespace().nth(19)?.parse().ok()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = process_id;
-        None
-    }
-}
-
 pub fn terminate_active_process(child: &mut crate::process::SupervisedChild) -> Result<(), String> {
     child
         .terminate()
         .map(|_| ())
         .map_err(|error| format!("terminate harness process {}: {error}", child.id()))
-}
-
-#[cfg(unix)]
-pub fn terminate_process(
-    process_id: u32,
-    _expected_start_time_ticks: Option<u64>,
-) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
-    if process_start_time_ticks(process_id) != _expected_start_time_ticks
-        || _expected_start_time_ticks.is_none()
-    {
-        return Err(format!(
-            "refusing to terminate harness process {process_id}: process identity changed or was not recorded"
-        ));
-    }
-    let process_group = -(process_id as libc::pid_t);
-    let result = unsafe { libc::kill(process_group, libc::SIGTERM) };
-    if result != 0 {
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(());
-        }
-        return Err(format!("terminate harness process {process_id}: {error}"));
-    }
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    while std::time::Instant::now() < deadline {
-        #[cfg(target_os = "linux")]
-        if process_start_time_ticks(process_id) != _expected_start_time_ticks {
-            return Ok(());
-        }
-        #[cfg(not(target_os = "linux"))]
-        if !process_group_is_signalable(process_id)? {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let result = unsafe { libc::kill(process_group, libc::SIGKILL) };
-    let error = std::io::Error::last_os_error();
-    if result == 0
-        || error.raw_os_error() == Some(libc::ESRCH)
-        || cfg!(target_os = "macos") && error.raw_os_error() == Some(libc::EPERM)
-    {
-        Ok(())
-    } else {
-        Err(format!("kill harness process {process_id}: {error}"))
-    }
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn process_group_is_signalable(process_id: u32) -> Result<bool, String> {
-    let result = unsafe { libc::kill(-(process_id as libc::pid_t), 0) };
-    if result == 0 {
-        return Ok(true);
-    }
-    let error = std::io::Error::last_os_error();
-    if matches!(error.raw_os_error(), Some(libc::ESRCH) | Some(libc::EPERM)) {
-        Ok(false)
-    } else {
-        Err(format!(
-            "inspect harness process group {process_id}: {error}"
-        ))
-    }
-}
-
-#[cfg(not(unix))]
-pub fn terminate_process(
-    process_id: u32,
-    _expected_start_time_ticks: Option<u64>,
-) -> Result<(), String> {
-    crate::process::run_status_named(
-        Command::new("taskkill").args(["/PID", &process_id.to_string(), "/T", "/F"]),
-        crate::process::ProcessPolicy::Metadata,
-        crate::process::ProcessDescriptor::new("harness.process.terminate"),
-    )
-    .map_err(|error| format!("terminate harness process {process_id}: {error}"))
 }
 
 fn invocation_from_template(
@@ -890,11 +796,8 @@ fn temporary_prompt_file(prompt: &str) -> Result<PathBuf, String> {
         ));
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
         match options.open(&path) {
             Ok(mut file) => {
                 file.write_all(prompt.as_bytes())
@@ -1123,101 +1026,6 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn managed_process_cancellation_sends_sigterm() {
-        let invocation = Invocation {
-            argv: vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "exec sleep 30".to_string(),
-            ],
-            environment: BTreeMap::new(),
-            stdin: None,
-            prompt_file: None,
-            structured_events: false,
-            attach: false,
-        };
-        let mut child = invocation.spawn(Path::new("/tmp")).unwrap();
-        terminate_process(child.id(), process_start_time_ticks(child.id())).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            if child.try_wait().unwrap().is_some() {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "process ignored SIGTERM"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn managed_process_cancellation_terminates_wrapper_descendants() {
-        let invocation = Invocation {
-            argv: vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                "sleep 30 & child=$!; printf '%s\\n' \"$child\"; wait".to_string(),
-            ],
-            environment: BTreeMap::new(),
-            stdin: None,
-            prompt_file: None,
-            structured_events: false,
-            attach: false,
-        };
-        let mut child = invocation.spawn(Path::new("/tmp")).unwrap();
-        let descendant_id = {
-            let stdout = child.stdout.as_mut().unwrap();
-            let mut line = String::new();
-            BufReader::new(stdout).read_line(&mut line).unwrap();
-            line.trim().parse::<libc::pid_t>().unwrap()
-        };
-
-        terminate_process(child.id(), process_start_time_ticks(child.id())).unwrap();
-        child.wait().unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        loop {
-            let result = unsafe { libc::kill(descendant_id, 0) };
-            if result != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH) {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "wrapper descendant survived process-group cancellation"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn managed_process_cancellation_rejects_reused_process_identity() {
-        let invocation = Invocation {
-            argv: vec!["sleep".to_string(), "30".to_string()],
-            environment: BTreeMap::new(),
-            stdin: None,
-            prompt_file: None,
-            structured_events: false,
-            attach: false,
-        };
-        let mut child = invocation.spawn(Path::new("/tmp")).unwrap();
-        let start = process_start_time_ticks(child.id()).unwrap();
-
-        assert!(terminate_process(child.id(), Some(start + 1)).is_err());
-        assert!(child.try_wait().unwrap().is_none());
-        terminate_process(child.id(), Some(start)).unwrap();
-        child.wait().unwrap();
-    }
-
-    #[test]
-    #[cfg(all(unix, not(target_os = "linux")))]
-    fn terminating_absent_process_group_is_successful() {
-        terminate_process(i32::MAX as u32, None).unwrap();
-    }
-
-    #[test]
-    #[cfg(unix)]
     fn large_stdin_to_non_reading_term_ignoring_child_is_deadline_bounded() {
         let invocation = Invocation {
             argv: vec![
@@ -1241,18 +1049,15 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let process_id = child.id();
+        let recorded = crate::process::record_process(process_id).unwrap();
         let stage = child.terminate().unwrap();
 
         assert_eq!(stage, crate::process::TerminationStage::Kill);
         assert!(started.elapsed() < std::time::Duration::from_secs(2));
         assert_eq!(
-            unsafe { libc::kill(process_id as libc::pid_t, 0) },
-            -1,
+            crate::process::observe_process(recorded).unwrap(),
+            crate::process::ProcessObservation::Missing,
             "child was not reaped"
-        );
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH)
         );
     }
 

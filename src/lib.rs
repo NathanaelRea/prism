@@ -1,3 +1,6 @@
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+compile_error!("unsupported Prism target OS; Prism supports only Linux and macOS");
+
 mod actions;
 mod agent;
 mod agent_session;
@@ -20,6 +23,7 @@ mod observability;
 mod opencode;
 mod plan;
 pub mod plan_run;
+mod platform;
 mod process;
 mod repo;
 mod review;
@@ -42,3 +46,6 @@ mod view;
 mod worker;
 mod workspace;
 mod workspace_state;
+
+#[cfg(test)]
+mod platform_contract_tests;

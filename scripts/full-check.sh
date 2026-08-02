@@ -39,27 +39,29 @@ export TMUX_TMPDIR="$isolated_tmux_dir"
 run cargo fmt --check
 run cargo test
 run cargo clippy --all-targets -- -D warnings
+run cargo test platform_contract_
 
 case "$(uname -s)" in
   Linux)
-    macos_target="${FULL_CHECK_MACOS_TARGET:-aarch64-apple-darwin}"
-    cc_var="CC_${macos_target//-/_}"
-
     require_command clang
     require_command pkg-config
-    require_rust_target "$macos_target"
 
     if ! pkg-config --exists sqlite3; then
       printf 'missing pkg-config metadata for sqlite3; install sqlite development files\n' >&2
       exit 1
     fi
 
-    printf '\n==> cargo clippy --target %s --all-targets -- -D warnings\n' "$macos_target"
-    env \
-      PKG_CONFIG_ALLOW_CROSS=1 \
-      LIBSQLITE3_SYS_USE_PKG_CONFIG=1 \
-      "$cc_var=clang" \
-      cargo clippy --target "$macos_target" --all-targets -- -D warnings
+    macos_targets="${FULL_CHECK_MACOS_TARGETS:-aarch64-apple-darwin}"
+    for macos_target in $macos_targets; do
+      require_rust_target "$macos_target"
+      cc_var="CC_${macos_target//-/_}"
+      printf '\n==> cargo clippy --target %s --all-targets -- -D warnings\n' "$macos_target"
+      env \
+        PKG_CONFIG_ALLOW_CROSS=1 \
+        LIBSQLITE3_SYS_USE_PKG_CONFIG=1 \
+        "$cc_var=clang" \
+        cargo clippy --target "$macos_target" --all-targets -- -D warnings
+    done
     ;;
   Darwin)
     ;;

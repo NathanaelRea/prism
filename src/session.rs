@@ -858,21 +858,8 @@ pub(crate) fn worktree_incarnation(path: &Path) -> String {
         return String::new();
     };
     if metadata.is_dir() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            return format!("directory:{}:{}", metadata.dev(), metadata.ino());
-        }
-        #[cfg(not(unix))]
-        {
-            let created = metadata
-                .created()
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default();
-            return format!("directory:{created}");
-        }
+        use std::os::unix::fs::MetadataExt;
+        return format!("directory:{}:{}", metadata.dev(), metadata.ino());
     }
     let modified = metadata
         .modified()
@@ -881,13 +868,10 @@ pub(crate) fn worktree_incarnation(path: &Path) -> String {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     let target = fs::read_to_string(&git_link).unwrap_or_default();
-    #[cfg(unix)]
     let file_id = {
         use std::os::unix::fs::MetadataExt;
         metadata.ino()
     };
-    #[cfg(not(unix))]
-    let file_id = 0;
     format!("{file_id}:{modified}:{}:{target}", metadata.len())
 }
 

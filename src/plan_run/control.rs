@@ -85,10 +85,12 @@ pub fn apply_plan_run_control(
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum RecordedProcessState {
-    Missing,
-    Live(u32),
-    Dead(u32),
+    Missing(Option<u32>),
+    Same(u32),
+    Reused(u32),
+    Unverifiable(u32),
 }
 
 pub fn prepare_plan_run_for_resume(
@@ -105,11 +107,17 @@ pub fn prepare_plan_run_for_resume(
         ) {
             continue;
         }
-        if let Some(process_id) = step.execution.process_id
-            && process_is_running(process_id)
-        {
-            has_live_child = true;
-            continue;
+        if step.execution.process_id.is_some() {
+            match recorded_process_state(
+                step.execution.process_id,
+                step.execution.process_identity,
+            )? {
+                RecordedProcessState::Same(_) | RecordedProcessState::Unverifiable(_) => {
+                    has_live_child = true;
+                    continue;
+                }
+                RecordedProcessState::Missing(_) | RecordedProcessState::Reused(_) => {}
+            }
         }
         let message = format!(
             "phase {} was interrupted before completion and was queued for resume",
@@ -147,13 +155,13 @@ pub fn abort_plan_step(conn: &rusqlite::Connection, step: &mut PlanStepRun) -> R
     }
     if let Some(process_id) = step.execution.process_id
         && let Err(error) =
-            crate::harness::terminate_process(process_id, step.execution.process_start_time_ticks)
+            terminate_recorded_process(process_id, step.execution.process_identity, "plan phase")
     {
         errors.push(error);
     }
     step.status = PlanStepStatus::Aborted;
     step.execution.process_id = None;
-    step.execution.process_start_time_ticks = None;
+    step.execution.process_identity = None;
     step.finished_unix_ms = Some(unix_ms());
     step.error = if errors.is_empty() {
         Some("aborted".to_string())
@@ -207,6 +215,20 @@ pub fn reconcile_stale_plan_run(
     persisted: &mut PersistedPlanRun,
     max_output_lines_per_step: usize,
 ) -> Result<bool, String> {
+    reconcile_stale_plan_run_with_observer(
+        conn,
+        persisted,
+        max_output_lines_per_step,
+        recorded_process_state,
+    )
+}
+
+pub(super) fn reconcile_stale_plan_run_with_observer(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedPlanRun,
+    max_output_lines_per_step: usize,
+    mut observe: impl FnMut(Option<u32>, Option<u64>) -> Result<RecordedProcessState, String>,
+) -> Result<bool, String> {
     let mut changed = false;
     let mut changed_run_status = false;
     let repo_root = persisted.run.repo_root.clone();
@@ -218,8 +240,9 @@ pub fn reconcile_stale_plan_run(
         ) {
             continue;
         }
-        match recorded_process_state(step.execution.process_id) {
-            RecordedProcessState::Live(process_id) => {
+        match observe(step.execution.process_id, step.execution.process_identity)? {
+            RecordedProcessState::Same(process_id)
+            | RecordedProcessState::Unverifiable(process_id) => {
                 if reconcile_plan_step_from_server(conn, step, max_output_lines_per_step)
                     .unwrap_or(false)
                 {
@@ -245,20 +268,30 @@ pub fn reconcile_stale_plan_run(
                     "kept-running-live-process",
                 );
             }
-            RecordedProcessState::Dead(process_id) => {
+            RecordedProcessState::Reused(process_id) => {
                 let message = format!(
-                    "Prism restarted while phase {} was running, and recorded process {process_id} is no longer running.",
+                    "Prism restarted while phase {} was running, and process id {process_id} now belongs to a different process.",
                     step.step
                 );
                 mark_stale_step_failed(conn, step, &message, max_output_lines_per_step)?;
                 changed = true;
                 changed_run_status = true;
-                append_stale_reconciliation_log(&repo_root, &run_id, step, "failed-dead-process");
+                append_stale_reconciliation_log(&repo_root, &run_id, step, "failed-reused-process");
             }
-            RecordedProcessState::Missing => {
-                let message = format!(
-                    "Prism restarted while phase {} was marked running, but no child process id was recorded.",
-                    step.step
+            RecordedProcessState::Missing(process_id) => {
+                let message = process_id.map_or_else(
+                    || {
+                        format!(
+                            "Prism restarted while phase {} was marked running, but no child process id was recorded.",
+                            step.step
+                        )
+                    },
+                    |process_id| {
+                        format!(
+                            "Prism restarted while phase {} was running, and recorded process {process_id} is no longer running.",
+                            step.step
+                        )
+                    },
                 );
                 mark_stale_step_failed(conn, step, &message, max_output_lines_per_step)?;
                 changed = true;
@@ -306,13 +339,54 @@ pub(super) fn mark_stale_step_failed(
     save_step_with_conn(conn, step)
 }
 
-pub(super) fn recorded_process_state(process_id: Option<u32>) -> RecordedProcessState {
-    match process_id {
-        Some(process_id) if process_is_running(process_id) => {
-            RecordedProcessState::Live(process_id)
+pub(super) fn recorded_process_state(
+    process_id: Option<u32>,
+    stored_identity: Option<u64>,
+) -> Result<RecordedProcessState, String> {
+    let Some(process_id) = process_id else {
+        return Ok(RecordedProcessState::Missing(None));
+    };
+    let recorded = crate::process::RecordedProcess::from_stored(process_id, stored_identity);
+    crate::process::observe_process(recorded)
+        .map(|observation| recorded_process_state_from_observation(process_id, observation))
+        .map_err(|error| format!("inspect plan phase process {process_id}: {error}"))
+}
+
+pub(super) fn recorded_process_state_from_observation(
+    process_id: u32,
+    observation: crate::process::ProcessObservation,
+) -> RecordedProcessState {
+    match observation {
+        crate::process::ProcessObservation::RunningSameProcess => {
+            RecordedProcessState::Same(process_id)
         }
-        Some(process_id) => RecordedProcessState::Dead(process_id),
-        None => RecordedProcessState::Missing,
+        crate::process::ProcessObservation::Missing => {
+            RecordedProcessState::Missing(Some(process_id))
+        }
+        crate::process::ProcessObservation::IdentityReused => {
+            RecordedProcessState::Reused(process_id)
+        }
+        crate::process::ProcessObservation::RunningUnverifiable => {
+            RecordedProcessState::Unverifiable(process_id)
+        }
+    }
+}
+
+fn terminate_recorded_process(
+    process_id: u32,
+    stored_identity: Option<u64>,
+    label: &str,
+) -> Result<(), String> {
+    let recorded = crate::process::RecordedProcess::from_stored(process_id, stored_identity);
+    match crate::process::terminate_recorded_process(recorded, std::time::Duration::from_secs(1))
+        .map_err(|error| format!("terminate {label} process {process_id}: {error}"))?
+    {
+        crate::process::TerminationOutcome::Terminated
+        | crate::process::TerminationOutcome::AlreadyExited
+        | crate::process::TerminationOutcome::IdentityReused => Ok(()),
+        crate::process::TerminationOutcome::Unverifiable => Err(format!(
+            "refusing to terminate {label} process {process_id}: reusable process identity is unavailable"
+        )),
     }
 }
 
@@ -536,23 +610,6 @@ pub(super) fn reload_pause_request(
         return Ok(true);
     }
     Ok(false)
-}
-
-#[cfg(unix)]
-pub(super) fn process_is_running(process_id: u32) -> bool {
-    let result = unsafe { libc::kill(process_id as libc::pid_t, 0) };
-    result == 0
-}
-
-#[cfg(not(unix))]
-pub(super) fn process_is_running(process_id: u32) -> bool {
-    crate::process::run_output_allow_failure_named(
-        Command::new("tasklist").args(["/FI", &format!("PID eq {process_id}")]),
-        crate::process::ProcessPolicy::Metadata,
-        crate::process::ProcessDescriptor::new("harness.process.inspect"),
-    )
-    .map(|output| output.stdout.contains(&process_id.to_string()))
-    .unwrap_or(false)
 }
 
 pub(super) fn reset_step_for_retry(step: &mut PlanStepRun) {
