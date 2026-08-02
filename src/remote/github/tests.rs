@@ -2016,6 +2016,23 @@ fn github_preserves_merge_state_status_separately_from_mergeability() {
         normalized.mergeability,
         crate::remote::MergeabilityState::Mergeable
     );
+
+    let mut behind = parse_pr_summary_index(&raw.replace("BLOCKED", "BEHIND")).remove(0);
+    assert_eq!(behind.merge_state_status, "BEHIND");
+    behind.change_request_identity = Some(test_identity(
+        crate::remote::ProviderKind::GitHub,
+        "github.com",
+        "example/repo",
+        "117",
+    ));
+    let normalized =
+        adapter::normalize_summary(behind, crate::remote::RemoteOperation::ListChangeRequests)
+            .unwrap();
+
+    assert_eq!(
+        normalized.mergeability,
+        crate::remote::MergeabilityState::Behind
+    );
 }
 
 #[test]

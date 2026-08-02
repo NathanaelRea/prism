@@ -520,12 +520,22 @@ pub(super) fn normalize_summary(
     } else {
         LifecycleState::from_native(summary.state.clone())
     };
-    let mergeability = summary
-        .native_state_evidence
-        .mergeability
-        .first()
-        .cloned()
-        .unwrap_or_else(|| summary.merge_state_status.clone());
+    let native_mergeability = MergeabilityState::from_native(
+        summary
+            .native_state_evidence
+            .mergeability
+            .first()
+            .cloned()
+            .unwrap_or_else(|| summary.merge_state_status.clone()),
+    );
+    let merge_state = MergeabilityState::from_native(summary.merge_state_status.clone());
+    let mergeability = match (&native_mergeability, &merge_state) {
+        (MergeabilityState::Conflicting, _) | (_, MergeabilityState::Conflicting) => {
+            MergeabilityState::Conflicting
+        }
+        (_, MergeabilityState::Behind) => MergeabilityState::Behind,
+        _ => native_mergeability,
+    };
     Ok(ChangeRequestSummary {
         change_request,
         title: summary.title,
@@ -535,7 +545,7 @@ pub(super) fn normalize_summary(
         lifecycle,
         review_decision: ReviewDecision::from_native(summary.review_decision),
         requested_reviewers: summary.requested_reviewers,
-        mergeability: MergeabilityState::from_native(mergeability),
+        mergeability,
         check_state: CheckState::from_native(summary.check_status),
         queue_state: QueueState::from_native(summary.queue_state),
         native_state_evidence: summary.native_state_evidence,
