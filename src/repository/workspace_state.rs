@@ -1243,6 +1243,7 @@ fn controls_for(
     ownerless: bool,
 ) -> AvailableControls {
     let terminal = lifecycle.terminal();
+    let stranded = !terminal && dispatch == Some(execution::DispatchState::Terminal);
     AvailableControls {
         pause: ownerless
             && !terminal
@@ -1255,7 +1256,8 @@ fn controls_for(
             && !terminal
             && (pause_requested
                 || lifecycle == WorkflowLifecycle::Paused
-                || dispatch == Some(execution::DispatchState::Paused))
+                || dispatch == Some(execution::DispatchState::Paused)
+                || stranded)
             && dispatch != Some(execution::DispatchState::RecoveryPending),
         stop: ownerless && !terminal,
         recover: ownerless && dispatch == Some(execution::DispatchState::RecoveryPending),
@@ -1368,7 +1370,10 @@ fn apply_control_transaction(
             }
         }
         ControlAction::Resume => {
-            if !workflow.pause_requested
+            let stranded = !workflow.lifecycle.terminal()
+                && workflow.dispatch.state == Some(execution::DispatchState::Terminal);
+            if !stranded
+                && !workflow.pause_requested
                 && workflow.lifecycle != WorkflowLifecycle::Paused
                 && workflow.dispatch.state != Some(execution::DispatchState::Paused)
             {
@@ -2029,6 +2034,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dispatch, ("claimed".to_string(), 0));
+    }
+
+    #[test]
+    fn nonterminal_workflow_with_terminal_dispatch_can_be_resumed() {
+        let mut conn = connection();
+        insert_run(&conn, "queued", false, "terminal");
+        conn.execute(
+            "insert into plan_step_run (run_id, step, prompt, status)
+             values ('plan-1', 1, 'phase', 'queued')",
+            [],
+        )
+        .unwrap();
+        let workflow = workflow("queued", false, "terminal");
+
+        assert!(
+            controls_for(
+                workflow.lifecycle,
+                workflow.pause_requested,
+                workflow.dispatch.state,
+                true,
+            )
+            .resume
+        );
+        let (state, _) =
+            apply_control_transaction(&mut conn, &workflow, ControlAction::Resume).unwrap();
+
+        assert_eq!(state, "queued");
+        let persisted: (String, i64, String) = conn
+            .query_row(
+                "select p.status, p.pause_requested, e.dispatch_state
+                 from plan_run p join workflow_execution e on e.run_id = p.id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, ("queued".to_string(), 0, "queued".to_string()));
     }
 
     #[test]
