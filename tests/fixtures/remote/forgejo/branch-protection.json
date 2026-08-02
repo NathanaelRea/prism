@@ -1,0 +1,9 @@
+{
+  "enable_status_check": true,
+  "status_check_contexts": ["build", "lint"],
+  "required_approvals": 2,
+  "block_on_outdated_branch": true,
+  "block_on_rejected_reviews": true,
+  "block_on_official_review_requests": true,
+  "dismiss_stale_approvals": true
+}

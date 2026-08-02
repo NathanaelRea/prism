@@ -1,0 +1,18 @@
+[
+  {
+    "id": 501,
+    "project_id": 20,
+    "sha": "0123456789abcdef0123456789abcdef01234567",
+    "status": "failed",
+    "ref": "feature/topic",
+    "source": "push"
+  },
+  {
+    "id": 502,
+    "project_id": 20,
+    "sha": "fedcba9876543210fedcba9876543210fedcba98",
+    "status": "success",
+    "ref": "refs/merge-requests/7/merge",
+    "source": "merge_request_event"
+  }
+]

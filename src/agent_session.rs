@@ -524,7 +524,7 @@ mod tests {
     };
     use crate::agent::AgentState;
     use crate::config::Config;
-    use crate::github::PrCache;
+    use crate::remote::PrCache;
     use crate::repo::Repository;
     use crate::session::{Session, worktree_incarnation};
     use crate::tui::ManagedRepo;

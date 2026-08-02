@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::github::PrCheckState;
+use crate::remote::PrCheckState;
 
 use super::stabilization_model::*;
 
@@ -75,6 +75,8 @@ pub(crate) fn derive_blockers(snapshot: &StabilizationSnapshot) -> Vec<Stabiliza
     let required_ci_blocker = required_ci_blocker(&pull_request.ci.required);
     if let Some(blocker) = required_ci_blocker {
         blockers.push(blocker);
+    } else if pull_request.ci.aggregate == PrCheckState::Unknown {
+        blockers.push(StabilizationBlocker::CiMissingRequiredChecks);
     } else if pull_request.ci.required.is_empty() {
         match pull_request.ci.aggregate {
             PrCheckState::Failed | PrCheckState::Mixed => {
@@ -86,20 +88,17 @@ pub(crate) fn derive_blockers(snapshot: &StabilizationSnapshot) -> Vec<Stabiliza
     }
 
     if pull_request.review.approval_required
-        && !pull_request
-            .review
-            .decision
-            .eq_ignore_ascii_case("APPROVED")
+        && !pull_request.review.approval_requirement_satisfied()
     {
         blockers.push(StabilizationBlocker::ReviewApprovalMissing);
     }
 
     match &snapshot.policy {
         PolicyFacts::Blocked { .. } => blockers.push(StabilizationBlocker::PolicyBlocked),
-        PolicyFacts::Unknown { .. } if snapshot.goal.auto_merge => {
+        PolicyFacts::Unknown { .. } => {
             blockers.push(StabilizationBlocker::PolicyUnknown);
         }
-        PolicyFacts::Unknown { .. } | PolicyFacts::Satisfied => {}
+        PolicyFacts::Satisfied => {}
     }
 
     if blockers.is_empty() {
@@ -169,7 +168,7 @@ pub(crate) fn conservative_cached_state(
         repository: RepositoryFacts {
             root: session.path.clone(),
             default_base: config.default_base.clone(),
-            github_remote: None,
+            remote_project: None,
             policy_refreshed_unix_ms: None,
             policy_error: None,
         },
@@ -185,12 +184,8 @@ pub(crate) fn conservative_cached_state(
             remote_head_sha: None,
         },
         pull_request,
-        policy: if config.auto.merge {
-            PolicyFacts::Unknown {
-                reason: Some("repository policy is unavailable in the cached view".to_string()),
-            }
-        } else {
-            PolicyFacts::Satisfied
+        policy: PolicyFacts::Unknown {
+            reason: Some("repository policy is unavailable in the cached view".to_string()),
         },
         goal: StabilizationGoal {
             auto_merge: config.auto.merge,
@@ -332,9 +327,20 @@ fn reason_for_blocker(snapshot: &StabilizationSnapshot, blocker: &StabilizationB
         StabilizationBlocker::ReviewFeedbackFound => {
             "actionable review feedback is present".to_string()
         }
-        StabilizationBlocker::ReviewApprovalMissing => {
-            "review approval is required but not satisfied".to_string()
-        }
+        StabilizationBlocker::ReviewApprovalMissing => snapshot.pull_request.as_ref().map_or_else(
+            || "review approval is required but not satisfied".to_string(),
+            |pull_request| {
+                let review = &pull_request.review;
+                if review.required_approvals > 0 {
+                    format!(
+                        "{} of {} required review approvals are satisfied",
+                        review.approval_count, review.required_approvals
+                    )
+                } else {
+                    "review approval is required but not satisfied".to_string()
+                }
+            },
+        ),
         StabilizationBlocker::CiFailed => required_check_reason(
             snapshot,
             &[PrCheckState::Failed, PrCheckState::Mixed],
@@ -415,6 +421,14 @@ fn required_check_reason(
 
 fn work_guard(snapshot: &StabilizationSnapshot) -> WorkGuard {
     WorkGuard {
+        change_request_identity: snapshot
+            .pull_request
+            .as_ref()
+            .and_then(|pull_request| pull_request.change_request_identity.clone()),
+        authorized_target_branch: snapshot
+            .pull_request
+            .as_ref()
+            .map(|pull_request| pull_request.base_ref.clone()),
         local_head_sha: snapshot.worktree.local_head_sha.clone(),
         remote_head_sha: snapshot.worktree.remote_head_sha.clone(),
         pr_head_sha: snapshot
@@ -447,7 +461,7 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::agent::AgentState;
-    use crate::github::{CiFailure, PrCache, PrCheckState, PrDetails, PrSummary};
+    use crate::remote::{CachedCiFailure, PrCache, PrCheckState, PrDetails, PrSummary};
     use crate::session::{Session, SessionClassification};
 
     use super::*;
@@ -495,6 +509,7 @@ mod tests {
         let mut snapshot = snapshot(Some(pr));
         snapshot.worktree.dirty = true;
         snapshot.pending_push = Some(PendingPushGuard {
+            change_request_identity: None,
             repair_kind: RepairKind::Review,
             commit_sha: "repair".to_string(),
             expected_local_head_sha: "repair".to_string(),
@@ -752,7 +767,24 @@ mod tests {
     }
 
     #[test]
-    fn policy_unknown_blocks_auto_merge_only() {
+    fn numeric_approval_threshold_blocks_planning_despite_approved_aggregate() {
+        let mut pr = clean_pr();
+        pr.review.approval_required = true;
+        pr.review.required_approvals = 2;
+        pr.review.approval_count = 1;
+
+        let work = plan(&snapshot(Some(pr)));
+
+        assert_eq!(work.blocker, StabilizationBlocker::ReviewApprovalMissing);
+        assert_eq!(work.kind, StabilizationWorkKind::WaitForReview);
+        assert_eq!(
+            work.reason,
+            "1 of 2 required review approvals are satisfied"
+        );
+    }
+
+    #[test]
+    fn policy_unknown_blocks_manual_and_auto_merge_readiness() {
         let mut manual = snapshot(Some(clean_pr()));
         manual.policy = PolicyFacts::Unknown {
             reason: Some("not fetched".to_string()),
@@ -761,11 +793,64 @@ mod tests {
         let mut auto = manual.clone();
         auto.goal.auto_merge = true;
 
-        assert_eq!(
-            plan(&manual).blocker,
-            StabilizationBlocker::ReadyForManualMerge
-        );
+        assert_eq!(plan(&manual).blocker, StabilizationBlocker::PolicyUnknown);
         assert_eq!(plan(&auto).blocker, StabilizationBlocker::PolicyUnknown);
+    }
+
+    #[test]
+    fn unknown_aggregate_ci_blocks_manual_and_auto_merge_readiness() {
+        for auto_merge in [false, true] {
+            let mut pr = clean_pr();
+            pr.ci.aggregate = PrCheckState::Unknown;
+            let mut snapshot = snapshot(Some(pr));
+            snapshot.goal.auto_merge = auto_merge;
+
+            let work = plan(&snapshot);
+
+            assert_eq!(work.blocker, StabilizationBlocker::CiMissingRequiredChecks);
+            assert!(!matches!(
+                work.kind,
+                StabilizationWorkKind::MarkReadyForManualMerge | StabilizationWorkKind::Merge
+            ));
+        }
+    }
+
+    #[test]
+    fn authoritative_no_ci_is_ready_when_policy_requires_no_checks() {
+        for auto_merge in [false, true] {
+            let mut pr = clean_pr();
+            pr.ci.aggregate = PrCheckState::Success;
+            pr.ci.required.clear();
+            let mut snapshot = snapshot(Some(pr));
+            snapshot.goal.auto_merge = auto_merge;
+
+            let work = plan(&snapshot);
+
+            assert_eq!(
+                work.blocker,
+                if auto_merge {
+                    StabilizationBlocker::ReadyToAutoMerge
+                } else {
+                    StabilizationBlocker::ReadyForManualMerge
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_aggregate_ci_blocks_even_when_known_required_checks_pass() {
+        let mut pr = clean_pr();
+        pr.ci.aggregate = PrCheckState::Unknown;
+        pr.ci.required.push(CheckFact {
+            name: "ci".to_string(),
+            state: PrCheckState::Success,
+            required: true,
+            head_sha: Some("head".to_string()),
+        });
+
+        let work = plan(&snapshot(Some(pr)));
+
+        assert_eq!(work.blocker, StabilizationBlocker::CiMissingRequiredChecks);
     }
 
     #[test]
@@ -857,6 +942,19 @@ mod tests {
     }
 
     #[test]
+    fn unknown_pull_request_lifecycle_fails_closed() {
+        let mut pr = clean_pr();
+        pr.state = PullRequestState::Unknown;
+        let mut snapshot = snapshot(Some(pr));
+        snapshot.goal.auto_merge = true;
+
+        let work = plan(&snapshot);
+
+        assert_eq!(work.blocker, StabilizationBlocker::Escalate);
+        assert_eq!(work.kind, StabilizationWorkKind::Escalate);
+    }
+
+    #[test]
     fn planner_always_returns_one_work_item_for_representative_snapshots() {
         let cases = [snapshot(None), snapshot(Some(clean_pr())), {
             let mut item = snapshot(Some(clean_pr()));
@@ -940,7 +1038,7 @@ mod tests {
             repository: RepositoryFacts {
                 root: PathBuf::from("/repo"),
                 default_base: Some("main".to_string()),
-                github_remote: Some("owner/repo".to_string()),
+                remote_project: Some("owner/repo".to_string()),
                 policy_refreshed_unix_ms: Some(1),
                 policy_error: None,
             },
@@ -966,6 +1064,7 @@ mod tests {
     fn clean_pr() -> PullRequestFacts {
         PullRequestFacts {
             number: 1,
+            change_request_identity: Some(crate::remote::test_change_request_identity()),
             url: "https://example.test/pr/1".to_string(),
             state: PullRequestState::Open,
             draft: false,
@@ -977,16 +1076,19 @@ mod tests {
                 aggregate: PrCheckState::Success,
                 required: Vec::new(),
                 optional_failures: Vec::new(),
-                failures: Vec::<CiFailure>::new(),
+                failures: Vec::<CachedCiFailure>::new(),
             },
             review: ReviewFacts {
                 decision: "APPROVED".to_string(),
                 approval_required: false,
+                approval_count: 0,
+                required_approvals: 0,
                 actionable_reviews: Vec::new(),
                 unresolved_threads: Vec::new(),
                 top_level_comments: 0,
             },
             mergeability: MergeabilityFacts::Clean,
+            queue_state: crate::remote::QueueState::NotQueued,
             top_level_comment_count: 0,
             observation_error: None,
         }
@@ -1025,6 +1127,8 @@ mod tests {
             pr: PrCache::observed(
                 PrSummary {
                     number: 42,
+                    change_request_identity: None,
+                    native_state_evidence: crate::remote::NativeStateEvidence::default(),
                     title: "Ready".to_string(),
                     author: "author".to_string(),
                     body: String::new(),
@@ -1038,6 +1142,7 @@ mod tests {
                     updated_at: "now".to_string(),
                     check_status: "passed".to_string(),
                     merge_state_status: "CLEAN".to_string(),
+                    queue_state: "not_queued".to_string(),
                     comment_count: 0,
                     merged: false,
                     draft: false,

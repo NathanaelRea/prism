@@ -1,0 +1,21 @@
+{
+  "id": 1001,
+  "iid": 7,
+  "title": "Stale embedded pipeline",
+  "state": "opened",
+  "source_branch": "feature/topic",
+  "target_branch": "main",
+  "sha": "0123456789abcdef0123456789abcdef01234567",
+  "source_project_id": 20,
+  "target_project_id": 20,
+  "author": { "id": 1, "username": "alice" },
+  "detailed_merge_status": "can_be_merged",
+  "head_pipeline": {
+    "id": 499,
+    "project_id": 20,
+    "sha": "fedcba9876543210fedcba9876543210fedcba98",
+    "status": "success",
+    "ref": "feature/topic",
+    "source": "push"
+  }
+}

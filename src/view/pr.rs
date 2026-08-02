@@ -41,7 +41,12 @@ pub(super) fn pr_panel_lines(
                 pr_state_style(summary),
             ),
             Span::styled(
-                format!(" PR #{} {}", summary.number, pr_state_label(summary)),
+                format!(
+                    " {} #{} {}",
+                    summary.provider_noun(),
+                    summary.number,
+                    pr_state_label(summary)
+                ),
                 pr_state_style(summary),
             ),
         ]),
@@ -57,7 +62,7 @@ pub(super) fn pr_panel_lines(
 }
 
 pub(super) fn pr_comment_lines(
-    details: &crate::github::PrDetails,
+    details: &crate::remote::PrDetails,
     max_comments: usize,
     selected: usize,
 ) -> Vec<Line<'static>> {
@@ -93,7 +98,7 @@ pub(crate) struct PrCommentDisplayRow {
     pub resolved: String,
 }
 
-pub(crate) fn pr_comment_rows(details: &crate::github::PrDetails) -> Vec<PrCommentDisplayRow> {
+pub(crate) fn pr_comment_rows(details: &crate::remote::PrDetails) -> Vec<PrCommentDisplayRow> {
     let mut rows = Vec::new();
     for comment in details.comments.iter().rev() {
         rows.push(PrCommentDisplayRow {
@@ -235,7 +240,7 @@ pub(super) fn description_lines(body: &str, max_lines: usize) -> Vec<Line<'stati
     }
 }
 
-pub(super) fn pr_comment_count_label(cache: &crate::github::PrCache) -> String {
+pub(super) fn pr_comment_count_label(cache: &crate::remote::PrCache) -> String {
     if let Some(details) = cache.details() {
         let open = details.comments.len()
             + details
@@ -257,8 +262,8 @@ pub(super) fn pr_comment_count_label(cache: &crate::github::PrCache) -> String {
 }
 
 pub(super) fn review_decision_for_display(
-    summary: &crate::github::PrSummary,
-    details: Option<&crate::github::PrDetails>,
+    summary: &crate::remote::PrSummary,
+    details: Option<&crate::remote::PrDetails>,
 ) -> String {
     if !matches!(summary.review_decision.as_str(), "" | "UNKNOWN") {
         return summary.review_decision.clone();
@@ -283,8 +288,10 @@ pub(super) fn review_decision_for_display(
         .unwrap_or_else(|| summary.review_decision.clone())
 }
 
-pub(super) fn pr_state_label(summary: &crate::github::PrSummary) -> &'static str {
-    if pr_has_merge_conflict(summary) {
+pub(super) fn pr_state_label(summary: &crate::remote::PrSummary) -> &'static str {
+    if !pr_lifecycle_is_known(summary) {
+        "unknown"
+    } else if pr_has_merge_conflict(summary) {
         "conflict"
     } else if summary.merged {
         "merged"
@@ -309,9 +316,12 @@ pub(super) fn review_label(decision: &str) -> &str {
 }
 
 pub(super) fn pr_state_icon(
-    summary: &crate::github::PrSummary,
+    summary: &crate::remote::PrSummary,
     icon_style: IconStyle,
 ) -> &'static str {
+    if !pr_lifecycle_is_known(summary) {
+        return "?";
+    }
     if pr_has_merge_conflict(summary) {
         return icon(icon_style, "⚔", "");
     }
@@ -337,8 +347,16 @@ pub(super) fn pr_state_icon(
     }
 }
 
-pub(super) fn pr_has_merge_conflict(summary: &crate::github::PrSummary) -> bool {
+pub(super) fn pr_has_merge_conflict(summary: &crate::remote::PrSummary) -> bool {
     summary.merge_state_status.eq_ignore_ascii_case("DIRTY")
+}
+
+fn pr_lifecycle_is_known(summary: &crate::remote::PrSummary) -> bool {
+    summary.merged
+        || matches!(
+            summary.state.trim().to_ascii_uppercase().as_str(),
+            "OPEN" | "CLOSED" | "MERGED"
+        )
 }
 
 pub(super) fn ci_icon(
@@ -385,8 +403,10 @@ pub(super) fn auto_status_label(status: AutoRunStatus) -> &'static str {
     }
 }
 
-pub(super) fn pr_state_style(summary: &crate::github::PrSummary) -> Style {
-    if pr_has_merge_conflict(summary) {
+pub(super) fn pr_state_style(summary: &crate::remote::PrSummary) -> Style {
+    if !pr_lifecycle_is_known(summary) {
+        attention_style()
+    } else if pr_has_merge_conflict(summary) {
         error_style()
     } else if summary.merged {
         Style::default()
@@ -442,8 +462,10 @@ pub(super) fn pr_check_style(status: &str) -> Style {
     }
 }
 
-pub(super) fn pr_style(summary: &crate::github::PrSummary) -> Style {
-    if pr_has_merge_conflict(summary) {
+pub(super) fn pr_style(summary: &crate::remote::PrSummary) -> Style {
+    if !pr_lifecycle_is_known(summary) {
+        attention_style()
+    } else if pr_has_merge_conflict(summary) {
         Style::default().fg(Color::Red)
     } else if summary.merged {
         Style::default().fg(Color::Magenta)

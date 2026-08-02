@@ -1,0 +1,27 @@
+{
+  "id": 1001,
+  "iid": 7,
+  "title": "Same project",
+  "description": "Adapter fixture",
+  "state": "opened",
+  "draft": false,
+  "source_branch": "feature/topic",
+  "target_branch": "main",
+  "sha": "0123456789abcdef0123456789abcdef01234567",
+  "source_project_id": 20,
+  "target_project_id": 20,
+  "author": { "id": 1, "username": "alice" },
+  "reviewers": [
+    { "id": 2, "username": "bob" },
+    { "id": 3, "username": "carol" }
+  ],
+  "detailed_merge_status": "can_be_merged",
+  "head_pipeline": {
+    "id": 501,
+    "project_id": 20,
+    "sha": "0123456789abcdef0123456789abcdef01234567",
+    "status": "success",
+    "ref": "feature/topic",
+    "source": "push"
+  }
+}

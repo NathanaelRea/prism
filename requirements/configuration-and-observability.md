@@ -19,8 +19,8 @@
   state comparable to `opencode db`.
 - **Constraint**: Normal Prism operation does not require the external `sqlite3`
   executable. Build-time and runtime prerequisites are documented separately.
-- **Customization**: Users can override executable paths for Git, GitHub CLI,
-  tmux, Worktrunk, lazygit, fzf, and configured harnesses.
+- **Customization**: Users can override executable paths for Git, GitHub and
+  GitLab CLIs, tmux, Worktrunk, lazygit, fzf, and configured harnesses.
 - **Behavior**: The TUI provides a global harness chooser for the fixed built-in
   IDs and configured generic harnesses, and can collect interactive and optional
   headless commands when creating a generic harness.
@@ -32,9 +32,11 @@
 - **Behavior**: Startup validates tools required for the selected mode and names
   missing tools and relevant configuration locations. Optional tools are checked
   only when their actions require them.
-- **Behavior**: `prism doctor` reports tool availability and versions, GitHub
-  authentication, configured checks, selected harness capabilities, and discovered
-  worktrees.
+- **Behavior**: `prism doctor` reports tool availability and versions; GitHub
+  and GitLab CLI authentication; Forgejo credential-source availability; the
+  resolved remote host/provider, capabilities, and server version when
+  discoverable; configured checks; selected harness capabilities; and discovered
+  worktrees, without printing credential values.
 - **Behavior**: Startup rejects Worktrunk versions below 0.58.0. Diagnostics
   report the detected Worktrunk version and minimum; observation failures use a
   bounded safe summary rather than raw command output or development URLs.

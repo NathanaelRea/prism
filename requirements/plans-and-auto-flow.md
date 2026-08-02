@@ -60,7 +60,7 @@
 - **Invariant**: Plan-backed Auto Flow links to one persisted Plan run instead of
   duplicating its phases as Auto Flow steps.
 - **Behavior**: After implementation and local verification, Auto Flow delegates
-  pull request gate decisions to PR Stabilization and proceeds toward the
+  change-request gate decisions to Change Request Stabilization and proceeds toward the
   configured merge-readiness goal.
 - **Default**: Auto Flow may push the initial implementation and create its pull
   request, but managed repair commits remain local behind a guarded pending push.

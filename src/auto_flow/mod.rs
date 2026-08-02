@@ -11,7 +11,6 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::github::{PrCheckState, PrDetails, PrSummary};
 use crate::observability::{self, LogLevel};
 use crate::plan::PlanExecution;
 use crate::plan_run::{
@@ -21,6 +20,7 @@ use crate::plan_run::{
     resume_paused_plan_run, retry_failed_steps as retry_plan_failed_steps,
     retry_from_step as retry_plan_from_step, save_plan_run,
 };
+use crate::remote::{PrCheckState, PrDetails, PrSummary};
 use crate::repo::Repository;
 use crate::review::{ReviewFeedback, ReviewFeedbackFilter, actionable_review_feedback};
 use crate::verify::{VerifyMode, VerifyResult};
@@ -59,7 +59,8 @@ pub use output::{
 pub use runner::execute_auto_initial_step;
 pub use storage::{
     load_auto_run, load_auto_run_snapshot, load_recent_active_run_snapshots_for_repo,
-    load_recent_active_runs_for_repo, migrate_schema, save_auto_run, submit_auto_run,
+    load_recent_active_runs_for_repo, load_terminal_repair_run_snapshots_for_repo, migrate_schema,
+    save_auto_run, submit_auto_run,
 };
 
 pub(crate) use support::unix_ms;

@@ -1,0 +1,22 @@
+{
+  "id": 99,
+  "number": 7,
+  "title": "Change",
+  "body": "A forked pull request",
+  "state": "open",
+  "merged": false,
+  "mergeable": true,
+  "head": {
+    "ref": "topic",
+    "sha": "abc123",
+    "repo": { "id": 12, "full_name": "contributor/widget" }
+  },
+  "base": {
+    "ref": "main",
+    "sha": "def456",
+    "repo": { "id": 10, "full_name": "acme/widget" }
+  },
+  "user": { "login": "contributor" },
+  "html_url": "https://codeberg.org/acme/widget/pulls/7",
+  "updated_at": "2026-07-29T12:00:00Z"
+}

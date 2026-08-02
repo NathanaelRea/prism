@@ -302,29 +302,6 @@ pub(crate) fn fetch_origin(path: &std::path::Path, config: &Config) -> Result<()
     )
 }
 
-pub(crate) fn fetch_pull_request_branch(
-    path: &std::path::Path,
-    config: &Config,
-    number: u64,
-    branch: &str,
-) -> Result<(), String> {
-    if branch.trim().is_empty() || branch == "(detached)" {
-        return Err("cannot fetch pull request into an empty or detached branch name".to_string());
-    }
-    if local_branch_exists(path, config, branch) {
-        return Ok(());
-    }
-    run_status_named(
-        Command::new(config.tool("git"))
-            .arg("-C")
-            .arg(path)
-            .args(["fetch", "origin"])
-            .arg(format!("pull/{number}/head:refs/heads/{branch}")),
-        ProcessPolicy::NetworkQuery,
-        ProcessDescriptor::new("git.fetch"),
-    )
-}
-
 pub fn selected_dirty(path: &std::path::Path, config: &Config) -> Result<bool, String> {
     Ok(inspect_dirty(path, config)?.dirty)
 }
@@ -488,6 +465,15 @@ pub(crate) fn remote_branch_head_sha(
     branch: &str,
     config: &Config,
 ) -> Result<Option<String>, String> {
+    remote_branch_head_sha_on(path, "origin", branch, config)
+}
+
+pub(crate) fn remote_branch_head_sha_on(
+    path: &std::path::Path,
+    remote: &str,
+    branch: &str,
+    config: &Config,
+) -> Result<Option<String>, String> {
     if branch.trim().is_empty() || branch == "(detached)" {
         return Ok(None);
     }
@@ -496,14 +482,14 @@ pub(crate) fn remote_branch_head_sha(
             .arg("-C")
             .arg(path)
             .args(["rev-parse", "--verify", "--quiet"])
-            .arg(format!("refs/remotes/origin/{branch}")),
+            .arg(format!("refs/remotes/{remote}/{branch}")),
         ProcessPolicy::Metadata,
     )?;
     if !output.status.success() {
         return match output.status.code() {
             Some(1) => Ok(None),
             _ => Err(format!(
-                "inspect remote branch {branch}: {}",
+                "inspect remote branch {remote}/{branch}: {}",
                 output.stderr.trim()
             )),
         };
@@ -514,6 +500,94 @@ pub(crate) fn remote_branch_head_sha(
     } else {
         Ok(Some(sha.to_string()))
     }
+}
+
+pub(crate) fn fetch_remote_branch(
+    path: &std::path::Path,
+    remote: &str,
+    branch: &str,
+    config: &Config,
+) -> Result<(), String> {
+    let remote = remote.trim();
+    if remote.is_empty() {
+        return Err("cannot fetch from an empty remote name".to_string());
+    }
+    let branch = branch.trim();
+    if branch.is_empty() || branch == "(detached)" {
+        return Err("cannot fetch an empty or detached branch name".to_string());
+    }
+
+    run_status_named(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["fetch", "--no-tags", remote])
+            .arg(format!(
+                "+refs/heads/{branch}:refs/remotes/{remote}/{branch}"
+            )),
+        ProcessPolicy::NetworkQuery,
+        ProcessDescriptor::new("git.fetch"),
+    )
+}
+
+pub(crate) fn push_remote_branch_head_sha(
+    path: &std::path::Path,
+    remote: &str,
+    branch: &str,
+    config: &Config,
+) -> Result<Option<String>, String> {
+    let push_url = single_push_remote_url(path, remote, config)?;
+    let output = run_output_allow_failure(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["ls-remote", "--exit-code", "--heads"])
+            .arg(&push_url)
+            .arg(format!("refs/heads/{branch}")),
+        ProcessPolicy::NetworkQuery,
+    )?;
+    if !output.status.success() {
+        return match output.status.code() {
+            Some(2) => Ok(None),
+            _ => Err(format!(
+                "inspect push branch {remote}/{branch}: {}",
+                output.stderr.trim()
+            )),
+        };
+    }
+    let sha = output
+        .stdout
+        .split_whitespace()
+        .next()
+        .filter(|sha| !sha.is_empty())
+        .ok_or_else(|| format!("push branch {remote}/{branch} returned no object ID"))?;
+    Ok(Some(sha.to_string()))
+}
+
+pub(crate) fn single_push_remote_url(
+    path: &std::path::Path,
+    remote: &str,
+    config: &Config,
+) -> Result<String, String> {
+    let push_urls = run_capture(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["remote", "get-url", "--push", "--all", remote]),
+        ProcessPolicy::Metadata,
+    )?;
+    let urls = push_urls
+        .lines()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .collect::<Vec<_>>();
+    if urls.len() != 1 {
+        return Err(format!(
+            "push remote {remote} must have exactly one push URL, found {}",
+            urls.len()
+        ));
+    }
+    Ok(urls[0].to_string())
 }
 
 #[cfg(test)]
@@ -543,6 +617,25 @@ mod tests {
             ),
             "dirty 2 ahead 3 behind 2"
         );
+    }
+
+    #[test]
+    fn fetch_remote_branch_rejects_invalid_names_before_running_git() {
+        let missing_path = Path::new("/path/that/does/not/exist");
+        let config = test_config();
+
+        for remote in ["", " \t"] {
+            assert_eq!(
+                fetch_remote_branch(missing_path, remote, "main", &config),
+                Err("cannot fetch from an empty remote name".to_string())
+            );
+        }
+        for branch in ["", " \t", "(detached)", " (detached) "] {
+            assert_eq!(
+                fetch_remote_branch(missing_path, "origin", branch, &config),
+                Err("cannot fetch an empty or detached branch name".to_string())
+            );
+        }
     }
 
     #[test]
@@ -578,52 +671,6 @@ mod tests {
         run_git(&remote, &["push", "origin", "main"]);
 
         assert_eq!(branch_behind(&work, "main", &config).unwrap(), 1);
-
-        let _ = fs::remove_dir_all(temp);
-    }
-
-    #[test]
-    fn fetch_pull_request_branch_preserves_an_existing_local_branch() {
-        let temp = unique_temp_dir("prism-pr-branch-collision-test");
-        let origin = temp.join("origin.git");
-        let seed = temp.join("seed");
-        let work = temp.join("work");
-        fs::create_dir_all(&temp).unwrap();
-
-        run(Command::new("git").args(["init", "--bare"]).arg(&origin));
-        run(Command::new("git").arg("clone").arg(&origin).arg(&seed));
-        configure_user(&seed);
-        fs::write(seed.join("tracked.txt"), "base\n").unwrap();
-        run_git(&seed, &["add", "tracked.txt"]);
-        run_git(&seed, &["commit", "-m", "initial"]);
-        run_git(&seed, &["branch", "-M", "main"]);
-        run_git(&seed, &["push", "-u", "origin", "main"]);
-        run(Command::new("git").arg("clone").arg(&origin).arg(&work));
-        configure_user(&work);
-
-        run_git(&seed, &["switch", "-c", "incoming"]);
-        fs::write(seed.join("incoming.txt"), "incoming\n").unwrap();
-        run_git(&seed, &["add", "incoming.txt"]);
-        run_git(&seed, &["commit", "-m", "incoming"]);
-        run_git(&seed, &["push", "origin", "incoming:refs/pull/42/head"]);
-
-        run_git(&work, &["switch", "-c", "feature/exact-name"]);
-        fs::write(work.join("local.txt"), "local\n").unwrap();
-        run_git(&work, &["add", "local.txt"]);
-        run_git(&work, &["commit", "-m", "local"]);
-        let local = current_head_sha(&work, &test_config()).unwrap();
-        run_git(&work, &["switch", "main"]);
-
-        fetch_pull_request_branch(&work, &test_config(), 42, "feature/exact-name").unwrap();
-        let preserved = run_capture(
-            Command::new("git")
-                .arg("-C")
-                .arg(&work)
-                .args(["rev-parse", "refs/heads/feature/exact-name"]),
-            ProcessPolicy::Metadata,
-        )
-        .unwrap();
-        assert_eq!(preserved.trim(), local);
 
         let _ = fs::remove_dir_all(temp);
     }

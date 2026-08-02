@@ -44,7 +44,7 @@ pub(super) fn repo_overview_lines(
     lines.push(Line::from(""));
     let remaining_rows = visible_rows.saturating_sub(lines.len());
     match model.repo_main_view {
-        crate::view::RepoMainView::Github => lines.extend(repo_github_panel_lines(
+        crate::view::RepoMainView::ChangeRequests => lines.extend(repo_change_request_panel_lines(
             model.config,
             &model.repo_prs,
             width,
@@ -105,7 +105,7 @@ pub(super) fn repo_github_summary(
     summary
 }
 
-pub(super) fn repo_github_panel_lines(
+pub(super) fn repo_change_request_panel_lines(
     config: &crate::config::Config,
     repo_prs: &[crate::view::RepoPrRow],
     width: usize,
@@ -122,26 +122,41 @@ pub(super) fn repo_pr_table_lines(
     width: usize,
     visible_rows: usize,
 ) -> Vec<Line<'static>> {
-    const PR_WIDTH: usize = 8;
-    const DETAIL_WIDTH: usize = 73;
+    const CR_WIDTH: usize = 8;
+    const DETAIL_WIDTH: usize = 94;
 
-    let open_prs = repo_prs
+    let active_prs = repo_prs
         .iter()
-        .filter(|pr| !pr.merged && pr.state.eq_ignore_ascii_case("OPEN"))
+        .filter(|pr| {
+            !pr.merged
+                && !matches!(
+                    pr.state.trim().to_ascii_uppercase().as_str(),
+                    "CLOSED" | "MERGED"
+                )
+        })
         .collect::<Vec<_>>();
+    let provider_noun = active_prs
+        .first()
+        .map(|summary| summary.provider_noun)
+        .unwrap_or("CR");
     let detailed = width > DETAIL_WIDTH;
-    let mut header = vec![Span::styled(format!("{:<PR_WIDTH$}", "PR"), muted_style())];
+    let mut header = vec![Span::styled(
+        fixed_cell(provider_noun, CR_WIDTH),
+        muted_style(),
+    )];
     if detailed {
         header.extend([
             Span::styled(format!("{:<13}", "repo"), muted_style()),
+            Span::styled(format!("{:<9}", "state"), muted_style()),
             Span::styled(format!("{:<9}", "ci"), muted_style()),
+            Span::styled(format!("{:<12}", "queue/train"), muted_style()),
             Span::styled(format!("{:<10}", "review"), muted_style()),
             Span::styled(format!("{:<13}", "author"), muted_style()),
             Span::styled(format!("{:<16}", "requested"), muted_style()),
             Span::styled(format!("{:<4}", "wt"), muted_style()),
         ]);
     }
-    let prefix_width = if detailed { DETAIL_WIDTH } else { PR_WIDTH };
+    let prefix_width = if detailed { DETAIL_WIDTH } else { CR_WIDTH };
     if width > prefix_width {
         header.push(Span::styled(
             truncate_to_width("title", width - prefix_width),
@@ -149,15 +164,15 @@ pub(super) fn repo_pr_table_lines(
         ));
     }
     let mut lines = vec![Line::from(header)];
-    if open_prs.is_empty() {
+    if active_prs.is_empty() {
         lines.push(Line::from(Span::styled(
-            "No open pull requests discovered",
+            "No open change requests discovered",
             muted_style(),
         )));
         lines.truncate(visible_rows);
         return lines;
     }
-    for pr in open_prs {
+    for pr in active_prs {
         if lines.len() >= visible_rows {
             break;
         }
@@ -170,7 +185,7 @@ pub(super) fn repo_pr_table_lines(
         };
         let wt = if pr.has_worktree { "yes" } else { "no" };
         let mut spans = vec![Span::styled(
-            fixed_cell(&pr_cell, PR_WIDTH),
+            fixed_cell(&pr_cell, CR_WIDTH),
             if pr.selected {
                 title_style(true)
             } else {
@@ -181,9 +196,18 @@ pub(super) fn repo_pr_table_lines(
             spans.extend([
                 Span::styled(fixed_cell(&pr.repo_label, 13), muted_style()),
                 Span::styled(
+                    fixed_cell(repo_pr_state_label(pr), 9),
+                    if repo_pr_state_label(pr) == "unknown" {
+                        attention_style()
+                    } else {
+                        muted_style()
+                    },
+                ),
+                Span::styled(
                     fixed_cell(&pr.check_status, 9),
                     pr_check_style(&pr.check_status),
                 ),
+                Span::styled(fixed_cell(&pr.queue_state, 12), muted_style()),
                 Span::styled(
                     fixed_cell(&review, 10),
                     review_color_style(&pr.review_decision),
@@ -229,6 +253,18 @@ pub(super) fn repo_pr_table_lines(
         lines.push(Line::from(spans));
     }
     lines
+}
+
+fn repo_pr_state_label(pr: &crate::view::RepoPrRow) -> &'static str {
+    if pr.merged || pr.state.eq_ignore_ascii_case("MERGED") {
+        "merged"
+    } else if pr.state.eq_ignore_ascii_case("OPEN") {
+        "open"
+    } else if pr.state.eq_ignore_ascii_case("CLOSED") {
+        "closed"
+    } else {
+        "unknown"
+    }
 }
 
 fn fixed_cell(value: &str, width: usize) -> String {

@@ -9,10 +9,10 @@ use rusqlite::{OptionalExtension, params};
 use crate::agent::AgentState;
 use crate::config::Config;
 use crate::git::git_status_label;
-use crate::github::{PrCache, load_pr_cache_for_branch};
 use crate::json::json_string_field;
 use crate::observability::{self, LogLevel};
 use crate::opencode::OpencodeStatus;
+use crate::remote::{PrCache, load_pr_cache_for_branch};
 use crate::repo::Repository;
 use crate::util::{safe_branch_filename, status_count, truncate};
 
@@ -1032,7 +1032,7 @@ fn remove_worktree_owned_state(
             .map_err(|error| format!("begin worktree session cleanup transaction: {error}"))?;
         let result = (|| {
             ensure_cleanup_ownership(conn, branch, &worktree_path)?;
-            crate::github::remove_pr_cache_with_conn(conn, branch)?;
+            crate::remote::remove_pr_cache_with_conn(conn, branch)?;
             crate::agent_session::remove_state_with_conn(conn, branch)?;
             crate::opencode::remove_worktree_session_runtimes_with_conn(conn, &runtimes)?;
             conn.execute(
@@ -2734,7 +2734,7 @@ exit 0
             Some("old-session".to_string()),
         ));
         previous.pr = PrCache::stale_for_test(
-            Some(crate::github::PrDetails::default()),
+            Some(crate::remote::PrDetails::default()),
             "old branch PR failure",
         );
         previous

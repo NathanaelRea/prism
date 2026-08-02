@@ -15,12 +15,12 @@ use crate::{
         },
     },
     config::Config,
-    github::{PrCache, PrDetails, PrReviewComment, PrSummary},
     opencode::{OpencodeState, OpencodeStatus},
     plan_run::{
         PersistedPlanRun, PlanOutputKind, PlanOutputLine, PlanRun, PlanRunMode, PlanRunStatus,
         PlanStepRun, PlanStepStatus,
     },
+    remote::{PrCache, PrDetails, PrReviewComment, PrSummary},
     session::Session,
     view::{
         AutoDashboard, AutoOutputViewerState, ChoiceList, DialogLine, DialogModel, FrameModel,
@@ -600,6 +600,15 @@ fn pr_merge_conflict_uses_conflict_icon() {
 }
 
 #[test]
+fn unknown_pr_lifecycle_has_an_explicit_unknown_display() {
+    let mut summary = test_pr_summary();
+    summary.state = "SUPERSEDED_BY_TRAIN".to_string();
+
+    assert_eq!(pr_state_label(&summary), "unknown");
+    assert_eq!(pr_state_icon(&summary, IconStyle::Unicode), "?");
+}
+
+#[test]
 fn worktree_detail_omits_loaded_wt_columns() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Running);
@@ -657,7 +666,7 @@ fn main_panel_switches_by_focus() {
     assert_region_contains(&status_buffer, 56..120, 0..29, "version");
     assert_region_contains(&status_buffer, 56..120, 0..29, "selected repo repo");
     assert!(!region_text(&status_buffer, 56..120, 0..29).contains("Documentation"));
-    assert_region_contains(&repo_buffer, 56..120, 0..29, "view github");
+    assert_region_contains(&repo_buffer, 56..120, 0..29, "view requests");
     assert!(!region_text(&repo_buffer, 56..120, 0..29).contains("Preview"));
     assert_region_contains(&worktree_buffer, 56..120, 0..29, "prompt implement feature");
 }
@@ -677,9 +686,14 @@ fn repo_main_panel_lists_indexed_pr_without_worktree() {
     closed.number = 25;
     closed.title = "Closed PR".to_string();
     closed.state = "CLOSED".to_string();
+    let mut unknown = remote.clone();
+    unknown.number = 26;
+    unknown.title = "Future lifecycle".to_string();
+    unknown.state = "SUPERSEDED_BY_TRAIN".to_string();
     model.repo_prs = vec![
         RepoPrRow::from_summary("repo".to_string(), &remote, false, false),
         RepoPrRow::from_summary("repo".to_string(), &closed, false, false),
+        RepoPrRow::from_summary("repo".to_string(), &unknown, false, false),
     ];
 
     let buffer = render_to_string(&model, 200, 30);
@@ -689,6 +703,8 @@ fn repo_main_panel_lists_indexed_pr_without_worktree() {
     assert!(buffer.contains("octocat"));
     assert!(buffer.contains("alice,backend"));
     assert!(buffer.contains("no"));
+    assert!(buffer.contains("#26"));
+    assert!(buffer.contains("unknown"));
     assert!(!buffer.contains("#25"));
     assert!(!buffer.contains("Closed PR"));
 }
@@ -1034,8 +1050,9 @@ fn renders_auto_dashboard_steps_and_output_cursor() {
     model.auto_dashboard = Some(test_auto_dashboard());
     let buffer = render_to_string(&model, 120, 32);
 
-    assert!(!buffer.contains("Auto Flow"));
-    assert!(!buffer.contains("auto output"));
+    assert!(buffer.contains("Managed Work"));
+    assert!(buffer.contains("headless worker"));
+    assert!(buffer.contains("auto output"));
 }
 
 #[test]
@@ -1648,6 +1665,8 @@ fn test_session(branch: &str, agent_state: AgentState) -> Session {
 fn test_pr_summary() -> PrSummary {
     PrSummary {
         number: 42,
+        change_request_identity: None,
+        native_state_evidence: crate::remote::NativeStateEvidence::default(),
         title: "Feature PR".to_string(),
         author: "author".to_string(),
         body: String::new(),
@@ -1661,6 +1680,7 @@ fn test_pr_summary() -> PrSummary {
         updated_at: "2026-01-01T00:00:00Z".to_string(),
         check_status: "failed".to_string(),
         merge_state_status: "CLEAN".to_string(),
+        queue_state: "not_queued".to_string(),
         comment_count: 5,
         merged: false,
         draft: false,
@@ -1731,7 +1751,7 @@ fn test_model<'a>(
         focus,
         main_focused: false,
         main_scroll: 0,
-        repo_main_view: RepoMainView::Github,
+        repo_main_view: RepoMainView::ChangeRequests,
         worktree_main_view: WorktreeMainView::Details,
         worktree_list_mode: WorktreeListMode::Repo,
         mode_label: "normal",
@@ -1934,6 +1954,7 @@ fn test_auto_dashboard() -> AutoDashboard {
             cursor: 0,
             follow: true,
         },
+        worker_status: "healthy".to_string(),
     }
 }
 
@@ -1951,6 +1972,7 @@ fn stabilization_dashboard(
 
 fn test_pending_push_guard() -> PendingPushGuard {
     PendingPushGuard {
+        change_request_identity: None,
         repair_kind: RepairKind::Ci,
         commit_sha: "fedcba9876543210".to_string(),
         expected_local_head_sha: "abc1234567890000".to_string(),

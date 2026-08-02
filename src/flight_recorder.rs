@@ -676,9 +676,13 @@ fn trigger_unix(repo: &Repository, options: RecordOptions) -> Result<PathBuf, St
         )
     })?;
     let mut response = [0_u8; 4096];
-    let size = socket
-        .recv(&mut response)
-        .map_err(|error| format!("wait for debug recording: {error}"))?;
+    let size = loop {
+        match socket.recv(&mut response) {
+            Ok(size) => break size,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(format!("wait for debug recording: {error}")),
+        }
+    };
     let response: CaptureResponse = serde_json::from_slice(&response[..size])
         .map_err(|error| format!("decode debug recorder response: {error}"))?;
     if let Some(error) = response.error {

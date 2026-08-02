@@ -482,9 +482,7 @@ pub(crate) fn migrate_legacy_agent_sessions(
             continue;
         }
         if sessions.iter().any(|session| session == &name) {
-            return Err(format!(
-                "cannot migrate tmux session '{legacy_name}': '{name}' already exists"
-            ));
+            continue;
         }
         run_tmux_status(Command::new(config.tool("tmux")).env_remove("TMUX").args([
             "rename-session",
@@ -1196,8 +1194,8 @@ mod tests {
 
     use crate::agent::AgentState;
     use crate::config::Config;
-    use crate::github::PrCache;
     use crate::opencode::{OpencodeRuntime, save_runtime, server_url};
+    use crate::remote::PrCache;
     use crate::repo::Repository;
     use crate::session::Session;
 
@@ -1603,6 +1601,59 @@ exit 1
             "rename-session -t {legacy_repo_prefix}worker-auto-1234567890123456"
         )));
         assert!(!commands.contains(&format!("rename-session -t {current_other_repo}")));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn startup_migration_accepts_an_existing_current_session() {
+        let temp = unique_temp_dir("prism-tmux-existing-current-session-test");
+        fs::create_dir_all(&temp).unwrap();
+        let log = temp.join("tmux.log");
+        let tmux = temp.join("tmux");
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let current_name = format!("{}0", super::agent_session_prefix(&repo, "feature"));
+        let legacy_name = format!(
+            "{}feature-0",
+            super::legacy_agent_session_repo_prefix(&repo)
+        );
+        fs::write(
+            &tmux,
+            format!(
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> '{}'
+case "$1" in
+  list-sessions)
+    echo '{}'
+    echo '{}'
+    exit 0
+    ;;
+  rename-session)
+    exit 1
+    ;;
+esac
+exit 1
+"#,
+                log.display(),
+                legacy_name,
+                current_name,
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+
+        let result = migrate_legacy_agent_sessions(&repo, &config);
+
+        assert_eq!(result, Ok(()));
+        let commands = fs::read_to_string(&log).unwrap();
+        assert!(!commands.contains("rename-session"));
 
         let _ = fs::remove_dir_all(temp);
     }

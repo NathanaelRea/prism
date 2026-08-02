@@ -37,3 +37,15 @@ installation.
 - Prefer typed parsers over ad hoc string parsing for structured formats.
 - Dependency changes should be reviewed alongside product behavior, build impact,
   and test coverage.
+
+## Remote HTTP Addendum
+
+Forgejo has no required first-party end-user CLI, so Prism uses `ureq` with its
+native TLS backend for synchronous HTTPS and platform certificate validation.
+Rustls was evaluated first, but its crypto provider requires C code that does not
+pass Prism's SDK-free macOS cross-target Clippy gate. The `url` crate
+owns URL joining, query encoding, and same-origin pagination checks; `httpdate`
+parses standard `Retry-After` dates. These dependencies replace security-critical
+hand-written TLS, URL, redirect, and HTTP parsing. Redirects are disabled,
+response bodies and headers are bounded, and HTTP types remain private to the
+remote transport module.
