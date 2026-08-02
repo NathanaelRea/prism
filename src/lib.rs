@@ -12,6 +12,7 @@ pub mod cli;
 #[path = "../test-support/compact_runtime.rs"]
 mod compact_runtime;
 mod config;
+mod desktop_notification;
 mod durability;
 mod execution;
 pub mod file_persistence;

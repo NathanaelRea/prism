@@ -4,7 +4,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::config::{AutoConfig, Checks, Config, EscapeKey, IconStyle, LayoutConfig, MergeMethod};
+use crate::config::{
+    AutoConfig, Checks, Config, EscapeKey, IconStyle, LayoutConfig, MergeMethod, NotificationConfig,
+};
 
 static SHIM_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -37,6 +39,7 @@ pub(crate) fn test_config() -> Config {
         icon_style_configured: false,
         auto: AutoConfig::default(),
         layout: LayoutConfig::default(),
+        notifications: NotificationConfig::default(),
         checks: Checks::default(),
         worktree_columns: Vec::new(),
         tools,

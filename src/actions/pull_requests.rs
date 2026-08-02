@@ -512,12 +512,13 @@ impl Tui {
             crate::observability::with_writable_db(repo, |conn| load_auto_run(conn, &run_id))?
                 .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?
         } else {
-            let initial_prompt = self.sessions[selected].prompt_summary.trim();
-            let initial_prompt = if initial_prompt.is_empty() {
-                format!("Repair PR branch {session_branch}")
-            } else {
-                initial_prompt.to_string()
-            };
+            let initial_prompt = crate::session::load_task_initial_prompt(repo, &session_branch)?
+                .filter(|prompt| !prompt.trim().is_empty())
+                .or_else(|| {
+                    let summary = self.sessions[selected].prompt_summary.trim();
+                    (!summary.is_empty()).then(|| summary.to_string())
+                })
+                .unwrap_or_else(|| format!("Repair PR branch {session_branch}"));
             let launch = AutoLaunch::with_options(
                 &repo.root,
                 &session_path,

@@ -538,7 +538,8 @@ pub(super) fn identify_attached_plan_session(
         return;
     }
     let title = format!("{} phase {}", executor.title_prefix, step.step);
-    if let Ok(sessions) = crate::harness::list_sessions(server_url)
+    if let Ok(sessions) =
+        crate::opencode::list_sessions_for_directory(server_url, &executor.scope_path)
         && let Some(session) = sessions
             .iter()
             .filter(|session| session.title.as_deref() == Some(title.as_str()))

@@ -57,6 +57,7 @@ case "$(uname -s)" in
       cc_var="CC_${macos_target//-/_}"
       printf '\n==> cargo clippy --target %s --all-targets -- -D warnings\n' "$macos_target"
       env \
+        DOCS_RS=1 \
         PKG_CONFIG_ALLOW_CROSS=1 \
         LIBSQLITE3_SYS_USE_PKG_CONFIG=1 \
         "$cc_var=clang" \

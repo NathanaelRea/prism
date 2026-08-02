@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
@@ -199,18 +200,36 @@ pub fn ensure_opencode_server_with_program(
     worktree: &Path,
     program: &str,
 ) -> Result<OpencodeRuntime, String> {
+    let _server_lock = lock_repository_server(repo)?;
+    ensure_opencode_server_locked(repo, config, harness_id, branch, worktree, program)
+}
+
+fn ensure_opencode_server_locked(
+    repo: &Repository,
+    config: &Config,
+    harness_id: &str,
+    branch: &str,
+    worktree: &Path,
+    program: &str,
+) -> Result<OpencodeRuntime, String> {
     let existing = load_runtime(repo, harness_id, branch, worktree)?;
-    if let Some(runtime) = existing.as_ref()
-        && stored_runtime_is_healthy(runtime)?
-    {
-        return Ok(runtime.clone());
+    let runtimes = load_runtimes_for_harness(repo, harness_id)?;
+    if let Some(shared) = healthy_shared_runtime(&runtimes) {
+        let runtime = runtime_for_worktree(repo, harness_id, branch, worktree, &shared, &existing);
+        save_shared_server_runtime(repo, &runtime)?;
+        return Ok(runtime);
     }
 
     let runtime_identity = format!("{}:{harness_id}", repo.root.display());
+    let stored_port = runtimes
+        .iter()
+        .filter(|runtime| runtime.server_pid.is_some() && stored_server_identity_is_valid(runtime))
+        .min_by_key(|runtime| (runtime.server_port, runtime.server_url.as_str()))
+        .map(|runtime| runtime.server_port);
     let port = allocate_port(
         &runtime_identity,
-        &worktree.display().to_string(),
-        existing.as_ref().map(|runtime| runtime.server_port),
+        "",
+        stored_port,
         config.opencode_port_base,
         config.opencode_port_span,
         port_status,
@@ -225,7 +244,7 @@ pub fn ensure_opencode_server_with_program(
             .arg("serve")
             .args(["--hostname", "127.0.0.1"])
             .args(["--port", &port.to_string()])
-            .current_dir(worktree)
+            .current_dir(&repo.root)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -265,7 +284,7 @@ pub fn ensure_opencode_server_with_program(
         generation: 0,
         updated_unix_ms: unix_ms(),
     };
-    if let Err(error) = save_runtime(repo, &runtime) {
+    if let Err(error) = save_shared_server_runtime(repo, &runtime) {
         if let Some(mut child) = started_server {
             let _ = child.terminate();
         }
@@ -275,6 +294,139 @@ pub fn ensure_opencode_server_with_program(
         record_owned_server_process(child);
     }
     Ok(runtime)
+}
+
+pub(crate) fn lock_repository_server(repo: &Repository) -> Result<File, String> {
+    let state_dir = repo.prism_dir();
+    fs::create_dir_all(&state_dir).map_err(|error| {
+        format!(
+            "create OpenCode server state directory {}: {error}",
+            state_dir.display()
+        )
+    })?;
+    let lock_path = state_dir.join("opencode-server.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .map_err(|error| format!("open OpenCode server lock {}: {error}", lock_path.display()))?;
+    lock.lock().map_err(|error| {
+        format!(
+            "acquire OpenCode server lock {}: {error}",
+            lock_path.display()
+        )
+    })?;
+    Ok(lock)
+}
+
+fn healthy_shared_runtime(runtimes: &[OpencodeRuntime]) -> Option<OpencodeRuntime> {
+    let mut servers = BTreeMap::new();
+    for runtime in runtimes {
+        servers
+            .entry((runtime.server_port, runtime.server_url.as_str()))
+            .or_insert(runtime);
+    }
+    servers
+        .into_values()
+        .find(|runtime| {
+            check_health(&runtime.server_url)
+                && (stored_server_identity_is_valid(runtime) || runtime.server_pid.is_none())
+        })
+        .cloned()
+}
+
+fn stored_server_identity_is_valid(runtime: &OpencodeRuntime) -> bool {
+    if parse_localhost_url(&runtime.server_url)
+        .ok()
+        .map(|(_, port)| port)
+        != Some(runtime.server_port)
+    {
+        return false;
+    }
+    if let Some(pid) = runtime.server_pid {
+        if !stored_server_process_matches(pid, runtime.server_port).unwrap_or(false) {
+            return false;
+        }
+        return match runtime.server_process_identity {
+            Some(identity) => crate::process::observe_process(
+                crate::process::RecordedProcess::from_stored(pid, Some(identity)),
+            )
+            .is_ok_and(|observation| {
+                observation == crate::process::ProcessObservation::RunningSameProcess
+            }),
+            None => stored_runtime_session_matches(runtime),
+        };
+    }
+    stored_runtime_session_matches(runtime)
+}
+
+fn stored_runtime_session_matches(runtime: &OpencodeRuntime) -> bool {
+    runtime
+        .opencode_session_id
+        .as_deref()
+        .and_then(|session_id| {
+            get_session_for_worktree(
+                &runtime.server_url,
+                session_id,
+                Path::new(&runtime.worktree_path),
+            )
+            .ok()
+            .flatten()
+        })
+        .is_some_and(|session| session.directory.as_deref() == Some(runtime.worktree_path.as_str()))
+}
+
+fn runtime_for_worktree(
+    repo: &Repository,
+    harness_id: &str,
+    branch: &str,
+    worktree: &Path,
+    shared: &OpencodeRuntime,
+    existing: &Option<OpencodeRuntime>,
+) -> OpencodeRuntime {
+    let unchanged_server = existing.as_ref().is_some_and(|runtime| {
+        runtime.server_url == shared.server_url
+            && runtime.server_pid == shared.server_pid
+            && runtime.server_process_identity == shared.server_process_identity
+    });
+    OpencodeRuntime {
+        repo_root: repo.root.display().to_string(),
+        harness_id: harness_id.to_string(),
+        branch: branch.to_string(),
+        worktree_path: worktree.display().to_string(),
+        server_port: shared.server_port,
+        server_url: shared.server_url.clone(),
+        server_pid: shared.server_pid,
+        server_process_identity: shared.server_process_identity,
+        opencode_session_id: existing
+            .as_ref()
+            .and_then(|runtime| runtime.opencode_session_id.clone()),
+        generation: existing
+            .as_ref()
+            .map(|runtime| runtime.generation)
+            .unwrap_or_default(),
+        updated_unix_ms: if unchanged_server {
+            existing
+                .as_ref()
+                .map(|runtime| runtime.updated_unix_ms)
+                .unwrap_or_else(unix_ms)
+        } else {
+            unix_ms()
+        },
+    }
+}
+
+fn server_reference_count(repo: &Repository, runtime: &OpencodeRuntime) -> Result<i64, String> {
+    observability::with_writable_db(repo, |conn| {
+        conn.query_row(
+            "select count(*) from opencode_runtime where repo_root = ?1 and server_url = ?2",
+            params![runtime.repo_root, runtime.server_url],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| format!("count OpenCode server references: {error}"))
+    })
 }
 
 pub fn ensure_opencode_session(
@@ -301,8 +453,9 @@ pub fn ensure_opencode_session_with_program(
     worktree: &Path,
     program: &str,
 ) -> Result<OpencodeRuntime, String> {
+    let _server_lock = lock_repository_server(repo)?;
     let mut runtime =
-        ensure_opencode_server_with_program(repo, config, harness_id, branch, worktree, program)?;
+        ensure_opencode_server_locked(repo, config, harness_id, branch, worktree, program)?;
     let session = resolve_session(&runtime, worktree)?;
     save_runtime_session(repo, &mut runtime, session.id)?;
     Ok(runtime)
@@ -313,6 +466,17 @@ pub fn refresh_opencode_session(
     mut runtime: OpencodeRuntime,
     worktree: &Path,
 ) -> Result<OpencodeRuntime, String> {
+    let _server_lock = lock_repository_server(repo)?;
+    let Some(current) = load_runtime(
+        repo,
+        &runtime.harness_id,
+        &runtime.branch,
+        Path::new(&runtime.worktree_path),
+    )?
+    else {
+        return Ok(runtime);
+    };
+    runtime = current;
     let Some(session) = newest_listed_session_for_worktree(&runtime, worktree).unwrap_or(None)
     else {
         return Ok(runtime);
@@ -332,13 +496,35 @@ pub fn list_sessions(server_url: &str) -> Result<Vec<OpencodeSession>, String> {
     Ok(parse_sessions(&response.body))
 }
 
+pub(crate) fn list_sessions_for_directory(
+    server_url: &str,
+    directory: &Path,
+) -> Result<Vec<OpencodeSession>, String> {
+    list_sessions_for_worktree(server_url, &directory.display().to_string())
+}
+
 pub fn get_session(server_url: &str, session_id: &str) -> Result<Option<OpencodeSession>, String> {
-    let response = get(
-        "opencode.session.get",
-        server_url,
+    get_session_in_directory(server_url, session_id, None)
+}
+
+fn get_session_for_worktree(
+    server_url: &str,
+    session_id: &str,
+    worktree: &Path,
+) -> Result<Option<OpencodeSession>, String> {
+    get_session_in_directory(server_url, session_id, Some(worktree))
+}
+
+fn get_session_in_directory(
+    server_url: &str,
+    session_id: &str,
+    directory: Option<&Path>,
+) -> Result<Option<OpencodeSession>, String> {
+    let path = request_path(
         &format!("/session/{}", url_path_segment(session_id)),
-        API_TIMEOUT,
-    )?;
+        directory,
+    );
+    let response = get("opencode.session.get", server_url, &path, API_TIMEOUT)?;
     match response.status_code {
         200 => Ok(parse_session(&response.body)),
         404 => Ok(None),
@@ -400,11 +586,42 @@ pub fn create_session(
 }
 
 pub fn submit_prompt(server_url: &str, session_id: &str, prompt: &str) -> Result<(), String> {
+    let directory = get_session(server_url, session_id)
+        .ok()
+        .flatten()
+        .and_then(|session| session.directory);
+    submit_prompt_in_directory(
+        server_url,
+        session_id,
+        prompt,
+        directory.as_deref().map(Path::new),
+    )
+}
+
+pub(crate) fn submit_prompt_for_worktree(
+    server_url: &str,
+    session_id: &str,
+    prompt: &str,
+    worktree: &Path,
+) -> Result<(), String> {
+    submit_prompt_in_directory(server_url, session_id, prompt, Some(worktree))
+}
+
+fn submit_prompt_in_directory(
+    server_url: &str,
+    session_id: &str,
+    prompt: &str,
+    directory: Option<&Path>,
+) -> Result<(), String> {
     let body = prompt_async_body(prompt);
+    let path = request_path(
+        &format!("/session/{}/prompt_async", url_path_segment(session_id)),
+        directory,
+    );
     let response = post(
         "opencode.session.prompt",
         server_url,
-        &format!("/session/{}/prompt_async", url_path_segment(session_id)),
+        &path,
         &body,
         API_TIMEOUT,
     )?;
@@ -420,10 +637,18 @@ pub fn submit_prompt(server_url: &str, session_id: &str, prompt: &str) -> Result
 }
 
 pub fn abort_session(server_url: &str, session_id: &str) -> Result<(), String> {
+    let directory = get_session(server_url, session_id)
+        .ok()
+        .flatten()
+        .and_then(|session| session.directory);
+    let path = request_path(
+        &format!("/session/{}/abort", url_path_segment(session_id)),
+        directory.as_deref().map(Path::new),
+    );
     let response = post(
         "opencode.session.abort",
         server_url,
-        &format!("/session/{}/abort", url_path_segment(session_id)),
+        &path,
         "{}",
         API_TIMEOUT,
     )?;
@@ -517,35 +742,6 @@ fn stored_server_process_matches_with(
     }))
 }
 
-fn stored_runtime_is_healthy(runtime: &OpencodeRuntime) -> Result<bool, String> {
-    if !check_health(&runtime.server_url) {
-        return Ok(false);
-    }
-    let Some(pid) = runtime.server_pid else {
-        return Ok(false);
-    };
-    let recorded =
-        crate::process::RecordedProcess::from_stored(pid, runtime.server_process_identity);
-    if crate::process::observe_process(recorded)
-        .map_err(|error| format!("inspect stored opencode server {pid} before reuse: {error}"))?
-        != crate::process::ProcessObservation::RunningSameProcess
-        || !stored_server_process_matches(pid, runtime.server_port).map_err(|error| {
-            format!("inspect stored opencode server {pid} before reuse: {error}")
-        })?
-    {
-        return Ok(false);
-    }
-    if let Some(session_id) = runtime.opencode_session_id.as_deref() {
-        return Ok(get_session(&runtime.server_url, session_id)
-            .ok()
-            .flatten()
-            .is_some_and(|session| {
-                session.directory.as_deref() == Some(runtime.worktree_path.as_str())
-            }));
-    }
-    Ok(true)
-}
-
 fn stored_server_args_match(args: &[&str], port: u16) -> bool {
     let port = port.to_string();
     args.windows(2).any(|window| window[1] == "serve")
@@ -607,52 +803,22 @@ pub fn poll_status(runtime: &OpencodeRuntime) -> Result<OpencodeStatus, String> 
             last_updated_unix_ms: Some(unix_ms()),
         });
     };
-    if !check_health(&runtime.server_url) {
-        return Ok(OpencodeStatus::offline(
-            Some(runtime.server_url.clone()),
-            Some(session_id.to_string()),
-        ));
-    }
-
-    let session = get_session(&runtime.server_url, session_id)?.unwrap_or(OpencodeSession {
-        id: session_id.to_string(),
-        directory: None,
-        title: None,
-        time_updated: None,
-        parent_id: None,
-    });
-    let mut state =
-        fetch_session_state(&runtime.server_url, session_id).unwrap_or(OpencodeState::Idle);
-    if fetch_pending_permission(&runtime.server_url, session_id).unwrap_or(false) {
-        state = OpencodeState::NeedsInput;
-    }
-    let mut messages = fetch_message_summary(&runtime.server_url, session_id).unwrap_or_default();
-    if state == OpencodeState::Idle
-        && let Some(message_state) = messages.latest_turn_state
-    {
-        state = message_state;
-    }
-    if state == OpencodeState::NeedsInput {
-        messages.active_tool = None;
-    }
-    let todos = fetch_todos(&runtime.server_url, session_id).unwrap_or_default();
-
-    Ok(OpencodeStatus {
-        server_url: Some(runtime.server_url.clone()),
-        session_id: Some(session_id.to_string()),
-        title: session.title,
-        state,
-        detail: messages.latest_error,
-        latest_message: messages.latest_message,
-        latest_user_message: messages.latest_user_message,
-        recent_messages: messages.recent_messages,
-        active_tool: messages.active_tool,
-        todos,
-        last_updated_unix_ms: Some(unix_ms()),
-    })
+    poll_session_status_in_directory(
+        &runtime.server_url,
+        session_id,
+        Some(Path::new(&runtime.worktree_path)),
+    )
 }
 
 pub fn poll_session_status(server_url: &str, session_id: &str) -> Result<OpencodeStatus, String> {
+    poll_session_status_in_directory(server_url, session_id, None)
+}
+
+fn poll_session_status_in_directory(
+    server_url: &str,
+    session_id: &str,
+    directory: Option<&Path>,
+) -> Result<OpencodeStatus, String> {
     if !check_health(server_url) {
         return Ok(OpencodeStatus::offline(
             Some(server_url.to_string()),
@@ -660,18 +826,22 @@ pub fn poll_session_status(server_url: &str, session_id: &str) -> Result<Opencod
         ));
     }
 
-    let session = get_session(server_url, session_id)?.unwrap_or(OpencodeSession {
-        id: session_id.to_string(),
-        directory: None,
-        title: None,
-        time_updated: None,
-        parent_id: None,
-    });
-    let mut state = fetch_session_state(server_url, session_id).unwrap_or(OpencodeState::Idle);
-    if fetch_pending_permission(server_url, session_id).unwrap_or(false) {
+    let session =
+        get_session_in_directory(server_url, session_id, directory)?.unwrap_or(OpencodeSession {
+            id: session_id.to_string(),
+            directory: None,
+            title: None,
+            time_updated: None,
+            parent_id: None,
+        });
+    let session_directory = session.directory.as_deref().map(Path::new);
+    let directory = directory.or(session_directory);
+    let mut state =
+        fetch_session_state(server_url, session_id, directory).unwrap_or(OpencodeState::Idle);
+    if fetch_pending_permission(server_url, session_id, directory).unwrap_or(false) {
         state = OpencodeState::NeedsInput;
     }
-    let mut messages = fetch_message_summary(server_url, session_id).unwrap_or_default();
+    let mut messages = fetch_message_summary(server_url, session_id, directory).unwrap_or_default();
     if state == OpencodeState::Idle
         && let Some(message_state) = messages.latest_turn_state
     {
@@ -680,7 +850,7 @@ pub fn poll_session_status(server_url: &str, session_id: &str) -> Result<Opencod
     if state == OpencodeState::NeedsInput {
         messages.active_tool = None;
     }
-    let todos = fetch_todos(server_url, session_id).unwrap_or_default();
+    let todos = fetch_todos(server_url, session_id, directory).unwrap_or_default();
 
     Ok(OpencodeStatus {
         server_url: Some(server_url.to_string()),
@@ -714,16 +884,30 @@ pub fn listen_events_until(
     should_stop: impl FnMut() -> bool,
     mut on_event: impl FnMut(OpencodeEvent) -> Result<(), String>,
 ) -> Result<(), String> {
-    listen_classified_events_until(server_url, should_stop, |event, _| on_event(event))
+    listen_classified_events_until_in_directory(server_url, None, should_stop, |event, _| {
+        on_event(event)
+    })
 }
 
 pub(crate) fn listen_classified_events_until(
     server_url: &str,
+    directory: &Path,
+    should_stop: impl FnMut() -> bool,
+    on_event: impl FnMut(OpencodeEvent, Option<OpencodeSnapshotFacet>) -> Result<(), String>,
+) -> Result<(), String> {
+    listen_classified_events_until_in_directory(server_url, Some(directory), should_stop, on_event)
+}
+
+fn listen_classified_events_until_in_directory(
+    server_url: &str,
+    directory: Option<&Path>,
     mut should_stop: impl FnMut() -> bool,
     mut on_event: impl FnMut(OpencodeEvent, Option<OpencodeSnapshotFacet>) -> Result<(), String>,
 ) -> Result<(), String> {
-    listen_event_payloads_with_stop(
+    let path = request_path("/event", directory);
+    listen_event_payloads_with_stop_at_path(
         server_url,
+        &path,
         SSE_CANCEL_POLL_INTERVAL,
         SSE_CANCEL_POLL_INTERVAL,
         SSE_READ_TIMEOUT,
@@ -759,6 +943,26 @@ fn listen_event_payloads_with_stop(
     should_stop: &mut impl FnMut() -> bool,
     on_payload: &mut impl FnMut(String) -> Result<(), String>,
 ) -> Result<(), String> {
+    listen_event_payloads_with_stop_at_path(
+        server_url,
+        "/event",
+        connect_timeout,
+        read_poll_interval,
+        inactivity_timeout,
+        should_stop,
+        on_payload,
+    )
+}
+
+fn listen_event_payloads_with_stop_at_path(
+    server_url: &str,
+    path: &str,
+    connect_timeout: Duration,
+    read_poll_interval: Duration,
+    inactivity_timeout: Duration,
+    should_stop: &mut impl FnMut() -> bool,
+    on_payload: &mut impl FnMut(String) -> Result<(), String>,
+) -> Result<(), String> {
     let mut trace = crate::flight_recorder::ExternalCallTrace::begin(
         crate::flight_recorder::ExternalCallCategory::Http,
         "opencode.events",
@@ -770,9 +974,12 @@ fn listen_event_payloads_with_stop(
     let mut metrics = SseMetrics::default();
     let result = listen_event_payloads_with_stop_inner(
         server_url,
-        connect_timeout,
-        read_poll_interval,
-        inactivity_timeout,
+        SseRequest {
+            path,
+            connect_timeout,
+            read_poll_interval,
+            inactivity_timeout,
+        },
         should_stop,
         on_payload,
         &mut metrics,
@@ -817,6 +1024,14 @@ struct SseMetrics {
     status_code: Option<u16>,
     payload_count: u64,
     payload_bytes: u64,
+}
+
+#[derive(Clone, Copy)]
+struct SseRequest<'a> {
+    path: &'a str,
+    connect_timeout: Duration,
+    read_poll_interval: Duration,
+    inactivity_timeout: Duration,
 }
 
 impl SseMetrics {
@@ -922,13 +1137,17 @@ fn sse_io_failure(
 
 fn listen_event_payloads_with_stop_inner(
     server_url: &str,
-    connect_timeout: Duration,
-    read_poll_interval: Duration,
-    inactivity_timeout: Duration,
+    request: SseRequest<'_>,
     should_stop: &mut impl FnMut() -> bool,
     on_payload: &mut impl FnMut(String) -> Result<(), String>,
     metrics: &mut SseMetrics,
 ) -> Result<(), SseFailure> {
+    let SseRequest {
+        path,
+        connect_timeout,
+        read_poll_interval,
+        inactivity_timeout,
+    } = request;
     let resolve_started = Instant::now();
     let (host, port) = parse_localhost_url(server_url)
         .map_err(|message| SseFailure::new(SseFailureKind::Protocol, message))?;
@@ -955,7 +1174,7 @@ fn listen_event_payloads_with_stop_inner(
     let write_started = Instant::now();
     write!(
         stream,
-        "GET /event HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+        "GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\nAccept: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
     )
     .map_err(|error| sse_io_failure(SseFailureKind::Write, "write SSE request", error))?;
     metrics.write_us = Some(write_started.elapsed().as_micros());
@@ -1300,13 +1519,13 @@ struct MessageSummary {
     latest_error: Option<String>,
 }
 
-fn fetch_session_state(server_url: &str, session_id: &str) -> Result<OpencodeState, String> {
-    let response = get(
-        "opencode.session.status",
-        server_url,
-        "/session/status",
-        API_TIMEOUT,
-    )?;
+fn fetch_session_state(
+    server_url: &str,
+    session_id: &str,
+    directory: Option<&Path>,
+) -> Result<OpencodeState, String> {
+    let path = request_path("/session/status", directory);
+    let response = get("opencode.session.status", server_url, &path, API_TIMEOUT)?;
     if !success_status(response.status_code) {
         return Err(http_error_message(
             "read opencode session status",
@@ -1321,13 +1540,13 @@ fn session_state_from_status_body(body: &str, session_id: &str) -> OpencodeState
     parse_session_state(body, session_id).unwrap_or(OpencodeState::Idle)
 }
 
-fn fetch_pending_permission(server_url: &str, session_id: &str) -> Result<bool, String> {
-    let response = get(
-        "opencode.permission.list",
-        server_url,
-        "/permission",
-        API_TIMEOUT,
-    )?;
+fn fetch_pending_permission(
+    server_url: &str,
+    session_id: &str,
+    directory: Option<&Path>,
+) -> Result<bool, String> {
+    let path = request_path("/permission", directory);
+    let response = get("opencode.permission.list", server_url, &path, API_TIMEOUT)?;
     if !success_status(response.status_code) {
         return Err(http_error_message(
             "read opencode permissions",
@@ -1338,13 +1557,16 @@ fn fetch_pending_permission(server_url: &str, session_id: &str) -> Result<bool, 
     Ok(has_pending_permission(&response.body, session_id))
 }
 
-fn fetch_message_summary(server_url: &str, session_id: &str) -> Result<MessageSummary, String> {
-    let response = get(
-        "opencode.session.messages",
-        server_url,
+fn fetch_message_summary(
+    server_url: &str,
+    session_id: &str,
+    directory: Option<&Path>,
+) -> Result<MessageSummary, String> {
+    let path = request_path(
         &format!("/session/{}/message?limit=10", url_path_segment(session_id)),
-        API_TIMEOUT,
-    )?;
+        directory,
+    );
+    let response = get("opencode.session.messages", server_url, &path, API_TIMEOUT)?;
     if !success_status(response.status_code) {
         return Err(http_error_message(
             "read opencode messages",
@@ -1355,13 +1577,16 @@ fn fetch_message_summary(server_url: &str, session_id: &str) -> Result<MessageSu
     Ok(parse_message_summary(&response.body))
 }
 
-fn fetch_todos(server_url: &str, session_id: &str) -> Result<Vec<OpencodeTodo>, String> {
-    let response = get(
-        "opencode.session.todos",
-        server_url,
+fn fetch_todos(
+    server_url: &str,
+    session_id: &str,
+    directory: Option<&Path>,
+) -> Result<Vec<OpencodeTodo>, String> {
+    let path = request_path(
         &format!("/session/{}/todo", url_path_segment(session_id)),
-        API_TIMEOUT,
-    )?;
+        directory,
+    );
+    let response = get("opencode.session.todos", server_url, &path, API_TIMEOUT)?;
     if !success_status(response.status_code) {
         return Err(http_error_message(
             "read opencode todos",
@@ -1375,7 +1600,7 @@ fn fetch_todos(server_url: &str, session_id: &str) -> Result<Vec<OpencodeTodo>, 
 fn resolve_session(runtime: &OpencodeRuntime, worktree: &Path) -> Result<OpencodeSession, String> {
     let worktree_path = worktree.display().to_string();
     let stored_session = if let Some(session_id) = runtime.opencode_session_id.as_deref()
-        && let Some(session) = get_session(&runtime.server_url, session_id)?
+        && let Some(session) = get_session_for_worktree(&runtime.server_url, session_id, worktree)?
         && session_matches_worktree(&session, &worktree_path)
     {
         Some(session)
@@ -1475,38 +1700,32 @@ fn load_runtime_with_conn(
           from opencode_runtime
           where repo_root = ?1 and harness_id = ?2 and branch = ?3 and worktree_path = ?4",
         params![repo_root, harness_id, branch, worktree_path],
-        |row| {
-            let server_port = row.get::<_, i64>(4)?;
-            let server_pid = row
-                .get::<_, Option<i64>>(6)?
-                .and_then(|pid| u32::try_from(pid).ok());
-            Ok(OpencodeRuntime {
-                repo_root: row.get(0)?,
-                harness_id: row.get(1)?,
-                branch: row.get(2)?,
-                worktree_path: row.get(3)?,
-                server_port: u16::try_from(server_port).unwrap_or_default(),
-                server_url: row.get(5)?,
-                server_pid,
-                server_process_identity: row
-                    .get::<_, Option<i64>>(10)?
-                    .map(|value| value.max(0) as u64),
-                opencode_session_id: row.get(7)?,
-                generation: row
-                    .get::<_, i64>(8)
-                    .ok()
-                    .and_then(|value| u64::try_from(value).ok())
-                    .unwrap_or_default(),
-                updated_unix_ms: row
-                    .get::<_, i64>(9)
-                    .ok()
-                    .and_then(|value| u64::try_from(value).ok())
-                    .unwrap_or_default(),
-            })
-        },
+        runtime_from_row,
     )
     .optional()
     .map_err(|error| format!("read opencode runtime: {error}"))
+}
+
+fn load_runtimes_for_harness(
+    repo: &Repository,
+    harness_id: &str,
+) -> Result<Vec<OpencodeRuntime>, String> {
+    let repo_root = repo.root.display().to_string();
+    observability::with_writable_db(repo, |conn| {
+        let mut statement = conn
+            .prepare(
+                "select repo_root, harness_id, branch, worktree_path, server_port, server_url, server_pid,
+                        opencode_session_id, generation, updated_unix_ms, server_start_time_ticks
+                   from opencode_runtime
+                  where repo_root = ?1 and harness_id = ?2",
+            )
+            .map_err(|error| format!("prepare OpenCode server lookup: {error}"))?;
+        let rows = statement
+            .query_map(params![repo_root, harness_id], runtime_from_row)
+            .map_err(|error| format!("read OpenCode servers: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read OpenCode server: {error}"))
+    })
 }
 
 pub(crate) fn load_runtimes_for_worktree_session(
@@ -1526,34 +1745,7 @@ pub(crate) fn load_runtimes_for_worktree_session(
             )
             .map_err(|error| format!("prepare opencode runtime lookup: {error}"))?;
         let rows = statement
-            .query_map(params![repo_root, branch, worktree_path], |row| {
-                let server_pid = row
-                    .get::<_, Option<i64>>(6)?
-                    .and_then(|pid| u32::try_from(pid).ok());
-                Ok(OpencodeRuntime {
-                    repo_root: row.get(0)?,
-                    harness_id: row.get(1)?,
-                    branch: row.get(2)?,
-                    worktree_path: row.get(3)?,
-                    server_port: u16::try_from(row.get::<_, i64>(4)?).unwrap_or_default(),
-                    server_url: row.get(5)?,
-                    server_pid,
-                    server_process_identity: row
-                        .get::<_, Option<i64>>(10)?
-                        .map(|value| value.max(0) as u64),
-                    opencode_session_id: row.get(7)?,
-                    generation: row
-                        .get::<_, i64>(8)
-                        .ok()
-                        .and_then(|value| u64::try_from(value).ok())
-                        .unwrap_or_default(),
-                    updated_unix_ms: row
-                        .get::<_, i64>(9)
-                        .ok()
-                        .and_then(|value| u64::try_from(value).ok())
-                        .unwrap_or_default(),
-                })
-            })
+            .query_map(params![repo_root, branch, worktree_path], runtime_from_row)
             .map_err(|error| format!("read opencode runtime: {error}"))?;
 
         let mut runtimes = Vec::new();
@@ -1564,10 +1756,77 @@ pub(crate) fn load_runtimes_for_worktree_session(
     })
 }
 
+fn runtime_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpencodeRuntime> {
+    let server_pid = row
+        .get::<_, Option<i64>>(6)?
+        .and_then(|pid| u32::try_from(pid).ok());
+    Ok(OpencodeRuntime {
+        repo_root: row.get(0)?,
+        harness_id: row.get(1)?,
+        branch: row.get(2)?,
+        worktree_path: row.get(3)?,
+        server_port: u16::try_from(row.get::<_, i64>(4)?).unwrap_or_default(),
+        server_url: row.get(5)?,
+        server_pid,
+        server_process_identity: row
+            .get::<_, Option<i64>>(10)?
+            .map(|value| value.max(0) as u64),
+        opencode_session_id: row.get(7)?,
+        generation: row
+            .get::<_, i64>(8)
+            .ok()
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or_default(),
+        updated_unix_ms: row
+            .get::<_, i64>(9)
+            .ok()
+            .and_then(|value| u64::try_from(value).ok())
+            .unwrap_or_default(),
+    })
+}
+
 pub fn save_runtime(repo: &Repository, runtime: &OpencodeRuntime) -> Result<(), String> {
+    observability::with_writable_db(repo, |conn| save_runtime_with_conn(conn, runtime))
+}
+
+fn save_shared_server_runtime(repo: &Repository, runtime: &OpencodeRuntime) -> Result<(), String> {
     observability::with_writable_db(repo, |conn| {
-        conn.execute(
-            "insert into opencode_runtime (
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|error| format!("begin shared OpenCode server update: {error}"))?;
+        tx.execute(
+            "update opencode_runtime
+                set server_port = ?3, server_url = ?4, server_pid = ?5,
+                    server_start_time_ticks = ?6, updated_unix_ms = ?7
+              where repo_root = ?1 and harness_id = ?2
+                and (server_port != ?3 or server_url != ?4 or server_pid is not ?5
+                     or server_start_time_ticks is not ?6)",
+            params![
+                runtime.repo_root.as_str(),
+                runtime.harness_id.as_str(),
+                i64::from(runtime.server_port),
+                runtime.server_url.as_str(),
+                runtime.server_pid.map(i64::from),
+                runtime
+                    .server_process_identity
+                    .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+                i64::try_from(runtime.updated_unix_ms).unwrap_or(i64::MAX),
+            ],
+        )
+        .map_err(|error| format!("update shared OpenCode server references: {error}"))?;
+        save_runtime_with_conn(&tx, runtime)?;
+        tx.commit()
+            .map_err(|error| format!("commit shared OpenCode server update: {error}"))?;
+        Ok(())
+    })
+}
+
+fn save_runtime_with_conn(
+    conn: &rusqlite::Connection,
+    runtime: &OpencodeRuntime,
+) -> Result<(), String> {
+    conn.execute(
+        "insert into opencode_runtime (
                 repo_root, harness_id, branch, worktree_path, server_port, server_url, server_pid,
                  opencode_session_id, generation, updated_unix_ms, server_start_time_ticks
               ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
@@ -1579,25 +1838,24 @@ pub fn save_runtime(repo: &Repository, runtime: &OpencodeRuntime) -> Result<(), 
                 generation = excluded.generation,
                 updated_unix_ms = excluded.updated_unix_ms,
                 server_start_time_ticks = excluded.server_start_time_ticks",
-            params![
-                runtime.repo_root.as_str(),
-                runtime.harness_id.as_str(),
-                runtime.branch.as_str(),
-                runtime.worktree_path.as_str(),
-                i64::from(runtime.server_port),
-                runtime.server_url.as_str(),
-                runtime.server_pid.map(i64::from),
-                runtime.opencode_session_id.as_deref(),
-                i64::try_from(runtime.generation).unwrap_or(i64::MAX),
-                i64::try_from(runtime.updated_unix_ms).unwrap_or(i64::MAX),
-                runtime
-                    .server_process_identity
-                    .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
-            ],
-        )
-        .map_err(|error| format!("write opencode runtime: {error}"))?;
-        Ok(())
-    })
+        params![
+            runtime.repo_root.as_str(),
+            runtime.harness_id.as_str(),
+            runtime.branch.as_str(),
+            runtime.worktree_path.as_str(),
+            i64::from(runtime.server_port),
+            runtime.server_url.as_str(),
+            runtime.server_pid.map(i64::from),
+            runtime.opencode_session_id.as_deref(),
+            i64::try_from(runtime.generation).unwrap_or(i64::MAX),
+            i64::try_from(runtime.updated_unix_ms).unwrap_or(i64::MAX),
+            runtime
+                .server_process_identity
+                .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
+        ],
+    )
+    .map_err(|error| format!("write opencode runtime: {error}"))?;
+    Ok(())
 }
 
 pub(crate) fn migrate_runtime_schema(conn: &rusqlite::Connection) -> Result<(), String> {
@@ -1700,13 +1958,23 @@ pub(crate) fn shutdown_worktree_session_runtimes(
     branch: &str,
     worktree: &Path,
 ) -> Result<(), String> {
+    let _server_lock = lock_repository_server(repo)?;
     let runtimes = load_runtimes_for_worktree_session(repo, branch, worktree)?;
     let mut errors = Vec::new();
     for runtime in runtimes {
         if runtime.branch != branch || runtime.worktree_path != worktree.display().to_string() {
             continue;
         }
-        if let Err(error) = shutdown_stored_server(&runtime) {
+        let references = match server_reference_count(repo, &runtime) {
+            Ok(references) => references,
+            Err(error) => {
+                errors.push(error);
+                continue;
+            }
+        };
+        if references <= 1
+            && let Err(error) = shutdown_stored_server(&runtime)
+        {
             errors.push(error);
             continue;
         }
@@ -1756,13 +2024,30 @@ pub(crate) fn remove_worktree_session_runtimes_with_conn(
     Ok(())
 }
 
-pub(crate) fn shutdown_worktree_session_runtime_processes(
+pub(crate) fn shutdown_worktree_session_runtime_processes_with_lock_held(
+    repo: &Repository,
     runtimes: &[OpencodeRuntime],
 ) -> Result<(), String> {
-    let errors = runtimes
-        .iter()
-        .filter_map(|runtime| shutdown_stored_server(runtime).err())
-        .collect::<Vec<_>>();
+    let mut seen = BTreeMap::new();
+    for runtime in runtimes {
+        seen.entry(runtime.server_url.as_str()).or_insert(runtime);
+    }
+    let mut errors = Vec::new();
+    for runtime in seen.into_values() {
+        let removed_references = runtimes
+            .iter()
+            .filter(|candidate| candidate.server_url == runtime.server_url)
+            .count() as i64;
+        match server_reference_count(repo, runtime) {
+            Ok(references) if references <= removed_references => {
+                if let Err(error) = shutdown_stored_server(runtime) {
+                    errors.push(error);
+                }
+            }
+            Ok(_) => {}
+            Err(error) => errors.push(error),
+        }
+    }
     if errors.is_empty() {
         Ok(())
     } else {
@@ -2591,6 +2876,17 @@ fn session_matches_worktree(session: &OpencodeSession, worktree_path: &str) -> b
         .is_none_or(|directory| directory == worktree_path)
 }
 
+fn request_path(path: &str, directory: Option<&Path>) -> String {
+    let Some(directory) = directory else {
+        return path.to_string();
+    };
+    let separator = if path.contains('?') { '&' } else { '?' };
+    format!(
+        "{path}{separator}directory={}",
+        url_path_segment(&directory.display().to_string())
+    )
+}
+
 fn url_path_segment(value: &str) -> String {
     let mut output = String::new();
     for byte in value.bytes() {
@@ -2734,9 +3030,12 @@ mod tests {
 
         let failure = listen_event_payloads_with_stop_inner(
             &url,
-            Duration::from_millis(100),
-            Duration::from_millis(20),
-            Duration::from_millis(100),
+            SseRequest {
+                path: "/event",
+                connect_timeout: Duration::from_millis(100),
+                read_poll_interval: Duration::from_millis(20),
+                inactivity_timeout: Duration::from_millis(100),
+            },
             &mut || false,
             &mut |_| Err("HTTP invalid closed application error".to_string()),
             &mut metrics,
@@ -2903,6 +3202,230 @@ mod tests {
     }
 
     #[test]
+    fn worktrees_in_one_repository_reuse_one_healthy_server() {
+        let temp = unique_temp_dir("prism-opencode-shared-server-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let first_worktree = temp.join("first");
+        let second_worktree = temp.join("second");
+        let (server_url, stop, server) = start_health_server(first_worktree.clone());
+        let server_port = parse_localhost_url(&server_url).unwrap().1;
+        let first = OpencodeRuntime {
+            repo_root: temp.display().to_string(),
+            harness_id: "opencode".to_string(),
+            branch: "feature/first".to_string(),
+            worktree_path: first_worktree.display().to_string(),
+            server_port,
+            server_url: server_url.clone(),
+            server_pid: None,
+            server_process_identity: None,
+            opencode_session_id: Some("ses_first".to_string()),
+            generation: 0,
+            updated_unix_ms: 42,
+        };
+        save_runtime(&repo, &first).unwrap();
+
+        let second = ensure_opencode_server_with_program(
+            &repo,
+            &Config::load(&repo),
+            "opencode",
+            "feature/second",
+            &second_worktree,
+            "/definitely/missing/opencode",
+        )
+        .unwrap();
+
+        assert_eq!(second.server_url, first.server_url);
+        assert_eq!(second.server_port, first.server_port);
+        assert_eq!(second.server_pid, first.server_pid);
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn legacy_worktree_servers_converge_to_one_canonical_server() {
+        let temp = unique_temp_dir("prism-opencode-legacy-server-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let first_worktree = temp.join("first");
+        let second_worktree = temp.join("second");
+        let (first_url, first_stop, first_server) = start_health_server(first_worktree.clone());
+        let (second_url, second_stop, second_server) = start_health_server(second_worktree.clone());
+        let runtime =
+            |branch: &str, worktree: &Path, server_url: String, session_id: &str| OpencodeRuntime {
+                repo_root: temp.display().to_string(),
+                harness_id: "opencode".to_string(),
+                branch: branch.to_string(),
+                worktree_path: worktree.display().to_string(),
+                server_port: parse_localhost_url(&server_url).unwrap().1,
+                server_url,
+                server_pid: None,
+                server_process_identity: None,
+                opencode_session_id: Some(session_id.to_string()),
+                generation: 0,
+                updated_unix_ms: 42,
+            };
+        let first = runtime("feature/first", &first_worktree, first_url, "ses_first");
+        let second = runtime("feature/second", &second_worktree, second_url, "ses_first");
+        save_runtime(&repo, &first).unwrap();
+        save_runtime(&repo, &second).unwrap();
+        let canonical_url = [&first, &second]
+            .into_iter()
+            .min_by_key(|runtime| runtime.server_port)
+            .unwrap()
+            .server_url
+            .clone();
+        let noncanonical = [&first, &second]
+            .into_iter()
+            .find(|runtime| runtime.server_url != canonical_url)
+            .unwrap();
+
+        let selected = ensure_opencode_server_with_program(
+            &repo,
+            &Config::load(&repo),
+            "opencode",
+            &noncanonical.branch,
+            Path::new(&noncanonical.worktree_path),
+            "/definitely/missing/opencode",
+        )
+        .unwrap();
+
+        assert_eq!(selected.server_url, canonical_url);
+        for runtime in load_runtimes_for_harness(&repo, "opencode").unwrap() {
+            assert_eq!(runtime.server_url, canonical_url);
+        }
+        first_stop.store(true, Ordering::Release);
+        second_stop.store(true, Ordering::Release);
+        first_server.join().unwrap();
+        second_server.join().unwrap();
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn replacing_shared_server_updates_every_worktree_reference() {
+        let temp = unique_temp_dir("prism-opencode-replacement-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let runtime = |branch: &str, worktree: &str, session_id: &str| OpencodeRuntime {
+            repo_root: temp.display().to_string(),
+            harness_id: "opencode".to_string(),
+            branch: branch.to_string(),
+            worktree_path: temp.join(worktree).display().to_string(),
+            server_port: 41_000,
+            server_url: server_url(41_000),
+            server_pid: Some(100),
+            server_process_identity: Some(200),
+            opencode_session_id: Some(session_id.to_string()),
+            generation: 1,
+            updated_unix_ms: 42,
+        };
+        let first = runtime("feature/first", "first", "ses_first");
+        let second = runtime("feature/second", "second", "ses_second");
+        save_runtime(&repo, &first).unwrap();
+        save_runtime(&repo, &second).unwrap();
+        let replacement = OpencodeRuntime {
+            server_port: 41_001,
+            server_url: server_url(41_001),
+            server_pid: Some(300),
+            server_process_identity: Some(400),
+            updated_unix_ms: 84,
+            ..first.clone()
+        };
+
+        save_shared_server_runtime(&repo, &replacement).unwrap();
+
+        let runtimes = load_runtimes_for_harness(&repo, "opencode").unwrap();
+        assert_eq!(runtimes.len(), 2);
+        for runtime in &runtimes {
+            assert_eq!(runtime.server_port, replacement.server_port);
+            assert_eq!(runtime.server_url, replacement.server_url);
+            assert_eq!(runtime.server_pid, replacement.server_pid);
+            assert_eq!(
+                runtime.server_process_identity,
+                replacement.server_process_identity
+            );
+        }
+        let sessions = runtimes
+            .iter()
+            .map(|runtime| {
+                (
+                    runtime.branch.as_str(),
+                    runtime.opencode_session_id.as_deref(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            sessions.get(first.branch.as_str()),
+            Some(&Some("ses_first"))
+        );
+        assert_eq!(
+            sessions.get(second.branch.as_str()),
+            Some(&Some("ses_second"))
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn replacing_shared_server_rolls_back_every_reference_on_failure() {
+        let temp = unique_temp_dir("prism-opencode-replacement-rollback-test");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let runtime = |branch: &str, worktree: &str| OpencodeRuntime {
+            repo_root: temp.display().to_string(),
+            harness_id: "opencode".to_string(),
+            branch: branch.to_string(),
+            worktree_path: temp.join(worktree).display().to_string(),
+            server_port: 41_000,
+            server_url: server_url(41_000),
+            server_pid: Some(100),
+            server_process_identity: Some(200),
+            opencode_session_id: None,
+            generation: 1,
+            updated_unix_ms: 42,
+        };
+        let first = runtime("feature/first", "first");
+        let second = runtime("feature/second", "second");
+        save_runtime(&repo, &first).unwrap();
+        save_runtime(&repo, &second).unwrap();
+        observability::with_writable_db(&repo, |conn| {
+            conn.execute_batch(
+                "create trigger fail_runtime_upsert
+                 before update of generation on opencode_runtime
+                 when old.branch = 'feature/first'
+                 begin
+                   select raise(abort, 'forced runtime upsert failure');
+                 end;",
+            )
+            .map_err(|error| error.to_string())?;
+            Ok(())
+        })
+        .unwrap();
+        let replacement = OpencodeRuntime {
+            server_port: 41_001,
+            server_url: server_url(41_001),
+            server_pid: Some(300),
+            server_process_identity: Some(400),
+            updated_unix_ms: 84,
+            ..first.clone()
+        };
+
+        let error = save_shared_server_runtime(&repo, &replacement).unwrap_err();
+
+        assert!(error.contains("forced runtime upsert failure"));
+        for runtime in load_runtimes_for_harness(&repo, "opencode").unwrap() {
+            assert_eq!(runtime.server_port, first.server_port);
+            assert_eq!(runtime.server_url, first.server_url);
+            assert_eq!(runtime.server_pid, first.server_pid);
+            assert_eq!(
+                runtime.server_process_identity,
+                first.server_process_identity
+            );
+        }
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn runtime_identity_is_isolated_by_harness_id() {
         let temp = unique_temp_dir("prism-opencode-runtime-harness-test");
         fs::create_dir_all(&temp).unwrap();
@@ -2975,6 +3498,66 @@ mod tests {
             )
             .unwrap();
         assert_eq!(harness_id, "opencode");
+    }
+
+    #[test]
+    fn runtime_schema_migration_keeps_legacy_process_ownership_unknown() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "create table opencode_runtime (
+               repo_root text not null, harness_id text not null, branch text not null,
+               worktree_path text not null, server_port integer not null, server_url text not null,
+               server_pid integer, opencode_session_id text, generation integer not null,
+               updated_unix_ms integer not null, server_start_time_ticks integer,
+               primary key (repo_root, harness_id, branch, worktree_path)
+             );
+             insert into opencode_runtime values
+               ('/repo', 'opencode', 'feature', '/repo/feature', 41222,
+                'http://127.0.0.1:41222', 123, 'ses_old', 2, 42, null);",
+        )
+        .unwrap();
+
+        migrate_runtime_schema(&conn).unwrap();
+
+        let start_time = conn
+            .query_row(
+                "select server_start_time_ticks from opencode_runtime",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .unwrap();
+        assert_eq!(start_time, None);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn legacy_runtime_without_start_time_cannot_stop_a_matching_live_process() {
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("while :; do sleep 1; done")
+            .arg("legacy-opencode-fixture")
+            .args(["serve", "--hostname", "127.0.0.1", "--port", "41222"])
+            .spawn()
+            .unwrap();
+        let runtime = OpencodeRuntime {
+            repo_root: "/repo".to_string(),
+            harness_id: "opencode".to_string(),
+            branch: "feature".to_string(),
+            worktree_path: "/repo/feature".to_string(),
+            server_port: 41_222,
+            server_url: server_url(41_222),
+            server_pid: Some(child.id()),
+            server_process_identity: None,
+            opencode_session_id: Some("ses_old".to_string()),
+            generation: 2,
+            updated_unix_ms: 42,
+        };
+
+        shutdown_stored_server(&runtime).unwrap();
+
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
     }
 
     #[test]
@@ -3148,6 +3731,21 @@ mod tests {
     fn url_path_segment_percent_encodes_non_segment_bytes() {
         assert_eq!(url_path_segment("session/id 1"), "session%2Fid%201");
         assert_eq!(url_path_segment("ses_1-2.3~4"), "ses_1-2.3~4");
+    }
+
+    #[test]
+    fn request_path_routes_requests_to_the_worktree_directory() {
+        let directory = Path::new("/repo/work tree");
+
+        assert_eq!(
+            request_path("/session/status", Some(directory)),
+            "/session/status?directory=%2Frepo%2Fwork%20tree"
+        );
+        assert_eq!(
+            request_path("/session/ses_1/message?limit=10", Some(directory)),
+            "/session/ses_1/message?limit=10&directory=%2Frepo%2Fwork%20tree"
+        );
+        assert_eq!(request_path("/global/health", None), "/global/health");
     }
 
     #[test]
@@ -3469,13 +4067,15 @@ mod tests {
             .expect("set PRISM_TEST_OPENCODE to the real OpenCode binary");
         let temp = unique_temp_dir("prism-real-opencode-test");
         let worktree = temp.join("worktree");
+        let second_worktree = temp.join("second-worktree");
         let home = temp.join("home");
         let config_dir = temp.join("opencode-config");
         let data_dir = temp.join("data");
-        for path in [&worktree, &home, &config_dir, &data_dir] {
+        for path in [&worktree, &second_worktree, &home, &config_dir, &data_dir] {
             fs::create_dir_all(path).unwrap();
         }
         let worktree = fs::canonicalize(worktree).unwrap();
+        let second_worktree = fs::canonicalize(second_worktree).unwrap();
         let repo = Repository::with_config_dir_for_test(worktree.clone(), temp.join("config"));
         let wrapper = temp.join("opencode-isolated");
         let real_home = std::env::var("HOME").unwrap_or_default();
@@ -3513,6 +4113,20 @@ mod tests {
             if !check_health(&runtime.server_url) {
                 return Err("OpenCode server did not remain healthy".to_string());
             }
+            let second_runtime =
+                ensure_opencode_server(&repo, &config, "feature/second", &second_worktree)?;
+            if second_runtime.server_url != runtime.server_url
+                || second_runtime.server_pid != runtime.server_pid
+            {
+                return Err("worktrees did not reuse one OpenCode server".to_string());
+            }
+            let second_session =
+                create_session(&runtime.server_url, &second_worktree, "Second worktree")?;
+            if get_session_for_worktree(&runtime.server_url, &second_session.id, &second_worktree)?
+                .is_none()
+            {
+                return Err("shared server did not route the second worktree".to_string());
+            }
             let created = create_session(&runtime.server_url, &worktree, "Prism smoke test")?;
             let listed = list_sessions(&runtime.server_url)?;
             if !listed.iter().any(|session| session.id == created.id) {
@@ -3541,7 +4155,7 @@ mod tests {
             submit_prompt(&runtime.server_url, &created.id, prompt)?;
             let mut persisted = false;
             for _ in 0..20 {
-                let summary = fetch_message_summary(&runtime.server_url, &created.id)?;
+                let summary = fetch_message_summary(&runtime.server_url, &created.id, None)?;
                 if summary.latest_user_message.as_deref() == Some(prompt) {
                     persisted = true;
                     break;
@@ -3558,6 +4172,58 @@ mod tests {
 
         result.unwrap();
         shutdown.unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn worktree_cleanup_keeps_a_server_referenced_by_another_worktree() {
+        let temp = unique_temp_dir("prism-shared-opencode-cleanup");
+        fs::create_dir_all(&temp).unwrap();
+        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "while :; do sleep 1; done"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = crate::process::SupervisedChild::spawn(&mut command, None, None).unwrap();
+        let process_id = child.id();
+        record_owned_server_process(child);
+        let runtime = |branch: &str, worktree: &str| OpencodeRuntime {
+            repo_root: repo.root.display().to_string(),
+            harness_id: "opencode".to_string(),
+            branch: branch.to_string(),
+            worktree_path: worktree.to_string(),
+            server_port: 41_000,
+            server_url: "http://127.0.0.1:41000".to_string(),
+            server_pid: Some(process_id),
+            server_process_identity: stored_process_identity(process_id),
+            opencode_session_id: None,
+            generation: 0,
+            updated_unix_ms: 0,
+        };
+        let first = runtime("feature/first", "/repo/first");
+        let second = runtime("feature/second", "/repo/second");
+        save_runtime(&repo, &first).unwrap();
+        save_runtime(&repo, &second).unwrap();
+
+        shutdown_worktree_session_runtime_processes_with_lock_held(
+            &repo,
+            std::slice::from_ref(&first),
+        )
+        .unwrap();
+        assert!(owned_server_process(process_id));
+
+        observability::with_writable_db(&repo, |conn| {
+            remove_worktree_session_runtimes_with_conn(conn, std::slice::from_ref(&first))
+        })
+        .unwrap();
+        shutdown_worktree_session_runtime_processes_with_lock_held(
+            &repo,
+            std::slice::from_ref(&second),
+        )
+        .unwrap();
+        assert!(!owned_server_process(process_id));
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]
@@ -3722,6 +4388,46 @@ mod tests {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    fn start_health_server(
+        worktree: PathBuf,
+    ) -> (String, Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server = std::thread::spawn(move || {
+            while !server_stop.load(Ordering::Acquire) {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(error) => panic!("accept health request: {error}"),
+                };
+                let mut request = [0_u8; 1024];
+                let count = stream.read(&mut request).unwrap();
+                let request = String::from_utf8_lossy(&request[..count]);
+                let body = if request.starts_with("GET /global/health ") {
+                    r#"{"healthy":true}"#.to_string()
+                } else {
+                    format!(
+                        r#"{{"id":"ses_first","directory":"{}"}}"#,
+                        worktree.display()
+                    )
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        (url, stop, server)
     }
 
     fn start_session_resolution_server() -> String {

@@ -48,7 +48,10 @@ impl Tui {
             "prism-session-refresh".to_string(),
             move |context| {
                 for managed in &mut repos {
-                    managed.config = crate::config::Config::load(&managed.repo);
+                    let config = crate::config::Config::load(&managed.repo);
+                    if config.config_errors.is_empty() {
+                        managed.config = config;
+                    }
                 }
                 let repositories = repos
                     .iter()
@@ -219,7 +222,10 @@ impl Tui {
 
     pub(crate) fn refresh_sessions(&mut self) -> Result<(), String> {
         for managed in &mut self.repos {
-            managed.config = crate::config::Config::load(&managed.repo);
+            let config = crate::config::Config::load(&managed.repo);
+            if config.config_errors.is_empty() {
+                managed.config = config;
+            }
         }
         let repositories = self
             .repos
@@ -277,6 +283,7 @@ impl Tui {
                 || self.pr_persistence_in_flight.contains(key)
         });
         self.retain_agent_state_persistence_for(&live);
+        self.desktop_notifier.retain(&live);
         self.session_repository_identities = self
             .repos
             .iter()
@@ -288,6 +295,7 @@ impl Tui {
             &self.sessions,
             &mut self.tmux_generations,
         );
+        self.reseed_desktop_notifications();
         self.ensure_navigation_valid();
     }
 

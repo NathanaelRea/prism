@@ -35,6 +35,15 @@
 - **Behavior**: `prism doctor` reports tool availability and versions, GitHub
   authentication, configured checks, selected harness capabilities, and discovered
   worktrees.
+- **Default**: Desktop notifications are disabled. When enabled, category switches
+  independently control input-required, completed, and failed/restart Agent
+  Session transitions and may be overridden per repository.
+- **Invariant**: Enabling or reloading notifications establishes current Agent
+  Session states as a baseline and never reports persisted attention states.
+- **Constraint**: Desktop notification delivery is best effort, nonblocking, and
+  limited to accepted transitions while the dashboard event loop runs. Missing
+  graphical services, queue pressure, and backend failures never change session
+  state or fail a workflow.
 
 ## Verification Commands
 
@@ -109,6 +118,8 @@
 - **Invariant**: External-call flight events never contain argv, dynamic URLs,
   query values, bodies, headers, environment values, repository paths, session
   IDs, branch names, or raw stderr.
+- **Invariant**: Desktop notification diagnostics are throttled and contain only
+  platform, failure category, and notification kind, never notification text.
 - **Behavior**: Corruption-class SQLite failures trigger best-effort read-only
   `quick_check` and foreign-key diagnostics without replacing the original error
   or modifying the database.

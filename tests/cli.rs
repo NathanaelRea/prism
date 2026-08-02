@@ -518,6 +518,8 @@ fn config_discovery_commands_print_templates_schema_and_paths() {
     let example_stdout = stdout(&example);
     assert!(example_stdout.contains("#:schema https://raw.githubusercontent.com/"));
     assert!(example_stdout.contains("[ui]"));
+    assert!(example_stdout.contains("[notifications]"));
+    assert!(example_stdout.contains("enabled = false"));
     assert!(example_stdout.contains("default_harness = \"opencode\""));
     assert!(example_stdout.contains("[worktrees]"));
     assert!(example_stdout.contains("auto_implement ="));
@@ -527,6 +529,7 @@ fn config_discovery_commands_print_templates_schema_and_paths() {
     let schema_stdout = stdout(&schema);
     assert!(schema_stdout.contains(r#""title": "Prism Config""#));
     assert!(schema_stdout.contains(r#""merge_method""#));
+    assert!(schema_stdout.contains(r#""notifications""#));
 
     let paths = run(["config", "paths"], &repo, &config_home);
     assert!(paths.status.success(), "{}", stderr(&paths));

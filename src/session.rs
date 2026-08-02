@@ -434,7 +434,9 @@ fn shutdown_worktree_session_resources(
     if let Err(error) = crate::agent_session::shutdown(repo, config, branch) {
         errors.push(error);
     }
-    if let Err(error) = crate::opencode::shutdown_worktree_session_runtime_processes(runtimes) {
+    if let Err(error) =
+        crate::opencode::shutdown_worktree_session_runtime_processes_with_lock_held(repo, runtimes)
+    {
         errors.push(error);
     }
     if let Err(error) = crate::agent_session::remove_owned_log(repo, branch) {
@@ -714,6 +716,7 @@ fn remove_worktree_owned_state(
     observability::with_writable_db(repo, |conn| {
         ensure_cleanup_ownership(conn, branch, &worktree_path)
     })?;
+    let _server_lock = crate::opencode::lock_repository_server(repo)?;
     let runtimes = crate::opencode::load_runtimes_for_worktree_session(repo, branch, path)?;
     shutdown_worktree_session_resources(repo, config, branch, &runtimes)?;
     observability::with_writable_db(repo, |conn| {
@@ -1327,6 +1330,21 @@ fn load_task_metadata(repo: &Repository, branch: &str) -> Result<Option<TaskMeta
         )
         .optional()
         .map_err(|error| format!("read task metadata: {error}"))
+    })
+}
+
+pub(crate) fn load_task_initial_prompt(
+    repo: &Repository,
+    branch: &str,
+) -> Result<Option<String>, String> {
+    observability::with_writable_db(repo, |conn| {
+        conn.query_row(
+            "select initial_prompt from task_metadata where branch = ?1",
+            params![branch],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("read task initial prompt: {error}"))
     })
 }
 
