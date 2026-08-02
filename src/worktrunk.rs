@@ -1236,7 +1236,7 @@ mod tests {
             path: &created.path,
         })
         .unwrap();
-        assert_eq!(removed.path, created.path);
+        assert_eq!(removed.branch.as_deref(), Some("ci/real-smoke"));
         assert!(!created.path.exists());
         let _ = fs::remove_dir_all(temp);
     }
