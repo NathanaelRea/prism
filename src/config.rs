@@ -43,9 +43,9 @@ opencode_plan_plugin = false
 icon_style = "unicode" # or "nerd-font"
 
 [notifications]
-enabled = false
+enabled = true
 needs_input = true
-completed = true
+completed = false
 failed = true
 
 [worktrees]
@@ -158,9 +158,9 @@ pub struct NotificationConfig {
 impl Default for NotificationConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             needs_input: true,
-            completed: true,
+            completed: false,
             failed: true,
         }
     }
@@ -2029,7 +2029,15 @@ mod tests {
         assert_eq!(config.icon_style, IconStyle::Unicode);
         assert!(!config.icon_style_configured);
         assert_eq!(config.layout.sidebar_width, None);
-        assert_eq!(config.notifications, NotificationConfig::default());
+        assert_eq!(
+            config.notifications,
+            NotificationConfig {
+                enabled: true,
+                needs_input: true,
+                completed: false,
+                failed: true,
+            }
+        );
         assert!(config.worktree_columns.is_empty());
         assert_eq!(config.opencode_port_base, 41_000);
         assert_eq!(config.opencode_port_span, 1_000);

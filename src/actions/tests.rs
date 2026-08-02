@@ -1017,6 +1017,7 @@ fn opencode_poll_does_not_mark_busy_session_done_before_completed_message() {
     session.opencode_status = Some(test_opencode_status(OpencodeState::Busy));
     let mut config = test_config();
     config.notifications.enabled = true;
+    config.notifications.completed = true;
     let mut tui = Tui::new_single(repo, config, vec![session]);
     let (notifier, notifications) = crate::desktop_notification::DesktopNotifier::recording();
     tui.desktop_notifier = notifier;
@@ -2103,6 +2104,83 @@ fn stale_tmux_warmup_result_does_not_update_current_generation() {
     assert!(!changed);
     assert_eq!(tui.sessions[0].agent_state, AgentState::Idle);
 
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn tmux_warmup_liveness_does_not_replay_current_notification() {
+    let temp = unique_temp_dir("prism-tmux-notification-replay-test");
+    fs::create_dir_all(&temp).unwrap();
+    let mut config = test_config();
+    config.notifications.enabled = true;
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut session = test_session(temp.join("worktree"), "feature");
+    session.agent_state = AgentState::NeedsInput;
+    let mut tui = Tui::new_single(repo, config, vec![session]);
+    let (notifier, notifications) = crate::desktop_notification::DesktopNotifier::recording();
+    tui.desktop_notifier = notifier;
+    tui.reseed_desktop_notifications();
+    let slot = AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
+    tui.tmux_generations.insert(slot.clone(), 1);
+
+    assert!(tui.apply_tmux_warmup_result(AgentSessionWarmupResult {
+        key: AgentSessionWarmupKey::new(slot, 1),
+        running: Some(true),
+        error: None,
+    }));
+    assert_eq!(tui.sessions[0].agent_state, AgentState::Attached);
+    assert!(tui.apply_agent_state(0, AgentState::NeedsInput, true));
+
+    tui.desktop_notifier.flush();
+    assert!(notifications.lock().unwrap().is_empty());
+
+    assert!(tui.apply_tmux_warmup_result(AgentSessionWarmupResult {
+        key: AgentSessionWarmupKey::new(
+            AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0],),
+            1,
+        ),
+        running: Some(true),
+        error: None,
+    }));
+    tui.observe_current_agent_state(0);
+    assert!(tui.apply_agent_state(0, AgentState::ExitedError, true));
+    tui.desktop_notifier.flush();
+    assert_eq!(notifications.lock().unwrap().len(), 1);
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn tmux_warmup_liveness_can_report_a_distinct_completion() {
+    let temp = unique_temp_dir("prism-tmux-completion-notification-test");
+    fs::create_dir_all(&temp).unwrap();
+    let mut config = test_config();
+    config.notifications.enabled = true;
+    config.notifications.completed = true;
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut session = test_session(temp.join("worktree"), "feature");
+    session.agent_state = AgentState::ExitedError;
+    let mut tui = Tui::new_single(repo, config, vec![session]);
+    let (notifier, notifications) = crate::desktop_notification::DesktopNotifier::recording();
+    tui.desktop_notifier = notifier;
+    tui.reseed_desktop_notifications();
+    let slot = AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
+    tui.tmux_generations.insert(slot.clone(), 1);
+
+    assert!(tui.apply_tmux_warmup_result(AgentSessionWarmupResult {
+        key: AgentSessionWarmupKey::new(slot.clone(), 1),
+        running: Some(true),
+        error: None,
+    }));
+    assert_eq!(tui.sessions[0].agent_state, AgentState::Attached);
+    assert!(tui.apply_tmux_warmup_result(AgentSessionWarmupResult {
+        key: AgentSessionWarmupKey::new(slot, 1),
+        running: Some(false),
+        error: None,
+    }));
+    assert_eq!(tui.sessions[0].agent_state, AgentState::ExitedOk);
+
+    tui.desktop_notifier.flush();
+    assert_eq!(notifications.lock().unwrap().len(), 1);
     let _ = fs::remove_dir_all(temp);
 }
 

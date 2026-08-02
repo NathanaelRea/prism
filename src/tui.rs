@@ -42,6 +42,13 @@ use crate::workspace_state::{
     WorkspaceContext, WorkspaceState,
 };
 
+#[derive(Clone, Copy)]
+enum AgentObservationMode {
+    Baseline,
+    Transition,
+    AttachedLiveness,
+}
+
 pub struct Tui {
     pub(crate) repo: Repository,
     pub(crate) config: Config,
@@ -3383,7 +3390,12 @@ impl Tui {
         }
         session.agent_state = state;
         self.queue_agent_state_persistence(session_index);
-        self.submit_agent_observation(session_index, notify);
+        let mode = if notify {
+            AgentObservationMode::Transition
+        } else {
+            AgentObservationMode::Baseline
+        };
+        self.submit_agent_observation(session_index, mode);
         true
     }
 
@@ -3391,20 +3403,42 @@ impl Tui {
         &mut self,
         session_index: usize,
         previous: AgentState,
+        suppress_attached_liveness: bool,
     ) -> bool {
-        if self
+        let Some(current) = self
             .sessions
             .get(session_index)
-            .is_none_or(|session| session.agent_state == previous)
-        {
+            .map(|session| session.agent_state)
+        else {
+            return false;
+        };
+        if current == previous {
             return false;
         }
         self.queue_agent_state_persistence(session_index);
-        self.submit_agent_observation(session_index, true);
+        let replayed_liveness = suppress_attached_liveness
+            && current == AgentState::Attached
+            && matches!(
+                previous,
+                AgentState::NeedsInput
+                    | AgentState::ExitedOk
+                    | AgentState::ExitedError
+                    | AgentState::NeedsRestart
+            );
+        let mode = if replayed_liveness {
+            AgentObservationMode::AttachedLiveness
+        } else {
+            AgentObservationMode::Transition
+        };
+        self.submit_agent_observation(session_index, mode);
         true
     }
 
-    fn submit_agent_observation(&mut self, session_index: usize, notify: bool) {
+    pub(crate) fn observe_current_agent_state(&mut self, session_index: usize) {
+        self.submit_agent_observation(session_index, AgentObservationMode::Transition);
+    }
+
+    fn submit_agent_observation(&mut self, session_index: usize, mode: AgentObservationMode) {
         let Some(session) = self.sessions.get(session_index) else {
             return;
         };
@@ -3421,10 +3455,12 @@ impl Tui {
             state,
             config,
         };
-        if notify {
-            self.desktop_notifier.observe(observation);
-        } else {
-            self.desktop_notifier.baseline(observation);
+        match mode {
+            AgentObservationMode::Baseline => self.desktop_notifier.baseline(observation),
+            AgentObservationMode::Transition => self.desktop_notifier.observe(observation),
+            AgentObservationMode::AttachedLiveness => {
+                self.desktop_notifier.observe_attached_liveness(observation)
+            }
         }
     }
 

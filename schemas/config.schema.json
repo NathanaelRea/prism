@@ -161,11 +161,11 @@
     "notifications": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Opt-in desktop notifications. Every value may be overridden by repository config.",
+      "description": "Desktop notifications. Every value may be overridden by repository config.",
       "properties": {
         "enabled": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "description": "Enable desktop notifications for live Agent Session transitions."
         },
         "needs_input": {
@@ -175,7 +175,7 @@
         },
         "completed": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "description": "Notify when active work completes successfully."
         },
         "failed": {
