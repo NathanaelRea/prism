@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 
 use crate::session::Session;
@@ -787,7 +788,34 @@ impl Tui {
         Ok(())
     }
 
-    pub(super) fn handle_mouse_click(&mut self, x: u16, y: u16, area: Rect) {
+    pub(super) fn handle_mouse_event(&mut self, event: MouseEvent, area: Rect) -> bool {
+        match event.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.handle_mouse_click(event.column, event.row, area);
+                true
+            }
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                let body_height = area.height.saturating_sub(1);
+                let sidebar_width =
+                    view::sidebar_width_for(area.width, self.config.layout.sidebar_width);
+                if event.column < sidebar_width
+                    || event.column >= area.width
+                    || event.row >= body_height
+                {
+                    return false;
+                }
+                if event.kind == MouseEventKind::ScrollDown {
+                    self.main_scroll = self.main_scroll.saturating_add(1);
+                } else {
+                    self.main_scroll = self.main_scroll.saturating_sub(1);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_mouse_click(&mut self, x: u16, y: u16, area: Rect) {
         let body_height = area.height.saturating_sub(1);
         if x >= view::sidebar_width_for(area.width, self.config.layout.sidebar_width)
             || y >= body_height
