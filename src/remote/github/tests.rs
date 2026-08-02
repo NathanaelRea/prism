@@ -1959,6 +1959,83 @@ fn parses_graphql_pr_summary_index() {
 }
 
 #[test]
+fn github_preserves_merge_state_status_separately_from_mergeability() {
+    let raw = r#"{
+        "data": {
+            "repository": {
+                "pullRequests": {
+                    "pageInfo": {"hasNextPage": false},
+                    "nodes": [{
+                        "number": 117,
+                        "mergeable": "MERGEABLE",
+                        "mergeStateStatus": "BLOCKED",
+                        "commits": {
+                            "nodes": [{
+                                "commit": {
+                                    "statusCheckRollup": {
+                                        "contexts": {
+                                            "pageInfo": {"hasNextPage": false},
+                                            "nodes": [{
+                                                "__typename": "CheckRun",
+                                                "name": "test",
+                                                "status": "IN_PROGRESS",
+                                                "conclusion": null
+                                            }]
+                                        }
+                                    }
+                                }
+                            }]
+                        }
+                    }]
+                }
+            }
+        }
+    }"#;
+
+    let mut summaries = parse_pr_summary_index(raw);
+
+    assert_eq!(summaries[0].check_status, "running");
+    assert_eq!(summaries[0].merge_state_status, "BLOCKED");
+    assert_eq!(
+        summaries[0].native_state_evidence.mergeability,
+        vec!["MERGEABLE", "BLOCKED"]
+    );
+
+    let mut summary = summaries.remove(0);
+    summary.change_request_identity = Some(test_identity(
+        crate::remote::ProviderKind::GitHub,
+        "github.com",
+        "example/repo",
+        "117",
+    ));
+    let normalized =
+        adapter::normalize_summary(summary, crate::remote::RemoteOperation::ListChangeRequests)
+            .unwrap();
+
+    assert_eq!(
+        normalized.mergeability,
+        crate::remote::MergeabilityState::Mergeable
+    );
+
+    let mut behind = parse_pr_summary_index(&raw.replace("BLOCKED", "BEHIND")).remove(0);
+    assert_eq!(behind.merge_state_status, "BEHIND");
+    behind.change_request_identity = Some(test_identity(
+        crate::remote::ProviderKind::GitHub,
+        "github.com",
+        "example/repo",
+        "117",
+    ));
+    let normalized =
+        adapter::normalize_summary(behind, crate::remote::RemoteOperation::ListChangeRequests)
+            .unwrap();
+
+    assert_eq!(
+        normalized.mergeability,
+        crate::remote::MergeabilityState::Behind
+    );
+}
+
+#[test]
 fn graphql_queue_state_distinguishes_native_entry_absence_and_unobserved() {
     let queued = try_parse_pr_summary_index(
             r#"{"data":{"repository":{"pullRequests":{"nodes":[{"number":42,"mergeQueueEntry":{"state":"AWAITING_CHECKS"}}],"pageInfo":{"hasNextPage":false}}}}}"#,
