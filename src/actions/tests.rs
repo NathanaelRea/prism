@@ -21,8 +21,9 @@ use crate::tui::{
 use super::worktrees::development_url_opened_message;
 use super::{
     apply_bulk_review_resolution, archived_picker_overflow_message, discover_wt_columns,
-    open_http_url_in_browser, plan_run_mode_from_parallel_confirmation, pr_target_choice_list,
-    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener, status_label_with_behind,
+    ensure_review_resolution_head, open_http_url_in_browser,
+    plan_run_mode_from_parallel_confirmation, pr_target_choice_list, remote_pr_choice_keys,
+    remote_pr_worktree_branch, run_browser_opener, status_label_with_behind,
     unresolved_review_thread_ids, validate_push_target_after_checks, worktree_column_choices,
 };
 use std::cell::RefCell;
@@ -111,6 +112,16 @@ fn review_resolution_uses_only_unresolved_threads_in_the_observed_details() {
         unresolved_review_thread_ids(&details),
         vec!["thread-1", "thread-2"]
     );
+}
+
+#[test]
+fn review_resolution_waits_until_the_pushed_commit_is_observed() {
+    let mut summary = phase_1_pr_summary("old-head");
+
+    assert!(ensure_review_resolution_head(&summary, "new-head").is_err());
+
+    summary.head_sha = "new-head".to_string();
+    assert!(ensure_review_resolution_head(&summary, "new-head").is_ok());
 }
 
 #[test]

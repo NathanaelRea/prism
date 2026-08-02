@@ -50,6 +50,7 @@ impl Tui {
                 context.session_index,
                 &context.repo,
                 &context.config,
+                None,
             )? {
                 return Ok(());
             }
