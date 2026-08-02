@@ -346,6 +346,42 @@ pub fn load_recent_active_run_snapshots_for_repo(
         .collect()
 }
 
+pub fn load_terminal_repair_run_snapshots_for_repo(
+    conn: &rusqlite::Connection,
+    repo_root: &Path,
+) -> Result<Vec<PersistedAutoRun>, String> {
+    let mut statement = conn
+        .prepare(
+            "select run.id
+             from auto_run run
+             where run.repo_root = ?1
+               and run.archived_unix_ms is null
+               and run.variant = 'repair'
+               and run.status in ('done', 'aborted')
+               and not exists (
+                  select 1 from auto_run newer
+                  where newer.repo_root = run.repo_root
+                    and newer.worktree_path = run.worktree_path
+                    and newer.archived_unix_ms is null
+                    and newer.variant = 'repair'
+                    and newer.status in ('done', 'aborted')
+                    and newer.updated_unix_ms > run.updated_unix_ms
+               )
+             order by run.updated_unix_ms desc",
+        )
+        .map_err(|error| format!("prepare terminal repair history load: {error}"))?;
+    let ids = statement
+        .query_map([repo_root.display().to_string()], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|error| format!("query terminal repair history: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("read terminal repair history: {error}"))?;
+    ids.into_iter()
+        .filter_map(|id| load_auto_run_snapshot(conn, &id).transpose())
+        .collect()
+}
+
 fn load_recent_active_run_ids_for_repo(
     conn: &rusqlite::Connection,
     repo_root: &Path,

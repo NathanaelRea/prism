@@ -59,7 +59,8 @@ pub use output::{
 pub use runner::execute_auto_initial_step;
 pub use storage::{
     load_auto_run, load_auto_run_snapshot, load_recent_active_run_snapshots_for_repo,
-    load_recent_active_runs_for_repo, migrate_schema, save_auto_run, submit_auto_run,
+    load_recent_active_runs_for_repo, load_terminal_repair_run_snapshots_for_repo, migrate_schema,
+    save_auto_run, submit_auto_run,
 };
 
 pub(crate) use support::unix_ms;

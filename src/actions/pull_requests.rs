@@ -646,8 +646,12 @@ impl Tui {
             &context.config,
             crate::auto_flow::stabilization_model::RepairKind::Review,
         )?;
-        self.start_managed_repair(selected, &context.repo, &context.config, repair)?;
-        self.show_message("started managed review repair; commit will wait for guarded push")?;
+        let queued = self.start_managed_repair(selected, &context.repo, &context.config, repair)?;
+        self.show_message(if queued {
+            "review repair queued on headless worker; commit will wait for guarded push"
+        } else {
+            "review repair is already queued; focused existing managed action"
+        })?;
         Ok(())
     }
 
@@ -693,8 +697,12 @@ impl Tui {
             &context.config,
             crate::auto_flow::stabilization_model::RepairKind::Ci,
         )?;
-        self.start_managed_repair(selected, &context.repo, &context.config, repair)?;
-        self.show_message("started managed CI repair; commit will wait for guarded push")?;
+        let queued = self.start_managed_repair(selected, &context.repo, &context.config, repair)?;
+        self.show_message(if queued {
+            "CI repair queued on headless worker; commit will wait for guarded push"
+        } else {
+            "CI repair is already queued; focused existing managed action"
+        })?;
         Ok(())
     }
 
@@ -704,7 +712,7 @@ impl Tui {
         repo: &crate::repo::Repository,
         config: &crate::config::Config,
         repair: crate::auto_flow::stabilization_execute::StandaloneRepair,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         let session_path = self.sessions[selected].path.clone();
         let session_branch = self.sessions[selected].branch.clone();
         let mut persisted = if let Some(run_id) = self.active_auto_runs.get(&session_path).cloned()
@@ -750,22 +758,41 @@ impl Tui {
             run
         };
 
-        crate::observability::with_writable_db(repo, |conn| {
+        let queue = crate::observability::with_writable_db(repo, |conn| {
             crate::auto_flow::stabilization_execute::queue_standalone_repair(
                 conn,
                 &mut persisted,
                 repair,
-            )?;
-            Ok(())
+            )
         })?;
+        let selected_step = match queue {
+            crate::auto_flow::stabilization_execute::StandaloneRepairQueue::Queued(step_id)
+            | crate::auto_flow::stabilization_execute::StandaloneRepairQueue::AlreadyPending(
+                step_id,
+            ) => step_id,
+        };
         self.remember_auto_run(persisted.clone());
+        self.selected_auto_step_by_run
+            .insert(persisted.run.id.clone(), selected_step);
         self.selected_auto_run = Some(persisted.run.id.clone());
         #[cfg(test)]
         if self.prompt_submissions.is_some() {
-            return Ok(());
+            return Ok(matches!(
+                queue,
+                crate::auto_flow::stabilization_execute::StandaloneRepairQueue::Queued(_)
+            ));
         }
-        self.spawn_auto_run_executor(repo.clone(), config.clone(), persisted)?;
-        Ok(())
+        let queued = matches!(
+            queue,
+            crate::auto_flow::stabilization_execute::StandaloneRepairQueue::Queued(_)
+        );
+        if queued {
+            self.spawn_auto_run_executor(repo.clone(), config.clone(), persisted)?;
+        } else {
+            crate::worker::ensure_running()?;
+            crate::worker::wake()?;
+        }
+        Ok(queued)
     }
 
     #[cfg(test)]

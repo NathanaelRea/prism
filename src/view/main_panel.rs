@@ -25,11 +25,14 @@ pub(super) fn render_main(frame: &mut Frame<'_>, area: Rect, model: &crate::view
         PanelFocus::Repos => repo_overview_lines(model, width, content_area),
         PanelFocus::Worktrees => worktree_detail_lines(model),
     };
-    if model.focus == PanelFocus::Worktrees
-        && let Some(dashboard) = &model.plan_dashboard
-    {
-        lines.push(Line::from(""));
-        lines.extend(plan_dashboard_lines(dashboard, width, content_area));
+    if model.focus == PanelFocus::Worktrees {
+        if let Some(dashboard) = &model.auto_dashboard {
+            lines.push(Line::from(""));
+            lines.extend(auto_dashboard_lines(dashboard, width, content_area));
+        } else if let Some(dashboard) = &model.plan_dashboard {
+            lines.push(Line::from(""));
+            lines.extend(plan_dashboard_lines(dashboard, width, content_area));
+        }
     }
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     let rendered_lines = paragraph.line_count(inner_area.width);

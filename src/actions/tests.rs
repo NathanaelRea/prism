@@ -870,6 +870,14 @@ esac
     tui.prompt_submissions = Some(Vec::new());
 
     tui.start_ci_fix_for_test().unwrap();
+    let first_run_id = tui
+        .active_auto_runs
+        .get(&tui.sessions[0].path)
+        .unwrap()
+        .clone();
+    tui.selected_auto_step_by_run
+        .insert(first_run_id.clone(), i64::MAX);
+    tui.start_ci_fix_for_test().unwrap();
 
     let run_id = tui
         .active_auto_runs
@@ -881,6 +889,10 @@ esac
             .unwrap()
             .unwrap();
     assert_eq!(persisted.steps.len(), 1);
+    assert_eq!(
+        tui.selected_auto_step_by_run.get(&first_run_id),
+        persisted.steps[0].id.as_ref()
+    );
     assert_eq!(persisted.steps[0].step_key, AutoStepKey::FixCi);
     let prompt = persisted.steps[0].reason.as_deref().unwrap();
     assert!(prompt.contains("Here are CI failures on PR 42."));

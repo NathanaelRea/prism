@@ -263,6 +263,7 @@ pub(crate) struct AutoDashboard {
     pub linked_plan_dashboard: Option<PlanDashboard>,
     pub output_lines: Vec<AutoOutputLine>,
     pub output_state: AutoOutputViewerState,
+    pub worker_status: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -329,6 +330,7 @@ pub(crate) fn sidebar_width_for(cols: u16, configured_width: Option<u16>) -> u16
     layout::sidebar_width(cols, configured_width)
 }
 
+use auto_dashboard::*;
 use dialog::*;
 use format::*;
 use layout::*;

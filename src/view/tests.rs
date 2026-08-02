@@ -999,8 +999,9 @@ fn renders_auto_dashboard_steps_and_output_cursor() {
     model.auto_dashboard = Some(test_auto_dashboard());
     let buffer = render_to_string(&model, 120, 32);
 
-    assert!(!buffer.contains("Auto Flow"));
-    assert!(!buffer.contains("auto output"));
+    assert!(buffer.contains("Managed Work"));
+    assert!(buffer.contains("headless worker"));
+    assert!(buffer.contains("auto output"));
 }
 
 #[test]
@@ -1901,6 +1902,7 @@ fn test_auto_dashboard() -> AutoDashboard {
             cursor: 0,
             follow: true,
         },
+        worker_status: "healthy".to_string(),
     }
 }
 

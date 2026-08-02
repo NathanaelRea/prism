@@ -1939,7 +1939,7 @@ fn stale_reconciliation_marks_active_steps_failed() {
 }
 
 #[test]
-fn recent_active_runs_excludes_archived_and_done_runs() {
+fn recent_active_runs_exclude_terminal_repair_history() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
     let repo = PathBuf::from("/repo/prism");
@@ -1951,12 +1951,18 @@ fn recent_active_runs_excludes_archived_and_done_runs() {
         .unwrap()
         .create_run();
     done.run.status = AutoRunStatus::Done;
+    let mut repair = AutoLaunch::new(&repo, &repo.join("feature-r"), "feat/r", "Repair r")
+        .unwrap()
+        .create_run();
+    repair.run.variant = "repair".to_string();
+    repair.run.status = AutoRunStatus::Aborted;
     let mut archived = AutoLaunch::new(&repo, &repo.join("feature-c"), "feat/c", "Implement c")
         .unwrap()
         .create_run();
     archived.run.status = AutoRunStatus::Failed;
     save_auto_run(&conn, &mut active).unwrap();
     save_auto_run(&conn, &mut done).unwrap();
+    save_auto_run(&conn, &mut repair).unwrap();
     save_auto_run(&conn, &mut archived).unwrap();
     archive_auto_run(&conn, &mut archived).unwrap();
 
@@ -1964,6 +1970,10 @@ fn recent_active_runs_excludes_archived_and_done_runs() {
 
     assert_eq!(recent.len(), 1);
     assert_eq!(recent[0].run.id, active.run.id);
+
+    let history = load_terminal_repair_run_snapshots_for_repo(&conn, &repo).unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].run.id, repair.run.id);
 }
 
 #[test]

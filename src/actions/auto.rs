@@ -172,7 +172,7 @@ impl Tui {
         self.selected_auto_run = Some(run_id);
         crate::worker::ensure_running()?;
         crate::worker::wake()?;
-        self.show_message("started Auto Flow run")?;
+        self.show_message("Auto Flow queued on headless worker")?;
         Ok(())
     }
 
@@ -276,14 +276,14 @@ impl Tui {
                 title: "Abort Auto Flow".to_string(),
                 choices: vec![
                     if selected_active {
-                        crate::view::KeyChoice::new("s", "selected step")
+                        crate::view::KeyChoice::new("s", "cancel selected action")
                     } else {
-                        crate::view::KeyChoice::disabled("s", "selected step")
+                        crate::view::KeyChoice::disabled("s", "cancel selected action")
                     },
                     if run_active {
-                        crate::view::KeyChoice::new("a", "whole run")
+                        crate::view::KeyChoice::new("a", "abort all pending actions")
                     } else {
-                        crate::view::KeyChoice::disabled("a", "whole run")
+                        crate::view::KeyChoice::disabled("a", "abort all pending actions")
                     },
                 ],
             },

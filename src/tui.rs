@@ -15,6 +15,7 @@ use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSession
 use crate::auto_flow::{
     AutoOutputLine, AutoRunStatus, PersistedAutoRun, load_auto_run_snapshot,
     load_output_lines as load_auto_output_lines, load_recent_active_run_snapshots_for_repo,
+    load_terminal_repair_run_snapshots_for_repo,
 };
 use crate::config::Config;
 use crate::input::{Key, KeyInput};
@@ -140,6 +141,7 @@ pub struct Tui {
     workflow_polls_in_flight: BTreeSet<WorktreeRepositoryKey>,
     workflow_last_polled: BTreeMap<WorktreeRepositoryKey, Instant>,
     workflow_revision: u64,
+    worker_health: Option<Result<(), String>>,
     linked_plan_runs: BTreeMap<String, PersistedPlanRun>,
     dashboard_output_tx: LatestSender<DashboardOutputKey, DashboardOutputResult>,
     dashboard_output_rx: LatestReceiver<DashboardOutputKey, DashboardOutputResult>,
@@ -335,6 +337,7 @@ pub(crate) struct WorkflowPollSnapshot {
     plan_runs: Result<Vec<PersistedPlanRun>, String>,
     auto_runs: Result<Vec<PersistedAutoRun>, String>,
     linked_plan_runs: Result<Vec<PersistedPlanRun>, String>,
+    worker_health: Result<(), String>,
 }
 
 pub(crate) struct WorkflowPollResult {
@@ -1200,6 +1203,7 @@ impl Tui {
             workflow_polls_in_flight: BTreeSet::new(),
             workflow_last_polled: BTreeMap::new(),
             workflow_revision: 0,
+            worker_health: None,
             linked_plan_runs: BTreeMap::new(),
             dashboard_output_tx,
             dashboard_output_rx,
@@ -4368,6 +4372,10 @@ impl Tui {
             if self.move_repo_pr_selection(1) {
                 return;
             }
+            if self.move_auto_step_selection(1) {
+                self.main_scroll = self.main_scroll.saturating_add(1);
+                return;
+            }
             let moved_comment = self.move_comment_selection(1);
             self.main_scroll = self.main_scroll.saturating_add(1);
             if !moved_comment {
@@ -4385,6 +4393,10 @@ impl Tui {
     fn move_up(&mut self) {
         if self.main_focused {
             if self.move_repo_pr_selection(-1) {
+                return;
+            }
+            if self.move_auto_step_selection(-1) {
+                self.main_scroll = self.main_scroll.saturating_sub(1);
                 return;
             }
             let moved_comment = self.move_comment_selection(-1);
@@ -5150,6 +5162,8 @@ impl Tui {
             let Ok(snapshot) = result.snapshot else {
                 continue;
             };
+            changed |= self.worker_health.as_ref() != Some(&snapshot.worker_health);
+            self.worker_health = Some(snapshot.worker_health.clone());
             if let Ok(runs) = snapshot.plan_runs {
                 for run in runs {
                     changed |= self.remember_plan_run_snapshot(run);
@@ -5199,13 +5213,26 @@ impl Tui {
                 Some(TUI_ACTION_JOB_TIMEOUT),
                 "prism-workflow-poll".to_string(),
                 move |_| {
+                    let worker_health = crate::worker::health();
                     let snapshot = crate::observability::with_nonblocking_read_db_named(
                         &repo,
                         "tui.workflow.refresh",
                         |conn| {
                             let plan_runs = load_recent_plan_runs_for_repo(conn, &repo.root, 8);
-                            let auto_runs =
-                                load_recent_active_run_snapshots_for_repo(conn, &repo.root, 8);
+                            let auto_runs = (|| {
+                                let mut runs =
+                                    load_recent_active_run_snapshots_for_repo(conn, &repo.root, 8)?;
+                                let active_ids = runs
+                                    .iter()
+                                    .map(|run| run.run.id.clone())
+                                    .collect::<BTreeSet<_>>();
+                                runs.extend(
+                                    load_terminal_repair_run_snapshots_for_repo(conn, &repo.root)?
+                                        .into_iter()
+                                        .filter(|run| !active_ids.contains(&run.run.id)),
+                                );
+                                Ok(runs)
+                            })();
                             let linked_plan_runs = match &auto_runs {
                                 Ok(runs) => {
                                     let plan_ids = runs
@@ -5226,6 +5253,7 @@ impl Tui {
                                 plan_runs,
                                 auto_runs,
                                 linked_plan_runs,
+                                worker_health,
                             })
                         },
                     );
@@ -5549,7 +5577,7 @@ impl Tui {
             );
         }
         if let Some((repo, worktree_path)) = self.selected_auto_scope()
-            && let Some(run_id) = self.active_auto_runs.get(&worktree_path)
+            && let Some(run_id) = self.auto_run_id_for_worktree(&worktree_path)
             && let Some(run) = self.auto_runs.get(run_id)
         {
             let selected_step_run_id = self
@@ -5593,7 +5621,7 @@ impl Tui {
 
     pub(crate) fn current_auto_dashboard(&self) -> Option<view::AutoDashboard> {
         let (repo, worktree_path) = self.selected_auto_scope()?;
-        let run_id = self.active_auto_runs.get(&worktree_path)?;
+        let run_id = self.auto_run_id_for_worktree(&worktree_path)?;
         let mut run = self.auto_runs.get(run_id)?.clone();
         if let Some(selected_step) = self.selected_auto_step_by_run.get(run_id).copied() {
             run.run.selected_step_run_id = Some(selected_step);
@@ -5631,7 +5659,37 @@ impl Tui {
             linked_plan_dashboard,
             output_lines,
             output_state,
+            worker_status: match &self.worker_health {
+                Some(Ok(())) => "healthy".to_string(),
+                Some(Err(_)) => "unavailable".to_string(),
+                None => "checking".to_string(),
+            },
         })
+    }
+
+    fn auto_run_id_for_worktree(&self, worktree_path: &Path) -> Option<&String> {
+        if let Some(run_id) = self.active_auto_runs.get(worktree_path) {
+            return Some(run_id);
+        }
+        if self.plan_runs.values().any(|run| {
+            run.run.scope_path == worktree_path
+                && run.run.archived_unix_ms.is_none()
+                && matches!(
+                    run.run.status,
+                    PlanRunStatus::Queued | PlanRunStatus::Running | PlanRunStatus::Paused
+                )
+        }) {
+            return None;
+        }
+        self.auto_runs
+            .iter()
+            .filter(|(_, run)| {
+                run.run.worktree_path == worktree_path
+                    && run.run.archived_unix_ms.is_none()
+                    && run.run.variant == "repair"
+            })
+            .max_by_key(|(_, run)| run.run.updated_unix_ms)
+            .map(|(run_id, _)| run_id)
     }
 
     fn linked_plan_dashboard(
@@ -5793,6 +5851,45 @@ impl Tui {
         if let Some(step) = steps.get(next as usize).copied() {
             self.selected_plan_step_by_run.insert(run_id, step);
         }
+        true
+    }
+
+    fn move_auto_step_selection(&mut self, direction: isize) -> bool {
+        let Some(dashboard) = self.current_auto_dashboard() else {
+            return false;
+        };
+        if dashboard.run.run.variant != "repair" {
+            return false;
+        }
+        let run_id = dashboard.run.run.id.clone();
+        let steps = dashboard
+            .run
+            .steps
+            .iter()
+            .filter_map(|step| step.id)
+            .collect::<Vec<_>>();
+        if steps.is_empty() {
+            return false;
+        }
+        let current_step = self
+            .selected_auto_step_by_run
+            .get(&run_id)
+            .copied()
+            .or(dashboard.run.run.selected_step_run_id)
+            .unwrap_or(steps[0]);
+        let current = steps
+            .iter()
+            .position(|step| *step == current_step)
+            .unwrap_or(0);
+        let next = current as isize + direction;
+        let Some(step) = usize::try_from(next)
+            .ok()
+            .and_then(|next| steps.get(next))
+            .copied()
+        else {
+            return false;
+        };
+        self.selected_auto_step_by_run.insert(run_id, step);
         true
     }
 
@@ -8807,7 +8904,10 @@ esac
     #[test]
     fn terminal_auto_run_remains_in_history_but_is_no_longer_active() {
         let mut tui = test_tui();
+        tui.focused_panel = PanelFocus::Worktrees;
+        tui.select_worktree(1);
         let mut run = test_auto_run("run", "/repo-one/feature-one", 10);
+        run.run.variant = "repair".to_string();
 
         tui.remember_auto_run(run.clone());
         assert_eq!(
@@ -8820,6 +8920,11 @@ esac
 
         assert!(!tui.active_auto_runs.contains_key(&run.run.worktree_path));
         assert_eq!(tui.auto_runs.get(&run.run.id), Some(&run));
+        assert_eq!(tui.current_auto_dashboard().unwrap().run.run.id, run.run.id);
+
+        tui.remember_plan_run(test_plan_run("plan", "/repo-one/feature-one"));
+        assert!(tui.current_auto_dashboard().is_none());
+        assert_eq!(tui.current_plan_dashboard().unwrap().run.run.id, "plan");
     }
 
     #[test]

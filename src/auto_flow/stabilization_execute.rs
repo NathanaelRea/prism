@@ -43,6 +43,12 @@ pub(crate) struct StandaloneRepair {
     guard: WorkGuard,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StandaloneRepairQueue {
+    Queued(i64),
+    AlreadyPending(i64),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WaitDecision {
     KeepWaiting,
@@ -622,7 +628,7 @@ pub(crate) fn queue_standalone_repair(
     conn: &rusqlite::Connection,
     persisted: &mut PersistedAutoRun,
     repair: StandaloneRepair,
-) -> Result<i64, String> {
+) -> Result<StandaloneRepairQueue, String> {
     let original = persisted.clone();
     let step_key = match &repair.kind {
         super::stabilization_model::RepairKind::Review => AutoStepKey::FixReview,
@@ -642,24 +648,57 @@ pub(crate) fn queue_standalone_repair(
         ),
         super::stabilization_model::RepairKind::Merge => unreachable!(),
     };
-    apply_state(
-        persisted,
-        &super::stabilization_model::StabilizationState {
-            status: super::stabilization_model::StabilizationStatus::Blocked,
-            blocker,
-            next_work,
-            reason: "standalone PR repair requested from a trustworthy observation".to_string(),
-        },
-    );
-    persisted.run.pause_requested = false;
-    let result = super::append_step_run_with_work_guard(
-        conn,
-        persisted,
-        step_key,
-        Some(repair.prompt),
-        repair.guard,
-        None,
-    );
+    let result = (|| {
+        let transaction =
+            crate::flight_recorder::TransactionTrace::begin("auto_run.queue_standalone_repair");
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| format!("begin standalone repair transaction: {error}"))?;
+        if let Some(latest) = super::load_auto_run(&tx, &persisted.run.id)? {
+            *persisted = latest;
+        }
+        let queue = if let Some(step_id) = persisted.steps.iter().find_map(|step| {
+            (step.step_key == step_key
+                && matches!(
+                    step.status,
+                    AutoStepStatus::Queued
+                        | AutoStepStatus::Starting
+                        | AutoStepStatus::Running
+                        | AutoStepStatus::Waiting
+                ))
+            .then_some(step.id)
+            .flatten()
+        }) {
+            persisted.run.selected_step_run_id = Some(step_id);
+            super::save_run_with_conn(&tx, &persisted.run)?;
+            StandaloneRepairQueue::AlreadyPending(step_id)
+        } else {
+            apply_state(
+                persisted,
+                &super::stabilization_model::StabilizationState {
+                    status: super::stabilization_model::StabilizationStatus::Blocked,
+                    blocker,
+                    next_work,
+                    reason: "standalone PR repair requested from a trustworthy observation"
+                        .to_string(),
+                },
+            );
+            persisted.run.pause_requested = false;
+            let step_id = super::append_step_run_with_work_guard_in_transaction(
+                &tx,
+                persisted,
+                step_key,
+                Some(repair.prompt),
+                repair.guard,
+                None,
+            )?;
+            StandaloneRepairQueue::Queued(step_id)
+        };
+        tx.commit()
+            .map_err(|error| format!("commit standalone repair transaction: {error}"))?;
+        transaction.committed();
+        Ok(queue)
+    })();
     if result.is_err() {
         *persisted = original;
     }
@@ -2137,18 +2176,34 @@ mod tests {
             persisted.steps.clear();
             super::super::save_auto_run(&conn, &mut persisted).unwrap();
 
-            queue_standalone_repair(
+            let first = queue_standalone_repair(
+                &conn,
+                &mut persisted,
+                StandaloneRepair {
+                    kind: kind.clone(),
+                    prompt: "repair this PR".to_string(),
+                    guard: WorkGuard::default(),
+                },
+            )
+            .unwrap();
+            assert!(matches!(first, StandaloneRepairQueue::Queued(_)));
+
+            let duplicate = queue_standalone_repair(
                 &conn,
                 &mut persisted,
                 StandaloneRepair {
                     kind,
-                    prompt: "repair this PR".to_string(),
+                    prompt: "duplicate repair".to_string(),
                     guard: WorkGuard::default(),
                 },
             )
             .unwrap();
 
             assert_eq!(persisted.steps.len(), 1);
+            assert!(matches!(
+                duplicate,
+                StandaloneRepairQueue::AlreadyPending(_)
+            ));
             assert_eq!(persisted.steps[0].step_key, expected);
             assert!(!persisted.run.pause_requested);
             assert_eq!(

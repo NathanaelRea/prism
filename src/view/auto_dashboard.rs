@@ -16,7 +16,7 @@ pub(super) fn auto_dashboard_lines(
         .last()
         .map(|line| short_log_tail(&line.text));
     let mut lines = vec![
-        heading_line("Auto Flow"),
+        heading_line("Managed Work"),
         labelled_line("task", run.prompt_summary.clone()),
     ];
     if let Some(step) = selected_step {
@@ -48,6 +48,13 @@ pub(super) fn auto_dashboard_lines(
         Span::raw(elapsed_label(run.created_unix_ms, run.updated_unix_ms)),
     ]));
     lines.extend([
+        labelled_line(
+            "executor",
+            format!(
+                "headless worker {}  ·  Space p to manage",
+                dashboard.worker_status
+            ),
+        ),
         Line::from(vec![
             Span::styled("source ", muted_style()),
             Span::raw(auto_source_label(run.implementation_source)),
@@ -93,20 +100,105 @@ pub(super) fn auto_dashboard_lines(
         Span::raw(counts.failed.to_string()),
     ]));
     lines.push(Line::from(""));
-    lines.push(heading_line("Checklist"));
+    lines.push(heading_line(if run.variant == "repair" {
+        "Action Queue"
+    } else {
+        "Checklist"
+    }));
     let linked_plan_rows_reserved = linked_plan_summary_lines(dashboard).len();
+    let output_rows_reserved = if run.variant == "repair" && !dashboard.output_lines.is_empty() {
+        dashboard.output_lines.len().min(4) + 1
+    } else {
+        0
+    };
     let step_rows_available = visible_rows
         .saturating_sub(lines.len())
         .saturating_sub(linked_plan_rows_reserved)
+        .saturating_sub(output_rows_reserved)
         .max(3);
-    lines.extend(auto_checklist_lines(
-        dashboard,
-        step_rows_available,
-        output_tail.as_deref(),
-    ));
+    if run.variant == "repair" {
+        lines.extend(managed_work_queue_lines(
+            dashboard,
+            step_rows_available,
+            output_tail.as_deref(),
+        ));
+    } else {
+        lines.extend(auto_checklist_lines(
+            dashboard,
+            step_rows_available,
+            output_tail.as_deref(),
+        ));
+    }
+    if run.variant == "repair" && !dashboard.output_lines.is_empty() {
+        lines.push(heading_line("Selected Output"));
+        let output_rows = output_rows_reserved.saturating_sub(1);
+        let selected = if dashboard.output_state.follow {
+            dashboard.output_lines.len().saturating_sub(1)
+        } else {
+            dashboard
+                .output_state
+                .cursor
+                .min(dashboard.output_lines.len().saturating_sub(1))
+        };
+        let start = dashboard.output_lines.len().saturating_sub(output_rows);
+        lines.extend(
+            dashboard
+                .output_lines
+                .iter()
+                .enumerate()
+                .skip(start)
+                .map(|(index, line)| auto_output_row(line, index == selected)),
+        );
+    }
     lines.extend(linked_plan_summary_lines(dashboard));
     lines.truncate(visible_rows);
     lines
+}
+
+fn managed_work_queue_lines(
+    dashboard: &crate::view::AutoDashboard,
+    max_rows: usize,
+    output_tail: Option<&str>,
+) -> Vec<Line<'static>> {
+    let selected = dashboard.run.run.selected_step_run_id;
+    let selected_index = dashboard
+        .run
+        .steps
+        .iter()
+        .position(|step| step.id == selected)
+        .unwrap_or_else(|| dashboard.run.steps.len().saturating_sub(1));
+    let start = selected_index
+        .saturating_sub(max_rows / 2)
+        .min(dashboard.run.steps.len().saturating_sub(max_rows));
+    dashboard
+        .run
+        .steps
+        .iter()
+        .skip(start)
+        .take(max_rows)
+        .map(|step| {
+            let is_selected = step.id == selected;
+            Line::from(vec![
+                Span::styled(
+                    if is_selected { "▶ " } else { "  " },
+                    title_style(is_selected),
+                ),
+                Span::styled(format!("{:<3}", step.sequence), muted_style()),
+                Span::raw(format!("{:<22}", step.step_key.as_str())),
+                Span::styled(
+                    auto_step_status_label(step.status),
+                    auto_step_status_style(step.status),
+                ),
+                Span::raw(if is_selected {
+                    output_tail
+                        .map(|tail| format!("  {tail}"))
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                }),
+            ])
+        })
+        .collect()
 }
 
 pub(super) fn linked_plan_summary_lines(

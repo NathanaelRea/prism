@@ -443,15 +443,23 @@ impl Tui {
                 )
             }),
         };
-        let answer = self.prompt_choice_dialog(
-            raw,
-            Self::plan_action_choices(
-                "Auto Flow Actions",
-                "skip linked phase",
-                false,
-                availability,
-            ),
-        )?;
+        let dismiss = matches!(
+            dashboard.run.run.status,
+            AutoRunStatus::Done | AutoRunStatus::Failed | AutoRunStatus::Aborted
+        );
+        let mut choices = Self::plan_action_choices(
+            "Auto Flow Actions",
+            "skip linked phase",
+            false,
+            availability,
+        );
+        if let Some(abort) = choices.choices.iter_mut().find(|choice| choice.key == "x") {
+            abort.label = "cancel selected / abort all".to_string();
+        }
+        choices
+            .choices
+            .push(action_choice("d", "dismiss history", dismiss));
+        let answer = self.prompt_choice_dialog(raw, choices)?;
         let Some(answer) = answer else {
             return Ok(());
         };
@@ -477,8 +485,12 @@ impl Tui {
                 let _ = self.abort_selected_auto_run_or_step(raw)?;
                 Ok(())
             }
+            "d" | "dismiss" => {
+                let _ = self.dismiss_selected_auto_run()?;
+                Ok(())
+            }
             _ => {
-                self.show_message("unknown Auto Plan action")?;
+                self.show_message("unknown Auto Flow action")?;
                 Ok(())
             }
         }
