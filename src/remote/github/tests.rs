@@ -3065,7 +3065,14 @@ esac
 
     let command = fs::read_to_string(&log).unwrap();
     let args = command.lines().skip(1).collect::<Vec<_>>();
-    assert_eq!(command.lines().next(), Some(directory.to_str().unwrap()));
+    assert_eq!(
+        command
+            .lines()
+            .next()
+            .map(PathBuf::from)
+            .map(|path| path.canonicalize().unwrap()),
+        Some(directory.canonicalize().unwrap())
+    );
     assert_eq!(args[0], "<api>");
     assert_eq!(
         args[1],
