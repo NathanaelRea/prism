@@ -155,6 +155,9 @@ pub(crate) fn build_stabilization_snapshot(
             policy_error: policy_cache
                 .as_ref()
                 .and_then(|policy| policy.error.clone()),
+            merge_queue_required: policy_cache
+                .as_ref()
+                .is_some_and(|policy| policy.merge_queue_required),
         },
         worktree: WorktreeFacts {
             path: session.path.clone(),
@@ -300,6 +303,9 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
                     .as_ref()
                     .and_then(|policy| policy.error.clone())
             }),
+            merge_queue_required: policy_cache
+                .as_ref()
+                .is_some_and(|policy| policy.merge_queue_required),
         },
         worktree: WorktreeFacts {
             path: run.worktree_path.clone(),
@@ -320,7 +326,7 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
     }
 }
 
-fn target_remote_name(
+pub(super) fn target_remote_name(
     path: &std::path::Path,
     config: &Config,
     target_repository: Option<&crate::remote::RemoteRepositoryId>,
@@ -379,14 +385,6 @@ fn policy_facts_from_cache(
         {
             blockers.push(PolicyBlocker::ConversationsUnresolved);
         }
-        if policy.require_branch_up_to_date
-            && matches!(&pull_request.mergeability, MergeabilityFacts::Blocked { reason } if reason.contains("BEHIND"))
-        {
-            blockers.push(PolicyBlocker::BranchOutOfDate);
-        }
-    }
-    if policy.merge_queue_required {
-        blockers.push(PolicyBlocker::MergeQueueRequired);
     }
     if !blockers.is_empty() {
         return PolicyFacts::Blocked { blockers };
@@ -670,6 +668,7 @@ fn mergeability_facts(
         .as_str()
     {
         "CLEAN" | "HAS_HOOKS" | "UNSTABLE" => MergeabilityFacts::Clean,
+        "BEHIND" => MergeabilityFacts::Behind,
         "" | "UNKNOWN" => MergeabilityFacts::Unknown,
         other => MergeabilityFacts::Blocked {
             reason: format!("GitHub merge state is {other}"),
@@ -1106,6 +1105,19 @@ esac
         assert!(facts.review.approval_required);
         assert!(facts.review.actionable_reviews.is_empty());
         assert_eq!(facts.mergeability, MergeabilityFacts::Clean);
+    }
+
+    #[test]
+    fn github_blocked_merge_state_remains_fail_closed() {
+        let mut summary = test_summary();
+        summary.merge_state_status = "BLOCKED".to_string();
+
+        assert_eq!(
+            mergeability_facts(&summary, None),
+            MergeabilityFacts::Blocked {
+                reason: "GitHub merge state is BLOCKED".to_string()
+            }
+        );
     }
 
     #[test]

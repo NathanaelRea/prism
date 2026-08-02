@@ -262,6 +262,20 @@ pub(crate) fn execute_merge_authorization(
     path: &std::path::Path,
     authorization: MergeAuthorization,
 ) -> Result<ManualMergeExecution, String> {
+    execute_merge_authorization_with_mode(
+        config,
+        path,
+        authorization,
+        crate::remote::MergeSubmissionMode::Immediate,
+    )
+}
+
+pub(crate) fn execute_merge_authorization_with_mode(
+    config: &Config,
+    path: &std::path::Path,
+    authorization: MergeAuthorization,
+    submission_mode: crate::remote::MergeSubmissionMode,
+) -> Result<ManualMergeExecution, String> {
     match authorization {
         MergeAuthorization::Authorized(AuthorizedMerge {
             display_number,
@@ -279,6 +293,7 @@ pub(crate) fn execute_merge_authorization(
                 identity,
                 display_number,
                 expected_head_sha,
+                submission_mode,
             )?;
             match result.outcome {
                 crate::remote::MergeMutationOutcome::Merged => Ok(ManualMergeExecution::Merged {
@@ -490,17 +505,43 @@ pub(crate) fn next_repair_continuation(persisted: &PersistedAutoRun) -> Option<R
 }
 
 pub(crate) fn observe_and_plan(
+    conn: &rusqlite::Connection,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
-) -> StabilizationWorkItem {
-    let snapshot =
-        stabilization_observe::build_auto_run_stabilization_snapshot(repo, &persisted.run, config);
+) -> Result<StabilizationWorkItem, String> {
+    let merge_intent_armed = crate::integration::ensure_default_merge_intent(
+        conn,
+        &persisted.run.id,
+        config.auto.merge,
+    )?;
+    let mut effective_config = config.clone();
+    effective_config.auto.merge = merge_intent_armed;
+    let snapshot = stabilization_observe::build_auto_run_stabilization_snapshot(
+        repo,
+        &persisted.run,
+        &effective_config,
+    );
+    if merge_intent_armed
+        && let Some(pull_request) = snapshot.pull_request.as_ref()
+        && let Some(identity) = pull_request.change_request_identity.clone()
+    {
+        crate::integration::synchronize_generation(
+            conn,
+            &persisted.run.id,
+            &crate::integration::CandidateGeneration {
+                change_request_identity: identity,
+                target_branch: pull_request.base_ref.clone(),
+                pr_number: pull_request.number,
+                head_sha: pull_request.head_sha.clone(),
+            },
+        )?;
+    }
     let work = stabilization_plan::plan(&snapshot);
     apply_state(persisted, &work.state());
     persisted.run.status = persisted.authoritative_status();
     persisted.run.updated_unix_ms = unix_ms();
-    work
+    Ok(work)
 }
 
 fn apply_state(
@@ -733,11 +774,43 @@ pub(crate) fn append_planned_work(
         &persisted.run.id,
         work.guard.change_request_identity.as_ref(),
     )?;
+    if matches!(
+        work.kind,
+        super::stabilization_model::StabilizationWorkKind::Merge
+            | super::stabilization_model::StabilizationWorkKind::UpdateBranch
+    ) && crate::integration::active_merge_intent(conn, &persisted.run.id)?.is_some()
+    {
+        let expected_head_sha = work
+            .guard
+            .pr_head_sha
+            .as_deref()
+            .ok_or_else(|| "ready integration work has no pull request head".to_string())?;
+        if crate::integration::publish_ready(conn, &persisted.run.id, expected_head_sha)?
+            == crate::integration::IntegrationPlacement::Backlogged
+        {
+            apply_state(
+                persisted,
+                &super::stabilization_model::StabilizationState {
+                    status: super::stabilization_model::StabilizationStatus::Waiting,
+                    blocker:
+                        super::stabilization_model::StabilizationBlocker::IntegrationBacklogged,
+                    next_work:
+                        super::stabilization_model::StabilizationWorkKind::WaitForIntegration,
+                    reason: "pull request is ready and waiting for the repository integration lane"
+                        .to_string(),
+                },
+            );
+            persisted.run.status = persisted.authoritative_status();
+            persisted.run.updated_unix_ms = unix_ms();
+            save_run_with_conn(conn, &persisted.run)?;
+            return Ok(false);
+        }
+    }
     let Some(step_key) = step_for_work(&work.kind) else {
         save_run_with_conn(conn, &persisted.run)?;
         return Ok(false);
     };
-    if has_active_or_completed_step_after_latest_pr(persisted, &step_key) {
+    if has_active_or_completed_step_after_latest_pr(persisted, &step_key, &work.guard) {
         save_run_with_conn(conn, &persisted.run)?;
         return Ok(false);
     }
@@ -914,12 +987,14 @@ fn step_for_work(kind: &super::stabilization_model::StabilizationWorkKind) -> Op
         StabilizationWorkKind::FixCi => Some(AutoStepKey::FixCi),
         StabilizationWorkKind::VerifyCiFix => Some(AutoStepKey::VerifyCiFix),
         StabilizationWorkKind::CommitCiFix => Some(AutoStepKey::CommitCiFix),
+        StabilizationWorkKind::UpdateBranch => Some(AutoStepKey::UpdateBranch),
         StabilizationWorkKind::WaitForCi => Some(AutoStepKey::WaitCi),
         StabilizationWorkKind::WaitForReview => Some(AutoStepKey::WaitReview),
         StabilizationWorkKind::MarkReadyForManualMerge | StabilizationWorkKind::Merge => {
             Some(AutoStepKey::Merge)
         }
         StabilizationWorkKind::PushPendingRepair
+        | StabilizationWorkKind::WaitForIntegration
         | StabilizationWorkKind::Done
         | StabilizationWorkKind::Escalate => None,
     }
@@ -928,6 +1003,7 @@ fn step_for_work(kind: &super::stabilization_model::StabilizationWorkKind) -> Op
 fn has_active_or_completed_step_after_latest_pr(
     persisted: &PersistedAutoRun,
     key: &AutoStepKey,
+    expected_guard: &WorkGuard,
 ) -> bool {
     let pr_sequence = persisted
         .steps
@@ -939,15 +1015,20 @@ fn has_active_or_completed_step_after_latest_pr(
     persisted.steps.iter().any(|step| {
         step.sequence > pr_sequence
             && step.step_key.as_str() == key.as_str()
-            && matches!(
+            && step.work_guard.as_ref().is_some_and(|guard| {
+                guard.change_request_identity == expected_guard.change_request_identity
+                    && guard.authorized_target_branch == expected_guard.authorized_target_branch
+                    && guard.pr_head_sha == expected_guard.pr_head_sha
+            })
+            && (matches!(
                 step.status,
                 AutoStepStatus::Queued
                     | AutoStepStatus::Starting
                     | AutoStepStatus::Running
                     | AutoStepStatus::Waiting
                     | AutoStepStatus::Done
-                    | AutoStepStatus::Skipped
-            )
+            ) && !(key == &AutoStepKey::UpdateBranch && step.status == AutoStepStatus::Done)
+                || (step.status == AutoStepStatus::Skipped && key != &AutoStepKey::Merge))
     })
 }
 
@@ -957,7 +1038,7 @@ pub(crate) fn observe_plan_and_save(
     config: &Config,
     persisted: &mut PersistedAutoRun,
 ) -> Result<StabilizationWorkItem, String> {
-    let work = observe_and_plan(repo, config, persisted);
+    let work = observe_and_plan(conn, repo, config, persisted)?;
     save_run_with_conn(conn, &persisted.run)?;
     super::save_observed_change_request_identity(
         conn,
@@ -1119,7 +1200,11 @@ pub(crate) fn complete_repair_commit(
     guard.commit_sha = commit_sha.clone();
     guard.expected_local_head_sha = local_head_sha.clone().unwrap_or_else(|| commit_sha.clone());
     save_run_with_conn(conn, &persisted.run)?;
-    if config.auto.push_repairs {
+    let push_repair = config.auto.push_repairs
+        || crate::integration::active_merge_intent(conn, &persisted.run.id)?.is_some_and(
+            |intent| intent.placement == crate::integration::IntegrationPlacement::Reserved,
+        );
+    if push_repair {
         progress_pending_push(conn, repo, config, persisted, cache, || Ok(()))?;
     }
 
@@ -1131,7 +1216,7 @@ pub(crate) fn complete_repair_commit(
         super::stabilization_model::RepairKind::Ci => "CI",
         super::stabilization_model::RepairKind::Merge => "merge",
     };
-    let summary = if config.auto.push_repairs {
+    let summary = if push_repair {
         format!("committed {label} fixes as {commit_sha} and pushed")
     } else {
         format!("committed {label} fixes as {commit_sha}; pending guarded push")
@@ -1345,6 +1430,18 @@ pub(crate) fn progress_pending_push(
                 .to_string(),
         );
     }
+    if let Some(identity) = summary.change_request_identity.clone() {
+        crate::integration::synchronize_managed_generation(
+            conn,
+            &persisted.run.id,
+            &crate::integration::CandidateGeneration {
+                change_request_identity: identity,
+                target_branch: summary.base_ref.clone(),
+                pr_number: summary.number,
+                head_sha: summary.head_sha.clone(),
+            },
+        )?;
+    }
 
     while let Some(thread_id) = persisted
         .run
@@ -1548,6 +1645,48 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn completed_wait_from_old_head_does_not_suppress_new_generation() {
+        let mut persisted = AutoLaunch::new(
+            Path::new("/repo"),
+            Path::new("/repo/feature"),
+            "feature",
+            "stabilize",
+        )
+        .unwrap()
+        .create_run();
+        persisted.steps.clear();
+        let mut push = AutoStepRun::running(&persisted.run.id, 1, AutoStepKey::PushPr, 1);
+        push.status = AutoStepStatus::Done;
+        persisted.steps.push(push);
+        let mut wait = AutoStepRun::running(&persisted.run.id, 2, AutoStepKey::WaitCi, 1);
+        wait.status = AutoStepStatus::Done;
+        wait.work_guard = Some(WorkGuard {
+            pr_head_sha: Some("old-head".to_string()),
+            ..WorkGuard::default()
+        });
+        persisted.steps.push(wait);
+
+        let old_guard = WorkGuard {
+            pr_head_sha: Some("old-head".to_string()),
+            ..WorkGuard::default()
+        };
+        let new_guard = WorkGuard {
+            pr_head_sha: Some("new-head".to_string()),
+            ..WorkGuard::default()
+        };
+        assert!(has_active_or_completed_step_after_latest_pr(
+            &persisted,
+            &AutoStepKey::WaitCi,
+            &old_guard
+        ));
+        assert!(!has_active_or_completed_step_after_latest_pr(
+            &persisted,
+            &AutoStepKey::WaitCi,
+            &new_guard
+        ));
+    }
 
     #[test]
     fn blocked_manual_merge_cases_never_invoke_gh_merge() {
@@ -2498,6 +2637,7 @@ mod tests {
                 remote_project: Some("owner/repo".to_string()),
                 policy_refreshed_unix_ms: Some(1),
                 policy_error: None,
+                merge_queue_required: false,
             },
             worktree: WorktreeFacts {
                 path: PathBuf::from("/repo/feature"),

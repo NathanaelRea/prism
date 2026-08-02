@@ -51,6 +51,7 @@ pub(crate) struct RepositoryFacts {
     pub remote_project: Option<String>,
     pub policy_refreshed_unix_ms: Option<u64>,
     pub policy_error: Option<String>,
+    pub merge_queue_required: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,6 +157,7 @@ pub(crate) struct ReviewThreadFact {
 pub(crate) enum MergeabilityFacts {
     Unknown,
     Clean,
+    Behind,
     Blocked { reason: String },
 }
 
@@ -217,6 +219,7 @@ pub enum StabilizationBlocker {
     WrongBase,
     HeadDiverged,
     MergeBlocked,
+    BranchBehind,
     ReviewFeedbackFound,
     ReviewApprovalMissing,
     CiFailed,
@@ -224,6 +227,7 @@ pub enum StabilizationBlocker {
     CiMissingRequiredChecks,
     PolicyBlocked,
     PolicyUnknown,
+    IntegrationBacklogged,
     ReadyForManualMerge,
     ReadyToAutoMerge,
     Merged,
@@ -252,8 +256,10 @@ pub enum StabilizationWorkKind {
     FixCi,
     VerifyCiFix,
     CommitCiFix,
+    UpdateBranch,
     WaitForCi,
     WaitForReview,
+    WaitForIntegration,
     MarkReadyForManualMerge,
     Merge,
     Done,
@@ -318,6 +324,7 @@ impl StabilizationBlocker {
             Self::WrongBase => "wrong_base",
             Self::HeadDiverged => "head_diverged",
             Self::MergeBlocked => "merge_blocked",
+            Self::BranchBehind => "branch_behind",
             Self::ReviewFeedbackFound => "review_feedback_found",
             Self::ReviewApprovalMissing => "review_approval_missing",
             Self::CiFailed => "ci_failed",
@@ -325,6 +332,7 @@ impl StabilizationBlocker {
             Self::CiMissingRequiredChecks => "ci_missing_required_checks",
             Self::PolicyBlocked => "policy_blocked",
             Self::PolicyUnknown => "policy_unknown",
+            Self::IntegrationBacklogged => "integration_backlogged",
             Self::ReadyForManualMerge => "ready_for_manual_merge",
             Self::ReadyToAutoMerge => "ready_to_auto_merge",
             Self::Merged => "merged",
@@ -344,6 +352,7 @@ impl StabilizationBlocker {
             "wrong_base" => Ok(Self::WrongBase),
             "head_diverged" => Ok(Self::HeadDiverged),
             "merge_blocked" => Ok(Self::MergeBlocked),
+            "branch_behind" => Ok(Self::BranchBehind),
             "review_feedback_found" => Ok(Self::ReviewFeedbackFound),
             "review_approval_missing" => Ok(Self::ReviewApprovalMissing),
             "ci_failed" => Ok(Self::CiFailed),
@@ -351,6 +360,7 @@ impl StabilizationBlocker {
             "ci_missing_required_checks" => Ok(Self::CiMissingRequiredChecks),
             "policy_blocked" => Ok(Self::PolicyBlocked),
             "policy_unknown" => Ok(Self::PolicyUnknown),
+            "integration_backlogged" => Ok(Self::IntegrationBacklogged),
             "ready_for_manual_merge" => Ok(Self::ReadyForManualMerge),
             "ready_to_auto_merge" => Ok(Self::ReadyToAutoMerge),
             "merged" => Ok(Self::Merged),
@@ -375,8 +385,10 @@ impl StabilizationWorkKind {
             Self::FixCi => "fix_ci",
             Self::VerifyCiFix => "verify_ci_fix",
             Self::CommitCiFix => "commit_ci_fix",
+            Self::UpdateBranch => "update_branch",
             Self::WaitForCi => "wait_for_ci",
             Self::WaitForReview => "wait_for_review",
+            Self::WaitForIntegration => "wait_for_integration",
             Self::MarkReadyForManualMerge => "mark_ready_for_manual_merge",
             Self::Merge => "merge",
             Self::Done => "done",
@@ -398,8 +410,10 @@ impl StabilizationWorkKind {
             "fix_ci" => Ok(Self::FixCi),
             "verify_ci_fix" => Ok(Self::VerifyCiFix),
             "commit_ci_fix" => Ok(Self::CommitCiFix),
+            "update_branch" => Ok(Self::UpdateBranch),
             "wait_for_ci" => Ok(Self::WaitForCi),
             "wait_for_review" => Ok(Self::WaitForReview),
+            "wait_for_integration" => Ok(Self::WaitForIntegration),
             "mark_ready_for_manual_merge" => Ok(Self::MarkReadyForManualMerge),
             "merge" => Ok(Self::Merge),
             "done" => Ok(Self::Done),
@@ -412,9 +426,9 @@ impl StabilizationWorkKind {
 impl StabilizationWorkItem {
     fn status(&self) -> StabilizationStatus {
         match self.kind {
-            StabilizationWorkKind::WaitForCi | StabilizationWorkKind::WaitForReview => {
-                StabilizationStatus::Waiting
-            }
+            StabilizationWorkKind::WaitForCi
+            | StabilizationWorkKind::WaitForReview
+            | StabilizationWorkKind::WaitForIntegration => StabilizationStatus::Waiting,
             StabilizationWorkKind::MarkReadyForManualMerge | StabilizationWorkKind::Merge => {
                 StabilizationStatus::Ready
             }

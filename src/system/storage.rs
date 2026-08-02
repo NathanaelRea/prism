@@ -747,6 +747,7 @@ fn apply_additive_schema_migrations(conn: &Connection) -> Result<(), StorageErro
     crate::opencode::migrate_runtime_schema(conn).map_err(migration_error)?;
     crate::plan_run::migrate_schema(conn).map_err(migration_error)?;
     crate::auto_flow::migrate_schema(conn).map_err(migration_error)?;
+    crate::integration::migrate_schema(conn).map_err(migration_error)?;
     crate::execution::migrate_schema(conn).map_err(migration_error)?;
     crate::remote::migrate_pr_cache_schema(conn).map_err(migration_error)?;
     Ok(())
@@ -754,7 +755,8 @@ fn apply_additive_schema_migrations(conn: &Connection) -> Result<(), StorageErro
 
 fn additive_schema_current(conn: &Connection) -> Result<bool, StorageError> {
     Ok(table_has_column(conn, "pr_cache", "author")?
-        && table_has_column(conn, "pending_worktree_deletion", "branch_deleted")?)
+        && table_has_column(conn, "pending_worktree_deletion", "branch_deleted")?
+        && table_has_column(conn, "merge_intent", "placement")?)
 }
 
 fn table_has_column(

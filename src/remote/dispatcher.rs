@@ -1171,6 +1171,7 @@ pub(crate) fn merge_change_request(
     authorized_identity: &CanonicalChangeRequestIdentity,
     display_number: u64,
     expected_head_sha: &str,
+    submission_mode: super::MergeSubmissionMode,
 ) -> Result<MergeMutationResult, String> {
     let remotes = configured_remote_repositories(path, config)?;
     let authorized_id = authorized_identity
@@ -1211,7 +1212,7 @@ pub(crate) fn merge_change_request(
             crate::config::MergeMethod::Squash => MergeMethod::Squash,
             crate::config::MergeMethod::Rebase => MergeMethod::Rebase,
         },
-        native_guard: None,
+        submission_mode,
     };
     request
         .validate_observation(&summary)
@@ -2241,6 +2242,7 @@ printf '%s\n' '{{"data":{{"repository":{{"pullRequests":{{"nodes":[{{"id":"PR_fo
         ));
         std::fs::create_dir_all(&directory).unwrap();
         let gh_log = directory.join("gh.log");
+        let gh_count = directory.join("gh-count");
         let mut config = crate::test_support::test_config();
         crate::test_support::install_tool(
             &mut config,
@@ -2264,13 +2266,21 @@ esac
 printf '%s\n' "$*" >> '{}'
 case "$*" in
   *"api graphql"*)
+    count=0
+    test ! -f '{}' || count=$(cat '{}')
+    count=$((count + 1))
+    printf '%s\n' "$count" > '{}'
+    test "$count" -lt 3 || exit 1
     printf '%s\n' '{{"data":{{"repository":{{"pullRequest":{{"id":"PR_stale","number":42,"title":"Fork change","state":"OPEN","headRefName":"topic","baseRefName":"main","headRefOid":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","headRepository":{{"nameWithOwner":"former-contributor/widget"}},"baseRepository":{{"nameWithOwner":"acme/widget"}}}}}}}}}}'
     ;;
   *"pr merge 42"*) exit 0 ;;
   *) exit 1 ;;
 esac
 "#,
-                gh_log.display()
+                gh_log.display(),
+                gh_count.display(),
+                gh_count.display(),
+                gh_count.display()
             ),
         );
         let source = repository(ProviderKind::GitHub, "former-contributor/widget");
@@ -2288,12 +2298,18 @@ esac
             &identity,
             42,
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            super::super::MergeSubmissionMode::Immediate,
         )
         .unwrap();
 
         assert_eq!(
             result.outcome,
             super::super::MergeMutationOutcome::Uncertain
+        );
+        assert!(
+            result
+                .native_state
+                .contains("post-mutation observation failed")
         );
         let commands = std::fs::read_to_string(&gh_log).unwrap();
         assert!(commands.contains(

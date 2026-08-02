@@ -8,6 +8,7 @@ mod application;
 pub use application::cli;
 pub(crate) use application::{args, config, setup};
 pub mod auto_flow;
+mod integration;
 pub mod plan_run;
 mod remote;
 mod repository;

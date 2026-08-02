@@ -25,6 +25,18 @@ use super::{
     remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener, status_label_with_behind,
     unresolved_review_thread_ids, validate_push_target_after_checks, worktree_column_choices,
 };
+
+#[test]
+fn auto_startup_choices_only_allow_disable_for_active_runs() {
+    let active = super::auto::auto_startup_choices(true);
+    assert_eq!(active.choices[0].key, "x");
+    assert!(!active.choices[0].disabled);
+    assert!(active.choices[1..].iter().all(|choice| choice.disabled));
+
+    let inactive = super::auto::auto_startup_choices(false);
+    assert!(inactive.choices[0].disabled);
+    assert!(inactive.choices[1..].iter().all(|choice| !choice.disabled));
+}
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;

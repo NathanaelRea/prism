@@ -405,7 +405,6 @@ macro_rules! opaque_id {
 opaque_id!(NativeRepositoryId);
 opaque_id!(NativeChangeRequestId);
 opaque_id!(NativeReviewThreadId);
-opaque_id!(NativeMergeGuard);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RemoteRepository {
@@ -708,8 +707,8 @@ normalized_state!(CheckState {
 
 normalized_state!(QueueState {
     NotQueued => ["not_queued", "none"],
-    Queued => ["queued", "pending"],
-    Running => ["running", "active"],
+    Queued => ["queued", "pending", "awaiting_checks", "locked"],
+    Running => ["running", "active", "mergeable"],
     Blocked => ["blocked"],
     Complete => ["complete", "completed", "merged"]
 });
@@ -948,6 +947,12 @@ pub(crate) enum MergeMethod {
     Rebase,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MergeSubmissionMode {
+    Immediate,
+    NativeQueue,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GuardedMerge {
     pub(crate) id: ChangeRequestId,
@@ -955,7 +960,7 @@ pub(crate) struct GuardedMerge {
     pub(crate) target_branch: String,
     pub(crate) expected_source_sha: String,
     pub(crate) method: MergeMethod,
-    pub(crate) native_guard: Option<NativeMergeGuard>,
+    pub(crate) submission_mode: MergeSubmissionMode,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

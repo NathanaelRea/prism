@@ -11,6 +11,14 @@ pub fn execute_auto_initial_step(
     let run_id = persisted.run.id.clone();
     *persisted = load_auto_run(conn, &run_id)?
         .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
+    if persisted.run.status == AutoRunStatus::Paused
+        && !persisted.run.pause_requested
+        && crate::integration::active_merge_intent(conn, &run_id)?.is_some_and(|intent| {
+            intent.placement == crate::integration::IntegrationPlacement::Reserved
+        })
+    {
+        persisted.run.status = AutoRunStatus::Queued;
+    }
     if auto_run_execution_blocked(persisted) {
         return Ok(());
     }
@@ -47,7 +55,13 @@ pub fn execute_auto_initial_step(
             return Ok(());
         }
 
-        if persisted.run.pending_push.is_some() && config.auto.push_repairs {
+        let reserved_integration = crate::integration::active_merge_intent(conn, &run_id)?
+            .is_some_and(|intent| {
+                intent.placement == crate::integration::IntegrationPlacement::Reserved
+            });
+        if persisted.run.pending_push.is_some()
+            && (config.auto.push_repairs || reserved_integration)
+        {
             let mut cache = crate::remote::load_pr_cache(repo, &persisted.run.branch);
             stabilization_execute::progress_pending_push(
                 conn,

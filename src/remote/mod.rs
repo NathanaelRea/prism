@@ -33,17 +33,18 @@ pub(crate) use discovery::{
 pub(crate) use discovery::{DiscoveryError, GitRemoteParser, GitTransport};
 pub(crate) use error::{RemoteError, RemoteErrorClass, RemoteOperation, RetryHint, Retryability};
 pub(crate) use migrations::migrate_pr_cache_schema;
+#[cfg(test)]
+pub(crate) use model::HeadAssociation;
 pub(crate) use model::{
     CanonicalChangeRequestIdentity, ChangeRequest, ChangeRequestDetails, ChangeRequestId,
     ChangeRequestSummary, CheckContext, CheckState, CiFailure, Comment, CreateChangeRequest,
     FetchChangeRequest, GuardedMerge, HostIdentity, IdentityError, LifecycleState, MergeMethod,
-    MergeMutationOutcome, MergeMutationResult, MergeabilityState, NativeChangeRequestId,
-    NativeReviewThreadId, NativeStateEvidence, Observation, PolicyFacts, ProviderKind, QueueState,
-    RemoteBase, RemoteRepository, RemoteRepositoryId, RepositoryPolicy, ResolveReviewThread,
-    Review, ReviewDecision, ReviewSubmissionKind, ReviewThread, SubmitReview, WebScheme,
+    MergeMutationOutcome, MergeMutationResult, MergeSubmissionMode, MergeabilityState,
+    NativeChangeRequestId, NativeReviewThreadId, NativeStateEvidence, Observation, PolicyFacts,
+    ProviderKind, QueueState, RemoteBase, RemoteRepository, RemoteRepositoryId, RepositoryPolicy,
+    ResolveReviewThread, Review, ReviewDecision, ReviewSubmissionKind, ReviewThread, SubmitReview,
+    WebScheme,
 };
-#[cfg(test)]
-pub(crate) use model::{HeadAssociation, NativeMergeGuard};
 #[cfg(test)]
 pub(crate) use store::record_pr_summary;
 #[cfg(test)]

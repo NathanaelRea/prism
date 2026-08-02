@@ -125,7 +125,7 @@ impl KeyInput {
             KeyCode::Char('o') if plain_char(event) => Key::OpenPr,
             KeyCode::Char('v') if plain_char(event) => Key::SubmitReview,
             KeyCode::Char('P') if plain_char(event) => Key::Push,
-            KeyCode::Char('M') if plain_char(event) => Key::Merge,
+            KeyCode::Char('M') if plain_char(event) => Key::ToggleMergeQueue,
             KeyCode::Char('c') if plain_char(event) => Key::CiFix,
             KeyCode::Char('f') if plain_char(event) => Key::ReviewFix,
             KeyCode::Char('R') if plain_char(event) => Key::ResolveAllComments,
@@ -193,7 +193,7 @@ pub enum Key {
     ReviewFix,
     ResolveAllComments,
     Push,
-    Merge,
+    ToggleMergeQueue,
     PullDefault,
     PlanMode,
     Create,
@@ -376,11 +376,14 @@ mod tests {
     }
 
     #[test]
-    fn key_input_handles_merge() {
+    fn key_input_handles_merge_queue_toggle() {
         let mut input = KeyInput::default();
         assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
         assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
-        assert_eq!(map(&mut input, shift_key(KeyCode::Char('M'))), Key::Merge);
+        assert_eq!(
+            map(&mut input, shift_key(KeyCode::Char('M'))),
+            Key::ToggleMergeQueue
+        );
     }
 
     #[test]

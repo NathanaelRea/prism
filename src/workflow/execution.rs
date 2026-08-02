@@ -512,6 +512,111 @@ pub fn install_claim_guards(conn: &Connection, claim: &ExecutionClaim) -> Result
                 .map_err(|error| format!("install execution claim guard for {table}: {error}"))?;
         }
     }
+    for operation in ["insert", "update", "delete"] {
+        let rows = match operation {
+            "insert" => vec!["new"],
+            "delete" => vec!["old"],
+            _ => vec!["old", "new"],
+        };
+        let ownership = rows
+            .into_iter()
+            .map(|row| {
+                format!(
+                    "exists (
+                       select 1 from _prism_execution_claim_guard g
+                       where g.workflow_kind = 'auto'
+                         and (g.run_id = {row}.run_id
+                           or ({row}.lane_key is not null and exists (
+                             select 1 from merge_intent owned
+                             where owned.run_id = g.run_id
+                               and owned.state = 'armed'
+                               and owned.placement in ('reserved', 'updating', 'submitting', 'submitted')
+                               and owned.lane_key = {row}.lane_key
+                           )))
+                     )"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let trigger = format!(
+            "drop trigger if exists temp._prism_guard_merge_intent_{operation};
+             create temp trigger _prism_guard_merge_intent_{operation}
+             before {operation} on main.merge_intent
+             when not (({ownership}) and ({current_claim}))
+             begin
+               select raise(abort, 'execution claim is stale');
+             end;"
+        );
+        conn.execute_batch(&trigger)
+            .map_err(|error| format!("install execution claim guard for merge_intent: {error}"))?;
+    }
+    for operation in ["insert", "update", "delete"] {
+        let rows = match operation {
+            "insert" => vec!["new"],
+            "delete" => vec!["old"],
+            _ => vec!["old", "new"],
+        };
+        let ownership = if operation == "insert" {
+            "exists (
+               select 1 from _prism_execution_claim_guard g
+               where g.workflow_kind = 'auto' and exists (
+                 select 1 from merge_intent owned
+                 where owned.run_id = g.run_id and owned.state = 'armed'
+               )
+             )"
+            .to_string()
+        } else {
+            let reservation_ownership = if operation == "update" {
+                "owned.id = old.reserved_intent_id
+                 or (
+                   old.reserved_intent_id is null
+                   and owned.id = new.reserved_intent_id
+                   and owned.id = (
+                     select candidate.id from merge_intent candidate
+                     where candidate.lane_key = new.lane_key
+                       and candidate.state = 'armed'
+                       and candidate.placement in ('ready', 'backlogged')
+                       and candidate.ready_sequence is not null
+                     order by candidate.ready_sequence, candidate.id limit 1
+                   )
+                 )"
+            } else {
+                "owned.id = old.reserved_intent_id"
+            };
+            rows.into_iter()
+                .map(|row| {
+                    format!(
+                        "exists (
+                           select 1 from _prism_execution_claim_guard g
+                           where g.workflow_kind = 'auto' and exists (
+                             select 1 from merge_intent owned
+                              where owned.run_id = g.run_id
+                                and owned.state = 'armed'
+                                and owned.lane_key = {row}.lane_key
+                                and (
+                                  owned.placement in ('reserved', 'updating', 'submitting', 'submitted')
+                                  or {reservation_ownership}
+                                )
+                            )
+                         )"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" and ")
+        };
+        let trigger = format!(
+            "drop trigger if exists temp._prism_guard_integration_lane_{operation};
+             create temp trigger _prism_guard_integration_lane_{operation}
+             before {operation} on main.integration_lane
+             when not (({ownership}) and ({current_claim}))
+             begin
+               select raise(abort, 'execution claim is stale');
+             end;"
+        );
+        conn.execute_batch(&trigger).map_err(|error| {
+            format!("install execution claim guard for integration_lane: {error}")
+        })?;
+    }
     Ok(())
 }
 
@@ -875,10 +980,19 @@ mod tests {
                     step_run_id integer, line_number integer, time_unix_ms integer,
                     kind text, text text
                   );
-                  create table auto_event (
-                    id integer primary key, run_id text, step_run_id integer,
-                    time_unix_ms integer, kind text, data_json text
-                  );",
+                   create table auto_event (
+                     id integer primary key, run_id text, step_run_id integer,
+                     time_unix_ms integer, kind text, data_json text
+                   );
+                   create table merge_intent (
+                     id integer primary key, run_id text, generation integer, state text,
+                     placement text, lane_key text, head_sha text, ready_sequence integer,
+                     created_unix_ms integer, updated_unix_ms integer
+                   );
+                   create table integration_lane (
+                     lane_key text primary key, next_ready_sequence integer,
+                     reserved_intent_id integer, updated_unix_ms integer
+                   );",
             )
             .unwrap();
         migrate_schema(&first).unwrap();
@@ -1303,6 +1417,33 @@ mod tests {
                 [&workflow.run_id],
             )
             .unwrap();
+        managed
+            .execute(
+                "insert into merge_intent (
+                   id, run_id, generation, state, placement, lane_key,
+                   created_unix_ms, updated_unix_ms
+                 ) values (30, ?1, 1, 'armed', 'reserved', 'github|example|repo|main', 1, 1)",
+                [&workflow.run_id],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "insert into integration_lane (
+                   lane_key, next_ready_sequence, reserved_intent_id, updated_unix_ms
+                 ) values ('github|example|repo|main', 2, 30, 1)",
+                [],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "insert into merge_intent (
+                   id, run_id, generation, state, placement, lane_key,
+                   created_unix_ms, updated_unix_ms
+                 ) values (31, 'next-auto', 1, 'armed', 'backlogged',
+                   'github|example|repo|main', 1, 1)",
+                [],
+            )
+            .unwrap();
         install_claim_guards(&managed, &claim).unwrap();
         managed
             .execute(
@@ -1347,12 +1488,68 @@ mod tests {
             "update auto_step_run set status = 'done' where id = 10",
             "update auto_output_line set text = 'two' where step_run_id = 10",
             "update auto_event set kind = 'finished' where id = 20",
+            "update merge_intent set updated_unix_ms = 2 where id = 30",
+            "update merge_intent set updated_unix_ms = 2 where id = 31",
+            "update integration_lane set updated_unix_ms = 2 where reserved_intent_id = 30",
             "update plan_run set updated_unix_ms = 2 where id = 'linked-plan'",
             "update plan_step_run set status = 'done' where run_id = 'linked-plan'",
             "update plan_output_line set text = 'two' where run_id = 'linked-plan'",
         ] {
             managed.execute(statement, []).unwrap();
         }
+        managed
+            .execute(
+                "update merge_intent set state = 'merged', placement = 'merged' where id = 30",
+                [],
+            )
+            .unwrap();
+        assert_stale(managed.execute(
+            "update merge_intent set updated_unix_ms = 4 where id = 31",
+            [],
+        ));
+        managed
+            .execute(
+                "update merge_intent set state = 'armed', placement = 'reserved' where id = 30",
+                [],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "update merge_intent set ready_sequence = 1 where id = 31",
+                [],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "update integration_lane set reserved_intent_id = null
+                 where lane_key = 'github|example|repo|main'",
+                [],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "update merge_intent set placement = 'backlogged', ready_sequence = 2 where id = 30",
+                [],
+            )
+            .unwrap();
+        assert_stale(managed.execute(
+            "update integration_lane set reserved_intent_id = 30
+             where lane_key = 'github|example|repo|main'",
+            [],
+        ));
+        managed
+            .execute(
+                "update merge_intent set placement = 'reserved' where id = 30",
+                [],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "update integration_lane set reserved_intent_id = 30
+                 where lane_key = 'github|example|repo|main'",
+                [],
+            )
+            .unwrap();
 
         other
             .execute(
@@ -1367,6 +1564,9 @@ mod tests {
             "update auto_step_run set status = 'failed' where id = 10",
             "update auto_output_line set text = 'stale' where step_run_id = 10",
             "update auto_event set kind = 'stale' where id = 20",
+            "update merge_intent set updated_unix_ms = 3 where id = 30",
+            "update merge_intent set updated_unix_ms = 3 where id = 31",
+            "update integration_lane set updated_unix_ms = 3 where reserved_intent_id = 30",
             "update plan_run set updated_unix_ms = 3 where id = 'linked-plan'",
             "update plan_step_run set status = 'failed' where run_id = 'linked-plan'",
             "update plan_output_line set text = 'stale' where run_id = 'linked-plan'",

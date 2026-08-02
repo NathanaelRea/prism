@@ -909,13 +909,13 @@ impl Tui {
                         self.show_error("push failed", &error)?;
                     }
                 }
-                Key::Merge => {
+                Key::ToggleMergeQueue => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.git_action_enabled(GitAction::Merge)
-                        && let Err(error) = self.merge_selected_pr(runtime)
+                    if self.git_action_enabled(GitAction::MergeIntent)
+                        && let Err(error) = self.toggle_selected_merge_intent()
                     {
-                        self.show_error("merge failed", &error)?;
+                        self.show_error("merge queue update failed", &error)?;
                     }
                 }
                 Key::PullDefault => {

@@ -279,6 +279,31 @@ fn existing_pull_request_source_skips_implementation_pipeline() {
 }
 
 #[test]
+fn auto_submission_rejects_a_second_active_run_for_the_worktree() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    crate::execution::migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let worktree = repo.join("feature");
+    let mut first = AutoLaunch::new(&repo, &worktree, "feat/auto", "First task")
+        .unwrap()
+        .create_run();
+    let mut second = AutoLaunch::new(&repo, &worktree, "feat/auto", "Second task")
+        .unwrap()
+        .create_run();
+
+    submit_auto_run(&conn, &mut first).unwrap();
+    let error = submit_auto_run(&conn, &mut second).unwrap_err();
+
+    assert_eq!(
+        error,
+        format!("worktree already has active Auto Flow run {}", first.run.id)
+    );
+    assert!(load_auto_run(&conn, &second.run.id).unwrap().is_none());
+}
+
+#[test]
 #[cfg(unix)]
 fn existing_pull_request_adoption_allows_stabilization_to_report_head_divergence() {
     let temp = TempDir::new("adopt-existing-pr-diverged");
@@ -888,6 +913,7 @@ fn auto_control_abort_run_only_aborts_active_or_pending_steps() {
     persisted.run.status = AutoRunStatus::Running;
     persisted.run.pause_requested = true;
     save_auto_run(&conn, &mut persisted).unwrap();
+    crate::integration::arm_merge_intent(&conn, &persisted.run.id).unwrap();
 
     let outcome =
         apply_auto_run_control(&conn, &persisted.run.id, AutoRunControlIntent::AbortRun).unwrap();
@@ -901,6 +927,11 @@ fn auto_control_abort_run_only_aborts_active_or_pending_steps() {
         outcome.run.steps[1..]
             .iter()
             .all(|step| step.status == AutoStepStatus::Aborted)
+    );
+    assert!(
+        crate::integration::active_merge_intent(&conn, &persisted.run.id)
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -2047,6 +2078,105 @@ fn stale_reconciliation_marks_active_steps_failed() {
 }
 
 #[test]
+fn stale_reconciliation_preserves_submitted_merge_for_observation() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted = AutoLaunch::new(
+        &repo,
+        &repo.join("feature"),
+        "feat/auto",
+        "Integrate pull request",
+    )
+    .unwrap()
+    .create_run();
+    persisted.steps.clear();
+    push_test_step(
+        &mut persisted,
+        1,
+        AutoStepKey::Merge,
+        AutoStepStatus::Running,
+    );
+    persisted.run.status = AutoRunStatus::Running;
+    save_auto_run(&conn, &mut persisted).unwrap();
+    crate::integration::arm_merge_intent(&conn, &persisted.run.id).unwrap();
+    crate::integration::synchronize_generation(
+        &conn,
+        &persisted.run.id,
+        &crate::integration::CandidateGeneration {
+            change_request_identity: crate::remote::test_change_request_identity(),
+            target_branch: "main".to_string(),
+            pr_number: 42,
+            head_sha: "head".to_string(),
+        },
+    )
+    .unwrap();
+    crate::integration::publish_ready(&conn, &persisted.run.id, "head").unwrap();
+    crate::integration::mark_submitting(&conn, &persisted.run.id).unwrap();
+    crate::integration::mark_submitted(&conn, &persisted.run.id).unwrap();
+
+    assert!(reconcile_stale_auto_run(&conn, &mut persisted).unwrap());
+
+    assert_eq!(persisted.steps[0].status, AutoStepStatus::Waiting);
+    assert_eq!(
+        crate::integration::active_merge_intent(&conn, &persisted.run.id)
+            .unwrap()
+            .unwrap()
+            .placement,
+        crate::integration::IntegrationPlacement::Submitted
+    );
+}
+
+#[test]
+fn stale_reconciliation_requeues_updating_branch_for_effect_reconciliation() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted = AutoLaunch::new(
+        &repo,
+        &repo.join("feature"),
+        "feat/auto",
+        "Update pull request",
+    )
+    .unwrap()
+    .create_run();
+    persisted.steps.clear();
+    push_test_step(
+        &mut persisted,
+        1,
+        AutoStepKey::UpdateBranch,
+        AutoStepStatus::Running,
+    );
+    persisted.run.status = AutoRunStatus::Running;
+    save_auto_run(&conn, &mut persisted).unwrap();
+    crate::integration::arm_merge_intent(&conn, &persisted.run.id).unwrap();
+    crate::integration::synchronize_generation(
+        &conn,
+        &persisted.run.id,
+        &crate::integration::CandidateGeneration {
+            change_request_identity: crate::remote::test_change_request_identity(),
+            target_branch: "main".to_string(),
+            pr_number: 42,
+            head_sha: "head".to_string(),
+        },
+    )
+    .unwrap();
+    crate::integration::publish_ready(&conn, &persisted.run.id, "head").unwrap();
+    crate::integration::mark_updating(&conn, &persisted.run.id).unwrap();
+
+    assert!(reconcile_stale_auto_run(&conn, &mut persisted).unwrap());
+
+    assert_eq!(persisted.steps[0].status, AutoStepStatus::Queued);
+    assert_eq!(
+        crate::integration::active_merge_intent(&conn, &persisted.run.id)
+            .unwrap()
+            .unwrap()
+            .placement,
+        crate::integration::IntegrationPlacement::Updating
+    );
+}
+
+#[test]
 fn recent_active_runs_exclude_terminal_repair_history() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
@@ -2789,6 +2919,54 @@ fn manual_merge_skip_completes_run_without_cleanup() {
 }
 
 #[test]
+fn reserved_integration_runs_merge_without_another_pause() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    crate::execution::migrate_schema(&conn).unwrap();
+    let repo = Repository {
+        root: PathBuf::from("/repo/prism"),
+    };
+    let mut persisted = AutoLaunch::new(
+        &repo.root,
+        &repo.root.join("feature"),
+        "feature",
+        "Integrate",
+    )
+    .unwrap()
+    .create_run();
+    persisted.steps.clear();
+    push_test_step(
+        &mut persisted,
+        1,
+        AutoStepKey::Merge,
+        AutoStepStatus::Queued,
+    );
+    save_auto_run(&conn, &mut persisted).unwrap();
+    crate::integration::arm_merge_intent(&conn, &persisted.run.id).unwrap();
+    crate::integration::synchronize_generation(
+        &conn,
+        &persisted.run.id,
+        &crate::integration::CandidateGeneration {
+            change_request_identity: crate::remote::test_change_request_identity(),
+            target_branch: "main".to_string(),
+            pr_number: 42,
+            head_sha: "head".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        crate::integration::publish_ready(&conn, &persisted.run.id, "head").unwrap(),
+        crate::integration::IntegrationPlacement::Reserved
+    );
+
+    pause_before_next_auto_step_with_context(&conn, &repo, &test_config(), &mut persisted).unwrap();
+
+    assert!(!persisted.run.pause_requested);
+    assert_ne!(persisted.run.status, AutoRunStatus::Paused);
+}
+
+#[test]
 fn waiting_merge_reconciliation_keeps_pending_without_resubmitting() {
     let temp = TempDir::new("merge-reconcile-pending");
     let repo = Repository::with_config_dir_for_test(
@@ -2797,7 +2975,24 @@ fn waiting_merge_reconciliation_keeps_pending_without_resubmitting() {
     );
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    crate::execution::migrate_schema(&conn).unwrap();
     let mut persisted = waiting_merge_run(&conn, temp.path());
+    crate::integration::arm_merge_intent(&conn, &persisted.run.id).unwrap();
+    crate::integration::synchronize_generation(
+        &conn,
+        &persisted.run.id,
+        &crate::integration::CandidateGeneration {
+            change_request_identity: crate::remote::test_change_request_identity(),
+            target_branch: "main".to_string(),
+            pr_number: 42,
+            head_sha: "head".to_string(),
+        },
+    )
+    .unwrap();
+    crate::integration::publish_ready(&conn, &persisted.run.id, "head").unwrap();
+    crate::integration::mark_submitting(&conn, &persisted.run.id).unwrap();
+    crate::integration::mark_submitted(&conn, &persisted.run.id).unwrap();
     let observations = std::cell::Cell::new(0);
 
     for queue_state in [
@@ -2826,6 +3021,98 @@ fn waiting_merge_reconciliation_keeps_pending_without_resubmitting() {
             .summary
             .as_deref()
             .is_some_and(|summary| summary.contains("still pending"))
+    );
+}
+
+#[test]
+fn waiting_merge_observation_failure_keeps_submitted_lane_reserved() {
+    let temp = TempDir::new("merge-reconcile-observation-failure");
+    let repo = Repository::with_config_dir_for_test(
+        temp.path().to_path_buf(),
+        temp.path().join("prism-config"),
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    crate::execution::migrate_schema(&conn).unwrap();
+    let mut persisted = waiting_merge_run(&conn, temp.path());
+    crate::integration::arm_merge_intent(&conn, &persisted.run.id).unwrap();
+    crate::integration::synchronize_generation(
+        &conn,
+        &persisted.run.id,
+        &crate::integration::CandidateGeneration {
+            change_request_identity: crate::remote::test_change_request_identity(),
+            target_branch: "main".to_string(),
+            pr_number: 42,
+            head_sha: "head".to_string(),
+        },
+    )
+    .unwrap();
+    crate::integration::publish_ready(&conn, &persisted.run.id, "head").unwrap();
+    crate::integration::mark_submitting(&conn, &persisted.run.id).unwrap();
+    crate::integration::mark_submitted(&conn, &persisted.run.id).unwrap();
+
+    let progress = reconcile_waiting_merge_step_with(&conn, &repo, &mut persisted, 0, 100, |_| {
+        Err("provider timeout".to_string())
+    })
+    .unwrap();
+
+    assert_eq!(progress, MergeReconciliationProgress::Waiting);
+    assert_eq!(persisted.steps[0].status, AutoStepStatus::Waiting);
+    assert_eq!(
+        crate::integration::active_merge_intent(&conn, &persisted.run.id)
+            .unwrap()
+            .unwrap()
+            .placement,
+        crate::integration::IntegrationPlacement::Submitted
+    );
+}
+
+#[test]
+fn interrupted_unobserved_submission_is_rearmed_for_guarded_retry() {
+    let temp = TempDir::new("merge-reconcile-unobserved-submission");
+    let repo = Repository::with_config_dir_for_test(
+        temp.path().to_path_buf(),
+        temp.path().join("prism-config"),
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    crate::execution::migrate_schema(&conn).unwrap();
+    let mut persisted = waiting_merge_run(&conn, temp.path());
+    crate::integration::arm_merge_intent(&conn, &persisted.run.id).unwrap();
+    crate::integration::synchronize_generation(
+        &conn,
+        &persisted.run.id,
+        &crate::integration::CandidateGeneration {
+            change_request_identity: crate::remote::test_change_request_identity(),
+            target_branch: "main".to_string(),
+            pr_number: 42,
+            head_sha: "head".to_string(),
+        },
+    )
+    .unwrap();
+    crate::integration::publish_ready(&conn, &persisted.run.id, "head").unwrap();
+    crate::integration::mark_submitting(&conn, &persisted.run.id).unwrap();
+
+    let progress =
+        reconcile_waiting_merge_step_with(&conn, &repo, &mut persisted, 0, 100, |expected| {
+            Ok(waiting_merge_observation(
+                expected,
+                crate::remote::LifecycleState::Open,
+                crate::remote::QueueState::NotQueued,
+            ))
+        })
+        .unwrap();
+
+    assert_eq!(progress, MergeReconciliationProgress::RetrySubmission);
+    assert_eq!(persisted.steps[0].status, AutoStepStatus::Queued);
+    assert_eq!(
+        crate::integration::active_merge_intent(&conn, &persisted.run.id)
+            .unwrap()
+            .unwrap()
+            .placement,
+        crate::integration::IntegrationPlacement::Reserved
     );
 }
 
@@ -2930,6 +3217,53 @@ fn waiting_merge_reconciliation_escalates_terminal_unmerged_closure() {
     assert_eq!(
         persisted.run.stabilization_status,
         Some(stabilization_model::StabilizationStatus::Escalated)
+    );
+}
+
+#[test]
+fn waiting_merge_reconciliation_stops_when_provider_removes_queue_entry() {
+    let temp = TempDir::new("merge-reconcile-removed");
+    let repo = Repository::with_config_dir_for_test(
+        temp.path().to_path_buf(),
+        temp.path().join("prism-config"),
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    crate::execution::migrate_schema(&conn).unwrap();
+    let mut persisted = waiting_merge_run(&conn, temp.path());
+    crate::integration::arm_merge_intent(&conn, &persisted.run.id).unwrap();
+    crate::integration::synchronize_generation(
+        &conn,
+        &persisted.run.id,
+        &crate::integration::CandidateGeneration {
+            change_request_identity: crate::remote::test_change_request_identity(),
+            target_branch: "main".to_string(),
+            pr_number: 42,
+            head_sha: "head".to_string(),
+        },
+    )
+    .unwrap();
+    crate::integration::publish_ready(&conn, &persisted.run.id, "head").unwrap();
+    crate::integration::mark_submitting(&conn, &persisted.run.id).unwrap();
+    crate::integration::mark_submitted(&conn, &persisted.run.id).unwrap();
+
+    let error =
+        reconcile_waiting_merge_step_with(&conn, &repo, &mut persisted, 0, 100, |expected| {
+            Ok(waiting_merge_observation(
+                expected,
+                crate::remote::LifecycleState::Open,
+                crate::remote::QueueState::NotQueued,
+            ))
+        })
+        .unwrap_err();
+
+    assert!(error.contains("no longer queued"));
+    assert_eq!(persisted.steps[0].status, AutoStepStatus::Failed);
+    assert!(
+        crate::integration::active_merge_intent(&conn, &persisted.run.id)
+            .unwrap()
+            .is_none()
     );
 }
 

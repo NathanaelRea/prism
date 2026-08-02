@@ -1417,6 +1417,12 @@ fn apply_control_transaction(
         }
         ControlAction::Stop => {
             let cancellation = recorded_cancellation(&tx, workflow)?;
+            if workflow.identity.kind == WorkflowKind::Auto {
+                crate::integration::withdraw_merge_intent_in_transaction(
+                    &tx,
+                    &workflow.identity.run_id,
+                )?;
+            }
             tx.execute(&format!("update {step_table} set status = 'aborted', finished_unix_ms = ?1, error = coalesce(error, 'aborted'), execution_process_id = null, execution_process_start_time_ticks = null, process_id = null where run_id = ?2 and status in ('queued','starting','running','waiting')"), params![now, workflow.identity.run_id]).map_err(|error| format!("abort workflow steps: {error}"))?;
             let changed = tx.execute(&format!("update {run_table} set pause_requested = 0, status = 'aborted', updated_unix_ms = ?1 where id = ?2 and status not in ('done','aborted')"), params![now, workflow.identity.run_id]).map_err(|error| format!("stop workflow: {error}"))?;
             if changed != 1 {

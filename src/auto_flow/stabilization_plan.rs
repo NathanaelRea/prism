@@ -71,6 +71,11 @@ pub(crate) fn derive_blockers(snapshot: &StabilizationSnapshot) -> Vec<Stabiliza
         blockers.push(StabilizationBlocker::MergeBlocked);
     } else if matches!(pull_request.mergeability, MergeabilityFacts::Unknown) {
         blockers.push(StabilizationBlocker::Escalate);
+    } else if matches!(pull_request.mergeability, MergeabilityFacts::Behind)
+        && snapshot.goal.auto_merge
+        && !snapshot.repository.merge_queue_required
+    {
+        blockers.push(StabilizationBlocker::BranchBehind);
     }
     if !pull_request.review.actionable_reviews.is_empty()
         || !pull_request.review.unresolved_threads.is_empty()
@@ -177,6 +182,7 @@ pub(crate) fn conservative_cached_state(
             remote_project: None,
             policy_refreshed_unix_ms: None,
             policy_error: None,
+            merge_queue_required: false,
         },
         worktree: WorktreeFacts {
             path: session.path.clone(),
@@ -237,16 +243,18 @@ fn blocker_priority(blocker: &StabilizationBlocker) -> u8 {
         StabilizationBlocker::DraftPullRequest => 6,
         StabilizationBlocker::WrongBase => 7,
         StabilizationBlocker::HeadDiverged => 8,
-        StabilizationBlocker::MergeBlocked => 9,
-        StabilizationBlocker::ReviewFeedbackFound => 10,
-        StabilizationBlocker::CiFailed | StabilizationBlocker::CiMissingRequiredChecks => 11,
+        StabilizationBlocker::ReviewFeedbackFound => 9,
+        StabilizationBlocker::CiFailed | StabilizationBlocker::CiMissingRequiredChecks => 10,
+        StabilizationBlocker::MergeBlocked => 11,
         StabilizationBlocker::CiPending => 12,
         StabilizationBlocker::ReviewApprovalMissing => 13,
         StabilizationBlocker::PolicyBlocked => 14,
         StabilizationBlocker::PolicyUnknown => 15,
-        StabilizationBlocker::ReadyToAutoMerge | StabilizationBlocker::ReadyForManualMerge => 16,
-        StabilizationBlocker::Merged => 17,
-        StabilizationBlocker::Escalate => 18,
+        StabilizationBlocker::IntegrationBacklogged => 16,
+        StabilizationBlocker::BranchBehind => 17,
+        StabilizationBlocker::ReadyToAutoMerge | StabilizationBlocker::ReadyForManualMerge => 18,
+        StabilizationBlocker::Merged => 19,
+        StabilizationBlocker::Escalate => 20,
     }
 }
 
@@ -261,6 +269,8 @@ fn work_kind_for_blocker(blocker: &StabilizationBlocker) -> StabilizationWorkKin
         }
         StabilizationBlocker::CiPending => StabilizationWorkKind::WaitForCi,
         StabilizationBlocker::ReviewApprovalMissing => StabilizationWorkKind::WaitForReview,
+        StabilizationBlocker::IntegrationBacklogged => StabilizationWorkKind::WaitForIntegration,
+        StabilizationBlocker::BranchBehind => StabilizationWorkKind::UpdateBranch,
         StabilizationBlocker::ReadyForManualMerge => StabilizationWorkKind::MarkReadyForManualMerge,
         StabilizationBlocker::ReadyToAutoMerge => StabilizationWorkKind::Merge,
         StabilizationBlocker::Merged => StabilizationWorkKind::Done,
@@ -327,9 +337,15 @@ fn reason_for_blocker(snapshot: &StabilizationSnapshot, blocker: &StabilizationB
             .as_ref()
             .and_then(|pr| match &pr.mergeability {
                 MergeabilityFacts::Blocked { reason } => Some(reason.clone()),
-                MergeabilityFacts::Unknown | MergeabilityFacts::Clean => None,
+                MergeabilityFacts::Unknown
+                | MergeabilityFacts::Clean
+                | MergeabilityFacts::Behind => None,
             })
             .unwrap_or_else(|| "pull request mergeability is blocked".to_string()),
+        StabilizationBlocker::BranchBehind => {
+            "the reserved pull request must be updated with the latest base before integration"
+                .to_string()
+        }
         StabilizationBlocker::ReviewFeedbackFound => {
             "actionable review feedback is present".to_string()
         }
@@ -368,6 +384,9 @@ fn reason_for_blocker(snapshot: &StabilizationSnapshot, blocker: &StabilizationB
         StabilizationBlocker::PolicyBlocked => "repository policy blocks readiness".to_string(),
         StabilizationBlocker::PolicyUnknown => {
             "repository policy is unknown, so merge authorization is blocked".to_string()
+        }
+        StabilizationBlocker::IntegrationBacklogged => {
+            "pull request is ready and waiting for the repository integration lane".to_string()
         }
         StabilizationBlocker::ReadyForManualMerge => {
             "all known gates pass; auto-merge is disabled".to_string()
@@ -614,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn merge_blocked_wins_over_review_feedback() {
+    fn review_feedback_remains_actionable_when_provider_reports_blocked() {
         let mut pr = clean_pr();
         pr.mergeability = MergeabilityFacts::Blocked {
             reason: "conflict".to_string(),
@@ -624,9 +643,35 @@ mod tests {
 
         let work = plan(&snapshot);
 
-        assert_eq!(work.blocker, StabilizationBlocker::MergeBlocked);
-        assert_eq!(work.kind, StabilizationWorkKind::Escalate);
-        assert!(work.reason.contains("conflict"));
+        assert_eq!(work.blocker, StabilizationBlocker::ReviewFeedbackFound);
+        assert_eq!(work.kind, StabilizationWorkKind::FixReview);
+    }
+
+    #[test]
+    fn behind_with_native_queue_is_ready_for_guarded_submission() {
+        let mut pr = clean_pr();
+        pr.mergeability = MergeabilityFacts::Behind;
+        let mut snapshot = snapshot(Some(pr));
+        snapshot.goal.auto_merge = true;
+        snapshot.repository.merge_queue_required = true;
+
+        let work = plan(&snapshot);
+
+        assert_eq!(work.blocker, StabilizationBlocker::ReadyToAutoMerge);
+        assert_eq!(work.kind, StabilizationWorkKind::Merge);
+    }
+
+    #[test]
+    fn behind_without_native_queue_plans_one_serialized_update() {
+        let mut pr = clean_pr();
+        pr.mergeability = MergeabilityFacts::Behind;
+        let mut snapshot = snapshot(Some(pr));
+        snapshot.goal.auto_merge = true;
+
+        let work = plan(&snapshot);
+
+        assert_eq!(work.blocker, StabilizationBlocker::BranchBehind);
+        assert_eq!(work.kind, StabilizationWorkKind::UpdateBranch);
     }
 
     #[test]
@@ -1066,6 +1111,7 @@ mod tests {
                 remote_project: Some("owner/repo".to_string()),
                 policy_refreshed_unix_ms: Some(1),
                 policy_error: None,
+                merge_queue_required: false,
             },
             worktree: WorktreeFacts {
                 path: PathBuf::from("/repo/feature"),

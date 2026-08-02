@@ -110,6 +110,7 @@ pub(super) fn next_queued_non_agent_step(persisted: &PersistedAutoRun) -> Option
                     | AutoStepKey::WaitCi
                     | AutoStepKey::VerifyCiFix
                     | AutoStepKey::CommitCiFix
+                    | AutoStepKey::UpdateBranch
                     | AutoStepKey::Merge
                     | AutoStepKey::Cleanup
             )
@@ -154,6 +155,29 @@ pub(super) fn pause_before_next_auto_step_with_context(
         ensure_next_auto_step_with_context(conn, repo, config, persisted)?;
     }
     if !has_pending_auto_work(persisted) {
+        return Ok(());
+    }
+    let integration_reserved = crate::integration::active_merge_intent(conn, &persisted.run.id)?
+        .is_some_and(|intent| {
+            intent.placement == crate::integration::IntegrationPlacement::Reserved
+        });
+    let reserved_stabilization_step = persisted.steps.iter().any(|step| {
+        step.status == AutoStepStatus::Queued
+            && matches!(
+                step.step_key,
+                AutoStepKey::WaitReview
+                    | AutoStepKey::FixReview
+                    | AutoStepKey::VerifyReviewFix
+                    | AutoStepKey::CommitReviewFix
+                    | AutoStepKey::WaitCi
+                    | AutoStepKey::FixCi
+                    | AutoStepKey::VerifyCiFix
+                    | AutoStepKey::CommitCiFix
+                    | AutoStepKey::UpdateBranch
+                    | AutoStepKey::Merge
+            )
+    });
+    if integration_reserved && reserved_stabilization_step {
         return Ok(());
     }
     if next_queued_non_agent_step(persisted).is_some_and(|index| {
@@ -223,7 +247,10 @@ pub(super) fn ensure_next_auto_step_with_context(
     config: &Config,
     persisted: &mut PersistedAutoRun,
 ) -> Result<bool, String> {
-    if merge_or_manual_merge_complete(persisted) {
+    let rearmed_manual_merge = latest_step_status(persisted, &AutoStepKey::Merge)
+        == Some(AutoStepStatus::Skipped)
+        && crate::integration::merge_intent_enabled(conn, &persisted.run.id, config.auto.merge)?;
+    if merge_or_manual_merge_complete(persisted) && !rearmed_manual_merge {
         persisted.run.status = if persisted.run.stabilization_status
             == Some(stabilization_model::StabilizationStatus::Done)
         {
@@ -385,7 +412,7 @@ fn ensure_next_stabilization_step(
     config: &Config,
     persisted: &mut PersistedAutoRun,
 ) -> Result<bool, String> {
-    let work = stabilization_execute::observe_and_plan(repo, config, persisted);
+    let work = stabilization_execute::observe_and_plan(conn, repo, config, persisted)?;
 
     stabilization_execute::append_planned_work(conn, persisted, work)
 }
