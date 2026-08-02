@@ -1,5 +1,4 @@
 use super::*;
-#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 #[test]
@@ -1154,6 +1153,84 @@ fn reconcile_keeps_running_step_with_live_process() {
 }
 
 #[test]
+fn recovery_classifies_each_synthetic_process_observation() {
+    use crate::process::ProcessObservation;
+
+    let cases = [
+        (
+            ProcessObservation::RunningSameProcess,
+            RecordedProcessState::Same(42),
+            PlanStepStatus::Running,
+            "stdout cannot be reattached",
+        ),
+        (
+            ProcessObservation::Missing,
+            RecordedProcessState::Missing(Some(42)),
+            PlanStepStatus::Failed,
+            "is no longer running",
+        ),
+        (
+            ProcessObservation::IdentityReused,
+            RecordedProcessState::Reused(42),
+            PlanStepStatus::Failed,
+            "belongs to a different process",
+        ),
+        (
+            ProcessObservation::RunningUnverifiable,
+            RecordedProcessState::Unverifiable(42),
+            PlanStepStatus::Running,
+            "stdout cannot be reattached",
+        ),
+    ];
+    for (observation, expected_state, expected_status, expected_message) in cases {
+        assert_eq!(
+            recorded_process_state_from_observation(42, observation),
+            expected_state
+        );
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        migrate_schema(&conn).unwrap();
+        let repo = PathBuf::from("/repo/prism");
+        let mut persisted = PlanLaunch::new(
+            &repo,
+            &repo,
+            &repo.join("plan.md"),
+            "phase",
+            1,
+            1,
+            PlanRunMode::Sequential,
+        )
+        .unwrap()
+        .create_run();
+        persisted.run.status = PlanRunStatus::Running;
+        persisted.steps[0].status = PlanStepStatus::Running;
+        persisted.steps[0].execution.process_id = Some(42);
+        persisted.steps[0].execution.process_identity = Some(7);
+        save_plan_run(&conn, &persisted).unwrap();
+
+        reconcile_stale_plan_run_with_observer(
+            &conn,
+            &mut persisted,
+            DEFAULT_OUTPUT_LINES_PER_STEP,
+            |process_id, _| {
+                Ok(recorded_process_state_from_observation(
+                    process_id.unwrap(),
+                    observation,
+                ))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(persisted.steps[0].status, expected_status);
+        assert!(
+            load_output_lines(&conn, &persisted.run.id, 1)
+                .unwrap()
+                .iter()
+                .any(|line| line.text.contains(expected_message))
+        );
+    }
+}
+
+#[test]
 fn retry_from_step_resets_selected_and_later_steps() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
@@ -1235,6 +1312,38 @@ touch should-not-run
     assert!(!marker.exists());
 
     let _ = std::fs::remove_dir_all(temp);
+}
+
+#[test]
+fn plan_control_entry_point_reports_pause_and_resume_execution_effects() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let persisted = PlanLaunch::new(
+        &repo,
+        &repo,
+        &repo.join("plan.md"),
+        "phase",
+        1,
+        1,
+        PlanRunMode::Sequential,
+    )
+    .unwrap()
+    .create_run();
+    save_plan_run(&conn, &persisted).unwrap();
+
+    let paused =
+        apply_plan_run_control(&conn, &persisted.run.id, PlanRunControlIntent::Pause).unwrap();
+    assert_eq!(paused.effect, PlanRunControlEffect::Paused);
+    assert_eq!(paused.executor, PlanExecutorDecision::DoNotStart);
+    assert_eq!(paused.run.run.status, PlanRunStatus::Paused);
+
+    let resumed =
+        apply_plan_run_control(&conn, &persisted.run.id, PlanRunControlIntent::Resume).unwrap();
+    assert_eq!(resumed.effect, PlanRunControlEffect::Resumed);
+    assert_eq!(resumed.executor, PlanExecutorDecision::Start);
+    assert_eq!(resumed.run.run.status, PlanRunStatus::Queued);
+    assert!(!resumed.run.run.pause_requested);
 }
 
 #[test]
@@ -1327,12 +1436,8 @@ fn fake_opencode(dir: &Path, body: &str) -> PathBuf {
     path
 }
 
-#[cfg(unix)]
 fn make_executable(path: &Path) {
     let mut permissions = std::fs::metadata(path).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(path, permissions).unwrap();
 }
-
-#[cfg(not(unix))]
-fn make_executable(_path: &Path) {}

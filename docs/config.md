@@ -4,6 +4,18 @@ Tracked repositories live in `~/.config/prism/repos.toml`.
 
 Global Prism settings live in `~/.config/prism/config.toml`. Press `E` in the TUI to edit this file and reload configuration.
 
+Prism uses the first non-empty value of `VISUAL` and `EDITOR` when opening
+configuration files. These values use Prism's command-word grammar, so quoted
+arguments retain their boundaries and are launched directly rather than through
+a shell. For example, `VISUAL='code --wait --profile "Prism Work"'` launches
+`code` with those three arguments followed by the configuration path. Without
+either variable, Prism tries `nvim`, `vim`, then `vi`.
+
+Repository terminals and tmux terminal windows use a non-empty `SHELL`, falling
+back to `/bin/sh`. Shell command strings that Prism must pass to tmux use POSIX
+single-argument quoting; configurable tools and editors remain direct-argv
+integrations.
+
 Run `prism config example` to print the complete default config with active values, `prism config schema` to print the JSON Schema used by TOML editor tooling, and `prism config paths` to inspect the active config paths and schema URL.
 
 Each repository entry has a path and may have a digit key. Digit keys are used as `Space <digit>` shortcuts in the TUI.

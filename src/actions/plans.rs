@@ -223,9 +223,9 @@ impl Tui {
             server_port,
             server_url: server_url.clone(),
             server_pid: plan_runtime.as_ref().and_then(|runtime| runtime.server_pid),
-            server_start_time_ticks: plan_runtime
+            server_process_identity: plan_runtime
                 .as_ref()
-                .and_then(|runtime| runtime.server_start_time_ticks),
+                .and_then(|runtime| runtime.server_process_identity),
             opencode_session_id: None,
             generation: 0,
             updated_unix_ms: 0,
@@ -320,14 +320,16 @@ impl Tui {
             .steps
             .iter()
             .find(|step| step.step == dashboard.run.run.selected_step);
-        let resuming =
-            dashboard.run.run.pause_requested || dashboard.run.run.status == PlanRunStatus::Paused;
+        let controls = self
+            .workflow_controls(
+                Path::new(&dashboard.run.run.repo_root),
+                crate::execution::WorkflowKind::Plan,
+                &dashboard.run.run.id,
+            )
+            .cloned()
+            .unwrap_or_default();
         let availability = PlanActionAvailability {
-            pause_resume: resuming
-                || !matches!(
-                    dashboard.run.run.status,
-                    PlanRunStatus::Done | PlanRunStatus::Failed | PlanRunStatus::Aborted
-                ),
+            pause_resume: controls.pause || controls.resume,
             retry_failed: dashboard.run.steps.iter().any(|step| {
                 matches!(
                     step.status,
@@ -416,14 +418,16 @@ impl Tui {
                 .iter()
                 .find(|step| step.step == linked.run.run.selected_step)
         });
-        let resuming =
-            dashboard.run.run.pause_requested || dashboard.run.run.status == AutoRunStatus::Paused;
+        let controls = self
+            .workflow_controls(
+                Path::new(&dashboard.run.run.repo_root),
+                crate::execution::WorkflowKind::Auto,
+                &dashboard.run.run.id,
+            )
+            .cloned()
+            .unwrap_or_default();
         let availability = PlanActionAvailability {
-            pause_resume: resuming
-                || !matches!(
-                    dashboard.run.run.status,
-                    AutoRunStatus::Done | AutoRunStatus::Failed | AutoRunStatus::Aborted
-                ),
+            pause_resume: controls.pause || controls.resume,
             retry_failed: dashboard.run.steps.iter().any(|step| {
                 matches!(
                     step.status,
@@ -534,12 +538,15 @@ impl Tui {
                     PlanStepStatus::Starting | PlanStepStatus::Running
                 )
         });
-        let run_active = dashboard.run.steps.iter().any(|step| {
-            matches!(
-                step.status,
-                PlanStepStatus::Queued | PlanStepStatus::Starting | PlanStepStatus::Running
-            )
-        });
+        let run_active = self
+            .workflow_controls(&repo.root, crate::execution::WorkflowKind::Plan, &run_id)
+            .is_some_and(|controls| controls.stop)
+            && dashboard.run.steps.iter().any(|step| {
+                matches!(
+                    step.status,
+                    PlanStepStatus::Queued | PlanStepStatus::Starting | PlanStepStatus::Running
+                )
+            });
         let answer = self.prompt_choice_dialog(
             raw,
             crate::view::ChoiceList {
@@ -554,13 +561,21 @@ impl Tui {
             return Ok(true);
         };
         if answer == "a" {
-            crate::observability::with_writable_db(&repo, |conn| {
-                let mut run = load_plan_run(conn, &run_id)?
-                    .ok_or_else(|| format!("plan run not found: {run_id}"))?;
-                abort_plan_run(conn, &mut run)
-            })?;
+            let receipt = crate::workspace_state::control_repository_workflow(
+                &repo,
+                crate::workspace_state::ControlAction::Stop,
+                "plan",
+                &run_id,
+            )?;
             self.load_plan_run_snapshot(&repo.root, &run_id);
-            self.show_message("abort requested for plan run")?;
+            if receipt.warnings.is_empty() {
+                self.show_message("abort requested for plan run")?;
+            } else {
+                self.show_message(&format!(
+                    "abort requested for plan run with warnings: {}",
+                    receipt.warnings.join("; ")
+                ))?;
+            }
             return Ok(true);
         }
         crate::observability::with_writable_db(&repo, |conn| {
@@ -715,31 +730,32 @@ impl Tui {
         let repo = Repository {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
-        let config = Config::load(&repo);
         let run_id = dashboard.run.run.id.clone();
-        let mut should_execute = false;
-        let persisted = crate::observability::with_writable_db(&repo, |conn| {
-            let mut run = load_plan_run(conn, &run_id)?
-                .ok_or_else(|| format!("plan run not found: {run_id}"))?;
-            if run.run.pause_requested || run.run.status == PlanRunStatus::Paused {
-                resume_paused_plan_run(conn, &mut run)?;
-                should_execute =
-                    prepare_plan_run_for_resume(conn, &mut run, DEFAULT_OUTPUT_LINES_PER_STEP)?;
-            } else {
-                request_plan_run_pause(conn, &mut run)?;
-            }
-            Ok(run)
-        })?;
-        self.remember_plan_run(persisted.clone());
-        if persisted.run.pause_requested || persisted.run.status == PlanRunStatus::Paused {
+        let controls = self
+            .workflow_controls(&repo.root, crate::execution::WorkflowKind::Plan, &run_id)
+            .cloned()
+            .unwrap_or_default();
+        let (action, resuming) = if controls.resume {
+            (crate::workspace_state::ControlAction::Resume, true)
+        } else if controls.pause {
+            (crate::workspace_state::ControlAction::Pause, false)
+        } else {
+            return Err("pause/resume is not available for this plan run".to_string());
+        };
+        let receipt =
+            crate::workspace_state::control_repository_workflow(&repo, action, "plan", &run_id)?;
+        self.load_plan_run_snapshot(&repo.root, &run_id);
+        if !resuming {
             self.show_message("plan run will pause before the next phase")?;
             return Ok(true);
         }
-        if should_execute {
-            self.spawn_plan_run_executor(repo, config, persisted)?;
+        if receipt.warnings.is_empty() {
             self.show_message("resumed plan run")?;
         } else {
-            self.show_message("plan run is already running")?;
+            self.show_message(&format!(
+                "resumed plan run with warnings: {}",
+                receipt.warnings.join("; ")
+            ))?;
         }
         Ok(true)
     }

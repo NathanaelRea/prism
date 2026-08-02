@@ -1,38 +1,12 @@
+mod common;
+
 use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new(name: &str) -> Self {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock before unix epoch")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "prism-cli-test-{name}-{}-{unique}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&path).expect("create temp dir");
-        Self { path }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
+use common::CompactTempDir as TempDir;
 
 fn prism() -> Command {
     Command::new(env!("CARGO_BIN_EXE_prism"))
@@ -48,7 +22,8 @@ where
         .args(args)
         .current_dir(cwd)
         .env("XDG_CONFIG_HOME", config_home)
-        .env("HOME", config_home);
+        .env("HOME", config_home)
+        .env("PRISM_RUNTIME_DIR", config_home.join("runtime"));
     command.output().expect("run prism")
 }
 
@@ -160,6 +135,359 @@ fn version_prints_package_version_without_repo() {
         format!("prism {}", env!("CARGO_PKG_VERSION"))
     );
     assert!(stderr(&output).is_empty());
+}
+
+#[test]
+fn list_json_inspects_git_without_creating_prism_state() {
+    let temp = TempDir::new("list-json-readonly");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+    fs::write(repo.join("untracked.txt"), "dirty\n").unwrap();
+
+    let output = run(["list", "--json"], &repo, &config_home);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["repositories"][0]["root"], canonical_display(&repo));
+    assert_eq!(value["repositories"][0]["worktrees"][0]["git"]["dirty"], 1);
+    assert!(!contains_file_named(&config_home, "prism.db"));
+    assert!(!contains_file_named(&config_home, "run-markers"));
+}
+
+#[test]
+#[cfg(unix)]
+fn list_is_read_only_and_never_uses_network_tools() {
+    let temp = TempDir::new("list-existing-db-readonly");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    let bin = temp.path().join("bin");
+    let forbidden = temp.path().join("network-command");
+    init_repo(&repo);
+    fs::create_dir_all(config_home.join("prism")).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    write_executable(
+        &bin.join("git"),
+        &format!(
+            "#!/bin/sh\ncase \" $* \" in *\" fetch \"*) printf fetch > {}; exit 97;; esac\nexec /usr/bin/git \"$@\"\n",
+            shell_quote(&forbidden.display().to_string())
+        ),
+    );
+    write_executable(
+        &bin.join("gh"),
+        &format!(
+            "#!/bin/sh\nprintf gh > {}\nexit 98\n",
+            shell_quote(&forbidden.display().to_string())
+        ),
+    );
+    fs::write(
+        config_home.join("prism/config.toml"),
+        format!(
+            "[tools]\ngit = \"{}\"\ngh = \"{}\"\n",
+            toml_escape(&bin.join("git").display().to_string()),
+            toml_escape(&bin.join("gh").display().to_string())
+        ),
+    )
+    .unwrap();
+    let initialized = run(["db", "path"], &repo, &config_home);
+    assert!(initialized.status.success(), "{}", stderr(&initialized));
+    let db_path = PathBuf::from(stdout(&initialized).trim());
+    let before = fs::read(&db_path).unwrap();
+
+    let output = run(["list", "--json"], &repo, &config_home);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    serde_json::from_str::<serde_json::Value>(&stdout(&output)).unwrap();
+    assert_eq!(fs::read(&db_path).unwrap(), before);
+    assert!(!forbidden.exists());
+    assert!(!config_home.join("runtime/worker.sock").exists());
+}
+
+#[test]
+fn list_preserves_tracked_order_and_reports_missing_repositories() {
+    let temp = TempDir::new("list-tracked-order");
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    let missing = temp.path().join("missing");
+    let outside = temp.path().join("outside");
+    let config_home = temp.path().join("xdg");
+    init_repo(&first);
+    init_repo(&second);
+    fs::create_dir_all(&outside).unwrap();
+    fs::create_dir_all(config_home.join("prism")).unwrap();
+    fs::write(
+        config_home.join("prism/repos.toml"),
+        format!(
+            "[[repos]]\npath = \"{}\"\nkey = \"2\"\n[[repos]]\npath = \"{}\"\n[[repos]]\npath = \"{}\"\nkey = \"1\"\n",
+            second.display(),
+            missing.display(),
+            first.display()
+        ),
+    )
+    .unwrap();
+
+    let output = run(["list", "--json"], &outside, &config_home);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(value["repositories"][0]["root"], canonical_display(&second));
+    assert_eq!(value["repositories"][1]["root"], canonical_display(&first));
+    assert_eq!(value["repositories"][0]["shortcut"], "2");
+    assert_eq!(value["warnings"][0]["code"], "repository_discovery_failed");
+    assert!(stderr(&output).contains(&missing.display().to_string()));
+}
+
+#[test]
+fn list_accepts_command_local_repo_and_keeps_json_stdout_clean() {
+    let temp = TempDir::new("list-command-local-repo");
+    let repo = temp.path().join("repo");
+    let outside = temp.path().join("outside");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+    fs::create_dir_all(&outside).unwrap();
+
+    let output = run(
+        [
+            "list",
+            "--json",
+            "--repo",
+            repo.to_str().expect("UTF-8 repository path"),
+        ],
+        &outside,
+        &config_home,
+    );
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["repositories"][0]["root"], canonical_display(&repo));
+}
+
+#[test]
+fn status_defaults_to_current_worktree() {
+    let temp = TempDir::new("status-current-worktree");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+
+    let output = run(["status"], &repo, &config_home);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(stdout(&output).contains(&format!("worktree = {}", canonical_display(&repo))));
+    assert!(!contains_file_named(&config_home, "prism.db"));
+}
+
+#[test]
+fn daemon_status_reports_stopped_without_starting_it() {
+    let temp = TempDir::new("daemon-status-stopped");
+    let output = prism()
+        .args(["daemon", "status", "--json"])
+        .current_dir(temp.path())
+        .env("XDG_CONFIG_HOME", temp.path())
+        .env("HOME", temp.path())
+        .env("PRISM_RUNTIME_DIR", temp.runtime_path())
+        .output()
+        .expect("run daemon status");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(value["daemon"]["state"], "stopped");
+}
+
+#[test]
+#[cfg(unix)]
+fn daemon_status_reports_invalid_runtime_configuration_distinctly() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let temp = TempDir::new("daemon-status-invalid");
+    let mut runtime = temp.path().join("runtime");
+    while runtime.as_os_str().as_bytes().len() + b"/worker.sock".len() <= 103 {
+        runtime.push("x");
+    }
+    let output = prism()
+        .args(["daemon", "status", "--json"])
+        .current_dir(temp.path())
+        .env("XDG_CONFIG_HOME", temp.path())
+        .env("HOME", temp.path())
+        .env("PRISM_RUNTIME_DIR", &runtime)
+        .output()
+        .expect("run daemon status");
+
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("103 bytes"), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("PRISM_RUNTIME_DIR"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!runtime.exists());
+}
+
+#[test]
+fn daemon_status_with_long_tmpdir_uses_the_explicit_compact_runtime() {
+    let temp = TempDir::new("daemon-status-long-tmpdir");
+    let long_tmpdir = temp.path().join("x".repeat(160));
+    let runtime = temp.runtime_path().to_path_buf();
+    let output = prism()
+        .args(["daemon", "status", "--json"])
+        .current_dir(temp.path())
+        .env("XDG_CONFIG_HOME", temp.path())
+        .env("HOME", temp.path())
+        .env("TMPDIR", long_tmpdir)
+        .env("PRISM_RUNTIME_DIR", &runtime)
+        .output()
+        .expect("run daemon status");
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(value["daemon"]["state"], "stopped");
+    assert!(!runtime.exists());
+}
+
+#[test]
+fn list_and_control_project_and_mutate_managed_plan_state() {
+    let temp = TempDir::new("managed-plan-control");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+    let repo = fs::canonicalize(repo).unwrap();
+    let path_output = run(["db", "path"], &repo, &config_home);
+    assert!(path_output.status.success(), "{}", stderr(&path_output));
+    let db_path = stdout(&path_output).trim().to_string();
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute(
+        "insert into plan_run (
+           id, harness_id, adapter_id, repo_root, scope_path, plan_path, plan_display,
+           step_name, start_step, total_steps, mode, status, pause_requested,
+           selected_step, created_unix_ms, updated_unix_ms
+         ) values ('plan-control-12345678', 'opencode', 'opencode', ?1, ?1, ?2,
+                   'plan.md', 'phase', 1, 2, 'sequential', 'queued', 0, 1, 10, 20)",
+        rusqlite::params![
+            repo.display().to_string(),
+            repo.join("plan.md").display().to_string()
+        ],
+    )
+    .unwrap();
+    for step in 1..=2 {
+        conn.execute(
+            "insert into plan_step_run (run_id, step, prompt, status, todos_json)
+             values ('plan-control-12345678', ?1, 'prompt', 'queued', '[]')",
+            [step],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "insert into workflow_execution (
+           workflow_kind, run_id, dispatch_state, fencing_token,
+           interruption_generation, created_unix_ms, updated_unix_ms
+         ) values ('plan', 'plan-control-12345678', 'queued', 0, 0, 10, 20)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "insert into plan_run (
+           id, harness_id, adapter_id, repo_root, scope_path, plan_path, plan_display,
+           step_name, start_step, total_steps, mode, status, pause_requested,
+           selected_step, created_unix_ms, updated_unix_ms
+         ) values ('plan-history-87654321', 'opencode', 'opencode', ?1, ?1, ?2,
+                   'old-plan.md', 'phase', 1, 1, 'sequential', 'done', 0, 1, 1, 5)",
+        rusqlite::params![
+            repo.display().to_string(),
+            repo.join("old-plan.md").display().to_string()
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "insert into workflow_execution (
+           workflow_kind, run_id, dispatch_state, fencing_token,
+           interruption_generation, created_unix_ms, updated_unix_ms
+         ) values ('plan', 'plan-history-87654321', 'terminal', 0, 0, 1, 5)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    let listed = run(["list", "--all", "--json"], &repo, &config_home);
+    assert!(listed.status.success(), "{}", stderr(&listed));
+    let value: serde_json::Value = serde_json::from_str(&stdout(&listed)).unwrap();
+    assert_eq!(
+        value["repositories"][0]["workflows"][0]["identity"]["run_id"],
+        "plan-control-12345678"
+    );
+    assert_eq!(
+        value["repositories"][0]["workflows"][0]["dispatch"]["state"],
+        "queued"
+    );
+    assert_eq!(
+        value["repositories"][0]["workflows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        value["repositories"][0]["worktrees"][0]["workflows"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    let paused = run(["pause", "plan:plan-control-12345678"], &repo, &config_home);
+    assert!(paused.status.success(), "{}", stderr(&paused));
+    assert!(stdout(&paused).contains("state = paused"));
+    assert!(stderr(&paused).contains("control committed, but daemon wake failed"));
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let state: (String, i64, String) = conn
+        .query_row(
+            "select p.status, p.pause_requested, e.dispatch_state
+         from plan_run p join workflow_execution e on e.run_id = p.id
+         where p.id = 'plan-control-12345678'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(state, ("paused".to_string(), 1, "paused".to_string()));
+    conn.execute(
+        "update plan_run set status = 'running', pause_requested = 0, updated_unix_ms = 30
+         where id = 'plan-control-12345678'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "update workflow_execution set dispatch_state = 'recovery_pending',
+           interruption_generation = 3, updated_unix_ms = 30
+         where run_id = 'plan-control-12345678'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    fs::write(config_home.join("runtime"), "block daemon startup").unwrap();
+
+    let recovered = run(
+        ["recover", "plan:plan-control-12345678"],
+        &repo,
+        &config_home,
+    );
+    assert!(recovered.status.success(), "{}", stderr(&recovered));
+    assert!(stderr(&recovered).contains("recovery committed, but daemon is unavailable"));
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    let recovery: (String, i64) = conn
+        .query_row(
+            "select dispatch_state, interruption_generation from workflow_execution
+             where run_id = 'plan-control-12345678'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(recovery.0, "queued");
+    assert_eq!(recovery.1, 4);
+    drop(conn);
+
+    let stopped = run(["stop", "p:plan-con"], &repo, &config_home);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
+    assert!(stdout(&stopped).contains("state = aborted"));
 }
 
 #[test]

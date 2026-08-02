@@ -69,6 +69,10 @@
 
 ## Technology Boundaries
 
+- **Constraint**: Linux and macOS are the supported operating systems. Platform
+  policy is deterministic for explicit Linux/macOS facts, while native syscall
+  and integration behavior is verified on the corresponding host. Unsupported
+  targets fail explicitly and do not use partial fallback behavior.
 - **Constraint**: Prism is a Rust terminal application using Ratatui and
   Crossterm for terminal lifecycle, typed events, layout, and rendering.
 - **Constraint**: Tmux is the sole interactive Agent Session runtime. Agent

@@ -55,9 +55,9 @@ impl PlanModeLaunch {
         let exe = std::env::current_exe()
             .map_err(|error| format!("resolve prism executable: {error}"))?;
         let command = [
-            shell_quote(&exe.to_string_lossy()),
+            crate::terminal::posix_shell_quote(&exe.to_string_lossy()),
             "--repo".to_string(),
-            shell_quote(&cwd.to_string_lossy()),
+            crate::terminal::posix_shell_quote(&cwd.to_string_lossy()),
             "plan".to_string(),
         ]
         .join(" ");
@@ -454,20 +454,6 @@ fn plan_mode_session_name(cwd: &Path) -> String {
     format!("prism-plan-{:016x}", stable_hash(cwd))
 }
 
-#[allow(dead_code)]
-fn shell_quote(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    if value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '='))
-    {
-        return value.to_string();
-    }
-    format!("'{}'", value.replace('\'', "'\"'\"'"))
-}
-
 fn prompt_string(label: &str, default: &str) -> Result<String, String> {
     print!("{label} [{default}]: ");
     io::stdout()
@@ -629,14 +615,6 @@ mod tests {
                 .shell_command
                 .contains("[prism plan mode exited with status %s]")
         );
-    }
-
-    #[test]
-    fn shell_quote_preserves_plan_launch_argument_boundaries() {
-        assert_eq!(shell_quote("opencode"), "opencode");
-        assert_eq!(shell_quote(""), "''");
-        assert_eq!(shell_quote("two words"), "'two words'");
-        assert_eq!(shell_quote("that's"), "'that'\"'\"'s'");
     }
 
     #[test]

@@ -38,6 +38,9 @@ jobs:
             https://github.com/max-sixty/worktrunk/releases/download/v0.71.0/worktrunk-installer.sh \
             | sh
           wt --version
+      - name: Native macOS platform smoke
+        if: runner.os == 'macOS'
+        run: scripts/platform-smoke.sh
       - run: scripts/full-check.sh
       - name: Smoke-test Prism's real Worktrunk integration
         run: |
@@ -51,11 +54,13 @@ jobs:
           cargo test worktrunk::tests::real_worktrunk_create_observe_remove_smoke \
             -- --ignored --exact
       - name: Test real OpenCode integration
+        if: runner.os == 'Linux'
         run: |
           PRISM_TEST_OPENCODE="$(command -v opencode)" \
             cargo test opencode::tests::real_opencode_server_round_trips_prism_session_api \
               -- --ignored --exact
       - name: Test real Prism, OpenCode, and tmux stack
+        if: runner.os == 'Linux'
         run: |
           PRISM_TEST_OPENCODE="$(command -v opencode)" \
           PRISM_TEST_TMUX="$(command -v tmux)" \

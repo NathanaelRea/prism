@@ -1,30 +1,13 @@
+mod common;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-struct TempDir {
-    path: PathBuf,
-}
-
-impl TempDir {
-    fn new() -> Self {
-        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!("pw-{:x}-{id:x}", std::process::id()));
-        fs::create_dir_all(&path).expect("create worker test directory");
-        Self { path }
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
+use common::CompactTempDir as TempDir;
 
 fn prism(runtime: &Path, home: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_prism"));
@@ -50,10 +33,10 @@ fn serial_worker_test() -> MutexGuard<'static, ()> {
 }
 
 #[test]
-fn real_worker_starts_once_reports_health_and_shuts_down() {
+fn platform_smoke_native_worker_starts_once_reports_health_and_shuts_down() {
     let _serial = serial_worker_test();
-    let temp = TempDir::new();
-    let runtime = temp.path.join("runtime");
+    let temp = TempDir::new("worker-start");
+    let runtime = temp.runtime_path().to_path_buf();
     let home = temp.path.join("home");
     fs::create_dir_all(&home).unwrap();
 
@@ -89,12 +72,12 @@ fn real_worker_starts_once_reports_health_and_shuts_down() {
 }
 
 #[test]
-fn real_worker_recovers_stale_socket_and_lock_files() {
+fn platform_smoke_native_worker_recovers_stale_socket_and_lock_files() {
     let _serial = serial_worker_test();
     use std::os::unix::net::UnixListener;
 
-    let temp = TempDir::new();
-    let runtime = temp.path.join("runtime");
+    let temp = TempDir::new("worker-stale");
+    let runtime = temp.runtime_path().to_path_buf();
     let home = temp.path.join("home");
     fs::create_dir_all(&runtime).unwrap();
     fs::create_dir_all(&home).unwrap();
@@ -117,10 +100,27 @@ fn real_worker_recovers_stale_socket_and_lock_files() {
 }
 
 #[test]
+fn worker_ensure_rejects_an_invalid_socket_path_before_startup_side_effects() {
+    let _serial = serial_worker_test();
+    let temp = TempDir::new("worker-invalid-runtime");
+    let runtime = temp.path.join("x".repeat(120));
+    let home = temp.path.join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    let ensure = run(&runtime, &home, &["worker", "ensure"]);
+
+    assert!(!ensure.status.success());
+    let error = String::from_utf8_lossy(&ensure.stderr);
+    assert!(error.contains("103 bytes"), "{error}");
+    assert!(error.contains("PRISM_RUNTIME_DIR"), "{error}");
+    assert!(!runtime.exists());
+}
+
+#[test]
 fn real_worker_executes_a_queued_plan_and_persists_lifecycle() {
     let _serial = serial_worker_test();
-    let temp = TempDir::new();
-    let runtime = temp.path.join("runtime");
+    let temp = TempDir::new("worker-plan");
+    let runtime = temp.runtime_path().to_path_buf();
     let home = temp.path.join("home");
     let repo = temp.path.join("repo");
     fs::create_dir_all(home.join("prism")).unwrap();
@@ -245,8 +245,8 @@ fn real_worker_executes_a_queued_plan_and_persists_lifecycle() {
 #[test]
 fn daemon_crash_leaves_claimed_work_recovery_pending() {
     let _serial = serial_worker_test();
-    let temp = TempDir::new();
-    let runtime = temp.path.join("runtime");
+    let temp = TempDir::new("worker-crash");
+    let runtime = temp.runtime_path().to_path_buf();
     let home = temp.path.join("home");
     let repo = temp.path.join("repo");
     fs::create_dir_all(home.join("prism")).unwrap();

@@ -6,6 +6,39 @@ Run the local CI gate before pushing:
 scripts/full-check.sh
 ```
 
+Prism supports Linux and macOS. On Linux, the gate runs native tests and clippy,
+the host-independent policy tests for both supported operating systems, and
+Darwin cross-clippy for Apple Silicon. There are no architecture-specific code
+paths warranting a duplicate Intel cross-check. Cross-compilation does not
+replace native macOS verification.
+
+Run the focused native contracts on a prepared macOS host before the complete
+suite:
+
+```sh
+scripts/platform-smoke.sh
+scripts/full-check.sh
+```
+
+The smoke command requires real `opencode` and `tmux` executables. It selects the
+`platform_smoke_native_` tests and the two real OpenCode/tmux integration tests.
+The selected tests exercise native process, durability, Unix-socket, worker,
+OpenCode, and tmux contracts without invoking a model. Deterministic policy,
+errno classification, and fault-injection tests remain in the full suite except
+where a staging test also proves a native durability primitive.
+
+To synchronize the current worktree, including uncommitted files, to an
+SSH-accessible Mac and run that smoke command without pushing a branch:
+
+```sh
+scripts/remote-macos-smoke.sh mac-builder prism-platform-smoke
+```
+
+`PRISM_MAC_HOST` and `PRISM_MAC_DIR` provide the same values without arguments.
+The destination must already be a Git checkout or worktree. Its working files
+are treated as a dedicated mirror: rsync deletes stale files while excluding
+`.git` and `target`.
+
 CI also runs a no-model smoke test against a pinned real OpenCode binary on Linux and macOS. To run it locally with an installed OpenCode:
 
 ```sh

@@ -204,7 +204,7 @@ pub(super) fn finish_step_after_exit(
     harness_id: &str,
 ) -> Result<(), String> {
     step.execution.process_id = None;
-    step.execution.process_start_time_ticks = None;
+    step.execution.process_identity = None;
     step.finished_unix_ms = Some(unix_ms());
     if exit_code == 0 && step.error.is_none() {
         step.status = AutoStepStatus::Done;
@@ -245,7 +245,7 @@ pub(super) fn finish_step_after_exit(
             .map_err(|error| format!("reload auto step status: {error}"))?;
         step.status = AutoStepStatus::parse(&status)?;
         step.execution.process_id = None;
-        step.execution.process_start_time_ticks = None;
+        step.execution.process_identity = None;
         if step.status == AutoStepStatus::Aborted {
             step.error = Some("aborted".to_string());
         }
@@ -262,7 +262,9 @@ pub(super) fn claim_spawned_process(
         .id
         .ok_or_else(|| "auto step must be saved before process spawn".to_string())?;
     let process_id = child.id();
-    let start_time_ticks = crate::harness::process_start_time_ticks(process_id);
+    let process_identity = crate::process::record_process(process_id)
+        .map_err(|error| format!("record auto harness process {process_id}: {error}"))?
+        .identity;
     let changed = conn
         .execute(
             "update auto_step_run
@@ -271,7 +273,7 @@ pub(super) fn claim_spawned_process(
              where id = ?3 and status = 'starting'",
             params![
                 i64::from(process_id),
-                start_time_ticks.map(u64_to_i64),
+                process_identity.map(|identity| u64_to_i64(identity.stored_value())),
                 step_id,
             ],
         )
@@ -284,7 +286,7 @@ pub(super) fn claim_spawned_process(
     }
     step.status = AutoStepStatus::Running;
     step.execution.process_id = Some(process_id);
-    step.execution.process_start_time_ticks = start_time_ticks;
+    step.execution.process_identity = process_identity.map(|identity| identity.stored_value());
     Ok(true)
 }
 

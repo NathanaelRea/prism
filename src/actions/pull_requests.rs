@@ -72,7 +72,11 @@ fn remote_pr_choice_label(summary: &crate::github::PrSummary) -> String {
 }
 
 pub(super) fn open_url_in_browser(url: &str) -> Result<(), String> {
-    run_browser_opener(&browser_opener_candidates(), url).map(|_| ())
+    run_browser_opener(
+        crate::platform::browser_candidates(crate::platform::current_os()),
+        url,
+    )
+    .map(|_| ())
 }
 
 pub(super) fn open_http_url_in_browser(url: &str) -> Result<(), String> {
@@ -82,26 +86,31 @@ pub(super) fn open_http_url_in_browser(url: &str) -> Result<(), String> {
     }) {
         return Err("development URL must use http or https".to_string());
     }
-    run_browser_opener_private(&browser_opener_candidates(), url).map(|_| ())
+    run_browser_opener_private(
+        crate::platform::browser_candidates(crate::platform::current_os()),
+        url,
+    )
+    .map(|_| ())
 }
 
-fn run_browser_opener_private(candidates: &[(&str, &[&str])], url: &str) -> Result<String, String> {
-    let mut attempted = false;
-    for (program, args) in candidates {
-        if !command_exists(program) {
+fn run_browser_opener_private(
+    candidates: &[crate::platform::CommandCandidate<'_>],
+    url: &str,
+) -> Result<String, String> {
+    for candidate in candidates {
+        if !command_exists(candidate.program) {
             continue;
         }
-        attempted = true;
-        let mut command = Command::new(program);
+        let mut command = Command::new(candidate.program);
         command
-            .args(*args)
+            .args(candidate.args)
             .arg(url)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         match command.spawn() {
             Ok(mut child) => {
-                let program = (*program).to_string();
+                let program = candidate.program.to_string();
                 std::thread::spawn(move || {
                     let _ = child.wait();
                 });
@@ -110,57 +119,36 @@ fn run_browser_opener_private(candidates: &[(&str, &[&str])], url: &str) -> Resu
             Err(_) => continue,
         }
     }
-    if attempted {
-        Err("browser opener failed".to_string())
-    } else {
-        Err("no browser opener found".to_string())
-    }
-}
-
-pub(super) const NO_BROWSER_ARGS: &[&str] = &[];
-pub(super) const GIO_BROWSER_ARGS: &[&str] = &["open"];
-pub(super) const WINDOWS_BROWSER_ARGS: &[&str] = &["url.dll,FileProtocolHandler"];
-
-pub(super) fn windows_browser_opener_candidate() -> (&'static str, &'static [&'static str]) {
-    ("rundll32.exe", WINDOWS_BROWSER_ARGS)
-}
-
-pub(super) fn browser_opener_candidates() -> Vec<(&'static str, &'static [&'static str])> {
-    if cfg!(target_os = "macos") {
-        vec![("open", NO_BROWSER_ARGS)]
-    } else if cfg!(target_os = "windows") {
-        vec![windows_browser_opener_candidate()]
-    } else {
-        vec![
-            ("xdg-open", NO_BROWSER_ARGS),
-            ("gio", GIO_BROWSER_ARGS),
-            ("wslview", NO_BROWSER_ARGS),
-        ]
-    }
+    Err("no usable browser opener found".to_string())
 }
 
 pub(super) fn run_browser_opener(
-    candidates: &[(&str, &[&str])],
+    candidates: &[crate::platform::CommandCandidate<'_>],
     url: &str,
 ) -> Result<String, String> {
     let mut errors = Vec::new();
-    for (program, args) in candidates {
-        if !command_exists(program) {
+    for candidate in candidates {
+        if !command_exists(candidate.program) {
             continue;
         }
         match run_output_allow_failure(
-            Command::new(program).args(*args).arg(url),
+            Command::new(candidate.program)
+                .args(candidate.args)
+                .arg(url),
             ProcessPolicy::LocalMutation,
         ) {
-            Ok(output) if output.status.success() => return Ok((*program).to_string()),
-            Ok(output) => errors.push(format!("{program}: exited with {}", output.status)),
-            Err(error) => errors.push(format!("{program}: {error}")),
+            Ok(output) if output.status.success() => return Ok(candidate.program.to_string()),
+            Ok(output) => errors.push(format!(
+                "{}: exited with {}",
+                candidate.program, output.status
+            )),
+            Err(error) => errors.push(format!("{}: {error}", candidate.program)),
         }
     }
     if errors.is_empty() {
         let names = candidates
             .iter()
-            .map(|(program, _)| *program)
+            .map(|candidate| candidate.program)
             .collect::<Vec<_>>()
             .join(", ");
         Err(format!("no browser opener found; tried {names}"))
@@ -579,12 +567,13 @@ impl Tui {
             crate::observability::with_writable_db(repo, |conn| load_auto_run(conn, &run_id))?
                 .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?
         } else {
-            let initial_prompt = self.sessions[selected].prompt_summary.trim();
-            let initial_prompt = if initial_prompt.is_empty() {
-                format!("Repair PR branch {session_branch}")
-            } else {
-                initial_prompt.to_string()
-            };
+            let initial_prompt = crate::session::load_task_initial_prompt(repo, &session_branch)?
+                .filter(|prompt| !prompt.trim().is_empty())
+                .or_else(|| {
+                    let summary = self.sessions[selected].prompt_summary.trim();
+                    (!summary.is_empty()).then(|| summary.to_string())
+                })
+                .unwrap_or_else(|| format!("Repair PR branch {session_branch}"));
             let launch = AutoLaunch::with_options(
                 &repo.root,
                 &session_path,

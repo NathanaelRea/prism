@@ -9,15 +9,15 @@ use crate::config::Config;
 use crate::github::{PrCache, PrComment, PrDetails, PrSummary, pr_summary_or_error};
 use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
 use crate::plan_run::PlanRunMode;
+use crate::platform::CommandCandidate;
 use crate::repo::Repository;
-use crate::session::{DeleteWorktreeOutcome, Session};
+use crate::session::{DeleteWorktreeOutcome, Session, adopt_worktree_session};
 use crate::tui::{
     DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, OpencodeEventResult,
     OpencodeListenerKey, OpencodePollKey, OpencodePollResult, PanelFocus, PrPollKey, Tui,
     TuiJobKey, TuiJobKind, WtObservation, WtPollResult,
 };
 
-use super::pull_requests::windows_browser_opener_candidate;
 use super::worktrees::development_url_opened_message;
 use super::{
     apply_bulk_review_resolution, archived_picker_overflow_message, discover_wt_columns,
@@ -139,8 +139,14 @@ exit 0
     let no_args: &[&str] = &[];
     let flag_args: &[&str] = &["--flag"];
     let candidates = [
-        ("/definitely/missing", no_args),
-        (opener.as_str(), flag_args),
+        CommandCandidate {
+            program: "/definitely/missing",
+            args: no_args,
+        },
+        CommandCandidate {
+            program: opener.as_str(),
+            args: flag_args,
+        },
     ];
 
     let used = run_browser_opener(&candidates, "https://example.test/pr/42").unwrap();
@@ -159,23 +165,6 @@ fn development_browser_rejects_non_http_urls_without_exposing_the_value() {
     let error = open_http_url_in_browser(secret_url).unwrap_err();
     assert_eq!(error, "development URL must use http or https");
     assert!(!error.contains(secret_url));
-}
-
-#[test]
-fn windows_browser_opener_is_direct_and_keeps_the_url_in_one_argument() {
-    let (program, args) = windows_browser_opener_candidate();
-    let url = "https://example.test/a path?x=1&y=2";
-    let mut command = std::process::Command::new(program);
-    command.args(args).arg(url);
-
-    assert_eq!(program, "rundll32.exe");
-    assert_eq!(
-        command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect::<Vec<_>>(),
-        vec!["url.dll,FileProtocolHandler", url]
-    );
 }
 
 #[test]
@@ -337,6 +326,11 @@ esac
         .insert("git".to_string(), git.display().to_string());
     let repo = Repository::with_config_dir_for_test(repo_root.clone(), temp.join("config"));
     let mut session = test_session(worktree, "feature");
+    let original_task = "Implement the complete original task without shortening this multiline description.\nPreserve this final requirement in the review repair prompt.";
+    assert_eq!(
+        adopt_worktree_session(&repo, &mut session, original_task),
+        crate::session::AdoptWorktreeOutcome::Adopted
+    );
     session.pr = PrCache::observed(
         PrSummary {
             number: 42,
@@ -382,6 +376,7 @@ esac
             .unwrap();
     assert_eq!(persisted.steps.len(), 1);
     assert_eq!(persisted.steps[0].step_key, AutoStepKey::FixReview);
+    assert_eq!(persisted.run.initial_prompt, original_task);
     let prompt = persisted.steps[0].reason.as_deref().unwrap();
     assert!(!prompt.contains("fresh top-level comment"));
     assert!(prompt.contains("fresh review body"));

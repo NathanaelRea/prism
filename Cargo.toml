@@ -10,6 +10,9 @@ readme = "README.md"
 keywords = ["cli", "git", "terminal", "tmux", "worktree"]
 categories = ["command-line-utilities", "development-tools"]
 
+[package.metadata.prism]
+supported-operating-systems = ["linux", "macos"]
+
 [dependencies]
 ansi-to-tui = { version = "8.0.1", default-features = false }
 crossterm = { version = "0.29.0", default-features = false, features = [
