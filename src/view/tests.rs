@@ -1364,6 +1364,59 @@ fn worktree_main_panel_renders_review_gate() {
 }
 
 #[test]
+fn worktree_main_panel_passes_review_gate_without_actionable_feedback() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Idle);
+    let mut summary = test_pr_summary();
+    summary.review_decision = "UNKNOWN".to_string();
+    session.pr = PrCache::observed(
+        summary,
+        Some(PrDetails {
+            review_comments: vec![PrReviewComment {
+                author: "reviewer".to_string(),
+                body: "resolved suggestion".to_string(),
+                resolved: true,
+                ..PrReviewComment::default()
+            }],
+            ..PrDetails::default()
+        }),
+    );
+    let sessions = vec![session];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.auto_dashboard = Some(stabilization_dashboard(
+        StabilizationBlocker::ReadyForManualMerge,
+        StabilizationWorkKind::MarkReadyForManualMerge,
+        None,
+    ));
+
+    let buffer = render_to_string(&model, 120, 40);
+
+    assert!(buffer.contains("passed"));
+    assert!(!buffer.contains("disabled"));
+}
+
+#[test]
+fn worktree_main_panel_keeps_provider_review_requirement_actionable() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Idle);
+    let mut summary = test_pr_summary();
+    summary.review_decision = "REVIEW_REQUIRED".to_string();
+    session.pr = PrCache::observed(summary, None);
+    let sessions = vec![session];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.auto_dashboard = Some(stabilization_dashboard(
+        StabilizationBlocker::ReviewApprovalMissing,
+        StabilizationWorkKind::WaitForReview,
+        None,
+    ));
+
+    let buffer = render_to_string(&model, 120, 40);
+
+    assert!(buffer.contains("missing"));
+    assert!(!buffer.contains("passed"));
+}
+
+#[test]
 fn renders_stabilization_ci_failed_in_worktree_main_panel() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);

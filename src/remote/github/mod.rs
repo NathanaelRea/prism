@@ -108,6 +108,8 @@ struct GithubPullRequest {
     status_check_rollup: GithubStatusCheckRollup,
     #[serde(default, rename = "mergeStateStatus")]
     merge_state_status: String,
+    #[serde(default)]
+    mergeable: String,
     #[serde(
         default,
         rename = "mergeQueueEntry",
@@ -1478,6 +1480,7 @@ query($owner: String!, $name: String!, $headRefName: String, $endCursor: String)
           nameWithOwner
         }
         updatedAt
+        mergeable
         mergeStateStatus
         mergeQueueEntry {
           state
@@ -1558,6 +1561,7 @@ query($owner: String!, $name: String!, $number: Int!) {
         nameWithOwner
       }
       updatedAt
+      mergeable
       mergeStateStatus
       mergeQueueEntry {
         state
@@ -1813,9 +1817,10 @@ fn pr_summary_from_node(
         native_state_evidence: crate::remote::NativeStateEvidence {
             lifecycle: crate::remote::NativeStateEvidence::retain([node.state.clone()]),
             review: crate::remote::NativeStateEvidence::retain(node.review_decision.clone()),
-            mergeability: crate::remote::NativeStateEvidence::retain([node
-                .merge_state_status
-                .clone()]),
+            mergeability: crate::remote::NativeStateEvidence::retain([
+                node.mergeable.clone(),
+                node.merge_state_status.clone(),
+            ]),
             check: crate::remote::NativeStateEvidence::retain(
                 status_contexts_for_pr(node)
                     .into_iter()

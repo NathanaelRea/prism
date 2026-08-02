@@ -399,19 +399,23 @@ fn review_gate_label(config: &crate::config::Config, session: &Session) -> Strin
     if has_actionable_review_feedback(session) {
         return "feedback".to_string();
     }
-    if !config.auto.require_review_approval {
-        return if summary.requested_reviewers.is_empty() {
-            "disabled".to_string()
-        } else {
-            "pending".to_string()
-        };
-    }
     if summary.review_decision.eq_ignore_ascii_case("approved") {
         "approved".to_string()
+    } else if summary
+        .review_decision
+        .eq_ignore_ascii_case("changes_requested")
+    {
+        "feedback".to_string()
     } else if !summary.requested_reviewers.is_empty() {
         "pending".to_string()
-    } else {
+    } else if config.auto.require_review_approval
+        || summary
+            .review_decision
+            .eq_ignore_ascii_case("review_required")
+    {
         "missing".to_string()
+    } else {
+        "passed".to_string()
     }
 }
 
