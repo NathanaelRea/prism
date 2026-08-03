@@ -1416,7 +1416,7 @@ fn apply_control_transaction(
                 }
             };
             if resumed_state == "queued" {
-                enqueue_dispatch(&tx, workflow, now)?;
+                enqueue_dispatch(&tx, workflow)?;
             }
             resumed_state.to_string()
         }
@@ -1513,16 +1513,18 @@ fn set_dispatch(
     state: &str,
     now: i64,
 ) -> Result<(), String> {
-    conn.execute("update workflow_execution set dispatch_state = ?1, worker_id = null, daemon_instance_id = null, lease_expires_unix_ms = null, executor_pid = null, executor_process_identity = null, requeue_requested = 0, fencing_token = fencing_token + 1, updated_unix_ms = ?2 where workflow_kind = ?3 and run_id = ?4", params![state, now, workflow.identity.kind.label(), workflow.identity.run_id]).map_err(|error| format!("update workflow dispatch: {error}"))?;
+    conn.execute("update workflow_execution set dispatch_state = ?1, worker_id = null, daemon_instance_id = null, lease_expires_unix_ms = null, heartbeat_unix_ms = null, executor_pid = null, executor_process_identity = null, requeue_requested = 0, not_before_unix_ms = null, wake_reason = null, fencing_token = fencing_token + 1, workflow_revision = workflow_revision + 1, updated_unix_ms = ?2 where workflow_kind = ?3 and run_id = ?4", params![state, now, workflow.identity.kind.label(), workflow.identity.run_id]).map_err(|error| format!("update workflow dispatch: {error}"))?;
     Ok(())
 }
 
-fn enqueue_dispatch(
-    conn: &Connection,
-    workflow: &WorkflowSnapshot,
-    now: i64,
-) -> Result<(), String> {
-    conn.execute("insert into workflow_execution (workflow_kind, run_id, dispatch_state, fencing_token, requeue_requested, interruption_generation, created_unix_ms, updated_unix_ms) values (?1, ?2, 'queued', 0, 0, 0, ?3, ?3) on conflict(workflow_kind, run_id) do update set dispatch_state = case when workflow_execution.dispatch_state = 'claimed' then 'claimed' else 'queued' end, requeue_requested = case when workflow_execution.dispatch_state = 'claimed' then 1 else 0 end, worker_id = case when workflow_execution.dispatch_state = 'claimed' then worker_id else null end, daemon_instance_id = case when workflow_execution.dispatch_state = 'claimed' then daemon_instance_id else null end, updated_unix_ms = excluded.updated_unix_ms", params![workflow.identity.kind.label(), workflow.identity.run_id, now]).map_err(|error| format!("queue workflow: {error}"))?;
+fn enqueue_dispatch(conn: &Connection, workflow: &WorkflowSnapshot) -> Result<(), String> {
+    crate::execution::enqueue(
+        conn,
+        &crate::execution::WorkflowIdentity::new(
+            workflow.identity.kind,
+            workflow.identity.run_id.clone(),
+        ),
+    )?;
     Ok(())
 }
 
@@ -1837,9 +1839,12 @@ mod tests {
                workflow_kind text not null, run_id text not null, dispatch_state text not null,
                worker_id text, daemon_instance_id text, lease_expires_unix_ms integer,
                heartbeat_unix_ms integer, fencing_token integer not null,
-               executor_pid integer, executor_process_identity text,
-               requeue_requested integer not null default 0, interruption_generation integer not null,
-               created_unix_ms integer not null, updated_unix_ms integer not null,
+                executor_pid integer, executor_process_identity text,
+                requeue_requested integer not null default 0, interruption_generation integer not null,
+                recovery_decided_unix_ms integer, execution_version integer not null default 1,
+                not_before_unix_ms integer, wake_reason text,
+                workflow_revision integer not null default 0,
+                created_unix_ms integer not null, updated_unix_ms integer not null,
                primary key (workflow_kind, run_id)
              );",
         )

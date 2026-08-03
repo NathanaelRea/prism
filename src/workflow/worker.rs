@@ -378,20 +378,14 @@ pub fn serve() -> Result<(), String> {
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                match respond(
+                respond(
                     &mut stream,
                     &instance_id,
                     &started_executable_identity,
                     &active,
                     draining,
-                ) {
-                    WorkerControl::Continue => {}
-                    WorkerControl::Drain => draining = true,
-                    WorkerControl::Replace => {
-                        draining = true;
-                        restart_after_drain = true;
-                    }
-                }
+                )
+                .apply(&mut next_poll, &mut draining, &mut restart_after_drain);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(format!("accept Prism worker connection: {error}")),
@@ -430,8 +424,23 @@ pub fn serve() -> Result<(), String> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WorkerControl {
     Continue,
+    Wake,
     Drain,
     Replace,
+}
+
+impl WorkerControl {
+    fn apply(self, next_poll: &mut Instant, draining: &mut bool, restart_after_drain: &mut bool) {
+        match self {
+            Self::Continue => {}
+            Self::Wake => *next_poll = Instant::now(),
+            Self::Drain => *draining = true,
+            Self::Replace => {
+                *draining = true;
+                *restart_after_drain = true;
+            }
+        }
+    }
 }
 
 fn respond(
@@ -466,6 +475,7 @@ fn respond(
     };
     let _ = stream.write_all(response.as_bytes());
     match command.trim() {
+        "wake" if !draining => WorkerControl::Wake,
         "shutdown" => WorkerControl::Drain,
         "replace" => WorkerControl::Replace,
         _ => WorkerControl::Continue,
@@ -1145,6 +1155,27 @@ mod tests {
         assert!(daemon_uses_executable(&current, "8:100"));
         assert!(!daemon_uses_executable(&replaced, "8:100"));
         assert!(!daemon_uses_executable(&legacy, "8:100"));
+    }
+
+    #[test]
+    fn wake_requests_force_running_scheduler_poll_only() {
+        let active = Arc::new(Mutex::new(BTreeSet::new()));
+        for (draining, expected) in [
+            (false, WorkerControl::Wake),
+            (true, WorkerControl::Continue),
+        ] {
+            let (mut server, mut client) = UnixStream::pair().unwrap();
+            client.write_all(b"wake\n").unwrap();
+
+            let control = respond(&mut server, "daemon", "exe", &active, draining);
+            assert_eq!(control, expected);
+            let future = Instant::now() + POLL_INTERVAL;
+            let mut next_poll = future;
+            let mut applied_draining = draining;
+            let mut restart = false;
+            control.apply(&mut next_poll, &mut applied_draining, &mut restart);
+            assert_eq!(next_poll < future, !draining);
+        }
     }
 
     fn runtime_with_socket_path_len(byte_len: usize) -> PathBuf {
