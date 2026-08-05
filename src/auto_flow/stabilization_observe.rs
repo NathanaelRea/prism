@@ -184,6 +184,13 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
     config: &Config,
 ) -> StabilizationSnapshot {
     let mut cache = crate::remote::load_pr_cache(repo, &run.branch);
+    if let (Some(pr_number), Some(pr_url), Some(head_sha)) = (
+        run.pr_number,
+        run.pr_url.as_deref(),
+        run.current_head_sha.as_deref(),
+    ) {
+        cache.reauthorize_persisted_run_summary(pr_number, pr_url, head_sha);
+    }
     if let Some(guard) = run.pending_push.as_ref() {
         reauthorize_pending_push_cache(&mut cache, &run.worktree_path, guard, config);
     }
@@ -877,6 +884,82 @@ esac
         assert_eq!(
             snapshot.pull_request.map(|request| request.state),
             Some(PullRequestState::Merged)
+        );
+        let _ = fs::remove_dir_all(repo.prism_dir());
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_run_snapshot_keeps_its_pull_request_when_local_head_advances() {
+        let temp = unique_temp_dir("prism-advanced-local-head-snapshot-test");
+        fs::create_dir_all(&temp).unwrap();
+        let git = temp.join("git");
+        let gh = temp.join("gh");
+        write_executable(
+            &git,
+            r#"#!/bin/sh
+case "$*" in
+  *"branch --show-current"*) printf '%s\n' 'feature' ;;
+  *"for-each-ref --format=%(push:remotename)%00%(push) refs/heads/feature"*) printf 'origin\000refs/remotes/origin/feature\n' ;;
+  *"remote get-url --push --all origin"*|*"remote get-url origin"*) printf '%s\n' 'https://github.com/example/repo.git' ;;
+  *"rev-parse HEAD"*) printf '%s\n' 'local-repair-head' ;;
+  *"ls-remote --exit-code --heads https://github.com/example/repo.git refs/heads/feature"*) printf '%s\t%s\n' 'pull-request-head' 'refs/heads/feature' ;;
+  *"fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main"*) exit 0 ;;
+  *"rev-parse --verify --quiet refs/remotes/origin/main"*) printf '%s\n' 'base-head' ;;
+  *"merge-tree --write-tree HEAD origin/main"*) printf '%s\n' 'tree-head' ;;
+  *"status --short"*) exit 0 ;;
+  *) exit 1 ;;
+esac
+"#,
+        );
+        write_executable(
+            &gh,
+            r#"#!/bin/sh
+case "$*" in
+  *"reviewThreads(first: 100"*) printf '%s\n' '[{"data":{"repository":{"pullRequest":{"reviewThreads":{"totalCount":0,"pageInfo":{"hasNextPage":false},"nodes":[]}}}}}]' ;;
+  *"/issues/42/comments?per_page=100"*|*"/pulls/42/reviews?per_page=100"*|*"/pulls/42/files?per_page=100"*|*"/commits/pull-request-head/statuses?per_page=100"*) printf '%s\n' '[[]]' ;;
+  *"/commits/pull-request-head/check-runs?per_page=100"*) printf '%s\n' '[{"total_count":0,"check_runs":[]}]' ;;
+  "run list "*) printf '%s\n' '[]' ;;
+  *"pullRequest(number"*) printf '%s\n' '{"data":{"repository":{"pullRequest":{"id":"PR_test","number":42,"title":"Repair","url":"https://example.com/pr/42","state":"OPEN","headRefName":"feature","baseRefName":"main","headRefOid":"pull-request-head","headRepository":{"nameWithOwner":"example/repo"},"baseRepository":{"nameWithOwner":"example/repo"}}}}}' ;;
+  api\ graphql*) printf '%s\n' '[{"data":{"repository":{"pullRequests":{"nodes":[{"id":"PR_test","number":42,"title":"Repair","url":"https://example.com/pr/42","state":"OPEN","headRefName":"feature","baseRefName":"main","headRefOid":"pull-request-head","headRepository":{"nameWithOwner":"example/repo"},"baseRepository":{"nameWithOwner":"example/repo"}}],"pageInfo":{"hasNextPage":false}}}}}]' ;;
+  *) exit 1 ;;
+esac
+"#,
+        );
+        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+        let mut config = test_config(false);
+        config
+            .tools
+            .insert("git".to_string(), git.display().to_string());
+        config
+            .tools
+            .insert("gh".to_string(), gh.display().to_string());
+        let mut summary = test_summary();
+        summary.number = 42;
+        summary.url = "https://example.com/pr/42".to_string();
+        summary.head_sha = "pull-request-head".to_string();
+        summary.change_request_identity = Some(crate::remote::test_change_request_identity());
+        save_pr_cache(
+            &repo,
+            "feature",
+            &PrCache::observed(summary, Some(PrDetails::default())),
+        )
+        .unwrap();
+        let mut run = super::super::AutoLaunch::new(&temp, &temp, "feature", "Repair")
+            .unwrap()
+            .create_run()
+            .run;
+        run.pr_number = Some(42);
+        run.pr_url = Some("https://example.com/pr/42".to_string());
+        run.current_head_sha = Some("pull-request-head".to_string());
+
+        let snapshot = build_auto_run_stabilization_snapshot(&repo, &run, &config);
+
+        assert!(snapshot.pull_request.is_some());
+        assert_eq!(
+            super::super::stabilization_plan::plan(&snapshot).blocker,
+            StabilizationBlocker::HeadDiverged
         );
         let _ = fs::remove_dir_all(repo.prism_dir());
         let _ = fs::remove_dir_all(temp);
