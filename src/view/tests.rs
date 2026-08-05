@@ -1346,9 +1346,17 @@ fn renders_stabilization_pending_push_in_worktree_main_panel() {
 fn worktree_main_panel_renders_review_gate() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
-    let mut summary = test_pr_summary();
-    summary.requested_reviewers = vec!["review-team".to_string()];
-    session.pr = PrCache::observed(summary, None);
+    session.pr = PrCache::observed(
+        test_pr_summary(),
+        Some(PrDetails {
+            review_comments: vec![PrReviewComment {
+                body: "please fix this".to_string(),
+                resolved: false,
+                ..PrReviewComment::default()
+            }],
+            ..PrDetails::default()
+        }),
+    );
     let sessions = vec![session];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.auto_dashboard = Some(stabilization_dashboard(
@@ -1360,7 +1368,7 @@ fn worktree_main_panel_renders_review_gate() {
     let buffer = render_to_string(&model, 120, 40);
 
     assert!(buffer.contains("review"));
-    assert!(buffer.contains("pending"));
+    assert!(buffer.contains("needs review"));
 }
 
 #[test]
@@ -1368,7 +1376,7 @@ fn worktree_main_panel_passes_review_gate_without_actionable_feedback() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
     let mut summary = test_pr_summary();
-    summary.review_decision = "UNKNOWN".to_string();
+    summary.review_decision = "CHANGES_REQUESTED".to_string();
     session.pr = PrCache::observed(
         summary,
         Some(PrDetails {
@@ -1396,7 +1404,7 @@ fn worktree_main_panel_passes_review_gate_without_actionable_feedback() {
 }
 
 #[test]
-fn worktree_main_panel_keeps_provider_review_requirement_actionable() {
+fn worktree_main_panel_ignores_provider_review_state_without_unresolved_comments() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
     let mut summary = test_pr_summary();
@@ -1405,15 +1413,14 @@ fn worktree_main_panel_keeps_provider_review_requirement_actionable() {
     let sessions = vec![session];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.auto_dashboard = Some(stabilization_dashboard(
-        StabilizationBlocker::ReviewApprovalMissing,
-        StabilizationWorkKind::WaitForReview,
+        StabilizationBlocker::ReadyForManualMerge,
+        StabilizationWorkKind::MarkReadyForManualMerge,
         None,
     ));
 
     let buffer = render_to_string(&model, 120, 40);
 
-    assert!(buffer.contains("missing"));
-    assert!(!buffer.contains("passed"));
+    assert!(buffer.contains("passed"));
 }
 
 #[test]

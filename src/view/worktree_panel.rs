@@ -212,7 +212,7 @@ pub(crate) fn stabilization_panel_model(
             .as_ref()
             .map(|blocker| ci_gate_label(session, blocker))
             .unwrap_or_default(),
-        review: review_gate_label(model.config, session),
+        review: review_gate_label(session),
         merge: merge_gate_label(session),
         policy: blocker.as_ref().map(policy_gate_label).unwrap_or_default(),
     }
@@ -392,31 +392,14 @@ fn ci_blockers_ruled_out(blocker: &StabilizationBlocker) -> bool {
     )
 }
 
-fn review_gate_label(config: &crate::config::Config, session: &Session) -> String {
-    let Some(summary) = session.pr.summary() else {
+fn review_gate_label(session: &Session) -> String {
+    if session.pr.summary().is_none() {
         return "unknown".to_string();
-    };
-    if has_actionable_review_feedback(session) {
-        return "feedback".to_string();
     }
-    if summary.review_decision.eq_ignore_ascii_case("approved") {
-        "approved".to_string()
-    } else if summary
-        .review_decision
-        .eq_ignore_ascii_case("changes_requested")
-    {
-        "feedback".to_string()
-    } else if !summary.requested_reviewers.is_empty() {
-        "pending".to_string()
-    } else if config.auto.require_review_approval
-        || summary
-            .review_decision
-            .eq_ignore_ascii_case("review_required")
-    {
-        "missing".to_string()
-    } else {
-        "passed".to_string()
+    if has_unresolved_review_comments(session) {
+        return "needs review".to_string();
     }
+    "passed".to_string()
 }
 
 fn merge_gate_label(session: &Session) -> String {
@@ -460,12 +443,12 @@ fn merge_blocked(summary: &crate::remote::PrSummary) -> bool {
     )
 }
 
-fn has_actionable_review_feedback(session: &Session) -> bool {
+fn has_unresolved_review_comments(session: &Session) -> bool {
     session.pr.details().is_some_and(|details| {
         details
             .review_comments
             .iter()
-            .any(|comment| !comment.resolved && !comment.body.trim().is_empty())
+            .any(|comment| !comment.resolved)
     })
 }
 
@@ -488,6 +471,7 @@ fn gate_style(label: &str) -> Style {
     } else if normalized.contains("pending")
         || normalized.contains("unknown")
         || normalized.contains("feedback")
+        || normalized.contains("needs review")
     {
         attention_style()
     } else if normalized.contains("pass")
