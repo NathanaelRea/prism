@@ -19,6 +19,7 @@ jobs:
         with:
           components: rustfmt, clippy
           targets: aarch64-apple-darwin
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - uses: actions/setup-node@v4
         with:
           node-version: 22
