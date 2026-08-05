@@ -205,13 +205,8 @@ pub fn ensure_running() -> Result<(), String> {
                 state: DaemonState::Running,
                 ..
             } => {
-                let response = request_at(&socket, "replace")?;
-                if response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
-                    return wait_for_replacement(
-                        &socket,
-                        &executable_identity,
-                        DAEMON_TRANSITION_TIMEOUT,
-                    );
+                if request_worker_replacement(&socket, &executable_identity)? {
+                    return Ok(());
                 }
                 let shutdown_health = parse_health_response(&request_at(&socket, "shutdown")?)?;
                 if shutdown_health.active > 0 {
@@ -221,10 +216,14 @@ pub fn ensure_running() -> Result<(), String> {
                 wait_for_socket_to_close(&socket, DAEMON_TRANSITION_TIMEOUT)?;
                 break;
             }
-            DaemonHealth {
+            current @ DaemonHealth {
                 state: DaemonState::Draining,
                 ..
             } => {
+                if current.active > 0 && request_worker_replacement(&socket, &executable_identity)?
+                {
+                    return Ok(());
+                }
                 health = wait_for_drain_transition(DAEMON_TRANSITION_TIMEOUT, || {
                     probe_health_at(&socket)
                 })?;
@@ -327,6 +326,21 @@ fn wait_for_replacement(
     Err(format!(
         "Prism worker is draining before replacement ({active} active)"
     ))
+}
+
+fn request_worker_replacement(
+    socket: &WorkerSocketPath,
+    executable_identity: &str,
+) -> Result<bool, String> {
+    let response = request_at(socket, "replace")?;
+    if !response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
+        return Ok(false);
+    }
+    let health = parse_health_response(&response)?;
+    if health.active == 0 {
+        wait_for_replacement(socket, executable_identity, DAEMON_TRANSITION_TIMEOUT)?;
+    }
+    Ok(true)
 }
 
 pub fn wake() -> Result<(), String> {

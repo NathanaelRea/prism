@@ -133,6 +133,154 @@ fn worker_ensure_restarts_a_same_version_replaced_executable() {
 }
 
 #[test]
+fn worker_ensure_allows_active_work_to_drain_before_replacement() {
+    let _serial = serial_worker_test();
+    let temp = TempDir::new("worker-active-replacement");
+    let runtime = temp.runtime_path().to_path_buf();
+    let home = temp.path.join("home");
+    let repo = temp.path.join("repo");
+    let installed = temp.path.join("prism");
+    let replacement = temp.path.join("prism.new");
+    let release = temp.path.join("release");
+    fs::create_dir_all(home.join("prism")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_prism"), &installed).unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let harness = temp.path.join("harness.sh");
+    fs::write(
+        &harness,
+        format!(
+            "#!/bin/sh\nwhile [ ! -e '{}' ]; do sleep 0.1; done\n",
+            release.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&harness, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        home.join("prism/config.toml"),
+        format!(
+            "default_harness = \"test\"\n[harnesses.test]\nadapter = \"generic\"\ninteractive_command = [\"{}\"]\nheadless_command = [\"{}\", \"{{prompt}}\"]\nheadless_prompt_transport = \"argument\"\noutput_format = \"text\"\n",
+            harness.display(), harness.display()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        home.join("prism/repos.toml"),
+        format!("[[repos]]\npath = \"{}\"\n", repo.display()),
+    )
+    .unwrap();
+    let db = prism_at(&installed, &runtime, &home)
+        .args(["--repo", repo.to_str().unwrap(), "db", "path"])
+        .output()
+        .unwrap();
+    assert!(db.status.success());
+    let db = PathBuf::from(String::from_utf8_lossy(&db.stdout).trim());
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    conn.execute(
+        "insert into plan_run (id, harness_id, adapter_id, repo_root, scope_path, plan_path,
+           plan_display, step_name, start_step, total_steps, mode, status, pause_requested,
+           selected_step, created_unix_ms, updated_unix_ms)
+         values ('replacement-plan', 'test', 'generic', ?1, ?1, ?2, 'plan.md', 'Phase', 1, 1,
+                 'sequential', 'queued', 0, 1, 1, 1)",
+        rusqlite::params![
+            repo.display().to_string(),
+            repo.join("plan.md").display().to_string()
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "insert into plan_step_run (run_id, step, prompt, status)
+         values ('replacement-plan', 1, 'wait for release', 'queued')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "insert into workflow_execution (workflow_kind, run_id, dispatch_state, fencing_token,
+           interruption_generation, created_unix_ms, updated_unix_ms)
+         values ('plan', 'replacement-plan', 'queued', 0, 0, 1, 1)",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+
+    assert!(
+        prism_at(&installed, &runtime, &home)
+            .args(["worker", "ensure"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let first_pid = loop {
+        let health = prism_at(&installed, &runtime, &home)
+            .args(["worker", "health"])
+            .output()
+            .unwrap();
+        if health.status.success() && String::from_utf8_lossy(&health.stdout).contains("active=1") {
+            break health_pid(&health);
+        }
+        assert!(Instant::now() < deadline, "workflow did not become active");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+
+    fs::copy(env!("CARGO_BIN_EXE_prism"), &replacement).unwrap();
+    fs::rename(&replacement, &installed).unwrap();
+    let ensure = prism_at(&installed, &runtime, &home)
+        .args(["worker", "ensure"])
+        .output()
+        .unwrap();
+    let ensure_while_draining = prism_at(&installed, &runtime, &home)
+        .args(["worker", "ensure"])
+        .output()
+        .unwrap();
+    fs::write(&release, "release").unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let health = prism_at(&installed, &runtime, &home)
+            .args(["worker", "health"])
+            .output()
+            .unwrap();
+        if health.status.success()
+            && String::from_utf8_lossy(&health.stdout).contains("state=running active=0")
+            && health_pid(&health) != first_pid
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replacement daemon did not start"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        prism_at(&installed, &runtime, &home)
+            .args(["worker", "shutdown"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        ensure.status.success(),
+        "replacement ensure failed: {}",
+        String::from_utf8_lossy(&ensure.stderr)
+    );
+    assert!(
+        ensure_while_draining.status.success(),
+        "ensure while draining failed: {}",
+        String::from_utf8_lossy(&ensure_while_draining.stderr)
+    );
+}
+
+#[test]
 fn platform_smoke_native_worker_recovers_stale_socket_and_lock_files() {
     let _serial = serial_worker_test();
     use std::os::unix::net::UnixListener;
