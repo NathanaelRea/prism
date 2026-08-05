@@ -953,6 +953,7 @@ fn tmux_missing_session_error(error: &str) -> bool {
         || error.contains("can't find window")
         || error.contains("can't find pane")
         || error.contains("no server running")
+        || error.contains("error connecting to")
 }
 
 fn agent_shell_command(
@@ -1255,7 +1256,7 @@ mod tests {
         TmuxAgentSession, TmuxWindow, attach_or_create_agent, attach_or_create_plan_mode,
         attach_or_create_window, capture_agent_pane, ensure_agent_session,
         latest_agent_session_generation, migrate_legacy_agent_sessions, pane_command_matches_agent,
-        pane_start_command_matches_agent, paste_agent_prompt,
+        pane_start_command_matches_agent, paste_agent_prompt, session_exists,
     };
 
     #[test]
@@ -1777,6 +1778,30 @@ exit 1
         let result = migrate_legacy_agent_sessions(&repo, &config);
 
         assert_eq!(result, Ok(()));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn session_lookup_accepts_missing_tmux_socket() {
+        let temp = unique_temp_dir("prism-tmux-missing-socket-session-test");
+        fs::create_dir_all(&temp).unwrap();
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            "#!/bin/sh\necho 'error connecting to /tmp/tmux/prism (No such file or directory)' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+
+        assert_eq!(session_exists(&config, "prism-test"), Ok(false));
 
         let _ = fs::remove_dir_all(temp);
     }
