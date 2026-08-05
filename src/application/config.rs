@@ -76,7 +76,7 @@ review_fix = []
 
 [auto]
 merge = false
-cleanup_after_merge = false
+cleanup_after_merge = true
 review_requirement = "resolved" # none, resolved, or approved
 push_initial = true
 push_repairs = false
@@ -220,7 +220,7 @@ impl Default for AutoConfig {
     fn default() -> Self {
         Self {
             merge: false,
-            cleanup_after_merge: false,
+            cleanup_after_merge: true,
             review_requirement: ReviewRequirement::Resolved,
             push_initial: true,
             push_repairs: false,
@@ -2151,6 +2151,7 @@ mod tests {
         assert_eq!(config.opencode_port_span, 1_000);
         assert!(!config.opencode_shutdown_owned_servers);
         assert!(!config.opencode_plan_plugin);
+        assert!(config.auto.cleanup_after_merge);
         assert!(config.is_default_branch("main"));
         assert_eq!(
             config.agent_command("opencode"),

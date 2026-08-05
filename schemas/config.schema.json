@@ -217,7 +217,7 @@
         },
         "cleanup_after_merge": {
           "type": "boolean",
-          "default": false,
+          "default": true,
           "description": "Whether Auto Flow should clean up branches/worktrees after merging."
         },
         "review_requirement": {

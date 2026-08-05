@@ -229,7 +229,7 @@ Stabilization gate behavior:
 ```toml
 [auto]
 merge = false
-cleanup_after_merge = false
+cleanup_after_merge = true
 review_requirement = "resolved"
 push_initial = true
 push_repairs = false

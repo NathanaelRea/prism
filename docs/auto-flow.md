@@ -50,14 +50,14 @@ Safety defaults:
 - managed review and CI repairs verify locally, create a repair commit, and enter guarded pending-push by default
 - review bodies and unresolved inline review threads can authorize review repair; top-level change-request comments remain advisory
 - pending repair commits are not pushed automatically unless `auto.push_repairs = true`; inspect the commit diff and use `Space g P` to push through the guard
-- `auto.merge = false` and `auto.cleanup_after_merge = false` by default
+- `auto.merge = false` and `auto.cleanup_after_merge = true` by default
 
 Useful per-repository options:
 
 ```toml
 [auto]
 merge = false
-cleanup_after_merge = false
+cleanup_after_merge = true
 review_requirement = "resolved"
 push_initial = true
 push_repairs = false

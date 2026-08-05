@@ -3046,8 +3046,10 @@ fn merged_run_finishes_cleanup_without_another_pause() {
         AutoStepStatus::Queued,
     );
     save_auto_run(&conn, &mut persisted).unwrap();
+    let mut config = test_config();
+    config.auto.cleanup_after_merge = false;
 
-    pause_before_next_auto_step_with_context(&conn, &repo, &test_config(), &mut persisted).unwrap();
+    pause_before_next_auto_step_with_context(&conn, &repo, &config, &mut persisted).unwrap();
 
     assert!(!persisted.run.pause_requested);
     assert_ne!(persisted.run.status, AutoRunStatus::Paused);
@@ -3057,7 +3059,7 @@ fn merged_run_finishes_cleanup_without_another_pause() {
     execute_auto_initial_step(
         &conn,
         &repo,
-        &test_config(),
+        &config,
         &mut persisted,
         &executor,
         &mut Vec::new(),
