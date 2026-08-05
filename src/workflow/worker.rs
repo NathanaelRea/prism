@@ -198,7 +198,7 @@ pub fn ensure_running() -> Result<(), String> {
     }
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve Prism worker executable: {error}"))?;
-    start_worker(executable)?;
+    start_worker(installed_executable_path(&executable))?;
 
     let deadline = Instant::now() + DAEMON_TRANSITION_TIMEOUT;
     let mut last_error = "worker did not become ready".to_string();
@@ -356,6 +356,7 @@ pub fn serve() -> Result<(), String> {
     let instance_id = execution::new_instance_id("daemon");
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve Prism worker executable: {error}"))?;
+    let executable = installed_executable_path(&executable);
     let started_executable_identity = executable_identity(&executable)?;
     classify_abandoned(&instance_id)?;
     log_daemon_lifecycle("daemon_start", &instance_id);
@@ -489,13 +490,29 @@ fn current_executable_identity() -> Result<String, String> {
 }
 
 fn executable_identity(executable: &Path) -> Result<String, String> {
-    let metadata = fs::metadata(executable).map_err(|error| {
+    let executable = installed_executable_path(executable);
+    let metadata = fs::metadata(&executable).map_err(|error| {
         format!(
             "inspect Prism executable identity {}: {error}",
             executable.display()
         )
     })?;
     Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
+}
+
+fn installed_executable_path(executable: &Path) -> PathBuf {
+    if executable.exists() {
+        return executable.to_path_buf();
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(path) = executable
+        .as_os_str()
+        .as_bytes()
+        .strip_suffix(b" (deleted)")
+    {
+        return PathBuf::from(std::ffi::OsStr::from_bytes(path));
+    }
+    executable.to_path_buf()
 }
 
 fn classify_abandoned(instance_id: &str) -> Result<(), String> {
@@ -1155,6 +1172,20 @@ mod tests {
         assert!(daemon_uses_executable(&current, "8:100"));
         assert!(!daemon_uses_executable(&replaced, "8:100"));
         assert!(!daemon_uses_executable(&legacy, "8:100"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deleted_executable_path_uses_installed_replacement_identity() {
+        let temp = crate::compact_runtime::CompactTempDir::new("worker-deleted-executable");
+        let installed = temp.path.join("prism");
+        fs::write(&installed, "replacement").unwrap();
+        let deleted = PathBuf::from(format!("{} (deleted)", installed.display()));
+
+        assert_eq!(
+            executable_identity(&deleted).unwrap(),
+            executable_identity(&installed).unwrap()
+        );
     }
 
     #[test]
