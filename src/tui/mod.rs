@@ -1047,11 +1047,11 @@ impl Tui {
                         self.show_error("edit user config failed", &error)?;
                     }
                 }
-                Key::EditWorktrunkConfig => {
+                Key::EditWorktrunkUserConfig => {
                     self.clear_leader_hint();
                     pending_g = false;
                     if let Err(error) = self.edit_worktrunk_user_config(runtime) {
-                        self.show_error("edit Worktrunk config failed", &error)?;
+                        self.show_error("edit Worktrunk user config failed", &error)?;
                     }
                 }
                 Key::SelectHarness => {
