@@ -228,7 +228,7 @@ Stabilization gate behavior:
 [auto]
 merge = false
 cleanup_after_merge = false
-require_review_approval = false
+review_requirement = "resolved"
 push_initial = true
 push_repairs = false
 review_wait_enabled = true
@@ -239,7 +239,7 @@ ci_wait_enabled = true
 
 `push_initial = true` allows Auto Flow to push the initial implementation commit and open or refresh the change request. `push_repairs = false` keeps managed review and CI repair commits local as guarded pending pushes for user inspection; use `Space g P` to push them after review.
 
-`require_review_approval = false` means review approval is not required unless repository policy requires it. When enabled, Change Request Stabilization treats missing approval as a blocker.
+`review_requirement` accepts `"none"`, `"resolved"`, or `"approved"`. `"none"` disables the local review gate, `"resolved"` requires at least one review comment and no unresolved comments, and `"approved"` requires an approved review. Repository policy remains mandatory regardless of this setting.
 
 `review_wait_enabled` and `ci_wait_enabled` control whether Auto Flow waits for review and CI observations when those work items are selected.
 

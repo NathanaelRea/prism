@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::Config;
+use crate::config::{Config, ReviewRequirement};
 use crate::git;
 use crate::remote::{PrCache, PrDetails, PrReview, PrReviewComment, PrSummary, RepoPolicyCache};
 use crate::repo::Repository;
@@ -548,9 +548,37 @@ fn review_facts(
     let mut actionable_reviews = Vec::new();
     let mut unresolved_threads = Vec::new();
     let top_level_comments = details.map(|details| details.comments.len()).unwrap_or(0);
+    let conversation_resolution_required = policy.is_some_and(|policy| {
+        policy
+            .error
+            .as_ref()
+            .is_none_or(|error| error.trim().is_empty())
+            && policy.require_conversation_resolution
+    });
+    let review_comment_count = details
+        .map(|details| {
+            details
+                .review_comments
+                .iter()
+                .filter(|comment| !comment.body.trim().is_empty())
+                .count()
+        })
+        .unwrap_or(0);
 
     if let Some(details) = details {
-        let feedback = stabilization_review_feedback(details, review_baseline_json);
+        let mut feedback = stabilization_review_feedback(details, review_baseline_json);
+        if config.auto.review_requirement == ReviewRequirement::Resolved
+            || conversation_resolution_required
+        {
+            feedback.inline_comments = actionable_review_feedback(
+                details,
+                ReviewFeedbackFilter {
+                    after: None,
+                    authors: &[],
+                },
+            )
+            .inline_comments;
+        }
         let mut review_bodies = feedback.review_bodies;
         review_bodies.retain(|review| {
             if crate::review::is_copilot_reviewer(&review.author) {
@@ -601,7 +629,12 @@ fn review_facts(
 
     ReviewFacts {
         decision: summary.review_decision.clone(),
-        approval_required: config.auto.require_review_approval || required_approvals > 0,
+        feedback_required: config.auto.review_requirement != ReviewRequirement::None
+            || conversation_resolution_required,
+        resolved_comments_required: config.auto.review_requirement == ReviewRequirement::Resolved,
+        review_comment_count,
+        approval_required: config.auto.review_requirement == ReviewRequirement::Approved
+            || required_approvals > 0,
         approval_count: approved_reviewers.len() as u64,
         required_approvals,
         actionable_reviews,
@@ -952,6 +985,109 @@ esac
             crate::review::review_thread_ids(&feedback),
             vec!["thread-new".to_string()]
         );
+    }
+
+    #[test]
+    fn repository_resolution_policy_keeps_old_unresolved_comments_actionable() {
+        let summary = test_summary();
+        let details = PrDetails {
+            review_comments: vec![PrReviewComment {
+                thread_id: "thread-old".to_string(),
+                id: "old".to_string(),
+                author: "reviewer".to_string(),
+                path: "src/lib.rs".to_string(),
+                line: "1".to_string(),
+                body: "unresolved feedback".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                resolved: false,
+            }],
+            ..PrDetails::default()
+        };
+        let policy = RepoPolicyCache {
+            require_conversation_resolution: true,
+            ..RepoPolicyCache::default()
+        };
+
+        let facts = review_facts(
+            &summary,
+            Some(&details),
+            Some(&details),
+            &test_config(false),
+            Some(&policy),
+            Some(r#"{"head_sha":"head","updated_at":"2026-01-01T00:01:00Z"}"#),
+        );
+
+        assert!(facts.feedback_required);
+        assert_eq!(facts.unresolved_threads.len(), 1);
+        assert_eq!(facts.unresolved_threads[0].thread_id, "thread-old");
+    }
+
+    #[test]
+    fn resolved_requirement_counts_resolved_comments_before_baseline() {
+        let summary = test_summary();
+        let details = PrDetails {
+            review_comments: vec![PrReviewComment {
+                thread_id: "thread-old".to_string(),
+                id: "old".to_string(),
+                author: "reviewer".to_string(),
+                path: "src/lib.rs".to_string(),
+                line: "1".to_string(),
+                body: "handled feedback".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                resolved: true,
+            }],
+            ..PrDetails::default()
+        };
+        let mut config = test_config(false);
+        config.auto.review_requirement = ReviewRequirement::Resolved;
+
+        let facts = review_facts(
+            &summary,
+            Some(&details),
+            Some(&details),
+            &config,
+            None,
+            Some(r#"{"head_sha":"head","updated_at":"2026-01-01T00:01:00Z"}"#),
+        );
+
+        assert!(facts.feedback_required);
+        assert!(facts.resolved_comments_required);
+        assert_eq!(facts.review_comment_count, 1);
+        assert!(facts.actionable_reviews.is_empty());
+        assert!(facts.unresolved_threads.is_empty());
+    }
+
+    #[test]
+    fn resolved_requirement_keeps_old_unresolved_comments_actionable() {
+        let summary = test_summary();
+        let details = PrDetails {
+            review_comments: vec![PrReviewComment {
+                thread_id: "thread-old".to_string(),
+                id: "old".to_string(),
+                author: "reviewer".to_string(),
+                path: "src/lib.rs".to_string(),
+                line: "1".to_string(),
+                body: "unresolved feedback".to_string(),
+                created_at: "2026-01-01T00:00:00Z".to_string(),
+                resolved: false,
+            }],
+            ..PrDetails::default()
+        };
+        let mut config = test_config(false);
+        config.auto.review_requirement = ReviewRequirement::Resolved;
+
+        let facts = review_facts(
+            &summary,
+            Some(&details),
+            Some(&details),
+            &config,
+            None,
+            Some(r#"{"head_sha":"head","updated_at":"2026-01-01T00:01:00Z"}"#),
+        );
+
+        assert_eq!(facts.review_comment_count, 1);
+        assert_eq!(facts.unresolved_threads.len(), 1);
+        assert_eq!(facts.unresolved_threads[0].thread_id, "thread-old");
     }
 
     #[test]
@@ -1825,7 +1961,11 @@ exit 1
         config.default_agent = "opencode".to_string();
         config.default_base = Some("main".to_string());
         config.auto = AutoConfig {
-            require_review_approval,
+            review_requirement: if require_review_approval {
+                ReviewRequirement::Approved
+            } else {
+                ReviewRequirement::None
+            },
             ..AutoConfig::default()
         };
         config

@@ -1720,11 +1720,9 @@ mod tests {
             },
             {
                 let mut snapshot = ready_manual_merge_snapshot();
-                snapshot
-                    .pull_request
-                    .as_mut()
-                    .unwrap()
-                    .review
+                let review = &mut snapshot.pull_request.as_mut().unwrap().review;
+                review.feedback_required = true;
+                review
                     .actionable_reviews
                     .push(ActionableReviewItem::ReviewBody {
                         review_id: "review".to_string(),
@@ -2555,11 +2553,9 @@ mod tests {
         };
         cases.push(policy);
         let mut review = ready.clone();
-        review
-            .pull_request
-            .as_mut()
-            .unwrap()
-            .review
+        let review_facts = &mut review.pull_request.as_mut().unwrap().review;
+        review_facts.feedback_required = true;
+        review_facts
             .actionable_reviews
             .push(ActionableReviewItem::ReviewBody {
                 review_id: "new-review".to_string(),
@@ -2666,6 +2662,9 @@ mod tests {
                 },
                 review: ReviewFacts {
                     decision: "APPROVED".to_string(),
+                    feedback_required: false,
+                    resolved_comments_required: false,
+                    review_comment_count: 0,
                     approval_required: false,
                     approval_count: 0,
                     required_approvals: 0,

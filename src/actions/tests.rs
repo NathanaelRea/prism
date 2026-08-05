@@ -540,6 +540,7 @@ esac
 
     let mut config = test_config();
     config.default_base = Some("main".to_string());
+    config.auto.review_requirement = crate::config::ReviewRequirement::Approved;
     config
         .tools
         .insert("gh".to_string(), gh.display().to_string());

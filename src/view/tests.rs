@@ -1343,7 +1343,7 @@ fn renders_stabilization_pending_push_in_worktree_main_panel() {
 }
 
 #[test]
-fn worktree_main_panel_renders_review_gate() {
+fn worktree_main_panel_uses_stabilization_review_blocker() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
     let mut summary = test_pr_summary();
@@ -1352,15 +1352,16 @@ fn worktree_main_panel_renders_review_gate() {
     let sessions = vec![session];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.auto_dashboard = Some(stabilization_dashboard(
-        StabilizationBlocker::ReadyForManualMerge,
-        StabilizationWorkKind::MarkReadyForManualMerge,
+        StabilizationBlocker::ReviewFeedbackMissing,
+        StabilizationWorkKind::WaitForReview,
         None,
     ));
 
     let buffer = render_to_string(&model, 120, 40);
 
     assert!(buffer.contains("review"));
-    assert!(buffer.contains("pending"));
+    assert!(buffer.contains("missing"));
+    assert!(!buffer.contains("pending"));
 }
 
 #[test]
@@ -1393,6 +1394,90 @@ fn worktree_main_panel_passes_review_gate_without_actionable_feedback() {
 
     assert!(buffer.contains("passed"));
     assert!(!buffer.contains("disabled"));
+}
+
+#[test]
+fn worktree_main_panel_marks_resolved_review_without_comments_missing() {
+    let config = test_config();
+    let mut session = test_session("feature", AgentState::Idle);
+    session.pr = PrCache::observed(test_pr_summary(), Some(PrDetails::default()));
+    let sessions = vec![session];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.auto_dashboard = Some(stabilization_dashboard(
+        StabilizationBlocker::ReviewFeedbackMissing,
+        StabilizationWorkKind::WaitForReview,
+        None,
+    ));
+
+    let buffer = render_to_string(&model, 120, 40);
+
+    assert!(buffer.contains("ReviewFeedbackMissing"));
+    assert!(buffer.contains("missing"));
+}
+
+#[test]
+fn worktree_main_panel_ignores_local_review_activity_when_review_is_none() {
+    let mut config = test_config();
+    config.auto.review_requirement = crate::config::ReviewRequirement::None;
+    let mut session = test_session("feature", AgentState::Idle);
+    let mut summary = test_pr_summary();
+    summary.review_decision = "UNKNOWN".to_string();
+    summary.requested_reviewers = vec!["reviewer".to_string()];
+    session.pr = PrCache::observed(
+        summary,
+        Some(PrDetails {
+            review_comments: vec![PrReviewComment {
+                body: "optional feedback".to_string(),
+                resolved: false,
+                ..PrReviewComment::default()
+            }],
+            ..PrDetails::default()
+        }),
+    );
+    let sessions = vec![session];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.auto_dashboard = Some(stabilization_dashboard(
+        StabilizationBlocker::ReadyForManualMerge,
+        StabilizationWorkKind::MarkReadyForManualMerge,
+        None,
+    ));
+
+    let buffer = render_to_string(&model, 120, 40);
+
+    assert!(buffer.contains("passed"));
+    assert!(!buffer.contains("pending"));
+}
+
+#[test]
+fn worktree_main_panel_does_not_claim_review_passed_when_an_earlier_blocker_masks_it() {
+    let mut config = test_config();
+    config.auto.review_requirement = crate::config::ReviewRequirement::Approved;
+    let mut session = test_session("feature", AgentState::Idle);
+    let mut summary = test_pr_summary();
+    summary.review_decision = "APPROVED".to_string();
+    session.pr = PrCache::observed(
+        summary,
+        Some(PrDetails {
+            review_comments: vec![PrReviewComment {
+                body: "unresolved feedback".to_string(),
+                resolved: false,
+                ..PrReviewComment::default()
+            }],
+            ..PrDetails::default()
+        }),
+    );
+    let sessions = vec![session];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.auto_dashboard = Some(stabilization_dashboard(
+        StabilizationBlocker::DirtyWorktree,
+        StabilizationWorkKind::Escalate,
+        None,
+    ));
+
+    let buffer = render_to_string(&model, 120, 40);
+
+    assert!(buffer.contains("unknown"));
+    assert!(!buffer.contains("approved"));
 }
 
 #[test]

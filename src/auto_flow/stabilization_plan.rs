@@ -77,10 +77,16 @@ pub(crate) fn derive_blockers(snapshot: &StabilizationSnapshot) -> Vec<Stabiliza
     {
         blockers.push(StabilizationBlocker::BranchBehind);
     }
-    if !pull_request.review.actionable_reviews.is_empty()
-        || !pull_request.review.unresolved_threads.is_empty()
+    if pull_request.review.feedback_required
+        && (!pull_request.review.actionable_reviews.is_empty()
+            || !pull_request.review.unresolved_threads.is_empty())
     {
         blockers.push(StabilizationBlocker::ReviewFeedbackFound);
+    }
+    if pull_request.review.resolved_comments_required
+        && pull_request.review.review_comment_count == 0
+    {
+        blockers.push(StabilizationBlocker::ReviewFeedbackMissing);
     }
 
     let required_ci_blocker = required_ci_blocker(&pull_request.ci.required);
@@ -247,7 +253,8 @@ fn blocker_priority(blocker: &StabilizationBlocker) -> u8 {
         StabilizationBlocker::CiFailed | StabilizationBlocker::CiMissingRequiredChecks => 10,
         StabilizationBlocker::MergeBlocked => 11,
         StabilizationBlocker::CiPending => 12,
-        StabilizationBlocker::ReviewApprovalMissing => 13,
+        StabilizationBlocker::ReviewFeedbackMissing
+        | StabilizationBlocker::ReviewApprovalMissing => 13,
         StabilizationBlocker::PolicyBlocked => 14,
         StabilizationBlocker::PolicyUnknown => 15,
         StabilizationBlocker::IntegrationBacklogged => 16,
@@ -264,6 +271,7 @@ fn work_kind_for_blocker(blocker: &StabilizationBlocker) -> StabilizationWorkKin
         StabilizationBlocker::NeedsPullRequest => StabilizationWorkKind::PushInitialAndOpenPr,
         StabilizationBlocker::PendingPush => StabilizationWorkKind::PushPendingRepair,
         StabilizationBlocker::ReviewFeedbackFound => StabilizationWorkKind::FixReview,
+        StabilizationBlocker::ReviewFeedbackMissing => StabilizationWorkKind::WaitForReview,
         StabilizationBlocker::CiFailed | StabilizationBlocker::CiMissingRequiredChecks => {
             StabilizationWorkKind::FixCi
         }
@@ -348,6 +356,9 @@ fn reason_for_blocker(snapshot: &StabilizationSnapshot, blocker: &StabilizationB
         }
         StabilizationBlocker::ReviewFeedbackFound => {
             "actionable review feedback is present".to_string()
+        }
+        StabilizationBlocker::ReviewFeedbackMissing => {
+            "at least one review comment is required before review is resolved".to_string()
         }
         StabilizationBlocker::ReviewApprovalMissing => snapshot.pull_request.as_ref().map_or_else(
             || "review approval is required but not satisfied".to_string(),
@@ -638,6 +649,7 @@ mod tests {
         pr.mergeability = MergeabilityFacts::Blocked {
             reason: "conflict".to_string(),
         };
+        pr.review.feedback_required = true;
         pr.review.unresolved_threads.push(review_thread("thread-1"));
         let snapshot = snapshot(Some(pr));
 
@@ -677,6 +689,7 @@ mod tests {
     #[test]
     fn review_feedback_plans_review_fix_and_guards_threads() {
         let mut pr = clean_pr();
+        pr.review.feedback_required = true;
         pr.review.unresolved_threads.push(review_thread("thread-1"));
         let snapshot = snapshot(Some(pr));
 
@@ -685,6 +698,40 @@ mod tests {
         assert_eq!(work.blocker, StabilizationBlocker::ReviewFeedbackFound);
         assert_eq!(work.kind, StabilizationWorkKind::FixReview);
         assert_eq!(work.guard.review_thread_ids, vec!["thread-1".to_string()]);
+    }
+
+    #[test]
+    fn resolved_review_requirement_waits_for_first_comment() {
+        let mut pr = clean_pr();
+        pr.review.feedback_required = true;
+        pr.review.resolved_comments_required = true;
+
+        let work = plan(&snapshot(Some(pr)));
+
+        assert_eq!(work.blocker, StabilizationBlocker::ReviewFeedbackMissing);
+        assert_eq!(work.kind, StabilizationWorkKind::WaitForReview);
+    }
+
+    #[test]
+    fn resolved_review_requirement_passes_after_a_resolved_comment() {
+        let mut pr = clean_pr();
+        pr.review.feedback_required = true;
+        pr.review.resolved_comments_required = true;
+        pr.review.review_comment_count = 1;
+
+        let work = plan(&snapshot(Some(pr)));
+
+        assert_eq!(work.blocker, StabilizationBlocker::ReadyForManualMerge);
+    }
+
+    #[test]
+    fn no_review_requirement_ignores_review_feedback() {
+        let mut pr = clean_pr();
+        pr.review.unresolved_threads.push(review_thread("thread-1"));
+
+        let work = plan(&snapshot(Some(pr)));
+
+        assert_eq!(work.blocker, StabilizationBlocker::ReadyForManualMerge);
     }
 
     #[test]
@@ -1151,6 +1198,9 @@ mod tests {
             },
             review: ReviewFacts {
                 decision: "APPROVED".to_string(),
+                feedback_required: false,
+                resolved_comments_required: false,
+                review_comment_count: 0,
                 approval_required: false,
                 approval_count: 0,
                 required_approvals: 0,

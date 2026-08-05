@@ -111,6 +111,9 @@ pub(crate) struct CheckFact {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ReviewFacts {
     pub decision: String,
+    pub feedback_required: bool,
+    pub resolved_comments_required: bool,
+    pub review_comment_count: usize,
     pub approval_required: bool,
     pub approval_count: u64,
     pub required_approvals: u64,
@@ -221,6 +224,7 @@ pub enum StabilizationBlocker {
     MergeBlocked,
     BranchBehind,
     ReviewFeedbackFound,
+    ReviewFeedbackMissing,
     ReviewApprovalMissing,
     CiFailed,
     CiPending,
@@ -326,6 +330,7 @@ impl StabilizationBlocker {
             Self::MergeBlocked => "merge_blocked",
             Self::BranchBehind => "branch_behind",
             Self::ReviewFeedbackFound => "review_feedback_found",
+            Self::ReviewFeedbackMissing => "review_feedback_missing",
             Self::ReviewApprovalMissing => "review_approval_missing",
             Self::CiFailed => "ci_failed",
             Self::CiPending => "ci_pending",
@@ -354,6 +359,7 @@ impl StabilizationBlocker {
             "merge_blocked" => Ok(Self::MergeBlocked),
             "branch_behind" => Ok(Self::BranchBehind),
             "review_feedback_found" => Ok(Self::ReviewFeedbackFound),
+            "review_feedback_missing" => Ok(Self::ReviewFeedbackMissing),
             "review_approval_missing" => Ok(Self::ReviewApprovalMissing),
             "ci_failed" => Ok(Self::CiFailed),
             "ci_pending" => Ok(Self::CiPending),

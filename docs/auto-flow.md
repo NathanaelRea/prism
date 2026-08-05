@@ -58,7 +58,7 @@ Useful per-repository options:
 [auto]
 merge = false
 cleanup_after_merge = false
-require_review_approval = false
+review_requirement = "resolved"
 push_initial = true
 push_repairs = false
 review_wait_enabled = true

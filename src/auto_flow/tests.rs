@@ -364,7 +364,7 @@ fn prompt_implementation_pr_delegates_to_stabilization_ready_state() {
     let head = git_output(&work, &["rev-parse", "HEAD"]);
     let repo = Repository::with_config_dir_for_test(work.clone(), temp.path().join("prism-config"));
     let mut config = Config::load(&repo);
-    config.auto.require_review_approval = false;
+    config.auto.review_requirement = crate::config::ReviewRequirement::None;
     configure_pr_observation(&temp, &mut config, "feat/auto", &head);
     seed_pr_cache(&repo, "feat/auto", &head);
     crate::remote::save_repo_policy_cache(
@@ -2788,7 +2788,8 @@ fn review_poll_skips_feedback_at_or_before_baseline() {
         root: temp.path().to_path_buf(),
     };
     let summary = test_pr_summary("feat/auto", "abc123", "2026-01-01T00:05:00Z");
-    let config = Config::load(&repo);
+    let mut config = Config::load(&repo);
+    config.auto.review_requirement = crate::config::ReviewRequirement::Approved;
     let details = crate::remote::PrDetails {
         comments: vec![crate::remote::PrComment {
             id: "comment-1".to_string(),
@@ -2815,6 +2816,94 @@ fn review_poll_skips_feedback_at_or_before_baseline() {
     assert!(outcome.fix_prompt.is_none());
     assert!(outcome.complete);
     assert!(outcome.summary.contains("no actionable review feedback"));
+}
+
+#[test]
+fn review_poll_keeps_old_unresolved_threads_actionable() {
+    let temp = TempDir::new("review-poll-old-thread");
+    let repo = Repository {
+        root: temp.path().to_path_buf(),
+    };
+    let summary = test_pr_summary("feat/auto", "abc123", "2026-01-01T00:05:00Z");
+    let mut config = Config::load(&repo);
+    config.auto.review_requirement = crate::config::ReviewRequirement::Approved;
+    let details = crate::remote::PrDetails {
+        review_comments: vec![crate::remote::PrReviewComment {
+            thread_id: "thread-old".to_string(),
+            body: "still unresolved".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            resolved: false,
+            ..crate::remote::PrReviewComment::default()
+        }],
+        ..crate::remote::PrDetails::default()
+    };
+    let mut persisted = AutoLaunch::new(temp.path(), temp.path(), "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+    persisted.run.review_baseline_json = Some(
+        serde_json::to_string(&ReviewBaseline {
+            head_sha: "abc123".to_string(),
+            updated_at: "2026-01-01T00:05:00Z".to_string(),
+        })
+        .unwrap(),
+    );
+
+    let outcome =
+        evaluate_review_feedback(&config, &mut persisted, &summary, Some(&details)).unwrap();
+
+    assert!(outcome.fix_prompt.is_some());
+    assert_eq!(outcome.review_thread_ids, vec!["thread-old".to_string()]);
+}
+
+#[test]
+fn review_poll_resolved_requirement_waits_without_review_comments() {
+    let temp = TempDir::new("review-poll-resolved-missing");
+    let repo = Repository {
+        root: temp.path().to_path_buf(),
+    };
+    let config = Config::load(&repo);
+    let summary = test_pr_summary("feat/auto", "abc123", "2026-01-01T00:00:00Z");
+    let mut persisted = AutoLaunch::new(temp.path(), temp.path(), "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+
+    let outcome = evaluate_review_feedback(
+        &config,
+        &mut persisted,
+        &summary,
+        Some(&crate::remote::PrDetails::default()),
+    )
+    .unwrap();
+
+    assert!(!outcome.complete);
+    assert_eq!(outcome.summary, "no review comments found yet");
+}
+
+#[test]
+fn review_poll_resolved_requirement_completes_with_a_resolved_comment() {
+    let temp = TempDir::new("review-poll-resolved-complete");
+    let repo = Repository {
+        root: temp.path().to_path_buf(),
+    };
+    let config = Config::load(&repo);
+    let summary = test_pr_summary("feat/auto", "abc123", "2026-01-01T00:00:00Z");
+    let details = crate::remote::PrDetails {
+        review_comments: vec![crate::remote::PrReviewComment {
+            body: "handled feedback".to_string(),
+            resolved: true,
+            ..crate::remote::PrReviewComment::default()
+        }],
+        ..crate::remote::PrDetails::default()
+    };
+    let mut persisted = AutoLaunch::new(temp.path(), temp.path(), "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+
+    let outcome =
+        evaluate_review_feedback(&config, &mut persisted, &summary, Some(&details)).unwrap();
+
+    assert!(outcome.complete);
+    assert_eq!(outcome.summary, "all 1 review comment(s) are resolved");
 }
 
 #[test]
@@ -3313,6 +3402,7 @@ fn headless_merge_step_refreshes_and_blocks_unknown_policy() {
     run_git(&work, &["push", "-u", "origin", "feat/auto"]);
     let repo = Repository::with_config_dir_for_test(work.clone(), temp.path().join("prism-config"));
     let mut config = Config::load(&repo);
+    config.auto.review_requirement = crate::config::ReviewRequirement::None;
     config.auto.merge = true;
     config.auto.review_wait_enabled = false;
     let gh_log = temp.path().join("gh.log");

@@ -220,10 +220,16 @@
           "default": false,
           "description": "Whether Auto Flow should clean up branches/worktrees after merging."
         },
+        "review_requirement": {
+          "type": "string",
+          "enum": ["none", "resolved", "approved"],
+          "default": "resolved",
+          "description": "Local review gate: none ignores review feedback, resolved requires at least one review comment and no unresolved comments, and approved requires an approved review. Repository policy remains mandatory."
+        },
         "require_review_approval": {
           "type": "boolean",
-          "default": false,
-          "description": "Whether PR Stabilization treats missing review approval as a blocker independent of repository policy."
+          "deprecated": true,
+          "description": "Deprecated compatibility setting. False maps to resolved and true maps to approved."
         },
         "push_initial": {
           "type": "boolean",
@@ -280,6 +286,9 @@
           "default": 30,
           "description": "Polling interval while waiting for CI."
         }
+      },
+      "not": {
+        "required": ["review_requirement", "require_review_approval"]
       }
     },
     "layout": {

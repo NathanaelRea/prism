@@ -2455,13 +2455,23 @@ pub(super) fn evaluate_review_feedback(
             complete: false,
         });
     };
-    let feedback = actionable_review_feedback(
+    let mut feedback = actionable_review_feedback(
         details,
         ReviewFeedbackFilter {
             after,
             authors: &[],
         },
     );
+    // Conversation-resolution policy applies to every unresolved thread, including
+    // feedback that predates this run's repair baseline.
+    feedback.inline_comments = actionable_review_feedback(
+        details,
+        ReviewFeedbackFilter {
+            after: None,
+            authors: &[],
+        },
+    )
+    .inline_comments;
     if feedback.is_actionable() {
         let prompt =
             render_auto_review_fix_prompt(summary.number, &persisted.run.branch, &feedback);
@@ -2470,6 +2480,23 @@ pub(super) fn evaluate_review_feedback(
             fix_prompt: Some(prompt),
             review_thread_ids: crate::review::review_thread_ids(&feedback),
             complete: false,
+        });
+    }
+    if config.auto.review_requirement == crate::config::ReviewRequirement::Resolved {
+        let review_comment_count = details
+            .review_comments
+            .iter()
+            .filter(|comment| !comment.body.trim().is_empty())
+            .count();
+        return Ok(ReviewPollOutcome {
+            summary: if review_comment_count == 0 {
+                "no review comments found yet".to_string()
+            } else {
+                format!("all {review_comment_count} review comment(s) are resolved")
+            },
+            fix_prompt: None,
+            review_thread_ids: Vec::new(),
+            complete: review_comment_count > 0,
         });
     }
     if !has_configured_reviewer_requested(summary, config) {
