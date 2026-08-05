@@ -1403,7 +1403,7 @@ exit 0
     }
 
     #[test]
-    fn ensure_agent_session_resolves_opencode_session_before_tmux_attach() {
+    fn ensure_agent_session_creates_opencode_session_before_tmux_attach() {
         let temp = unique_temp_dir("prism-tmux-opencode-resolve-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -2663,6 +2663,8 @@ exit 0
             (200, session)
         } else if method == "GET" && request_path == "/session" {
             (200, format!(r#"{{"data":[{session}]}}"#))
+        } else if method == "POST" && request_path == "/session" {
+            (200, session)
         } else if method == "POST" && request_path == "/session/ses_123/prompt_async" {
             (prompt_status, String::new())
         } else {

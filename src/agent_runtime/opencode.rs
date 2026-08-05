@@ -1598,6 +1598,10 @@ fn fetch_todos(
 }
 
 fn resolve_session(runtime: &OpencodeRuntime, worktree: &Path) -> Result<OpencodeSession, String> {
+    if runtime.opencode_session_id.is_none() {
+        return create_session(&runtime.server_url, worktree, &runtime.branch);
+    }
+
     let worktree_path = worktree.display().to_string();
     let stored_session = if let Some(session_id) = runtime.opencode_session_id.as_deref()
         && let Some(session) = get_session_for_worktree(&runtime.server_url, session_id, worktree)?
@@ -3716,6 +3720,55 @@ mod tests {
     }
 
     #[test]
+    fn resolve_session_does_not_adopt_an_old_session_for_an_unassociated_worktree() {
+        let worktree = PathBuf::from("/repo/wt");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut buffer = [0_u8; 256];
+                let count = stream.read(&mut buffer).unwrap();
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("POST /session?directory=%2Frepo%2Fwt "));
+            let body = r#"{"id":"fresh","directory":"/repo/wt"}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let runtime = OpencodeRuntime {
+            repo_root: "/repo".to_string(),
+            harness_id: "opencode".to_string(),
+            branch: "feature".to_string(),
+            worktree_path: worktree.display().to_string(),
+            server_port: 41_234,
+            server_url,
+            server_pid: None,
+            server_process_identity: None,
+            opencode_session_id: None,
+            generation: 0,
+            updated_unix_ms: 0,
+        };
+
+        let selected = resolve_session(&runtime, &worktree).unwrap();
+
+        assert_eq!(selected.id, "fresh");
+        server.join().unwrap();
+    }
+
+    #[test]
     fn refresh_session_keeps_runtime_when_session_listing_fails() {
         let temp = unique_temp_dir("prism-opencode-refresh-offline-test");
         fs::create_dir_all(&temp).unwrap();
@@ -4153,9 +4206,9 @@ mod tests {
                 ));
             }
             let resolved = ensure_opencode_session(&repo, &config, "feature/smoke", &worktree)?;
-            if resolved.opencode_session_id.as_deref() != Some(created.id.as_str()) {
+            if resolved.opencode_session_id.as_deref() == Some(created.id.as_str()) {
                 return Err(format!(
-                    "Prism did not select created OpenCode session {} for {}",
+                    "Prism reused unassociated OpenCode session {} for {}",
                     created.id,
                     worktree.display()
                 ));
