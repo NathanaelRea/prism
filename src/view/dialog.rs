@@ -175,8 +175,13 @@ pub(super) fn set_prompt_cursor(
     let prompt_prefix_lines = prompt.split('\n').collect::<Vec<_>>();
     let prompt_prefix = prompt_prefix_lines.last().copied().unwrap_or(prompt);
     let prompt_width = prompt_prefix.chars().count() as u16;
-    let input_width = visible_prompt_input_width(area.width, prompt_width);
     let input_lines = input.split('\n').collect::<Vec<_>>();
+    let prefix_width = if input_lines.len() == 1 {
+        prompt_width
+    } else {
+        0
+    };
+    let input_width = visible_prompt_input_width(area.width, prefix_width);
     let input_cursor = input_lines
         .last()
         .copied()
@@ -184,11 +189,6 @@ pub(super) fn set_prompt_cursor(
         .chars()
         .count()
         .min(input_width as usize) as u16;
-    let prefix_width = if input_lines.len() == 1 {
-        prompt_width
-    } else {
-        0
-    };
     let x_offset = prefix_width
         .saturating_add(input_cursor)
         .min(area.width.saturating_sub(1));

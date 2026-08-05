@@ -1027,6 +1027,32 @@ fn text_area_renders_input_on_new_lines_with_updated_controls() {
 }
 
 #[test]
+fn text_area_cursor_uses_full_width_after_first_input_line() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
+    let last_line = "abcdefghijklmnopqrstuvwxyz1234";
+    model.dialog = Some(DialogModel::TextArea {
+        title: "Create Pull Request".to_string(),
+        prompt: "Description: ".to_string(),
+        input: format!("First line\n{last_line}"),
+    });
+
+    let backend = render_to_backend(&model, 40, 20);
+    let buffer = backend.buffer();
+    let y = find_line(buffer, last_line);
+    let line_start = line_text(buffer, y)
+        .chars()
+        .position(|character| character == 'a')
+        .expect("last input line");
+
+    assert_eq!(
+        backend.cursor_position(),
+        Position::new(line_start as u16 + last_line.len() as u16, y)
+    );
+}
+
+#[test]
 fn text_area_scrolls_to_keep_long_input_and_controls_visible() {
     let config = test_config();
     let sessions = vec![test_session("feature", AgentState::Idle)];
