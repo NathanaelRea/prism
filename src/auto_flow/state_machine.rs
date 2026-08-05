@@ -110,6 +110,7 @@ pub(super) fn next_queued_non_agent_step(persisted: &PersistedAutoRun) -> Option
                     | AutoStepKey::WaitCi
                     | AutoStepKey::VerifyCiFix
                     | AutoStepKey::CommitCiFix
+                    | AutoStepKey::UpdateBranch
                     | AutoStepKey::Merge
                     | AutoStepKey::Cleanup
             )
@@ -156,10 +157,33 @@ pub(super) fn pause_before_next_auto_step_with_context(
     if !has_pending_auto_work(persisted) {
         return Ok(());
     }
+    let integration_reserved = crate::integration::active_merge_intent(conn, &persisted.run.id)?
+        .is_some_and(|intent| {
+            intent.placement == crate::integration::IntegrationPlacement::Reserved
+        });
+    let reserved_stabilization_step = persisted.steps.iter().any(|step| {
+        step.status == AutoStepStatus::Queued
+            && matches!(
+                step.step_key,
+                AutoStepKey::WaitReview
+                    | AutoStepKey::FixReview
+                    | AutoStepKey::VerifyReviewFix
+                    | AutoStepKey::CommitReviewFix
+                    | AutoStepKey::WaitCi
+                    | AutoStepKey::FixCi
+                    | AutoStepKey::VerifyCiFix
+                    | AutoStepKey::CommitCiFix
+                    | AutoStepKey::UpdateBranch
+                    | AutoStepKey::Merge
+            )
+    });
+    if integration_reserved && reserved_stabilization_step {
+        return Ok(());
+    }
     if next_queued_non_agent_step(persisted).is_some_and(|index| {
         matches!(
             persisted.steps[index].step_key,
-            AutoStepKey::LocalVerify | AutoStepKey::CommitImpl
+            AutoStepKey::LocalVerify | AutoStepKey::CommitImpl | AutoStepKey::Cleanup
         )
     }) {
         return Ok(());
@@ -182,6 +206,12 @@ pub(super) fn pause_before_next_auto_step_with_context(
 }
 
 pub(super) fn next_state_machine_step_needed(persisted: &PersistedAutoRun) -> bool {
+    if persisted.run.implementation_source == AutoImplementationSource::ExistingPullRequest {
+        return persisted
+            .run
+            .stabilization_status
+            .is_none_or(stabilization_model::StabilizationStatus::keeps_run_active);
+    }
     if persisted.run.implementation_source == AutoImplementationSource::DraftPlan {
         if !has_step_key(persisted, &AutoStepKey::CreatePlan) {
             return true;
@@ -204,6 +234,9 @@ pub(super) fn next_state_machine_step_needed(persisted: &PersistedAutoRun) -> bo
 }
 
 pub(super) fn implementation_follow_up_step_needed(persisted: &PersistedAutoRun) -> bool {
+    if persisted.run.implementation_source == AutoImplementationSource::ExistingPullRequest {
+        return false;
+    }
     latest_step_status(persisted, &implementation_step_key(persisted)) == Some(AutoStepStatus::Done)
         && !has_step_key(persisted, &AutoStepKey::LocalVerify)
 }
@@ -214,7 +247,10 @@ pub(super) fn ensure_next_auto_step_with_context(
     config: &Config,
     persisted: &mut PersistedAutoRun,
 ) -> Result<bool, String> {
-    if merge_or_manual_merge_complete(persisted) {
+    let rearmed_manual_merge = latest_step_status(persisted, &AutoStepKey::Merge)
+        == Some(AutoStepStatus::Skipped)
+        && crate::integration::merge_intent_enabled(conn, &persisted.run.id, config.auto.merge)?;
+    if merge_or_manual_merge_complete(persisted) && !rearmed_manual_merge {
         persisted.run.status = if persisted.run.stabilization_status
             == Some(stabilization_model::StabilizationStatus::Done)
         {
@@ -243,24 +279,26 @@ pub(super) fn ensure_next_auto_step_with_context(
     if persisted.run.variant == "repair" {
         return ensure_next_stabilization_step(conn, repo, config, persisted);
     }
-    if ensure_next_implementation_step(conn, persisted)? {
-        return Ok(true);
-    }
-    if matches!(
-        latest_step_status(persisted, &AutoStepKey::CommitImpl),
-        Some(AutoStepStatus::Done | AutoStepStatus::Skipped)
-    ) && !has_step_key(persisted, &AutoStepKey::PushPr)
-    {
-        append_step_run(
-            conn,
-            persisted,
-            AutoStepKey::PushPr,
-            Some("push branch and create or refresh pull request".to_string()),
-        )?;
-        return Ok(true);
-    }
-    if !has_step_status(persisted, &AutoStepKey::PushPr, AutoStepStatus::Done) {
-        return Ok(false);
+    if persisted.run.implementation_source != AutoImplementationSource::ExistingPullRequest {
+        if ensure_next_implementation_step(conn, persisted)? {
+            return Ok(true);
+        }
+        if matches!(
+            latest_step_status(persisted, &AutoStepKey::CommitImpl),
+            Some(AutoStepStatus::Done | AutoStepStatus::Skipped)
+        ) && !has_step_key(persisted, &AutoStepKey::PushPr)
+        {
+            append_step_run(
+                conn,
+                persisted,
+                AutoStepKey::PushPr,
+                Some("push branch and create or refresh pull request".to_string()),
+            )?;
+            return Ok(true);
+        }
+        if !has_step_status(persisted, &AutoStepKey::PushPr, AutoStepStatus::Done) {
+            return Ok(false);
+        }
     }
     ensure_next_stabilization_step(conn, repo, config, persisted)
 }
@@ -374,7 +412,7 @@ fn ensure_next_stabilization_step(
     config: &Config,
     persisted: &mut PersistedAutoRun,
 ) -> Result<bool, String> {
-    let work = stabilization_execute::observe_and_plan(repo, config, persisted);
+    let work = stabilization_execute::observe_and_plan(conn, repo, config, persisted)?;
 
     stabilization_execute::append_planned_work(conn, persisted, work)
 }
@@ -388,6 +426,9 @@ pub(super) fn initial_agent_step(persisted: &PersistedAutoRun) -> (AutoStepKey, 
         AutoImplementationSource::DraftPlan => {
             (AutoStepKey::CreatePlan, "create implementation plan.md")
         }
+        AutoImplementationSource::ExistingPullRequest => {
+            unreachable!("existing pull requests start at stabilization")
+        }
     }
 }
 
@@ -397,6 +438,9 @@ pub(super) fn implementation_step_key(persisted: &PersistedAutoRun) -> AutoStepK
         AutoImplementationSource::ExistingPlan | AutoImplementationSource::DraftPlan => {
             AutoStepKey::RunPlan
         }
+        AutoImplementationSource::ExistingPullRequest => {
+            unreachable!("existing pull requests have no implementation step")
+        }
     }
 }
 
@@ -405,6 +449,9 @@ pub(super) fn implementation_step_reason(persisted: &PersistedAutoRun) -> &'stat
         AutoImplementationSource::Prompt => "run initial implementation prompt",
         AutoImplementationSource::ExistingPlan => "run plan phases from selected plan",
         AutoImplementationSource::DraftPlan => "run plan phases from approved plan.md",
+        AutoImplementationSource::ExistingPullRequest => {
+            unreachable!("existing pull requests have no implementation step")
+        }
     }
 }
 

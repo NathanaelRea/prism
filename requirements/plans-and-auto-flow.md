@@ -76,3 +76,14 @@
 - **Customization**: Review and CI waiting can be disabled and their polling
   intervals and maximum waits configured. Review timeout continuation is
   separately configurable.
+- **Behavior**: `Space g M` toggles durable merge intent for an active Auto Flow
+  or an existing open change request. Exact-head ready generations enter a FIFO
+  integration lane scoped to the canonical target repository and branch.
+- **Invariant**: Only the reserved integration candidate may be updated because
+  its base moved. Other change requests continue review and ordinary CI without
+  eager branch updates.
+- **Behavior**: A required native merge queue owns latest-base integration. When
+  no native queue is required, a behind reserved candidate receives one guarded
+  base merge, push, and fresh review/CI convergence before guarded merge.
+- **Invariant**: Merge intent, readiness, base update, repair, queue submission,
+  and merge authorization remain bound to exact observed change-request heads.

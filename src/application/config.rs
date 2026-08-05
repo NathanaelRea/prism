@@ -76,8 +76,8 @@ review_fix = []
 
 [auto]
 merge = false
-cleanup_after_merge = false
-require_review_approval = false
+cleanup_after_merge = true
+review_requirement = "resolved" # none, resolved, or approved
 push_initial = true
 push_repairs = false
 review_wait_enabled = true
@@ -129,7 +129,7 @@ pub struct Checks {
 pub struct AutoConfig {
     pub merge: bool,
     pub cleanup_after_merge: bool,
-    pub require_review_approval: bool,
+    pub review_requirement: ReviewRequirement,
     pub push_initial: bool,
     pub push_repairs: bool,
     pub review_wait_enabled: bool,
@@ -140,6 +140,33 @@ pub struct AutoConfig {
     pub ci_wait_enabled: bool,
     pub ci_max_wait_seconds: u64,
     pub ci_poll_interval_seconds: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReviewRequirement {
+    None,
+    #[default]
+    Resolved,
+    Approved,
+}
+
+impl ReviewRequirement {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "none" => Some(Self::None),
+            "resolved" => Some(Self::Resolved),
+            "approved" => Some(Self::Approved),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Resolved => "resolved",
+            Self::Approved => "approved",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -193,8 +220,8 @@ impl Default for AutoConfig {
     fn default() -> Self {
         Self {
             merge: false,
-            cleanup_after_merge: false,
-            require_review_approval: false,
+            cleanup_after_merge: true,
+            review_requirement: ReviewRequirement::Resolved,
             push_initial: true,
             push_repairs: false,
             review_wait_enabled: true,
@@ -360,6 +387,8 @@ struct RawChecks {
 struct RawAutoConfig {
     merge: Option<bool>,
     cleanup_after_merge: Option<bool>,
+    review_requirement: Option<String>,
+    // Accepted while shipped configurations migrate to review_requirement.
     require_review_approval: Option<bool>,
     push_initial: Option<bool>,
     push_repairs: Option<bool>,
@@ -530,6 +559,21 @@ fn validate_config_values(raw: &RawConfig, is_user_config: bool) -> Result<(), S
         && IconStyle::parse(value).is_none()
     {
         return Err(format!("ui.icon_style has unsupported value '{value}'"));
+    }
+    if let Some(auto) = &raw.auto {
+        if auto.review_requirement.is_some() && auto.require_review_approval.is_some() {
+            return Err(
+                "auto.review_requirement and auto.require_review_approval cannot both be set"
+                    .to_string(),
+            );
+        }
+        if let Some(value) = auto.review_requirement.as_deref()
+            && ReviewRequirement::parse(value).is_none()
+        {
+            return Err(format!(
+                "auto.review_requirement has unsupported value '{value}'"
+            ));
+        }
     }
     if let Some(harnesses) = &raw.harnesses {
         for (id, harness) in harnesses {
@@ -815,8 +859,15 @@ impl Config {
             if let Some(enabled) = auto.cleanup_after_merge {
                 self.auto.cleanup_after_merge = enabled;
             }
-            if let Some(enabled) = auto.require_review_approval {
-                self.auto.require_review_approval = enabled;
+            if let Some(value) = auto.review_requirement {
+                self.auto.review_requirement = ReviewRequirement::parse(&value)
+                    .expect("review requirement was validated before applying config");
+            } else if let Some(enabled) = auto.require_review_approval {
+                self.auto.review_requirement = if enabled {
+                    ReviewRequirement::Approved
+                } else {
+                    ReviewRequirement::Resolved
+                };
             }
             if let Some(enabled) = auto.push_initial {
                 self.auto.push_initial = enabled;
@@ -1356,8 +1407,8 @@ pub fn print_config(repo: &Repository, config: &Config) {
         config.auto.cleanup_after_merge
     );
     println!(
-        "auto.require_review_approval = {}",
-        config.auto.require_review_approval
+        "auto.review_requirement = {}",
+        config.auto.review_requirement.label()
     );
     println!("auto.push_initial = {}", config.auto.push_initial);
     println!("auto.push_repairs = {}", config.auto.push_repairs);
@@ -2016,6 +2067,63 @@ mod tests {
     }
 
     #[test]
+    fn parses_review_requirement() {
+        for (value, expected) in [
+            ("none", ReviewRequirement::None),
+            ("resolved", ReviewRequirement::Resolved),
+            ("approved", ReviewRequirement::Approved),
+        ] {
+            let raw = parse_and_validate_config(
+                &format!("[auto]\nreview_requirement = \"{value}\"\n"),
+                true,
+            )
+            .unwrap();
+            let mut config = Config::defaults(
+                PathBuf::from("/tmp/user.toml"),
+                PathBuf::from("/tmp/repo.toml"),
+            );
+
+            config.apply_raw_config(raw, true);
+
+            assert_eq!(config.auto.review_requirement, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_unknown_review_requirement() {
+        let error = parse_and_validate_config("[auto]\nreview_requirement = \"comments\"\n", true)
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("auto.review_requirement has unsupported value 'comments'")
+        );
+    }
+
+    #[test]
+    fn legacy_review_approval_setting_maps_to_review_requirement() {
+        for (value, expected) in [
+            (false, ReviewRequirement::Resolved),
+            (true, ReviewRequirement::Approved),
+        ] {
+            let raw = parse_and_validate_config(
+                &format!("[auto]\nrequire_review_approval = {value}\n"),
+                true,
+            )
+            .unwrap();
+            let mut config = Config::defaults(
+                PathBuf::from("/tmp/user.toml"),
+                PathBuf::from("/tmp/repo.toml"),
+            );
+
+            config.apply_raw_config(raw, true);
+
+            assert_eq!(config.auto.review_requirement, expected);
+        }
+    }
+
+    #[test]
     fn defaults_to_opencode_json_run_backend() {
         let config = Config::defaults(
             PathBuf::from("/tmp/user.toml"),
@@ -2043,6 +2151,7 @@ mod tests {
         assert_eq!(config.opencode_port_span, 1_000);
         assert!(!config.opencode_shutdown_owned_servers);
         assert!(!config.opencode_plan_plugin);
+        assert!(config.auto.cleanup_after_merge);
         assert!(config.is_default_branch("main"));
         assert_eq!(
             config.agent_command("opencode"),

@@ -15,12 +15,18 @@ pub(crate) fn derive_blockers(snapshot: &StabilizationSnapshot) -> Vec<Stabiliza
 
     let Some(pull_request) = &snapshot.pull_request else {
         if snapshot.run.as_ref().is_some_and(|run| {
+            run.implementation_source == super::AutoImplementationSource::ExistingPullRequest
+        }) {
+            blockers.push(StabilizationBlocker::Escalate);
+            return blockers;
+        }
+        if snapshot.run.as_ref().is_some_and(|run| {
             matches!(
                 run.status,
                 super::AutoRunStatus::Queued
                     | super::AutoRunStatus::Running
                     | super::AutoRunStatus::Paused
-            )
+            ) && run.implementation_source != super::AutoImplementationSource::ExistingPullRequest
         }) {
             blockers.push(StabilizationBlocker::NeedsImplementation);
         } else {
@@ -66,9 +72,19 @@ pub(crate) fn derive_blockers(snapshot: &StabilizationSnapshot) -> Vec<Stabiliza
         blockers.push(StabilizationBlocker::MergeBlocked);
     } else if matches!(pull_request.mergeability, MergeabilityFacts::Unknown) {
         blockers.push(StabilizationBlocker::Escalate);
+    } else if matches!(pull_request.mergeability, MergeabilityFacts::Behind)
+        && snapshot.goal.auto_merge
+        && !snapshot.repository.merge_queue_required
+    {
+        blockers.push(StabilizationBlocker::BranchBehind);
     }
-    if !pull_request.review.unresolved_threads.is_empty() {
+    if pull_request.review.feedback_required && !pull_request.review.unresolved_threads.is_empty() {
         blockers.push(StabilizationBlocker::ReviewFeedbackFound);
+    }
+    if pull_request.review.resolved_comments_required
+        && pull_request.review.review_comment_count == 0
+    {
+        blockers.push(StabilizationBlocker::ReviewFeedbackMissing);
     }
 
     let required_ci_blocker = required_ci_blocker(&pull_request.ci.required);
@@ -84,6 +100,12 @@ pub(crate) fn derive_blockers(snapshot: &StabilizationSnapshot) -> Vec<Stabiliza
             PrCheckState::Pending => blockers.push(StabilizationBlocker::CiPending),
             PrCheckState::Success | PrCheckState::Unknown => {}
         }
+    }
+
+    if pull_request.review.approval_required
+        && !pull_request.review.approval_requirement_satisfied()
+    {
+        blockers.push(StabilizationBlocker::ReviewApprovalMissing);
     }
 
     match &snapshot.policy {
@@ -176,6 +198,7 @@ pub(crate) fn conservative_cached_state(
             remote_project: None,
             policy_refreshed_unix_ms: None,
             policy_error: None,
+            merge_queue_required: false,
         },
         worktree: WorktreeFacts {
             path: session.path.clone(),
@@ -234,16 +257,19 @@ fn blocker_priority(blocker: &StabilizationBlocker) -> u8 {
         StabilizationBlocker::DraftPullRequest => 6,
         StabilizationBlocker::WrongBase => 7,
         StabilizationBlocker::HeadDiverged => 8,
-        StabilizationBlocker::MergeBlocked => 9,
-        StabilizationBlocker::ReviewFeedbackFound => 10,
-        StabilizationBlocker::CiFailed | StabilizationBlocker::CiMissingRequiredChecks => 11,
+        StabilizationBlocker::ReviewFeedbackFound => 9,
+        StabilizationBlocker::CiFailed | StabilizationBlocker::CiMissingRequiredChecks => 10,
+        StabilizationBlocker::MergeBlocked => 11,
         StabilizationBlocker::CiPending => 12,
-        StabilizationBlocker::ReviewApprovalMissing => 13,
+        StabilizationBlocker::ReviewFeedbackMissing
+        | StabilizationBlocker::ReviewApprovalMissing => 13,
         StabilizationBlocker::PolicyBlocked => 14,
         StabilizationBlocker::PolicyUnknown => 15,
-        StabilizationBlocker::ReadyToAutoMerge | StabilizationBlocker::ReadyForManualMerge => 16,
-        StabilizationBlocker::Merged => 17,
-        StabilizationBlocker::Escalate => 18,
+        StabilizationBlocker::IntegrationBacklogged => 16,
+        StabilizationBlocker::BranchBehind => 17,
+        StabilizationBlocker::ReadyToAutoMerge | StabilizationBlocker::ReadyForManualMerge => 18,
+        StabilizationBlocker::Merged => 19,
+        StabilizationBlocker::Escalate => 20,
     }
 }
 
@@ -253,11 +279,14 @@ fn work_kind_for_blocker(blocker: &StabilizationBlocker) -> StabilizationWorkKin
         StabilizationBlocker::NeedsPullRequest => StabilizationWorkKind::PushInitialAndOpenPr,
         StabilizationBlocker::PendingPush => StabilizationWorkKind::PushPendingRepair,
         StabilizationBlocker::ReviewFeedbackFound => StabilizationWorkKind::FixReview,
+        StabilizationBlocker::ReviewFeedbackMissing => StabilizationWorkKind::WaitForReview,
         StabilizationBlocker::CiFailed | StabilizationBlocker::CiMissingRequiredChecks => {
             StabilizationWorkKind::FixCi
         }
         StabilizationBlocker::CiPending => StabilizationWorkKind::WaitForCi,
         StabilizationBlocker::ReviewApprovalMissing => StabilizationWorkKind::WaitForReview,
+        StabilizationBlocker::IntegrationBacklogged => StabilizationWorkKind::WaitForIntegration,
+        StabilizationBlocker::BranchBehind => StabilizationWorkKind::UpdateBranch,
         StabilizationBlocker::ReadyForManualMerge => StabilizationWorkKind::MarkReadyForManualMerge,
         StabilizationBlocker::ReadyToAutoMerge => StabilizationWorkKind::Merge,
         StabilizationBlocker::Merged => StabilizationWorkKind::Done,
@@ -324,11 +353,20 @@ fn reason_for_blocker(snapshot: &StabilizationSnapshot, blocker: &StabilizationB
             .as_ref()
             .and_then(|pr| match &pr.mergeability {
                 MergeabilityFacts::Blocked { reason } => Some(reason.clone()),
-                MergeabilityFacts::Unknown | MergeabilityFacts::Clean => None,
+                MergeabilityFacts::Unknown
+                | MergeabilityFacts::Clean
+                | MergeabilityFacts::Behind => None,
             })
             .unwrap_or_else(|| "pull request mergeability is blocked".to_string()),
+        StabilizationBlocker::BranchBehind => {
+            "the reserved pull request must be updated with the latest base before integration"
+                .to_string()
+        }
         StabilizationBlocker::ReviewFeedbackFound => {
             "actionable review feedback is present".to_string()
+        }
+        StabilizationBlocker::ReviewFeedbackMissing => {
+            "at least one review comment is required before review is resolved".to_string()
         }
         StabilizationBlocker::ReviewApprovalMissing => snapshot.pull_request.as_ref().map_or_else(
             || "review approval is required but not satisfied".to_string(),
@@ -365,6 +403,9 @@ fn reason_for_blocker(snapshot: &StabilizationSnapshot, blocker: &StabilizationB
         StabilizationBlocker::PolicyBlocked => "repository policy blocks readiness".to_string(),
         StabilizationBlocker::PolicyUnknown => {
             "repository policy is unknown, so merge authorization is blocked".to_string()
+        }
+        StabilizationBlocker::IntegrationBacklogged => {
+            "pull request is ready and waiting for the repository integration lane".to_string()
         }
         StabilizationBlocker::ReadyForManualMerge => {
             "all known gates pass; auto-merge is disabled".to_string()
@@ -485,6 +526,7 @@ mod tests {
         snapshot.run = Some(AutoRunRef {
             id: "run".to_string(),
             status: super::super::AutoRunStatus::Running,
+            implementation_source: super::super::AutoImplementationSource::Prompt,
             pr_number: None,
             pr_url: None,
             current_head_sha: None,
@@ -494,6 +536,24 @@ mod tests {
 
         assert_eq!(work.blocker, StabilizationBlocker::NeedsImplementation);
         assert_eq!(work.kind, StabilizationWorkKind::RunImplementation);
+    }
+
+    #[test]
+    fn adopted_run_without_pr_does_not_restart_implementation() {
+        let mut snapshot = snapshot(None);
+        snapshot.run = Some(AutoRunRef {
+            id: "run".to_string(),
+            status: super::super::AutoRunStatus::Running,
+            implementation_source: super::super::AutoImplementationSource::ExistingPullRequest,
+            pr_number: Some(42),
+            pr_url: Some("https://example.com/pr/42".to_string()),
+            current_head_sha: Some("abc123".to_string()),
+        });
+
+        let work = plan(&snapshot);
+
+        assert_eq!(work.blocker, StabilizationBlocker::Escalate);
+        assert_eq!(work.kind, StabilizationWorkKind::Escalate);
     }
 
     #[test]
@@ -592,24 +652,52 @@ mod tests {
     }
 
     #[test]
-    fn merge_blocked_wins_over_review_feedback() {
+    fn review_feedback_remains_actionable_when_provider_reports_blocked() {
         let mut pr = clean_pr();
         pr.mergeability = MergeabilityFacts::Blocked {
             reason: "conflict".to_string(),
         };
+        pr.review.feedback_required = true;
         pr.review.unresolved_threads.push(review_thread("thread-1"));
         let snapshot = snapshot(Some(pr));
 
         let work = plan(&snapshot);
 
-        assert_eq!(work.blocker, StabilizationBlocker::MergeBlocked);
-        assert_eq!(work.kind, StabilizationWorkKind::Escalate);
-        assert!(work.reason.contains("conflict"));
+        assert_eq!(work.blocker, StabilizationBlocker::ReviewFeedbackFound);
+        assert_eq!(work.kind, StabilizationWorkKind::FixReview);
+    }
+
+    #[test]
+    fn behind_with_native_queue_is_ready_for_guarded_submission() {
+        let mut pr = clean_pr();
+        pr.mergeability = MergeabilityFacts::Behind;
+        let mut snapshot = snapshot(Some(pr));
+        snapshot.goal.auto_merge = true;
+        snapshot.repository.merge_queue_required = true;
+
+        let work = plan(&snapshot);
+
+        assert_eq!(work.blocker, StabilizationBlocker::ReadyToAutoMerge);
+        assert_eq!(work.kind, StabilizationWorkKind::Merge);
+    }
+
+    #[test]
+    fn behind_without_native_queue_plans_one_serialized_update() {
+        let mut pr = clean_pr();
+        pr.mergeability = MergeabilityFacts::Behind;
+        let mut snapshot = snapshot(Some(pr));
+        snapshot.goal.auto_merge = true;
+
+        let work = plan(&snapshot);
+
+        assert_eq!(work.blocker, StabilizationBlocker::BranchBehind);
+        assert_eq!(work.kind, StabilizationWorkKind::UpdateBranch);
     }
 
     #[test]
     fn review_feedback_plans_review_fix_and_guards_threads() {
         let mut pr = clean_pr();
+        pr.review.feedback_required = true;
         pr.review.unresolved_threads.push(review_thread("thread-1"));
         let snapshot = snapshot(Some(pr));
 
@@ -621,8 +709,43 @@ mod tests {
     }
 
     #[test]
+    fn resolved_review_requirement_waits_for_first_comment() {
+        let mut pr = clean_pr();
+        pr.review.feedback_required = true;
+        pr.review.resolved_comments_required = true;
+
+        let work = plan(&snapshot(Some(pr)));
+
+        assert_eq!(work.blocker, StabilizationBlocker::ReviewFeedbackMissing);
+        assert_eq!(work.kind, StabilizationWorkKind::WaitForReview);
+    }
+
+    #[test]
+    fn resolved_review_requirement_passes_after_a_resolved_comment() {
+        let mut pr = clean_pr();
+        pr.review.feedback_required = true;
+        pr.review.resolved_comments_required = true;
+        pr.review.review_comment_count = 1;
+
+        let work = plan(&snapshot(Some(pr)));
+
+        assert_eq!(work.blocker, StabilizationBlocker::ReadyForManualMerge);
+    }
+
+    #[test]
+    fn no_review_requirement_ignores_review_feedback() {
+        let mut pr = clean_pr();
+        pr.review.unresolved_threads.push(review_thread("thread-1"));
+
+        let work = plan(&snapshot(Some(pr)));
+
+        assert_eq!(work.blocker, StabilizationBlocker::ReadyForManualMerge);
+    }
+
+    #[test]
     fn review_body_without_unresolved_threads_does_not_block_readiness() {
         let mut pr = clean_pr();
+        pr.review.feedback_required = true;
         pr.review
             .actionable_reviews
             .push(ActionableReviewItem::ReviewBody {
@@ -776,18 +899,19 @@ mod tests {
     }
 
     #[test]
-    fn review_approval_state_without_unresolved_threads_does_not_block() {
+    fn review_approval_missing_plans_wait_after_ci() {
         let mut pr = clean_pr();
         pr.review.approval_required = true;
         pr.review.decision = "REVIEW_REQUIRED".to_string();
 
         let work = plan(&snapshot(Some(pr)));
 
-        assert_eq!(work.blocker, StabilizationBlocker::ReadyForManualMerge);
+        assert_eq!(work.blocker, StabilizationBlocker::ReviewApprovalMissing);
+        assert_eq!(work.kind, StabilizationWorkKind::WaitForReview);
     }
 
     #[test]
-    fn numeric_approval_metadata_is_enforced_by_policy_not_the_review_gate() {
+    fn numeric_approval_threshold_blocks_planning_despite_approved_aggregate() {
         let mut pr = clean_pr();
         pr.review.approval_required = true;
         pr.review.required_approvals = 2;
@@ -795,7 +919,12 @@ mod tests {
 
         let work = plan(&snapshot(Some(pr)));
 
-        assert_eq!(work.blocker, StabilizationBlocker::ReadyForManualMerge);
+        assert_eq!(work.blocker, StabilizationBlocker::ReviewApprovalMissing);
+        assert_eq!(work.kind, StabilizationWorkKind::WaitForReview);
+        assert_eq!(
+            work.reason,
+            "1 of 2 required review approvals are satisfied"
+        );
     }
 
     #[test]
@@ -1066,6 +1195,7 @@ mod tests {
                 remote_project: Some("owner/repo".to_string()),
                 policy_refreshed_unix_ms: Some(1),
                 policy_error: None,
+                merge_queue_required: false,
             },
             worktree: WorktreeFacts {
                 path: PathBuf::from("/repo/feature"),
@@ -1105,6 +1235,9 @@ mod tests {
             },
             review: ReviewFacts {
                 decision: "APPROVED".to_string(),
+                feedback_required: false,
+                resolved_comments_required: false,
+                review_comment_count: 0,
                 approval_required: false,
                 approval_count: 0,
                 required_approvals: 0,
@@ -1183,6 +1316,7 @@ mod tests {
     fn cached_test_config() -> crate::config::Config {
         let mut config = crate::test_support::test_config();
         config.default_base = Some("main".to_string());
+        config.auto.review_requirement = crate::config::ReviewRequirement::None;
         config
     }
 }

@@ -79,6 +79,7 @@ pub struct DaemonHealth {
     pub protocol_version: Option<u32>,
     pub instance_id: Option<String>,
     pub pid: Option<u32>,
+    pub executable_identity: Option<String>,
     pub active: usize,
     pub notifications: bool,
 }
@@ -90,6 +91,7 @@ impl DaemonHealth {
             protocol_version: None,
             instance_id: None,
             pid: None,
+            executable_identity: None,
             active: 0,
             notifications: false,
         }
@@ -113,7 +115,11 @@ fn probe_health_at(path: &WorkerSocketPath) -> Result<DaemonHealth, String> {
         }
         Err(error) => return Err(format!("connect to Prism worker: {error}")),
     };
-    parse_health_response(&request_on_stream(stream, "health")?)
+    let response = request_on_stream(stream, "health")?;
+    if response.is_empty() {
+        return Ok(DaemonHealth::stopped());
+    }
+    parse_health_response(&response)
 }
 
 fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
@@ -135,6 +141,7 @@ fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
     let mut pid: Option<u32> = None;
     let mut state = None;
     let mut active = None;
+    let mut executable_identity = None;
     let mut notifications = false;
     for field in fields {
         if let Some(value) = field.strip_prefix("pid=") {
@@ -147,6 +154,8 @@ fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
             });
         } else if let Some(value) = field.strip_prefix("active=") {
             active = value.parse().ok();
+        } else if let Some(value) = field.strip_prefix("exe=") {
+            executable_identity = Some(value.to_string());
         } else if let Some(value) = field.strip_prefix("notifications=") {
             notifications = value == "1";
         }
@@ -156,6 +165,7 @@ fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
         protocol_version: Some(version),
         instance_id: Some(instance_id.to_string()),
         pid: Some(pid.ok_or_else(|| format!("missing Prism daemon PID: {response}"))?),
+        executable_identity,
         active: active.ok_or_else(|| format!("missing Prism daemon active count: {response}"))?,
         notifications,
     })
@@ -163,6 +173,7 @@ fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
 
 pub fn ensure_running() -> Result<(), String> {
     let socket = validated_socket_path()?;
+    let executable_identity = current_executable_identity()?;
     if std::env::var_os("PRISM_WAIT_FOR_WORKER_DRAIN").is_some() {
         loop {
             match probe_health_at(&socket)? {
@@ -170,37 +181,63 @@ pub fn ensure_running() -> Result<(), String> {
                     state: DaemonState::Stopped,
                     ..
                 } => break,
-                DaemonHealth {
+                health @ DaemonHealth {
                     state: DaemonState::Running,
                     notifications: true,
                     ..
-                } => return Ok(()),
+                } if daemon_uses_executable(&health, &executable_identity) => return Ok(()),
                 _ => thread::sleep(Duration::from_millis(250)),
             }
         }
     }
-    if wait_for_existing_daemon(DAEMON_TRANSITION_TIMEOUT, || probe_health_at(&socket))? {
-        let health = probe_health_at(&socket)?;
-        if health.notifications {
-            return Ok(());
+    let mut health = probe_health_at(&socket)?;
+    loop {
+        match health {
+            current @ DaemonHealth {
+                state: DaemonState::Running,
+                ..
+            } if daemon_uses_executable(&current, &executable_identity)
+                && current.notifications =>
+            {
+                return Ok(());
+            }
+            DaemonHealth {
+                state: DaemonState::Running,
+                ..
+            } => {
+                let response = request_at(&socket, "replace")?;
+                if response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
+                    return wait_for_replacement(
+                        &socket,
+                        &executable_identity,
+                        DAEMON_TRANSITION_TIMEOUT,
+                    );
+                }
+                let shutdown_health = parse_health_response(&request_at(&socket, "shutdown")?)?;
+                if shutdown_health.active > 0 {
+                    spawn_worker_replacement()?;
+                    return Ok(());
+                }
+                wait_for_socket_to_close(&socket, DAEMON_TRANSITION_TIMEOUT)?;
+                break;
+            }
+            DaemonHealth {
+                state: DaemonState::Draining,
+                ..
+            } => {
+                health = wait_for_drain_transition(DAEMON_TRANSITION_TIMEOUT, || {
+                    probe_health_at(&socket)
+                })?;
+            }
+            DaemonHealth {
+                state: DaemonState::Stopped,
+                ..
+            } => break,
         }
-        let shutdown_health = parse_health_response(&request_at(&socket, "shutdown")?)?;
-        if shutdown_health.active > 0 {
-            spawn_worker_replacement()?;
-            return Ok(());
-        }
-        wait_for_socket_to_close(&socket, DAEMON_TRANSITION_TIMEOUT)?;
     }
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve Prism worker executable: {error}"))?;
-    let mut command = Command::new(executable);
-    command.args(["worker", "serve"]);
-    crate::process::spawn_detached_named(
-        &mut command,
-        DetachedProcessPolicy::WorkerDaemon,
-        crate::process::ProcessDescriptor::new("prism.worker.serve"),
-    )
-    .map_err(|error| format!("start Prism worker daemon: {error}"))?;
+    start_worker(installed_executable_path(&executable))?;
 
     let deadline = Instant::now() + DAEMON_TRANSITION_TIMEOUT;
     let mut last_error = "worker did not become ready".to_string();
@@ -220,6 +257,22 @@ pub fn ensure_running() -> Result<(), String> {
     Err(last_error)
 }
 
+fn start_worker(executable: PathBuf) -> Result<(), String> {
+    let mut command = Command::new(executable);
+    command.args(["worker", "serve"]);
+    crate::process::spawn_detached_named(
+        &mut command,
+        DetachedProcessPolicy::WorkerDaemon,
+        crate::process::ProcessDescriptor::new("prism.worker.serve"),
+    )
+    .map_err(|error| format!("start Prism worker daemon: {error}"))?;
+    Ok(())
+}
+
+fn daemon_uses_executable(health: &DaemonHealth, executable_identity: &str) -> bool {
+    health.executable_identity.as_deref() == Some(executable_identity)
+}
+
 fn spawn_worker_replacement() -> Result<(), String> {
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve replacement Prism worker executable: {error}"))?;
@@ -236,36 +289,44 @@ fn spawn_worker_replacement() -> Result<(), String> {
     .map_err(|error| format!("schedule replacement Prism worker: {error}"))
 }
 
-fn wait_for_existing_daemon(
+fn wait_for_drain_transition(
     timeout: Duration,
     mut probe: impl FnMut() -> Result<DaemonHealth, String>,
-) -> Result<bool, String> {
+) -> Result<DaemonHealth, String> {
     let deadline = Instant::now() + timeout;
     loop {
-        match probe() {
-            Ok(DaemonHealth {
-                state: DaemonState::Running,
-                ..
-            }) => return Ok(true),
-            Ok(DaemonHealth {
-                state: DaemonState::Draining,
-                active,
-                ..
-            }) => {
-                if Instant::now() >= deadline {
-                    return Err(format!(
-                        "timed out waiting for Prism worker daemon to finish draining ({active} active)"
-                    ));
-                }
-                thread::sleep(Duration::from_millis(25));
-            }
-            Ok(DaemonHealth {
-                state: DaemonState::Stopped,
-                ..
-            }) => return Ok(false),
-            Err(error) => return Err(error),
+        let health = probe()?;
+        if health.state != DaemonState::Draining {
+            return Ok(health);
         }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for Prism worker daemon to finish draining ({} active)",
+                health.active
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
     }
+}
+
+fn wait_for_replacement(
+    socket: &WorkerSocketPath,
+    executable_identity: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = Instant::now() + timeout;
+    let mut active = 0;
+    while Instant::now() < deadline {
+        match probe_health_at(socket) {
+            Ok(health) if daemon_uses_executable(&health, executable_identity) => return Ok(()),
+            Ok(health) => active = health.active,
+            Err(_) => {}
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    Err(format!(
+        "Prism worker is draining before replacement ({active} active)"
+    ))
 }
 
 pub fn wake() -> Result<(), String> {
@@ -454,7 +515,7 @@ pub fn serve() -> Result<(), String> {
     fs::create_dir_all(&runtime).map_err(|error| format!("create worker runtime dir: {error}"))?;
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("secure worker runtime dir: {error}"))?;
-    let _lock = acquire_lock(&runtime.join("worker.lock"))?;
+    let worker_lock = acquire_lock(&runtime.join("worker.lock"))?;
     if socket.as_path().exists() {
         match UnixStream::connect(socket.as_path()) {
             Ok(_) => {
@@ -478,6 +539,10 @@ pub fn serve() -> Result<(), String> {
     }
 
     let instance_id = execution::new_instance_id("daemon");
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("resolve Prism worker executable: {error}"))?;
+    let executable = installed_executable_path(&executable);
+    let started_executable_identity = executable_identity(&executable)?;
     classify_abandoned(&instance_id)?;
     log_daemon_lifecycle("daemon_start", &instance_id);
     let listener = UnixListener::bind(socket.as_path()).map_err(|error| {
@@ -503,19 +568,22 @@ pub fn serve() -> Result<(), String> {
         .map_err(|error| format!("start notification observer: {error}"))?;
     let mut next_poll = Instant::now();
     let mut draining = false;
+    let mut restart_after_drain = false;
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                if respond(
+                let control = respond(
                     &mut stream,
                     &instance_id,
+                    &started_executable_identity,
                     &active,
                     &notification_subscriber,
                     draining,
-                ) {
-                    draining = true;
+                );
+                if matches!(control, WorkerControl::Drain | WorkerControl::Replace) {
                     notification_stop.store(true, Ordering::Release);
                 }
+                control.apply(&mut next_poll, &mut draining, &mut restart_after_drain);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(format!("accept Prism worker connection: {error}")),
@@ -529,6 +597,13 @@ pub fn serve() -> Result<(), String> {
             break;
         }
         if !draining && Instant::now() >= next_poll {
+            if executable_identity(&executable)
+                .is_ok_and(|identity| identity != started_executable_identity)
+            {
+                draining = true;
+                restart_after_drain = true;
+                continue;
+            }
             schedule_queued(&instance_id, Arc::clone(&active));
             next_poll = Instant::now() + POLL_INTERVAL;
         }
@@ -536,16 +611,45 @@ pub fn serve() -> Result<(), String> {
     }
     notification_stop.store(true, Ordering::Release);
     log_daemon_lifecycle("daemon_stop", &instance_id);
-    fs::remove_file(socket.as_path()).map_err(|error| format!("remove worker socket: {error}"))
+    fs::remove_file(socket.as_path()).map_err(|error| format!("remove worker socket: {error}"))?;
+    drop(listener);
+    drop(worker_lock);
+    if restart_after_drain {
+        start_worker(executable)?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerControl {
+    Continue,
+    Wake,
+    Drain,
+    Replace,
+}
+
+impl WorkerControl {
+    fn apply(self, next_poll: &mut Instant, draining: &mut bool, restart_after_drain: &mut bool) {
+        match self {
+            Self::Continue => {}
+            Self::Wake => *next_poll = Instant::now(),
+            Self::Drain => *draining = true,
+            Self::Replace => {
+                *draining = true;
+                *restart_after_drain = true;
+            }
+        }
+    }
 }
 
 fn respond(
     stream: &mut UnixStream,
     instance_id: &str,
+    executable_identity: &str,
     active: &Arc<Mutex<BTreeSet<PathBuf>>>,
     notification_subscriber: &Arc<Mutex<Vec<UnixStream>>>,
     draining: bool,
-) -> bool {
+) -> WorkerControl {
     let mut request = [0_u8; 64];
     let size = stream.read(&mut request).unwrap_or(0);
     let command = String::from_utf8_lossy(&request[..size]);
@@ -556,12 +660,16 @@ fn respond(
     let mut new_notification_subscriber = None;
     let response = match command.trim() {
         "health" | "wake" => format!(
-            "ok {PROTOCOL_VERSION} {instance_id} pid={} state={} active={active} notifications=1\n",
+            "ok {PROTOCOL_VERSION} {instance_id} pid={} state={} active={active} exe={executable_identity} notifications=1\n",
             std::process::id(),
             if draining { "draining" } else { "running" }
         ),
         "shutdown" => format!(
-            "ok {PROTOCOL_VERSION} {instance_id} pid={} state=draining active={active} notifications=1\n",
+            "ok {PROTOCOL_VERSION} {instance_id} pid={} state=draining active={active} exe={executable_identity} notifications=1\n",
+            std::process::id()
+        ),
+        "replace" => format!(
+            "ok {PROTOCOL_VERSION} {instance_id} pid={} state=draining active={active} exe={executable_identity} notifications=1\n",
             std::process::id()
         ),
         "subscribe-notifications" if !draining => match stream.try_clone() {
@@ -581,7 +689,44 @@ fn respond(
     {
         current.push(subscriber);
     }
-    command.trim() == "shutdown"
+    match command.trim() {
+        "wake" if !draining => WorkerControl::Wake,
+        "shutdown" => WorkerControl::Drain,
+        "replace" => WorkerControl::Replace,
+        _ => WorkerControl::Continue,
+    }
+}
+
+fn current_executable_identity() -> Result<String, String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("resolve Prism executable identity: {error}"))?;
+    executable_identity(&executable)
+}
+
+fn executable_identity(executable: &Path) -> Result<String, String> {
+    let executable = installed_executable_path(executable);
+    let metadata = fs::metadata(&executable).map_err(|error| {
+        format!(
+            "inspect Prism executable identity {}: {error}",
+            executable.display()
+        )
+    })?;
+    Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
+}
+
+fn installed_executable_path(executable: &Path) -> PathBuf {
+    if executable.exists() {
+        return executable.to_path_buf();
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(path) = executable
+        .as_os_str()
+        .as_bytes()
+        .strip_suffix(b" (deleted)")
+    {
+        return PathBuf::from(std::ffi::OsStr::from_bytes(path));
+    }
+    executable.to_path_buf()
 }
 
 fn notification_loop(stop: Arc<AtomicBool>, subscriber: Arc<Mutex<Vec<UnixStream>>>) {
@@ -1392,13 +1537,17 @@ mod tests {
         let subscriber = Arc::new(Mutex::new(Vec::new()));
         client.write_all(b"subscribe-notifications\n").unwrap();
 
-        assert!(!respond(
-            &mut server,
-            "daemon-test",
-            &active,
-            &subscriber,
-            false,
-        ));
+        assert_eq!(
+            respond(
+                &mut server,
+                "daemon-test",
+                "exe",
+                &active,
+                &subscriber,
+                false,
+            ),
+            WorkerControl::Continue
+        );
         let mut acknowledgement = [0_u8; 64];
         let size = client.read(&mut acknowledgement).unwrap();
         assert_eq!(
@@ -1636,29 +1785,114 @@ mod tests {
     }
 
     #[test]
-    fn waiting_for_a_draining_daemon_times_out() {
-        assert_eq!(
-            wait_for_existing_daemon(Duration::ZERO, || Ok(DaemonHealth {
+    fn same_version_worker_from_replaced_executable_is_not_reused() {
+        let current =
+            parse_health_response("ok 1 daemon pid=42 state=running active=0 exe=8:100").unwrap();
+        let replaced =
+            parse_health_response("ok 1 daemon pid=42 state=running active=0 exe=8:99").unwrap();
+        let legacy = parse_health_response("ok 1 daemon pid=42 state=running active=0").unwrap();
+
+        assert!(daemon_uses_executable(&current, "8:100"));
+        assert!(!daemon_uses_executable(&replaced, "8:100"));
+        assert!(!daemon_uses_executable(&legacy, "8:100"));
+    }
+
+    #[test]
+    fn draining_daemon_is_waited_through_socket_removal() {
+        let mut probes = [
+            DaemonHealth {
                 state: DaemonState::Draining,
                 protocol_version: Some(PROTOCOL_VERSION),
-                instance_id: Some("test".to_string()),
-                pid: Some(std::process::id()),
-                active: 2,
+                instance_id: Some("old".to_string()),
+                pid: Some(42),
+                executable_identity: Some("8:99".to_string()),
+                active: 0,
                 notifications: false,
-            })),
-            Err(
-                "timed out waiting for Prism worker daemon to finish draining (2 active)"
-                    .to_string()
-            )
+            },
+            DaemonHealth::stopped(),
+        ]
+        .into_iter();
+
+        assert_eq!(
+            wait_for_drain_transition(Duration::from_secs(1), || Ok(probes.next().unwrap()))
+                .unwrap(),
+            DaemonHealth::stopped()
         );
     }
 
     #[test]
-    fn daemon_probe_errors_are_not_treated_as_a_stopped_daemon() {
+    fn draining_daemon_is_waited_through_concurrent_replacement() {
+        let replacement = DaemonHealth {
+            state: DaemonState::Running,
+            protocol_version: Some(PROTOCOL_VERSION),
+            instance_id: Some("new".to_string()),
+            pid: Some(43),
+            executable_identity: Some("8:100".to_string()),
+            active: 0,
+            notifications: true,
+        };
+        let mut probes = [
+            DaemonHealth {
+                state: DaemonState::Draining,
+                protocol_version: Some(PROTOCOL_VERSION),
+                instance_id: Some("old".to_string()),
+                pid: Some(42),
+                executable_identity: Some("8:99".to_string()),
+                active: 1,
+                notifications: false,
+            },
+            replacement.clone(),
+        ]
+        .into_iter();
+
         assert_eq!(
-            wait_for_existing_daemon(Duration::ZERO, || Err("permission denied".to_string())),
-            Err("permission denied".to_string())
+            wait_for_drain_transition(Duration::from_secs(1), || Ok(probes.next().unwrap()))
+                .unwrap(),
+            replacement
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deleted_executable_path_uses_installed_replacement_identity() {
+        let temp = crate::compact_runtime::CompactTempDir::new("worker-deleted-executable");
+        let installed = temp.path.join("prism");
+        fs::write(&installed, "replacement").unwrap();
+        let deleted = PathBuf::from(format!("{} (deleted)", installed.display()));
+
+        assert_eq!(
+            executable_identity(&deleted).unwrap(),
+            executable_identity(&installed).unwrap()
+        );
+    }
+
+    #[test]
+    fn wake_requests_force_running_scheduler_poll_only() {
+        let active = Arc::new(Mutex::new(BTreeSet::new()));
+        let notification_subscriber = Arc::new(Mutex::new(Vec::new()));
+        for (draining, expected) in [
+            (false, WorkerControl::Wake),
+            (true, WorkerControl::Continue),
+        ] {
+            let (mut server, mut client) = UnixStream::pair().unwrap();
+            client.write_all(b"wake\n").unwrap();
+
+            let control = respond(
+                &mut server,
+                "daemon",
+                "exe",
+                &active,
+                &notification_subscriber,
+                draining,
+            );
+            assert_eq!(control, expected);
+            let future = Instant::now() + POLL_INTERVAL;
+            let mut next_poll = future;
+            let mut applied_draining = draining;
+            let mut restart = false;
+            control.apply(&mut next_poll, &mut applied_draining, &mut restart);
+            assert_eq!(next_poll < future, !draining);
+        }
     }
 
     fn runtime_with_socket_path_len(byte_len: usize) -> PathBuf {

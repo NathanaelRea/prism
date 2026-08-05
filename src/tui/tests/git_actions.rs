@@ -9,8 +9,8 @@ use crate::view::{ChoiceList, RepoMainView};
 
 use super::super::{GitAction, PanelFocus, PrPollResult, Tui, selectable_choice_key};
 use super::support::{
-    test_change_request_identity, test_change_request_identity_for, test_config, test_pr_summary,
-    test_session, unique_temp_dir,
+    test_auto_run, test_change_request_identity, test_change_request_identity_for, test_config,
+    test_pr_summary, test_session, unique_temp_dir,
 };
 
 #[test]
@@ -27,7 +27,7 @@ fn git_actions_allow_push_before_remote_capabilities_or_a_pr_are_known() {
 
     assert!(tui.git_action_enabled(GitAction::Push));
     assert!(!tui.git_action_enabled(GitAction::OpenPr));
-    assert!(!tui.git_action_enabled(GitAction::Merge));
+    assert!(!tui.git_action_enabled(GitAction::MergeIntent));
 
     tui.repos[0].remote_capabilities = Some(crate::remote::Capabilities::for_provider(
         crate::remote::ProviderKind::GitHub,
@@ -36,7 +36,7 @@ fn git_actions_allow_push_before_remote_capabilities_or_a_pr_are_known() {
 
     tui.sessions[0].pr = PrCache::observed(test_pr_summary(false), None);
     assert!(tui.git_action_enabled(GitAction::OpenPr));
-    assert!(tui.git_action_enabled(GitAction::Merge));
+    assert!(tui.git_action_enabled(GitAction::MergeIntent));
     assert!(!tui.git_action_enabled(GitAction::CiFix));
     tui.sessions[0].pr = PrCache::observed(
         test_pr_summary(false),
@@ -60,15 +60,31 @@ fn git_actions_allow_push_before_remote_capabilities_or_a_pr_are_known() {
 
     tui.sessions[0].pr = PrCache::observed(test_pr_summary(true), None);
     assert!(tui.git_action_enabled(GitAction::OpenPr));
-    assert!(!tui.git_action_enabled(GitAction::Merge));
+    assert!(!tui.git_action_enabled(GitAction::MergeIntent));
     assert!(!tui.git_action_enabled(GitAction::ReviewFix));
 
     let mut closed = test_pr_summary(false);
     closed.state = "CLOSED".to_string();
     tui.sessions[0].pr = PrCache::observed(closed, None);
     assert!(tui.git_action_enabled(GitAction::OpenPr));
-    assert!(!tui.git_action_enabled(GitAction::Merge));
+    assert!(!tui.git_action_enabled(GitAction::MergeIntent));
     assert!(!tui.git_action_enabled(GitAction::CiFix));
+}
+
+#[test]
+fn merge_intent_is_available_for_active_auto_flow_before_pr_creation() {
+    let repo = Repository {
+        root: PathBuf::from("/tmp/repo"),
+    };
+    let mut tui = Tui::new_single(
+        repo,
+        test_config(),
+        vec![test_session(0, "/tmp/repo", "feature")],
+    );
+    tui.focused_panel = PanelFocus::Worktrees;
+    tui.remember_auto_run(test_auto_run("auto", "/tmp/repo/feature", 1));
+
+    assert!(tui.git_action_enabled(GitAction::MergeIntent));
 }
 
 #[test]
@@ -280,7 +296,7 @@ fn review_resolution_action_requires_main_panel_and_unresolved_threads() {
 }
 
 #[test]
-fn conditional_remote_operations_are_disabled_and_not_selectable() {
+fn merge_intent_does_not_require_immediate_provider_merge_support() {
     let repo = Repository {
         root: PathBuf::from("/tmp/repo"),
     };
@@ -296,20 +312,19 @@ fn conditional_remote_operations_are_disabled_and_not_selectable() {
     capabilities.guarded_merge = crate::remote::SupportLevel::Conditional;
     tui.repos[0].remote_capabilities = Some(capabilities);
 
-    let choice = tui.git_choice(GitAction::Merge, "M", "merge");
+    let choice = tui.git_choice(GitAction::MergeIntent, "M", "toggle merge queue");
     let choices = ChoiceList {
         title: "Git Actions".to_string(),
         choices: vec![choice.clone()],
     };
 
-    assert!(choice.disabled);
-    assert!(choice.label.contains("conditional support not established"));
-    assert_eq!(selectable_choice_key(&choices, "M"), None);
-    assert!(!tui.git_action_enabled(GitAction::Merge));
+    assert!(!choice.disabled);
+    assert_eq!(selectable_choice_key(&choices, "M"), Some("m".to_string()));
+    assert!(tui.git_action_enabled(GitAction::MergeIntent));
 }
 
 #[test]
-fn gitlab_rebase_merge_choice_uses_adapter_capability_reason() {
+fn merge_intent_can_be_armed_before_provider_capability_is_established() {
     let repo = Repository {
         root: PathBuf::from("/tmp/repo"),
     };
@@ -327,12 +342,7 @@ fn gitlab_rebase_merge_choice_uses_adapter_capability_reason() {
         Some("GitLab adapter does not support rebase merges".to_string());
     tui.repos[0].remote_capabilities = Some(capabilities);
 
-    let choice = tui.git_choice(GitAction::Merge, "M", "merge");
+    let choice = tui.git_choice(GitAction::MergeIntent, "M", "toggle merge queue");
 
-    assert!(choice.disabled);
-    assert!(
-        choice
-            .label
-            .contains("GitLab adapter does not support rebase merges")
-    );
+    assert!(!choice.disabled);
 }

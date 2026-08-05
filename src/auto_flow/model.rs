@@ -138,6 +138,7 @@ pub enum AutoImplementationSource {
     Prompt,
     ExistingPlan,
     DraftPlan,
+    ExistingPullRequest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -170,6 +171,7 @@ pub enum AutoStepKey {
     FixCi,
     VerifyCiFix,
     CommitCiFix,
+    UpdateBranch,
     Merge,
     Cleanup,
     Custom(String),
@@ -234,6 +236,7 @@ impl AutoImplementationSource {
             Self::Prompt => "prompt",
             Self::ExistingPlan => "existing_plan",
             Self::DraftPlan => "draft_plan",
+            Self::ExistingPullRequest => "existing_pull_request",
         }
     }
 
@@ -242,6 +245,7 @@ impl AutoImplementationSource {
             "prompt" => Ok(Self::Prompt),
             "existing_plan" => Ok(Self::ExistingPlan),
             "draft_plan" => Ok(Self::DraftPlan),
+            "existing_pull_request" => Ok(Self::ExistingPullRequest),
             _ => Err(format!("unknown auto implementation source: {value}")),
         }
     }
@@ -293,6 +297,7 @@ impl AutoStepKey {
             Self::FixCi => "fix_ci",
             Self::VerifyCiFix => "verify_ci_fix",
             Self::CommitCiFix => "commit_ci_fix",
+            Self::UpdateBranch => "update_branch",
             Self::Merge => "merge",
             Self::Cleanup => "cleanup",
             Self::Custom(value) => value.as_str(),
@@ -319,6 +324,7 @@ impl AutoStepKey {
             "fix_ci" => Self::FixCi,
             "verify_ci_fix" => Self::VerifyCiFix,
             "commit_ci_fix" => Self::CommitCiFix,
+            "update_branch" => Self::UpdateBranch,
             "merge" => Self::Merge,
             "cleanup" => Self::Cleanup,
             other => Self::Custom(other.to_string()),
@@ -431,8 +437,12 @@ impl AutoLaunch {
         if implementation_source == AutoImplementationSource::ExistingPlan && plan_path.is_none() {
             return Err("existing-plan auto flow requires a plan path".to_string());
         }
-        if implementation_source == AutoImplementationSource::Prompt && plan_path.is_some() {
-            return Err("prompt auto flow cannot have a plan path".to_string());
+        if matches!(
+            implementation_source,
+            AutoImplementationSource::Prompt | AutoImplementationSource::ExistingPullRequest
+        ) && plan_path.is_some()
+        {
+            return Err("prompt and existing-PR auto flow cannot have a plan path".to_string());
         }
         if variant.trim().is_empty() {
             return Err("auto flow variant cannot be empty".to_string());

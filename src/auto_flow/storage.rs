@@ -251,6 +251,7 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
         params![AUTO_SCHEMA_VERSION],
     )
     .map_err(|error| format!("write auto schema version: {error}"))?;
+    crate::integration::migrate_schema(conn)?;
     Ok(())
 }
 
@@ -273,11 +274,50 @@ pub fn submit_auto_run(
     conn: &rusqlite::Connection,
     persisted: &mut PersistedAutoRun,
 ) -> Result<(), String> {
+    submit_auto_run_with_options(conn, persisted, false)
+}
+
+pub fn submit_auto_run_with_merge_intent(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+) -> Result<(), String> {
+    submit_auto_run_with_options(conn, persisted, true)
+}
+
+fn submit_auto_run_with_options(
+    conn: &rusqlite::Connection,
+    persisted: &mut PersistedAutoRun,
+    arm_merge_intent: bool,
+) -> Result<(), String> {
     let transaction = crate::flight_recorder::TransactionTrace::begin("auto_run.submit");
-    let tx = conn
-        .unchecked_transaction()
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| format!("begin managed Auto Flow submission: {error}"))?;
+    let active_run_id = tx
+        .query_row(
+            "select id from auto_run
+             where worktree_path = ?1
+               and id != ?2
+               and archived_unix_ms is null
+               and status in ('queued', 'running', 'paused')
+             order by updated_unix_ms desc
+             limit 1",
+            params![
+                persisted.run.worktree_path.display().to_string(),
+                persisted.run.id
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| format!("check active Auto Flow ownership: {error}"))?;
+    if let Some(active_run_id) = active_run_id {
+        return Err(format!(
+            "worktree already has active Auto Flow run {active_run_id}"
+        ));
+    }
     save_persisted_auto_run_with_conn(&tx, persisted)?;
+    if arm_merge_intent {
+        crate::integration::arm_merge_intent(&tx, &persisted.run.id)?;
+    }
     crate::execution::enqueue(
         &tx,
         &crate::execution::WorkflowIdentity::new(

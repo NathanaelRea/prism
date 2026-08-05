@@ -19,7 +19,7 @@ use super::{
 fn merge_is_authoritatively_pending(queue_state: &str) -> bool {
     matches!(
         queue_state.trim().to_ascii_lowercase().as_str(),
-        "queued" | "running" | "blocked"
+        "queued" | "running" | "blocked" | "awaiting_checks" | "locked" | "mergeable"
     )
 }
 
@@ -138,6 +138,7 @@ pub(crate) enum RemoteActionValue {
         cache: Box<PrCache>,
         resolved: usize,
     },
+    #[allow(dead_code)]
     MergeAuthorization {
         session: Box<Session>,
         authorization: Box<crate::auto_flow::stabilization_execute::MergeAuthorization>,

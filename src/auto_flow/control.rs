@@ -101,6 +101,7 @@ pub fn apply_auto_run_control(
             )
         }
         AutoRunControlIntent::AbortRun => {
+            crate::integration::withdraw_merge_intent_in_transaction(conn, run_id)?;
             abort_auto_run(conn, &mut persisted, &mut warnings)?;
             (
                 AutoRunControlEffect::AbortedRun,
@@ -228,22 +229,38 @@ pub fn fail_auto_run(
     persisted: &mut PersistedAutoRun,
     error: impl Into<String>,
 ) -> Result<(), String> {
+    let original = persisted.clone();
     persisted.run.pause_requested = false;
     persisted.run.status = AutoRunStatus::Failed;
     persisted.run.updated_unix_ms = unix_ms();
     let error = error.into();
-    append_auto_event(
-        conn,
-        &AutoEvent {
-            id: None,
-            run_id: persisted.run.id.clone(),
-            step_run_id: persisted.run.selected_step_run_id,
-            time_unix_ms: persisted.run.updated_unix_ms,
-            kind: "run_failed".to_string(),
-            data_json: format!("{{\"error\":{}}}", json_string(&error)),
-        },
-    )?;
-    save_run_with_conn(conn, &persisted.run)
+    let result = (|| {
+        let transaction = crate::flight_recorder::TransactionTrace::begin("auto_run.fail");
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| format!("begin Auto Flow failure transaction: {error}"))?;
+        append_auto_event(
+            &tx,
+            &AutoEvent {
+                id: None,
+                run_id: persisted.run.id.clone(),
+                step_run_id: persisted.run.selected_step_run_id,
+                time_unix_ms: persisted.run.updated_unix_ms,
+                kind: "run_failed".to_string(),
+                data_json: format!("{{\"error\":{}}}", json_string(&error)),
+            },
+        )?;
+        save_run_with_conn(&tx, &persisted.run)?;
+        crate::integration::release_failed_reservation_in_transaction(&tx, &persisted.run.id)?;
+        tx.commit()
+            .map_err(|error| format!("commit Auto Flow failure transaction: {error}"))?;
+        transaction.committed();
+        Ok(())
+    })();
+    if result.is_err() {
+        *persisted = original;
+    }
+    result
 }
 
 pub(super) fn retry_failed_auto_step(
@@ -412,6 +429,34 @@ pub fn reconcile_stale_auto_run(
             continue;
         }
         if step.step_key == AutoStepKey::Merge && step.status == AutoStepStatus::Waiting {
+            continue;
+        }
+        let integration_placement =
+            crate::integration::active_merge_intent(conn, &persisted.run.id)?
+                .map(|intent| intent.placement);
+        if step.step_key == AutoStepKey::Merge
+            && matches!(
+                integration_placement,
+                Some(
+                    crate::integration::IntegrationPlacement::Submitting
+                        | crate::integration::IntegrationPlacement::Submitted
+                )
+            )
+        {
+            step.status = AutoStepStatus::Waiting;
+            step.execution.process_id = None;
+            step.execution.process_identity = None;
+            step.summary = Some("reconciling interrupted provider merge submission".to_string());
+            save_step_with_conn(conn, step)?;
+            changed = true;
+            continue;
+        }
+        if step.step_key == AutoStepKey::UpdateBranch
+            && integration_placement == Some(crate::integration::IntegrationPlacement::Updating)
+        {
+            reset_auto_step_for_retry(step);
+            save_step_with_conn(conn, step)?;
+            changed = true;
             continue;
         }
         if step.step_key == AutoStepKey::RunPlan && step.plan_run_id.is_some() {

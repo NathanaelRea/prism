@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 pub const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
 static VALIDATED_DATABASES: OnceLock<Mutex<HashSet<DatabaseIdentity>>> = OnceLock::new();
@@ -693,6 +693,7 @@ fn migrate(
             let next = version + 1;
             match next {
                 1 => apply_complete_schema_baseline(conn)?,
+                2 => apply_additive_schema_migrations(conn)?,
                 _ => unreachable!("missing schema migration {next}"),
             }
             validate_complete_schema(conn)?;
@@ -761,6 +762,7 @@ fn apply_additive_schema_migrations(conn: &Connection) -> Result<(), StorageErro
     crate::opencode::migrate_runtime_schema(conn).map_err(migration_error)?;
     crate::plan_run::migrate_schema(conn).map_err(migration_error)?;
     crate::auto_flow::migrate_schema(conn).map_err(migration_error)?;
+    crate::integration::migrate_schema(conn).map_err(migration_error)?;
     crate::execution::migrate_schema(conn).map_err(migration_error)?;
     crate::remote::migrate_pr_cache_schema(conn).map_err(migration_error)?;
     crate::notification::migrate_schema(conn).map_err(migration_error)?;
@@ -771,6 +773,11 @@ fn additive_schema_current(conn: &Connection) -> Result<bool, StorageError> {
     Ok(table_has_column(conn, "pr_cache", "author")?
         && table_has_column(conn, "pending_worktree_deletion", "branch_deleted")?
         && table_has_column(conn, "active_worktree_session", "worktree_session_id")?
+        && table_has_column(conn, "merge_intent", "placement")?
+        && table_has_column(conn, "workflow_execution", "execution_version")?
+        && table_has_column(conn, "workflow_execution", "not_before_unix_ms")?
+        && table_has_column(conn, "workflow_execution", "wake_reason")?
+        && table_has_column(conn, "workflow_execution", "workflow_revision")?
         && table_has_column(conn, "notification_outbox", "backend_accepted_unix_ms")?)
 }
 
@@ -1039,9 +1046,20 @@ const REQUIRED_TABLES: &[RequiredTable] = &[
             "workflow_kind",
             "run_id",
             "dispatch_state",
+            "worker_id",
+            "daemon_instance_id",
+            "lease_expires_unix_ms",
+            "heartbeat_unix_ms",
             "fencing_token",
+            "executor_pid",
+            "executor_process_identity",
             "requeue_requested",
             "interruption_generation",
+            "recovery_decided_unix_ms",
+            "execution_version",
+            "not_before_unix_ms",
+            "wake_reason",
+            "workflow_revision",
             "created_unix_ms",
             "updated_unix_ms",
         ],
@@ -1627,6 +1645,46 @@ mod tests {
             .unwrap();
 
         assert_eq!(table_count, 1);
+        drop(conn);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn version_one_database_migrates_durable_scheduling_columns() {
+        let path = test_path("worker-scheduling-v1");
+        {
+            let conn = open_writable(&path).unwrap();
+            conn.execute(
+                "insert into workflow_execution (
+                   workflow_kind, run_id, dispatch_state, fencing_token,
+                   interruption_generation, created_unix_ms, updated_unix_ms
+                 ) values ('plan', 'legacy-plan', 'paused', 3, 0, 1, 1)",
+                [],
+            )
+            .unwrap();
+            conn.execute_batch(
+                "drop index workflow_execution_dispatch_idx;
+                 alter table workflow_execution drop column execution_version;
+                 alter table workflow_execution drop column not_before_unix_ms;
+                 alter table workflow_execution drop column wake_reason;
+                 alter table workflow_execution drop column workflow_revision;
+                 pragma user_version = 1;",
+            )
+            .unwrap();
+        }
+
+        let conn = open_writable(&path).unwrap();
+        let scheduling: (i64, Option<i64>, Option<String>, i64) = conn
+            .query_row(
+                "select execution_version, not_before_unix_ms, wake_reason, workflow_revision
+                 from workflow_execution where run_id = 'legacy-plan'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+
+        assert_eq!(user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
+        assert_eq!(scheduling, (1, None, None, 0));
         drop(conn);
         let _ = fs::remove_file(path);
     }

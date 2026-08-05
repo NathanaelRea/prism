@@ -163,6 +163,22 @@ impl PrCache {
         }
     }
 
+    pub(crate) fn reauthorize_persisted_run_summary(
+        &mut self,
+        expected_number: u64,
+        expected_url: &str,
+        expected_head_sha: &str,
+    ) {
+        if self.summary.as_ref().is_some_and(|summary| {
+            summary.number == expected_number
+                && summary.url == expected_url
+                && summary.head_sha == expected_head_sha
+                && summary.change_request_identity.is_some()
+        }) {
+            self.summary_observed_in_process = true;
+        }
+    }
+
     fn next_generation(&mut self) -> u64 {
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
         self.next_generation

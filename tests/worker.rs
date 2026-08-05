@@ -10,12 +10,24 @@ use std::time::{Duration, Instant};
 use common::CompactTempDir as TempDir;
 
 fn prism(runtime: &Path, home: &Path) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_prism"));
+    prism_at(Path::new(env!("CARGO_BIN_EXE_prism")), runtime, home)
+}
+
+fn prism_at(executable: &Path, runtime: &Path, home: &Path) -> Command {
+    let mut command = Command::new(executable);
     command
         .env("PRISM_RUNTIME_DIR", runtime)
         .env("XDG_CONFIG_HOME", home)
         .env("HOME", home);
     command
+}
+
+fn health_pid(output: &Output) -> u32 {
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("pid="))
+        .and_then(|pid| pid.parse().ok())
+        .expect("worker health PID")
 }
 
 fn run(runtime: &Path, home: &Path, args: &[&str]) -> Output {
@@ -69,6 +81,55 @@ fn platform_smoke_native_worker_starts_once_reports_health_and_shuts_down() {
         String::from_utf8_lossy(&shutdown.stderr)
     );
     assert!(!runtime.join("worker.sock").exists());
+}
+
+#[test]
+fn worker_ensure_restarts_a_same_version_replaced_executable() {
+    let _serial = serial_worker_test();
+    let temp = TempDir::new("worker-replaced-executable");
+    let runtime = temp.runtime_path().to_path_buf();
+    let home = temp.path.join("home");
+    let installed = temp.path.join("prism");
+    let replacement = temp.path.join("prism.new");
+    fs::create_dir_all(&home).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_prism"), &installed).unwrap();
+
+    let first = prism_at(&installed, &runtime, &home)
+        .args(["worker", "ensure"])
+        .output()
+        .unwrap();
+    assert!(first.status.success());
+    let first_health = prism_at(&installed, &runtime, &home)
+        .args(["worker", "health"])
+        .output()
+        .unwrap();
+    let first_pid = health_pid(&first_health);
+
+    fs::copy(env!("CARGO_BIN_EXE_prism"), &replacement).unwrap();
+    fs::rename(&replacement, &installed).unwrap();
+    let ensure = prism_at(&installed, &runtime, &home)
+        .args(["worker", "ensure"])
+        .output()
+        .unwrap();
+    assert!(
+        ensure.status.success(),
+        "replacement ensure failed: {}",
+        String::from_utf8_lossy(&ensure.stderr)
+    );
+    let second_health = prism_at(&installed, &runtime, &home)
+        .args(["worker", "health"])
+        .output()
+        .unwrap();
+    assert_ne!(health_pid(&second_health), first_pid);
+    assert!(String::from_utf8_lossy(&second_health.stdout).contains(" exe="));
+
+    assert!(
+        prism_at(&installed, &runtime, &home)
+            .args(["worker", "shutdown"])
+            .status()
+            .unwrap()
+            .success()
+    );
 }
 
 #[test]

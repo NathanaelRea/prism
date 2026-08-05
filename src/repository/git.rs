@@ -564,6 +564,60 @@ pub(crate) fn fetch_remote_branch(
     )
 }
 
+pub(crate) fn merge_remote_branch_guarded(
+    path: &std::path::Path,
+    remote: &str,
+    branch: &str,
+    expected_head_sha: &str,
+    expected_base_sha: &str,
+    config: &Config,
+) -> Result<String, String> {
+    fetch_remote_branch(path, remote, branch, config)?;
+    let current_head = current_head_sha(path, config)?;
+    if current_head != expected_head_sha {
+        return Err("local HEAD changed before the reserved base update".to_string());
+    }
+    let current_base = remote_branch_head_sha_on(path, remote, branch, config)?
+        .ok_or_else(|| format!("target branch {remote}/{branch} was not found after fetch"))?;
+    if current_base != expected_base_sha {
+        return Err("target branch changed before the reserved base update".to_string());
+    }
+    if selected_dirty(path, config)? {
+        return Err("worktree became dirty before the reserved base update".to_string());
+    }
+
+    let target = format!("refs/remotes/{remote}/{branch}");
+    let output = run_output_allow_failure(
+        Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .args(["merge", "--no-edit", "--"])
+            .arg(&target),
+        ProcessPolicy::LocalMutation,
+    )?;
+    if !output.status.success() {
+        let _ = run_status_named(
+            Command::new(config.tool("git"))
+                .arg("-C")
+                .arg(path)
+                .args(["merge", "--abort"]),
+            ProcessPolicy::LocalMutation,
+            ProcessDescriptor::new("git.merge_abort"),
+        );
+        let message = output.stderr.trim();
+        return Err(if message.is_empty() {
+            format!("merge {remote}/{branch} exited with {}", output.status)
+        } else {
+            format!("merge {remote}/{branch}: {message}")
+        });
+    }
+    let merged_head = current_head_sha(path, config)?;
+    if merged_head == expected_head_sha {
+        return Err("reserved base update did not create a new pull request head".to_string());
+    }
+    Ok(merged_head)
+}
+
 pub(crate) fn push_remote_branch_head_sha(
     path: &std::path::Path,
     remote: &str,
@@ -849,6 +903,68 @@ mod tests {
         assert_eq!(result.branch, "feature");
         assert!(result.set_upstream);
         assert!(has_upstream(&work, &test_config()).unwrap());
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn guarded_base_update_merges_only_the_expected_head_and_base() {
+        let temp = unique_temp_dir("prism-guarded-base-update-test");
+        let origin = temp.join("origin.git");
+        let work = temp.join("work");
+        let remote = temp.join("remote");
+        fs::create_dir_all(&temp).unwrap();
+        run(Command::new("git").args(["init", "--bare"]).arg(&origin));
+        run(Command::new("git").arg("--git-dir").arg(&origin).args([
+            "symbolic-ref",
+            "HEAD",
+            "refs/heads/main",
+        ]));
+        run(Command::new("git").arg("clone").arg(&origin).arg(&work));
+        configure_user(&work);
+        fs::write(work.join("base.txt"), "base\n").unwrap();
+        run_git(&work, &["add", "base.txt"]);
+        run_git(&work, &["commit", "-m", "base"]);
+        run_git(&work, &["push", "-u", "origin", "main"]);
+        run_git(&work, &["switch", "-c", "feature"]);
+        fs::write(work.join("feature.txt"), "feature\n").unwrap();
+        run_git(&work, &["add", "feature.txt"]);
+        run_git(&work, &["commit", "-m", "feature"]);
+        run_git(&work, &["push", "-u", "origin", "feature"]);
+        let expected_head = current_head_sha(&work, &test_config()).unwrap();
+
+        run(Command::new("git").arg("clone").arg(&origin).arg(&remote));
+        configure_user(&remote);
+        fs::write(remote.join("main.txt"), "main\n").unwrap();
+        run_git(&remote, &["add", "main.txt"]);
+        run_git(&remote, &["commit", "-m", "main"]);
+        run_git(&remote, &["push", "origin", "main"]);
+        let expected_base = current_head_sha(&remote, &test_config()).unwrap();
+
+        let merged = merge_remote_branch_guarded(
+            &work,
+            "origin",
+            "main",
+            &expected_head,
+            &expected_base,
+            &test_config(),
+        )
+        .unwrap();
+
+        assert_ne!(merged, expected_head);
+        assert_eq!(merged, current_head_sha(&work, &test_config()).unwrap());
+        let parents = run_capture(
+            Command::new("git").arg("-C").arg(&work).args([
+                "rev-list",
+                "--parents",
+                "-n",
+                "1",
+                "HEAD",
+            ]),
+            ProcessPolicy::Metadata,
+        )
+        .unwrap();
+        assert_eq!(parents.split_whitespace().count(), 3);
 
         let _ = fs::remove_dir_all(temp);
     }

@@ -95,6 +95,7 @@ pub(super) fn auto_source_label(source: AutoImplementationSource) -> &'static st
         AutoImplementationSource::Prompt => "prompt",
         AutoImplementationSource::ExistingPlan => "plan file",
         AutoImplementationSource::DraftPlan => "draft plan",
+        AutoImplementationSource::ExistingPullRequest => "existing PR",
     }
 }
 
