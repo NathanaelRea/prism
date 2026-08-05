@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 use std::io::{BufRead, BufReader};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
@@ -312,6 +312,17 @@ impl Drop for NotificationSubscription {
 
 #[cfg(target_os = "macos")]
 fn notification_subscription_loop(socket: &WorkerSocketPath, stop: &AtomicBool) {
+    notification_subscription_loop_with_delivery(socket, stop, |title, body| {
+        crate::desktop_notification::deliver_terminal_notification(title, body)
+    });
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn notification_subscription_loop_with_delivery(
+    socket: &WorkerSocketPath,
+    stop: &AtomicBool,
+    mut deliver: impl FnMut(&str, &str) -> Result<(), &'static str>,
+) {
     while !stop.load(Ordering::Acquire) {
         if let Ok(mut stream) = UnixStream::connect(socket.as_path()) {
             let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
@@ -325,6 +336,7 @@ fn notification_subscription_loop(socket: &WorkerSocketPath, stop: &AtomicBool) 
                     match reader.read_line(&mut line) {
                         Ok(0) => break,
                         Ok(_) if line.starts_with("ok ") => continue,
+                        Ok(_) if line.starts_with("error ") => break,
                         Ok(_) => {
                             let Ok(message) = serde_json::from_str::<serde_json::Value>(&line)
                             else {
@@ -337,13 +349,10 @@ fn notification_subscription_loop(socket: &WorkerSocketPath, stop: &AtomicBool) 
                             ) else {
                                 continue;
                             };
-                            let acknowledgement =
-                                match crate::desktop_notification::deliver_terminal_notification(
-                                    title, body,
-                                ) {
-                                    Ok(()) => format!("accepted {id}\n"),
-                                    Err(category) => format!("failed {id} {category}\n"),
-                                };
+                            let acknowledgement = match deliver(title, body) {
+                                Ok(()) => format!("accepted {id}\n"),
+                                Err(category) => format!("failed {id} {category}\n"),
+                            };
                             if reader
                                 .get_mut()
                                 .write_all(acknowledgement.as_bytes())
@@ -1386,6 +1395,53 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(&message[..size]).unwrap(),
             "{\"title\":\"Prism\",\"body\":\"ready\"}\n"
+        );
+    }
+
+    #[test]
+    fn notification_subscription_reconnects_after_a_protocol_error() {
+        let (_runtime, socket) = test_socket_path();
+        let listener = UnixListener::bind(socket.as_path()).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let listener_stop = Arc::clone(&stop);
+        let subscription_socket = socket.clone();
+        let subscription = thread::spawn(move || {
+            notification_subscription_loop_with_delivery(
+                &subscription_socket,
+                &listener_stop,
+                |_, _| Ok(()),
+            );
+        });
+
+        let (mut rejected, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 64];
+        let size = rejected.read(&mut request).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&request[..size]).unwrap(),
+            "subscribe-notifications\n"
+        );
+        rejected.write_all(b"error unknown-command\n").unwrap();
+
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let reconnected = loop {
+            match listener.accept() {
+                Ok((_stream, _)) => break true,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept replacement subscription: {error}"),
+            }
+        };
+
+        stop.store(true, Ordering::Release);
+        subscription.join().unwrap();
+        assert!(
+            reconnected,
+            "subscription did not reconnect after protocol error"
         );
     }
 
