@@ -159,42 +159,45 @@ fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
 pub fn ensure_running() -> Result<(), String> {
     let socket = validated_socket_path()?;
     let executable_identity = current_executable_identity()?;
-    match probe_health_at(&socket)? {
-        health @ DaemonHealth {
-            state: DaemonState::Running,
-            ..
-        } if daemon_uses_executable(&health, &executable_identity) => return Ok(()),
-        DaemonHealth {
-            state: DaemonState::Running,
-            ..
-        } => {
-            let response = request_at(&socket, "replace")?;
-            if response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
-                return wait_for_replacement(
-                    &socket,
-                    &executable_identity,
-                    DAEMON_TRANSITION_TIMEOUT,
-                );
+    let mut health = probe_health_at(&socket)?;
+    loop {
+        match health {
+            current @ DaemonHealth {
+                state: DaemonState::Running,
+                ..
+            } if daemon_uses_executable(&current, &executable_identity) => return Ok(()),
+            DaemonHealth {
+                state: DaemonState::Running,
+                ..
+            } => {
+                let response = request_at(&socket, "replace")?;
+                if response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
+                    return wait_for_replacement(
+                        &socket,
+                        &executable_identity,
+                        DAEMON_TRANSITION_TIMEOUT,
+                    );
+                }
+                let response = request_at(&socket, "shutdown")?;
+                if !response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
+                    return Err(format!("Prism worker rejected replacement: {response}"));
+                }
+                wait_for_socket_to_close(&socket, DAEMON_TRANSITION_TIMEOUT)?;
+                break;
             }
-            let response = request_at(&socket, "shutdown")?;
-            if !response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
-                return Err(format!("Prism worker rejected replacement: {response}"));
+            DaemonHealth {
+                state: DaemonState::Draining,
+                ..
+            } => {
+                health = wait_for_drain_transition(DAEMON_TRANSITION_TIMEOUT, || {
+                    probe_health_at(&socket)
+                })?;
             }
-            wait_for_socket_to_close(&socket, DAEMON_TRANSITION_TIMEOUT)?;
+            DaemonHealth {
+                state: DaemonState::Stopped,
+                ..
+            } => break,
         }
-        DaemonHealth {
-            state: DaemonState::Draining,
-            active,
-            ..
-        } => {
-            return Err(format!(
-                "Prism worker is draining before replacement ({active} active)"
-            ));
-        }
-        DaemonHealth {
-            state: DaemonState::Stopped,
-            ..
-        } => {}
     }
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve Prism worker executable: {error}"))?;
@@ -232,6 +235,26 @@ fn start_worker(executable: PathBuf) -> Result<(), String> {
 
 fn daemon_uses_executable(health: &DaemonHealth, executable_identity: &str) -> bool {
     health.executable_identity.as_deref() == Some(executable_identity)
+}
+
+fn wait_for_drain_transition(
+    timeout: Duration,
+    mut probe: impl FnMut() -> Result<DaemonHealth, String>,
+) -> Result<DaemonHealth, String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let health = probe()?;
+        if health.state != DaemonState::Draining {
+            return Ok(health);
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "timed out waiting for Prism worker daemon to finish draining ({} active)",
+                health.active
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn wait_for_replacement(
@@ -1172,6 +1195,58 @@ mod tests {
         assert!(daemon_uses_executable(&current, "8:100"));
         assert!(!daemon_uses_executable(&replaced, "8:100"));
         assert!(!daemon_uses_executable(&legacy, "8:100"));
+    }
+
+    #[test]
+    fn draining_daemon_is_waited_through_socket_removal() {
+        let mut probes = [
+            DaemonHealth {
+                state: DaemonState::Draining,
+                protocol_version: Some(PROTOCOL_VERSION),
+                instance_id: Some("old".to_string()),
+                pid: Some(42),
+                executable_identity: Some("8:99".to_string()),
+                active: 0,
+            },
+            DaemonHealth::stopped(),
+        ]
+        .into_iter();
+
+        assert_eq!(
+            wait_for_drain_transition(Duration::from_secs(1), || Ok(probes.next().unwrap()))
+                .unwrap(),
+            DaemonHealth::stopped()
+        );
+    }
+
+    #[test]
+    fn draining_daemon_is_waited_through_concurrent_replacement() {
+        let replacement = DaemonHealth {
+            state: DaemonState::Running,
+            protocol_version: Some(PROTOCOL_VERSION),
+            instance_id: Some("new".to_string()),
+            pid: Some(43),
+            executable_identity: Some("8:100".to_string()),
+            active: 0,
+        };
+        let mut probes = [
+            DaemonHealth {
+                state: DaemonState::Draining,
+                protocol_version: Some(PROTOCOL_VERSION),
+                instance_id: Some("old".to_string()),
+                pid: Some(42),
+                executable_identity: Some("8:99".to_string()),
+                active: 1,
+            },
+            replacement.clone(),
+        ]
+        .into_iter();
+
+        assert_eq!(
+            wait_for_drain_transition(Duration::from_secs(1), || Ok(probes.next().unwrap()))
+                .unwrap(),
+            replacement
+        );
     }
 
     #[cfg(target_os = "linux")]

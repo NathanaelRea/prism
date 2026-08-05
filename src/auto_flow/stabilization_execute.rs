@@ -774,6 +774,10 @@ pub(crate) fn append_planned_work(
         &persisted.run.id,
         work.guard.change_request_identity.as_ref(),
     )?;
+    if work.kind == super::stabilization_model::StabilizationWorkKind::Escalate {
+        super::fail_auto_run(conn, persisted, work.reason)?;
+        return Ok(false);
+    }
     if matches!(
         work.kind,
         super::stabilization_model::StabilizationWorkKind::Merge
@@ -1658,7 +1662,7 @@ fn short_sha(value: &str) -> String {
 mod tests {
     use super::*;
     use crate::auto_flow::{
-        AutoLaunch, AutoStepRun,
+        AutoLaunch, AutoRunStatus, AutoStepRun,
         stabilization_model::{
             ActionableReviewItem, CiFacts, MergeabilityFacts, PolicyBlocker, PolicyFacts,
             PullRequestFacts, PullRequestState, RepairKind, RepositoryFacts, ReviewFacts,
@@ -2037,6 +2041,82 @@ mod tests {
         assert!(!guarded_replan_is_terminal(&work(
             StabilizationBlocker::PolicyUnknown
         )));
+    }
+
+    #[test]
+    fn escalation_fails_reserved_run_and_releases_next_candidate() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        super::super::migrate_schema(&conn).unwrap();
+        crate::plan_run::migrate_schema(&conn).unwrap();
+        crate::execution::migrate_schema(&conn).unwrap();
+        let mut first = AutoLaunch::new(
+            Path::new("/repo"),
+            Path::new("/repo/first"),
+            "first",
+            "stabilize",
+        )
+        .unwrap()
+        .create_run();
+        let mut second = AutoLaunch::new(
+            Path::new("/repo"),
+            Path::new("/repo/second"),
+            "second",
+            "stabilize",
+        )
+        .unwrap()
+        .create_run();
+        super::super::save_auto_run(&conn, &mut first).unwrap();
+        super::super::save_auto_run(&conn, &mut second).unwrap();
+        for (run, head) in [(&first, "first-head"), (&second, "second-head")] {
+            crate::integration::arm_merge_intent(&conn, &run.run.id).unwrap();
+            crate::integration::synchronize_generation(
+                &conn,
+                &run.run.id,
+                &crate::integration::CandidateGeneration {
+                    change_request_identity: crate::remote::test_change_request_identity(),
+                    target_branch: "main".to_string(),
+                    pr_number: 42,
+                    head_sha: head.to_string(),
+                },
+            )
+            .unwrap();
+            crate::integration::publish_ready(&conn, &run.run.id, head).unwrap();
+        }
+
+        assert!(
+            !append_planned_work(
+                &conn,
+                &mut first,
+                StabilizationWorkItem {
+                    kind: StabilizationWorkKind::Escalate,
+                    blocker: StabilizationBlocker::ObservationFailed,
+                    reason: "repository policy refresh failed".to_string(),
+                    guard: WorkGuard::default(),
+                },
+            )
+            .unwrap()
+        );
+
+        assert_eq!(
+            super::super::load_auto_run(&conn, &first.run.id)
+                .unwrap()
+                .unwrap()
+                .run
+                .status,
+            AutoRunStatus::Failed
+        );
+        assert!(
+            crate::integration::active_merge_intent(&conn, &first.run.id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            crate::integration::active_merge_intent(&conn, &second.run.id)
+                .unwrap()
+                .unwrap()
+                .placement,
+            crate::integration::IntegrationPlacement::Reserved
+        );
     }
 
     #[test]

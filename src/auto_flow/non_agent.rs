@@ -1261,18 +1261,30 @@ pub(super) fn execute_update_branch_step(
         expected_base,
         config,
     )?;
-    crate::lifecycle::run_pre_push_checks(config, &persisted.run.worktree_path)?;
-    let source_push = crate::remote::dispatcher::prepare_push(
+    let expected_push = crate::remote::dispatcher::prepare_push(
         &persisted.run.worktree_path,
         config,
         &persisted.run.branch,
+    )?;
+    validate_base_update_push_guard(&expected_push, &expected_push, &merged_head, false)?;
+    crate::lifecycle::run_pre_push_checks(config, &persisted.run.worktree_path)?;
+    let current_push = crate::remote::dispatcher::prepare_push(
+        &persisted.run.worktree_path,
+        config,
+        &persisted.run.branch,
+    )?;
+    validate_base_update_push_guard(
+        &expected_push,
+        &current_push,
+        &merged_head,
+        crate::git::selected_dirty(&persisted.run.worktree_path, config)?,
     )?;
     crate::execution::validate_installed_claim(conn)?;
     crate::lifecycle::push_branch(
         config,
         &persisted.run.worktree_path,
         &persisted.run.branch,
-        source_push.set_upstream,
+        current_push.set_upstream,
     )?;
     crate::remote::dispatcher::refresh_change_request_cache(
         repo,
@@ -1296,6 +1308,26 @@ pub(super) fn execute_update_branch_step(
         merged_head,
         max_output_lines_per_step,
     )
+}
+
+pub(super) fn validate_base_update_push_guard(
+    expected: &crate::remote::dispatcher::PushGuard,
+    current: &crate::remote::dispatcher::PushGuard,
+    merged_head: &str,
+    dirty: bool,
+) -> Result<(), String> {
+    if expected.expected_head_sha != merged_head {
+        return Err("reserved base update produced an unexpected local HEAD".to_string());
+    }
+    if current != expected {
+        return Err("reserved base-update push guard changed during pre-push checks".to_string());
+    }
+    if dirty {
+        return Err(
+            "worktree became dirty during reserved base-update pre-push checks".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn finish_updated_branch_step(

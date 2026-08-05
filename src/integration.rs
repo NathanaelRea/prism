@@ -889,17 +889,32 @@ fn reserve_and_wake_next(conn: &Connection, lane_key: &str) -> Result<Option<Str
 }
 
 fn wake_toggled_auto_run(conn: &Connection, run_id: &str) -> Result<(), String> {
+    let (status, pause_requested) = conn
+        .query_row(
+            "select status, pause_requested from auto_run where id = ?1",
+            [run_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)),
+        )
+        .optional()
+        .map_err(|error| format!("inspect merge-intent Auto Flow: {error}"))?
+        .ok_or_else(|| "merge intent cannot wake a missing Auto Flow run".to_string())?;
+    if status == "aborted" {
+        return Err("merge intent cannot wake an aborted Auto Flow run".to_string());
+    }
+    if pause_requested {
+        return Ok(());
+    }
     let changed = conn
         .execute(
             "update auto_run
              set status = case when status = 'running' then 'running' else 'queued' end,
-                 pause_requested = 0, updated_unix_ms = ?1
-             where id = ?2 and status != 'aborted'",
+                 updated_unix_ms = ?1
+             where id = ?2 and status != 'aborted' and pause_requested = 0",
             params![u64_to_i64(crate::auto_flow::unix_ms()), run_id],
         )
         .map_err(|error| format!("wake merge-intent Auto Flow: {error}"))?;
     if changed != 1 {
-        return Err("merge intent cannot wake an aborted or missing Auto Flow run".to_string());
+        return Err("merge intent cannot wake the Auto Flow run".to_string());
     }
     enqueue_auto_run(conn, run_id)
 }
@@ -1051,6 +1066,38 @@ mod tests {
         assert_eq!(persisted.placement, IntegrationPlacement::Pending);
         assert_eq!(withdrawn.state, MergeIntentState::Withdrawn);
         assert!(active_merge_intent(&conn, &run.run.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn arming_merge_intent_preserves_explicit_auto_run_pause() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::auto_flow::migrate_schema(&conn).unwrap();
+        crate::plan_run::migrate_schema(&conn).unwrap();
+        crate::execution::migrate_schema(&conn).unwrap();
+        let mut run = saved_run(&conn, "feature");
+        run.run.status = crate::auto_flow::AutoRunStatus::Paused;
+        run.run.pause_requested = true;
+        crate::auto_flow::save_auto_run(&conn, &mut run).unwrap();
+
+        let intent = toggle_merge_intent(&conn, &run.run.id, false).unwrap();
+
+        let loaded = crate::auto_flow::load_auto_run(&conn, &run.run.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.state, MergeIntentState::Armed);
+        assert_eq!(loaded.run.status, crate::auto_flow::AutoRunStatus::Paused);
+        assert!(loaded.run.pause_requested);
+        assert_eq!(
+            crate::execution::dispatch_state(
+                &conn,
+                &crate::execution::WorkflowIdentity::new(
+                    crate::execution::WorkflowKind::Auto,
+                    &run.run.id,
+                ),
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]

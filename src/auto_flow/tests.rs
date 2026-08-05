@@ -2465,6 +2465,49 @@ fn initial_change_request_push_runs_pre_pr_then_pre_push_checks() {
 }
 
 #[test]
+fn reserved_base_update_rejects_mutated_pre_push_state() {
+    let repository = crate::remote::test_change_request_identity()
+        .source_repository()
+        .unwrap();
+    let expected = crate::remote::dispatcher::PushGuard {
+        repository,
+        remote: "origin".to_string(),
+        remote_branch: "feat/auto".to_string(),
+        local_branch: "feat/auto".to_string(),
+        expected_head_sha: "merged-head".to_string(),
+        set_upstream: false,
+    };
+
+    non_agent::validate_base_update_push_guard(&expected, &expected, "merged-head", false).unwrap();
+
+    let mut changed_head = expected.clone();
+    changed_head.expected_head_sha = "check-commit".to_string();
+    assert!(
+        non_agent::validate_base_update_push_guard(&expected, &changed_head, "merged-head", false,)
+            .unwrap_err()
+            .contains("push guard changed")
+    );
+
+    let mut changed_destination = expected.clone();
+    changed_destination.remote_branch = "other".to_string();
+    assert!(
+        non_agent::validate_base_update_push_guard(
+            &expected,
+            &changed_destination,
+            "merged-head",
+            false,
+        )
+        .unwrap_err()
+        .contains("push guard changed")
+    );
+    assert!(
+        non_agent::validate_base_update_push_guard(&expected, &expected, "merged-head", true,)
+            .unwrap_err()
+            .contains("became dirty")
+    );
+}
+
+#[test]
 #[cfg(unix)]
 fn executor_runs_fake_opencode_pauses_before_next_step_and_persists_events() {
     let temp = TempDir::new("executor-success");
