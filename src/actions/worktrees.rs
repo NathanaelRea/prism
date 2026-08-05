@@ -314,6 +314,7 @@ impl Tui {
                 || self.pr_persistence_in_flight.contains(key)
         });
         self.retain_agent_state_persistence_for(&live);
+        #[cfg(test)]
         self.desktop_notifier.retain(&live);
         self.session_repository_identities = self
             .repos
@@ -326,6 +327,7 @@ impl Tui {
             &self.sessions,
             &mut self.tmux_generations,
         );
+        #[cfg(test)]
         self.reseed_desktop_notifications();
         self.ensure_navigation_valid();
     }

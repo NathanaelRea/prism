@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
+#[cfg(target_os = "macos")]
+use std::io::{BufRead, BufReader};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
@@ -15,6 +17,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::execution::{self, DispatchState, ExecutionClaim, WorkflowIdentity, WorkflowKind};
+use crate::notification::{NotificationCoordinator, NotificationObservation, PendingNotification};
 use crate::platform::SupportedOs;
 use crate::process::DetachedProcessPolicy;
 use crate::repo::Repository;
@@ -23,6 +26,8 @@ use crate::{observability, workspace};
 
 const PROTOCOL_VERSION: u32 = 1;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+const NOTIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const NOTIFICATION_RETRY_INTERVAL: Duration = Duration::from_secs(10);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const DAEMON_TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
 const GLOBAL_CONCURRENCY: usize = 4;
@@ -75,6 +80,7 @@ pub struct DaemonHealth {
     pub instance_id: Option<String>,
     pub pid: Option<u32>,
     pub active: usize,
+    pub notifications: bool,
 }
 
 impl DaemonHealth {
@@ -85,6 +91,7 @@ impl DaemonHealth {
             instance_id: None,
             pid: None,
             active: 0,
+            notifications: false,
         }
     }
 }
@@ -128,6 +135,7 @@ fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
     let mut pid: Option<u32> = None;
     let mut state = None;
     let mut active = None;
+    let mut notifications = false;
     for field in fields {
         if let Some(value) = field.strip_prefix("pid=") {
             pid = value.parse().ok();
@@ -139,6 +147,8 @@ fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
             });
         } else if let Some(value) = field.strip_prefix("active=") {
             active = value.parse().ok();
+        } else if let Some(value) = field.strip_prefix("notifications=") {
+            notifications = value == "1";
         }
     }
     Ok(DaemonHealth {
@@ -147,13 +157,39 @@ fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
         instance_id: Some(instance_id.to_string()),
         pid: Some(pid.ok_or_else(|| format!("missing Prism daemon PID: {response}"))?),
         active: active.ok_or_else(|| format!("missing Prism daemon active count: {response}"))?,
+        notifications,
     })
 }
 
 pub fn ensure_running() -> Result<(), String> {
     let socket = validated_socket_path()?;
+    if std::env::var_os("PRISM_WAIT_FOR_WORKER_DRAIN").is_some() {
+        loop {
+            match probe_health_at(&socket)? {
+                DaemonHealth {
+                    state: DaemonState::Stopped,
+                    ..
+                } => break,
+                DaemonHealth {
+                    state: DaemonState::Running,
+                    notifications: true,
+                    ..
+                } => return Ok(()),
+                _ => thread::sleep(Duration::from_millis(250)),
+            }
+        }
+    }
     if wait_for_existing_daemon(DAEMON_TRANSITION_TIMEOUT, || probe_health_at(&socket))? {
-        return Ok(());
+        let health = probe_health_at(&socket)?;
+        if health.notifications {
+            return Ok(());
+        }
+        let shutdown_health = parse_health_response(&request_at(&socket, "shutdown")?)?;
+        if shutdown_health.active > 0 {
+            spawn_worker_replacement()?;
+            return Ok(());
+        }
+        wait_for_socket_to_close(&socket, DAEMON_TRANSITION_TIMEOUT)?;
     }
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve Prism worker executable: {error}"))?;
@@ -182,6 +218,22 @@ pub fn ensure_running() -> Result<(), String> {
         thread::sleep(Duration::from_millis(25));
     }
     Err(last_error)
+}
+
+fn spawn_worker_replacement() -> Result<(), String> {
+    let executable = std::env::current_exe()
+        .map_err(|error| format!("resolve replacement Prism worker executable: {error}"))?;
+    let mut command = Command::new(executable);
+    command
+        .args(["worker", "ensure"])
+        .env("PRISM_WAIT_FOR_WORKER_DRAIN", "1");
+    crate::process::spawn_detached_named(
+        &mut command,
+        DetachedProcessPolicy::WorkerDaemon,
+        crate::process::ProcessDescriptor::new("prism.worker.replace"),
+    )
+    .map(|_| ())
+    .map_err(|error| format!("schedule replacement Prism worker: {error}"))
 }
 
 fn wait_for_existing_daemon(
@@ -218,6 +270,107 @@ fn wait_for_existing_daemon(
 
 pub fn wake() -> Result<(), String> {
     request("wake").map(|_| ())
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) struct NotificationSubscription {
+    stop: Arc<AtomicBool>,
+    listener: Option<thread::JoinHandle<()>>,
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn subscribe_notifications() -> Result<NotificationSubscription, String> {
+    let socket = validated_socket_path()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let listener_stop = Arc::clone(&stop);
+    let listener = thread::Builder::new()
+        .name("prism-notification-subscription".to_string())
+        .spawn(move || notification_subscription_loop(&socket, &listener_stop))
+        .map_err(|error| format!("start notification subscription: {error}"))?;
+    Ok(NotificationSubscription {
+        stop,
+        listener: Some(listener),
+    })
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for NotificationSubscription {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        let Some(listener) = self.listener.take() else {
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !listener.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if listener.is_finished() {
+            let _ = listener.join();
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn notification_subscription_loop(socket: &WorkerSocketPath, stop: &AtomicBool) {
+    while !stop.load(Ordering::Acquire) {
+        if let Ok(mut stream) = UnixStream::connect(socket.as_path()) {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
+            if stream.write_all(b"subscribe-notifications\n").is_ok() {
+                let mut reader = BufReader::new(stream);
+                loop {
+                    if stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let mut line = String::new();
+                    match reader.read_line(&mut line) {
+                        Ok(0) => break,
+                        Ok(_) if line.starts_with("ok ") => continue,
+                        Ok(_) => {
+                            let Ok(message) = serde_json::from_str::<serde_json::Value>(&line)
+                            else {
+                                continue;
+                            };
+                            let (Some(id), Some(title), Some(body)) = (
+                                message.get("id").and_then(serde_json::Value::as_i64),
+                                message.get("title").and_then(serde_json::Value::as_str),
+                                message.get("body").and_then(serde_json::Value::as_str),
+                            ) else {
+                                continue;
+                            };
+                            let acknowledgement =
+                                match crate::desktop_notification::deliver_terminal_notification(
+                                    title, body,
+                                ) {
+                                    Ok(()) => format!("accepted {id}\n"),
+                                    Err(category) => format!("failed {id} {category}\n"),
+                                };
+                            if reader
+                                .get_mut()
+                                .write_all(acknowledgement.as_bytes())
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::WouldBlock
+                                    | std::io::ErrorKind::TimedOut
+                                    | std::io::ErrorKind::Interrupted
+                            ) => {}
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        for _ in 0..5 {
+            if stop.load(Ordering::Acquire) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 pub fn health_response() -> Result<String, String> {
@@ -331,13 +484,28 @@ pub fn serve() -> Result<(), String> {
         .map_err(|error| format!("configure Prism worker listener: {error}"))?;
 
     let active = Arc::new(Mutex::new(BTreeSet::<PathBuf>::new()));
+    let notification_subscriber = Arc::new(Mutex::new(Vec::<UnixStream>::new()));
+    let notification_stop = Arc::new(AtomicBool::new(false));
+    let observer_stop = Arc::clone(&notification_stop);
+    let observer_subscriber = Arc::clone(&notification_subscriber);
+    thread::Builder::new()
+        .name("prism-notification-observer".to_string())
+        .spawn(move || notification_loop(observer_stop, observer_subscriber))
+        .map_err(|error| format!("start notification observer: {error}"))?;
     let mut next_poll = Instant::now();
     let mut draining = false;
     loop {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                if respond(&mut stream, &instance_id, &active, draining) {
+                if respond(
+                    &mut stream,
+                    &instance_id,
+                    &active,
+                    &notification_subscriber,
+                    draining,
+                ) {
                     draining = true;
+                    notification_stop.store(true, Ordering::Release);
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
@@ -357,6 +525,7 @@ pub fn serve() -> Result<(), String> {
         }
         thread::sleep(Duration::from_millis(50));
     }
+    notification_stop.store(true, Ordering::Release);
     log_daemon_lifecycle("daemon_stop", &instance_id);
     fs::remove_file(socket.as_path()).map_err(|error| format!("remove worker socket: {error}"))
 }
@@ -365,6 +534,7 @@ fn respond(
     stream: &mut UnixStream,
     instance_id: &str,
     active: &Arc<Mutex<BTreeSet<PathBuf>>>,
+    notification_subscriber: &Arc<Mutex<Vec<UnixStream>>>,
     draining: bool,
 ) -> bool {
     let mut request = [0_u8; 64];
@@ -374,20 +544,307 @@ fn respond(
         .lock()
         .map(|active| active.len())
         .unwrap_or(usize::MAX);
+    let mut new_notification_subscriber = None;
     let response = match command.trim() {
         "health" | "wake" => format!(
-            "ok {PROTOCOL_VERSION} {instance_id} pid={} state={} active={active}\n",
+            "ok {PROTOCOL_VERSION} {instance_id} pid={} state={} active={active} notifications=1\n",
             std::process::id(),
             if draining { "draining" } else { "running" }
         ),
         "shutdown" => format!(
-            "ok {PROTOCOL_VERSION} {instance_id} pid={} state=draining active={active}\n",
+            "ok {PROTOCOL_VERSION} {instance_id} pid={} state=draining active={active} notifications=1\n",
             std::process::id()
         ),
+        "subscribe-notifications" if !draining => match stream.try_clone() {
+            Ok(subscriber) => {
+                let _ = subscriber.set_read_timeout(Some(Duration::from_secs(1)));
+                let _ = subscriber.set_write_timeout(Some(Duration::from_secs(1)));
+                new_notification_subscriber = Some(subscriber);
+                format!("ok {PROTOCOL_VERSION} subscribed\n")
+            }
+            Err(_) => "error subscribe-failed\n".to_string(),
+        },
         _ => "error unknown-command\n".to_string(),
     };
-    let _ = stream.write_all(response.as_bytes());
+    if stream.write_all(response.as_bytes()).is_ok()
+        && let Some(subscriber) = new_notification_subscriber
+        && let Ok(mut current) = notification_subscriber.lock()
+    {
+        current.push(subscriber);
+    }
     command.trim() == "shutdown"
+}
+
+fn notification_loop(stop: Arc<AtomicBool>, subscriber: Arc<Mutex<Vec<UnixStream>>>) {
+    while !stop.load(Ordering::Acquire) {
+        if let Err(error) = observe_and_deliver_notifications(&subscriber) {
+            eprintln!("Prism notification observer failed: {error}");
+        }
+        let deadline = Instant::now() + NOTIFICATION_POLL_INTERVAL;
+        while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+}
+
+fn observe_and_deliver_notifications(
+    subscriber: &Arc<Mutex<Vec<UnixStream>>>,
+) -> Result<(), String> {
+    let entries = workspace::load_entries()?;
+    for entry in workspace::discover_valid_entries(entries) {
+        let repo = entry.repo;
+        if let Err(error) = observability::attach_run_repo(&repo) {
+            eprintln!(
+                "Prism notification observer cannot attach {}: {error}",
+                repo.root.display()
+            );
+            continue;
+        }
+        let config = Config::load(&repo);
+        if !config.config_errors.is_empty() {
+            eprintln!(
+                "Prism notification observer skipped {} because configuration is invalid",
+                repo.root.display()
+            );
+            continue;
+        }
+        let sessions = match crate::session::discover_sessions(&repo, &config) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                eprintln!(
+                    "Prism notification observer cannot discover {}: {error}",
+                    repo.root.display()
+                );
+                continue;
+            }
+        };
+        let repository = crate::session::WorktreeRepositoryKey::new(repo.root.clone());
+        let repo_label = workspace::label_for_root(&repo.root);
+        let observed_unix_ms = current_unix_ms();
+        let mut observations = Vec::new();
+        let mut live = Vec::new();
+        for session in sessions
+            .iter()
+            .filter(|session| !session.hidden && session.path.exists())
+        {
+            let identity = session.identity_key(&repository);
+            live.push(identity.clone());
+            match observe_interactive_agent(&repo, &config, session) {
+                Ok(state) => observations.push((identity, state)),
+                Err(error) => eprintln!(
+                    "Prism notification observer cannot inspect {}: {error}",
+                    session.branch
+                ),
+            }
+        }
+        let result = observability::with_writable_db_mut(&repo, |conn| {
+            let mut coordinator = NotificationCoordinator::new(conn);
+            coordinator.abandon_uncertain(observed_unix_ms)?;
+            coordinator.retain(live.iter(), observed_unix_ms)?;
+            for (session, state) in &observations {
+                let state = resolve_observed_state(*state, coordinator.last_state(session)?);
+                let Some(state) = state else { continue };
+                coordinator.observe(NotificationObservation {
+                    session,
+                    repo_label: &repo_label,
+                    state,
+                    config: config.notifications,
+                    observed_unix_ms,
+                })?;
+            }
+            dispatch_pending_notifications(&mut coordinator, subscriber, observed_unix_ms)
+        });
+        if let Err(error) = result {
+            eprintln!(
+                "Prism notification observer cannot update {}: {error}",
+                repo.root.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn observe_interactive_agent(
+    repo: &Repository,
+    config: &Config,
+    session: &crate::session::Session,
+) -> Result<Option<crate::agent::AgentState>, String> {
+    let association = crate::session::worktree_harness(repo, session)?;
+    let effective_config = config.for_harness(&association.harness_id)?;
+    let generation = crate::tmux::latest_agent_session_generation_result(
+        repo,
+        &effective_config,
+        &session.branch,
+    )?;
+    let running = match generation {
+        Some(generation) => {
+            crate::tmux::agent_session_running_result(repo, &effective_config, session, generation)?
+        }
+        None => false,
+    };
+    if effective_config.selected_adapter_is("opencode")
+        && let Some(runtime) = crate::opencode::load_runtime_snapshot(
+            repo,
+            &association.harness_id,
+            &session.branch,
+            &session.path,
+        )?
+    {
+        return match crate::opencode::poll_status_authoritative(&runtime) {
+            Ok(status) => Ok(Some(normalize_interactive_state(
+                running,
+                Some(status.state.agent_state()),
+            ))),
+            Err(_) if running => Ok(Some(crate::agent::AgentState::Running)),
+            Err(error) => Err(error),
+        };
+    }
+    Ok(generation.map(|_| normalize_interactive_state(running, None)))
+}
+
+fn normalize_interactive_state(
+    running: bool,
+    rich_state: Option<crate::agent::AgentState>,
+) -> crate::agent::AgentState {
+    match rich_state {
+        Some(crate::agent::AgentState::NeedsRestart) if running => {
+            crate::agent::AgentState::Running
+        }
+        Some(state) => state,
+        None if running => crate::agent::AgentState::Running,
+        None => crate::agent::AgentState::ExitedOk,
+    }
+}
+
+fn resolve_observed_state(
+    observed: Option<crate::agent::AgentState>,
+    previous: Option<crate::agent::AgentState>,
+) -> Option<crate::agent::AgentState> {
+    match (observed, previous) {
+        (Some(state), _) => Some(state),
+        (None, Some(crate::agent::AgentState::Attached | crate::agent::AgentState::Running)) => {
+            Some(crate::agent::AgentState::ExitedOk)
+        }
+        (None, _) => None,
+    }
+}
+
+fn dispatch_pending_notifications(
+    coordinator: &mut NotificationCoordinator<'_>,
+    subscriber: &Arc<Mutex<Vec<UnixStream>>>,
+    now_unix_ms: i64,
+) -> Result<(), String> {
+    coordinator.expire_pending(now_unix_ms)?;
+    loop {
+        #[cfg(target_os = "macos")]
+        if subscriber
+            .lock()
+            .map(|subscriber| subscriber.is_empty())
+            .unwrap_or(true)
+        {
+            return Ok(());
+        }
+        let Some(notification) = coordinator.claim_next(now_unix_ms)? else {
+            return Ok(());
+        };
+        match deliver_worker_notification(&notification, subscriber) {
+            DeliveryOutcome::Accepted => {
+                coordinator.mark_accepted(notification.id, current_unix_ms())?
+            }
+            DeliveryOutcome::Retry(category) => coordinator.retry(
+                notification.id,
+                current_unix_ms().saturating_add(
+                    NOTIFICATION_RETRY_INTERVAL
+                        .as_millis()
+                        .min(i64::MAX as u128) as i64,
+                ),
+                category,
+            )?,
+            #[cfg(target_os = "macos")]
+            DeliveryOutcome::Uncertain(category) => {
+                coordinator.mark_uncertain(notification.id, current_unix_ms(), category)?
+            }
+        }
+    }
+}
+
+enum DeliveryOutcome {
+    Accepted,
+    Retry(&'static str),
+    #[cfg(target_os = "macos")]
+    Uncertain(&'static str),
+}
+
+#[cfg(target_os = "linux")]
+fn deliver_worker_notification(
+    notification: &PendingNotification,
+    _subscriber: &Arc<Mutex<Vec<UnixStream>>>,
+) -> DeliveryOutcome {
+    match crate::desktop_notification::deliver_native_notification(
+        &notification.title,
+        &notification.body,
+    ) {
+        Ok(()) => DeliveryOutcome::Accepted,
+        Err(category) => DeliveryOutcome::Retry(category),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn deliver_worker_notification(
+    notification: &PendingNotification,
+    subscriber: &Arc<Mutex<Vec<UnixStream>>>,
+) -> DeliveryOutcome {
+    let message = serde_json::json!({
+        "id": notification.id,
+        "title": notification.title,
+        "body": notification.body,
+    });
+    let Ok(mut subscribers) = subscriber.lock() else {
+        return DeliveryOutcome::Retry("subscriber_lock");
+    };
+    while let Some(stream) = subscribers.last_mut() {
+        if stream.write_all(format!("{message}\n").as_bytes()).is_err() {
+            subscribers.pop();
+            continue;
+        }
+        let response = read_notification_ack(stream);
+        let accepted = format!("accepted {}", notification.id);
+        let failed = format!("failed {}", notification.id);
+        return match response.as_deref() {
+            Ok(response) if response == accepted => DeliveryOutcome::Accepted,
+            Ok(response) if response.starts_with(&failed) => {
+                subscribers.pop();
+                continue;
+            }
+            _ => {
+                subscribers.pop();
+                DeliveryOutcome::Uncertain("subscriber_ack")
+            }
+        };
+    }
+    DeliveryOutcome::Retry("subscriber_unavailable")
+}
+
+#[cfg(target_os = "macos")]
+fn read_notification_ack(stream: &mut UnixStream) -> Result<String, std::io::Error> {
+    let mut response = Vec::new();
+    let mut byte = [0_u8; 1];
+    while response.len() < 128 {
+        let size = stream.read(&mut byte)?;
+        if size == 0 || byte[0] == b'\n' {
+            break;
+        }
+        response.push(byte[0]);
+    }
+    Ok(String::from_utf8_lossy(&response).to_string())
+}
+
+fn current_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
 }
 
 fn classify_abandoned(instance_id: &str) -> Result<(), String> {
@@ -870,6 +1327,69 @@ mod tests {
     }
 
     #[test]
+    fn notification_observation_prefers_rich_state_without_false_offline_restart() {
+        use crate::agent::AgentState;
+
+        assert_eq!(
+            normalize_interactive_state(true, Some(AgentState::NeedsRestart)),
+            AgentState::Running
+        );
+        assert_eq!(
+            normalize_interactive_state(true, Some(AgentState::NeedsInput)),
+            AgentState::NeedsInput
+        );
+        assert_eq!(
+            normalize_interactive_state(false, Some(AgentState::ExitedError)),
+            AgentState::ExitedError
+        );
+        assert_eq!(
+            normalize_interactive_state(false, None),
+            AgentState::ExitedOk
+        );
+        assert_eq!(
+            resolve_observed_state(None, Some(AgentState::Running)),
+            Some(AgentState::ExitedOk)
+        );
+        assert_eq!(resolve_observed_state(None, None), None);
+    }
+
+    #[test]
+    fn notification_subscription_keeps_a_worker_to_tui_stream() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let active = Arc::new(Mutex::new(BTreeSet::new()));
+        let subscriber = Arc::new(Mutex::new(Vec::new()));
+        client.write_all(b"subscribe-notifications\n").unwrap();
+
+        assert!(!respond(
+            &mut server,
+            "daemon-test",
+            &active,
+            &subscriber,
+            false,
+        ));
+        let mut acknowledgement = [0_u8; 64];
+        let size = client.read(&mut acknowledgement).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&acknowledgement[..size]).unwrap(),
+            "ok 1 subscribed\n"
+        );
+
+        subscriber
+            .lock()
+            .unwrap()
+            .last_mut()
+            .unwrap()
+            .write_all(b"{\"title\":\"Prism\",\"body\":\"ready\"}\n")
+            .unwrap();
+        let mut message = [0_u8; 64];
+        let size = client.read(&mut message).unwrap();
+        assert_eq!(
+            std::str::from_utf8(&message[..size]).unwrap(),
+            "{\"title\":\"Prism\",\"body\":\"ready\"}\n"
+        );
+    }
+
+    #[test]
     fn socket_and_lock_share_a_private_runtime_directory() {
         let socket = socket_path();
         assert_eq!(socket.parent(), Some(runtime_dir().as_path()));
@@ -1045,6 +1565,7 @@ mod tests {
                 instance_id: Some("test".to_string()),
                 pid: Some(std::process::id()),
                 active: 2,
+                notifications: false,
             })),
             Err(
                 "timed out waiting for Prism worker daemon to finish draining (2 active)"

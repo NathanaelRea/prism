@@ -316,21 +316,39 @@ pub fn agent_session_running(
     session: &Session,
     generation: u64,
 ) -> bool {
+    agent_session_running_result(repo, config, session, generation).unwrap_or(false)
+}
+
+pub fn agent_session_running_result(
+    repo: &Repository,
+    config: &Config,
+    session: &Session,
+    generation: u64,
+) -> Result<bool, String> {
     let runtime = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
-    tmux_agent_session_running(config, &runtime)
+    tmux_agent_session_running_result(config, &runtime)
 }
 
 fn tmux_agent_session_running(config: &Config, runtime: &TmuxAgentSession) -> bool {
-    if !matches!(session_exists(config, runtime.name()), Ok(true)) {
-        return false;
+    tmux_agent_session_running_result(config, runtime).unwrap_or(false)
+}
+
+fn tmux_agent_session_running_result(
+    config: &Config,
+    runtime: &TmuxAgentSession,
+) -> Result<bool, String> {
+    if !session_exists(config, runtime.name())? {
+        return Ok(false);
     }
     let target = runtime.target(TmuxWindow::Agent);
-    let Some(current_command) = pane_current_command(config, &target) else {
-        return false;
-    };
-    pane_command_matches_agent(config, &current_command)
-        || pane_start_command(config, &target)
-            .is_some_and(|command| pane_start_command_matches_agent(config, &command))
+    let current_command = pane_current_command_result(config, &target)?;
+    let start_command = pane_start_command_result(config, &target)?;
+    Ok(current_command
+        .as_deref()
+        .is_some_and(|command| pane_command_matches_agent(config, command))
+        || start_command
+            .as_deref()
+            .is_some_and(|command| pane_start_command_matches_agent(config, command)))
 }
 
 pub fn kill_agent_session(
@@ -360,6 +378,16 @@ pub fn latest_agent_session_generation(
     config: &Config,
     branch: &str,
 ) -> Option<u64> {
+    latest_agent_session_generation_result(repo, config, branch)
+        .ok()
+        .flatten()
+}
+
+pub fn latest_agent_session_generation_result(
+    repo: &Repository,
+    config: &Config,
+    branch: &str,
+) -> Result<Option<u64>, String> {
     let started = std::time::Instant::now();
     let prefix = agent_session_prefix(repo, branch);
     let sessions = agent_session_names_with_prefix(config, &prefix);
@@ -380,7 +408,7 @@ pub fn latest_agent_session_generation(
             crate::flight_recorder::unsigned("generation", generation.unwrap_or_default()),
         ],
     );
-    generation
+    sessions.map(|_| generation)
 }
 
 pub(crate) fn named_session_exists(config: &Config, expected: &str) -> Result<bool, String> {
@@ -764,13 +792,23 @@ fn kill_session(config: &Config, name: &str) -> Result<(), String> {
 }
 
 fn session_exists(config: &Config, name: &str) -> Result<bool, String> {
-    run_tmux_output_allow_failure(
+    let output = run_tmux_output_allow_failure(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
             .args(["has-session", "-t", name]),
         ProcessPolicy::TmuxPoll,
-    )
-    .map(|output| output.status.success())
+    )?;
+    if output.status.success() {
+        return Ok(true);
+    }
+    let error = output.stderr.trim();
+    if tmux_missing_session_error(error) || (error.is_empty() && output.status.code() == Some(1)) {
+        Ok(false)
+    } else if error.is_empty() {
+        Err(format!("tmux has-session exited with {}", output.status))
+    } else {
+        Err(error.to_string())
+    }
 }
 
 fn wait_for_agent_session_running(
@@ -1023,32 +1061,46 @@ fn opencode_runtime_for_session(
         .map_err(|error| format!("prepare harness runtime: {error}"))
 }
 
-fn pane_current_command(config: &Config, name: &str) -> Option<String> {
-    run_tmux_capture(
+fn pane_current_command_result(config: &Config, name: &str) -> Result<Option<String>, String> {
+    let result = run_tmux_capture(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
             .args(["display-message", "-p", "-t"])
             .arg(name)
             .arg("#{pane_current_command}"),
         ProcessPolicy::TmuxPoll,
-    )
-    .ok()
-    .map(|output| output.trim().to_string())
-    .filter(|output| !output.is_empty())
+    );
+    match result {
+        Ok(output) => {
+            let output = output.trim().to_string();
+            Ok((!output.is_empty()).then_some(output))
+        }
+        Err(error) if tmux_missing_session_error(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn pane_start_command(config: &Config, name: &str) -> Option<String> {
-    run_tmux_capture(
+    pane_start_command_result(config, name).ok().flatten()
+}
+
+fn pane_start_command_result(config: &Config, name: &str) -> Result<Option<String>, String> {
+    let result = run_tmux_capture(
         Command::new(config.tool("tmux"))
             .env_remove("TMUX")
             .args(["display-message", "-p", "-t"])
             .arg(name)
             .arg("#{pane_start_command}"),
         ProcessPolicy::TmuxPoll,
-    )
-    .ok()
-    .map(|output| output.trim().to_string())
-    .filter(|output| !output.is_empty())
+    );
+    match result {
+        Ok(output) => {
+            let output = output.trim().to_string();
+            Ok((!output.is_empty()).then_some(output))
+        }
+        Err(error) if tmux_missing_session_error(&error) => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn pane_command_matches_agent(config: &Config, pane_command: &str) -> bool {
