@@ -1,10 +1,13 @@
 mod common;
 
 use std::fs;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use common::CompactTempDir as TempDir;
@@ -277,6 +280,78 @@ fn worker_ensure_allows_active_work_to_drain_before_replacement() {
         ensure_while_draining.status.success(),
         "ensure while draining failed: {}",
         String::from_utf8_lossy(&ensure_while_draining.stderr)
+    );
+}
+
+#[test]
+fn worker_ensure_schedules_replacement_for_active_legacy_draining_daemon() {
+    let _serial = serial_worker_test();
+    let temp = TempDir::new("worker-legacy-draining");
+    let runtime = temp.runtime_path().to_path_buf();
+    let home = temp.path.join("home");
+    fs::create_dir_all(&runtime).unwrap();
+    fs::create_dir_all(&home).unwrap();
+
+    let socket = runtime.join("worker.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let server_stop = Arc::clone(&stop);
+    let server = std::thread::spawn(move || {
+        loop {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) => panic!("accept legacy worker request: {error}"),
+            };
+            let mut request = [0_u8; 64];
+            let size = stream.read(&mut request).unwrap();
+            let request = std::str::from_utf8(&request[..size]).unwrap().trim();
+            if server_stop.load(Ordering::Acquire) && request == "health" {
+                return;
+            }
+            match request {
+                "health" => stream
+                    .write_all(b"ok 1 legacy pid=42 state=draining active=1 exe=legacy\n")
+                    .unwrap(),
+                "replace" => stream.write_all(b"error unknown-command\n").unwrap(),
+                request => panic!("unexpected legacy worker request: {request}"),
+            }
+        }
+    });
+
+    let ensure = run(&runtime, &home, &["worker", "ensure"]);
+    stop.store(true, Ordering::Release);
+    server.join().unwrap();
+    fs::remove_file(&socket).unwrap();
+
+    assert!(
+        ensure.status.success(),
+        "ensure against legacy draining worker failed: {}",
+        String::from_utf8_lossy(&ensure.stderr)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let health = run(&runtime, &home, &["worker", "health"]);
+        if health.status.success()
+            && String::from_utf8_lossy(&health.stdout).contains("state=running active=0")
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replacement daemon did not start"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        run(&runtime, &home, &["worker", "shutdown"])
+            .status
+            .success()
     );
 }
 

@@ -220,8 +220,11 @@ pub fn ensure_running() -> Result<(), String> {
                 state: DaemonState::Draining,
                 ..
             } => {
-                if current.active > 0 && request_worker_replacement(&socket, &executable_identity)?
-                {
+                if current.active > 0 {
+                    if request_worker_replacement(&socket, &executable_identity)? {
+                        return Ok(());
+                    }
+                    spawn_worker_replacement()?;
                     return Ok(());
                 }
                 health = wait_for_drain_transition(DAEMON_TRANSITION_TIMEOUT, || {
