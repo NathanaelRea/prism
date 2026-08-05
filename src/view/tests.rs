@@ -213,6 +213,8 @@ fn renders_selected_sidebar_rows_with_focused_style() {
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     let buffer = render_to_buffer(&model, 120, 30);
     let (_, row) = sidebar_cell_containing(&buffer, "feature");
+    let (git_x, git_row) = sidebar_cell_containing(&buffer, "✓");
+    assert_eq!(git_row, row);
 
     assert_cell_style(
         &buffer,
@@ -233,7 +235,7 @@ fn renders_selected_sidebar_rows_with_focused_style() {
     );
     assert_cell_style(
         &buffer,
-        23,
+        git_x,
         row,
         Style::default()
             .fg(Color::Green)
@@ -436,6 +438,32 @@ fn worktree_sidebar_keeps_configured_columns_before_prompt_text() {
 
     assert!(row.contains("3"), "got {row:?}");
     assert!(row.contains("agent"), "got {row:?}");
+}
+
+#[test]
+fn wide_worktree_sidebar_uses_extra_space_for_branch_names() {
+    let mut config = test_config();
+    config.layout.sidebar_width = Some(72);
+    config.worktree_columns = vec!["owner".to_string()];
+    let mut session = test_session("feature/sidebar-width-fix", AgentState::Running);
+    session
+        .wt_columns
+        .insert("owner".to_string(), "agent".to_string());
+    let sessions = vec![session];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let buffer = render_to_buffer(&model, 120, 30);
+    let (_, row_y) = sidebar_cell_containing(&buffer, "feature/sid");
+    let row = region_text(&buffer, 0..72, row_y..row_y + 1);
+
+    assert!(row.contains("feature/sidebar-width-fix"), "got {row:?}");
+    assert!(row.contains("agent"), "got {row:?}");
+}
+
+#[test]
+fn worktree_branch_width_is_bounded_and_reserves_configured_columns() {
+    assert_eq!(worktree_branch_width(20, &[]), 12);
+    assert_eq!(worktree_branch_width(100, &[]), 32);
+    assert_eq!(worktree_branch_width(70, &[("owner", 12), ("url", 12)]), 22);
 }
 
 #[test]
