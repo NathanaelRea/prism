@@ -889,11 +889,19 @@ fn reserve_and_wake_next(conn: &Connection, lane_key: &str) -> Result<Option<Str
 }
 
 fn wake_toggled_auto_run(conn: &Connection, run_id: &str) -> Result<(), String> {
-    let (status, pause_requested) = conn
+    let (status, pause_requested, stabilization_blocker, stabilization_next_work) = conn
         .query_row(
-            "select status, pause_requested from auto_run where id = ?1",
+            "select status, pause_requested, stabilization_blocker, stabilization_next_work
+             from auto_run where id = ?1",
             [run_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? != 0)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            },
         )
         .optional()
         .map_err(|error| format!("inspect merge-intent Auto Flow: {error}"))?
@@ -901,15 +909,26 @@ fn wake_toggled_auto_run(conn: &Connection, run_id: &str) -> Result<(), String> 
     if status == "aborted" {
         return Err("merge intent cannot wake an aborted Auto Flow run".to_string());
     }
-    if pause_requested {
+    let manual_merge_gate = stabilization_blocker.as_deref()
+        == Some(
+            crate::auto_flow::stabilization_model::StabilizationBlocker::ReadyForManualMerge
+                .as_str(),
+        )
+        && stabilization_next_work.as_deref()
+            == Some(
+                crate::auto_flow::stabilization_model::StabilizationWorkKind::MarkReadyForManualMerge
+                    .as_str(),
+            );
+    if pause_requested && !manual_merge_gate {
         return Ok(());
     }
     let changed = conn
         .execute(
             "update auto_run
              set status = case when status = 'running' then 'running' else 'queued' end,
+                 pause_requested = 0,
                  updated_unix_ms = ?1
-             where id = ?2 and status != 'aborted' and pause_requested = 0",
+             where id = ?2 and status != 'aborted'",
             params![u64_to_i64(crate::auto_flow::unix_ms()), run_id],
         )
         .map_err(|error| format!("wake merge-intent Auto Flow: {error}"))?;
@@ -1097,6 +1116,45 @@ mod tests {
             )
             .unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn arming_merge_intent_resumes_manual_merge_gate() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::auto_flow::migrate_schema(&conn).unwrap();
+        crate::plan_run::migrate_schema(&conn).unwrap();
+        crate::execution::migrate_schema(&conn).unwrap();
+        let mut run = saved_run(&conn, "feature");
+        run.run.status = crate::auto_flow::AutoRunStatus::Paused;
+        run.run.pause_requested = true;
+        run.run.stabilization_status =
+            Some(crate::auto_flow::stabilization_model::StabilizationStatus::Ready);
+        run.run.stabilization_blocker =
+            Some(crate::auto_flow::stabilization_model::StabilizationBlocker::ReadyForManualMerge);
+        run.run.stabilization_next_work = Some(
+            crate::auto_flow::stabilization_model::StabilizationWorkKind::MarkReadyForManualMerge,
+        );
+        crate::auto_flow::save_auto_run(&conn, &mut run).unwrap();
+
+        let intent = toggle_merge_intent(&conn, &run.run.id, false).unwrap();
+
+        let loaded = crate::auto_flow::load_auto_run(&conn, &run.run.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.state, MergeIntentState::Armed);
+        assert_eq!(loaded.run.status, crate::auto_flow::AutoRunStatus::Queued);
+        assert!(!loaded.run.pause_requested);
+        assert_eq!(
+            crate::execution::dispatch_state(
+                &conn,
+                &crate::execution::WorkflowIdentity::new(
+                    crate::execution::WorkflowKind::Auto,
+                    &run.run.id,
+                ),
+            )
+            .unwrap(),
+            Some(crate::execution::DispatchState::Queued)
         );
     }
 
