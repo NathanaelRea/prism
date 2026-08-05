@@ -219,12 +219,13 @@ fn real_worker_executes_a_queued_plan_and_persists_lifecycle() {
     assert!(db_path.status.success());
     let db_path = PathBuf::from(String::from_utf8_lossy(&db_path.stdout).trim());
     let conn = rusqlite::Connection::open(&db_path).unwrap();
+    insert_active_worktree_session(&conn, "00000000000000000000000000000001", &repo);
     conn.execute(
         "insert into plan_run (
-           id, harness_id, adapter_id, repo_root, scope_path, plan_path, plan_display,
+           id, harness_id, adapter_id, repo_root, scope_path, worktree_session_id, plan_path, plan_display,
            step_name, start_step, total_steps, mode, status, pause_requested,
            selected_step, created_unix_ms, updated_unix_ms
-         ) values ('worker-plan', 'test', 'generic', ?1, ?1, ?2, 'plan.md',
+         ) values ('worker-plan', 'test', 'generic', ?1, ?1, '00000000000000000000000000000001', ?2, 'plan.md',
                    'Phase', 1, 1, 'sequential', 'queued', 0, 1, 1, 1)",
         rusqlite::params![
             repo.display().to_string(),
@@ -268,7 +269,34 @@ fn real_worker_executes_a_queued_plan_and_persists_lifecycle() {
                     |row| row.get(0),
                 )
                 .unwrap();
-            assert_eq!(status, "done");
+            if status != "done" {
+                let step: (String, Option<String>) = conn
+                    .query_row(
+                        "select status, error from plan_step_run where run_id = 'worker-plan'",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .unwrap();
+                let active = conn
+                    .prepare("select worktree_session_id, repo_root, worktree_path from active_worktree_session")
+                    .unwrap()
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                let failure: Option<String> = conn
+                    .query_row(
+                        "select message from event where action = 'executor_failed' order by id desc limit 1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                panic!(
+                    "worker plan ended as {status}; step={step:?}; active={active:?}; failure={failure:?}"
+                );
+            }
             let output: String = conn
                 .query_row(
                     "select text from plan_output_line
@@ -344,12 +372,13 @@ fn daemon_crash_leaves_claimed_work_recovery_pending() {
     assert!(db.status.success());
     let db = PathBuf::from(String::from_utf8_lossy(&db.stdout).trim());
     let conn = rusqlite::Connection::open(&db).unwrap();
+    insert_active_worktree_session(&conn, "00000000000000000000000000000002", &repo);
     conn.execute(
         "insert into plan_run (id, harness_id, adapter_id, repo_root, scope_path, plan_path,
            plan_display, step_name, start_step, total_steps, mode, status, pause_requested,
-           selected_step, created_unix_ms, updated_unix_ms)
+           selected_step, created_unix_ms, updated_unix_ms, worktree_session_id)
          values ('crash-plan', 'test', 'generic', ?1, ?1, ?2, 'plan.md', 'Phase', 1, 1,
-                 'sequential', 'queued', 0, 1, 1, 1)",
+                   'sequential', 'queued', 0, 1, 1, 1, '00000000000000000000000000000002')",
         rusqlite::params![
             repo.display().to_string(),
             repo.join("plan.md").display().to_string()
@@ -437,4 +466,32 @@ fn daemon_crash_leaves_claimed_work_recovery_pending() {
             .status
             .success()
     );
+}
+
+fn insert_active_worktree_session(conn: &rusqlite::Connection, id: &str, repo: &Path) {
+    let path = repo.display().to_string();
+    let mut repo_hash = 0xcbf29ce484222325_u64;
+    for byte in path.as_bytes() {
+        repo_hash ^= u64::from(*byte);
+        repo_hash = repo_hash.wrapping_mul(0x100000001b3);
+    }
+    fs::write(
+        repo.join(".git/prism-worktree-session-id"),
+        format!("{repo_hash:016x}:{id}\n"),
+    )
+    .unwrap();
+    conn.execute(
+        "insert into worktree_session
+         (id, repo_root, initial_branch, initial_worktree_path, created_unix_ms)
+         values (?1, ?2, 'main', ?2, 1)",
+        rusqlite::params![id, path],
+    )
+    .unwrap();
+    conn.execute(
+        "insert into active_worktree_session
+         (worktree_session_id, repo_root, branch, worktree_path, worktree_incarnation, observed_unix_ms)
+         values (?1, ?2, 'main', ?2, 'test', 1)",
+        rusqlite::params![id, path],
+    )
+    .unwrap();
 }

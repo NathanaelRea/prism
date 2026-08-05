@@ -44,6 +44,14 @@ pub fn apply_auto_run_control(
     let mut persisted =
         load_auto_run(conn, run_id)?.ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
     let mut warnings = Vec::new();
+    if matches!(
+        intent,
+        AutoRunControlIntent::Resume
+            | AutoRunControlIntent::RetryFailed
+            | AutoRunControlIntent::RetryFromStep { .. }
+    ) {
+        require_active_auto_run(conn, &persisted.run)?;
+    }
     let (effect, executor) = match intent {
         AutoRunControlIntent::Pause => {
             request_auto_run_pause(conn, &mut persisted)?;
@@ -606,6 +614,7 @@ pub fn prepare_auto_run_for_resume(
     persisted: &mut PersistedAutoRun,
     max_output_lines_per_step: usize,
 ) -> Result<bool, String> {
+    require_active_auto_run(conn, &persisted.run)?;
     let was_paused = persisted.run.pause_requested || persisted.run.status == AutoRunStatus::Paused;
     let linked_changed = reconcile_linked_plan_runs(conn, persisted, max_output_lines_per_step)?;
     let changed = reconcile_stale_auto_run(conn, persisted)? || linked_changed;
@@ -657,6 +666,19 @@ pub fn prepare_auto_run_for_resume(
         let _ = max_output_lines_per_step;
         Ok(false)
     }
+}
+
+fn require_active_auto_run(conn: &rusqlite::Connection, run: &AutoRun) -> Result<(), String> {
+    run.worktree_session_id.as_deref().ok_or_else(|| {
+        "auto flow run has no Worktree Session identity; legacy runs cannot execute".to_string()
+    })?;
+    crate::execution::require_active_worktree_session(
+        conn,
+        &crate::execution::WorkflowIdentity::new(
+            crate::execution::WorkflowKind::Auto,
+            run.id.clone(),
+        ),
+    )
 }
 
 pub(super) fn reset_auto_step_for_retry(step: &mut AutoStepRun) {

@@ -189,6 +189,13 @@ pub(super) fn execute_run_plan_step(
         .with_harness(
             persisted.run.harness_id.clone(),
             persisted.run.adapter_id.clone(),
+        )
+        .with_worktree_session_id(
+            persisted
+                .run
+                .worktree_session_id
+                .clone()
+                .ok_or_else(|| "auto flow run has no Worktree Session identity".to_string())?,
         );
     let mut plan_run = if let Some(plan_run_id) = persisted.steps[step_index].plan_run_id.as_deref()
     {

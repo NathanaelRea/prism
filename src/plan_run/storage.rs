@@ -9,6 +9,7 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
           adapter_id text not null default 'opencode',
           repo_root text not null,
           scope_path text not null,
+          worktree_session_id text,
           plan_path text not null,
           plan_display text not null,
           step_name text not null,
@@ -73,6 +74,12 @@ pub fn migrate_schema(conn: &rusqlite::Connection) -> Result<(), String> {
         ",
     )
     .map_err(|error| format!("create plan run schema: {error}"))?;
+    add_column_if_missing(
+        conn,
+        "plan_run",
+        "worktree_session_id",
+        "alter table plan_run add column worktree_session_id text",
+    )?;
     add_column_if_missing(
         conn,
         "plan_run",
@@ -229,6 +236,12 @@ pub fn load_resumable_plan_run(
     conn: &rusqlite::Connection,
     launch: &PlanLaunch,
 ) -> Result<Option<PersistedPlanRun>, String> {
+    let worktree_session_id = launch.worktree_session_id.as_deref().ok_or_else(|| {
+        "plan launch has no Worktree Session identity; resumable lookup is fenced".to_string()
+    })?;
+    if !crate::session::worktree_session_is_active(conn, worktree_session_id)? {
+        return Err("plan launch belongs to an inactive Worktree Session".to_string());
+    }
     let run_id = conn
         .query_row(
             "select id
@@ -241,7 +254,8 @@ pub fn load_resumable_plan_run(
                 and total_steps = ?6
                 and mode = ?7
                  and harness_id = ?8
-                 and adapter_id = ?9
+                  and adapter_id = ?9
+                  and worktree_session_id = ?10
                and archived_unix_ms is null
                and status in ('queued', 'running', 'paused')
              order by updated_unix_ms desc
@@ -256,6 +270,7 @@ pub fn load_resumable_plan_run(
                 launch.mode.as_str(),
                 launch.harness_id.as_str(),
                 launch.adapter_id.as_str(),
+                worktree_session_id,
             ],
             |row| row.get::<_, String>(0),
         )
@@ -274,15 +289,16 @@ pub fn save_plan_step(conn: &rusqlite::Connection, step: &PlanStepRun) -> Result
 pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &PlanRun) -> Result<(), String> {
     conn.execute(
         "insert into plan_run (
-           id, harness_id, repo_root, scope_path, plan_path, plan_display, step_name, start_step,
+           id, harness_id, repo_root, scope_path, worktree_session_id, plan_path, plan_display, step_name, start_step,
            total_steps, mode, status, pause_requested, selected_step, created_unix_ms,
-           updated_unix_ms, archived_unix_ms, adapter_id
-         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+            updated_unix_ms, archived_unix_ms, adapter_id
+          ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
          on conflict(id) do update set
             repo_root = excluded.repo_root,
             harness_id = excluded.harness_id,
             adapter_id = excluded.adapter_id,
            scope_path = excluded.scope_path,
+           worktree_session_id = excluded.worktree_session_id,
            plan_path = excluded.plan_path,
            plan_display = excluded.plan_display,
            step_name = excluded.step_name,
@@ -300,6 +316,7 @@ pub(super) fn save_run_with_conn(conn: &rusqlite::Connection, run: &PlanRun) -> 
             run.harness_id.as_str(),
             run.repo_root.as_str(),
             run.scope_path.display().to_string(),
+            run.worktree_session_id.as_deref(),
             run.plan_path.display().to_string(),
             run.plan_display.as_str(),
             run.step_name.as_str(),
@@ -392,34 +409,35 @@ pub(super) fn load_run_with_conn(
     run_id: &str,
 ) -> Result<Option<PlanRun>, String> {
     conn.query_row(
-        "select id, harness_id, repo_root, scope_path, plan_path, plan_display, step_name,
+        "select id, harness_id, repo_root, scope_path, worktree_session_id, plan_path, plan_display, step_name,
                 start_step, total_steps, mode, status, pause_requested, selected_step,
                  created_unix_ms, updated_unix_ms, archived_unix_ms, adapter_id
          from plan_run
          where id = ?1",
         params![run_id],
         |row| {
-            let mode: String = row.get(9)?;
-            let status: String = row.get(10)?;
+            let mode: String = row.get(10)?;
+            let status: String = row.get(11)?;
             Ok(PlanRun {
                 id: row.get(0)?,
                 harness_id: row.get(1)?,
-                adapter_id: row.get(16)?,
+                adapter_id: row.get(17)?,
                 repo_root: row.get(2)?,
                 scope_path: PathBuf::from(row.get::<_, String>(3)?),
-                plan_path: PathBuf::from(row.get::<_, String>(4)?),
-                plan_display: row.get(5)?,
-                step_name: row.get(6)?,
-                start_step: i64_to_usize(row.get(7)?, 7),
-                total_steps: i64_to_usize(row.get(8)?, 8),
+                worktree_session_id: row.get(4)?,
+                plan_path: PathBuf::from(row.get::<_, String>(5)?),
+                plan_display: row.get(6)?,
+                step_name: row.get(7)?,
+                start_step: i64_to_usize(row.get(8)?, 8),
+                total_steps: i64_to_usize(row.get(9)?, 9),
                 mode: PlanRunMode::parse(&mode).map_err(from_string_error)?,
                 status: PlanRunStatus::parse(&status).map_err(from_string_error)?,
-                pause_requested: row.get::<_, i64>(11)? != 0,
-                selected_step: i64_to_usize(row.get(12)?, 12),
-                created_unix_ms: i64_to_u64(row.get(13)?, 13),
-                updated_unix_ms: i64_to_u64(row.get(14)?, 14),
+                pause_requested: row.get::<_, i64>(12)? != 0,
+                selected_step: i64_to_usize(row.get(13)?, 13),
+                created_unix_ms: i64_to_u64(row.get(14)?, 14),
+                updated_unix_ms: i64_to_u64(row.get(15)?, 15),
                 archived_unix_ms: row
-                    .get::<_, Option<i64>>(15)?
+                    .get::<_, Option<i64>>(16)?
                     .map(|value| value.max(0) as u64),
             })
         },

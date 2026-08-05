@@ -272,9 +272,23 @@ fn open_writable_inner(path: &Path) -> Result<Connection, StorageError> {
         {
             return Ok(conn);
         }
-        validate_complete_schema(&conn)?;
-        validate_foreign_keys(&conn)?;
-        apply_additive_schema_migrations(&conn)?;
+        conn.execute_batch("begin immediate").map_err(|error| {
+            StorageError::from_sqlite("begin additive schema validation", error, started.elapsed())
+        })?;
+        let validation = apply_additive_schema_migrations(&conn)
+            .and_then(|()| validate_complete_schema(&conn))
+            .and_then(|()| validate_foreign_keys(&conn));
+        if let Err(error) = validation {
+            let _ = conn.execute_batch("rollback");
+            return Err(error);
+        }
+        conn.execute_batch("commit").map_err(|error| {
+            StorageError::from_sqlite(
+                "commit additive schema validation",
+                error,
+                started.elapsed(),
+            )
+        })?;
         mark_database_validated_if_unchanged(path, identity)?;
         return Ok(conn);
     }
@@ -668,9 +682,9 @@ fn migrate(
                 return Err(future_version_error(path, version));
             }
             if version == CURRENT_SCHEMA_VERSION {
+                apply_additive_schema_migrations(conn)?;
                 validate_complete_schema(conn)?;
                 validate_foreign_keys(conn)?;
-                apply_additive_schema_migrations(conn)?;
                 execute_batch(conn, "commit", "commit schema validation transaction")?;
                 transaction.committed();
                 return Ok(None);
@@ -758,6 +772,7 @@ fn apply_additive_schema_migrations(conn: &Connection) -> Result<(), StorageErro
 fn additive_schema_current(conn: &Connection) -> Result<bool, StorageError> {
     Ok(table_has_column(conn, "pr_cache", "author")?
         && table_has_column(conn, "pending_worktree_deletion", "branch_deleted")?
+        && table_has_column(conn, "active_worktree_session", "worktree_session_id")?
         && table_has_column(conn, "merge_intent", "placement")?
         && table_has_column(conn, "workflow_execution", "execution_version")?
         && table_has_column(conn, "workflow_execution", "not_before_unix_ms")?
@@ -828,6 +843,31 @@ const REQUIRED_TABLES: &[RequiredTable] = &[
         name: "startup_phase",
         columns: &["id", "run_id", "phase", "time_started_unix_ms", "status"],
         primary_key: &["id"],
+        minimum_foreign_keys: 1,
+    },
+    RequiredTable {
+        name: "worktree_session",
+        columns: &[
+            "id",
+            "repo_root",
+            "initial_branch",
+            "initial_worktree_path",
+            "created_unix_ms",
+        ],
+        primary_key: &["id"],
+        minimum_foreign_keys: 0,
+    },
+    RequiredTable {
+        name: "active_worktree_session",
+        columns: &[
+            "worktree_session_id",
+            "repo_root",
+            "branch",
+            "worktree_path",
+            "worktree_incarnation",
+            "observed_unix_ms",
+        ],
+        primary_key: &["worktree_session_id"],
         minimum_foreign_keys: 1,
     },
     RequiredTable {

@@ -40,6 +40,9 @@ pub fn apply_plan_run_control(
     let mut persisted =
         load_plan_run(conn, run_id)?.ok_or_else(|| format!("plan run not found: {run_id}"))?;
     let mut warnings = Vec::new();
+    if intent == PlanRunControlIntent::Resume {
+        require_active_plan_run(conn, &persisted.run)?;
+    }
     let (effect, executor) = match intent {
         PlanRunControlIntent::Pause => {
             request_plan_run_pause(conn, &mut persisted)?;
@@ -98,6 +101,7 @@ pub fn prepare_plan_run_for_resume(
     persisted: &mut PersistedPlanRun,
     max_output_lines_per_step: usize,
 ) -> Result<bool, String> {
+    require_active_plan_run(conn, &persisted.run)?;
     let mut changed = false;
     let mut has_live_child = false;
     for step in &mut persisted.steps {
@@ -215,6 +219,7 @@ pub fn reconcile_stale_plan_run(
     persisted: &mut PersistedPlanRun,
     max_output_lines_per_step: usize,
 ) -> Result<bool, String> {
+    require_active_plan_run(conn, &persisted.run)?;
     reconcile_stale_plan_run_with_observer(
         conn,
         persisted,
@@ -453,6 +458,7 @@ pub fn retry_failed_steps(
     conn: &rusqlite::Connection,
     persisted: &mut PersistedPlanRun,
 ) -> Result<(), String> {
+    require_active_plan_run(conn, &persisted.run)?;
     let mut first = None;
     for step in &mut persisted.steps {
         if matches!(
@@ -478,6 +484,7 @@ pub fn retry_from_step(
     persisted: &mut PersistedPlanRun,
     selected_step: usize,
 ) -> Result<(), String> {
+    require_active_plan_run(conn, &persisted.run)?;
     let mut found = false;
     for step in &mut persisted.steps {
         if step.step < selected_step {
@@ -557,6 +564,7 @@ pub fn resume_paused_plan_run(
     conn: &rusqlite::Connection,
     persisted: &mut PersistedPlanRun,
 ) -> Result<(), String> {
+    require_active_plan_run(conn, &persisted.run)?;
     if !persisted.run.pause_requested && persisted.run.status != PlanRunStatus::Paused {
         return Err("plan run is not paused".to_string());
     }
@@ -564,6 +572,19 @@ pub fn resume_paused_plan_run(
     persisted.run.status = persisted.aggregate_status();
     persisted.run.updated_unix_ms = unix_ms();
     save_run_with_conn(conn, &persisted.run)
+}
+
+fn require_active_plan_run(conn: &rusqlite::Connection, run: &PlanRun) -> Result<(), String> {
+    run.worktree_session_id.as_deref().ok_or_else(|| {
+        "plan run has no Worktree Session identity; legacy runs cannot execute".to_string()
+    })?;
+    crate::execution::require_active_worktree_session(
+        conn,
+        &crate::execution::WorkflowIdentity::new(
+            crate::execution::WorkflowKind::Plan,
+            run.id.clone(),
+        ),
+    )
 }
 
 pub fn archive_plan_run(

@@ -12,6 +12,7 @@ pub struct AutoRun {
     pub repo_root: String,
     pub worktree_path: PathBuf,
     pub worktree_incarnation: Option<String>,
+    pub worktree_session_id: Option<String>,
     pub branch: String,
     pub mode: AutoRunMode,
     pub implementation_source: AutoImplementationSource,
@@ -84,6 +85,7 @@ pub struct AutoLaunch {
     pub repo_root: String,
     pub worktree_path: PathBuf,
     worktree_incarnation: Option<String>,
+    worktree_session_id: Option<String>,
     pub branch: String,
     pub mode: AutoRunMode,
     pub implementation_source: AutoImplementationSource,
@@ -451,6 +453,11 @@ impl AutoLaunch {
             worktree_incarnation: nonempty_incarnation(crate::session::worktree_incarnation(
                 worktree_path,
             )),
+            worktree_session_id: if cfg!(test) {
+                Some("test-worktree-session".to_string())
+            } else {
+                None
+            },
             branch,
             mode,
             implementation_source,
@@ -480,6 +487,11 @@ impl AutoLaunch {
         self
     }
 
+    pub(crate) fn with_worktree_session_id(mut self, id: impl Into<String>) -> Self {
+        self.worktree_session_id = Some(id.into());
+        self
+    }
+
     pub fn create_run(&self) -> PersistedAutoRun {
         let now = unix_ms();
         let id = self.default_run_id(now);
@@ -490,6 +502,7 @@ impl AutoLaunch {
             repo_root: self.repo_root.clone(),
             worktree_path: self.worktree_path.clone(),
             worktree_incarnation: self.worktree_incarnation.clone(),
+            worktree_session_id: self.worktree_session_id.clone(),
             branch: self.branch.clone(),
             mode: self.mode,
             implementation_source: self.implementation_source,

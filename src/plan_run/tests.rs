@@ -2,6 +2,58 @@ use super::*;
 use std::os::unix::fs::PermissionsExt;
 
 #[test]
+fn resumable_lookup_fences_replaced_same_path_and_legacy_runs() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    conn.execute_batch(
+        "create table worktree_session (
+           id text primary key, repo_root text not null, initial_branch text not null,
+           initial_worktree_path text not null, created_unix_ms integer not null
+         );
+         create table active_worktree_session (
+           worktree_session_id text primary key references worktree_session(id),
+           repo_root text not null, branch text not null, worktree_path text not null,
+           worktree_incarnation text not null, observed_unix_ms integer not null,
+           unique(repo_root, branch), unique(repo_root, worktree_path)
+         );
+         insert into worktree_session values
+           ('session-old', '/repo/prism', 'feature', '/repo/prism/feature', 1),
+           ('session-new', '/repo/prism', 'feature', '/repo/prism/feature', 2);
+         insert into active_worktree_session values
+           ('session-new', '/repo/prism', 'feature', '/repo/prism/feature', 'new', 2);",
+    )
+    .unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let scope = repo.join("feature");
+    let plan = scope.join("plan.md");
+    let old_launch = PlanLaunch::new(&repo, &scope, &plan, "phase", 1, 1, PlanRunMode::Sequential)
+        .unwrap()
+        .with_worktree_session_id("session-old");
+    let old = old_launch.create_run();
+    save_plan_run(&conn, &old).unwrap();
+
+    let error = load_resumable_plan_run(&conn, &old_launch).unwrap_err();
+    assert!(error.contains("inactive Worktree Session"), "{error}");
+    assert!(load_plan_run(&conn, &old.run.id).unwrap().is_some());
+
+    let mut legacy_launch =
+        PlanLaunch::new(&repo, &scope, &plan, "phase", 1, 1, PlanRunMode::Sequential).unwrap();
+    legacy_launch.worktree_session_id = None;
+    let legacy = legacy_launch.create_run();
+    save_plan_run(&conn, &legacy).unwrap();
+    assert_eq!(
+        load_plan_run(&conn, &legacy.run.id)
+            .unwrap()
+            .unwrap()
+            .run
+            .worktree_session_id,
+        None
+    );
+    let error = load_resumable_plan_run(&conn, &legacy_launch).unwrap_err();
+    assert!(error.contains("resumable lookup is fenced"), "{error}");
+}
+
+#[test]
 fn launch_creates_queued_steps_with_prompts() {
     let repo = PathBuf::from("/repo/prism");
     let plan = repo.join("plan-plan.md");

@@ -3727,6 +3727,7 @@ fn test_session(branch: &str, pr: PrCache) -> Session {
         repo_label: "repo".to_string(),
         repo_key: None,
         path: PathBuf::from("/tmp").join(branch),
+        worktree_session_id: format!("test-{branch}"),
         incarnation: String::new(),
         path_display: format!("/tmp/{branch}"),
         branch: branch.to_string(),
