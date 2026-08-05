@@ -425,16 +425,6 @@ pub(crate) fn publish_ready(
                 |row| row.get::<_, i64>(0),
             )
             .map_err(|error| format!("read integration ready sequence: {error}"))?;
-        tx.execute(
-            "update integration_lane
-             set next_ready_sequence = ?1, updated_unix_ms = ?2 where lane_key = ?3",
-            params![
-                sequence.saturating_add(1),
-                u64_to_i64(crate::auto_flow::unix_ms()),
-                lane_key
-            ],
-        )
-        .map_err(|error| format!("advance integration ready sequence: {error}"))?;
         let published = tx
             .execute(
                 "update merge_intent
@@ -451,6 +441,16 @@ pub(crate) fn publish_ready(
         if published != 1 {
             return Err("merge intent changed while publishing integration readiness".to_string());
         }
+        tx.execute(
+            "update integration_lane
+             set next_ready_sequence = ?1, updated_unix_ms = ?2 where lane_key = ?3",
+            params![
+                sequence.saturating_add(1),
+                u64_to_i64(crate::auto_flow::unix_ms()),
+                lane_key
+            ],
+        )
+        .map_err(|error| format!("advance integration ready sequence: {error}"))?;
         intent.ready_sequence = Some(i64_to_u64(sequence));
     }
     let reserved = reserved_intent_id(&tx, &lane_key)?;

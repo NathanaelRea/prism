@@ -635,6 +635,16 @@ pub fn install_claim_guards(conn: &Connection, claim: &ExecutionClaim) -> Result
             } else {
                 "owned.id = old.reserved_intent_id"
             };
+            let readiness_sequence_ownership = if operation == "update" {
+                "or (
+                   owned.placement = 'ready'
+                   and owned.ready_sequence = old.next_ready_sequence
+                   and old.reserved_intent_id is new.reserved_intent_id
+                   and new.next_ready_sequence = old.next_ready_sequence + 1
+                 )"
+            } else {
+                ""
+            };
             rows.into_iter()
                 .map(|row| {
                     format!(
@@ -645,10 +655,11 @@ pub fn install_claim_guards(conn: &Connection, claim: &ExecutionClaim) -> Result
                               where owned.run_id = g.run_id
                                 and owned.state = 'armed'
                                 and owned.lane_key = {row}.lane_key
-                                and (
-                                  owned.placement in ('reserved', 'updating', 'submitting', 'submitted')
-                                  or {reservation_ownership}
-                                )
+                                 and (
+                                   owned.placement in ('reserved', 'updating', 'submitting', 'submitted')
+                                   or {reservation_ownership}
+                                   {readiness_sequence_ownership}
+                                 )
                             )
                          )"
                     )
@@ -1933,6 +1944,62 @@ mod tests {
 
         assert_stale(managed.execute(
             "update plan_run set updated_unix_ms = 2 where id = 'unrelated'",
+            [],
+        ));
+
+        drop(managed);
+        drop(other);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn auto_claim_can_allocate_ready_sequence_for_its_not_ready_intent() {
+        let (path, mut managed, other) = connections("auto-ready-sequence-guard");
+        let workflow = WorkflowIdentity::new(WorkflowKind::Auto, "auto-ready");
+        enqueue(&managed, &workflow).unwrap();
+        let claim = claim(&mut managed, &workflow, "daemon", "worker")
+            .unwrap()
+            .unwrap();
+        managed
+            .execute(
+                "insert into merge_intent (
+                   id, run_id, generation, state, placement, lane_key, head_sha,
+                   created_unix_ms, updated_unix_ms
+                 ) values (30, ?1, 1, 'armed', 'not_ready', 'github|example|repo|main',
+                   'head', 1, 1)",
+                [&workflow.run_id],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "insert into integration_lane (
+                   lane_key, next_ready_sequence, reserved_intent_id, updated_unix_ms
+                 ) values ('github|example|repo|main', 1, null, 1)",
+                [],
+            )
+            .unwrap();
+        install_claim_guards(&managed, &claim).unwrap();
+
+        managed
+            .execute(
+                "update merge_intent
+                 set placement = 'ready', ready_sequence = 1, updated_unix_ms = 2
+                 where id = 30",
+                [],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "update integration_lane
+                 set next_ready_sequence = 2, updated_unix_ms = 2
+                 where lane_key = 'github|example|repo|main'",
+                [],
+            )
+            .unwrap();
+        assert_stale(managed.execute(
+            "update integration_lane
+             set next_ready_sequence = 3, updated_unix_ms = 3
+             where lane_key = 'github|example|repo|main'",
             [],
         ));
 
