@@ -562,13 +562,19 @@ fn review_facts(
             .is_none_or(|error| error.trim().is_empty())
             && policy.require_conversation_resolution
     });
-    let review_comment_count = details
+    let review_feedback_count = details
         .map(|details| {
-            details
+            let inline_comments = details
                 .review_comments
                 .iter()
                 .filter(|comment| !comment.body.trim().is_empty())
-                .count()
+                .count();
+            let review_submissions = details
+                .reviews
+                .iter()
+                .filter(|review| !review.body.trim().is_empty())
+                .count();
+            inline_comments + review_submissions
         })
         .unwrap_or(0);
 
@@ -639,7 +645,7 @@ fn review_facts(
         feedback_required: config.auto.review_requirement != ReviewRequirement::None
             || conversation_resolution_required,
         resolved_comments_required: config.auto.review_requirement == ReviewRequirement::Resolved,
-        review_comment_count,
+        review_feedback_count,
         approval_required: config.auto.review_requirement == ReviewRequirement::Approved
             || required_approvals > 0,
         approval_count: approved_reviewers.len() as u64,
@@ -1005,18 +1011,21 @@ esac
             }],
             ..PrDetails::default()
         };
+        let mut config = test_config(false);
+        config.auto.review_requirement = ReviewRequirement::Resolved;
 
         let facts = review_facts(
             &summary,
             Some(&details),
             Some(&details),
-            &test_config(false),
+            &config,
             None,
             None,
         );
 
         assert!(facts.actionable_reviews.is_empty());
         assert!(facts.unresolved_threads.is_empty());
+        assert_eq!(facts.review_feedback_count, 1);
     }
 
     #[test]
@@ -1135,7 +1144,7 @@ esac
 
         assert!(facts.feedback_required);
         assert!(facts.resolved_comments_required);
-        assert_eq!(facts.review_comment_count, 1);
+        assert_eq!(facts.review_feedback_count, 1);
         assert!(facts.actionable_reviews.is_empty());
         assert!(facts.unresolved_threads.is_empty());
     }
@@ -1168,7 +1177,7 @@ esac
             Some(r#"{"head_sha":"head","updated_at":"2026-01-01T00:01:00Z"}"#),
         );
 
-        assert_eq!(facts.review_comment_count, 1);
+        assert_eq!(facts.review_feedback_count, 1);
         assert_eq!(facts.unresolved_threads.len(), 1);
         assert_eq!(facts.unresolved_threads[0].thread_id, "thread-old");
     }

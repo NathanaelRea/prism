@@ -2952,6 +2952,36 @@ fn review_poll_resolved_requirement_waits_without_review_comments() {
 }
 
 #[test]
+fn review_poll_resolved_requirement_accepts_copilot_review_without_inline_comments() {
+    let temp = TempDir::new("review-poll-copilot-no-inline");
+    let repo = Repository {
+        root: temp.path().to_path_buf(),
+    };
+    let summary = test_pr_summary("feat/auto", "abc123", "2026-01-01T00:00:00Z");
+    let mut config = Config::load(&repo);
+    config.auto.review_requirement = crate::config::ReviewRequirement::Resolved;
+    let details = crate::remote::PrDetails {
+        reviews: vec![crate::remote::PrReview {
+            id: "review-1".to_string(),
+            author: "copilot-pull-request-reviewer".to_string(),
+            state: "COMMENTED".to_string(),
+            body: "Copilot reviewed 2 out of 2 changed files.".to_string(),
+            submitted_at: "2026-01-01T00:01:00Z".to_string(),
+        }],
+        ..crate::remote::PrDetails::default()
+    };
+    let mut persisted = AutoLaunch::new(temp.path(), temp.path(), "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+
+    let outcome =
+        evaluate_review_feedback(&config, &mut persisted, &summary, Some(&details)).unwrap();
+
+    assert!(outcome.complete);
+    assert!(outcome.fix_prompt.is_none());
+}
+
+#[test]
 fn review_poll_resolved_requirement_completes_with_a_resolved_comment() {
     let temp = TempDir::new("review-poll-resolved-complete");
     let repo = Repository {

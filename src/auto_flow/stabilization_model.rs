@@ -113,7 +113,7 @@ pub(crate) struct ReviewFacts {
     pub decision: String,
     pub feedback_required: bool,
     pub resolved_comments_required: bool,
-    pub review_comment_count: usize,
+    pub review_feedback_count: usize,
     pub approval_required: bool,
     pub approval_count: u64,
     pub required_approvals: u64,
