@@ -205,15 +205,10 @@ pub fn ensure_running() -> Result<(), String> {
                 state: DaemonState::Running,
                 ..
             } => {
-                let Some(response) = request_if_worker_running(&socket, "replace")? else {
-                    break;
-                };
-                if response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
-                    return wait_for_replacement(
-                        &socket,
-                        &executable_identity,
-                        DAEMON_TRANSITION_TIMEOUT,
-                    );
+                match request_worker_replacement(&socket, &executable_identity)? {
+                    None => break,
+                    Some(true) => return Ok(()),
+                    Some(false) => {}
                 }
                 let shutdown_health = parse_health_response(&request_at(&socket, "shutdown")?)?;
                 if shutdown_health.active > 0 {
@@ -223,10 +218,19 @@ pub fn ensure_running() -> Result<(), String> {
                 wait_for_socket_to_close(&socket, DAEMON_TRANSITION_TIMEOUT)?;
                 break;
             }
-            DaemonHealth {
+            current @ DaemonHealth {
                 state: DaemonState::Draining,
                 ..
             } => {
+                if current.active > 0 {
+                    match request_worker_replacement(&socket, &executable_identity)? {
+                        None => break,
+                        Some(true) => return Ok(()),
+                        Some(false) => {}
+                    }
+                    spawn_worker_replacement()?;
+                    return Ok(());
+                }
                 health = wait_for_drain_transition(DAEMON_TRANSITION_TIMEOUT, || {
                     probe_health_at(&socket)
                 })?;
@@ -329,6 +333,23 @@ fn wait_for_replacement(
     Err(format!(
         "Prism worker is draining before replacement ({active} active)"
     ))
+}
+
+fn request_worker_replacement(
+    socket: &WorkerSocketPath,
+    executable_identity: &str,
+) -> Result<Option<bool>, String> {
+    let Some(response) = request_if_worker_running(socket, "replace")? else {
+        return Ok(None);
+    };
+    if !response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
+        return Ok(Some(false));
+    }
+    let health = parse_health_response(&response)?;
+    if health.active == 0 {
+        wait_for_replacement(socket, executable_identity, DAEMON_TRANSITION_TIMEOUT)?;
+    }
+    Ok(Some(true))
 }
 
 pub fn wake() -> Result<(), String> {
