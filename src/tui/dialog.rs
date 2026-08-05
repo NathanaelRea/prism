@@ -108,7 +108,7 @@ impl Tui {
             "R            edit repositories/order/keys/remove in repos.toml",
             "C            repos: open a worktree for a remote pull request",
             "c            repos: create worktree session in selected repo",
-            "+ / -        worktrees: raise/lower visibility sort",
+            "> / <        worktrees: raise/lower priority",
             "x            worktrees: abort selected agent session when supported",
             "M            worktrees: migrate selected worktree to the default harness",
             "H            choose the global default harness or add a generic harness",
