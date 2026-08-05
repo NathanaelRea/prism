@@ -995,6 +995,59 @@ fn prompt_dialog_sets_cursor_at_end_of_input() {
 }
 
 #[test]
+fn text_area_renders_input_on_new_lines_with_updated_controls() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
+    model.dialog = Some(DialogModel::TextArea {
+        title: "Create Pull Request".to_string(),
+        prompt: "Description:\n".to_string(),
+        input: "First line\nSecond line".to_string(),
+    });
+
+    let backend = render_to_backend(&model, 100, 24);
+    let buffer = backend.buffer();
+
+    assert_ne!(
+        find_line(buffer, "Description:"),
+        find_line(buffer, "First line")
+    );
+    assert_ne!(
+        find_line(buffer, "First line"),
+        find_line(buffer, "Second line")
+    );
+    assert!(
+        buffer_to_string(buffer)
+            .contains("Enter for new line, Ctrl+Enter to submit, Esc to cancel")
+    );
+    assert_eq!(
+        backend.cursor_position().y,
+        find_line(buffer, "Second line")
+    );
+}
+
+#[test]
+fn text_area_scrolls_to_keep_long_input_and_controls_visible() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
+    model.dialog = Some(DialogModel::TextArea {
+        title: "Create Pull Request".to_string(),
+        prompt: "Description:\n".to_string(),
+        input: (1..=10)
+            .map(|line| format!("Line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    });
+
+    let backend = render_to_backend(&model, 100, 10);
+    let buffer = backend.buffer();
+
+    assert!(buffer_to_string(buffer).contains("Ctrl+Enter to submit"));
+    assert_eq!(backend.cursor_position().y, find_line(buffer, "Line 10"));
+}
+
+#[test]
 fn prompt_dialog_geometry_is_stable_and_tail_truncates_input() {
     let area = Rect::new(0, 0, 80, 20);
     let short = DialogModel::Prompt {
