@@ -1991,7 +1991,25 @@ fn save_runtime_with_conn(
     if changed == 1 {
         Ok(())
     } else {
-        Err("OpenCode runtime belongs to a replaced Worktree Session".to_string())
+        let stored_worktree_session_id = conn
+            .query_row(
+                "select worktree_session_id from opencode_runtime
+                  where repo_root = ?1 and harness_id = ?2 and branch = ?3 and worktree_path = ?4",
+                params![
+                    runtime.repo_root.as_str(),
+                    runtime.harness_id.as_str(),
+                    runtime.branch.as_str(),
+                    runtime.worktree_path.as_str(),
+                ],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| format!("verify opencode runtime identity: {error}"))?;
+        if stored_worktree_session_id.as_ref() == Some(&runtime.worktree_session_id) {
+            Ok(())
+        } else {
+            Err("OpenCode runtime belongs to a replaced Worktree Session".to_string())
+        }
     }
 }
 
@@ -3355,6 +3373,7 @@ mod tests {
             updated_unix_ms: 42,
         };
 
+        save_runtime(&repo, &runtime).unwrap();
         save_runtime(&repo, &runtime).unwrap();
         let loaded = load_runtime(
             &repo,
