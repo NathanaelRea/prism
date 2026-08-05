@@ -1468,7 +1468,7 @@ impl Tui {
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<Option<String>, String> {
-        self.prompt_line_dialog(raw, "Create Pull Request", "Description: ", "")
+        self.text_area_dialog(raw, "Create Pull Request", "Description:\n", "")
     }
 
     pub(crate) fn merge_selected_pr(

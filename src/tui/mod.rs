@@ -41,12 +41,12 @@ mod workflow;
 mod tests;
 
 use agent_state::AgentStatePersistenceRequest;
-use dialog::{choice_list, ctrl_key};
 #[cfg(test)]
 use dialog::{
-    confirmation_result, move_enabled_ordered_item, selectable_choice_key, toggle_item_in_place,
-    toggle_ordered_item,
+    TextInputAction, confirmation_result, move_enabled_ordered_item, selectable_choice_key,
+    text_input_action, toggle_item_in_place, toggle_ordered_item,
 };
+use dialog::{choice_list, ctrl_key};
 pub(crate) use git_actions::GitAction;
 use job_orchestration::ShutdownReason;
 pub(crate) use job_orchestration::{TuiJobKey, TuiJobKind, TuiJobPayload};
