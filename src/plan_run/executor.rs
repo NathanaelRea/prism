@@ -1,14 +1,14 @@
 use super::*;
 
 pub fn execute_plan_sequential(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     persisted: &mut PersistedPlanRun,
     executor: &PlanExecutorConfig,
     output: &mut dyn Write,
 ) -> Result<(), String> {
     persisted.run.status = PlanRunStatus::Running;
     persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)?;
+    save_run_with_store(conn, &persisted.run)?;
 
     let mut failure: Option<String> = None;
     let mut paused = false;
@@ -35,7 +35,7 @@ pub fn execute_plan_sequential(
         persisted.run.status = persisted.aggregate_status();
     }
     persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)?;
+    save_run_with_store(conn, &persisted.run)?;
 
     if let Some(error) = failure {
         Err(error)
@@ -45,14 +45,14 @@ pub fn execute_plan_sequential(
 }
 
 pub fn execute_plan_parallel(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     persisted: &mut PersistedPlanRun,
     executor: &PlanExecutorConfig,
     output: &mut dyn Write,
 ) -> Result<(), String> {
     persisted.run.status = PlanRunStatus::Running;
     persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)?;
+    save_run_with_store(conn, &persisted.run)?;
 
     let (tx, rx) = mpsc::sync_channel::<Result<ParallelChildEvent, String>>(
         crate::harness::WORKFLOW_OUTPUT_CHANNEL_CAPACITY,
@@ -74,11 +74,11 @@ pub fn execute_plan_parallel(
             step.session.adapter_id = Some(executor.harness_config.adapter.clone());
             step.agent_variant = executor.agent_variant.clone();
             step.error = None;
-            save_step_with_conn(conn, step)?;
+            save_step_with_store(conn, step)?;
         }
         persisted.run.selected_step = step_number;
         persisted.run.updated_unix_ms = unix_ms();
-        save_run_with_conn(conn, &persisted.run)?;
+        save_run_with_store(conn, &persisted.run)?;
         writeln!(output, "\n==> {prompt}\n")
             .map_err(|error| format!("write plan output: {error}"))?;
 
@@ -96,7 +96,7 @@ pub fn execute_plan_parallel(
                     continue;
                 }
             };
-        crate::execution::validate_installed_claim(conn)?;
+        conn.validate_claim()?;
         let spawn_result = spawn_harness(&mut command, &invocation);
         let (mut child, used_attach) = match spawn_result {
             Ok(child) => (child, invocation.attach),
@@ -110,7 +110,7 @@ pub fn execute_plan_parallel(
                 )?;
                 let (mut fallback, fallback_invocation) =
                     harness_run_command(executor, step_number, &prompt, false)?;
-                crate::execution::validate_installed_claim(conn)?;
+                conn.validate_claim()?;
                 match spawn_harness(&mut fallback, &fallback_invocation) {
                     Ok(child) => (child, false),
                     Err(error) => {
@@ -146,7 +146,7 @@ pub fn execute_plan_parallel(
             continue;
         }
         identify_attached_plan_session(executor, &mut persisted.steps[index]);
-        save_step_with_conn(conn, &persisted.steps[index])?;
+        save_step_with_store(conn, &persisted.steps[index])?;
         spawn_parallel_child(index, child, used_attach, invocation, tx.clone())?;
         running += 1;
     }
@@ -198,7 +198,7 @@ pub fn execute_plan_parallel(
                     persisted.run.selected_step = step.step;
                     persisted.run.status = persisted.aggregate_status();
                     persisted.run.updated_unix_ms = unix_ms();
-                    if let Err(error) = save_run_with_conn(conn, &persisted.run) {
+                    if let Err(error) = save_run_with_store(conn, &persisted.run) {
                         terminate_running_plan_steps(&persisted.steps);
                         return Err(error);
                     }
@@ -210,7 +210,7 @@ pub fn execute_plan_parallel(
                 return Err(error);
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Err(error) = crate::execution::validate_installed_claim(conn) {
+                if let Err(error) = conn.validate_claim() {
                     terminate_running_plan_steps(&persisted.steps);
                     return Err(error);
                 }
@@ -221,7 +221,7 @@ pub fn execute_plan_parallel(
 
     persisted.run.status = persisted.aggregate_status();
     persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)?;
+    save_run_with_store(conn, &persisted.run)?;
 
     if persisted
         .steps
@@ -250,7 +250,7 @@ pub fn execute_plan_parallel(
 }
 
 pub(super) fn execute_one_step(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     persisted: &mut PersistedPlanRun,
     step_index: usize,
     executor: &PlanExecutorConfig,
@@ -266,8 +266,8 @@ pub(super) fn execute_one_step(
         step.error = None;
         persisted.run.selected_step = step.step;
         persisted.run.updated_unix_ms = unix_ms();
-        save_run_with_conn(conn, &persisted.run)?;
-        save_step_with_conn(conn, step)?;
+        save_run_with_store(conn, &persisted.run)?;
+        save_step_with_store(conn, step)?;
     }
 
     let step_number = persisted.steps[step_index].step;
@@ -287,7 +287,7 @@ pub(super) fn execute_one_step(
                 return Err(error);
             }
         };
-    crate::execution::validate_installed_claim(conn)?;
+    conn.validate_claim()?;
     let spawn_result = spawn_harness(&mut command, &invocation);
     let (mut child, used_attach) = match spawn_result {
         Ok(child) => (child, invocation.attach),
@@ -302,7 +302,7 @@ pub(super) fn execute_one_step(
             invocation.cleanup();
             let (mut fallback, fallback_invocation) =
                 harness_run_command(executor, step_number, &prompt, false)?;
-            crate::execution::validate_installed_claim(conn)?;
+            conn.validate_claim()?;
             match spawn_harness(&mut fallback, &fallback_invocation) {
                 Ok(child) => {
                     invocation = fallback_invocation;
@@ -341,7 +341,7 @@ pub(super) fn execute_one_step(
             ));
         }
         identify_attached_plan_session(executor, step);
-        save_step_with_conn(conn, step)?;
+        save_step_with_store(conn, step)?;
     }
 
     let exit_code = collect_child_output(
@@ -371,12 +371,13 @@ pub(super) fn execute_one_step(
 }
 
 pub(super) fn finish_step_after_exit(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     step: &mut PlanStepRun,
     exit_code: i32,
     used_attach: bool,
     harness_id: &str,
 ) -> Result<(), String> {
+    conn.validate_claim()?;
     step.execution.process_id = None;
     step.execution.process_identity = None;
     step.finished_unix_ms = Some(unix_ms());
@@ -394,33 +395,12 @@ pub(super) fn finish_step_after_exit(
             ));
         }
     }
-    let changed = conn
-        .execute(
-            "update plan_step_run
-             set status = ?1, execution_process_id = null,
-                 execution_process_start_time_ticks = null, finished_unix_ms = ?2,
-                 exit_code = ?3, active_tool = ?4, error = ?5
-             where run_id = ?6 and step = ?7 and status != 'aborted'",
-            params![
-                step.status.as_str(),
-                step.finished_unix_ms.map(u64_to_i64),
-                step.exit_code,
-                step.active_tool,
-                step.error,
-                step.run_id,
-                usize_to_i64(step.step),
-            ],
-        )
-        .map_err(|error| format!("finish plan step: {error}"))?;
-    if changed == 0 {
-        let status = conn
-            .query_row(
-                "select status from plan_step_run where run_id = ?1 and step = ?2",
-                params![step.run_id, usize_to_i64(step.step)],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|error| format!("reload plan step status: {error}"))?;
-        step.status = PlanStepStatus::parse(&status)?;
+    let changed = crate::persistence::plan_run::finish_step(conn.path(), step)
+        .map_err(|error| crate::execution::claim_write_error("finish plan step", error))?;
+    if !changed {
+        step.status =
+            crate::persistence::plan_run::load_step_status(conn.path(), &step.run_id, step.step)
+                .map_err(|error| format!("reload plan step status: {error}"))?;
         step.execution.process_id = None;
         step.execution.process_identity = None;
         if step.status == PlanStepStatus::Aborted {
@@ -431,42 +411,33 @@ pub(super) fn finish_step_after_exit(
 }
 
 pub(super) fn claim_spawned_process(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     step: &mut PlanStepRun,
     child: &mut crate::process::SupervisedChild,
 ) -> Result<bool, String> {
+    conn.validate_claim()?;
     let process_id = child.id();
     let process_identity = crate::process::record_process(process_id)
         .map_err(|error| format!("record plan harness process {process_id}: {error}"))?
         .identity;
-    let changed = conn
-        .execute(
-            "update plan_step_run
-             set status = 'running', execution_process_id = ?1,
-                 execution_process_start_time_ticks = ?2
-             where run_id = ?3 and step = ?4 and status = 'starting'",
-            params![
-                i64::from(process_id),
-                process_identity.map(|identity| u64_to_i64(identity.stored_value())),
-                step.run_id,
-                usize_to_i64(step.step),
-            ],
-        )
-        .map_err(|error| format!("claim plan harness process: {error}"))?;
-    if changed == 0 {
+    step.execution.process_id = Some(process_id);
+    step.execution.process_identity = process_identity.map(|identity| identity.stored_value());
+    let changed =
+        crate::persistence::plan_run::claim_process(conn.path(), step).map_err(|error| {
+            crate::execution::claim_write_error("claim plan harness process", error)
+        })?;
+    if !changed {
         let _ = crate::harness::terminate_active_process(child);
         step.status = PlanStepStatus::Aborted;
         step.execution = crate::harness::ExecutionRef::default();
         return Ok(false);
     }
     step.status = PlanStepStatus::Running;
-    step.execution.process_id = Some(process_id);
-    step.execution.process_identity = process_identity.map(|identity| identity.stored_value());
     Ok(true)
 }
 
 pub(super) fn mark_spawn_failure(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     step: &mut PlanStepRun,
     error: &str,
     max_output_lines_per_step: usize,
@@ -481,7 +452,7 @@ pub(super) fn mark_spawn_failure(
         error,
         max_output_lines_per_step,
     )?;
-    save_step_with_conn(conn, step)
+    save_step_with_store(conn, step)
 }
 
 #[cfg(test)]
@@ -565,7 +536,7 @@ fn invocation_cwd(_invocation: &crate::harness::Invocation, command: &Command) -
 }
 
 pub(super) fn collect_child_output(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     step: &mut PlanStepRun,
     child: &mut crate::process::SupervisedChild,
     max_output_lines_per_step: usize,
@@ -615,7 +586,7 @@ pub(super) fn collect_child_output(
             Ok(Ok(ChildLine::End)) => readers_open -= 1,
             Ok(Err(error)) => break Err(error),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Err(error) = crate::execution::validate_installed_claim(conn) {
+                if let Err(error) = conn.validate_claim() {
                     break Err(error);
                 }
                 if child.deadline_exceeded() {
@@ -814,7 +785,7 @@ pub(super) fn spawn_reader_thread(
 }
 
 pub(super) fn ingest_child_line(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     step: &mut PlanStepRun,
     stream: StreamKind,
     raw: &str,
@@ -844,7 +815,7 @@ pub(super) fn ingest_child_line(
             max_output_lines_per_step,
         )?;
         step.latest_message = Some(raw.to_string());
-        save_step_with_conn(conn, step)?;
+        save_step_with_store(conn, step)?;
         writeln!(output, "{raw}").map_err(|error| format!("write plan output: {error}"))?;
         return Ok(());
     }
@@ -854,6 +825,6 @@ pub(super) fn ingest_child_line(
         let text = ingest_single_plan_agent_event(conn, step, event, max_output_lines_per_step)?;
         writeln!(output, "{text}").map_err(|error| format!("write plan output: {error}"))?;
     }
-    save_step_with_conn(conn, step)?;
+    save_step_with_store(conn, step)?;
     Ok(())
 }

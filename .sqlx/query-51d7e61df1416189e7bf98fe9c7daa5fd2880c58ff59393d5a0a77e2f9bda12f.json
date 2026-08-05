@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update pending_worktree_deletion\nset branch_deleted = 1, updated_unix_ms = ?\nwhere branch = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "51d7e61df1416189e7bf98fe9c7daa5fd2880c58ff59393d5a0a77e2f9bda12f"
+}

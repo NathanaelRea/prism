@@ -1,5 +1,34 @@
 # Development
 
+Install the pinned SQLx CLI compatible with the crate's SQLx dependency:
+
+```sh
+cargo install sqlx-cli --version 0.8.6 --locked --no-default-features --features sqlite,rustls
+```
+
+After adding or changing a checked query or migration, refresh the committed
+offline metadata against a migrated temporary database:
+
+```sh
+db="$(mktemp "${TMPDIR:-/tmp}/prism-sqlx.XXXXXX.db")"
+workflow_db="$(mktemp "${TMPDIR:-/tmp}/prism-workflow-sqlx.XXXXXX.db")"
+cargo sqlx migrate run --source migrations/repository --database-url "sqlite://$db"
+cargo sqlx migrate run --source migrations/workflow --database-url "sqlite://$workflow_db"
+# Build the compatible compile-time union used by checked queries.
+for migration in migrations/workflow/*.sql; do
+  sqlite3 "$db" ".read $migration"
+done
+cargo sqlx prepare --workspace --database-url "sqlite://$db" -- --all-targets
+env DOCS_RS=1 PKG_CONFIG_ALLOW_CROSS=1 LIBSQLITE3_SYS_USE_PKG_CONFIG=1 \
+  CC_aarch64_apple_darwin=clang \
+  cargo sqlx prepare --workspace --database-url "sqlite://$db" \
+    -- --all-targets --target aarch64-apple-darwin
+rm -f "$db" "$db-wal" "$db-shm" "$workflow_db" "$workflow_db-wal" "$workflow_db-shm"
+```
+
+Review and commit the resulting `.sqlx` changes. `scripts/full-check.sh` verifies
+that this metadata is current and then compiles/tests with `SQLX_OFFLINE=true`.
+
 Run the local CI gate before pushing:
 
 ```sh
@@ -130,3 +159,38 @@ Prism stores per-repository runtime state in `prism.db` under the user's Prism c
 - `pr_cache`, `pr_details_cache`: provider-neutral change-request summary and
   detail caches; the historical table names are retained for migration safety.
 - `event`, `startup_run`, `startup_phase`: observability events and startup timing records.
+
+The generalized worker owns the separate user-scoped `workflow.db` in the Prism
+config directory. It contains definition snapshots, runs, steps, fenced
+attempts, output, artifacts, approvals, effects, triggers, resource claims,
+import journals, audit events, and control-plane metrics. Repository migrations
+must never be run against this database, and workflow migrations must never be
+run against `prism.db`.
+
+## Workflow Database Diagnostics And Recovery
+
+Start with `prism debug info`. Its `control_plane.*` facts report the latest
+writer wait and transaction times, reader/writer pool use, scheduler candidates,
+unsupported runnable work, due gates and triggers, output truncation, and effects
+requiring reconciliation. A growing writer wait with short transactions usually
+means writes should be batched or polling reduced; do not increase the SQLite
+writer count. A long transaction points to work that should be moved outside the
+transaction. Reader saturation should be established from repeated samples
+before changing the internal four-reader limit.
+
+When migration or import fails:
+
+1. Stop the Prism worker so no new workflow mutation can begin.
+2. Preserve `workflow.db` and any `-wal`/`-shm` companions before investigation.
+3. Keep the owner-only `*.pre-sqlx-backup` adoption backup. Never delete the
+   original database or edit `_sqlx_migrations` by hand.
+4. Record the complete error and inspect `pragma quick_check`,
+   `pragma foreign_key_check`, and the migration/import journal on a copy.
+5. Restore only from the preserved copy or backup after identifying the failed
+   boundary. Unknown, future, and corrupt schemas intentionally fail closed.
+
+Waiting workflows do not own tasks or execution slots. Pressure is represented
+by scheduler candidates and durable backlog, while active attempts are bounded
+independently by implementation, target, provider, repository, and resource
+claims. Output and heartbeats are batched; output truncation is explicit rather
+than an invitation to grow an unbounded buffer.

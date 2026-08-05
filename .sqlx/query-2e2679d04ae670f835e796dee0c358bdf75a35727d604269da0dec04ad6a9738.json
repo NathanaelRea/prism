@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "delete from plan_output_line where run_id = ? and step = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "2e2679d04ae670f835e796dee0c358bdf75a35727d604269da0dec04ad6a9738"
+}

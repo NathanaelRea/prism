@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select id as \"id!: String\"\nfrom plan_run\nwhere repo_root = ? and archived_unix_ms is null\norder by case status\n  when 'running' then 0 when 'queued' then 1 when 'paused' then 2\n  when 'failed' then 3 else 4 end,\n  updated_unix_ms desc\nlimit ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "173678259ed07a2e1fb62bda81a3ca30537d6606850745253de2db330c5d4238"
+}

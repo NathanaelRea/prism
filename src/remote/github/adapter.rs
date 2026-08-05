@@ -48,7 +48,13 @@ impl<'a> GitHubAdapter<'a> {
         .map_err(|error| github_provider_error(RemoteOperation::ListChangeRequests, error))?;
         summaries
             .into_iter()
-            .map(|summary| normalize_summary(summary, RemoteOperation::ListChangeRequests))
+            .map(|summary| {
+                normalize_summary(
+                    summary,
+                    &self.repository,
+                    RemoteOperation::ListChangeRequests,
+                )
+            })
             .collect()
     }
 
@@ -93,7 +99,7 @@ impl<'a> GitHubAdapter<'a> {
         else {
             return Ok(None);
         };
-        let summary = normalize_summary(summary, operation)?;
+        let summary = normalize_summary(summary, &self.repository, operation)?;
         if summary.change_request.id != *id {
             return Err(github_error(
                 operation,
@@ -229,7 +235,13 @@ impl<'a> GitHubAdapter<'a> {
         .map_err(|error| github_provider_error(RemoteOperation::CreateChangeRequest, error))?;
         let summary = summaries
             .into_iter()
-            .map(|summary| normalize_summary(summary, RemoteOperation::CreateChangeRequest))
+            .map(|summary| {
+                normalize_summary(
+                    summary,
+                    &self.repository,
+                    RemoteOperation::CreateChangeRequest,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .find(|summary| {
@@ -491,15 +503,11 @@ struct GithubCreatedReview {
 
 pub(super) fn normalize_summary(
     summary: PrSummary,
+    _expected_repository: &RemoteRepositoryId,
     operation: RemoteOperation,
 ) -> Result<ChangeRequestSummary, RemoteError> {
     let identity = summary.change_request_identity.as_ref().ok_or_else(|| {
-        github_error(
-            operation,
-            RemoteErrorClass::InvalidResponse,
-            Retryability::NotRetryable,
-            "GitHub pull request identity is incomplete",
-        )
+        github_invalid_response(operation, "missing canonical identity".to_string())
     })?;
     let change_request = ChangeRequest {
         id: identity

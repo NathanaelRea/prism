@@ -1,7 +1,7 @@
 use super::*;
 
 pub fn execute_auto_initial_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -134,7 +134,7 @@ pub(super) fn auto_run_execution_blocked(persisted: &PersistedAutoRun) -> bool {
 }
 
 pub(super) fn complete_queued_prepare(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {

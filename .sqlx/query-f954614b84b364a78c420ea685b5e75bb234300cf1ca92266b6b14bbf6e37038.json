@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "select r.status, r.pause_requested, r.updated_unix_ms, e.dispatch_state,\n       coalesce(e.interruption_generation, 0) as \"interruption_generation!: i64\"\nfrom auto_run r\nleft join workflow_execution e on e.workflow_kind = 'auto' and e.run_id = r.id\nwhere r.id = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "status",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "pause_requested",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "updated_unix_ms",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "dispatch_state",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "interruption_generation!: i64",
+        "ordinal": 4,
+        "type_info": "Null"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "f954614b84b364a78c420ea685b5e75bb234300cf1ca92266b6b14bbf6e37038"
+}

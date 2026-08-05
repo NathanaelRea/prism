@@ -553,15 +553,16 @@ impl Tui {
                             &request.config,
                         ));
                         let auto_run = request.auto_run_id.as_deref().map_or(Ok(None), |run_id| {
-                            crate::observability::with_writable_db(&request.repo, |conn| {
-                                let Some(mut run) = crate::auto_flow::load_auto_run(conn, run_id)?
+                            crate::observability::with_writable_db(&request.repo, |path| {
+                                let store = AutoFlowStore::open(path);
+                                let Some(mut run) = crate::auto_flow::load_auto_run(&store, run_id)?
                                 else {
                                     return Ok(None);
                                 };
                                 let mut session = request.session;
                                 session.pr = request.cache.clone();
                                 crate::auto_flow::stabilization_execute::observe_cached_plan_and_save(
-                                    conn,
+                                    &store,
                                     &request.repo,
                                     &request.config,
                                     &session,

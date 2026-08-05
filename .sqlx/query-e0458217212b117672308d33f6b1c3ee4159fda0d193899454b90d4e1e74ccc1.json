@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into opencode_runtime (\n  repo_root, harness_id, branch, worktree_path, server_port, server_url, server_pid,\n  opencode_session_id, generation, updated_unix_ms, server_start_time_ticks\n) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\non conflict(repo_root, harness_id, branch, worktree_path) do update set\n  server_port = excluded.server_port,\n  server_url = excluded.server_url,\n  server_pid = excluded.server_pid,\n  opencode_session_id = excluded.opencode_session_id,\n  generation = excluded.generation,\n  updated_unix_ms = excluded.updated_unix_ms,\n  server_start_time_ticks = excluded.server_start_time_ticks\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": []
+  },
+  "hash": "e0458217212b117672308d33f6b1c3ee4159fda0d193899454b90d4e1e74ccc1"
+}

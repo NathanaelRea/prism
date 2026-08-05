@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "select worktree_path, worktree_incarnation, harness_id, migration_policy\nfrom worktree_harness\nwhere branch = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "worktree_path",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "worktree_incarnation",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "harness_id",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "migration_policy",
+        "ordinal": 3,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "fe7e525b64736b304e2d39a6e06891913a440bb825dabbc311667a2d6ddee17c"
+}

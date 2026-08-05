@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update plan_step_run set status = 'queued', started_unix_ms = null, finished_unix_ms = null,\n execution_state = null, execution_process_id = null, execution_process_start_time_ticks = null,\n process_id = null, error = null where run_id = ? and status in ('starting', 'running')\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "55389886ba6658c1d4862957806dc7f1a9aeacc2bee39324766d646a845cb4c6"
+}

@@ -7,12 +7,7 @@ use std::process::Command;
 use crate::config::Config;
 #[cfg(test)]
 use crate::json::json_string_field;
-use crate::observability;
-use crate::plan_run::{
-    DEFAULT_OUTPUT_LINES_PER_STEP, PlanExecutorConfig, PlanLaunch, PlanRunMode,
-    execute_plan_sequential, load_resumable_plan_run, prepare_plan_plugin_config,
-    prepare_plan_run_for_resume, save_plan_run,
-};
+use crate::plan_run::{PlanLaunch, PlanRunMode};
 use crate::process::command_exists;
 use crate::repo::Repository;
 use crate::util::stable_hash;
@@ -226,57 +221,18 @@ pub fn run_plan_mode(cwd: &Path, config: &Config, path: Option<&Path>) -> Result
         config.default_harness.clone(),
         selected_harness.adapter.clone(),
     );
-    let server_url = {
-        let harness = crate::harness::Harness::new(&config.default_harness, &selected_harness);
-        match harness.prepare_server(&repo, config, "plan", &execution.cwd) {
-            Ok(runtime) => runtime.map(|runtime| runtime.server_url),
-            Err(error) => {
-                eprintln!(
-                    "warning: could not prepare harness server for attach; falling back to a direct harness run: {error}"
-                );
-                None
-            }
-        }
-    };
-
-    let mut executor = PlanExecutorConfig::for_harness(
-        config.default_harness.clone(),
-        selected_harness.clone(),
-        server_url,
-        execution.cwd.clone(),
-        execution.plan_file.clone(),
-    );
-    if selected_harness.adapter == "opencode"
-        && config.opencode_plan_plugin
-        && let Ok(plugin) = prepare_plan_plugin_config(&repo.prism_dir())
-    {
-        executor = executor.with_plugin_config(plugin);
-    }
-    observability::with_writable_db(&repo, |conn| {
-        let mut persisted = if let Some(mut persisted) = load_resumable_plan_run(conn, &launch)? {
-            let workflow = crate::execution::WorkflowIdentity::new(
-                crate::execution::WorkflowKind::Plan,
-                &persisted.run.id,
-            );
-            if crate::execution::dispatch_state(conn, &workflow)?
-                .is_some_and(|state| !matches!(state, crate::execution::DispatchState::Terminal))
-            {
-                return Err(format!(
-                    "matching plan run {} is managed by Prism; resume it interactively",
-                    persisted.run.id
-                ));
-            }
-            if !prepare_plan_run_for_resume(conn, &mut persisted, DEFAULT_OUTPUT_LINES_PER_STEP)? {
-                return Err("matching plan run is already running".to_string());
-            }
-            persisted
-        } else {
-            let persisted = launch.create_run();
-            save_plan_run(conn, &persisted)?;
-            persisted
-        };
-        execute_plan_sequential(conn, &mut persisted, &executor, &mut io::stdout())
-    })
+    let run_id = crate::worker::launch_bundled_plan(crate::workflow::bundled::BundledPlanLaunch {
+        repository: launch.repo_root,
+        scope_path: launch.scope_path,
+        plan_path: launch.plan_path,
+        step_name: launch.step_name,
+        start_step: launch.start_step,
+        total_steps: launch.total_steps,
+        parallel: false,
+        harness_id: launch.harness_id,
+    })?;
+    println!("workflow_run_id = {run_id}\nstatus = queued");
+    Ok(())
 }
 
 #[allow(dead_code)]

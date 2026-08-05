@@ -484,16 +484,10 @@ pub(crate) fn reconcile_session_refresh(current: &mut AgentState, previous: Agen
     *current = previous;
 }
 
-pub(crate) fn remove_state_with_conn(
-    conn: &rusqlite::Connection,
-    branch: &str,
-) -> Result<(), String> {
-    conn.execute(
-        "delete from agent_state where branch = ?1",
-        rusqlite::params![branch],
-    )
-    .map_err(|error| format!("remove Agent Session state: {error}"))?;
-    Ok(())
+pub(crate) fn remove_state(repo: &Repository, branch: &str) -> Result<(), String> {
+    crate::persistence::session::SessionStore::open(&crate::observability::db_path(repo))
+        .and_then(|store| store.remove_agent_state(branch))
+        .map_err(|error| format!("remove Agent Session state: {error}"))
 }
 
 pub(crate) fn remove_owned_log(repo: &Repository, branch: &str) -> Result<(), String> {

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update plan_run set pause_requested = 0, status = 'aborted', updated_unix_ms = ?\nwhere id in (select plan_run_id from auto_step_run where run_id = ? and plan_run_id is not null)\n  and status not in ('done','failed','aborted')\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "3a3f2d37afe6378ffdd641af9722ea249a6280e86691b6748e3135b37e1b33f0"
+}

@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "select distinct s.plan_run_id as \"plan_run_id!\", s.run_id as \"auto_run_id!\"\nfrom auto_step_run s\njoin auto_run r on r.id = s.run_id\nwhere s.plan_run_id is not null and r.archived_unix_ms is null\norder by s.plan_run_id, s.run_id\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "plan_run_id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "auto_run_id!",
+        "ordinal": 1,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "91c5ba5a1732f42febeb84d99768070b1e0cd1ac1702e28f76ccf9bfd8cd7f95"
+}

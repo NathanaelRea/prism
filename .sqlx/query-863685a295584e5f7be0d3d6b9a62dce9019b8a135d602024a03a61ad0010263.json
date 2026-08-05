@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update notification_outbox\nset delivery_state = 'pending', available_unix_ms = ?, last_failure_category = ?\nwhere id = ? and delivery_state = 'dispatching'\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "863685a295584e5f7be0d3d6b9a62dce9019b8a135d602024a03a61ad0010263"
+}

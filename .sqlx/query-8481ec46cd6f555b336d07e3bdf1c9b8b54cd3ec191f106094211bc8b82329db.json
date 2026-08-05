@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select server_pid\nfrom opencode_runtime\nwhere branch = ?1\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "server_pid",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "8481ec46cd6f555b336d07e3bdf1c9b8b54cd3ec191f106094211bc8b82329db"
+}

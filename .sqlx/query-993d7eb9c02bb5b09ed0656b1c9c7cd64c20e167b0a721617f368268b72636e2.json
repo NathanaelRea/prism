@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update auto_run set worktree_incarnation = null where id = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "993d7eb9c02bb5b09ed0656b1c9c7cd64c20e167b0a721617f368268b72636e2"
+}

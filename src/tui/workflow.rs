@@ -3,13 +3,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::auto_flow::{
-    AutoOutputLine, AutoRunStatus, PersistedAutoRun, load_auto_run_snapshot,
+    AutoFlowStore, AutoOutputLine, AutoRunStatus, PersistedAutoRun, load_auto_run_snapshot,
     load_output_lines as load_auto_output_lines, load_recent_active_run_snapshots_for_repo,
     load_terminal_repair_run_snapshots_for_repo,
 };
 use crate::plan_run::{
-    PersistedPlanRun, PlanOutputLine, PlanRunStatus, PlanStepStatus, load_output_lines,
-    load_plan_run, load_recent_plan_runs_for_repo,
+    PersistedPlanRun, PlanOutputLine, PlanRunStatus, PlanRunStore, PlanStepStatus,
+    load_output_lines, load_plan_run, load_recent_plan_runs_for_repo,
 };
 use crate::repo::Repository;
 use crate::session::WorktreeRepositoryKey;
@@ -218,19 +218,28 @@ impl Tui {
                     let snapshot = crate::observability::with_nonblocking_read_db_named(
                         &repo,
                         "tui.workflow.refresh",
-                        |conn| {
-                            let plan_runs = load_recent_plan_runs_for_repo(conn, &repo.root, 8);
+                        |path| {
+                            let plan_store = PlanRunStore::open(path);
+                            let auto_store = AutoFlowStore::open(path);
+                            let plan_runs =
+                                load_recent_plan_runs_for_repo(&plan_store, &repo.root, 8);
                             let auto_runs = (|| {
-                                let mut runs =
-                                    load_recent_active_run_snapshots_for_repo(conn, &repo.root, 8)?;
+                                let mut runs = load_recent_active_run_snapshots_for_repo(
+                                    &auto_store,
+                                    &repo.root,
+                                    8,
+                                )?;
                                 let active_ids = runs
                                     .iter()
                                     .map(|run| run.run.id.clone())
                                     .collect::<BTreeSet<_>>();
                                 runs.extend(
-                                    load_terminal_repair_run_snapshots_for_repo(conn, &repo.root)?
-                                        .into_iter()
-                                        .filter(|run| !active_ids.contains(&run.run.id)),
+                                    load_terminal_repair_run_snapshots_for_repo(
+                                        &auto_store,
+                                        &repo.root,
+                                    )?
+                                    .into_iter()
+                                    .filter(|run| !active_ids.contains(&run.run.id)),
                                 );
                                 Ok(runs)
                             })();
@@ -244,7 +253,7 @@ impl Tui {
                                     plan_ids
                                         .into_iter()
                                         .filter_map(|run_id| {
-                                            load_plan_run(conn, run_id).transpose()
+                                            load_plan_run(&plan_store, run_id).transpose()
                                         })
                                         .collect::<Result<Vec<_>, _>>()
                                 }
@@ -276,7 +285,7 @@ impl Tui {
         if let Ok(Some(run)) = crate::observability::with_nonblocking_read_db_named(
             &repo,
             "tui.plan_run.snapshot",
-            |conn| load_plan_run(conn, run_id),
+            |path| load_plan_run(&PlanRunStore::open(path), run_id),
         ) {
             self.remember_plan_run(run);
         }
@@ -443,7 +452,7 @@ impl Tui {
         if let Ok(Some(run)) = crate::observability::with_nonblocking_read_db_named(
             &repo,
             "tui.auto_run.snapshot",
-            |conn| load_auto_run_snapshot(conn, run_id),
+            |path| load_auto_run_snapshot(&AutoFlowStore::open(path), run_id),
         ) {
             self.remember_auto_run(run);
         }
@@ -557,13 +566,13 @@ impl Tui {
                     let lines = crate::observability::with_nonblocking_read_db_named(
                         &repo,
                         "tui.dashboard_output.refresh",
-                        |conn| match &job_key {
+                        |path| match &job_key {
                             DashboardOutputKey::Plan { run_id, step, .. } => {
-                                load_output_lines(conn, run_id, *step)
+                                load_output_lines(&PlanRunStore::open(path), run_id, *step)
                                     .map(DashboardOutputLines::Plan)
                             }
                             DashboardOutputKey::Auto { step_run_id, .. } => {
-                                load_auto_output_lines(conn, *step_run_id)
+                                load_auto_output_lines(&AutoFlowStore::open(path), *step_run_id)
                                     .map(DashboardOutputLines::Auto)
                             }
                         },

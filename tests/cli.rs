@@ -1,6 +1,7 @@
 mod common;
+#[path = "../src/persistence/cli_test_support.rs"]
+mod persistence_test_support;
 
-use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -184,7 +185,7 @@ fn list_is_read_only_and_never_uses_network_tools() {
     fs::write(
         config_home.join("prism/config.toml"),
         format!(
-            "[tools]\ngit = \"{}\"\ngh = \"{}\"\n",
+            "config_version = 1\n[tools]\ngit = \"{}\"\ngh = \"{}\"\n",
             toml_escape(&bin.join("git").display().to_string()),
             toml_escape(&bin.join("gh").display().to_string())
         ),
@@ -354,59 +355,8 @@ fn list_and_control_project_and_mutate_managed_plan_state() {
     let repo = fs::canonicalize(repo).unwrap();
     let path_output = run(["db", "path"], &repo, &config_home);
     assert!(path_output.status.success(), "{}", stderr(&path_output));
-    let db_path = stdout(&path_output).trim().to_string();
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    conn.execute(
-        "insert into plan_run (
-           id, harness_id, adapter_id, repo_root, scope_path, plan_path, plan_display,
-           step_name, start_step, total_steps, mode, status, pause_requested,
-           selected_step, created_unix_ms, updated_unix_ms
-         ) values ('plan-control-12345678', 'opencode', 'opencode', ?1, ?1, ?2,
-                   'plan.md', 'phase', 1, 2, 'sequential', 'queued', 0, 1, 10, 20)",
-        rusqlite::params![
-            repo.display().to_string(),
-            repo.join("plan.md").display().to_string()
-        ],
-    )
-    .unwrap();
-    for step in 1..=2 {
-        conn.execute(
-            "insert into plan_step_run (run_id, step, prompt, status, todos_json)
-             values ('plan-control-12345678', ?1, 'prompt', 'queued', '[]')",
-            [step],
-        )
-        .unwrap();
-    }
-    conn.execute(
-        "insert into workflow_execution (
-           workflow_kind, run_id, dispatch_state, fencing_token,
-           interruption_generation, created_unix_ms, updated_unix_ms
-         ) values ('plan', 'plan-control-12345678', 'queued', 0, 0, 10, 20)",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "insert into plan_run (
-           id, harness_id, adapter_id, repo_root, scope_path, plan_path, plan_display,
-           step_name, start_step, total_steps, mode, status, pause_requested,
-           selected_step, created_unix_ms, updated_unix_ms
-         ) values ('plan-history-87654321', 'opencode', 'opencode', ?1, ?1, ?2,
-                   'old-plan.md', 'phase', 1, 1, 'sequential', 'done', 0, 1, 1, 5)",
-        rusqlite::params![
-            repo.display().to_string(),
-            repo.join("old-plan.md").display().to_string()
-        ],
-    )
-    .unwrap();
-    conn.execute(
-        "insert into workflow_execution (
-           workflow_kind, run_id, dispatch_state, fencing_token,
-           interruption_generation, created_unix_ms, updated_unix_ms
-         ) values ('plan', 'plan-history-87654321', 'terminal', 0, 0, 1, 5)",
-        [],
-    )
-    .unwrap();
-    drop(conn);
+    let db_path = PathBuf::from(stdout(&path_output).trim());
+    persistence_test_support::install_plan_control_fixture(&db_path, &repo).unwrap();
 
     let listed = run(["list", "--all", "--json"], &repo, &config_home);
     assert!(listed.status.success(), "{}", stderr(&listed));
@@ -438,31 +388,9 @@ fn list_and_control_project_and_mutate_managed_plan_state() {
     assert!(paused.status.success(), "{}", stderr(&paused));
     assert!(stdout(&paused).contains("state = paused"));
     assert!(stderr(&paused).contains("control committed, but daemon wake failed"));
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    let state: (String, i64, String) = conn
-        .query_row(
-            "select p.status, p.pause_requested, e.dispatch_state
-         from plan_run p join workflow_execution e on e.run_id = p.id
-         where p.id = 'plan-control-12345678'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
+    let state = persistence_test_support::plan_control_state(&db_path).unwrap();
     assert_eq!(state, ("paused".to_string(), 1, "paused".to_string()));
-    conn.execute(
-        "update plan_run set status = 'running', pause_requested = 0, updated_unix_ms = 30
-         where id = 'plan-control-12345678'",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "update workflow_execution set dispatch_state = 'recovery_pending',
-           interruption_generation = 3, updated_unix_ms = 30
-         where run_id = 'plan-control-12345678'",
-        [],
-    )
-    .unwrap();
-    drop(conn);
+    persistence_test_support::prepare_plan_recovery(&db_path).unwrap();
     fs::write(config_home.join("runtime"), "block daemon startup").unwrap();
 
     let recovered = run(
@@ -472,18 +400,9 @@ fn list_and_control_project_and_mutate_managed_plan_state() {
     );
     assert!(recovered.status.success(), "{}", stderr(&recovered));
     assert!(stderr(&recovered).contains("recovery committed, but daemon is unavailable"));
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    let recovery: (String, i64) = conn
-        .query_row(
-            "select dispatch_state, interruption_generation from workflow_execution
-             where run_id = 'plan-control-12345678'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
+    let recovery = persistence_test_support::plan_recovery_state(&db_path).unwrap();
     assert_eq!(recovery.0, "queued");
     assert_eq!(recovery.1, 4);
-    drop(conn);
 
     let stopped = run(["stop", "p:plan-con"], &repo, &config_home);
     assert!(stopped.status.success(), "{}", stderr(&stopped));
@@ -528,7 +447,7 @@ fn config_discovery_commands_print_templates_schema_and_paths() {
     let schema = run(["config", "schema"], &repo, &config_home);
     assert!(schema.status.success(), "{}", stderr(&schema));
     let schema_stdout = stdout(&schema);
-    assert!(schema_stdout.contains(r#""title": "Prism Config""#));
+    assert!(schema_stdout.contains(r#""title": "Prism Global Config V1""#));
     assert!(schema_stdout.contains(r#""merge_method""#));
     assert!(schema_stdout.contains(r#""notifications""#));
 
@@ -598,6 +517,19 @@ fn db_path_prints_repo_database_path() {
 }
 
 #[test]
+fn database_migrations_and_schema_match_the_canonical_contract() {
+    let temp = TempDir::new("db-contract");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+
+    let output = run(["db", "path"], &repo, &config_home);
+
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_canonical_database_contract(stdout(&output).trim());
+}
+
+#[test]
 #[cfg(unix)]
 fn db_without_arguments_launches_sqlite3_with_initialized_database() {
     let temp = TempDir::new("db-shell");
@@ -628,28 +560,6 @@ fn db_without_arguments_launches_sqlite3_with_initialized_database() {
     let db_path = fs::read_to_string(marker).expect("read sqlite3 marker");
     assert!(db_path.trim().ends_with("/prism.db"));
     assert!(Path::new(db_path.trim()).exists());
-    assert_db_has_tables(
-        db_path.trim(),
-        [
-            "agent_state",
-            "auto_event",
-            "auto_output_line",
-            "auto_run",
-            "auto_step_run",
-            "event",
-            "hidden_session",
-            "metadata",
-            "opencode_runtime",
-            "plan_output_line",
-            "plan_run",
-            "plan_step_run",
-            "pr_cache",
-            "pr_details_cache",
-            "startup_phase",
-            "startup_run",
-            "task_metadata",
-        ],
-    );
 }
 
 #[test]
@@ -663,17 +573,8 @@ fn repository_command_completes_only_its_own_run_marker() {
 
     assert!(output.status.success(), "{}", stderr(&output));
     let db_path = PathBuf::from(stdout(&output).trim());
-    let conn =
-        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .unwrap();
-    let (run_id, status, finished): (String, String, Option<i64>) = conn
-        .query_row(
-            "select id, status, time_finished_unix_ms
-             from startup_run order by time_started_unix_ms desc limit 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
-        .unwrap();
+    let (run_id, status, finished) =
+        persistence_test_support::latest_startup_run(&db_path).unwrap();
     assert_eq!(status, "ok");
     assert!(finished.is_some());
     let marker = db_path
@@ -795,7 +696,6 @@ fn debug_integrity_reports_healthy_database_read_only() {
     assert!(output.status.success(), "{}", stderr(&output));
     let output = stdout(&output);
     assert!(output.contains(&format!("path = {path}")));
-    assert!(output.contains("user_version = 1"));
     assert!(output.contains("journal_mode = wal"));
     assert!(output.contains("main_bytes = "));
     assert!(output.contains("wal_bytes = "));
@@ -841,7 +741,6 @@ fn debug_integrity_reports_corruption_and_preserves_original_bytes() {
     assert!(!output.status.success());
     let output_text = stdout(&output);
     assert!(output_text.contains(&format!("path = {}", path.display())));
-    assert!(output_text.contains("user_version = unavailable"));
     assert!(output_text.contains("integrity_check:\n  ERROR:"));
     assert!(stderr(&output).contains("not a database"));
     assert_eq!(fs::read(&path).unwrap(), corrupt);
@@ -955,7 +854,7 @@ fn real_prism_opencode_tmux_stack_ensures_reusable_agent_session() {
     fs::write(
         prism_config_dir.join("config.toml"),
         format!(
-            "default_harness = \"opencode\"\ndefault_base = \"main\"\nopencode_port_base = 43000\nopencode_port_span = 1000\n\n[harnesses.opencode]\nadapter = \"opencode\"\nprogram = \"{}\"\n\n[tools]\ntmux = \"{}\"\n",
+            "config_version = 1\ndefault_harness = \"opencode\"\ndefault_base = \"main\"\nopencode_port_base = 43000\nopencode_port_span = 1000\n\n[harnesses.opencode]\nadapter = \"opencode\"\nprogram = \"{}\"\n\n[tools]\ntmux = \"{}\"\n",
             toml_escape(&bin.join("opencode").display().to_string()),
             toml_escape(&bin.join("tmux").display().to_string()),
         ),
@@ -1019,14 +918,11 @@ fn real_prism_opencode_tmux_stack_ensures_reusable_agent_session() {
 
     let db_path = run(["db", "path"], &repo, &config_home);
     assert!(db_path.status.success(), "{}", stderr(&db_path));
-    let conn = rusqlite::Connection::open(stdout(&db_path).trim()).expect("open Prism database");
-    let server_pid = conn
-        .query_row(
-            "select server_pid from opencode_runtime where branch = 'feature/e2e'",
-            [],
-            |row| row.get::<_, Option<u32>>(0),
-        )
-        .expect("read OpenCode server PID");
+    let server_pid = persistence_test_support::opencode_server_pid(
+        Path::new(stdout(&db_path).trim()),
+        "feature/e2e",
+    )
+    .expect("read OpenCode server PID");
     assert!(server_pid.is_some());
 }
 
@@ -1043,14 +939,10 @@ impl Drop for FullStackCleanup {
         let _ = Command::new(&self.tmux).arg("kill-server").status();
         let db_path = run(["db", "path"], &self.repo, &self.config_home);
         if db_path.status.success()
-            && let Ok(conn) = rusqlite::Connection::open(stdout(&db_path).trim())
-            && let Ok(mut statement) = conn.prepare(
-                "select server_pid, server_port from opencode_runtime where server_pid is not null",
-            )
             && let Ok(processes) =
-                statement.query_map([], |row| Ok((row.get::<_, u32>(0)?, row.get::<_, u16>(1)?)))
+                persistence_test_support::opencode_processes(Path::new(stdout(&db_path).trim()))
         {
-            for (pid, port) in processes.flatten() {
+            for (pid, port) in processes {
                 terminate_test_opencode(pid, port);
             }
         }
@@ -1171,23 +1063,18 @@ fn install_shim(bin: &Path, name: &str) {
     fs::set_permissions(path, permissions).expect("chmod shim");
 }
 
-fn assert_db_has_tables<const N: usize>(db_path: &str, expected: [&str; N]) {
-    let conn = rusqlite::Connection::open(db_path).expect("open db");
-    let mut statement = conn
-        .prepare("select name from sqlite_master where type = 'table'")
-        .expect("prepare table list");
-    let actual = statement
-        .query_map([], |row| row.get::<_, String>(0))
-        .expect("query table list")
-        .collect::<Result<BTreeSet<_>, _>>()
-        .expect("read table list");
-
-    for table in expected {
-        assert!(
-            actual.contains(table),
-            "missing table {table}; found {actual:?}"
-        );
-    }
+fn assert_canonical_database_contract(db_path: &str) {
+    let (migrations, schema_fingerprint) =
+        persistence_test_support::database_contract(Path::new(db_path))
+            .expect("read canonical database contract");
+    assert_eq!(
+        migrations,
+        include_str!("fixtures/sql/migrations.txt").trim()
+    );
+    assert_eq!(
+        schema_fingerprint,
+        include_str!("fixtures/sql/schema.sha256").trim()
+    );
 }
 
 #[cfg(unix)]

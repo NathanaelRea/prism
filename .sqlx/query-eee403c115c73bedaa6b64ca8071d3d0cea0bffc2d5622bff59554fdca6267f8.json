@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select coalesce(max(line_number), 0) + 1 as \"line_number!: i64\"\nfrom auto_output_line\nwhere step_run_id = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "line_number!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "eee403c115c73bedaa6b64ca8071d3d0cea0bffc2d5622bff59554fdca6267f8"
+}

@@ -778,10 +778,25 @@ impl Tui {
     ) -> Result<bool, String> {
         let session_path = self.sessions[selected].path.clone();
         let session_branch = self.sessions[selected].branch.clone();
+        #[cfg(not(test))]
+        if !self.active_auto_runs.contains_key(&session_path) {
+            crate::worker::launch_bundled_coding(crate::workflow::bundled::BundledCodingLaunch {
+                repository: repo.root.display().to_string(),
+                worktree_path: session_path,
+                task: repair.prompt().to_string(),
+                plan_path: None,
+                draft_plan: false,
+                harness_id: config.default_harness.clone(),
+                variant: Some("repair".into()),
+            })?;
+            return Ok(true);
+        }
         let mut persisted = if let Some(run_id) = self.active_auto_runs.get(&session_path).cloned()
         {
-            crate::observability::with_writable_db(repo, |conn| load_auto_run(conn, &run_id))?
-                .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?
+            crate::observability::with_writable_db(repo, |path| {
+                load_auto_run(&AutoFlowStore::open(path), &run_id)
+            })?
+            .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?
         } else {
             let initial_prompt = crate::session::load_task_initial_prompt(repo, &session_branch)?
                 .filter(|prompt| !prompt.trim().is_empty())
@@ -822,9 +837,9 @@ impl Tui {
             run
         };
 
-        let queue = crate::observability::with_writable_db(repo, |conn| {
+        let queue = crate::observability::with_writable_db(repo, |path| {
             crate::auto_flow::stabilization_execute::queue_standalone_repair(
-                conn,
+                &AutoFlowStore::open(path),
                 &mut persisted,
                 repair,
             )
@@ -1228,14 +1243,14 @@ impl Tui {
                 )),
             },
             move || {
-                let mut persisted = crate::observability::with_writable_db(&repo, |conn| {
-                    load_auto_run(conn, &run_id)
+                let mut persisted = crate::observability::with_writable_db(&repo, |path| {
+                    load_auto_run(&AutoFlowStore::open(path), &run_id)
                 })?
                 .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?;
                 let progress = if persisted.run.pending_push.is_some() {
-                    Some(crate::observability::with_writable_db(&repo, |conn| {
+                    Some(crate::observability::with_writable_db(&repo, |path| {
                         crate::auto_flow::stabilization_execute::progress_pending_push(
-                            conn,
+                            &AutoFlowStore::open(path),
                             &repo,
                             &config,
                             &mut persisted,
@@ -1320,8 +1335,8 @@ impl Tui {
                 let branch = branch.clone();
                 move || {
                     let mut persisted =
-                        crate::observability::with_writable_db(&repo, |conn| {
-                            load_auto_run(conn, &run_id)
+                        crate::observability::with_writable_db(&repo, |path| {
+                            load_auto_run(&AutoFlowStore::open(path), &run_id)
                         })?
                         .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?;
                     if persisted.run.stabilization_blocker
@@ -1350,9 +1365,9 @@ impl Tui {
                         ensure_review_resolution_head(&summary, expected_head_sha)?;
                     }
                     if thread_ids.is_empty() {
-                        crate::observability::with_writable_db(&repo, |conn| {
+                        crate::observability::with_writable_db(&repo, |path| {
                             crate::auto_flow::stabilization_execute::observe_plan_and_save(
-                                conn,
+                                &AutoFlowStore::open(path),
                                 &repo,
                                 &config,
                                 &mut persisted,
@@ -1438,9 +1453,9 @@ impl Tui {
                     )
                 })?;
                 refresh_pr_cache(&repo, &branch, &mut cache, &path, &config, true)?;
-                crate::observability::with_writable_db(&repo, |conn| {
+                crate::observability::with_writable_db(&repo, |path| {
                     crate::auto_flow::stabilization_execute::observe_plan_and_save(
-                        conn,
+                        &AutoFlowStore::open(path),
                         &repo,
                         &config,
                         &mut persisted,

@@ -164,16 +164,20 @@ impl Tui {
                 .harness_adapter(&context.config.default_harness)?,
         )
         .with_worktree_incarnation(session_incarnation);
-        let mut persisted = launch.create_run();
-        crate::observability::with_writable_db(&context.repo, |conn| {
-            crate::auto_flow::submit_auto_run(conn, &mut persisted)
-        })?;
-        let run_id = persisted.run.id.clone();
-        self.remember_auto_run(persisted.clone());
-        self.selected_auto_run = Some(run_id);
-        crate::worker::ensure_running()?;
-        crate::worker::wake()?;
-        self.show_message("Auto Flow queued on headless worker")?;
+        let run_id =
+            crate::worker::launch_bundled_coding(crate::workflow::bundled::BundledCodingLaunch {
+                repository: launch.repo_root.clone(),
+                worktree_path: launch.worktree_path.clone(),
+                task: launch.initial_prompt.clone(),
+                plan_path: launch.plan_path.clone(),
+                draft_plan: launch.implementation_source
+                    == crate::auto_flow::AutoImplementationSource::DraftPlan,
+                harness_id: context.config.default_harness.clone(),
+                variant: Some(launch.variant.clone()),
+            })?;
+        self.show_message(&format!(
+            "Coding workflow {run_id} queued on headless worker"
+        ))?;
         Ok(())
     }
 
@@ -226,9 +230,9 @@ impl Tui {
         _config: crate::config::Config,
         persisted: crate::auto_flow::PersistedAutoRun,
     ) -> Result<(), String> {
-        crate::observability::with_writable_db(&repo, |conn| {
+        crate::observability::with_writable_db(&repo, |path| {
             crate::execution::enqueue(
-                conn,
+                path,
                 &crate::execution::WorkflowIdentity::new(
                     crate::execution::WorkflowKind::Auto,
                     &persisted.run.id,
@@ -332,8 +336,8 @@ impl Tui {
             }
             return Ok(true);
         }
-        let outcome = crate::observability::with_writable_db(&repo, |conn| {
-            apply_auto_run_control(conn, &run_id, intent)
+        let outcome = crate::observability::with_writable_db(&repo, |path| {
+            apply_auto_run_control(&AutoFlowStore::open(path), &run_id, intent)
         })?;
         self.remember_auto_run(outcome.run);
         if outcome.warnings.is_empty() {
@@ -362,8 +366,12 @@ impl Tui {
             &run_id,
             "retry",
         )?;
-        let outcome = crate::observability::with_writable_db(&repo, |conn| {
-            apply_auto_run_control(conn, &run_id, AutoRunControlIntent::RetryFailed)
+        let outcome = crate::observability::with_writable_db(&repo, |path| {
+            apply_auto_run_control(
+                &AutoFlowStore::open(path),
+                &run_id,
+                AutoRunControlIntent::RetryFailed,
+            )
         })?;
         let persisted = outcome.run;
         self.remember_auto_run(persisted.clone());
@@ -405,9 +413,9 @@ impl Tui {
             &run_id,
             "retry",
         )?;
-        let outcome = crate::observability::with_writable_db(&repo, |conn| {
+        let outcome = crate::observability::with_writable_db(&repo, |path| {
             apply_auto_run_control(
-                conn,
+                &AutoFlowStore::open(path),
                 &run_id,
                 AutoRunControlIntent::RetryFromStep {
                     step_run_id: selected,
@@ -497,10 +505,11 @@ impl Tui {
             .filter_map(|step| step.id)
             .collect::<BTreeSet<_>>();
         let repository = crate::session::WorktreeRepositoryKey::new(repo.root.clone());
-        crate::observability::with_writable_db(&repo, |conn| {
-            let mut run = load_auto_run(conn, &run_id)?
+        crate::observability::with_writable_db(&repo, |path| {
+            let store = AutoFlowStore::open(path);
+            let mut run = load_auto_run(&store, &run_id)?
                 .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
-            archive_auto_run(conn, &mut run)
+            archive_auto_run(&store, &mut run)
         })?;
         self.invalidate_workflow_snapshots();
         self.auto_runs.remove(&run_id);

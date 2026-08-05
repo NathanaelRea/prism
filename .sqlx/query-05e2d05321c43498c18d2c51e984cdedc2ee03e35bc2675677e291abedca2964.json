@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update workflow_execution\nset requeue_requested = 1, updated_unix_ms = ?\nwhere workflow_kind = 'auto' and run_id = ? and dispatch_state = 'claimed'\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "05e2d05321c43498c18d2c51e984cdedc2ee03e35bc2675677e291abedca2964"
+}

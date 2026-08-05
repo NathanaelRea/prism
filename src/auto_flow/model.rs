@@ -210,14 +210,14 @@ pub struct AutoStatusCounts {
 }
 
 impl AutoRunMode {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Standard => "standard",
             Self::PlanFirst => "plan_first",
         }
     }
 
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "standard" => Ok(Self::Standard),
             "plan_first" => Ok(Self::PlanFirst),
@@ -227,7 +227,7 @@ impl AutoRunMode {
 }
 
 impl AutoImplementationSource {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Prompt => "prompt",
             Self::ExistingPlan => "existing_plan",
@@ -235,7 +235,7 @@ impl AutoImplementationSource {
         }
     }
 
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "prompt" => Ok(Self::Prompt),
             "existing_plan" => Ok(Self::ExistingPlan),
@@ -246,7 +246,7 @@ impl AutoImplementationSource {
 }
 
 impl AutoRunStatus {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
@@ -257,7 +257,7 @@ impl AutoRunStatus {
         }
     }
 
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "queued" => Ok(Self::Queued),
             "running" => Ok(Self::Running),
@@ -297,7 +297,7 @@ impl AutoStepKey {
         }
     }
 
-    pub(super) fn parse(value: &str) -> Self {
+    pub(crate) fn parse(value: &str) -> Self {
         match value {
             "prepare" => Self::Prepare,
             "create_plan" => Self::CreatePlan,
@@ -325,7 +325,7 @@ impl AutoStepKey {
 }
 
 impl AutoStepStatus {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Starting => "starting",
@@ -338,7 +338,7 @@ impl AutoStepStatus {
         }
     }
 
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "queued" => Ok(Self::Queued),
             "starting" => Ok(Self::Starting),
@@ -354,7 +354,7 @@ impl AutoStepStatus {
 }
 
 impl AutoOutputKind {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Assistant => "assistant",
             Self::Tool => "tool",
@@ -367,7 +367,7 @@ impl AutoOutputKind {
         }
     }
 
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "assistant" => Ok(Self::Assistant),
             "tool" => Ok(Self::Tool),

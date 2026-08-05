@@ -1,29 +1,27 @@
 use super::*;
 
 pub(super) fn append_step_run(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     step_key: AutoStepKey,
     reason: Option<String>,
 ) -> Result<i64, String> {
-    let mut step = AutoStepRun::queued(
+    let step = AutoStepRun::queued(
         &persisted.run.id,
         persisted.next_sequence(),
         step_key.clone(),
         persisted.next_attempt_for(&step_key),
         reason,
     );
-    let id = save_step_with_conn(conn, &mut step)?;
-    persisted.run.selected_step_run_id = Some(id);
     persisted.steps.push(step);
     persisted.run.status = persisted.authoritative_status();
     persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)?;
-    Ok(id)
+    let selected = persisted.steps.len() - 1;
+    save_auto_run_selecting_step(conn, persisted, selected)
 }
 
 pub(super) fn append_step_run_with_work_guard(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     step_key: AutoStepKey,
     reason: Option<String>,
@@ -31,20 +29,9 @@ pub(super) fn append_step_run_with_work_guard(
     blocker: Option<stabilization_model::StabilizationBlocker>,
 ) -> Result<i64, String> {
     let original = persisted.clone();
-    let result = (|| {
-        let transaction =
-            crate::flight_recorder::TransactionTrace::begin("auto_run.append_guarded_step");
-        let tx =
-            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-                .map_err(|error| format!("begin guarded auto step transaction: {error}"))?;
-        let id = append_step_run_with_work_guard_in_transaction(
-            &tx, persisted, step_key, reason, work_guard, blocker,
-        )?;
-        tx.commit()
-            .map_err(|error| format!("commit guarded auto step transaction: {error}"))?;
-        transaction.committed();
-        Ok(id)
-    })();
+    let result = append_step_run_with_work_guard_in_transaction(
+        conn, persisted, step_key, reason, work_guard, blocker,
+    );
     if result.is_err() {
         *persisted = original;
     }
@@ -52,14 +39,13 @@ pub(super) fn append_step_run_with_work_guard(
 }
 
 pub(super) fn append_step_run_with_work_guard_in_transaction(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     step_key: AutoStepKey,
     reason: Option<String>,
     work_guard: stabilization_model::WorkGuard,
     blocker: Option<stabilization_model::StabilizationBlocker>,
 ) -> Result<i64, String> {
-    save_persisted_auto_run_with_conn(conn, persisted)?;
     let mut step = AutoStepRun::queued(
         &persisted.run.id,
         persisted.next_sequence(),
@@ -69,13 +55,11 @@ pub(super) fn append_step_run_with_work_guard_in_transaction(
     );
     step.work_guard = Some(work_guard);
     step.blocker = blocker;
-    let id = save_step_with_conn(conn, &mut step)?;
-    persisted.run.selected_step_run_id = Some(id);
     persisted.steps.push(step);
     persisted.run.status = persisted.authoritative_status();
     persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)?;
-    Ok(id)
+    let selected = persisted.steps.len() - 1;
+    save_auto_run_selecting_step(conn, persisted, selected)
 }
 
 pub(super) fn next_queued_agent_step(persisted: &PersistedAutoRun) -> Option<usize> {
@@ -139,7 +123,7 @@ pub(super) fn has_pending_auto_work(persisted: &PersistedAutoRun) -> bool {
 }
 
 pub(super) fn pause_before_next_auto_step_with_context(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -209,7 +193,7 @@ pub(super) fn implementation_follow_up_step_needed(persisted: &PersistedAutoRun)
 }
 
 pub(super) fn ensure_next_auto_step_with_context(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -266,7 +250,7 @@ pub(super) fn ensure_next_auto_step_with_context(
 }
 
 fn ensure_next_implementation_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
 ) -> Result<bool, String> {
     if persisted.run.implementation_source == AutoImplementationSource::DraftPlan
@@ -369,7 +353,7 @@ fn ensure_next_implementation_step(
 }
 
 fn ensure_next_stabilization_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,

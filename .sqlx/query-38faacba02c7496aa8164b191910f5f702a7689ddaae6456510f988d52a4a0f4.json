@@ -1,0 +1,92 @@
+{
+  "db_name": "SQLite",
+  "query": "select provider as \"provider!\", canonical_host as \"canonical_host!\",\n       project_path as \"project_path!\", project_path_key as \"project_path_key!\",\n       target_branch as \"target_branch!\", default_branch, required_approvals as \"required_approvals!\",\n       require_conversation_resolution as \"require_conversation_resolution!\",\n       require_branch_up_to_date as \"require_branch_up_to_date!\",\n       required_checks as \"required_checks!\", merge_queue_required as \"merge_queue_required!\",\n       refreshed_unix_ms as \"refreshed_unix_ms!\", error\nfrom repo_policy_cache\nwhere provider = ? and canonical_host = ? and project_path_key = ? and target_branch = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "provider!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "canonical_host!",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "project_path!",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "project_path_key!",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_branch!",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "default_branch",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "required_approvals!",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "require_conversation_resolution!",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "require_branch_up_to_date!",
+        "ordinal": 8,
+        "type_info": "Integer"
+      },
+      {
+        "name": "required_checks!",
+        "ordinal": 9,
+        "type_info": "Text"
+      },
+      {
+        "name": "merge_queue_required!",
+        "ordinal": 10,
+        "type_info": "Integer"
+      },
+      {
+        "name": "refreshed_unix_ms!",
+        "ordinal": 11,
+        "type_info": "Integer"
+      },
+      {
+        "name": "error",
+        "ordinal": 12,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "38faacba02c7496aa8164b191910f5f702a7689ddaae6456510f988d52a4a0f4"
+}

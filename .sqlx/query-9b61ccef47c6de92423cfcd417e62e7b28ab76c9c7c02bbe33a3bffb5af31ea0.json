@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "select branch as \"branch!\", worktree_path\nfrom opencode_runtime\nwhere branch not in (select branch from task_metadata)\n  and branch not in (select branch from archived_worktree)\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "branch!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "worktree_path",
+        "ordinal": 1,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "9b61ccef47c6de92423cfcd417e62e7b28ab76c9c7c02bbe33a3bffb5af31ea0"
+}

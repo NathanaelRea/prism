@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update auto_run set change_request_identity_json = '{not-json' where id = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "87cecb321e3dbf40f716e2e745f6aa444298b89a8958752e55dab111297cebc4"
+}

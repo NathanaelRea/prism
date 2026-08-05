@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update worktree_harness\nset worktree_path = ?, worktree_incarnation = ?, updated_unix_ms = ?\nwhere branch = ? and worktree_path = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "414d052110f5b3e1901fb264b22982b313da0472de445db3d3ed610e7a391ff4"
+}

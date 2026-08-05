@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update opencode_runtime\nset server_port = ?, server_url = ?, server_pid = ?,\n    server_start_time_ticks = ?, updated_unix_ms = ?\nwhere repo_root = ? and harness_id = ?\n  and (server_port != ? or server_url != ? or server_pid is not ?\n       or server_start_time_ticks is not ?)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": []
+  },
+  "hash": "6437b1244bde9c2d0d5d2efe216e9b9b8cb2ada64bf714736f45714cc8035e9b"
+}

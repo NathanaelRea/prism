@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn execute_one_non_agent_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -9,7 +9,7 @@ pub(super) fn execute_one_non_agent_step(
     executor: &AutoExecutorConfig,
 ) -> Result<(), String> {
     start_non_agent_step(conn, persisted, step_index)?;
-    crate::execution::validate_installed_claim(conn)?;
+    conn.validate_claim()?;
     let max_output_lines_per_step = executor.max_output_lines_per_step;
     let result = match persisted.steps[step_index].step_key {
         AutoStepKey::ApprovePlan => {
@@ -123,7 +123,7 @@ pub(super) fn execute_one_non_agent_step(
 }
 
 pub(super) fn execute_approve_plan_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
     max_output_lines_per_step: usize,
@@ -158,7 +158,7 @@ pub(super) fn execute_approve_plan_step(
 }
 
 pub(super) fn execute_run_plan_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -319,7 +319,7 @@ pub(super) fn execute_run_plan_step(
 }
 
 pub(super) fn start_non_agent_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
 ) -> Result<(), String> {
@@ -336,13 +336,13 @@ pub(super) fn start_non_agent_step(
 }
 
 pub(super) fn execute_local_verify_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     config: &Config,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
-    crate::execution::validate_installed_claim(conn)?;
+    conn.validate_claim()?;
     let result =
         crate::verify::run_auto_verify(config, &persisted.run.worktree_path, VerifyMode::Normal);
     let summary = format_verify_result(&result);
@@ -390,14 +390,14 @@ pub(super) fn execute_local_verify_step(
 }
 
 pub(super) fn execute_commit_impl_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     config: &Config,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
     let message = implementation_commit_message(&persisted.run);
-    crate::execution::validate_installed_claim(conn)?;
+    conn.validate_claim()?;
     let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
     let step = &mut persisted.steps[step_index];
     step.commit_sha = result.commit_sha.clone();
@@ -437,7 +437,7 @@ pub(super) fn execute_commit_impl_step(
 }
 
 pub(super) fn execute_push_pr_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -502,7 +502,7 @@ pub(super) fn execute_push_pr_step(
         );
     }
     let head_sha = crate::git::current_head_sha(&persisted.run.worktree_path, config)?;
-    crate::execution::validate_installed_claim(conn)?;
+    conn.validate_claim()?;
     crate::lifecycle::push_branch(
         config,
         &persisted.run.worktree_path,
@@ -544,7 +544,7 @@ pub(super) fn execute_push_pr_step(
             &pushed_source,
         )?;
         let body = auto_pr_body(config, &persisted.run);
-        crate::execution::validate_installed_claim(conn)?;
+        conn.validate_claim()?;
         crate::remote::dispatcher::create_change_request(
             repo,
             config,
@@ -627,7 +627,7 @@ fn run_create_checks_after_push(
 }
 
 pub(super) fn execute_wait_review_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -731,13 +731,13 @@ pub(super) fn execute_wait_review_step(
 }
 
 pub(super) fn execute_verify_review_fix_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     config: &Config,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
-    crate::execution::validate_installed_claim(conn)?;
+    conn.validate_claim()?;
     let result =
         crate::verify::run_auto_verify(config, &persisted.run.worktree_path, VerifyMode::ReviewFix);
     let summary = format_verify_result(&result);
@@ -784,7 +784,7 @@ pub(super) fn execute_verify_review_fix_step(
 }
 
 pub(super) fn execute_commit_review_fix_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -842,7 +842,7 @@ pub(super) fn execute_commit_review_fix_step(
         config,
         &stabilization_model::RepairKind::Review,
     );
-    crate::execution::validate_installed_claim(conn)?;
+    conn.validate_claim()?;
     let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
     let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
     let outcome = stabilization_execute::complete_repair_commit(
@@ -872,7 +872,7 @@ pub(super) fn execute_commit_review_fix_step(
 }
 
 pub(super) fn execute_wait_ci_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -967,10 +967,10 @@ pub(super) fn execute_wait_ci_step(
     }
 }
 
-fn interruptible_execution_sleep(conn: &rusqlite::Connection, seconds: u64) -> Result<(), String> {
+fn interruptible_execution_sleep(conn: &AutoFlowStore, seconds: u64) -> Result<(), String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
     while std::time::Instant::now() < deadline {
-        crate::execution::validate_installed_claim(conn)?;
+        conn.validate_claim()?;
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         std::thread::sleep(remaining.min(std::time::Duration::from_millis(250)));
     }
@@ -978,13 +978,13 @@ fn interruptible_execution_sleep(conn: &rusqlite::Connection, seconds: u64) -> R
 }
 
 pub(super) fn execute_verify_ci_fix_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     config: &Config,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
-    crate::execution::validate_installed_claim(conn)?;
+    conn.validate_claim()?;
     let result =
         crate::verify::run_auto_verify(config, &persisted.run.worktree_path, VerifyMode::Normal);
     let summary = format_verify_result(&result);
@@ -1031,7 +1031,7 @@ pub(super) fn execute_verify_ci_fix_step(
 }
 
 pub(super) fn execute_commit_ci_fix_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -1087,7 +1087,7 @@ pub(super) fn execute_commit_ci_fix_step(
     }
     let message =
         stabilization_execute::repair_commit_message(config, &stabilization_model::RepairKind::Ci);
-    crate::execution::validate_installed_claim(conn)?;
+    conn.validate_claim()?;
     let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
     let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
     let outcome = stabilization_execute::complete_repair_commit(
@@ -1117,7 +1117,7 @@ pub(super) fn execute_commit_ci_fix_step(
 }
 
 pub(super) fn execute_merge_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -1147,7 +1147,7 @@ pub(super) fn execute_merge_step(
         return Ok(());
     }
 
-    crate::execution::validate_installed_claim(conn)?;
+    conn.validate_claim()?;
     let verify =
         crate::verify::run_auto_verify(config, &persisted.run.worktree_path, VerifyMode::Normal);
     crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
@@ -1213,7 +1213,7 @@ pub(super) fn execute_merge_step(
         return Err(gate.summary);
     }
 
-    crate::execution::validate_installed_claim(conn)?;
+    conn.validate_claim()?;
     let execution = stabilization_execute::execute_merge_authorization(
         config,
         &persisted.run.worktree_path,
@@ -1353,7 +1353,7 @@ pub(super) enum MergeReconciliationProgress {
 }
 
 pub(super) fn reconcile_waiting_merge_until_complete(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -1361,7 +1361,7 @@ pub(super) fn reconcile_waiting_merge_until_complete(
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
     loop {
-        crate::execution::validate_installed_claim(conn)?;
+        conn.validate_claim()?;
         let worktree_path = persisted.run.worktree_path.clone();
         let progress = reconcile_waiting_merge_step_with(
             conn,
@@ -1389,7 +1389,7 @@ pub(super) fn reconcile_waiting_merge_until_complete(
 }
 
 pub(super) fn reconcile_waiting_merge_step_with<F>(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
@@ -1519,7 +1519,7 @@ fn validate_pending_merge_observation(
 }
 
 fn pending_merge_change_request(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &PersistedAutoRun,
     step_index: usize,
 ) -> Result<crate::remote::ChangeRequest, String> {
@@ -1577,7 +1577,7 @@ fn merge_pending_state(observed: &crate::remote::ChangeRequestSummary) -> String
 }
 
 fn append_merge_reconciliation_output(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     step: &AutoStepRun,
     kind: AutoOutputKind,
     summary: &str,
@@ -1597,7 +1597,7 @@ fn append_merge_reconciliation_output(
 }
 
 fn fail_waiting_merge_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
     error: &str,
@@ -1621,7 +1621,7 @@ fn fail_waiting_merge_step(
 }
 
 pub(super) fn execute_cleanup_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -1709,7 +1709,7 @@ pub(super) fn execute_cleanup_step(
         crate::worktrunk::ApprovalStatus::Approved
         | crate::worktrunk::ApprovalStatus::NotWorktrunk => {}
     }
-    crate::execution::validate_installed_claim(conn)?;
+    conn.validate_claim()?;
     let outcome = crate::session::delete_worktree_session_if_current(
         repo,
         config,
@@ -1762,7 +1762,7 @@ pub(super) fn execute_cleanup_step(
 }
 
 pub(super) fn finish_non_agent_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     step: &mut AutoStepRun,
     status: AutoStepStatus,
     summary: Option<String>,
@@ -1777,7 +1777,7 @@ pub(super) fn finish_non_agent_step(
 }
 
 pub(super) fn set_auto_step_waiting(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     step: &mut AutoStepRun,
     summary: String,
 ) -> Result<(), String> {
@@ -1817,7 +1817,7 @@ struct MergeGateOutcome {
 }
 
 pub(super) fn poll_ci_status(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -1906,7 +1906,7 @@ pub(super) fn evaluate_ci_status(
 }
 
 pub(super) fn poll_review_feedback(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -2240,20 +2240,5 @@ pub(super) fn plan_run_status_label(status: PlanRunStatus) -> &'static str {
         PlanRunStatus::Done => "done",
         PlanRunStatus::Failed => "failed",
         PlanRunStatus::Aborted => "aborted",
-    }
-}
-
-pub(super) fn plan_run_mode_label(mode: PlanRunMode) -> &'static str {
-    match mode {
-        PlanRunMode::Sequential => "sequential",
-        PlanRunMode::Parallel => "parallel",
-    }
-}
-
-pub(super) fn parse_plan_run_mode(value: &str) -> Result<PlanRunMode, String> {
-    match value {
-        "sequential" => Ok(PlanRunMode::Sequential),
-        "parallel" => Ok(PlanRunMode::Parallel),
-        _ => Err(format!("unknown plan run mode: {value}")),
     }
 }

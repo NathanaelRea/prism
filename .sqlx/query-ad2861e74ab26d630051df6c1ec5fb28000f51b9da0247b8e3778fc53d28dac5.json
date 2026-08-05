@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "delete from opencode_runtime\nwhere repo_root = ? and harness_id = ? and branch = ? and worktree_path = ?\n  and generation = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "ad2861e74ab26d630051df6c1ec5fb28000f51b9da0247b8e3778fc53d28dac5"
+}

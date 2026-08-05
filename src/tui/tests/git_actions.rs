@@ -231,8 +231,12 @@ fn review_resolution_action_requires_main_panel_and_unresolved_threads() {
         vec![test_session(0, "/tmp/repo", "feature")],
     );
     tui.focused_panel = PanelFocus::Worktrees;
+    let mut summary = test_pr_summary(false);
+    summary.change_request_identity = Some(test_change_request_identity(
+        crate::remote::ProviderKind::GitHub,
+    ));
     tui.sessions[0].pr = PrCache::observed(
-        test_pr_summary(false),
+        summary.clone(),
         Some(PrDetails {
             review_comments: vec![PrReviewComment {
                 thread_id: "thread-1".to_string(),
@@ -253,7 +257,7 @@ fn review_resolution_action_requires_main_panel_and_unresolved_threads() {
     assert!(!tui.git_action_enabled(GitAction::ResolveAllComments));
 
     tui.sessions[0].pr = PrCache::observed(
-        test_pr_summary(false),
+        summary.clone(),
         Some(PrDetails {
             review_comments: vec![PrReviewComment {
                 thread_id: "  ".to_string(),
@@ -266,7 +270,7 @@ fn review_resolution_action_requires_main_panel_and_unresolved_threads() {
     assert!(!tui.git_action_enabled(GitAction::ResolveAllComments));
 
     tui.sessions[0].pr = PrCache::observed(
-        test_pr_summary(false),
+        summary,
         Some(PrDetails {
             review_comments: vec![PrReviewComment {
                 thread_id: "thread-1".to_string(),

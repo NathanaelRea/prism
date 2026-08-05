@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "select state as \"state!\", transition_sequence as \"transition_sequence!\"\nfrom notification_session\nwhere worktree_path = ? and branch = ? and incarnation = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "state!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "transition_sequence!",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "57de426b22586c8eabc9fa2e91960ca84e507bf06871b599280c398bad7d9500"
+}

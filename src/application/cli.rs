@@ -3,8 +3,8 @@ use crate::args::{
     DaemonCommand, DbCommand, DebugCommand, InspectOptions, StatusOptions, WorkerCommand,
 };
 use crate::auto_flow::{
-    AutoImplementationSource, AutoLaunch, AutoLaunchOptions, AutoRunMode,
-    load_recent_active_runs_for_repo, prepare_auto_run_for_resume, submit_auto_run,
+    AutoFlowStore, AutoImplementationSource, AutoLaunch, AutoLaunchOptions, AutoRunMode,
+    load_recent_active_runs_for_repo, prepare_auto_run_for_resume,
 };
 use crate::config::Config;
 use crate::git::{current_branch_name, selected_dirty};
@@ -63,8 +63,7 @@ pub fn run() -> Result<(), String> {
         }
         CommandKind::Config(command) => {
             let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
-            run_config_command(command, &repo, &config);
-            Ok(())
+            run_config_command(command, &repo, &config)
         }
         CommandKind::Doctor => {
             let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;
@@ -118,17 +117,31 @@ pub fn run() -> Result<(), String> {
     result
 }
 
-fn run_config_command(command: ConfigCommand, repo: &Repository, config: &Config) {
+fn run_config_command(
+    command: ConfigCommand,
+    repo: &Repository,
+    config: &Config,
+) -> Result<(), String> {
     match command {
         ConfigCommand::Show => config::print_config(repo, config),
         ConfigCommand::Example => print!("{}", config::config_example()),
-        ConfigCommand::Schema => print!("{}", config::CONFIG_SCHEMA_JSON),
+        ConfigCommand::Schema => print!("{}", config::GLOBAL_CONFIG_SCHEMA_JSON),
         ConfigCommand::Paths => {
             println!("user_config = {}", config.user_path.display());
             println!("repo_config = {}", config.repo_config_path.display());
-            println!("schema_url = {}", config::CONFIG_SCHEMA_URL);
+            println!("global_schema_url = {}", config::GLOBAL_CONFIG_SCHEMA_URL);
+            println!(
+                "repository_schema_url = {}",
+                config::REPOSITORY_CONFIG_SCHEMA_URL
+            );
+        }
+        ConfigCommand::Migrate(mode) => {
+            for line in config::migrate_config_files(config, mode)? {
+                println!("{line}");
+            }
         }
     }
+    Ok(())
 }
 
 fn run_agent_command(
@@ -651,14 +664,21 @@ fn load_single_repo_context(
 }
 
 fn warn_pending_recovery(repo: &Repository) {
-    let count = observability::with_writable_db(repo, |conn| {
-        conn.query_row(
-            "select count(*) from workflow_execution where dispatch_state = 'recovery_pending'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| format!("count interrupted workflows: {error}"))
-    });
+    let count = workspace_state(Some(&repo.root))
+        .and_then(|state| {
+            state.inspect(InspectRequest {
+                include_hidden: true,
+                include_terminal: true,
+            })
+        })
+        .map(|snapshot| {
+            snapshot
+                .repositories
+                .iter()
+                .flat_map(|repo| &repo.workflows)
+                .filter(|workflow| workflow.dispatch.state.as_deref() == Some("recovery_pending"))
+                .count()
+        });
     if let Ok(count) = count
         && count > 0
     {
@@ -818,16 +838,16 @@ fn run_auto_command(
     mut command: AutoCommand,
 ) -> Result<(), String> {
     workspace::ensure_repo_entry(&repo.root)?;
-    let existing = observability::with_writable_db(repo, |conn| {
-        load_recent_active_runs_for_repo(conn, &repo.root, 1)
+    let existing = observability::with_writable_db(repo, |path| {
+        load_recent_active_runs_for_repo(&AutoFlowStore::open(path), &repo.root, 1)
     })?;
     if let Some(mut run) = existing.into_iter().next() {
         let workflow = crate::execution::WorkflowIdentity::new(
             crate::execution::WorkflowKind::Auto,
             &run.run.id,
         );
-        let dispatch = observability::with_writable_db(repo, |conn| {
-            crate::execution::dispatch_state(conn, &workflow)
+        let dispatch = observability::with_writable_db(repo, |path| {
+            crate::execution::dispatch_state(path, &workflow)
         })?;
         if matches!(
             dispatch,
@@ -852,16 +872,16 @@ fn run_auto_command(
             );
             return Ok(());
         }
-        let should_execute = observability::with_writable_db(repo, |conn| {
+        let should_execute = observability::with_writable_db(repo, |path| {
             prepare_auto_run_for_resume(
-                conn,
+                &AutoFlowStore::open(path),
                 &mut run,
                 crate::plan_run::DEFAULT_OUTPUT_LINES_PER_STEP,
             )
         })?;
         if should_execute {
-            observability::with_writable_db(repo, |conn| {
-                crate::execution::enqueue(conn, &workflow)
+            observability::with_writable_db(repo, |path| {
+                crate::execution::enqueue(path, &workflow)
             })?;
             crate::worker::ensure_running()?;
             crate::worker::wake()?;
@@ -894,15 +914,20 @@ fn run_auto_command(
         config.default_harness.clone(),
         config.harness_adapter(&config.default_harness)?,
     );
-    let mut persisted = launch.create_run();
-    observability::with_writable_db(repo, |conn| submit_auto_run(conn, &mut persisted))?;
-    crate::worker::ensure_running()?;
-    crate::worker::wake()?;
+    let run_id =
+        crate::worker::launch_bundled_coding(crate::workflow::bundled::BundledCodingLaunch {
+            repository: launch.repo_root.clone(),
+            worktree_path: launch.worktree_path.clone(),
+            task: launch.initial_prompt.clone(),
+            plan_path: launch.plan_path.clone(),
+            draft_plan: launch.implementation_source
+                == crate::auto_flow::AutoImplementationSource::DraftPlan,
+            harness_id: config.default_harness.clone(),
+            variant: Some(launch.variant.clone()),
+        })?;
     println!(
-        "auto_run_id = {}\nstatus = {:?}\nworktree = {}",
-        persisted.run.id,
-        persisted.run.status,
-        persisted.run.worktree_path.display()
+        "workflow_run_id = {run_id}\nstatus = queued\nworktree = {}",
+        launch.worktree_path.display()
     );
     Ok(())
 }
@@ -1016,6 +1041,18 @@ fn discover_workspace_sessions(repos: &[ManagedRepo]) -> Result<Vec<session::Ses
     Ok(all)
 }
 
+fn control_plane_debug_metrics() -> Result<Vec<crate::ControlPlaneMetric>, String> {
+    crate::async_runtime::block_on(async {
+        crate::WorkflowOperations::open_default()
+            .await
+            .map_err(|error| error.to_string())?
+            .control_plane_metrics()
+            .await
+            .map_err(|error| error.to_string())
+    })
+    .map_err(|error| format!("run workflow debug operation: {error}"))?
+}
+
 fn run_debug_command(
     command: DebugCommand,
     repo: &Repository,
@@ -1117,6 +1154,23 @@ fn run_debug_command(
                 }
                 Err(error) => println!("wal_checkpoint_passive_error = {error}"),
             }
+            match control_plane_debug_metrics() {
+                Ok(metrics) => {
+                    println!(
+                        "workflow_database = {}",
+                        crate::util::prism_config_dir()
+                            .join("workflow.db")
+                            .display()
+                    );
+                    for metric in metrics {
+                        println!(
+                            "control_plane.{} = {} time_unix_ms={} labels={}",
+                            metric.name, metric.value, metric.time_unix_ms, metric.labels_json
+                        );
+                    }
+                }
+                Err(error) => println!("control_plane_error = {error}"),
+            }
             Ok(())
         }
         DebugCommand::Logs => {
@@ -1193,6 +1247,9 @@ fn run_db_command(command: DbCommand, repo: &Repository) -> Result<(), String> {
         DbCommand::Path => {
             println!("{}", observability::db_path(repo).display());
             Ok(())
+        }
+        DbCommand::Query(query) if query.trim().is_empty() => {
+            Err("database query must not be empty".to_string())
         }
         DbCommand::Query(query) => observability::run_readonly_query(repo, &query),
     }

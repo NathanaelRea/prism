@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update auto_run\nset pause_requested = 1,\n    status = case when exists(\n      select 1 from auto_step_run where run_id = ? and status in ('starting','running','waiting')\n    ) then status else 'paused' end,\n    updated_unix_ms = ?\nwhere id = ? and status not in ('done','failed','aborted')\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "49d8501f50d644fbdd13e66957dccb9561474468edd3744d5ab3baab87b01341"
+}

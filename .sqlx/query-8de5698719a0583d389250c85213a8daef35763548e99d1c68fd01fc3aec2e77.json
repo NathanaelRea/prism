@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "delete from pr_cache where branch = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "8de5698719a0583d389250c85213a8daef35763548e99d1c68fd01fc3aec2e77"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "delete from pending_worktree_deletion where branch = ? and worktree_path = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "51c2a66c958ea41e7e60e6ddea474035ff8ddb2a0623308c638c4843bbc5b05c"
+}

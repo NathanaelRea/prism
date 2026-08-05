@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into pr_details_cache (\n  branch, pr_number, head_sha, provider, canonical_host, project_path, native_cr_id,\n  display_number, source_provider, source_canonical_host, source_project_path,\n  target_provider, target_canonical_host, target_project_path, comments, reviews,\n  review_comments, files, failing_checks, check_contexts, ci_failures,\n  refreshed_unix_ms, observation_error\n) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\non conflict(branch) do update set\n  pr_number = excluded.pr_number, head_sha = excluded.head_sha, provider = excluded.provider,\n  canonical_host = excluded.canonical_host, project_path = excluded.project_path,\n  native_cr_id = excluded.native_cr_id, display_number = excluded.display_number,\n  source_provider = excluded.source_provider,\n  source_canonical_host = excluded.source_canonical_host,\n  source_project_path = excluded.source_project_path,\n  target_provider = excluded.target_provider,\n  target_canonical_host = excluded.target_canonical_host,\n  target_project_path = excluded.target_project_path, comments = excluded.comments,\n  reviews = excluded.reviews, review_comments = excluded.review_comments,\n  files = excluded.files, failing_checks = excluded.failing_checks,\n  check_contexts = excluded.check_contexts, ci_failures = excluded.ci_failures,\n  refreshed_unix_ms = excluded.refreshed_unix_ms,\n  observation_error = excluded.observation_error\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 23
+    },
+    "nullable": []
+  },
+  "hash": "eb8f298dad5abaf43f9fc9b08497605e19328fb799f05db0d47c7111b459a4df"
+}

@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "select distinct execution_process_id as \"process_id!\",\n  execution_process_start_time_ticks as \"start_time_ticks?\"\nfrom plan_step_run\nwhere run_id = ? and execution_process_id is not null\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "process_id!",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "start_time_ticks?",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "4926eadfda48ea81283df117fe7d3c88856f5f5ea2e6ec044eb8910a807d5849"
+}

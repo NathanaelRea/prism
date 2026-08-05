@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/NathanaelRea/prism/main/schemas/config/v1/repository.schema.json",
+  "title": "Prism Repository Config V1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["config_version"],
+  "properties": {
+    "config_version": { "const": 1 },
+    "default_base": { "type": "string" },
+    "plan_dir": { "type": "string" },
+    "review_packet_dir": { "type": "string" },
+    "worktree_command": { "type": "string" },
+    "opencode_port_base": { "type": "integer", "minimum": 0, "maximum": 65535 },
+    "opencode_port_span": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "opencode_shutdown_owned_servers": { "type": "boolean" },
+    "opencode_plan_plugin": { "type": "boolean" },
+    "escape_key": { "enum": ["esc-esc", "ctrl-space"] },
+    "merge_method": { "enum": ["squash", "merge", "rebase"] },
+    "ui": { "$ref": "global.schema.json#/$defs/ui" },
+    "checks": { "$ref": "global.schema.json#/$defs/checks" },
+    "auto": { "$ref": "global.schema.json#/$defs/auto" },
+    "layout": { "$ref": "global.schema.json#/$defs/layout" },
+    "notifications": { "$ref": "global.schema.json#/$defs/notifications" },
+    "worktrees": { "$ref": "global.schema.json#/$defs/worktrees" },
+    "tools": { "$ref": "global.schema.json#/$defs/tools" },
+    "remote_hosts": { "$ref": "global.schema.json#/$defs/remoteHosts" },
+    "prompt_templates": { "$ref": "global.schema.json#/$defs/stringMap" }
+  }
+}

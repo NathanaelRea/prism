@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn execute_one_agent_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     config: &Config,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
@@ -47,7 +47,7 @@ pub(super) fn execute_one_agent_step(
                 return Err(error);
             }
         };
-    crate::execution::validate_installed_claim(conn)?;
+    conn.validate_claim()?;
     let spawn_result = spawn_harness(&mut command, &invocation);
     let (mut child, used_attach) = match spawn_result {
         Ok(child) => (child, invocation.attach),
@@ -65,7 +65,7 @@ pub(super) fn execute_one_agent_step(
             invocation.cleanup();
             let (mut fallback, fallback_invocation) =
                 harness_run_command(executor, &persisted.steps[step_index], &prompt, false)?;
-            crate::execution::validate_installed_claim(conn)?;
+            conn.validate_claim()?;
             match spawn_harness(&mut fallback, &fallback_invocation) {
                 Ok(child) => {
                     invocation = fallback_invocation;
@@ -177,7 +177,7 @@ fn spawn_harness(
 }
 
 pub(super) fn mark_spawn_failure(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     step: &mut AutoStepRun,
     error: &str,
     max_output_lines_per_step: usize,
@@ -197,7 +197,7 @@ pub(super) fn mark_spawn_failure(
 }
 
 pub(super) fn finish_step_after_exit(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     step: &mut AutoStepRun,
     exit_code: i32,
     used_attach: bool,
@@ -221,29 +221,11 @@ pub(super) fn finish_step_after_exit(
     let step_id = step
         .id
         .ok_or_else(|| "auto step must be saved before completion".to_string())?;
-    let changed = conn
-        .execute(
-            "update auto_step_run
-             set status = ?1, execution_process_id = null,
-                 execution_process_start_time_ticks = null, finished_unix_ms = ?2, error = ?3
-             where id = ?4 and status != 'aborted'",
-            params![
-                step.status.as_str(),
-                step.finished_unix_ms.map(u64_to_i64),
-                step.error,
-                step_id,
-            ],
-        )
-        .map_err(|error| format!("finish auto step: {error}"))?;
-    if changed == 0 {
-        let status = conn
-            .query_row(
-                "select status from auto_step_run where id = ?1",
-                params![step_id],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|error| format!("reload auto step status: {error}"))?;
-        step.status = AutoStepStatus::parse(&status)?;
+    if !persistence::finish_step(conn.path(), step)
+        .map_err(|error| crate::execution::claim_write_error("finish Auto Flow step", error))?
+    {
+        step.status = persistence::load_step_status(conn.path(), step_id)
+            .map_err(|error| format!("reload Auto Flow step status: {error}"))?;
         step.execution.process_id = None;
         step.execution.process_identity = None;
         if step.status == AutoStepStatus::Aborted {
@@ -254,7 +236,7 @@ pub(super) fn finish_step_after_exit(
 }
 
 pub(super) fn claim_spawned_process(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     step: &mut AutoStepRun,
     child: &mut crate::process::SupervisedChild,
 ) -> Result<bool, String> {
@@ -265,20 +247,14 @@ pub(super) fn claim_spawned_process(
     let process_identity = crate::process::record_process(process_id)
         .map_err(|error| format!("record auto harness process {process_id}: {error}"))?
         .identity;
-    let changed = conn
-        .execute(
-            "update auto_step_run
-             set status = 'running', execution_process_id = ?1,
-                 execution_process_start_time_ticks = ?2
-             where id = ?3 and status = 'starting'",
-            params![
-                i64::from(process_id),
-                process_identity.map(|identity| u64_to_i64(identity.stored_value())),
-                step_id,
-            ],
-        )
-        .map_err(|error| format!("claim auto harness process: {error}"))?;
-    if changed == 0 {
+    if !persistence::claim_process(
+        conn.path(),
+        step_id,
+        process_id,
+        process_identity.map(|identity| identity.stored_value()),
+    )
+    .map_err(|error| crate::execution::claim_write_error("claim Auto Flow process", error))?
+    {
         let _ = crate::harness::terminate_active_process(child);
         step.status = AutoStepStatus::Aborted;
         step.execution = crate::harness::ExecutionRef::default();
@@ -291,7 +267,7 @@ pub(super) fn claim_spawned_process(
 }
 
 pub(super) fn collect_child_output(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     step: &mut AutoStepRun,
     child: &mut crate::process::SupervisedChild,
     max_output_lines_per_step: usize,
@@ -341,7 +317,7 @@ pub(super) fn collect_child_output(
             Ok(Ok(ChildLine::End)) => readers_open -= 1,
             Ok(Err(error)) => break Err(error),
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if let Err(error) = crate::execution::validate_installed_claim(conn) {
+                if let Err(error) = conn.validate_claim() {
                     break Err(error);
                 }
                 if child.deadline_exceeded() {
@@ -437,7 +413,7 @@ pub(super) fn spawn_reader_thread(
 }
 
 pub(super) fn ingest_child_line(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     step: &mut AutoStepRun,
     stream: StreamKind,
     raw: &str,
@@ -490,7 +466,7 @@ pub(super) fn ingest_child_line(
 }
 
 pub(super) fn ingest_single_agent_event(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     step: &mut AutoStepRun,
     event: PlanAgentEvent,
     max_output_lines_per_step: usize,

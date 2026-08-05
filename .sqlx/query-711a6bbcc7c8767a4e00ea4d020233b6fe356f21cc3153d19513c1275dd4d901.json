@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select state\nfrom agent_state\nwhere branch = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "state",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "711a6bbcc7c8767a4e00ea4d020233b6fe356f21cc3153d19513c1275dd4d901"
+}

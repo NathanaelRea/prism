@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "delete from hidden_session where branch = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "d2b3d8d9cf5f12c35386aaf4ff15af5914c4c3dc4abba39bf5fa0f4a75c6e604"
+}

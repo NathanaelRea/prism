@@ -558,8 +558,11 @@ impl Tui {
                 )
             })?;
         let mut persisted = persisted.clone();
-        crate::observability::with_writable_db(&managed.repo, |conn| {
-            crate::auto_flow::save_auto_run(conn, &mut persisted)
+        crate::observability::with_writable_db(&managed.repo, |path| {
+            crate::auto_flow::save_auto_run(
+                &crate::auto_flow::AutoFlowStore::open(path),
+                &mut persisted,
+            )
         })?;
         self.remember_auto_run(persisted);
         Ok(())

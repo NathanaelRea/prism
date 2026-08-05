@@ -346,10 +346,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(selected, "codex");
-        assert_eq!(
-            fs::read_to_string(&config.user_path).unwrap(),
-            "default_harness = \"codex\"\n"
-        );
+        let persisted = fs::read_to_string(&config.user_path).unwrap();
+        assert!(persisted.contains("config_version = 1"));
+        assert!(persisted.contains("default_harness = \"codex\""));
         assert!(!config.needs_initial_harness_setup());
         let output = String::from_utf8(output).unwrap();
         assert!(output.contains("2  Codex"));

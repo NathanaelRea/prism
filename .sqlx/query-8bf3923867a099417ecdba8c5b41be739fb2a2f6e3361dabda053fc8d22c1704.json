@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "delete from task_metadata where branch = ? and worktree = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "8bf3923867a099417ecdba8c5b41be739fb2a2f6e3361dabda053fc8d22c1704"
+}

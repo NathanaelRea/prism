@@ -40,6 +40,39 @@ fn cleanup_finishes_and_persists_accepted_remote_mutations() {
         let mut summary = test_pr_summary(false);
         summary.number = index as u64 + 10;
         summary.head_ref = (*branch).to_string();
+        let change_request = test_change_request_identity(crate::remote::ProviderKind::GitHub);
+        summary.change_request_identity = Some(change_request.clone());
+        let target = match *branch {
+            "create" => RemoteMutationTarget::Create {
+                source_provider: crate::remote::ProviderKind::GitHub,
+                source_host: "github.com".to_string(),
+                source_project: "example/repo".to_string(),
+                source_branch: (*branch).to_string(),
+                expected_head_sha: summary.head_sha.clone(),
+                target_provider: Some(crate::remote::ProviderKind::GitHub),
+                target_host: "github.com".to_string(),
+                target_project: "example/repo".to_string(),
+                target_branch: summary.base_ref.clone(),
+                expected_base_sha: "base123".to_string(),
+            },
+            "resolve" => RemoteMutationTarget::Resolve {
+                change_request: change_request.clone(),
+                thread_ids: vec!["thread-1".to_string()],
+            },
+            "push" => RemoteMutationTarget::Push {
+                remote: "origin".to_string(),
+                branch: (*branch).to_string(),
+                expected_head_sha: summary.head_sha.clone(),
+                repository_provider: None,
+                repository_host: String::new(),
+                repository_project: String::new(),
+            },
+            "merge" => RemoteMutationTarget::Merge {
+                change_request,
+                expected_head_sha: summary.head_sha.clone(),
+            },
+            _ => unreachable!(),
+        };
         let cache = PrCache::observed(summary, None);
         let payload_session = if *branch == "merge" {
             let mut session = test_session(0, &temp.join(branch).display().to_string(), branch);
@@ -95,6 +128,13 @@ fn cleanup_finishes_and_persists_accepted_remote_mutations() {
                 },
             );
         tui.remote_actions_requiring_reconciliation.insert(id);
+        tui.remote_action_reconciliation_contexts.insert(
+            id,
+            RemoteActionReconciliationContext {
+                key: TuiJobKey::Worktree(tui.sessions[index].identity_key(&tui.repos[0].identity)),
+                target,
+            },
+        );
     }
 
     let (ordinary_stopped_tx, ordinary_stopped_rx) = std::sync::mpsc::channel();
@@ -212,16 +252,12 @@ fn empty_list_retains_persisted_create_marker_until_matching_summary_is_observed
     restarted.reconcile_remote_mutation_summaries(&repository, &[observed], &BTreeMap::new());
 
     assert!(!restarted.remote_action_reconciliation_blocked(&key, &target));
-    let marker_exists = crate::observability::with_writable_db(&repo, |conn| {
-        conn.query_row(
-            "select exists(select 1 from metadata where key = ?1)",
-            [super::super::REMOTE_MUTATION_RECONCILIATION_KEY],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(|error| error.to_string())
-    })
+    let marker = crate::persistence::database::load_metadata(
+        &crate::observability::db_path(&repo),
+        super::super::REMOTE_MUTATION_RECONCILIATION_KEY,
+    )
     .unwrap();
-    assert!(!marker_exists);
+    assert!(marker.is_none());
 
     fs::remove_dir_all(temp).unwrap();
 }
@@ -391,6 +427,9 @@ fn cleanup_applies_a_mutation_payload_routed_before_shutdown_started() {
     let mut summary = test_pr_summary(false);
     summary.number = 42;
     summary.head_ref = branch.to_string();
+    summary.change_request_identity = Some(test_change_request_identity(
+        crate::remote::ProviderKind::GitHub,
+    ));
     let cache = PrCache::observed(summary, None);
     let id = tui.spawn_tui_job(
         TuiJobKind::RemoteAction,

@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "select server_pid as \"server_pid!: i64\", server_port\nfrom opencode_runtime\nwhere server_pid is not null\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "server_pid!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "server_port",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "366817fa53562983d345a8278403d78c7765cf68b9207df9e6f444f4c53899d0"
+}

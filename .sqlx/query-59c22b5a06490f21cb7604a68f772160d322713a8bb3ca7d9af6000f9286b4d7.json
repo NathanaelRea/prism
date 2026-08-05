@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into agent_state (branch, state, updated_unix_ms)\nvalues (?, ?, ?)\non conflict(branch) do update set\n  state = excluded.state,\n  updated_unix_ms = excluded.updated_unix_ms\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "59c22b5a06490f21cb7604a68f772160d322713a8bb3ca7d9af6000f9286b4d7"
+}

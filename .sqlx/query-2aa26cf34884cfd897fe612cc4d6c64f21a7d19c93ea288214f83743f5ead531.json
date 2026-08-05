@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update auto_run set pause_requested = 0, status = 'aborted', updated_unix_ms = ?\nwhere id = ? and status not in ('done','aborted')\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "2aa26cf34884cfd897fe612cc4d6c64f21a7d19c93ea288214f83743f5ead531"
+}

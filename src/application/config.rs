@@ -19,14 +19,17 @@ use crate::session::discover_sessions;
 use crate::util::prism_config_dir;
 
 pub const AGENT_CANDIDATES: [&str; 1] = ["opencode"];
-pub const CONFIG_SCHEMA_URL: &str =
-    "https://raw.githubusercontent.com/NathanaelRea/prism/main/schemas/config.schema.json";
-pub const CONFIG_SCHEMA_JSON: &str = include_str!("../../schemas/config.schema.json");
+pub const CONFIG_VERSION: u64 = 1;
+pub const GLOBAL_CONFIG_SCHEMA_URL: &str = "https://raw.githubusercontent.com/NathanaelRea/prism/main/schemas/config/v1/global.schema.json";
+pub const REPOSITORY_CONFIG_SCHEMA_URL: &str = "https://raw.githubusercontent.com/NathanaelRea/prism/main/schemas/config/v1/repository.schema.json";
+pub const GLOBAL_CONFIG_SCHEMA_JSON: &str =
+    include_str!("../../schemas/config/v1/global.schema.json");
 
 pub fn config_example() -> String {
-    format!("#:schema {CONFIG_SCHEMA_URL}\n")
+    format!("#:schema {GLOBAL_CONFIG_SCHEMA_URL}\n")
         + r#"
 # Prism config. Harness settings are global; other settings may be repository overrides.
+config_version = 1
 default_harness = "opencode"
 default_base = "main"
 merge_method = "squash" # squash, merge, or rebase
@@ -105,12 +108,14 @@ repair_commit_merge = "fix: merge"
 }
 
 pub fn user_config_template() -> String {
-    config_example()
+    format!(
+        "#:schema {GLOBAL_CONFIG_SCHEMA_URL}\n\n# Global overrides. Unspecified values use Prism defaults.\nconfig_version = {CONFIG_VERSION}\n"
+    )
 }
 
 pub fn repo_config_template(include_worktree_columns: bool) -> String {
     let mut text = format!(
-        "#:schema {CONFIG_SCHEMA_URL}\n\n# Repository overrides. Unspecified values inherit the global config.\n"
+        "#:schema {REPOSITORY_CONFIG_SCHEMA_URL}\n\n# Repository overrides. Unspecified values inherit the global config.\nconfig_version = 1\n"
     );
     if include_worktree_columns {
         text.push_str("\n[worktrees]\ncolumns = []\n");
@@ -176,7 +181,7 @@ impl IconStyle {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim() {
             "unicode" => Some(Self::Unicode),
-            "nerd-font" | "nerdfont" | "nerd_font" => Some(Self::NerdFont),
+            "nerd-font" => Some(Self::NerdFont),
             _ => None,
         }
     }
@@ -218,8 +223,8 @@ pub enum EscapeKey {
 impl EscapeKey {
     fn parse(value: &str) -> Option<Self> {
         match value.trim() {
-            "esc-esc" | "escape-escape" => Some(Self::EscEsc),
-            "ctrl-space" | "control-space" => Some(Self::CtrlSpace),
+            "esc-esc" => Some(Self::EscEsc),
+            "ctrl-space" => Some(Self::CtrlSpace),
             _ => None,
         }
     }
@@ -267,7 +272,7 @@ impl MergeMethod {
 }
 
 #[derive(Clone, Debug)]
-pub struct Config {
+pub struct EffectiveConfig {
     pub default_harness: String,
     pub harnesses: BTreeMap<String, HarnessConfig>,
     pub config_errors: Vec<String>,
@@ -298,11 +303,32 @@ pub struct Config {
     pub repo_config_path: PathBuf,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
-struct RawConfig {
+pub type Config = EffectiveConfig;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigScope {
+    Global,
+    Repository,
+}
+
+impl ConfigScope {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Repository => "repository",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct GlobalOverrides {
+    common: RepoOverrides,
     default_harness: Option<String>,
     harnesses: Option<BTreeMap<String, RawHarnessConfig>>,
-    default_agent: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RepoOverrides {
     default_base: Option<String>,
     plan_dir: Option<String>,
     review_packet_dir: Option<String>,
@@ -321,8 +347,86 @@ struct RawConfig {
     worktrees: Option<RawWorktrees>,
     tools: Option<BTreeMap<String, String>>,
     remote_hosts: Option<BTreeMap<String, RawRemoteHostConfig>>,
-    agents: Option<BTreeMap<String, RawAgentConfig>>,
     prompt_templates: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GlobalConfigFileV1 {
+    config_version: u64,
+    default_harness: Option<String>,
+    harnesses: Option<BTreeMap<String, RawHarnessConfig>>,
+    default_base: Option<String>,
+    plan_dir: Option<String>,
+    review_packet_dir: Option<String>,
+    worktree_command: Option<String>,
+    opencode_port_base: Option<u16>,
+    opencode_port_span: Option<u16>,
+    opencode_shutdown_owned_servers: Option<bool>,
+    opencode_plan_plugin: Option<bool>,
+    escape_key: Option<String>,
+    merge_method: Option<String>,
+    ui: Option<RawUiConfig>,
+    checks: Option<RawChecks>,
+    auto: Option<RawAutoConfig>,
+    layout: Option<RawLayoutConfig>,
+    notifications: Option<RawNotificationConfig>,
+    worktrees: Option<RawWorktrees>,
+    tools: Option<BTreeMap<String, String>>,
+    remote_hosts: Option<BTreeMap<String, RawRemoteHostConfig>>,
+    prompt_templates: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RepoConfigFileV1 {
+    config_version: u64,
+    default_base: Option<String>,
+    plan_dir: Option<String>,
+    review_packet_dir: Option<String>,
+    worktree_command: Option<String>,
+    opencode_port_base: Option<u16>,
+    opencode_port_span: Option<u16>,
+    opencode_shutdown_owned_servers: Option<bool>,
+    opencode_plan_plugin: Option<bool>,
+    escape_key: Option<String>,
+    merge_method: Option<String>,
+    ui: Option<RawUiConfig>,
+    checks: Option<RawChecks>,
+    auto: Option<RawAutoConfig>,
+    layout: Option<RawLayoutConfig>,
+    notifications: Option<RawNotificationConfig>,
+    worktrees: Option<RawWorktrees>,
+    tools: Option<BTreeMap<String, String>>,
+    remote_hosts: Option<BTreeMap<String, RawRemoteHostConfig>>,
+    prompt_templates: Option<BTreeMap<String, String>>,
+}
+
+macro_rules! repo_overrides {
+    ($file:expr) => {{
+        let file = $file;
+        RepoOverrides {
+            default_base: file.default_base,
+            plan_dir: file.plan_dir,
+            review_packet_dir: file.review_packet_dir,
+            worktree_command: file.worktree_command,
+            opencode_port_base: file.opencode_port_base,
+            opencode_port_span: file.opencode_port_span,
+            opencode_shutdown_owned_servers: file.opencode_shutdown_owned_servers,
+            opencode_plan_plugin: file.opencode_plan_plugin,
+            escape_key: file.escape_key,
+            merge_method: file.merge_method,
+            ui: file.ui,
+            checks: file.checks,
+            auto: file.auto,
+            layout: file.layout,
+            notifications: file.notifications,
+            worktrees: file.worktrees,
+            tools: file.tools,
+            remote_hosts: file.remote_hosts,
+            prompt_templates: file.prompt_templates,
+        }
+    }};
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -345,11 +449,13 @@ struct RawRemoteHostConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawUiConfig {
     icon_style: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawChecks {
     pre_pr: Option<Vec<String>>,
     pre_push: Option<Vec<String>>,
@@ -357,6 +463,7 @@ struct RawChecks {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawAutoConfig {
     merge: Option<bool>,
     cleanup_after_merge: Option<bool>,
@@ -374,11 +481,13 @@ struct RawAutoConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawLayoutConfig {
     sidebar_width: Option<u16>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawNotificationConfig {
     enabled: Option<bool>,
     needs_input: Option<bool>,
@@ -387,17 +496,13 @@ struct RawNotificationConfig {
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawWorktrees {
     columns: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
-struct RawAgentConfig {
-    command: Option<String>,
-    prompt_mode: Option<String>,
-}
-
-#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RawHarnessConfig {
     adapter: Option<String>,
     program: Option<String>,
@@ -472,17 +577,52 @@ fn harness_config_from_raw(id: &str, raw: RawHarnessConfig) -> Result<HarnessCon
 
 #[derive(Debug)]
 enum ConfigDocumentError {
-    Utf8(std::string::FromUtf8Error),
-    Toml(toml::de::Error),
-    Semantic(String),
+    Utf8 {
+        scope: ConfigScope,
+        error: std::string::FromUtf8Error,
+    },
+    Toml {
+        scope: ConfigScope,
+        error: toml::de::Error,
+    },
+    Version {
+        scope: ConfigScope,
+        version: String,
+        remediation: &'static str,
+    },
+    Semantic {
+        scope: ConfigScope,
+        message: String,
+    },
 }
 
 impl fmt::Display for ConfigDocumentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Utf8(error) => write!(formatter, "config is unreadable text: {error}"),
-            Self::Toml(error) => write!(formatter, "config has invalid TOML: {error}"),
-            Self::Semantic(error) => write!(formatter, "config is semantically invalid: {error}"),
+            Self::Utf8 { scope, error } => write!(
+                formatter,
+                "config is unreadable text category=encoding scope={} version=unknown field=<document>: {error}; remediation: save the file as UTF-8",
+                scope.label()
+            ),
+            Self::Toml { scope, error } => write!(
+                formatter,
+                "config has invalid TOML category=syntax scope={} version=unknown field=<document>: {error}; remediation: correct the TOML syntax",
+                scope.label()
+            ),
+            Self::Version {
+                scope,
+                version,
+                remediation,
+            } => write!(
+                formatter,
+                "config category=version scope={} version={version} field=config_version: expected config_version = {CONFIG_VERSION}; remediation: {remediation}",
+                scope.label()
+            ),
+            Self::Semantic { scope, message } => write!(
+                formatter,
+                "config is semantically invalid category=field scope={} version=1 field=reported-by-decoder: {message}; remediation: remove or correct the reported field",
+                scope.label()
+            ),
         }
     }
 }
@@ -490,31 +630,123 @@ impl fmt::Display for ConfigDocumentError {
 impl Error for ConfigDocumentError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Utf8(error) => Some(error),
-            Self::Toml(error) => Some(error),
-            Self::Semantic(_) => None,
+            Self::Utf8 { error, .. } => Some(error),
+            Self::Toml { error, .. } => Some(error),
+            Self::Version { .. } | Self::Semantic { .. } => None,
         }
     }
 }
 
-fn parse_and_validate_config(
-    text: &str,
-    is_user_config: bool,
-) -> Result<RawConfig, ConfigDocumentError> {
-    if text.trim().is_empty() {
-        return Ok(RawConfig::default());
-    }
-    let value = toml::from_str::<toml::Value>(text).map_err(ConfigDocumentError::Toml)?;
-    let raw = value
-        .try_into::<RawConfig>()
-        .map_err(|error| ConfigDocumentError::Semantic(error.to_string()))?;
-    validate_config_values(&raw, is_user_config).map_err(ConfigDocumentError::Semantic)?;
-    Ok(raw)
+#[derive(Debug)]
+enum ParsedOverrides {
+    Global(GlobalOverrides),
+    Repository(RepoOverrides),
 }
 
-fn validate_config_values(raw: &RawConfig, is_user_config: bool) -> Result<(), String> {
+fn parse_and_validate_config(
+    text: &str,
+    scope: ConfigScope,
+) -> Result<ParsedOverrides, ConfigDocumentError> {
+    let value = toml::from_str::<toml::Value>(text)
+        .map_err(|error| ConfigDocumentError::Toml { scope, error })?;
+    let version_value = value.get("config_version");
+    let version = version_value.and_then(toml::Value::as_integer);
+    match version {
+        None if version_value.is_none() => {
+            return Err(ConfigDocumentError::Version {
+                scope,
+                version: "missing".to_string(),
+                remediation: "add config_version = 1 or replace the file with the generated V1 template",
+            });
+        }
+        None => {
+            return Err(ConfigDocumentError::Version {
+                scope,
+                version: "invalid-type".to_string(),
+                remediation: "set config_version to the integer 1",
+            });
+        }
+        Some(version) if version != CONFIG_VERSION as i64 => {
+            return Err(ConfigDocumentError::Version {
+                scope,
+                version: version.to_string(),
+                remediation: if version > CONFIG_VERSION as i64 {
+                    "upgrade Prism to a release that supports this config version"
+                } else {
+                    "run prism config migrate --apply with a Prism release that supports this version"
+                },
+            });
+        }
+        Some(_) => {}
+    }
+    match scope {
+        ConfigScope::Global => {
+            let file = value.try_into::<GlobalConfigFileV1>().map_err(|error| {
+                ConfigDocumentError::Semantic {
+                    scope,
+                    message: error.to_string(),
+                }
+            })?;
+            debug_assert_eq!(file.config_version, CONFIG_VERSION);
+            let default_harness = file.default_harness.clone();
+            let harnesses = file.harnesses.clone();
+            let common = repo_overrides!(file);
+            validate_config_values(&common)
+                .map_err(|message| ConfigDocumentError::Semantic { scope, message })?;
+            if let Some(harnesses) = &harnesses {
+                for (id, harness) in harnesses {
+                    harness_config_from_raw(id, harness.clone())
+                        .map_err(|message| ConfigDocumentError::Semantic { scope, message })?;
+                }
+            }
+            if let Some(default_harness) = default_harness.as_deref()
+                && builtin_adapter(default_harness).is_none()
+                && !harnesses
+                    .as_ref()
+                    .is_some_and(|items| items.contains_key(default_harness))
+            {
+                return Err(ConfigDocumentError::Semantic {
+                    scope,
+                    message: format!(
+                        "harness '{default_harness}' has no matching [harnesses.{default_harness}]"
+                    ),
+                });
+            }
+            Ok(ParsedOverrides::Global(GlobalOverrides {
+                common,
+                default_harness,
+                harnesses,
+            }))
+        }
+        ConfigScope::Repository => {
+            let file = value.try_into::<RepoConfigFileV1>().map_err(|error| {
+                ConfigDocumentError::Semantic {
+                    scope,
+                    message: error.to_string(),
+                }
+            })?;
+            debug_assert_eq!(file.config_version, CONFIG_VERSION);
+            let overrides = repo_overrides!(file);
+            validate_config_values(&overrides)
+                .map_err(|message| ConfigDocumentError::Semantic { scope, message })?;
+            Ok(ParsedOverrides::Repository(overrides))
+        }
+    }
+}
+
+fn validate_config_values(raw: &RepoOverrides) -> Result<(), String> {
     if raw.opencode_port_span == Some(0) {
         return Err("opencode_port_span must be greater than zero".to_string());
+    }
+    if let Some(width) = raw.layout.as_ref().and_then(|layout| layout.sidebar_width)
+        && !(20..=120).contains(&width)
+    {
+        return Err("layout.sidebar_width must be between 20 and 120".to_string());
+    }
+    if raw.auto.as_ref().is_some_and(|auto| {
+        auto.review_poll_interval_seconds == Some(0) || auto.ci_poll_interval_seconds == Some(0)
+    }) {
+        return Err("auto poll intervals must be greater than zero".to_string());
     }
     if let Some(value) = raw.merge_method.as_deref()
         && MergeMethod::parse(value).is_none()
@@ -531,30 +763,10 @@ fn validate_config_values(raw: &RawConfig, is_user_config: bool) -> Result<(), S
     {
         return Err(format!("ui.icon_style has unsupported value '{value}'"));
     }
-    if let Some(harnesses) = &raw.harnesses {
-        for (id, harness) in harnesses {
-            harness_config_from_raw(id, harness.clone())?;
-        }
-    }
     if let Some(hosts) = &raw.remote_hosts {
         for (hostname, host) in hosts {
             remote_host_from_raw(hostname, host.clone())?;
         }
-    }
-    if !is_user_config && (raw.default_harness.is_some() || raw.harnesses.is_some()) {
-        return Err(
-            "repository config cannot contain default_harness or [harnesses.*]".to_string(),
-        );
-    }
-    Ok(())
-}
-
-fn validate_config_for_mutation(raw: &RawConfig, is_user_config: bool) -> Result<(), String> {
-    if raw.default_agent.is_some() || raw.agents.is_some() {
-        return Err(
-            "obsolete default_agent/[agents.*] settings must be replaced before Prism can update this file"
-                .to_string(),
-        );
     }
     if raw
         .tools
@@ -562,23 +774,69 @@ fn validate_config_for_mutation(raw: &RawConfig, is_user_config: bool) -> Result
         .is_some_and(|tools| tools.contains_key("opencode"))
     {
         return Err(
-            "obsolete [tools].opencode must be replaced with [harnesses.opencode].program before Prism can update this file"
+            "field=tools.opencode category=obsolete: [tools].opencode is unsupported; remediation: configure [harnesses.opencode].program in the global config"
                 .to_string(),
         );
     }
-    if is_user_config
-        && let Some(default_harness) = raw.default_harness.as_deref()
-        && builtin_adapter(default_harness).is_none()
-        && !raw
-            .harnesses
-            .as_ref()
-            .is_some_and(|harnesses| harnesses.contains_key(default_harness))
-    {
-        return Err(format!(
-            "default_harness '{default_harness}' has no matching harness configuration"
-        ));
-    }
     Ok(())
+}
+
+struct ConfigStore<'a> {
+    path: &'a Path,
+    scope: ConfigScope,
+}
+
+impl<'a> ConfigStore<'a> {
+    fn new(path: &'a Path, scope: ConfigScope) -> Self {
+        Self { path, scope }
+    }
+
+    fn update(
+        &self,
+        transform: impl FnOnce(&str, bool) -> Result<String, String>,
+    ) -> Result<(), String> {
+        file_persistence::update(self.path, UpdateOptions::important_toml(), |contents| {
+            let missing = matches!(contents, FileContents::Missing);
+            let text = match contents {
+                FileContents::Missing => String::new(),
+                FileContents::Present(bytes) => String::from_utf8(bytes)
+                    .map_err(|error| {
+                        Box::new(ConfigDocumentError::Utf8 {
+                            scope: self.scope,
+                            error,
+                        }) as BoxError
+                    })?,
+            };
+            if !missing {
+                parse_and_validate_config(&text, self.scope)
+                    .map_err(|error| Box::new(error) as BoxError)?;
+            }
+            let input = if missing {
+                match self.scope {
+                    ConfigScope::Global => format!(
+                        "#:schema {GLOBAL_CONFIG_SCHEMA_URL}\nconfig_version = {CONFIG_VERSION}\n"
+                    ),
+                    ConfigScope::Repository => format!(
+                        "#:schema {REPOSITORY_CONFIG_SCHEMA_URL}\nconfig_version = {CONFIG_VERSION}\n"
+                    ),
+                }
+            } else {
+                text.clone()
+            };
+            let updated = transform(&input, missing)
+                .map_err(|message| {
+                    Box::new(ConfigDocumentError::Semantic {
+                        scope: self.scope,
+                        message,
+                    }) as BoxError
+                })?;
+            parse_and_validate_config(&updated, self.scope)
+                .map_err(|error| Box::new(error) as BoxError)?;
+            let replacement = (updated != text).then(|| updated.into_bytes());
+            Ok(((), replacement))
+        })
+        .map_err(|error| error.to_string())
+    }
 }
 
 pub(crate) fn update_config_file(
@@ -586,34 +844,18 @@ pub(crate) fn update_config_file(
     is_user_config: bool,
     transform: impl FnOnce(&str, bool) -> Result<String, String>,
 ) -> Result<(), String> {
-    file_persistence::update(path, UpdateOptions::important_toml(), |contents| {
-        let missing = matches!(contents, FileContents::Missing);
-        let text = match contents {
-            FileContents::Missing => String::new(),
-            FileContents::Present(bytes) => String::from_utf8(bytes)
-                .map_err(|error| Box::new(ConfigDocumentError::Utf8(error)) as BoxError)?,
-        };
-        if !text.trim().is_empty() {
-            let raw = parse_and_validate_config(&text, is_user_config)
-                .map_err(|error| Box::new(error) as BoxError)?;
-            validate_config_for_mutation(&raw, is_user_config)
-                .map_err(|error| Box::new(ConfigDocumentError::Semantic(error)) as BoxError)?;
-        }
-        let updated = transform(&text, missing)
-            .map_err(|error| Box::new(ConfigDocumentError::Semantic(error)) as BoxError)?;
-        if !updated.trim().is_empty() {
-            let raw = parse_and_validate_config(&updated, is_user_config)
-                .map_err(|error| Box::new(error) as BoxError)?;
-            validate_config_for_mutation(&raw, is_user_config)
-                .map_err(|error| Box::new(ConfigDocumentError::Semantic(error)) as BoxError)?;
-        }
-        let replacement = (updated != text).then(|| updated.into_bytes());
-        Ok(((), replacement))
-    })
-    .map_err(|error| error.to_string())
+    ConfigStore::new(
+        path,
+        if is_user_config {
+            ConfigScope::Global
+        } else {
+            ConfigScope::Repository
+        },
+    )
+    .update(transform)
 }
 
-impl Config {
+impl EffectiveConfig {
     pub fn load(repo: &Repository) -> Self {
         let user_path = prism_config_dir().join("config.toml");
         let repo_config_path = repo.prism_dir().join("config.toml");
@@ -647,7 +889,6 @@ impl Config {
             ("tmux", "tmux"),
             ("lazygit", "lazygit"),
             ("fzf", "fzf"),
-            ("opencode", "opencode"),
         ]
         .into_iter()
         .map(|(key, value)| (key.to_string(), value.to_string()))
@@ -704,60 +945,43 @@ impl Config {
                 return;
             }
         };
-        let is_user_config = path == self.user_path;
-        let raw = match parse_and_validate_config(&text, is_user_config) {
-            Ok(raw) => raw,
+        let scope = if path == self.user_path {
+            ConfigScope::Global
+        } else {
+            ConfigScope::Repository
+        };
+        let overrides = match parse_and_validate_config(&text, scope) {
+            Ok(overrides) => overrides,
             Err(error) => {
                 self.config_errors
-                    .push(format!("load {}: {error}", path.display()));
+                    .push(format!("load path={} {error}", path.display()));
                 return;
             }
         };
-        if raw.default_agent.is_some() || raw.agents.is_some() {
-            self.config_errors.push(format!(
-                "{} uses obsolete default_agent/[agents.*] settings; replace them with default_harness/[harnesses.*]",
-                path.display()
-            ));
+        match overrides {
+            ParsedOverrides::Global(overrides) => self.apply_global_overrides(overrides),
+            ParsedOverrides::Repository(overrides) => self.apply_repo_overrides(overrides),
         }
-        if raw
-            .tools
-            .as_ref()
-            .is_some_and(|tools| tools.contains_key("opencode"))
-        {
-            self.config_errors.push(format!(
-                "{} uses obsolete [tools].opencode; configure [harnesses.opencode].program instead",
-                path.display()
-            ));
-        }
-        if !is_user_config && (raw.default_harness.is_some() || raw.harnesses.is_some()) {
-            self.config_errors.push(format!(
-                "{} configures default_harness/[harnesses.*], but harness selection is global; move these settings to {}",
-                path.display(),
-                self.user_path.display()
-            ));
-        }
-        self.apply_raw_config(raw, is_user_config);
     }
 
-    fn apply_raw_config(&mut self, raw: RawConfig, apply_harnesses: bool) {
-        if apply_harnesses {
-            if let Some(value) = raw.default_harness {
-                self.default_harness = value;
-            }
-            if let Some(harnesses) = raw.harnesses {
-                for (id, raw) in harnesses {
-                    match harness_config_from_raw(&id, raw) {
-                        Ok(harness) => {
-                            self.harnesses.insert(id, harness);
-                        }
-                        Err(error) => self.config_errors.push(error),
+    fn apply_global_overrides(&mut self, overrides: GlobalOverrides) {
+        if let Some(value) = overrides.default_harness {
+            self.default_harness = value;
+        }
+        if let Some(harnesses) = overrides.harnesses {
+            for (id, raw) in harnesses {
+                match harness_config_from_raw(&id, raw) {
+                    Ok(harness) => {
+                        self.harnesses.insert(id, harness);
                     }
+                    Err(error) => self.config_errors.push(error),
                 }
             }
         }
-        if let Some(value) = raw.default_agent {
-            self.default_agent = value;
-        }
+        self.apply_repo_overrides(overrides.common);
+    }
+
+    fn apply_repo_overrides(&mut self, raw: RepoOverrides) {
         if let Some(value) = raw.default_base {
             self.default_base = Some(value);
         }
@@ -834,7 +1058,7 @@ impl Config {
                 self.auto.review_max_wait_seconds = seconds;
             }
             if let Some(seconds) = auto.review_poll_interval_seconds {
-                self.auto.review_poll_interval_seconds = seconds.max(1);
+                self.auto.review_poll_interval_seconds = seconds;
             }
             if let Some(value) = auto.review_continue_on_timeout {
                 self.auto.review_continue_on_timeout = value;
@@ -846,13 +1070,13 @@ impl Config {
                 self.auto.ci_max_wait_seconds = seconds;
             }
             if let Some(seconds) = auto.ci_poll_interval_seconds {
-                self.auto.ci_poll_interval_seconds = seconds.max(1);
+                self.auto.ci_poll_interval_seconds = seconds;
             }
         }
         if let Some(layout) = raw.layout
             && let Some(width) = layout.sidebar_width
         {
-            self.layout.sidebar_width = Some(width.clamp(20, 120));
+            self.layout.sidebar_width = Some(width);
         }
         if let Some(notifications) = raw.notifications {
             if let Some(enabled) = notifications.enabled {
@@ -888,19 +1112,6 @@ impl Config {
         }
         if let Some(templates) = raw.prompt_templates {
             self.prompt_templates.extend(templates);
-        }
-        if let Some(agents) = raw.agents {
-            for (name, agent) in agents {
-                if let Some(command) = agent.command {
-                    self.agent_commands.insert(name.clone(), command);
-                }
-                if let Some(mode) = agent
-                    .prompt_mode
-                    .and_then(|value| PromptMode::parse(&value))
-                {
-                    self.agent_prompt_modes.insert(name, mode);
-                }
-            }
         }
     }
 
@@ -951,8 +1162,13 @@ impl Config {
 
     pub(crate) fn needs_initial_harness_setup(&self) -> bool {
         match fs::read_to_string(&self.user_path) {
-            Ok(text) => toml::from_str::<RawConfig>(&text)
-                .is_ok_and(|config| config.default_harness.is_none()),
+            Ok(text) => matches!(
+                parse_and_validate_config(&text, ConfigScope::Global),
+                Ok(ParsedOverrides::Global(GlobalOverrides {
+                    default_harness: None,
+                    ..
+                }))
+            ),
             Err(error) => error.kind() == std::io::ErrorKind::NotFound,
         }
     }
@@ -995,25 +1211,10 @@ impl Config {
     }
 
     pub fn harness_config(&self, id: &str) -> Result<HarnessConfig, String> {
-        let mut harness = self
-            .harnesses
+        self.harnesses
             .get(id)
             .cloned()
-            .ok_or_else(|| format!("harness '{id}' is not configured"))?;
-        if harness.adapter == "opencode"
-            && harness
-                .interactive_command
-                .first()
-                .is_some_and(|program| program == "opencode")
-        {
-            harness.interactive_command = vec![
-                self.tools
-                    .get("opencode")
-                    .cloned()
-                    .unwrap_or_else(|| "opencode".to_string()),
-            ];
-        }
-        Ok(harness)
+            .ok_or_else(|| format!("harness '{id}' is not configured"))
     }
 
     pub fn harness_adapter(&self, id: &str) -> Result<String, String> {
@@ -1310,6 +1511,35 @@ fn ui_table_insert_index(text: &str) -> Option<usize> {
     in_ui.then_some(offset)
 }
 
+pub fn migrate_config_files(
+    config: &Config,
+    mode: crate::args::ConfigMigrationMode,
+) -> Result<Vec<String>, String> {
+    [
+        (&config.user_path, ConfigScope::Global),
+        (&config.repo_config_path, ConfigScope::Repository),
+    ]
+    .into_iter()
+    .map(|(path, scope)| {
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(format!("{}: missing (no overrides)", path.display()));
+            }
+            Err(error) => return Err(format!("read {}: {error}", path.display())),
+        };
+        parse_and_validate_config(&text, scope)
+            .map_err(|error| format!("migrate path={} {error}", path.display()))?;
+        let status = match mode {
+            crate::args::ConfigMigrationMode::Check => "config_version = 1",
+            crate::args::ConfigMigrationMode::Diff => "no migration required",
+            crate::args::ConfigMigrationMode::Apply => "already at config_version = 1",
+        };
+        Ok(format!("{}: {status}", path.display()))
+    })
+    .collect()
+}
+
 pub fn print_config(repo: &Repository, config: &Config) {
     println!("repo_root = {}", repo.root.display());
     println!("user_config = {}", config.user_path.display());
@@ -1564,12 +1794,15 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
 fn harness_config_source(config: &Config) -> String {
     let configured_by_user = fs::read_to_string(&config.user_path)
         .ok()
-        .and_then(|text| toml::from_str::<RawConfig>(&text).ok())
-        .is_some_and(|raw| {
-            raw.default_harness.is_some()
-                || raw
+        .and_then(|text| parse_and_validate_config(&text, ConfigScope::Global).ok())
+        .is_some_and(|overrides| {
+            let ParsedOverrides::Global(overrides) = overrides else {
+                return false;
+            };
+            overrides.default_harness.is_some()
+                || overrides
                     .harnesses
-                    .is_some_and(|harnesses| harnesses.contains_key(&config.default_harness))
+                    .is_some_and(|items| items.contains_key(&config.default_harness))
         });
     if configured_by_user {
         config.user_path.display().to_string()
@@ -2052,6 +2285,115 @@ mod tests {
     }
 
     #[test]
+    fn v1_templates_and_schemas_identify_the_exact_scope() {
+        let global = config_example();
+        let repository = repo_config_template(false);
+
+        assert!(global.starts_with(&format!("#:schema {GLOBAL_CONFIG_SCHEMA_URL}\n")));
+        assert!(repository.starts_with(&format!("#:schema {REPOSITORY_CONFIG_SCHEMA_URL}\n")));
+        assert!(global.contains("config_version = 1"));
+        assert!(repository.contains("config_version = 1"));
+        assert!(matches!(
+            parse_and_validate_config(&global, ConfigScope::Global),
+            Ok(ParsedOverrides::Global(_))
+        ));
+        assert!(matches!(
+            parse_and_validate_config(&repository, ConfigScope::Repository),
+            Ok(ParsedOverrides::Repository(_))
+        ));
+
+        let global_schema: serde_json::Value =
+            serde_json::from_str(GLOBAL_CONFIG_SCHEMA_JSON).unwrap();
+        let repository_schema: serde_json::Value = serde_json::from_str(include_str!(
+            "../../schemas/config/v1/repository.schema.json"
+        ))
+        .unwrap();
+        assert_eq!(global_schema["$id"], GLOBAL_CONFIG_SCHEMA_URL);
+        assert_eq!(repository_schema["$id"], REPOSITORY_CONFIG_SCHEMA_URL);
+        assert_eq!(global_schema["properties"]["config_version"]["const"], 1);
+        assert_eq!(
+            repository_schema["properties"]["config_version"]["const"],
+            1
+        );
+        assert!(
+            repository_schema["properties"]
+                .get("default_harness")
+                .is_none()
+        );
+        assert!(repository_schema["properties"].get("harnesses").is_none());
+    }
+
+    #[test]
+    fn config_versions_and_scopes_are_strict() {
+        for (text, expected) in [
+            ("default_base = 'main'\n", "version=missing"),
+            ("config_version = 2\n", "version=2"),
+            ("config_version = '1'\n", "version=invalid-type"),
+        ] {
+            let error = parse_and_validate_config(text, ConfigScope::Repository)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
+            assert!(error.contains("scope=repository"), "{error}");
+            assert!(error.contains("remediation:"), "{error}");
+        }
+
+        for text in [
+            "config_version = 1\ndefault_harness = 'opencode'\n",
+            "config_version = 1\n[harnesses.opencode]\nprogram = 'opencode'\n",
+            "config_version = 1\ndefault_agent = 'opencode'\n",
+            "config_version = 1\n[agents.opencode]\ncommand = 'opencode'\n",
+        ] {
+            let error = parse_and_validate_config(text, ConfigScope::Repository)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("unknown field"), "{error}");
+        }
+        let tools_error = parse_and_validate_config(
+            "config_version = 1\n[tools]\nopencode = 'wrapper'\n",
+            ConfigScope::Global,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(tools_error.contains("tools.opencode"), "{tools_error}");
+    }
+
+    #[test]
+    fn loading_and_v1_migration_are_side_effect_free() {
+        let directory = std::env::temp_dir().join(format!(
+            "prism-config-v1-no-write-{}-{}",
+            std::process::id(),
+            crate::auto_flow::unix_ms()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let user_path = directory.join("user.toml");
+        let repo_path = directory.join("repository.toml");
+        let user = "config_version = 1\ndefault_base = 'global'\n";
+        let repository = "config_version = 1\ndefault_base = 'repository'\n";
+        fs::write(&user_path, user).unwrap();
+        fs::write(&repo_path, repository).unwrap();
+        let mut config = Config::defaults(user_path.clone(), repo_path.clone());
+
+        config.apply_file(&user_path);
+        config.apply_file(&repo_path);
+        assert_eq!(config.default_base.as_deref(), Some("repository"));
+        assert_eq!(fs::read_to_string(&user_path).unwrap(), user);
+        assert_eq!(fs::read_to_string(&repo_path).unwrap(), repository);
+
+        for mode in [
+            crate::args::ConfigMigrationMode::Check,
+            crate::args::ConfigMigrationMode::Diff,
+            crate::args::ConfigMigrationMode::Apply,
+        ] {
+            let lines = migrate_config_files(&config, mode).unwrap();
+            assert_eq!(lines.len(), 2);
+            assert_eq!(fs::read_to_string(&user_path).unwrap(), user);
+            assert_eq!(fs::read_to_string(&repo_path).unwrap(), repository);
+        }
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn repo_config_overrides_default_base() {
         let path = std::env::temp_dir().join(format!(
             "prism-config-override-{}-{}.toml",
@@ -2061,7 +2403,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        fs::write(&path, r#"default_base = "develop""#).unwrap();
+        fs::write(&path, "config_version = 1\ndefault_base = \"develop\"\n").unwrap();
         let mut config = Config::defaults(PathBuf::from("/tmp/user.toml"), path.clone());
 
         config.apply_file(&path);
@@ -2079,28 +2421,22 @@ mod tests {
             PathBuf::from("/tmp/user.toml"),
             PathBuf::from("/tmp/repo.toml"),
         );
-        config.apply_raw_config(
-            RawConfig {
-                notifications: Some(RawNotificationConfig {
-                    enabled: Some(true),
-                    completed: Some(false),
-                    ..RawNotificationConfig::default()
-                }),
-                ..RawConfig::default()
-            },
-            true,
-        );
-        config.apply_raw_config(
-            RawConfig {
-                notifications: Some(RawNotificationConfig {
-                    completed: Some(true),
-                    failed: Some(false),
-                    ..RawNotificationConfig::default()
-                }),
-                ..RawConfig::default()
-            },
-            false,
-        );
+        config.apply_repo_overrides(RepoOverrides {
+            notifications: Some(RawNotificationConfig {
+                enabled: Some(true),
+                completed: Some(false),
+                ..RawNotificationConfig::default()
+            }),
+            ..RepoOverrides::default()
+        });
+        config.apply_repo_overrides(RepoOverrides {
+            notifications: Some(RawNotificationConfig {
+                completed: Some(true),
+                failed: Some(false),
+                ..RawNotificationConfig::default()
+            }),
+            ..RepoOverrides::default()
+        });
 
         assert_eq!(
             config.notifications,
@@ -2125,7 +2461,7 @@ mod tests {
         ));
         fs::write(
             &path,
-            "opencode_port_base = 42000\nopencode_port_span = 50\nopencode_shutdown_owned_servers = true\nopencode_plan_plugin = true\n",
+            "config_version = 1\nopencode_port_base = 42000\nopencode_port_span = 50\nopencode_shutdown_owned_servers = true\nopencode_plan_plugin = true\n",
         )
         .unwrap();
         let mut config = Config::defaults(PathBuf::from("/tmp/user.toml"), path.clone());
@@ -2150,7 +2486,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        fs::write(&path, r#"merge_method = "merge""#).unwrap();
+        fs::write(&path, "config_version = 1\nmerge_method = \"merge\"\n").unwrap();
         let mut config = Config::defaults(PathBuf::from("/tmp/user.toml"), path.clone());
 
         config.apply_file(&path);
@@ -2174,6 +2510,7 @@ mod tests {
             &path,
             r#"
 # top-level comment
+config_version = 1
 default_harness = "company-agent"
 default_base = "release/main"
 review_packet_dir = ".agent/review \"packets\""
@@ -2229,33 +2566,16 @@ review = "fix\nreview"
     }
 
     #[test]
-    fn layout_sidebar_width_is_bounded() {
-        let mut config = Config::defaults(
-            PathBuf::from("/tmp/user.toml"),
-            PathBuf::from("/tmp/prism-repo-config.toml"),
-        );
-
-        config.apply_raw_config(
-            RawConfig {
-                layout: Some(RawLayoutConfig {
-                    sidebar_width: Some(4),
-                }),
-                ..RawConfig::default()
-            },
-            false,
-        );
-        assert_eq!(config.layout.sidebar_width, Some(20));
-
-        config.apply_raw_config(
-            RawConfig {
-                layout: Some(RawLayoutConfig {
-                    sidebar_width: Some(999),
-                }),
-                ..RawConfig::default()
-            },
-            false,
-        );
-        assert_eq!(config.layout.sidebar_width, Some(120));
+    fn layout_sidebar_width_outside_schema_range_is_rejected() {
+        for width in [4, 999] {
+            let error = parse_and_validate_config(
+                &format!("config_version = 1\n[layout]\nsidebar_width = {width}\n"),
+                ConfigScope::Repository,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("between 20 and 120"), "{error}");
+        }
     }
 
     #[test]
@@ -2268,7 +2588,7 @@ review = "fix\nreview"
                 .unwrap()
                 .as_nanos()
         ));
-        fs::write(&path, "[ui]\nother = true\n[tools]\ngh = \"gh\"\n").unwrap();
+        fs::write(&path, "config_version = 1\n[ui]\n[tools]\ngh = \"gh\"\n").unwrap();
 
         save_user_icon_style(&path, IconStyle::NerdFont).unwrap();
 
@@ -2315,7 +2635,7 @@ review = "fix\nreview"
         ));
         fs::create_dir_all(&directory).unwrap();
         let path = directory.join("config.toml");
-        let invalid = "merge_method = 'explode'\n";
+        let invalid = "config_version = 1\nmerge_method = 'explode'\n";
         fs::write(&path, invalid).unwrap();
 
         let error = update_config_file(&path, false, |text, _| {
@@ -2359,13 +2679,10 @@ review = "fix\nreview"
             PathBuf::from("/tmp/user.toml"),
             PathBuf::from("/tmp/prism-repo-config.toml"),
         );
-        config.apply_raw_config(
-            RawConfig {
-                default_harness: Some("codex".to_string()),
-                ..RawConfig::default()
-            },
-            true,
-        );
+        config.apply_global_overrides(GlobalOverrides {
+            default_harness: Some("codex".to_string()),
+            ..GlobalOverrides::default()
+        });
 
         let harness = config.selected_harness().unwrap();
 
@@ -2405,7 +2722,7 @@ review = "fix\nreview"
 
     #[test]
     fn harness_config_writer_preserves_comments_and_root_tables() {
-        let input = "# keep me\ndefault_harness = \"opencode\" # selected\n\n[ui]\nicon_style = \"unicode\"\n";
+        let input = "# keep me\nconfig_version = 1\ndefault_harness = \"opencode\" # selected\n\n[ui]\nicon_style = \"unicode\"\n";
 
         let updated = update_user_harness_config_text(input, "codex", None).unwrap();
         let parsed = updated.parse::<toml_edit::DocumentMut>().unwrap();
@@ -2430,12 +2747,12 @@ review = "fix\nreview"
         };
 
         let updated = update_user_harness_config_text(
-            "[ui]\nicon_style = \"unicode\"\n",
+            "config_version = 1\n[ui]\nicon_style = \"unicode\"\n",
             "company-agent",
             Some(&generic),
         )
         .unwrap();
-        let parsed = toml::from_str::<RawConfig>(&updated).unwrap();
+        let parsed = toml::from_str::<GlobalConfigFileV1>(&updated).unwrap();
         let raw = parsed.harnesses.unwrap().remove("company-agent").unwrap();
         let parsed_generic = harness_config_from_raw("company-agent", raw).unwrap();
 
@@ -2455,10 +2772,10 @@ review = "fix\nreview"
             output_format: OutputFormat::Text,
             environment: BTreeMap::new(),
         };
-        let input = "harnesses = { first = { adapter = \"generic\", interactive_command = [\"first-agent\"] } }\n";
+        let input = "config_version = 1\nharnesses = { first = { adapter = \"generic\", interactive_command = [\"first-agent\"] } }\n";
 
         let updated = update_user_harness_config_text(input, "second", Some(&generic)).unwrap();
-        let parsed = toml::from_str::<RawConfig>(&updated).unwrap();
+        let parsed = toml::from_str::<GlobalConfigFileV1>(&updated).unwrap();
         let harnesses = parsed.harnesses.unwrap();
 
         assert!(harnesses.contains_key("first"));
@@ -2481,7 +2798,11 @@ review = "fix\nreview"
         fs::create_dir_all(&directory).unwrap();
         let target = directory.join("managed.toml");
         let link = directory.join("config.toml");
-        fs::write(&target, "default_harness = \"opencode\"\n").unwrap();
+        fs::write(
+            &target,
+            "config_version = 1\ndefault_harness = \"opencode\"\n",
+        )
+        .unwrap();
         symlink(&target, &link).unwrap();
 
         update_user_harness_config(&link, "codex", None).unwrap();
@@ -2552,16 +2873,16 @@ review = "fix\nreview"
         let config = Config::defaults(path.clone(), PathBuf::from("/tmp/repo.toml"));
         assert_eq!(harness_config_source(&config), "built-in defaults");
 
-        fs::write(&path, "default_base = 'main'\n").unwrap();
+        fs::write(&path, "config_version = 1\ndefault_base = 'main'\n").unwrap();
         assert_eq!(harness_config_source(&config), "built-in defaults");
 
-        fs::write(&path, "default_harness = 'opencode'\n").unwrap();
+        fs::write(&path, "config_version = 1\ndefault_harness = 'opencode'\n").unwrap();
         assert_eq!(harness_config_source(&config), path.display().to_string());
         let _ = fs::remove_file(path);
     }
 
     #[test]
-    fn obsolete_agent_settings_report_the_source_and_replacements() {
+    fn obsolete_agent_settings_are_rejected_as_unknown_fields() {
         let path = std::env::temp_dir().join(format!(
             "prism-obsolete-agent-config-{}-{}.toml",
             std::process::id(),
@@ -2570,19 +2891,14 @@ review = "fix\nreview"
                 .unwrap()
                 .as_nanos()
         ));
-        fs::write(
-            &path,
-            "default_agent = 'opencode'\n[tools]\nopencode = 'opencode'\n[agents.opencode]\ncommand = 'opencode run'\n",
-        )
-        .unwrap();
+        fs::write(&path, "config_version = 1\ndefault_agent = 'opencode'\n").unwrap();
         let mut config = Config::defaults(path.clone(), PathBuf::from("/tmp/repo.toml"));
 
         config.apply_file(&path);
         let error = ensure_configured_default_agent(&config).unwrap_err();
 
         assert!(error.contains(&path.display().to_string()));
-        assert!(error.contains("default_harness/[harnesses.*]"));
-        assert!(error.contains("[harnesses.opencode].program"));
+        assert!(error.contains("unknown field `default_agent`"), "{error}");
         let _ = fs::remove_file(path);
     }
 
@@ -2594,14 +2910,18 @@ review = "fix\nreview"
         );
         let user = parse_and_validate_config(
             r#"
+config_version = 1
 [remote_hosts."git.example.com"]
 provider = "forgejo"
 credential_env = "FORGEJO_TOKEN"
 "#,
-            true,
+            ConfigScope::Global,
         )
         .unwrap();
-        config.apply_raw_config(user, true);
+        let ParsedOverrides::Global(user) = user else {
+            unreachable!();
+        };
+        config.apply_global_overrides(user);
 
         let repository = config
             .remote_discovery()
@@ -2624,11 +2944,12 @@ credential_env = "FORGEJO_TOKEN"
     fn remote_host_configuration_rejects_secrets_and_insecure_bases_by_shape() {
         let token_error = parse_and_validate_config(
             r#"
+config_version = 1
 [remote_hosts."git.example.com"]
 provider = "forgejo"
 credential_env = "actual token value"
 "#,
-            true,
+            ConfigScope::Global,
         )
         .unwrap_err()
         .to_string();
@@ -2636,11 +2957,12 @@ credential_env = "actual token value"
 
         let http_error = parse_and_validate_config(
             r#"
+config_version = 1
 [remote_hosts."git.example.com"]
 provider = "gitlab"
 web_url = "http://git.example.com"
 "#,
-            true,
+            ConfigScope::Global,
         )
         .unwrap_err()
         .to_string();
@@ -2651,6 +2973,7 @@ web_url = "http://git.example.com"
     fn github_and_gitlab_api_overrides_validate_supported_cli_shapes() {
         parse_and_validate_config(
             r#"
+config_version = 1
 [remote_hosts."github.example.com"]
 provider = "github"
 api_url = "https://api.example.com/api/v3"
@@ -2659,17 +2982,18 @@ api_url = "https://api.example.com/api/v3"
 provider = "gitlab"
 api_url = "https://api.example.com/gitlab/api/v4"
 "#,
-            true,
+            ConfigScope::Global,
         )
         .unwrap();
 
         let github_web = parse_and_validate_config(
             r#"
+config_version = 1
 [remote_hosts."github.example.com"]
 provider = "github"
 web_url = "https://proxy.example.com/github"
 "#,
-            true,
+            ConfigScope::Global,
         )
         .unwrap_err()
         .to_string();
@@ -2680,11 +3004,12 @@ web_url = "https://proxy.example.com/github"
 
         let github_api = parse_and_validate_config(
             r#"
+config_version = 1
 [remote_hosts."github.example.com"]
 provider = "github"
 api_url = "https://api.example.com/custom/rest"
 "#,
-            true,
+            ConfigScope::Global,
         )
         .unwrap_err()
         .to_string();

@@ -524,8 +524,7 @@ pub(crate) fn capabilities_for_summary(summary: &PrSummary) -> Capabilities {
         .change_request_identity
         .as_ref()
         .map(|identity| Capabilities::for_provider(identity.provider()))
-        // Legacy GitHub cache rows intentionally remain usable after migration.
-        .unwrap_or_else(|| Capabilities::for_provider(ProviderKind::GitHub))
+        .unwrap_or_default()
 }
 
 pub(crate) fn list_change_requests(path: &Path, config: &Config) -> Result<Vec<PrSummary>, String> {
@@ -1053,7 +1052,6 @@ pub(crate) fn refresh_repository_policy_for(
                 stale.error = Some(error.to_string());
                 cache = stale;
             } else {
-                cache.identity_complete = false;
                 cache.error = Some(error.to_string());
             }
         }
@@ -2866,9 +2864,10 @@ exit 17
                 .as_deref()
                 .is_some_and(|error| error.contains(expected))
         );
-        let persisted = crate::remote::store::load_repo_policy_cache_for_repository(
+        let persisted = crate::remote::store::load_repo_policy_cache_for_identity(
             &repo,
             &repository(ProviderKind::GitLab, "acme/widget"),
+            "main",
         )
         .unwrap();
         assert_eq!(persisted.error, cache.error);

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select branch as \"branch!\"\nfrom agent_state\nwhere branch not in (select branch from task_metadata)\n  and branch not in (select branch from archived_worktree)\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "branch!",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "4baf7d93371f0dcd08c3d80bf31b9f60c90d924eaea490b57927949a05901d9c"
+}

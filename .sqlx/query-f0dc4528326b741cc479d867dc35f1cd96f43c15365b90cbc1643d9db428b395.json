@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update plan_run set status = ?, pause_requested = 0, updated_unix_ms = ? where id = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "f0dc4528326b741cc479d867dc35f1cd96f43c15365b90cbc1643d9db428b395"
+}

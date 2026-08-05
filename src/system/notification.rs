@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
-
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use std::path::Path;
 
 use crate::agent::AgentState;
 use crate::config::NotificationConfig;
+use crate::persistence::notification::{NotificationStore, ObserveInput, OutboxInput, PendingRow};
 use crate::session::WorktreeSessionKey;
 
 const DELIVERY_LIFETIME_MS: i64 = 10 * 60 * 1_000;
@@ -66,377 +66,151 @@ pub(crate) struct PendingNotification {
     pub(crate) body: String,
 }
 
-pub(crate) struct NotificationCoordinator<'a> {
-    conn: &'a mut Connection,
+impl From<PendingRow> for PendingNotification {
+    fn from(row: PendingRow) -> Self {
+        Self {
+            id: row.id,
+            title: row.title,
+            body: row.body,
+        }
+    }
 }
 
-impl<'a> NotificationCoordinator<'a> {
-    pub(crate) fn new(conn: &'a mut Connection) -> Self {
-        Self { conn }
+pub(crate) struct NotificationCoordinator {
+    store: NotificationStore,
+}
+
+impl NotificationCoordinator {
+    pub(crate) fn open(path: &Path) -> Result<Self, String> {
+        NotificationStore::open(path)
+            .map(|store| Self { store })
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn observe(
-        &mut self,
+        &self,
         observation: NotificationObservation<'_>,
     ) -> Result<ObserveResult, String> {
         let path = observation.session.path.display().to_string();
         let branch = observation.session.branch.as_str();
         let incarnation = observation.session.incarnation.as_str();
-        let transaction = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| format!("begin notification observation: {error}"))?;
-        let previous = transaction
-            .query_row(
-                "select state, transition_sequence
-                   from notification_session
-                  where worktree_path = ?1 and branch = ?2 and incarnation = ?3",
-                params![path, branch, incarnation],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .optional()
-            .map_err(|error| format!("read notification baseline: {error}"))?;
-
-        let Some((previous, sequence)) = previous else {
-            transaction
-                .execute(
-                    "insert into notification_session (
-                       worktree_path, branch, incarnation, state, transition_sequence,
-                       observed_unix_ms
-                     ) values (?1, ?2, ?3, ?4, 0, ?5)",
-                    params![
-                        path,
-                        branch,
-                        incarnation,
-                        observation.state.label(),
-                        observation.observed_unix_ms
-                    ],
-                )
-                .map_err(|error| format!("record notification baseline: {error}"))?;
-            transaction
-                .commit()
-                .map_err(|error| format!("commit notification baseline: {error}"))?;
-            return Ok(ObserveResult { event_id: None });
-        };
-        let previous = AgentState::parse(&previous)
-            .ok_or_else(|| format!("invalid persisted notification state '{previous}'"))?;
-        if !observation.config.enabled {
-            transaction
-                .execute(
-                    "update notification_outbox
-                        set delivery_state = 'superseded', superseded_unix_ms = ?4
-                      where worktree_path = ?1 and branch = ?2 and incarnation = ?3
-                        and delivery_state = 'pending'",
-                    params![path, branch, incarnation, observation.observed_unix_ms],
-                )
-                .map_err(|error| format!("disable pending notifications: {error}"))?;
+        let previous = self.last_state(observation.session)?;
+        let kind = previous
+            .and_then(|previous| transition(previous, observation.state))
+            .filter(|kind| enabled(observation.config, *kind));
+        let subject = if observation.repo_label.is_empty() {
+            branch.to_string()
         } else {
-            for kind in [
-                (!observation.config.needs_input).then_some(NotificationKind::NeedsInput),
-                (!observation.config.completed).then_some(NotificationKind::Completed),
-                (!observation.config.failed).then_some(NotificationKind::Failed),
-                (!observation.config.failed).then_some(NotificationKind::NeedsRestart),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                transaction
-                    .execute(
-                        "update notification_outbox
-                            set delivery_state = 'superseded', superseded_unix_ms = ?5
-                          where worktree_path = ?1 and branch = ?2 and incarnation = ?3
-                            and kind = ?4 and delivery_state = 'pending'",
-                        params![
-                            path,
-                            branch,
-                            incarnation,
-                            kind.label(),
-                            observation.observed_unix_ms
-                        ],
-                    )
-                    .map_err(|error| format!("disable pending notification kind: {error}"))?;
-            }
-        }
-        if previous == observation.state {
-            transaction
-                .execute(
-                    "update notification_session
-                        set observed_unix_ms = ?4
-                      where worktree_path = ?1 and branch = ?2 and incarnation = ?3",
-                    params![path, branch, incarnation, observation.observed_unix_ms],
-                )
-                .map_err(|error| format!("refresh notification observation: {error}"))?;
-            transaction
-                .commit()
-                .map_err(|error| format!("commit notification observation: {error}"))?;
-            return Ok(ObserveResult { event_id: None });
-        }
-
-        let sequence = sequence.saturating_add(1);
-        transaction
-            .execute(
-                "update notification_session
-                    set state = ?4, transition_sequence = ?5, observed_unix_ms = ?6
-                  where worktree_path = ?1 and branch = ?2 and incarnation = ?3",
-                params![
-                    path,
-                    branch,
-                    incarnation,
-                    observation.state.label(),
-                    sequence,
-                    observation.observed_unix_ms
-                ],
-            )
-            .map_err(|error| format!("advance notification observation: {error}"))?;
-        transaction
-            .execute(
-                "update notification_outbox
-                    set delivery_state = 'superseded', superseded_unix_ms = ?4
-                  where worktree_path = ?1 and branch = ?2 and incarnation = ?3
-                    and delivery_state = 'pending'",
-                params![path, branch, incarnation, observation.observed_unix_ms],
-            )
-            .map_err(|error| format!("supersede obsolete notifications: {error}"))?;
-
-        let event_id = transition(previous, observation.state)
-            .filter(|kind| enabled(observation.config, *kind))
-            .map(|kind| {
-                let subject = if observation.repo_label.is_empty() {
-                    branch.to_string()
-                } else {
-                    format!("{}: {branch}", observation.repo_label)
-                };
-                let title = format!("Prism: {}", kind.title());
-                let body = format!("{subject} {}", kind.suffix());
-                transaction
-                    .execute(
-                        "insert into notification_outbox (
-                           worktree_path, branch, incarnation, transition_sequence, kind,
-                           title, body, observed_unix_ms, expires_unix_ms, delivery_state,
-                           available_unix_ms
-                         ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending', ?8)",
-                        params![
-                            path,
-                            branch,
-                            incarnation,
-                            sequence,
-                            kind.label(),
-                            title,
-                            body,
-                            observation.observed_unix_ms,
-                            observation
-                                .observed_unix_ms
-                                .saturating_add(DELIVERY_LIFETIME_MS)
-                        ],
-                    )
-                    .map_err(|error| format!("enqueue desktop notification: {error}"))?;
-                Ok::<i64, String>(transaction.last_insert_rowid())
+            format!("{}: {branch}", observation.repo_label)
+        };
+        let title = kind.map(|kind| format!("Prism: {}", kind.title()));
+        let body = kind.map(|kind| format!("{subject} {}", kind.suffix()));
+        let outbox = kind.map(|kind| OutboxInput {
+            kind: kind.label(),
+            title: title.as_deref().expect("notification title follows kind"),
+            body: body.as_deref().expect("notification body follows kind"),
+            expires_unix_ms: observation
+                .observed_unix_ms
+                .saturating_add(DELIVERY_LIFETIME_MS),
+        });
+        let disabled = [
+            (!observation.config.needs_input).then_some(NotificationKind::NeedsInput.label()),
+            (!observation.config.completed).then_some(NotificationKind::Completed.label()),
+            (!observation.config.failed).then_some(NotificationKind::Failed.label()),
+            (!observation.config.failed).then_some(NotificationKind::NeedsRestart.label()),
+        ];
+        let disabled = disabled.into_iter().flatten().collect::<Vec<_>>();
+        self.store
+            .observe(ObserveInput {
+                path: &path,
+                branch,
+                incarnation,
+                state: observation.state.label(),
+                observed_unix_ms: observation.observed_unix_ms,
+                disabled_kinds: &disabled,
+                notifications_enabled: observation.config.enabled,
+                expected_previous_state: previous.map(AgentState::label),
+                outbox,
             })
-            .transpose()?;
-        transaction
-            .commit()
-            .map_err(|error| format!("commit notification transition: {error}"))?;
-        Ok(ObserveResult { event_id })
+            .map(|event_id| ObserveResult { event_id })
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn last_state(
         &self,
         session: &WorktreeSessionKey,
     ) -> Result<Option<AgentState>, String> {
-        let state = self
-            .conn
-            .query_row(
-                "select state
-                   from notification_session
-                  where worktree_path = ?1 and branch = ?2 and incarnation = ?3",
-                params![
-                    session.path.display().to_string(),
-                    session.branch.as_str(),
-                    session.incarnation.as_str()
-                ],
-                |row| row.get::<_, String>(0),
+        self.store
+            .last_state(
+                &session.path.display().to_string(),
+                &session.branch,
+                &session.incarnation,
             )
-            .optional()
-            .map_err(|error| format!("read durable notification state: {error}"))?;
-        state
-            .map(|state| {
-                AgentState::parse(&state)
-                    .ok_or_else(|| format!("invalid persisted notification state '{state}'"))
-            })
-            .transpose()
+            .map_err(|error| error.to_string())
     }
 
     #[cfg(test)]
     pub(crate) fn pending(&self) -> Result<Vec<PendingNotification>, String> {
-        let mut statement = self
-            .conn
-            .prepare(
-                "select id, title, body
-                   from notification_outbox
-                  where delivery_state = 'pending'
-                  order by id",
-            )
-            .map_err(|error| format!("prepare pending notifications: {error}"))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|error| format!("query pending notifications: {error}"))?;
-        rows.map(|row| {
-            let (id, title, body) =
-                row.map_err(|error| format!("read pending notification: {error}"))?;
-            Ok(PendingNotification { id, title, body })
-        })
-        .collect()
+        self.store
+            .pending()
+            .map(|rows| rows.into_iter().map(Into::into).collect())
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn claim_next(
-        &mut self,
+        &self,
         now_unix_ms: i64,
     ) -> Result<Option<PendingNotification>, String> {
-        let transaction = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| format!("begin notification claim: {error}"))?;
-        transaction
-            .execute(
-                "update notification_outbox
-                    set delivery_state = 'expired', superseded_unix_ms = ?1
-                  where delivery_state = 'pending' and expires_unix_ms <= ?1",
-                [now_unix_ms],
-            )
-            .map_err(|error| format!("expire pending notifications: {error}"))?;
-        let pending = transaction
-            .query_row(
-                "select id, title, body
-                   from notification_outbox
-                  where delivery_state = 'pending' and available_unix_ms <= ?1
-                  order by id
-                  limit 1",
-                [now_unix_ms],
-                |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|error| format!("claim pending notification: {error}"))?;
-        let Some((id, title, body)) = pending else {
-            transaction
-                .commit()
-                .map_err(|error| format!("commit empty notification claim: {error}"))?;
-            return Ok(None);
-        };
-        let changed = transaction
-            .execute(
-                "update notification_outbox
-                    set delivery_state = 'dispatching', attempted_unix_ms = ?2,
-                        attempt_count = attempt_count + 1
-                  where id = ?1 and delivery_state = 'pending'",
-                params![id, now_unix_ms],
-            )
-            .map_err(|error| format!("mark notification dispatching: {error}"))?;
-        if changed != 1 {
-            return Err("pending notification changed while it was claimed".to_string());
-        }
-        transaction
-            .commit()
-            .map_err(|error| format!("commit notification claim: {error}"))?;
-        Ok(Some(PendingNotification { id, title, body }))
+        self.store
+            .claim_next(now_unix_ms)
+            .map(|row| row.map(Into::into))
+            .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn expire_pending(&mut self, now_unix_ms: i64) -> Result<usize, String> {
-        self.conn
-            .execute(
-                "update notification_outbox
-                    set delivery_state = 'expired', superseded_unix_ms = ?1
-                  where delivery_state = 'pending' and expires_unix_ms <= ?1",
-                [now_unix_ms],
-            )
-            .map_err(|error| format!("expire pending notifications: {error}"))
+    pub(crate) fn expire_pending(&self, now_unix_ms: i64) -> Result<usize, String> {
+        self.store
+            .expire_pending(now_unix_ms)
+            .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn mark_accepted(&mut self, id: i64, accepted_unix_ms: i64) -> Result<(), String> {
-        let changed = self
-            .conn
-            .execute(
-                "update notification_outbox
-                    set delivery_state = 'delivered', backend_accepted_unix_ms = ?2,
-                        last_failure_category = null
-                  where id = ?1 and delivery_state = 'dispatching'",
-                params![id, accepted_unix_ms],
-            )
-            .map_err(|error| format!("acknowledge desktop notification: {error}"))?;
-        (changed == 1)
-            .then_some(())
-            .ok_or_else(|| format!("notification {id} was not dispatching"))
+    pub(crate) fn mark_accepted(&self, id: i64, accepted_unix_ms: i64) -> Result<(), String> {
+        self.store
+            .mark_accepted(id, accepted_unix_ms)
+            .map_err(|error| error.to_string())
     }
 
     pub(crate) fn retry(
-        &mut self,
+        &self,
         id: i64,
         available_unix_ms: i64,
         category: &'static str,
     ) -> Result<(), String> {
-        let changed = self
-            .conn
-            .execute(
-                "update notification_outbox
-                    set delivery_state = 'pending', available_unix_ms = ?2,
-                        last_failure_category = ?3
-                  where id = ?1 and delivery_state = 'dispatching'",
-                params![id, available_unix_ms, category],
-            )
-            .map_err(|error| format!("retry desktop notification: {error}"))?;
-        (changed == 1)
-            .then_some(())
-            .ok_or_else(|| format!("notification {id} was not dispatching"))
+        self.store
+            .retry(id, available_unix_ms, category)
+            .map_err(|error| error.to_string())
     }
 
     #[cfg(target_os = "macos")]
     pub(crate) fn mark_uncertain(
-        &mut self,
+        &self,
         id: i64,
         at_unix_ms: i64,
         category: &'static str,
     ) -> Result<(), String> {
-        let changed = self
-            .conn
-            .execute(
-                "update notification_outbox
-                    set delivery_state = 'uncertain', superseded_unix_ms = ?2,
-                        last_failure_category = ?3
-                  where id = ?1 and delivery_state = 'dispatching'",
-                params![id, at_unix_ms, category],
-            )
-            .map_err(|error| format!("classify uncertain desktop notification: {error}"))?;
-        (changed == 1)
-            .then_some(())
-            .ok_or_else(|| format!("notification {id} was not dispatching"))
+        self.store
+            .mark_uncertain(id, at_unix_ms, category)
+            .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn abandon_uncertain(&mut self, now_unix_ms: i64) -> Result<usize, String> {
-        self.conn
-            .execute(
-                "update notification_outbox
-                    set delivery_state = 'uncertain', superseded_unix_ms = ?1,
-                        last_failure_category = 'interrupted_dispatch'
-                  where delivery_state = 'dispatching'",
-                [now_unix_ms],
-            )
-            .map_err(|error| format!("classify interrupted notifications: {error}"))
+    pub(crate) fn abandon_uncertain(&self, now_unix_ms: i64) -> Result<usize, String> {
+        self.store
+            .abandon_uncertain(now_unix_ms)
+            .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn retain<'b>(
-        &mut self,
-        live: impl IntoIterator<Item = &'b WorktreeSessionKey>,
+    pub(crate) fn retain<'a>(
+        &self,
+        live: impl IntoIterator<Item = &'a WorktreeSessionKey>,
         now_unix_ms: i64,
     ) -> Result<(), String> {
         let live = live
@@ -449,101 +223,14 @@ impl<'a> NotificationCoordinator<'a> {
                 )
             })
             .collect::<BTreeSet<_>>();
-        let transaction = self
-            .conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(|error| format!("begin notification retention: {error}"))?;
-        let persisted = {
-            let mut statement = transaction
-                .prepare(
-                    "select worktree_path, branch, incarnation
-                       from notification_session",
-                )
-                .map_err(|error| format!("prepare notification session retention: {error}"))?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })
-                .map_err(|error| format!("query notification session retention: {error}"))?;
-            rows.collect::<Result<Vec<_>, _>>()
-                .map_err(|error| format!("read notification session retention: {error}"))?
-        };
-        for (path, branch, incarnation) in persisted {
-            if live.contains(&(path.clone(), branch.clone(), incarnation.clone())) {
-                continue;
-            }
-            transaction
-                .execute(
-                    "update notification_outbox
-                        set delivery_state = 'superseded', superseded_unix_ms = ?4
-                      where worktree_path = ?1 and branch = ?2 and incarnation = ?3
-                        and delivery_state = 'pending'",
-                    params![path, branch, incarnation, now_unix_ms],
-                )
-                .map_err(|error| format!("supersede retired session notifications: {error}"))?;
-            transaction
-                .execute(
-                    "delete from notification_session
-                      where worktree_path = ?1 and branch = ?2 and incarnation = ?3",
-                    params![path, branch, incarnation],
-                )
-                .map_err(|error| format!("retire notification session: {error}"))?;
-        }
-        transaction
-            .execute(
-                "delete from notification_outbox
-                  where delivery_state not in ('pending', 'dispatching')
-                    and observed_unix_ms < ?1",
-                [now_unix_ms.saturating_sub(DELIVERY_HISTORY_RETENTION_MS)],
+        self.store
+            .retain(
+                &live,
+                now_unix_ms,
+                now_unix_ms.saturating_sub(DELIVERY_HISTORY_RETENTION_MS),
             )
-            .map_err(|error| format!("prune notification history: {error}"))?;
-        transaction
-            .commit()
-            .map_err(|error| format!("commit notification retention: {error}"))
+            .map_err(|error| error.to_string())
     }
-}
-
-pub(crate) fn migrate_schema(conn: &Connection) -> Result<(), String> {
-    conn.execute_batch(
-        "
-        create table if not exists notification_session (
-          worktree_path text not null,
-          branch text not null,
-          incarnation text not null,
-          state text not null,
-          transition_sequence integer not null,
-          observed_unix_ms integer not null,
-          primary key (worktree_path, branch, incarnation)
-        );
-        create table if not exists notification_outbox (
-          id integer primary key autoincrement,
-          worktree_path text not null,
-          branch text not null,
-          incarnation text not null,
-          transition_sequence integer not null,
-          kind text not null,
-          title text not null,
-          body text not null,
-          observed_unix_ms integer not null,
-          expires_unix_ms integer not null,
-          delivery_state text not null,
-          attempt_count integer not null default 0,
-          available_unix_ms integer not null,
-          attempted_unix_ms integer,
-          backend_accepted_unix_ms integer,
-          superseded_unix_ms integer,
-          last_failure_category text,
-          unique (worktree_path, branch, incarnation, transition_sequence)
-        );
-        create index if not exists notification_outbox_delivery_idx
-          on notification_outbox(delivery_state, expires_unix_ms, id);
-        ",
-    )
-    .map_err(|error| format!("migrate notification schema: {error}"))
 }
 
 fn transition(previous: AgentState, current: AgentState) -> Option<NotificationKind> {
@@ -570,14 +257,38 @@ fn enabled(config: NotificationConfig, kind: NotificationKind) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::Connection;
+    use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{
-        DELIVERY_LIFETIME_MS, NotificationCoordinator, NotificationObservation, migrate_schema,
-    };
-    use crate::agent::AgentState;
-    use crate::config::NotificationConfig;
+    use super::*;
     use crate::session::{WorktreeRepositoryKey, WorktreeSessionKey};
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    struct TestStore {
+        path: std::path::PathBuf,
+        coordinator: NotificationCoordinator,
+    }
+
+    impl TestStore {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "prism-notification-{}-{}.db",
+                std::process::id(),
+                SEQUENCE.fetch_add(1, Ordering::Relaxed)
+            ));
+            let coordinator = NotificationCoordinator::open(&path).unwrap();
+            Self { path, coordinator }
+        }
+    }
+
+    impl Drop for TestStore {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(format!("{}-wal", self.path.display()));
+            let _ = fs::remove_file(format!("{}-shm", self.path.display()));
+        }
+    }
 
     fn session() -> WorktreeSessionKey {
         WorktreeSessionKey {
@@ -599,33 +310,37 @@ mod tests {
     }
 
     #[test]
-    fn coordinator_baselines_then_records_one_active_to_attention_transition() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate_schema(&conn).unwrap();
-        let mut coordinator = NotificationCoordinator::new(&mut conn);
-
-        let baseline = coordinator
-            .observe(observation(AgentState::Running, 1_000))
-            .unwrap();
-        let transition = coordinator
-            .observe(observation(AgentState::NeedsInput, 2_000))
-            .unwrap();
-        let duplicate = coordinator
-            .observe(observation(AgentState::NeedsInput, 3_000))
-            .unwrap();
-
-        assert_eq!(baseline.event_id, None);
-        assert!(transition.event_id.is_some());
-        assert_eq!(duplicate.event_id, None);
+    fn baseline_transition_and_duplicate_are_atomic() {
+        let store = TestStore::new();
+        let coordinator = &store.coordinator;
+        assert_eq!(
+            coordinator
+                .observe(observation(AgentState::Running, 1_000))
+                .unwrap()
+                .event_id,
+            None
+        );
+        assert!(
+            coordinator
+                .observe(observation(AgentState::NeedsInput, 2_000))
+                .unwrap()
+                .event_id
+                .is_some()
+        );
+        assert_eq!(
+            coordinator
+                .observe(observation(AgentState::NeedsInput, 3_000))
+                .unwrap()
+                .event_id,
+            None
+        );
         assert_eq!(coordinator.pending().unwrap().len(), 1);
     }
 
     #[test]
-    fn coordinator_supersedes_obsolete_attention_before_rearming() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate_schema(&conn).unwrap();
-        let mut coordinator = NotificationCoordinator::new(&mut conn);
-
+    fn obsolete_delivery_is_superseded_before_rearming() {
+        let store = TestStore::new();
+        let coordinator = &store.coordinator;
         coordinator
             .observe(observation(AgentState::Running, 1_000))
             .unwrap();
@@ -642,7 +357,6 @@ mod tests {
             .unwrap()
             .event_id
             .unwrap();
-
         let pending = coordinator.pending().unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].id, second);
@@ -650,67 +364,31 @@ mod tests {
     }
 
     #[test]
-    fn claimed_notifications_are_not_replayed_after_acceptance_or_interrupted_dispatch() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate_schema(&conn).unwrap();
-        let mut coordinator = NotificationCoordinator::new(&mut conn);
+    fn delivery_state_survives_reopening_the_file() {
+        let store = TestStore::new();
+        let coordinator = &store.coordinator;
         coordinator
             .observe(observation(AgentState::Running, 1_000))
             .unwrap();
         coordinator
             .observe(observation(AgentState::NeedsInput, 2_000))
             .unwrap();
-
         let claimed = coordinator.claim_next(2_000).unwrap().unwrap();
         coordinator.mark_accepted(claimed.id, 2_100).unwrap();
-        assert!(coordinator.claim_next(2_200).unwrap().is_none());
-
-        coordinator
-            .observe(observation(AgentState::Running, 3_000))
-            .unwrap();
-        coordinator
-            .observe(observation(AgentState::NeedsInput, 4_000))
-            .unwrap();
-        coordinator.claim_next(4_000).unwrap().unwrap();
-        assert_eq!(coordinator.abandon_uncertain(4_100).unwrap(), 1);
-        assert!(coordinator.claim_next(4_200).unwrap().is_none());
-    }
-
-    #[test]
-    fn retired_session_supersedes_pending_delivery_and_rebaselines_if_recreated() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate_schema(&conn).unwrap();
-        let mut coordinator = NotificationCoordinator::new(&mut conn);
-        coordinator
-            .observe(observation(AgentState::Running, 1_000))
-            .unwrap();
-        coordinator
-            .observe(observation(AgentState::NeedsInput, 2_000))
-            .unwrap();
-
-        coordinator.retain(std::iter::empty(), 3_000).unwrap();
-        assert!(coordinator.pending().unwrap().is_empty());
-        assert_eq!(
-            coordinator
-                .observe(observation(AgentState::NeedsInput, 4_000))
-                .unwrap()
-                .event_id,
-            None
-        );
+        let reopened = NotificationCoordinator::open(&store.path).unwrap();
+        assert!(reopened.claim_next(2_200).unwrap().is_none());
     }
 
     #[test]
     fn stale_notification_expires_instead_of_replaying() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate_schema(&conn).unwrap();
-        let mut coordinator = NotificationCoordinator::new(&mut conn);
+        let store = TestStore::new();
+        let coordinator = &store.coordinator;
         coordinator
             .observe(observation(AgentState::Running, 1_000))
             .unwrap();
         coordinator
             .observe(observation(AgentState::NeedsInput, 2_000))
             .unwrap();
-
         assert!(
             coordinator
                 .claim_next(2_000 + DELIVERY_LIFETIME_MS)
@@ -721,10 +399,25 @@ mod tests {
     }
 
     #[test]
-    fn disabling_notifications_cancels_pending_intent_without_a_state_change() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        migrate_schema(&conn).unwrap();
-        let mut coordinator = NotificationCoordinator::new(&mut conn);
+    fn interrupted_dispatch_is_not_replayed() {
+        let store = TestStore::new();
+        let coordinator = &store.coordinator;
+        coordinator
+            .observe(observation(AgentState::Running, 1_000))
+            .unwrap();
+        coordinator
+            .observe(observation(AgentState::NeedsInput, 2_000))
+            .unwrap();
+        coordinator.claim_next(2_000).unwrap().unwrap();
+
+        assert_eq!(coordinator.abandon_uncertain(2_100).unwrap(), 1);
+        assert!(coordinator.claim_next(2_200).unwrap().is_none());
+    }
+
+    #[test]
+    fn disabling_notifications_supersedes_pending_intent() {
+        let store = TestStore::new();
+        let coordinator = &store.coordinator;
         coordinator
             .observe(observation(AgentState::Running, 1_000))
             .unwrap();
@@ -737,5 +430,28 @@ mod tests {
         coordinator.observe(disabled).unwrap();
 
         assert!(coordinator.pending().unwrap().is_empty());
+    }
+
+    #[test]
+    fn retiring_a_session_supersedes_delivery_and_rebaselines() {
+        let store = TestStore::new();
+        let coordinator = &store.coordinator;
+        coordinator
+            .observe(observation(AgentState::Running, 1_000))
+            .unwrap();
+        coordinator
+            .observe(observation(AgentState::NeedsInput, 2_000))
+            .unwrap();
+
+        coordinator.retain(std::iter::empty(), 3_000).unwrap();
+
+        assert!(coordinator.pending().unwrap().is_empty());
+        assert_eq!(
+            coordinator
+                .observe(observation(AgentState::NeedsInput, 4_000))
+                .unwrap()
+                .event_id,
+            None
+        );
     }
 }

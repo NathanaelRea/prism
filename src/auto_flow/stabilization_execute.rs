@@ -5,7 +5,7 @@ use crate::repo::Repository;
 
 use super::stabilization_model::{PendingPushGuard, StabilizationWorkItem, WorkGuard};
 use super::{
-    AutoEvent, AutoStepKey, AutoStepStatus, PersistedAutoRun, append_auto_event,
+    AutoEvent, AutoFlowStore, AutoStepKey, AutoStepStatus, PersistedAutoRun, append_auto_event,
     save_run_with_conn, stabilization_observe, stabilization_plan, unix_ms,
 };
 
@@ -41,6 +41,12 @@ pub(crate) struct StandaloneRepair {
     kind: super::stabilization_model::RepairKind,
     prompt: String,
     guard: WorkGuard,
+}
+
+impl StandaloneRepair {
+    pub(crate) fn prompt(&self) -> &str {
+        &self.prompt
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -625,7 +631,7 @@ pub(crate) fn decide_work_guard(
 }
 
 pub(crate) fn queue_standalone_repair(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     repair: StandaloneRepair,
 ) -> Result<StandaloneRepairQueue, String> {
@@ -649,12 +655,7 @@ pub(crate) fn queue_standalone_repair(
         super::stabilization_model::RepairKind::Merge => unreachable!(),
     };
     let result = (|| {
-        let transaction =
-            crate::flight_recorder::TransactionTrace::begin("auto_run.queue_standalone_repair");
-        let tx =
-            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-                .map_err(|error| format!("begin standalone repair transaction: {error}"))?;
-        if let Some(latest) = super::load_auto_run(&tx, &persisted.run.id)? {
+        if let Some(latest) = super::load_auto_run(conn, &persisted.run.id)? {
             *persisted = latest;
         }
         let queue = if let Some(step_id) = persisted.steps.iter().find_map(|step| {
@@ -670,7 +671,7 @@ pub(crate) fn queue_standalone_repair(
             .flatten()
         }) {
             persisted.run.selected_step_run_id = Some(step_id);
-            super::save_run_with_conn(&tx, &persisted.run)?;
+            super::save_auto_run(conn, persisted)?;
             StandaloneRepairQueue::AlreadyPending(step_id)
         } else {
             apply_state(
@@ -685,7 +686,7 @@ pub(crate) fn queue_standalone_repair(
             );
             persisted.run.pause_requested = false;
             let step_id = super::append_step_run_with_work_guard_in_transaction(
-                &tx,
+                conn,
                 persisted,
                 step_key,
                 Some(repair.prompt),
@@ -694,9 +695,7 @@ pub(crate) fn queue_standalone_repair(
             )?;
             StandaloneRepairQueue::Queued(step_id)
         };
-        tx.commit()
-            .map_err(|error| format!("commit standalone repair transaction: {error}"))?;
-        transaction.committed();
+        super::save_auto_run(conn, persisted)?;
         Ok(queue)
     })();
     if result.is_err() {
@@ -706,7 +705,7 @@ pub(crate) fn queue_standalone_repair(
 }
 
 pub(crate) fn append_repair_continuation(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
 ) -> Result<bool, String> {
     let Some(continuation) = next_repair_continuation(persisted) else {
@@ -724,7 +723,7 @@ pub(crate) fn append_repair_continuation(
 }
 
 pub(crate) fn append_planned_work(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     work: StabilizationWorkItem,
 ) -> Result<bool, String> {
@@ -777,7 +776,7 @@ pub(crate) fn ci_wait_decision(work: &StabilizationWorkItem) -> WaitDecision {
 }
 
 pub(crate) fn advance_review_wait(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
     work: StabilizationWorkItem,
@@ -815,7 +814,7 @@ pub(crate) fn advance_review_wait(
 }
 
 pub(crate) fn advance_ci_wait(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
     work: StabilizationWorkItem,
@@ -854,7 +853,7 @@ pub(crate) fn advance_ci_wait(
 
 #[allow(clippy::too_many_arguments)]
 fn queue_wait_repair(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
     step_key: AutoStepKey,
@@ -869,29 +868,19 @@ fn queue_wait_repair(
     }
     let original = persisted.clone();
     let result = (|| {
-        let transaction =
-            crate::flight_recorder::TransactionTrace::begin("auto_run.queue_wait_repair");
-        let tx =
-            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-                .map_err(|error| format!("begin wait repair transaction: {error}"))?;
-        super::finish_non_agent_step(
-            &tx,
-            &mut persisted.steps[step_index],
-            AutoStepStatus::Done,
-            Some(summary),
-            None,
-        )?;
+        let waiting_step = &mut persisted.steps[step_index];
+        waiting_step.status = AutoStepStatus::Done;
+        waiting_step.finished_unix_ms = Some(super::unix_ms());
+        waiting_step.summary = Some(summary);
+        waiting_step.error = None;
         super::append_step_run_with_work_guard_in_transaction(
-            &tx,
+            conn,
             persisted,
             step_key,
             Some(prompt),
             guard,
             None,
         )?;
-        tx.commit()
-            .map_err(|error| format!("commit wait repair transaction: {error}"))?;
-        transaction.committed();
         Ok(WaitProgress::RepairQueued)
     })();
     if result.is_err() {
@@ -952,7 +941,7 @@ fn has_active_or_completed_step_after_latest_pr(
 }
 
 pub(crate) fn observe_plan_and_save(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -968,7 +957,7 @@ pub(crate) fn observe_plan_and_save(
 }
 
 pub(crate) fn observe_cached_plan_and_save(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     session: &crate::session::Session,
@@ -1011,7 +1000,7 @@ pub(crate) fn repair_commit_message(
 }
 
 pub(crate) fn validate_and_begin_repair_commit(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -1078,7 +1067,7 @@ pub(crate) fn validate_and_begin_repair_commit(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn complete_repair_commit(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -1272,7 +1261,7 @@ pub(crate) fn decide_guarded_push(
 }
 
 pub(crate) fn progress_pending_push(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -1310,7 +1299,7 @@ pub(crate) fn progress_pending_push(
             )?;
             crate::lifecycle::run_pre_push_checks(config, &persisted.run.worktree_path)?;
             before_push()?;
-            crate::execution::validate_installed_claim(conn)?;
+            conn.validate_claim()?;
             match observe_guarded_push_decision(conn, repo, config, persisted, cache, &guard)? {
                 GuardedPushDecision::Invalidated { reason } => {
                     invalidate_pending_push(conn, repo, config, persisted, &reason)?;
@@ -1418,7 +1407,7 @@ pub(crate) fn progress_pending_push(
                 .any(|comment| comment.thread_id == thread_id && !comment.resolved)
         });
         if unresolved {
-            crate::execution::validate_installed_claim(conn)?;
+            conn.validate_claim()?;
             crate::remote::dispatcher::resolve_review_thread(
                 &persisted.run.worktree_path,
                 config,
@@ -1461,7 +1450,7 @@ fn guarded_replan_is_terminal(work: &StabilizationWorkItem) -> bool {
 }
 
 fn observe_guarded_push_decision(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &PersistedAutoRun,
@@ -1531,7 +1520,7 @@ fn refresh_after_guarded_effect(
 }
 
 fn invalidate_pending_push(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -1560,6 +1549,7 @@ fn short_sha(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auto_flow::tests::TestDatabase;
     use crate::auto_flow::{
         AutoLaunch, AutoStepRun,
         stabilization_model::{
@@ -2223,8 +2213,7 @@ mod tests {
                 super::super::stabilization_model::StabilizationWorkKind::FixCi,
             ),
         ] {
-            let conn = rusqlite::Connection::open_in_memory().unwrap();
-            super::super::migrate_schema(&conn).unwrap();
+            let conn = TestDatabase::new("standalone-repair");
             let mut persisted = AutoLaunch::new(
                 Path::new("/repo"),
                 Path::new("/repo/feature"),
@@ -2284,8 +2273,7 @@ mod tests {
 
     #[test]
     fn standalone_repair_late_write_failure_rolls_back_run_step_and_guard() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        super::super::migrate_schema(&conn).unwrap();
+        let conn = TestDatabase::new("standalone-deduplication");
         let mut persisted = AutoLaunch::new(
             Path::new("/repo"),
             Path::new("/repo/feature"),
@@ -2297,15 +2285,8 @@ mod tests {
         persisted.run.variant = "repair".to_string();
         persisted.steps.clear();
         super::super::save_auto_run(&conn, &mut persisted).unwrap();
-        conn.execute_batch(
-            "create trigger fail_guarded_queue_late
-             before update of selected_step_run_id on auto_run
-             when new.selected_step_run_id is not null
-             begin
-               select raise(fail, 'injected late write failure');
-             end;",
-        )
-        .unwrap();
+        crate::persistence::auto_flow::test_install_selected_step_failure(conn.path(), false)
+            .unwrap();
 
         let error = queue_standalone_repair(
             &conn,
@@ -2333,8 +2314,7 @@ mod tests {
 
     #[test]
     fn wait_repair_late_failure_restores_wait_step_and_does_not_enqueue() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        super::super::migrate_schema(&conn).unwrap();
+        let conn = TestDatabase::new("standalone-rollback");
         let mut persisted = AutoLaunch::new(
             Path::new("/repo"),
             Path::new("/repo/feature"),
@@ -2355,15 +2335,8 @@ mod tests {
         persisted.steps.push(wait);
         super::super::save_auto_run(&conn, &mut persisted).unwrap();
         let original = persisted.clone();
-        conn.execute_batch(
-            "create trigger fail_wait_repair_late
-             before update of selected_step_run_id on auto_run
-             when new.selected_step_run_id is not old.selected_step_run_id
-             begin
-               select raise(fail, 'injected wait repair failure');
-             end;",
-        )
-        .unwrap();
+        crate::persistence::auto_flow::test_install_selected_step_failure(conn.path(), true)
+            .unwrap();
 
         let error = queue_wait_repair(
             &conn,

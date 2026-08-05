@@ -1,0 +1,146 @@
+{
+  "db_name": "SQLite",
+  "query": "select branch as \"branch!\", pr_number as \"pr_number!\", head_sha as \"head_sha!\",\n       provider as \"provider!\", canonical_host as \"canonical_host!\",\n       project_path as \"project_path!\", native_cr_id as \"native_cr_id!\",\n       display_number as \"display_number!\", source_provider as \"source_provider!\",\n       source_canonical_host as \"source_canonical_host!\",\n       source_project_path as \"source_project_path!\",\n       target_provider as \"target_provider!\",\n       target_canonical_host as \"target_canonical_host!\",\n       target_project_path as \"target_project_path!\", comments as \"comments!\",\n       reviews as \"reviews!\", review_comments as \"review_comments!\", files as \"files!\",\n       failing_checks as \"failing_checks!\", check_contexts as \"check_contexts!\",\n       ci_failures as \"ci_failures!\", observation_error\nfrom pr_details_cache\nwhere branch = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "branch!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "pr_number!",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "head_sha!",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "provider!",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "canonical_host!",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "project_path!",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "native_cr_id!",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "display_number!",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "source_provider!",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "source_canonical_host!",
+        "ordinal": 9,
+        "type_info": "Text"
+      },
+      {
+        "name": "source_project_path!",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_provider!",
+        "ordinal": 11,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_canonical_host!",
+        "ordinal": 12,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_project_path!",
+        "ordinal": 13,
+        "type_info": "Text"
+      },
+      {
+        "name": "comments!",
+        "ordinal": 14,
+        "type_info": "Text"
+      },
+      {
+        "name": "reviews!",
+        "ordinal": 15,
+        "type_info": "Text"
+      },
+      {
+        "name": "review_comments!",
+        "ordinal": 16,
+        "type_info": "Text"
+      },
+      {
+        "name": "files!",
+        "ordinal": 17,
+        "type_info": "Text"
+      },
+      {
+        "name": "failing_checks!",
+        "ordinal": 18,
+        "type_info": "Text"
+      },
+      {
+        "name": "check_contexts!",
+        "ordinal": 19,
+        "type_info": "Text"
+      },
+      {
+        "name": "ci_failures!",
+        "ordinal": 20,
+        "type_info": "Text"
+      },
+      {
+        "name": "observation_error",
+        "ordinal": 21,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "0dd172c6901f98ccf9756ee3640fdf31af12a94163fe5d2954bf94c309c704b2"
+}

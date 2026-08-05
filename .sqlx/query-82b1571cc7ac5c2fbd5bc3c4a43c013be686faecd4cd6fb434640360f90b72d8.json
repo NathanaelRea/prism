@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select exists(\n select 1 from workflow_execution where workflow_kind = ? and run_id = ?\n  and dispatch_state = 'recovery_pending' and interruption_generation = ?\n) as \"current!: bool\"\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "current!: bool",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "82b1571cc7ac5c2fbd5bc3c4a43c013be686faecd4cd6fb434640360f90b72d8"
+}

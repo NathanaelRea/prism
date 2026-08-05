@@ -1,8 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-#[cfg(any(target_os = "macos", test))]
-use std::io::{BufRead, BufReader};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -16,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::execution::{self, DispatchState, ExecutionClaim, WorkflowIdentity, WorkflowKind};
+use crate::execution::{self, WorkflowIdentity};
 use crate::notification::{NotificationCoordinator, NotificationObservation, PendingNotification};
 use crate::platform::SupportedOs;
 use crate::process::DetachedProcessPolicy;
@@ -25,12 +23,9 @@ use crate::util::stable_hash;
 use crate::{observability, workspace};
 
 const PROTOCOL_VERSION: u32 = 1;
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const NOTIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const NOTIFICATION_RETRY_INTERVAL: Duration = Duration::from_secs(10);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const DAEMON_TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
-const GLOBAL_CONCURRENCY: usize = 4;
 const SOCKET_PATH_BUDGET: usize = 103;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -414,6 +409,36 @@ fn request(command: &str) -> Result<String, String> {
     request_at(&validated_socket_path()?, command)
 }
 
+pub fn launch_bundled_plan(
+    launch: crate::workflow::bundled::BundledPlanLaunch,
+) -> Result<String, String> {
+    launch_bundled("bundled_plan_launch", launch)
+}
+
+pub fn launch_bundled_coding(
+    launch: crate::workflow::bundled::BundledCodingLaunch,
+) -> Result<String, String> {
+    launch_bundled("bundled_coding_launch", launch)
+}
+
+fn launch_bundled<T: serde::Serialize>(kind: &str, launch: T) -> Result<String, String> {
+    ensure_running()?;
+    let response = request(&serde_json::json!({"type": kind, "launch": launch}).to_string())?;
+    let response: serde_json::Value = serde_json::from_str(&response)
+        .map_err(|error| format!("decode workflow worker response: {error}"))?;
+    if response["ok"] == true {
+        response["run_id"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "workflow worker omitted run id".to_string())
+    } else {
+        Err(response["error"]
+            .as_str()
+            .unwrap_or("workflow launch failed")
+            .to_string())
+    }
+}
+
 fn request_at(path: &WorkerSocketPath, command: &str) -> Result<String, String> {
     let stream = UnixStream::connect(path.as_path())
         .map_err(|error| format!("connect to Prism worker: {error}"))?;
@@ -435,6 +460,57 @@ fn request_on_stream(mut stream: UnixStream, command: &str) -> Result<String, St
 }
 
 pub fn serve() -> Result<(), String> {
+    // One long-lived runtime supervises the generalized async control plane. The blocking Unix
+    // socket adapter only translates requests; it does not run a second scheduling engine.
+    let async_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|error| format!("create Prism worker runtime: {error}"))?;
+    async_runtime.block_on(async {
+        let mut worker = crate::workflow::engine::WorkflowWorker::open_default(
+            execution::new_instance_id("workflow-worker"),
+            crate::workflow::engine::WorkerConfig::default(),
+        )
+        .await
+        .map_err(|error| format!("open workflow control plane: {error}"))?;
+        worker
+            .register_builtins()
+            .map_err(|error| format!("register workflow implementations: {error}"))?;
+        let operations = worker.operations();
+        crate::workflow::bundled::install(&operations)
+            .await
+            .map_err(|error| format!("install bundled workflow definitions: {error}"))?;
+        let (shutdown, shutdown_receiver) = tokio::sync::watch::channel(false);
+        let control_plane_failure = Arc::new(Mutex::new(None::<String>));
+        let failure = Arc::clone(&control_plane_failure);
+        let control_plane = tokio::spawn(async move {
+            if let Err(error) = worker.run(shutdown_receiver).await
+                && let Ok(mut current) = failure.lock()
+            {
+                *current = Some(error.to_string());
+            }
+        });
+        // Socket polling is blocking, so isolate the protocol adapter from runtime worker threads.
+        let socket_failure = Arc::clone(&control_plane_failure);
+        let socket =
+            tokio::task::spawn_blocking(move || serve_socket(&socket_failure, &operations));
+        let socket_result = socket
+            .await
+            .map_err(|error| format!("join workflow socket adapter: {error}"))?;
+        let _ = shutdown.send(true);
+        control_plane
+            .await
+            .map_err(|error| format!("join workflow control plane: {error}"))?;
+        socket_result
+    })
+}
+
+fn serve_socket(
+    control_plane_failure: &Arc<Mutex<Option<String>>>,
+    operations: &crate::WorkflowOperations,
+) -> Result<(), String> {
     let runtime = runtime_dir();
     let socket = WorkerSocketPath::for_runtime(&runtime)?;
     if let Ok(metadata) = fs::symlink_metadata(&runtime) {
@@ -501,9 +577,16 @@ pub fn serve() -> Result<(), String> {
         .name("prism-notification-observer".to_string())
         .spawn(move || notification_loop(observer_stop, observer_subscriber))
         .map_err(|error| format!("start notification observer: {error}"))?;
-    let mut next_poll = Instant::now();
     let mut draining = false;
     loop {
+        if let Some(error) = control_plane_failure
+            .lock()
+            .map_err(|_| "workflow control-plane supervisor state is poisoned".to_string())?
+            .clone()
+        {
+            notification_stop.store(true, Ordering::Release);
+            return Err(format!("workflow control plane failed: {error}"));
+        }
         match listener.accept() {
             Ok((mut stream, _)) => {
                 if respond(
@@ -511,6 +594,7 @@ pub fn serve() -> Result<(), String> {
                     &instance_id,
                     &active,
                     &notification_subscriber,
+                    Some(operations),
                     draining,
                 ) {
                     draining = true;
@@ -528,10 +612,6 @@ pub fn serve() -> Result<(), String> {
         {
             break;
         }
-        if !draining && Instant::now() >= next_poll {
-            schedule_queued(&instance_id, Arc::clone(&active));
-            next_poll = Instant::now() + POLL_INTERVAL;
-        }
         thread::sleep(Duration::from_millis(50));
     }
     notification_stop.store(true, Ordering::Release);
@@ -544,36 +624,56 @@ fn respond(
     instance_id: &str,
     active: &Arc<Mutex<BTreeSet<PathBuf>>>,
     notification_subscriber: &Arc<Mutex<Vec<UnixStream>>>,
+    operations: Option<&crate::WorkflowOperations>,
     draining: bool,
 ) -> bool {
-    let mut request = [0_u8; 64];
-    let size = stream.read(&mut request).unwrap_or(0);
-    let command = String::from_utf8_lossy(&request[..size]);
+    const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+    let mut command = String::new();
+    let read = BufReader::new(&mut *stream)
+        .take((MAX_REQUEST_BYTES + 1) as u64)
+        .read_line(&mut command);
+    if read.is_err() || command.len() > MAX_REQUEST_BYTES {
+        let _ = stream.write_all(b"error invalid-request\n");
+        return false;
+    }
+    let command = command.trim();
     let active = active
         .lock()
         .map(|active| active.len())
         .unwrap_or(usize::MAX);
     let mut new_notification_subscriber = None;
-    let response = match command.trim() {
-        "health" | "wake" => format!(
-            "ok {PROTOCOL_VERSION} {instance_id} pid={} state={} active={active} notifications=1\n",
-            std::process::id(),
-            if draining { "draining" } else { "running" }
-        ),
-        "shutdown" => format!(
-            "ok {PROTOCOL_VERSION} {instance_id} pid={} state=draining active={active} notifications=1\n",
-            std::process::id()
-        ),
-        "subscribe-notifications" if !draining => match stream.try_clone() {
-            Ok(subscriber) => {
-                let _ = subscriber.set_read_timeout(Some(Duration::from_secs(1)));
-                let _ = subscriber.set_write_timeout(Some(Duration::from_secs(1)));
-                new_notification_subscriber = Some(subscriber);
-                format!("ok {PROTOCOL_VERSION} subscribed\n")
-            }
-            Err(_) => "error subscribe-failed\n".to_string(),
-        },
-        _ => "error unknown-command\n".to_string(),
+    let response = if command.starts_with('{') {
+        operations.map_or_else(
+            || {
+                format!(
+                    "{}\n",
+                    serde_json::json!({"ok": false, "error": "workflow operations unavailable"})
+                )
+            },
+            |operations| workflow_socket_response(operations, command),
+        )
+    } else {
+        match command {
+            "health" | "wake" => format!(
+                "ok {PROTOCOL_VERSION} {instance_id} pid={} state={} active={active} notifications=1\n",
+                std::process::id(),
+                if draining { "draining" } else { "running" }
+            ),
+            "shutdown" => format!(
+                "ok {PROTOCOL_VERSION} {instance_id} pid={} state=draining active={active} notifications=1\n",
+                std::process::id()
+            ),
+            "subscribe-notifications" if !draining => match stream.try_clone() {
+                Ok(subscriber) => {
+                    let _ = subscriber.set_read_timeout(Some(Duration::from_secs(1)));
+                    let _ = subscriber.set_write_timeout(Some(Duration::from_secs(1)));
+                    new_notification_subscriber = Some(subscriber);
+                    format!("ok {PROTOCOL_VERSION} subscribed\n")
+                }
+                Err(_) => "error subscribe-failed\n".to_string(),
+            },
+            _ => "error unknown-command\n".to_string(),
+        }
     };
     if stream.write_all(response.as_bytes()).is_ok()
         && let Some(subscriber) = new_notification_subscriber
@@ -581,7 +681,390 @@ fn respond(
     {
         current.push(subscriber);
     }
-    command.trim() == "shutdown"
+    command == "shutdown"
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[allow(
+    clippy::enum_variant_names,
+    reason = "the stable wire tags are deliberately namespaced with workflow_"
+)]
+enum WorkflowSocketRequest {
+    WorkflowRegisterDefinition {
+        definition: SocketDefinition,
+    },
+    WorkflowLaunch {
+        run: SocketRun,
+        steps: Vec<SocketStep>,
+    },
+    BundledPlanLaunch {
+        launch: crate::workflow::bundled::BundledPlanLaunch,
+    },
+    BundledCodingLaunch {
+        launch: crate::workflow::bundled::BundledCodingLaunch,
+    },
+    WorkflowList {
+        repository: Option<String>,
+        limit: usize,
+    },
+    WorkflowInspect {
+        run_id: String,
+    },
+    WorkflowCommand {
+        run_id: String,
+        command: SocketWorkflowCommand,
+        now_unix_ms: i64,
+    },
+    WorkflowRequestApproval {
+        id: String,
+        run_id: String,
+        step_id: String,
+        now_unix_ms: i64,
+    },
+    WorkflowDecideApproval {
+        id: String,
+        decision: SocketApprovalDecision,
+        decided_by: String,
+        note: Option<String>,
+        now_unix_ms: i64,
+    },
+    WorkflowGrantAuthority {
+        id: String,
+        run_id: String,
+        scope: String,
+        granted_by: String,
+        now_unix_ms: i64,
+        expires_unix_ms: Option<i64>,
+    },
+    WorkflowRegisterTrigger {
+        id: String,
+        definition_snapshot_id: String,
+        overlap_policy: String,
+        config_json: String,
+        enabled: bool,
+    },
+    WorkflowRecordTriggerOccurrence {
+        id: String,
+        trigger_id: String,
+        deduplication_key: String,
+        due_unix_ms: i64,
+    },
+    WorkflowCompleteTrigger {
+        occurrence_id: String,
+        run_id: String,
+        checkpoint_json: String,
+        now_unix_ms: i64,
+    },
+    WorkflowWaitOnGate {
+        step_id: String,
+        gate_kind: String,
+        due_unix_ms: i64,
+        checkpoint_json: String,
+        now_unix_ms: i64,
+    },
+    WorkflowImportLegacy {
+        source_path: PathBuf,
+        importer_revision: String,
+        now_unix_ms: i64,
+    },
+}
+
+#[derive(serde::Deserialize)]
+struct SocketDefinition {
+    id: String,
+    name: String,
+    revision: String,
+    source: String,
+    trusted: bool,
+    body_json: String,
+    digest: String,
+    now_unix_ms: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct SocketRun {
+    run_id: String,
+    definition_snapshot_id: String,
+    repository: Option<String>,
+    idempotency_key: String,
+    now_unix_ms: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct SocketStep {
+    id: String,
+    key: String,
+    implementation: String,
+    target_id: String,
+    input_json: String,
+    #[serde(default)]
+    dependencies: Vec<String>,
+    #[serde(default)]
+    resources: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SocketWorkflowCommand {
+    Pause,
+    Resume,
+    Cancel,
+    Retry,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SocketApprovalDecision {
+    Approve,
+    Reject,
+}
+
+fn workflow_socket_response(operations: &crate::WorkflowOperations, request: &str) -> String {
+    let request = match serde_json::from_str::<WorkflowSocketRequest>(request) {
+        Ok(request) => request,
+        Err(error) => {
+            return format!(
+                "{}\n",
+                serde_json::json!({"ok": false, "error": format!("invalid workflow request: {error}")})
+            );
+        }
+    };
+    let result =
+        crate::async_runtime::block_on(async {
+            match request {
+                WorkflowSocketRequest::WorkflowRegisterDefinition { definition } => operations
+                    .register_definition(crate::DefinitionSnapshot {
+                        id: &definition.id,
+                        name: &definition.name,
+                        revision: &definition.revision,
+                        source: &definition.source,
+                        trusted: definition.trusted,
+                        body_json: &definition.body_json,
+                        digest: &definition.digest,
+                        now_unix_ms: definition.now_unix_ms,
+                    })
+                    .await
+                    .map(|()| serde_json::json!({"ok": true})),
+                WorkflowSocketRequest::WorkflowLaunch { run, steps } => operations
+                    .launch_materialized(
+                        crate::LaunchWorkflow {
+                            run_id: &run.run_id,
+                            definition_snapshot_id: &run.definition_snapshot_id,
+                            repository: run.repository.as_deref(),
+                            idempotency_key: &run.idempotency_key,
+                            now_unix_ms: run.now_unix_ms,
+                        },
+                        steps
+                            .into_iter()
+                            .map(|step| crate::WorkflowStep {
+                                id: step.id,
+                                key: step.key,
+                                implementation: step.implementation,
+                                target_id: step.target_id,
+                                input_json: step.input_json,
+                                dependencies: step.dependencies,
+                                resources: step.resources,
+                            })
+                            .collect(),
+                    )
+                    .await
+                    .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id})),
+                WorkflowSocketRequest::BundledPlanLaunch { launch } => {
+                    crate::workflow::bundled::launch_plan(operations, launch)
+                        .await
+                        .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id}))
+                }
+                WorkflowSocketRequest::BundledCodingLaunch { launch } => {
+                    crate::workflow::bundled::launch_coding(operations, launch)
+                        .await
+                        .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id}))
+                }
+                WorkflowSocketRequest::WorkflowList { repository, limit } => operations
+                    .list(repository.as_deref(), limit)
+                    .await
+                    .map(|runs| serde_json::json!({"ok": true, "runs": runs})),
+                WorkflowSocketRequest::WorkflowInspect { run_id } => {
+                    operations.inspect(&run_id).await.map(|run| {
+                        let run = run.map(|run| serde_json::json!({
+                        "id": run.id,
+                        "definition_name": run.definition_name,
+                        "status": run.status,
+                        "repository": run.repository,
+                        "created_unix_ms": run.created_unix_ms,
+                        "updated_unix_ms": run.updated_unix_ms,
+                        "completed_unix_ms": run.completed_unix_ms,
+                        "steps": run.steps.into_iter().map(|step| serde_json::json!({
+                            "id": step.id,
+                            "key": step.key,
+                            "implementation": step.implementation,
+                            "target_id": step.target_id,
+                            "status": step.status,
+                        })).collect::<Vec<_>>(),
+                        "attempts": run.attempts.into_iter().map(|attempt| serde_json::json!({
+                            "id": attempt.id,
+                            "step_id": attempt.step_id,
+                            "status": attempt.status,
+                            "worker_id": attempt.worker_id,
+                            "target_id": attempt.target_id,
+                            "fencing_token": attempt.fencing_token,
+                            "process_id": attempt.process_id,
+                            "process_start_time_ticks": attempt.process_start_time_ticks,
+                            "started_unix_ms": attempt.started_unix_ms,
+                            "finished_unix_ms": attempt.finished_unix_ms,
+                        })).collect::<Vec<_>>(),
+                        "events": run.events.into_iter().map(|event| serde_json::json!({
+                            "sequence": event.sequence,
+                            "step_id": event.step_id,
+                            "attempt_id": event.attempt_id,
+                            "kind": event.kind,
+                            "time_unix_ms": event.time_unix_ms,
+                            "data_json": event.data_json,
+                        })).collect::<Vec<_>>(),
+                    }));
+                        serde_json::json!({"ok": true, "run": run})
+                    })
+                }
+                WorkflowSocketRequest::WorkflowCommand {
+                    run_id,
+                    command,
+                    now_unix_ms,
+                } => operations
+                    .command(
+                        &run_id,
+                        match command {
+                            SocketWorkflowCommand::Pause => crate::WorkflowCommand::Pause,
+                            SocketWorkflowCommand::Resume => crate::WorkflowCommand::Resume,
+                            SocketWorkflowCommand::Cancel => crate::WorkflowCommand::Cancel,
+                            SocketWorkflowCommand::Retry => crate::WorkflowCommand::Retry,
+                        },
+                        now_unix_ms,
+                    )
+                    .await
+                    .map(|()| serde_json::json!({"ok": true})),
+                WorkflowSocketRequest::WorkflowRequestApproval {
+                    id,
+                    run_id,
+                    step_id,
+                    now_unix_ms,
+                } => operations
+                    .request_approval(&id, &run_id, &step_id, now_unix_ms)
+                    .await
+                    .map(|()| serde_json::json!({"ok": true})),
+                WorkflowSocketRequest::WorkflowDecideApproval {
+                    id,
+                    decision,
+                    decided_by,
+                    note,
+                    now_unix_ms,
+                } => operations
+                    .decide_approval(
+                        &id,
+                        match decision {
+                            SocketApprovalDecision::Approve => crate::ApprovalDecision::Approve,
+                            SocketApprovalDecision::Reject => crate::ApprovalDecision::Reject,
+                        },
+                        &decided_by,
+                        note.as_deref(),
+                        now_unix_ms,
+                    )
+                    .await
+                    .map(|()| serde_json::json!({"ok": true})),
+                WorkflowSocketRequest::WorkflowGrantAuthority {
+                    id,
+                    run_id,
+                    scope,
+                    granted_by,
+                    now_unix_ms,
+                    expires_unix_ms,
+                } => operations
+                    .grant_authority(
+                        &id,
+                        &run_id,
+                        &scope,
+                        &granted_by,
+                        now_unix_ms,
+                        expires_unix_ms,
+                    )
+                    .await
+                    .map(|()| serde_json::json!({"ok": true})),
+                WorkflowSocketRequest::WorkflowRegisterTrigger {
+                    id,
+                    definition_snapshot_id,
+                    overlap_policy,
+                    config_json,
+                    enabled,
+                } => operations
+                    .register_trigger(
+                        &id,
+                        &definition_snapshot_id,
+                        &overlap_policy,
+                        &config_json,
+                        enabled,
+                    )
+                    .await
+                    .map(|()| serde_json::json!({"ok": true})),
+                WorkflowSocketRequest::WorkflowRecordTriggerOccurrence {
+                    id,
+                    trigger_id,
+                    deduplication_key,
+                    due_unix_ms,
+                } => operations
+                    .record_trigger_occurrence(&id, &trigger_id, &deduplication_key, due_unix_ms)
+                    .await
+                    .map(|inserted| serde_json::json!({"ok": true, "inserted": inserted})),
+                WorkflowSocketRequest::WorkflowCompleteTrigger {
+                    occurrence_id,
+                    run_id,
+                    checkpoint_json,
+                    now_unix_ms,
+                } => operations
+                    .complete_trigger(&occurrence_id, &run_id, &checkpoint_json, now_unix_ms)
+                    .await
+                    .map(|()| serde_json::json!({"ok": true})),
+                WorkflowSocketRequest::WorkflowWaitOnGate {
+                    step_id,
+                    gate_kind,
+                    due_unix_ms,
+                    checkpoint_json,
+                    now_unix_ms,
+                } => operations
+                    .wait_on_gate(
+                        &step_id,
+                        &gate_kind,
+                        due_unix_ms,
+                        &checkpoint_json,
+                        now_unix_ms,
+                    )
+                    .await
+                    .map(|()| serde_json::json!({"ok": true})),
+                WorkflowSocketRequest::WorkflowImportLegacy {
+                    source_path,
+                    importer_revision,
+                    now_unix_ms,
+                } => operations
+                    .import_legacy_repository(&source_path, &importer_revision, now_unix_ms)
+                    .await
+                    .map(|summary| {
+                        serde_json::json!({
+                            "ok": true,
+                            "imported": summary.imported,
+                            "already_imported": summary.already_imported,
+                        })
+                    }),
+            }
+        });
+    match result {
+        Ok(Ok(value)) => format!("{value}\n"),
+        Ok(Err(error)) => format!(
+            "{}\n",
+            serde_json::json!({"ok": false, "error": error.to_string()})
+        ),
+        Err(error) => format!(
+            "{}\n",
+            serde_json::json!({"ok": false, "error": error.to_string()})
+        ),
+    }
 }
 
 fn notification_loop(stop: Arc<AtomicBool>, subscriber: Arc<Mutex<Vec<UnixStream>>>) {
@@ -646,8 +1129,8 @@ fn observe_and_deliver_notifications(
                 ),
             }
         }
-        let result = observability::with_writable_db_mut(&repo, |conn| {
-            let mut coordinator = NotificationCoordinator::new(conn);
+        let result = (|| {
+            let coordinator = NotificationCoordinator::open(&observability::db_path(&repo))?;
             coordinator.abandon_uncertain(observed_unix_ms)?;
             coordinator.retain(live.iter(), observed_unix_ms)?;
             for (session, state) in &observations {
@@ -661,8 +1144,8 @@ fn observe_and_deliver_notifications(
                     observed_unix_ms,
                 })?;
             }
-            dispatch_pending_notifications(&mut coordinator, subscriber, observed_unix_ms)
-        });
+            dispatch_pending_notifications(&coordinator, subscriber, observed_unix_ms)
+        })();
         if let Err(error) = result {
             eprintln!(
                 "Prism notification observer cannot update {}: {error}",
@@ -739,7 +1222,7 @@ fn resolve_observed_state(
 }
 
 fn dispatch_pending_notifications(
-    coordinator: &mut NotificationCoordinator<'_>,
+    coordinator: &NotificationCoordinator,
     subscriber: &Arc<Mutex<Vec<UnixStream>>>,
     now_unix_ms: i64,
 ) -> Result<(), String> {
@@ -859,88 +1342,9 @@ fn current_unix_ms() -> i64 {
 fn classify_abandoned(instance_id: &str) -> Result<(), String> {
     for entry in workspace::discover_valid_entries(workspace::load_entries()?) {
         observability::attach_run_repo(&entry.repo)?;
-        observability::with_writable_db(&entry.repo, |conn| {
-            execution::mark_abandoned(conn, instance_id).map(|_| ())
-        })?;
+        execution::mark_abandoned(&observability::db_path(&entry.repo), instance_id).map(|_| ())?;
     }
     Ok(())
-}
-
-fn schedule_queued(instance_id: &str, active: Arc<Mutex<BTreeSet<PathBuf>>>) {
-    let active_count = active
-        .lock()
-        .map(|active| active.len())
-        .unwrap_or(usize::MAX);
-    if active_count >= GLOBAL_CONCURRENCY {
-        return;
-    }
-    let entries = match workspace::load_entries() {
-        Ok(entries) => entries,
-        Err(error) => {
-            eprintln!("Prism worker cannot load repositories: {error}");
-            return;
-        }
-    };
-    for entry in workspace::discover_valid_entries(entries) {
-        let repo = entry.repo;
-        if let Err(error) = observability::attach_run_repo(&repo) {
-            eprintln!(
-                "Prism worker cannot attach repository {}: {error}",
-                repo.root.display()
-            );
-            continue;
-        }
-        let _ = observability::with_writable_db(&repo, |conn| {
-            execution::mark_abandoned(conn, instance_id).map(|_| ())
-        });
-        let queued = observability::with_writable_db(&repo, |conn| execution::queued(conn, 16));
-        let Ok(queued) = queued else {
-            continue;
-        };
-        for workflow in queued {
-            if active
-                .lock()
-                .map(|active| active.len())
-                .unwrap_or(usize::MAX)
-                >= GLOBAL_CONCURRENCY
-            {
-                return;
-            }
-            let Ok(worktree) = workflow_worktree(&repo, &workflow) else {
-                continue;
-            };
-            let config = Config::load(&repo);
-            if !matches!(legacy_worker_running(&repo, &config, &workflow), Ok(false)) {
-                continue;
-            }
-            let inserted = active
-                .lock()
-                .map(|mut active| active.insert(worktree.clone()))
-                .unwrap_or(false);
-            if !inserted {
-                continue;
-            }
-            let worker_id = execution::new_instance_id("executor");
-            let claim = observability::with_writable_db_mut(&repo, |conn| {
-                execution::claim(conn, &workflow, instance_id, &worker_id)
-            });
-            let Ok(Some(claim)) = claim else {
-                if let Ok(mut active) = active.lock() {
-                    active.remove(&worktree);
-                }
-                continue;
-            };
-            log_claim_lifecycle(&repo, "claim", &claim, "workflow claimed");
-            let active = Arc::clone(&active);
-            let executor_repo = repo.clone();
-            thread::spawn(move || {
-                execute_claim(&executor_repo, &claim);
-                if let Ok(mut active) = active.lock() {
-                    active.remove(&worktree);
-                }
-            });
-        }
-    }
 }
 
 pub fn legacy_worker_running(
@@ -956,251 +1360,6 @@ pub fn legacy_worker_running(
     );
     crate::tmux::named_session_exists(config, &expected)
         .map_err(|error| format!("inspect legacy tmux workers: {error}"))
-}
-
-fn workflow_worktree(repo: &Repository, workflow: &WorkflowIdentity) -> Result<PathBuf, String> {
-    observability::with_writable_db(repo, |conn| {
-        let (table, column) = match workflow.kind {
-            WorkflowKind::Auto => ("auto_run", "worktree_path"),
-            WorkflowKind::Plan => ("plan_run", "scope_path"),
-        };
-        conn.query_row(
-            &format!("select {column} from {table} where id = ?1"),
-            [&workflow.run_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map(PathBuf::from)
-        .map_err(|error| format!("load workflow worktree: {error}"))
-    })
-}
-
-fn execute_claim(repo: &Repository, claim: &ExecutionClaim) {
-    log_claim_lifecycle(repo, "executor_start", claim, "workflow executor started");
-    let heartbeat_stop = Arc::new(AtomicBool::new(false));
-    let ownership_lost = Arc::new(AtomicBool::new(false));
-    let heartbeat = spawn_heartbeat(
-        repo.clone(),
-        claim.clone(),
-        Arc::clone(&heartbeat_stop),
-        Arc::clone(&ownership_lost),
-    );
-    let config = Config::load(repo);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        observability::with_writable_db(repo, |conn| execution::validate_claim(conn, claim))
-            .and_then(|()| match claim.workflow.kind {
-                WorkflowKind::Auto => execute_auto(repo, &config, claim),
-                WorkflowKind::Plan => execute_plan(repo, &config, claim),
-            })
-    }))
-    .unwrap_or_else(|_| Err("workflow executor panicked".to_string()));
-    heartbeat_stop.store(true, Ordering::Release);
-    let _ = heartbeat.join();
-
-    let state = match result {
-        Ok(()) => workflow_release_state(repo, &claim.workflow).unwrap_or(DispatchState::Terminal),
-        Err(error) => {
-            if !ownership_lost.load(Ordering::Acquire) {
-                mark_domain_failed(repo, claim, &error);
-            }
-            DispatchState::Terminal
-        }
-    };
-    match observability::with_writable_db(repo, |conn| execution::release(conn, claim, state)) {
-        Ok(()) => log_claim_lifecycle(repo, "release", claim, state.label()),
-        Err(error) => log_claim_lifecycle(repo, "release_failed", claim, &error),
-    }
-    log_claim_lifecycle(repo, "executor_stop", claim, "workflow executor stopped");
-}
-
-fn spawn_heartbeat(
-    repo: Repository,
-    claim: ExecutionClaim,
-    stop: Arc<AtomicBool>,
-    ownership_lost: Arc<AtomicBool>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
-        while !stop.load(Ordering::Acquire) {
-            thread::sleep(Duration::from_millis(100));
-            if stop.load(Ordering::Acquire) {
-                break;
-            }
-            if Instant::now() < next_heartbeat {
-                continue;
-            }
-            if observability::with_writable_db(&repo, |conn| execution::heartbeat(conn, &claim))
-                .is_err()
-            {
-                let validation = observability::with_writable_db(&repo, |conn| {
-                    execution::validate_claim(conn, &claim)
-                });
-                if matches!(
-                    validation,
-                    Err(ref error) if execution::is_stale_claim_error(error)
-                ) {
-                    ownership_lost.store(true, Ordering::Release);
-                    log_claim_lifecycle(
-                        &repo,
-                        "heartbeat_lost",
-                        &claim,
-                        "execution ownership lost",
-                    );
-                    break;
-                }
-            }
-            next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
-        }
-    })
-}
-
-fn execute_auto(repo: &Repository, config: &Config, claim: &ExecutionClaim) -> Result<(), String> {
-    let run_id = &claim.workflow.run_id;
-    let mut persisted = observability::with_writable_db(repo, |conn| {
-        crate::auto_flow::load_auto_run(conn, run_id)
-    })?
-    .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
-    let harness_config = config
-        .harness_config(&persisted.run.harness_id)
-        .map_err(|_| {
-            format!(
-                "auto run harness '{}' is no longer configured",
-                persisted.run.harness_id
-            )
-        })?;
-    if harness_config.adapter != persisted.run.adapter_id {
-        return Err(format!(
-            "auto run harness '{}' was recorded with adapter '{}', but it is now configured as '{}'",
-            persisted.run.harness_id, persisted.run.adapter_id, harness_config.adapter
-        ));
-    }
-    let runtime = crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
-        .prepare_server(
-            repo,
-            config,
-            &persisted.run.branch,
-            &persisted.run.worktree_path,
-        )?
-        .map(|runtime| runtime.server_url);
-    let executor = crate::auto_flow::AutoExecutorConfig::for_harness(
-        persisted.run.harness_id.clone(),
-        harness_config,
-        runtime,
-        persisted.run.worktree_path.clone(),
-        format!("Auto Flow {}", persisted.run.prompt_summary),
-    );
-    observability::with_writable_db(repo, |conn| {
-        execution::install_claim_guards(conn, claim)?;
-        crate::auto_flow::execute_auto_initial_step(
-            conn,
-            repo,
-            config,
-            &mut persisted,
-            &executor,
-            &mut std::io::sink(),
-        )
-    })
-}
-
-fn execute_plan(repo: &Repository, config: &Config, claim: &ExecutionClaim) -> Result<(), String> {
-    let run_id = &claim.workflow.run_id;
-    let mut persisted =
-        observability::with_writable_db(repo, |conn| crate::plan_run::load_plan_run(conn, run_id))?
-            .ok_or_else(|| format!("plan run not found: {run_id}"))?;
-    let harness_config = config
-        .harness_config(&persisted.run.harness_id)
-        .map_err(|_| {
-            format!(
-                "plan run harness '{}' is no longer configured",
-                persisted.run.harness_id
-            )
-        })?;
-    if harness_config.adapter != persisted.run.adapter_id {
-        return Err(format!(
-            "plan run harness '{}' was recorded with adapter '{}', but it is now configured as '{}'",
-            persisted.run.harness_id, persisted.run.adapter_id, harness_config.adapter
-        ));
-    }
-    let server_url = crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
-        .prepare_server(repo, config, "plan", &persisted.run.scope_path)?
-        .map(|runtime| runtime.server_url);
-    let mut executor = crate::plan_run::PlanExecutorConfig::for_harness(
-        persisted.run.harness_id.clone(),
-        harness_config.clone(),
-        server_url,
-        persisted.run.scope_path.clone(),
-        persisted.run.plan_display.clone(),
-    );
-    if harness_config.adapter == "opencode"
-        && config.opencode_plan_plugin
-        && let Ok(plugin) = crate::plan_run::prepare_plan_plugin_config(&repo.prism_dir())
-    {
-        executor = executor.with_plugin_config(plugin);
-    }
-    observability::with_writable_db(repo, |conn| {
-        execution::install_claim_guards(conn, claim)?;
-        match persisted.run.mode {
-            crate::plan_run::PlanRunMode::Sequential => crate::plan_run::execute_plan_sequential(
-                conn,
-                &mut persisted,
-                &executor,
-                &mut std::io::sink(),
-            ),
-            crate::plan_run::PlanRunMode::Parallel => crate::plan_run::execute_plan_parallel(
-                conn,
-                &mut persisted,
-                &executor,
-                &mut std::io::sink(),
-            ),
-        }
-    })
-}
-
-fn workflow_release_state(
-    repo: &Repository,
-    workflow: &WorkflowIdentity,
-) -> Result<DispatchState, String> {
-    observability::with_writable_db(repo, |conn| {
-        let table = match workflow.kind {
-            WorkflowKind::Auto => "auto_run",
-            WorkflowKind::Plan => "plan_run",
-        };
-        let status = conn
-            .query_row(
-                &format!("select status from {table} where id = ?1"),
-                [&workflow.run_id],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|error| format!("load completed workflow status: {error}"))?;
-        Ok(if status == "paused" {
-            DispatchState::Paused
-        } else {
-            DispatchState::Terminal
-        })
-    })
-}
-
-fn mark_domain_failed(repo: &Repository, claim: &ExecutionClaim, error: &str) {
-    let _ = observability::with_writable_db(repo, |conn| {
-        execution::install_claim_guards(conn, claim)?;
-        match claim.workflow.kind {
-            WorkflowKind::Auto => {
-                if let Some(mut persisted) =
-                    crate::auto_flow::load_auto_run(conn, &claim.workflow.run_id)?
-                {
-                    crate::auto_flow::fail_auto_run(conn, &mut persisted, error.to_string())?;
-                }
-            }
-            WorkflowKind::Plan => {
-                conn.execute(
-                    "update plan_run set status = 'failed', updated_unix_ms = ?1
-                     where id = ?2 and status not in ('aborted', 'done')",
-                    rusqlite::params![execution::now_ms(), claim.workflow.run_id],
-                )
-                .map_err(|db_error| format!("mark plan run failed: {db_error}"))?;
-            }
-        }
-        Ok(())
-    });
 }
 
 fn log_daemon_lifecycle(action: &str, instance_id: &str) {
@@ -1222,35 +1381,19 @@ fn log_daemon_lifecycle(action: &str, instance_id: &str) {
     }
 }
 
-fn log_claim_lifecycle(repo: &Repository, action: &str, claim: &ExecutionClaim, message: &str) {
-    let data = format!(
-        "{{\"workflow_kind\":\"{}\",\"run_id\":{},\"worker_id\":{},\"daemon_instance_id\":{},\"fencing_token\":{}}}",
-        claim.workflow.kind.label(),
-        serde_json::to_string(&claim.workflow.run_id).unwrap_or_else(|_| "null".to_string()),
-        serde_json::to_string(&claim.worker_id).unwrap_or_else(|_| "null".to_string()),
-        serde_json::to_string(&claim.daemon_instance_id).unwrap_or_else(|_| "null".to_string()),
-        claim.fencing_token,
-    );
-    log_worker_event(repo, action, message, Some(&data));
-}
-
 fn log_worker_event(repo: &Repository, action: &str, message: &str, data_json: Option<&str>) {
-    let _ = observability::with_writable_db(repo, |conn| {
-        conn.execute(
-            "insert into event (
-               time_unix_ms, level, target, action, repo, message, data_json
-             ) values (?1, 'info', 'worker', ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                execution::now_ms(),
+    let repo_path = repo.root.display().to_string();
+    let _ = execution::persistence::WorkflowStore::open(&observability::db_path(repo)).and_then(
+        |store| {
+            store.insert_worker_event(execution::persistence::WorkerEvent {
+                time: execution::now_ms(),
                 action,
-                repo.root.display().to_string(),
+                repo: &repo_path,
                 message,
                 data_json,
-            ],
-        )
-        .map(|_| ())
-        .map_err(|error| format!("record worker lifecycle event: {error}"))
-    });
+            })
+        },
+    );
 }
 
 fn acquire_lock(path: &Path) -> Result<File, String> {
@@ -1374,6 +1517,7 @@ mod tests {
             "daemon-test",
             &active,
             &subscriber,
+            None,
             false,
         ));
         let mut acknowledgement = [0_u8; 64];

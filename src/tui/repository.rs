@@ -84,12 +84,14 @@ pub(crate) fn load_worktree_harness_configs(
 }
 
 pub(crate) fn maintain_workflow_storage(repo: &Repository) -> Result<(), String> {
-    crate::observability::with_writable_db_named(repo, "workflow.maintenance", |conn| {
+    crate::observability::with_writable_db_named(repo, "workflow.maintenance", |path| {
+        let plan_store = crate::plan_run::PlanRunStore::open(path);
         crate::plan_run::cleanup_stale_archived_plan_runs(
-            conn,
+            &plan_store,
             crate::plan_run::ARCHIVED_PLAN_RETENTION_MS,
         )?;
-        crate::auto_flow::load_recent_active_runs_for_repo(conn, &repo.root, usize::MAX)?;
+        let auto_store = crate::auto_flow::AutoFlowStore::open(path);
+        crate::auto_flow::load_recent_active_runs_for_repo(&auto_store, &repo.root, usize::MAX)?;
         Ok(())
     })
 }

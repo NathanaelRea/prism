@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into task_metadata (\n  branch, prompt_summary, initial_prompt, worktree, classification, visibility, updated_unix_ms\n) values (?, ?, ?, ?, ?, ?, ?)\non conflict(branch) do update set\n  prompt_summary = excluded.prompt_summary,\n  initial_prompt = excluded.initial_prompt,\n  worktree = excluded.worktree,\n  classification = excluded.classification,\n  visibility = excluded.visibility,\n  updated_unix_ms = excluded.updated_unix_ms\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "5811672aef8efcf4a3ecf3091fb36c43acb9ec99834015c14f08ba8ad783635c"
+}

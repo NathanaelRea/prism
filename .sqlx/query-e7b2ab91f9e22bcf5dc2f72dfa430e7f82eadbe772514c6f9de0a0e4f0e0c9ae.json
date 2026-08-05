@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update workflow_execution set dispatch_state = ?, recovery_decided_unix_ms = ?, updated_unix_ms = ?,\n requeue_requested = 0, fencing_token = fencing_token + 1,\n interruption_generation = interruption_generation + 1\nwhere workflow_kind = ? and run_id = ? and dispatch_state = 'recovery_pending'\n and interruption_generation = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "e7b2ab91f9e22bcf5dc2f72dfa430e7f82eadbe772514c6f9de0a0e4f0e0c9ae"
+}

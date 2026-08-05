@@ -313,9 +313,10 @@ mod tests {
     use super::{WorktrunkApprovalStatus, check_worktrunk_approval_status, switch_checkout_args};
     use crate::config::Config;
     use crate::observability;
+    use crate::persistence::database::TestDatabase;
     use crate::repo::Repository;
+    use crate::sqlx_test_params as params;
     use crate::test_support::write_executable;
-    use rusqlite::params;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -352,7 +353,7 @@ mod tests {
             .tools
             .insert("wt".to_string(), wt.display().to_string());
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into hidden_session (branch, hidden_unix_ms) values (?1, ?2)",
                 params!["feature", 123_i64],
@@ -392,7 +393,7 @@ mod tests {
             .tools
             .insert("wt".to_string(), wt.display().to_string());
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into archived_worktree (
                     branch, repo_root, worktree_path, archived_unix_ms, classification
@@ -434,7 +435,7 @@ mod tests {
             .tools
             .insert("wt".to_string(), wt.display().to_string());
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into hidden_session (branch, hidden_unix_ms) values (?1, ?2)",
                 params!["feature", 123_i64],
@@ -478,7 +479,7 @@ mod tests {
             .tools
             .insert("wt".to_string(), wt.display().to_string());
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into hidden_session (branch, hidden_unix_ms) values (?1, ?2)",
                 params!["feature", 123_i64],
@@ -683,7 +684,7 @@ exit 0
         config
             .tools
             .insert("wt".to_string(), wt.display().to_string());
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
                     branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
@@ -715,19 +716,29 @@ exit 0
             .unwrap();
             conn.execute(
                 "insert into pr_cache (
-                    branch, number, title, url, state, review_decision, head_ref, base_ref,
+                    branch, number, provider, canonical_host, project_path, native_cr_id,
+                    display_number, source_provider, source_canonical_host, source_project_path,
+                    target_provider, target_canonical_host, target_project_path,
+                    title, url, state, review_decision, head_ref, base_ref,
                     head_sha, updated_at, check_status, merged, draft, last_refreshed,
                     refreshed_unix_ms
-                 ) values (?1, 42, 'Delete me', 'https://example.test/pull/42', 'OPEN', '',
+                 ) values (?1, 42, 'github', 'github.com', 'org/repo', '42', 42,
+                           'github', 'github.com', 'org/repo', 'github', 'github.com', 'org/repo',
+                           'Delete me', 'https://example.test/pull/42', 'OPEN', '',
                            ?1, 'main', 'abc123', '', 'pending', 0, 0, '', 123)",
                 params![branch],
             )
             .unwrap();
             conn.execute(
                 "insert into pr_details_cache (
-                    branch, comments, reviews, review_comments, files, failing_checks,
+                    branch, pr_number, head_sha, provider, canonical_host, project_path,
+                    native_cr_id, display_number, source_provider, source_canonical_host,
+                    source_project_path, target_provider, target_canonical_host, target_project_path,
+                    comments, reviews, review_comments, files, failing_checks,
                     refreshed_unix_ms
-                 ) values (?1, '[]', '[]', '[]', '[]', '[]', 123)",
+                 ) values (?1, 42, 'abc123', 'github', 'github.com', 'org/repo', '42', 42,
+                           'github', 'github.com', 'org/repo', 'github', 'github.com', 'org/repo',
+                           '[]', '[]', '[]', '[]', '[]', 123)",
                 params![branch],
             )
             .unwrap();
@@ -761,8 +772,11 @@ exit 0
             crate::auto_flow::AutoLaunch::new(&repo.root, &path, branch, "preserve deletion audit")
                 .unwrap()
                 .create_run();
-        observability::with_writable_db(&repo, |conn| {
-            crate::auto_flow::save_auto_run(conn, &mut audit)
+        with_test_database(&repo, |conn| {
+            crate::auto_flow::save_auto_run(
+                &crate::auto_flow::AutoFlowStore::open(conn.path()),
+                &mut audit,
+            )
         })
         .unwrap();
 
@@ -796,8 +810,11 @@ exit 0
             );
         }
         assert!(!agent_log.exists());
-        let audit_preserved = observability::with_writable_db(&repo, |conn| {
-            crate::auto_flow::load_auto_run(conn, &audit.run.id)
+        let audit_preserved = with_test_database(&repo, |conn| {
+            crate::auto_flow::load_auto_run(
+                &crate::auto_flow::AutoFlowStore::open(conn.path()),
+                &audit.run.id,
+            )
         })
         .unwrap();
         assert!(audit_preserved.is_some());
@@ -888,7 +905,7 @@ exit 0
         config
             .tools
             .insert("wt".to_string(), wt.display().to_string());
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
                     branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
@@ -1007,7 +1024,7 @@ exit 0
             .tools
             .insert("wt".to_string(), wt.display().to_string());
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
                     branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
@@ -1046,10 +1063,15 @@ exit 0
             .unwrap();
             conn.execute(
                 "insert into pr_cache (
-                    branch, number, title, url, state, review_decision, head_ref, base_ref,
+                    branch, number, provider, canonical_host, project_path, native_cr_id,
+                    display_number, source_provider, source_canonical_host, source_project_path,
+                    target_provider, target_canonical_host, target_project_path,
+                    title, url, state, review_decision, head_ref, base_ref,
                     head_sha, updated_at, check_status, merged, draft, last_refreshed,
                     refreshed_unix_ms
-                 ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                 ) values (?1, ?2, 'github', 'github.com', 'org/repo', '42', 42,
+                           'github', 'github.com', 'org/repo', 'github', 'github.com', 'org/repo',
+                           ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                 params![
                     branch,
                     42_i64,
@@ -1071,9 +1093,14 @@ exit 0
             .unwrap();
             conn.execute(
                 "insert into pr_details_cache (
-                    branch, comments, reviews, review_comments, files, failing_checks,
+                    branch, pr_number, head_sha, provider, canonical_host, project_path,
+                    native_cr_id, display_number, source_provider, source_canonical_host,
+                    source_project_path, target_provider, target_canonical_host, target_project_path,
+                    comments, reviews, review_comments, files, failing_checks,
                     refreshed_unix_ms
-                 ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 ) values (?1, 42, 'abc123', 'github', 'github.com', 'org/repo', '42', 42,
+                           'github', 'github.com', 'org/repo', 'github', 'github.com', 'org/repo',
+                           ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![branch, "[]", "[]", "[]", "[]", "[]", 123_i64],
             )
             .unwrap();
@@ -1176,7 +1203,7 @@ exit 0
         config
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
                     branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
@@ -1249,7 +1276,7 @@ exit 0
         config
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
                     branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
@@ -1326,7 +1353,7 @@ exit 0
         config
             .tools
             .insert("wt".to_string(), wt.display().to_string());
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
                     branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
@@ -1390,7 +1417,7 @@ exit 0
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
         let path = temp.join("worktree");
         fs::create_dir_all(&path).unwrap();
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
                     branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
@@ -1434,7 +1461,7 @@ exit 0
     }
 
     fn count_rows(repo: &Repository, table: &str, branch: &str) -> i64 {
-        observability::with_writable_db(repo, |conn| {
+        with_test_database(repo, |conn| {
             conn.query_row(
                 &format!("select count(*) from {table} where branch = ?1"),
                 params![branch],
@@ -1443,6 +1470,13 @@ exit 0
             .map_err(|error| error.to_string())
         })
         .unwrap()
+    }
+
+    fn with_test_database<T>(
+        repo: &Repository,
+        run: impl FnOnce(&TestDatabase) -> Result<T, String>,
+    ) -> Result<T, String> {
+        observability::with_writable_db(repo, |path| run(&TestDatabase::open(path)?))
     }
 
     fn write_successful_remove_wt(

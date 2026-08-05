@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update plan_run\nset pause_requested = 1,\n    status = case when exists(\n      select 1 from plan_step_run where run_id = plan_run.id and status in ('starting','running')\n    ) then status else 'paused' end,\n    updated_unix_ms = ?\nwhere id in (select plan_run_id from auto_step_run where run_id = ? and plan_run_id is not null)\n  and status not in ('done','failed','aborted')\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "f63dfaa09a125f1f55790b99f78fb3cc7745421d85a70052ca39d8bcd441dd87"
+}

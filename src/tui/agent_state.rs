@@ -227,9 +227,7 @@ impl Tui {
                         Some(state) => {
                             crate::session::save_agent_state(&request.repo, &request.branch, state)?
                         }
-                        None => crate::observability::with_writable_db(&request.repo, |conn| {
-                            crate::agent_session::remove_state_with_conn(conn, &request.branch)
-                        })?,
+                        None => crate::agent_session::remove_state(&request.repo, &request.branch)?,
                     }
                     Ok(None)
                 },

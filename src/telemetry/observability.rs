@@ -8,9 +8,6 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::types::ValueRef;
-use rusqlite::{Connection, params};
-
 use crate::json::json_escape;
 use crate::repo::Repository;
 use crate::util::{single_line, truncate};
@@ -744,22 +741,7 @@ pub fn append_runtime_message(repo: &Repository, message: &str) -> Result<(), St
 
 pub fn run_readonly_query(repo: &Repository, query: &str) -> Result<(), String> {
     let path = db_path(repo);
-    let conn = open_observed_readonly_db_path(&path)?;
-    let mut statement = conn
-        .prepare(query)
-        .map_err(|error| format!("prepare query: {error}"))?;
-    let column_count = statement.column_count();
-    let mut rows = statement
-        .query([])
-        .map_err(|error| format!("run query: {error}"))?;
-    while let Some(row) = rows.next().map_err(|error| format!("read row: {error}"))? {
-        let mut values = Vec::new();
-        for index in 0..column_count {
-            let value = row
-                .get_ref(index)
-                .map_err(|error| format!("read column {index}: {error}"))?;
-            values.push(sqlite_value_to_string(value));
-        }
+    for values in crate::persistence::database::run_operator_query(&path, query)? {
         println!("{}", values.join("\t"));
     }
     Ok(())
@@ -768,7 +750,7 @@ pub fn run_readonly_query(repo: &Repository, query: &str) -> Result<(), String> 
 #[track_caller]
 pub fn with_writable_db<T>(
     repo: &Repository,
-    run: impl FnOnce(&Connection) -> Result<T, String>,
+    run: impl FnOnce(&Path) -> Result<T, String>,
 ) -> Result<T, String> {
     let caller = std::panic::Location::caller();
     writable_db(repo).run_observed(&format!("{}:{}", caller.file(), caller.line()), run)
@@ -777,56 +759,16 @@ pub fn with_writable_db<T>(
 pub fn with_writable_db_named<T>(
     repo: &Repository,
     operation: &'static str,
-    run: impl FnOnce(&Connection) -> Result<T, String>,
+    run: impl FnOnce(&Path) -> Result<T, String>,
 ) -> Result<T, String> {
     writable_db(repo).run_observed(operation, run)
 }
 
 #[track_caller]
-pub fn with_writable_db_mut<T>(
-    repo: &Repository,
-    run: impl FnOnce(&mut Connection) -> Result<T, String>,
-) -> Result<T, String> {
-    assert_database_access_allowed();
-    let caller = std::panic::Location::caller();
-    let operation = format!("{}:{}", caller.file(), caller.line());
-    let started = Instant::now();
-    let open_started = Instant::now();
-    let opened = open_observed_writable_db_path(&db_path(repo));
-    let open_elapsed = open_started.elapsed();
-    let mut conn = match opened {
-        Ok(conn) => conn,
-        Err(error) => {
-            record_db_operation(
-                "writable",
-                &operation,
-                started.elapsed(),
-                open_elapsed,
-                Some(&error),
-            );
-            return Err(error);
-        }
-    };
-    let result = run(&mut conn);
-    record_db_operation(
-        "writable",
-        &operation,
-        started.elapsed(),
-        open_elapsed,
-        result.as_ref().err().map(String::as_str),
-    );
-    if result.is_ok() {
-        drop(conn);
-        crate::storage::monitor_wal_growth(&db_path(repo));
-        flush_deferred_events();
-    }
-    result
-}
-
-#[track_caller]
+#[cfg(test)]
 pub fn with_nonblocking_read_db<T>(
     repo: &Repository,
-    run: impl FnOnce(&Connection) -> Result<T, String>,
+    run: impl FnOnce(&Path) -> Result<T, String>,
 ) -> Result<T, String> {
     let caller = std::panic::Location::caller();
     with_nonblocking_read_db_observed(repo, &format!("{}:{}", caller.file(), caller.line()), run)
@@ -835,7 +777,7 @@ pub fn with_nonblocking_read_db<T>(
 pub fn with_nonblocking_read_db_named<T>(
     repo: &Repository,
     operation: &'static str,
-    run: impl FnOnce(&Connection) -> Result<T, String>,
+    run: impl FnOnce(&Path) -> Result<T, String>,
 ) -> Result<T, String> {
     with_nonblocking_read_db_observed(repo, operation, run)
 }
@@ -843,7 +785,7 @@ pub fn with_nonblocking_read_db_named<T>(
 fn with_nonblocking_read_db_observed<T>(
     repo: &Repository,
     operation: &str,
-    run: impl FnOnce(&Connection) -> Result<T, String>,
+    run: impl FnOnce(&Path) -> Result<T, String>,
 ) -> Result<T, String> {
     assert_database_access_allowed();
     let started = Instant::now();
@@ -851,8 +793,8 @@ fn with_nonblocking_read_db_observed<T>(
     let path = db_path(repo);
     let opened = open_observed_readonly_db_path(&path);
     let open_elapsed = open_started.elapsed();
-    let conn = match opened {
-        Ok(conn) => conn,
+    match opened {
+        Ok(()) => {}
         Err(error) => {
             record_db_operation(
                 "readonly",
@@ -863,8 +805,8 @@ fn with_nonblocking_read_db_observed<T>(
             );
             return Err(error);
         }
-    };
-    let result = run(&conn);
+    }
+    let result = run(&path);
     record_db_operation(
         "readonly",
         operation,
@@ -888,22 +830,22 @@ pub struct WritableDb {
 
 impl WritableDb {
     #[cfg(test)]
-    pub fn run<T>(&self, run: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
+    pub fn run<T>(&self, run: impl FnOnce(&Path) -> Result<T, String>) -> Result<T, String> {
         self.run_observed("test", run)
     }
 
     fn run_observed<T>(
         &self,
         operation: &str,
-        run: impl FnOnce(&Connection) -> Result<T, String>,
+        run: impl FnOnce(&Path) -> Result<T, String>,
     ) -> Result<T, String> {
         assert_database_access_allowed();
         let started = Instant::now();
         let open_started = Instant::now();
         let opened = open_observed_writable_db_path(&self.path);
         let open_elapsed = open_started.elapsed();
-        let conn = match opened {
-            Ok(conn) => conn,
+        let path = match opened {
+            Ok(path) => path,
             Err(error) => {
                 record_db_operation(
                     "writable",
@@ -915,7 +857,7 @@ impl WritableDb {
                 return Err(error);
             }
         };
-        let result = run(&conn);
+        let result = run(&path);
         record_db_operation(
             "writable",
             operation,
@@ -924,7 +866,6 @@ impl WritableDb {
             result.as_ref().err().map(String::as_str),
         );
         if result.is_ok() {
-            drop(conn);
             crate::storage::monitor_wal_growth(&self.path);
             flush_deferred_events();
         }
@@ -967,24 +908,29 @@ fn record_db_operation(
     crate::flight_recorder::record("sqlite", "operation", Some(total), fields);
 }
 
-fn open_observed_writable_db_path(path: &Path) -> Result<Connection, String> {
-    crate::storage::open_writable(path).map_err(|error| {
+fn open_observed_writable_db_path(path: &Path) -> Result<PathBuf, String> {
+    crate::storage::prepare_writable(path)
+        .map(|()| path.to_path_buf())
+        .map_err(|error| {
+            crate::storage::record_storage_error(&error);
+            error.to_string()
+        })
+}
+
+fn open_observed_readonly_db_path(path: &Path) -> Result<(), String> {
+    crate::storage::verify_readonly(path).map_err(|error| {
         crate::storage::record_storage_error(&error);
         error.to_string()
     })
 }
 
-fn open_observed_readonly_db_path(path: &Path) -> Result<Connection, String> {
-    crate::storage::open_readonly(path).map_err(|error| {
-        crate::storage::record_storage_error(&error);
-        error.to_string()
-    })
-}
-
-fn open_writable_db_path(path: &Path) -> Result<Connection, String> {
+#[cfg(test)]
+fn open_writable_db_path(path: &Path) -> Result<PathBuf, String> {
     // Observer persistence calls this while holding OBSERVER. Keep it unobserved
     // and never flush deferred events from this path.
-    crate::storage::open_writable(path).map_err(|error| error.to_string())
+    crate::storage::prepare_writable(path)
+        .map(|()| path.to_path_buf())
+        .map_err(|error| error.to_string())
 }
 
 fn record_panic(message: String) {
@@ -1202,32 +1148,23 @@ impl ObserverState {
             return Ok(());
         };
         let path = prism_dir.join("prism.db");
-        let conn = self.open_writable_db(&path)?;
-        conn.execute(
-            "insert into event (
-                time_unix_ms, level, target, action, operation_id, parent_operation_id,
-                repo, branch, session, message, data_json
-            ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                event.time_unix_ms,
-                event.level.label(),
-                event.target.as_str(),
-                event.action.as_str(),
-                event.operation_id.as_deref(),
-                event.parent_operation_id.as_deref(),
-                event.repo.as_deref(),
-                event.branch.as_deref(),
-                event.session.as_deref(),
-                event.message.as_str(),
-                event.data_json.as_deref(),
-            ],
-        )
-        .map_err(|error| format!("insert event: {error}"))?;
-        Ok(())
-    }
-
-    fn open_writable_db(&mut self, path: &Path) -> Result<Connection, String> {
-        open_writable_db_path(path)
+        crate::persistence::observability::ObservabilityStore::open(&path)
+            .and_then(|store| {
+                store.insert_event(&crate::persistence::observability::EventRecord {
+                    time_unix_ms: event.time_unix_ms,
+                    level: event.level.label(),
+                    target: event.target.as_str(),
+                    action: event.action.as_str(),
+                    operation_id: event.operation_id.as_deref(),
+                    parent_operation_id: event.parent_operation_id.as_deref(),
+                    repo: event.repo.as_deref(),
+                    branch: event.branch.as_deref(),
+                    session: event.session.as_deref(),
+                    message: event.message.as_str(),
+                    data_json: event.data_json.as_deref(),
+                })
+            })
+            .map_err(|error| format!("insert event: {error}"))
     }
 
     fn persist_unpersisted_phases(&mut self) {
@@ -1238,8 +1175,8 @@ impl ObserverState {
             return;
         };
         let path = prism_dir.join("prism.db");
-        let conn = match self.open_writable_db(&path) {
-            Ok(conn) => conn,
+        let store = match crate::persistence::observability::ObservabilityStore::open(&path) {
+            Ok(store) => store,
             Err(error) => {
                 let warning = format!("startup phase persist failed: {error}");
                 let _ = self.append_text_warning(&warning);
@@ -1251,19 +1188,15 @@ impl ObserverState {
             if phase.persisted {
                 continue;
             }
-            let result = conn.execute(
-                "insert into startup_phase (
-                    run_id, phase, time_started_unix_ms, time_finished_unix_ms, status, error
-                ) values (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    run_id.as_str(),
-                    phase.record.phase.as_str(),
-                    phase.record.time_started_unix_ms,
-                    phase.record.time_finished_unix_ms,
-                    phase.record.status.as_str(),
-                    phase.record.error.as_deref(),
-                ],
-            );
+            let result =
+                store.insert_phase(&crate::persistence::observability::StartupPhaseRecord {
+                    run_id: run_id.as_str(),
+                    phase: phase.record.phase.as_str(),
+                    time_started_unix_ms: phase.record.time_started_unix_ms,
+                    time_finished_unix_ms: phase.record.time_finished_unix_ms,
+                    status: phase.record.status.as_str(),
+                    error: phase.record.error.as_deref(),
+                });
             match result {
                 Ok(_) => phase.persisted = true,
                 Err(error) => {
@@ -1568,16 +1501,6 @@ pub(crate) fn take_captured_events() -> Vec<CapturedEvent> {
     CAPTURED_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
 }
 
-fn sqlite_value_to_string(value: ValueRef<'_>) -> String {
-    match value {
-        ValueRef::Null => String::new(),
-        ValueRef::Integer(value) => value.to_string(),
-        ValueRef::Real(value) => value.to_string(),
-        ValueRef::Text(value) => single_line(&String::from_utf8_lossy(value)),
-        ValueRef::Blob(value) => format!("<blob {} bytes>", value.len()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -1618,35 +1541,35 @@ mod tests {
         let temp = test_path("nonblocking-read-writer");
         fs::create_dir_all(&temp).unwrap();
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
-        super::with_writable_db(&repo, |conn| {
-            conn.execute_batch(
+        super::with_writable_db(&repo, |path| {
+            execute_at(
+                path,
                 "create table read_probe (value text not null);\
                  insert into read_probe (value) values ('committed');",
             )
             .map_err(|error| error.to_string())
         })
         .unwrap();
-        let blocker = super::open_writable_db_path(&super::db_path(&repo)).unwrap();
-        blocker
-            .execute_batch(
-                "begin immediate;\
+        let mut blocker =
+            crate::persistence::database::TestConnection::open_writable(&super::db_path(&repo))
+                .unwrap();
+        execute_on(
+            &mut blocker,
+            "begin immediate;\
                  update read_probe set value = 'uncommitted';",
-            )
-            .unwrap();
+        )
+        .unwrap();
         let (tx, rx) = std::sync::mpsc::sync_channel(0);
         let reader_repo = repo.clone();
         let reader = std::thread::spawn(move || {
-            let result = super::with_nonblocking_read_db(&reader_repo, |conn| {
-                conn.query_row("select value from read_probe", [], |row| {
-                    row.get::<_, String>(0)
-                })
-                .map_err(|error| error.to_string())
+            let result = super::with_nonblocking_read_db(&reader_repo, |path| {
+                scalar_string(path, "select value from read_probe")
             });
             let _ = tx.send(result);
         });
 
         let result = rx.recv_timeout(Duration::from_secs(1));
-        blocker.execute_batch("rollback").unwrap();
+        execute_on(&mut blocker, "rollback").unwrap();
         reader.join().unwrap();
 
         assert_eq!(result.unwrap().unwrap(), "committed");
@@ -1737,13 +1660,9 @@ mod tests {
         let path = db_path(&repo);
         assert_eq!(path, repo.prism_dir().join("prism.db"));
 
-        db.run(|conn| {
-            conn.execute(
-                "insert into metadata (key, value) values ('phase', 'six')",
-                [],
-            )
-            .map_err(|error| format!("insert metadata: {error}"))?;
-            Ok(())
+        db.run(|path| {
+            crate::persistence::database::upsert_metadata(path, "phase", "six")
+                .map_err(|error| format!("insert metadata: {error}"))
         })
         .unwrap();
 
@@ -1850,38 +1769,56 @@ mod tests {
 
         assert!(state.deferred_db_events.is_empty());
         assert_eq!(state.deferred_db_overflow_pending, 0);
-        let conn = rusqlite::Connection::open(&db).unwrap();
         assert_eq!(
-            conn.query_row(
+            scalar_i64(
+                &db,
                 "select count(*) from event where target = 'deferred_test' and action = 'terminal'",
-                [],
-                |row| row.get::<_, i64>(0),
             )
             .unwrap(),
             1
         );
-        let data: String = conn
-            .query_row(
+        let data = scalar_string(
+                &db,
                 "select data_json from event where target = 'observability' and action = 'deferred_overflow'",
-                [],
-                |row| row.get(0),
             )
             .unwrap();
         let data: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(data["overflow_count"], 2);
         assert_eq!(data["overflow_total"], 3);
-        drop(conn);
         let _ = fs::remove_dir_all(dir);
     }
 
     fn table_exists(path: &Path, table: &str) -> bool {
-        let conn = rusqlite::Connection::open(path).unwrap();
-        conn.query_row(
-            "select exists(select 1 from sqlite_master where type = 'table' and name = ?1)",
-            [table],
-            |row| row.get::<_, bool>(0),
-        )
-        .unwrap()
+        let mut connection =
+            crate::persistence::database::TestConnection::open_readonly(path).unwrap();
+        connection
+            .scalar_bool(
+                "select exists(select 1 from sqlite_master where type = 'table' and name = ?1)",
+                table,
+            )
+            .unwrap()
+    }
+
+    fn execute_at(path: &Path, sql: &str) -> Result<(), String> {
+        let mut connection = crate::persistence::database::TestConnection::open_writable(path)?;
+        execute_on(&mut connection, sql)
+    }
+
+    fn execute_on(
+        connection: &mut crate::persistence::database::TestConnection,
+        sql: &str,
+    ) -> Result<(), String> {
+        connection.execute_batch(sql)
+    }
+
+    fn scalar_i64(path: &Path, query: &str) -> Result<i64, String> {
+        let mut connection = crate::persistence::database::TestConnection::open_readonly(path)?;
+        connection.scalar_i64(query)
+    }
+
+    fn scalar_string(path: &Path, query: &str) -> Result<String, String> {
+        let mut connection = crate::persistence::database::TestConnection::open_readonly(path)?;
+        connection.scalar_string(query)
     }
 
     fn test_path(label: &str) -> PathBuf {

@@ -37,7 +37,7 @@ pub struct AutoRunControlOutcome {
 }
 
 pub fn apply_auto_run_control(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     run_id: &str,
     intent: AutoRunControlIntent,
 ) -> Result<AutoRunControlOutcome, String> {
@@ -109,7 +109,7 @@ pub fn apply_auto_run_control(
 }
 
 fn abort_selected_auto_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     step_run_id: i64,
     warnings: &mut Vec<String>,
@@ -127,7 +127,7 @@ fn abort_selected_auto_step(
 }
 
 fn abort_auto_run(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     warnings: &mut Vec<String>,
 ) -> Result<(), String> {
@@ -150,7 +150,7 @@ fn abort_auto_run(
 }
 
 fn abort_linked_plan_run(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     step: &AutoStepRun,
     warnings: &mut Vec<String>,
 ) -> Result<(), String> {
@@ -174,7 +174,7 @@ fn abort_linked_plan_run(
 }
 
 fn abort_step_recording_warning(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     step: &mut AutoStepRun,
     warnings: &mut Vec<String>,
 ) {
@@ -192,7 +192,7 @@ fn abort_step_recording_warning(
 }
 
 pub(super) fn request_auto_run_pause(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
 ) -> Result<(), String> {
     if matches!(
@@ -216,7 +216,7 @@ pub(super) fn request_auto_run_pause(
 }
 
 pub fn fail_auto_run(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     error: impl Into<String>,
 ) -> Result<(), String> {
@@ -224,22 +224,23 @@ pub fn fail_auto_run(
     persisted.run.status = AutoRunStatus::Failed;
     persisted.run.updated_unix_ms = unix_ms();
     let error = error.into();
-    append_auto_event(
-        conn,
-        &AutoEvent {
-            id: None,
-            run_id: persisted.run.id.clone(),
-            step_run_id: persisted.run.selected_step_run_id,
-            time_unix_ms: persisted.run.updated_unix_ms,
-            kind: "run_failed".to_string(),
-            data_json: format!("{{\"error\":{}}}", json_string(&error)),
-        },
-    )?;
-    save_run_with_conn(conn, &persisted.run)
+    let event = AutoEvent {
+        id: None,
+        run_id: persisted.run.id.clone(),
+        step_run_id: persisted.run.selected_step_run_id,
+        time_unix_ms: persisted.run.updated_unix_ms,
+        kind: "run_failed".to_string(),
+        data_json: format!("{{\"error\":{}}}", json_string(&error)),
+    };
+    persistence::save_run_and_event(conn.path(), &persisted.run, &event)
+        .map_err(|error| crate::execution::claim_write_error("fail Auto Flow run", error))?;
+    emit_auto_event_log(&event);
+    emit_auto_run_log(&persisted.run);
+    Ok(())
 }
 
 pub(super) fn retry_failed_auto_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
 ) -> Result<(), String> {
     let failed_index = persisted
@@ -296,7 +297,7 @@ pub(super) fn retry_failed_auto_step(
 }
 
 pub(super) fn retry_auto_from_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     selected_step_run_id: i64,
 ) -> Result<(), String> {
@@ -329,7 +330,7 @@ pub(super) fn retry_auto_from_step(
 }
 
 pub fn archive_auto_run(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
 ) -> Result<(), String> {
     if matches!(
@@ -344,10 +345,7 @@ pub fn archive_auto_run(
     save_run_with_conn(conn, &persisted.run)
 }
 
-pub(super) fn abort_auto_step(
-    conn: &rusqlite::Connection,
-    step: &mut AutoStepRun,
-) -> Result<(), String> {
+pub(super) fn abort_auto_step(conn: &AutoFlowStore, step: &mut AutoStepRun) -> Result<(), String> {
     let mut errors = Vec::new();
     if step.session.id.is_some()
         && let Err(error) = crate::harness::cancel_native_session(&step.session)
@@ -392,7 +390,7 @@ pub(super) fn abort_auto_step(
 }
 
 pub fn reconcile_stale_auto_run(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
 ) -> Result<bool, String> {
     let mut changed = false;
@@ -455,7 +453,7 @@ pub fn reconcile_stale_auto_run(
 }
 
 pub(super) fn reconcile_linked_plan_runs(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     max_output_lines_per_step: usize,
 ) -> Result<bool, String> {
@@ -557,7 +555,7 @@ pub(super) fn reconcile_linked_plan_runs(
 }
 
 pub fn prepare_auto_run_for_resume(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     max_output_lines_per_step: usize,
 ) -> Result<bool, String> {
@@ -627,7 +625,7 @@ pub(super) fn reset_auto_step_for_retry(step: &mut AutoStepRun) {
 }
 
 pub(super) fn request_active_linked_plan_pause(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
 ) -> Result<(), String> {
     for step in &persisted.steps {
@@ -659,7 +657,7 @@ pub(super) fn request_active_linked_plan_pause(
 }
 
 pub(super) fn fail_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     step: &mut AutoStepRun,
     error: &str,
     max_output_lines_per_step: usize,
@@ -679,7 +677,7 @@ pub(super) fn fail_step(
 }
 
 pub(super) fn reload_pause_request(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
 ) -> Result<bool, String> {
     let Some(run) = load_run_with_conn(conn, &persisted.run.id)? else {

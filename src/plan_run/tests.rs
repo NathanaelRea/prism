@@ -54,8 +54,7 @@ fn opencode_run_command_passes_prompt_as_single_raw_argument() {
 #[test]
 #[cfg(unix)]
 fn generic_stdin_harness_executes_plan_step_as_bounded_plain_text() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let scope = std::env::temp_dir().join(format!(
         "prism-generic-plan-{}-{}",
         std::process::id(),
@@ -117,8 +116,7 @@ fn generic_stdin_harness_executes_plan_step_as_bounded_plain_text() {
 
 #[test]
 fn unsupported_generic_headless_plan_fails_the_step_instead_of_leaving_it_starting() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let scope = PathBuf::from("/repo/prism");
     let mut persisted = PlanLaunch::new(
         &scope,
@@ -164,67 +162,6 @@ fn unsupported_generic_headless_plan_fails_the_step_instead_of_leaving_it_starti
 }
 
 #[test]
-fn legacy_plan_execution_fields_backfill_to_neutral_references_once() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "
-        create table plan_run (
-          id text primary key, repo_root text not null, scope_path text not null,
-          plan_path text not null, plan_display text not null, step_name text not null,
-          start_step integer not null, total_steps integer not null, mode text not null,
-          status text not null, selected_step integer not null,
-          created_unix_ms integer not null, updated_unix_ms integer not null
-        );
-        create table plan_step_run (
-          run_id text not null, step integer not null, prompt text not null, status text not null,
-          opencode_state text, opencode_server_url text, opencode_session_id text,
-          process_id integer, started_unix_ms integer, finished_unix_ms integer,
-          exit_code integer, latest_message text, active_tool text,
-          todos_json text not null default '[]', summary text, error text,
-          primary key (run_id, step)
-        );
-        insert into plan_run (
-          id, repo_root, scope_path, plan_path, plan_display, step_name,
-          start_step, total_steps, mode, status, selected_step, created_unix_ms, updated_unix_ms
-        ) values ('legacy', '/repo', '/repo', '/repo/plan.md', 'plan.md', 'phase',
-          1, 1, 'sequential', 'paused', 1, 1, 1);
-        insert into plan_step_run (
-          run_id, step, prompt, status, opencode_state, opencode_server_url,
-          opencode_session_id, process_id
-        ) values ('legacy', 1, 'work', 'running', 'busy',
-          'http://127.0.0.1:41000', 'ses_legacy', 1234);
-        ",
-    )
-    .unwrap();
-
-    migrate_schema(&conn).unwrap();
-    let loaded = load_plan_run(&conn, "legacy").unwrap().unwrap();
-    assert_eq!(loaded.run.harness_id, "opencode");
-    assert_eq!(loaded.run.adapter_id, "opencode");
-    assert_eq!(loaded.steps[0].execution.state.as_deref(), Some("busy"));
-    assert_eq!(loaded.steps[0].execution.process_id, Some(1234));
-    assert_eq!(
-        loaded.steps[0].session.endpoint.as_deref(),
-        Some("http://127.0.0.1:41000")
-    );
-    assert_eq!(loaded.steps[0].session.id.as_deref(), Some("ses_legacy"));
-    assert_eq!(
-        loaded.steps[0].session.adapter_id.as_deref(),
-        Some("opencode")
-    );
-
-    conn.execute(
-        "update plan_step_run set session_id = null, execution_process_id = null where run_id = 'legacy'",
-        [],
-    )
-    .unwrap();
-    migrate_schema(&conn).unwrap();
-    let loaded = load_plan_run(&conn, "legacy").unwrap().unwrap();
-    assert_eq!(loaded.steps[0].session.id, None);
-    assert_eq!(loaded.steps[0].execution.process_id, None);
-}
-
-#[test]
 fn aggregate_status_prioritizes_failure_and_running_state() {
     assert_eq!(
         aggregate_step_status([
@@ -250,8 +187,7 @@ fn aggregate_status_prioritizes_failure_and_running_state() {
 
 #[test]
 fn schema_round_trips_plan_run_steps_and_output() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
 
     let repo = PathBuf::from("/repo/prism");
     let plan = repo.join("plans/plan-one.md");
@@ -331,8 +267,7 @@ fn plan_plugin_config_is_generated_under_prism_state() {
 
 #[test]
 fn executor_passes_plugin_environment_only_when_enabled() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let temp = unique_temp_dir("prism-plan-plugin-env");
     let observed_config_dir = PathBuf::from("observed-config-dir");
     let observed_hook_log = PathBuf::from("observed-hook-log");
@@ -383,8 +318,7 @@ echo '{"type":"message","text":"plugin env observed"}'
 
 #[test]
 fn sequential_executor_updates_steps_from_fake_opencode() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let temp = unique_temp_dir("prism-plan-executor-success");
     let opencode = fake_opencode(
         &temp,
@@ -451,8 +385,7 @@ echo '{"type":"todo.updated","todos":[{"title":"write tests","status":"done"}]}'
 
 #[test]
 fn sequential_executor_stops_on_failed_step() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let temp = unique_temp_dir("prism-plan-executor-failure");
     let opencode = fake_opencode(
         &temp,
@@ -509,8 +442,7 @@ fi
 
 #[test]
 fn parallel_executor_runs_all_steps_and_waits_for_failures() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let temp = unique_temp_dir("prism-plan-executor-parallel-failure");
     let marker = temp.join("phase-3-finished");
     let opencode = fake_opencode(
@@ -580,8 +512,7 @@ fi
 
 #[test]
 fn parallel_executor_marks_success_after_all_steps_finish() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let temp = unique_temp_dir("prism-plan-executor-parallel-success");
     let opencode = fake_opencode(
         &temp,
@@ -724,8 +655,7 @@ fn malformed_structured_output_is_a_protocol_error_and_unknown_json_is_retained(
 
 #[test]
 fn successful_plan_step_clears_benign_stderr_but_preserves_abort() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let repo = PathBuf::from("/repo/prism");
     let mut persisted = PlanLaunch::new(
         &repo,
@@ -757,7 +687,7 @@ fn successful_plan_step_clears_benign_stderr_but_preserves_abort() {
     assert_eq!(persisted.steps[0].error, None);
 
     persisted.steps[0].status = PlanStepStatus::Running;
-    save_step_with_conn(&conn, &persisted.steps[0]).unwrap();
+    save_step_with_store(&conn, &persisted.steps[0]).unwrap();
     let mut stale = persisted.steps[0].clone();
     abort_plan_step(&conn, &mut persisted.steps[0]).unwrap();
     executor::finish_step_after_exit(&conn, &mut stale, 143, false, "test").unwrap();
@@ -775,8 +705,7 @@ fn successful_plan_step_clears_benign_stderr_but_preserves_abort() {
 #[test]
 #[cfg(unix)]
 fn abort_during_start_prevents_spawned_plan_process_from_becoming_running() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let repo = PathBuf::from("/repo/prism");
     let mut persisted = PlanLaunch::new(
         &repo,
@@ -816,8 +745,7 @@ fn abort_during_start_prevents_spawned_plan_process_from_becoming_running() {
 
 #[test]
 fn sse_payload_ingestion_updates_matching_step_and_ignores_other_sessions() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let repo = PathBuf::from("/repo/prism");
     let mut persisted = PlanLaunch::new(
         &repo,
@@ -861,8 +789,7 @@ fn sse_payload_ingestion_updates_matching_step_and_ignores_other_sessions() {
 
 #[test]
 fn sse_payload_ingestion_tracks_session_and_raw_relevant_unknown_events() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let repo = PathBuf::from("/repo/prism");
     let mut persisted = PlanLaunch::new(
         &repo,
@@ -911,8 +838,7 @@ fn sse_payload_ingestion_tracks_session_and_raw_relevant_unknown_events() {
 
 #[test]
 fn poll_reconciliation_recovers_latest_status_message_tool_and_todos() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let repo = PathBuf::from("/repo/prism");
     let mut persisted = PlanLaunch::new(
         &repo,
@@ -978,8 +904,7 @@ fn poll_reconciliation_recovers_latest_status_message_tool_and_todos() {
 
 #[test]
 fn abort_plan_step_marks_step_aborted() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let repo = PathBuf::from("/repo/prism");
     let mut persisted = PlanLaunch::new(
         &repo,
@@ -1006,8 +931,7 @@ fn abort_plan_step_marks_step_aborted() {
 
 #[test]
 fn abort_plan_run_aborts_queued_steps_and_clears_pause() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let repo = PathBuf::from("/repo/prism");
     let mut persisted = PlanLaunch::new(
         &repo,
@@ -1045,8 +969,7 @@ fn abort_plan_run_aborts_queued_steps_and_clears_pause() {
 
 #[test]
 fn reconcile_marks_running_steps_failed_after_restart() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let repo = PathBuf::from("/repo/prism");
     let mut persisted = PlanLaunch::new(
         &repo,
@@ -1090,8 +1013,7 @@ fn reconcile_marks_running_steps_failed_after_restart() {
 
 #[test]
 fn reconcile_keeps_running_step_with_live_process() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let temp = unique_temp_dir("prism-plan-live-reconcile");
     let mut persisted = PlanLaunch::new(
         &temp,
@@ -1187,8 +1109,7 @@ fn recovery_classifies_each_synthetic_process_observation() {
             recorded_process_state_from_observation(42, observation),
             expected_state
         );
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        migrate_schema(&conn).unwrap();
+        let conn = test_connection();
         let repo = PathBuf::from("/repo/prism");
         let mut persisted = PlanLaunch::new(
             &repo,
@@ -1232,8 +1153,7 @@ fn recovery_classifies_each_synthetic_process_observation() {
 
 #[test]
 fn retry_from_step_resets_selected_and_later_steps() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let repo = PathBuf::from("/repo/prism");
     let mut persisted = PlanLaunch::new(
         &repo,
@@ -1267,8 +1187,7 @@ fn retry_from_step_resets_selected_and_later_steps() {
 
 #[test]
 fn pause_request_stops_sequential_executor_before_next_queued_step() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let temp = unique_temp_dir("prism-plan-pause-before-next");
     let marker = temp.join("should-not-run");
     let opencode = fake_opencode(
@@ -1316,8 +1235,7 @@ touch should-not-run
 
 #[test]
 fn plan_control_entry_point_reports_pause_and_resume_execution_effects() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let repo = PathBuf::from("/repo/prism");
     let persisted = PlanLaunch::new(
         &repo,
@@ -1348,8 +1266,7 @@ fn plan_control_entry_point_reports_pause_and_resume_execution_effects() {
 
 #[test]
 fn resumable_run_requeues_interrupted_steps_and_preserves_done_steps() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let repo = PathBuf::from("/repo/prism");
     let launch = PlanLaunch::new(
         &repo,
@@ -1387,8 +1304,7 @@ fn resumable_run_requeues_interrupted_steps_and_preserves_done_steps() {
 
 #[test]
 fn skip_and_archive_plan_run_hide_it_from_recent_runs() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    migrate_schema(&conn).unwrap();
+    let conn = test_connection();
     let repo = PathBuf::from("/repo/prism");
     let mut persisted = PlanLaunch::new(
         &repo,
@@ -1427,6 +1343,13 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).unwrap();
     path
+}
+
+fn test_connection() -> PlanRunStore {
+    let dir = unique_temp_dir("prism-plan-store");
+    let path = dir.join("prism.db");
+    crate::persistence::database::initialize(&path).unwrap();
+    PlanRunStore::open(path)
 }
 
 fn fake_opencode(dir: &Path, body: &str) -> PathBuf {

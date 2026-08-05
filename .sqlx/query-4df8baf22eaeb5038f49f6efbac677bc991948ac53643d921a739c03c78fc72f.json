@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select value\nfrom metadata\nwhere key = ?1\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "value",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4df8baf22eaeb5038f49f6efbac677bc991948ac53643d921a739c03c78fc72f"
+}

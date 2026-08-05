@@ -1420,9 +1420,10 @@ exit 0
         config
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
-        config
-            .tools
-            .insert("opencode".to_string(), "/usr/bin/opencode".to_string());
+        config.harnesses.insert(
+            "opencode".to_string(),
+            crate::harness::HarnessConfig::opencode("/usr/bin/opencode"),
+        );
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
         save_runtime(
@@ -1493,9 +1494,10 @@ exit 0
         config
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
-        config
-            .tools
-            .insert("opencode".to_string(), "/usr/bin/opencode".to_string());
+        config.harnesses.insert(
+            "opencode".to_string(),
+            crate::harness::HarnessConfig::opencode("/usr/bin/opencode"),
+        );
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
         let port = match start_fake_opencode_server(session.path.clone(), 200, None, 4) {

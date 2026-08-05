@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "select session_adapter_id as adapter_id, session_endpoint as endpoint, session_id as \"id!\"\nfrom auto_step_run where run_id = ? and session_id is not null\nunion\nselect session_adapter_id, session_endpoint, session_id\nfrom plan_step_run where run_id in (\n  select plan_run_id from auto_step_run where run_id = ? and plan_run_id is not null\n) and session_id is not null\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "adapter_id",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "endpoint",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "id!",
+        "ordinal": 2,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "cdc5f6f5f70343832d5a15d8c6cf44dc0a8f396963b47b60eed3e8d83b43ff74"
+}

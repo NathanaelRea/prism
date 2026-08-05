@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update auto_step_run set status = 'aborted', finished_unix_ms = ?,\n  error = coalesce(error, 'aborted'), execution_process_id = null,\n  execution_process_start_time_ticks = null, process_id = null\nwhere run_id = ? and status in ('queued','starting','running','waiting')\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "761d4170de42bdc2d5724962d19ba2115dc665d212ee9eb7dc1ad2f63e88f168"
+}

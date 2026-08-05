@@ -951,7 +951,7 @@ pub(crate) fn refresh_repo_policy_cache_for_repository(
                     canonical_host: Some(repository.host().to_string()),
                     project_path: Some(repository.project_path().to_string()),
                     target_branch: Some(target_branch.to_string()),
-                    identity_complete: false,
+                    identity_complete: true,
                     refreshed_unix_ms: unix_seconds().max(0) as u64,
                     error: Some(error),
                     ..RepoPolicyCache::default()
@@ -1100,11 +1100,11 @@ fn fetch_repo_policy(
 
     Ok(RepoPolicyCache {
         repo_remote: repository.project_path().to_string(),
-        provider: None,
-        canonical_host: None,
-        project_path: None,
+        provider: Some(repository.provider()),
+        canonical_host: Some(repository.host().to_string()),
+        project_path: Some(repository.project_path().to_string()),
         target_branch: Some(target_branch.to_string()),
-        identity_complete: false,
+        identity_complete: true,
         default_branch: Some(target_branch.to_string()),
         required_approvals: facts.required_approvals,
         require_conversation_resolution: facts.require_conversation_resolution,

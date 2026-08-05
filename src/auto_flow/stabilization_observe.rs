@@ -74,7 +74,9 @@ pub(crate) fn build_stabilization_snapshot(
         .as_ref()
         .map(|repository| repository.project_path().to_string());
     let policy_cache = target_repository.as_ref().and_then(|repository| {
-        crate::remote::load_repo_policy_cache_for_repository(repo, repository)
+        session.pr.summary().and_then(|summary| {
+            crate::remote::load_repo_policy_cache_for_identity(repo, repository, &summary.base_ref)
+        })
     });
     let target_remote = target_remote_name(&session.path, config, target_repository.as_ref());
     let merge_conflict = session.pr.summary().and_then(|summary| {
@@ -198,7 +200,9 @@ pub(crate) fn build_auto_run_stabilization_snapshot(
         .as_ref()
         .map(|repository| repository.project_path().to_string());
     let policy_cache = target_repository.as_ref().and_then(|repository| {
-        crate::remote::load_repo_policy_cache_for_repository(repo, repository)
+        cache.summary().and_then(|summary| {
+            crate::remote::load_repo_policy_cache_for_identity(repo, repository, &summary.base_ref)
+        })
     });
     let is_default_branch = config.is_default_branch(&run.branch)
         || policy_cache
@@ -1611,12 +1615,8 @@ exit 1
             },
         )
         .unwrap();
-        crate::observability::with_writable_db(&repo, |conn| {
-            conn.execute_batch(
-                "create trigger reject_policy_refresh before update on repo_policy_cache
-                 begin select raise(abort, 'policy refresh rejected'); end;",
-            )
-            .map_err(|error| error.to_string())
+        crate::observability::with_writable_db(&repo, |database| {
+            crate::persistence::auto_flow::test_install_policy_refresh_failure(database)
         })
         .unwrap();
         let run = super::super::AutoLaunch::new(
