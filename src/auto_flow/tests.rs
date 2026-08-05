@@ -2978,6 +2978,54 @@ fn merge_success_queues_cleanup_separately() {
 }
 
 #[test]
+fn merged_run_finishes_cleanup_without_another_pause() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = Repository {
+        root: PathBuf::from("/repo/prism"),
+    };
+    let mut persisted = AutoLaunch::new(
+        &repo.root,
+        &repo.root.join("feature"),
+        "feat/auto",
+        "Implement auto",
+    )
+    .unwrap()
+    .create_run();
+    persisted.run.implementation_source = AutoImplementationSource::ExistingPullRequest;
+    persisted.run.stabilization_status = Some(stabilization_model::StabilizationStatus::Done);
+    persisted.steps.clear();
+    push_test_step(&mut persisted, 1, AutoStepKey::Merge, AutoStepStatus::Done);
+    push_test_step(
+        &mut persisted,
+        2,
+        AutoStepKey::Cleanup,
+        AutoStepStatus::Queued,
+    );
+    save_auto_run(&conn, &mut persisted).unwrap();
+
+    pause_before_next_auto_step_with_context(&conn, &repo, &test_config(), &mut persisted).unwrap();
+
+    assert!(!persisted.run.pause_requested);
+    assert_ne!(persisted.run.status, AutoRunStatus::Paused);
+
+    let executor =
+        AutoExecutorConfig::new("unused", None, persisted.run.worktree_path.clone(), "Auto");
+    execute_auto_initial_step(
+        &conn,
+        &repo,
+        &test_config(),
+        &mut persisted,
+        &executor,
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    assert_eq!(persisted.run.status, AutoRunStatus::Done);
+    assert_eq!(persisted.steps[1].status, AutoStepStatus::Skipped);
+}
+
+#[test]
 fn manual_merge_skip_completes_run_without_cleanup() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();

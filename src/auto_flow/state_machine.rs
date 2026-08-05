@@ -183,7 +183,7 @@ pub(super) fn pause_before_next_auto_step_with_context(
     if next_queued_non_agent_step(persisted).is_some_and(|index| {
         matches!(
             persisted.steps[index].step_key,
-            AutoStepKey::LocalVerify | AutoStepKey::CommitImpl
+            AutoStepKey::LocalVerify | AutoStepKey::CommitImpl | AutoStepKey::Cleanup
         )
     }) {
         return Ok(());
