@@ -582,6 +582,7 @@ mod tests {
     fn session() -> WorktreeSessionKey {
         WorktreeSessionKey {
             repository: WorktreeRepositoryKey::new("/tmp/repo".into()),
+            worktree_session_id: "test-session".to_string(),
             path: "/tmp/repo/feature".into(),
             branch: "feature".to_string(),
             incarnation: "one".to_string(),

@@ -225,6 +225,7 @@ pub fn migrate_schema(conn: &Connection) -> Result<(), String> {
 }
 
 pub fn enqueue(conn: &Connection, workflow: &WorkflowIdentity) -> Result<(), String> {
+    require_active_worktree_session(conn, workflow)?;
     let now = now_ms();
     let changed = conn
         .execute(
@@ -344,6 +345,7 @@ fn claim_with_lease(
     let tx = conn
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| format!("begin workflow claim: {error}"))?;
+    require_active_worktree_session(&tx, workflow)?;
     let changed = tx
         .execute(
             "update workflow_execution set
@@ -397,6 +399,7 @@ fn claim_with_lease(
 }
 
 pub fn heartbeat(conn: &Connection, claim: &ExecutionClaim) -> Result<(), String> {
+    require_active_worktree_session(conn, &claim.workflow).map_err(|_| stale_claim_error())?;
     let now = now_ms();
     let changed = conn
         .execute(
@@ -461,7 +464,8 @@ pub fn validate_claim(conn: &Connection, claim: &ExecutionClaim) -> Result<(), S
         )
         .optional()
         .map_err(|error| format!("validate workflow claim: {error}"))?;
-    current.ok_or_else(stale_claim_error)
+    current.ok_or_else(stale_claim_error)?;
+    require_active_worktree_session(conn, &claim.workflow).map_err(|_| stale_claim_error())
 }
 
 pub fn install_claim_guards(conn: &Connection, claim: &ExecutionClaim) -> Result<(), String> {
@@ -491,17 +495,46 @@ pub fn install_claim_guards(conn: &Connection, claim: &ExecutionClaim) -> Result
     )
     .map_err(|error| format!("store execution claim guard: {error}"))?;
 
-    let current_claim = "exists (
+    let active_worktree_session = if table_has_column(conn, "auto_run", "worktree_session_id")?
+        && table_has_column(conn, "plan_run", "worktree_session_id")?
+    {
+        "and exists (
+           select 1 from _prism_execution_claim_guard g
+           where (g.workflow_kind = 'auto' and exists (
+                    select 1 from auto_run r
+                    join active_worktree_session a
+                      on a.worktree_session_id = r.worktree_session_id
+                     and a.repo_root = r.repo_root
+                     and a.worktree_path = r.worktree_path
+                     and a.branch = r.branch
+                    where r.id = g.run_id
+                  ))
+              or (g.workflow_kind = 'plan' and exists (
+                    select 1 from plan_run r
+                    join active_worktree_session a
+                      on a.worktree_session_id = r.worktree_session_id
+                     and a.repo_root = r.repo_root
+                     and a.worktree_path = r.scope_path
+                    where r.id = g.run_id
+                  ))
+         )"
+    } else {
+        ""
+    };
+    let current_claim = format!(
+        "exists (
            select 1
            from workflow_execution e, _prism_execution_claim_guard g
            where e.workflow_kind = g.workflow_kind
              and e.run_id = g.run_id
              and e.dispatch_state = 'claimed'
              and e.worker_id = g.worker_id
-             and e.daemon_instance_id = g.daemon_instance_id
-             and e.fencing_token = g.fencing_token
-             and e.lease_expires_unix_ms > cast(unixepoch('now', 'subsec') * 1000 as integer)
-         )";
+              and e.daemon_instance_id = g.daemon_instance_id
+              and e.fencing_token = g.fencing_token
+              and e.lease_expires_unix_ms > cast(unixepoch('now', 'subsec') * 1000 as integer)
+              {active_worktree_session}
+          )"
+    );
     let guarded_tables = [
         ("plan_run", "id", true, false),
         ("plan_step_run", "run_id", true, false),
@@ -555,7 +588,7 @@ pub fn install_claim_guards(conn: &Connection, claim: &ExecutionClaim) -> Result
                 "drop trigger if exists temp._prism_guard_{table}_{operation};
                  create temp trigger _prism_guard_{table}_{operation}
                  before {operation} on main.{table}
-                 when not (({ownership}) and ({current_claim}))
+                  when not (({ownership}) and ({current_claim}))
                  begin
                    select raise(abort, 'execution claim is stale');
                  end;"
@@ -712,7 +745,16 @@ pub fn validate_installed_claim(conn: &Connection) -> Result<(), String> {
         )
         .optional()
         .map_err(|error| format!("validate installed execution claim: {error}"))?;
-    current.ok_or_else(stale_claim_error)
+    current.ok_or_else(stale_claim_error)?;
+    let (kind, run_id) = conn
+        .query_row(
+            "select workflow_kind, run_id from temp._prism_execution_claim_guard limit 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|error| format!("load installed execution ownership: {error}"))?;
+    let workflow = WorkflowIdentity::new(WorkflowKind::parse(&kind)?, run_id);
+    require_active_worktree_session(conn, &workflow).map_err(|_| stale_claim_error())
 }
 
 pub fn release(
@@ -824,6 +866,9 @@ pub fn apply_recovery_decision(
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(|error| format!("begin recovery decision: {error}"))?;
     let now = now_ms();
+    for (workflow, _, _) in decisions {
+        require_active_worktree_session(&tx, workflow)?;
+    }
     for (workflow, generation, _) in decisions {
         let current = tx
             .query_row(
@@ -1022,6 +1067,87 @@ fn require_current_claim(changed: usize) -> Result<(), String> {
 
 fn stale_claim_error() -> String {
     "execution claim is stale".to_string()
+}
+
+pub(crate) fn require_active_worktree_session(
+    conn: &Connection,
+    workflow: &WorkflowIdentity,
+) -> Result<(), String> {
+    let _table = match workflow.kind {
+        WorkflowKind::Auto => "auto_run",
+        WorkflowKind::Plan => "plan_run",
+    };
+    #[cfg(test)]
+    if !table_has_column(conn, _table, "worktree_session_id")? {
+        return Ok(());
+    }
+    #[cfg(test)]
+    if !conn
+        .query_row(
+            "select exists(
+               select 1 from sqlite_master
+               where type = 'table' and name = 'active_worktree_session'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("inspect Worktree Session schema: {error}"))?
+    {
+        return Ok(());
+    }
+    let location_query = match workflow.kind {
+        WorkflowKind::Auto => {
+            "select worktree_session_id, repo_root, worktree_path, branch from auto_run where id = ?1"
+        }
+        WorkflowKind::Plan => {
+            "select worktree_session_id, repo_root, scope_path, null from plan_run where id = ?1"
+        }
+    };
+    let (id, repo_root, worktree_path, branch) = conn
+        .query_row(location_query, [&workflow.run_id], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .optional()
+        .map_err(|error| format!("load workflow Worktree Session identity: {error}"))?
+        .ok_or_else(|| {
+            format!(
+                "{} run {} was not found",
+                workflow.kind.label(),
+                workflow.run_id
+            )
+        })?;
+    let id = id.ok_or_else(|| {
+        format!(
+            "{} run {} has no Worktree Session identity; legacy runs cannot execute",
+            workflow.kind.label(),
+            workflow.run_id
+        )
+    })?;
+    let active = conn
+        .query_row(
+            "select exists(
+               select 1 from active_worktree_session
+               where worktree_session_id = ?1 and repo_root = ?2 and worktree_path = ?3
+                 and (?4 is null or branch = ?4)
+             )",
+            params![id, repo_root, worktree_path, branch],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("validate workflow Worktree Session location: {error}"))?;
+    if active {
+        Ok(())
+    } else {
+        Err(format!(
+            "{} run {} belongs to an inactive Worktree Session",
+            workflow.kind.label(),
+            workflow.run_id
+        ))
+    }
 }
 
 pub fn is_stale_claim_error(error: &str) -> bool {

@@ -1,4 +1,116 @@
 use super::*;
+
+fn workflow_identity_tables(conn: &rusqlite::Connection) {
+    conn.execute_batch(
+        "create table worktree_session (
+           id text primary key, repo_root text not null, initial_branch text not null,
+           initial_worktree_path text not null, created_unix_ms integer not null
+         );
+         create table active_worktree_session (
+           worktree_session_id text primary key references worktree_session(id),
+           repo_root text not null, branch text not null, worktree_path text not null,
+           worktree_incarnation text not null, observed_unix_ms integer not null,
+           unique(repo_root, branch), unique(repo_root, worktree_path)
+         );",
+    )
+    .unwrap();
+}
+
+fn activate_worktree_session(conn: &rusqlite::Connection, id: &str, repo: &Path, path: &Path) {
+    conn.execute(
+        "insert into worktree_session
+         (id, repo_root, initial_branch, initial_worktree_path, created_unix_ms)
+         values (?1, ?2, 'feat/auto', ?3, 1)",
+        params![id, repo.display().to_string(), path.display().to_string()],
+    )
+    .unwrap();
+    conn.execute(
+        "insert into active_worktree_session
+         (worktree_session_id, repo_root, branch, worktree_path, worktree_incarnation, observed_unix_ms)
+         values (?1, ?2, 'feat/auto', ?3, 'incarnation', 1)",
+        params![id, repo.display().to_string(), path.display().to_string()],
+    )
+    .unwrap();
+}
+
+#[test]
+fn auto_submission_fences_replaced_same_path_and_legacy_runs() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    workflow_identity_tables(&conn);
+    crate::execution::migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let path = repo.join("feature");
+    activate_worktree_session(&conn, "session-old", &repo, &path);
+
+    let mut replaced = AutoLaunch::new(&repo, &path, "feat/auto", "Implement auto")
+        .unwrap()
+        .with_worktree_session_id("session-old")
+        .create_run();
+    conn.execute("delete from active_worktree_session", [])
+        .unwrap();
+    activate_worktree_session(&conn, "session-new", &repo, &path);
+    let error = submit_auto_run(&conn, &mut replaced).unwrap_err();
+    assert!(error.contains("inactive Worktree Session"), "{error}");
+
+    let mut legacy = AutoLaunch::new(&repo, &path, "feat/auto", "Legacy auto")
+        .unwrap()
+        .create_run();
+    legacy.run.worktree_session_id = None;
+    save_auto_run(&conn, &mut legacy).unwrap();
+    assert_eq!(
+        load_auto_run_snapshot(&conn, &legacy.run.id)
+            .unwrap()
+            .unwrap()
+            .run
+            .worktree_session_id,
+        None
+    );
+    let error = submit_auto_run(&conn, &mut legacy).unwrap_err();
+    assert!(error.contains("legacy runs cannot execute"), "{error}");
+}
+
+#[test]
+fn running_auto_claim_fences_mutations_after_worktree_session_retirement() {
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    workflow_identity_tables(&conn);
+    crate::execution::migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let path = repo.join("feature");
+    activate_worktree_session(&conn, "session-old", &repo, &path);
+    let mut persisted = AutoLaunch::new(&repo, &path, "feat/auto", "Implement auto")
+        .unwrap()
+        .with_worktree_session_id("session-old")
+        .create_run();
+    submit_auto_run(&conn, &mut persisted).unwrap();
+    let workflow = crate::execution::WorkflowIdentity::new(
+        crate::execution::WorkflowKind::Auto,
+        persisted.run.id.clone(),
+    );
+    let claim = crate::execution::claim(&mut conn, &workflow, "daemon", "worker")
+        .unwrap()
+        .unwrap();
+    crate::execution::install_claim_guards(&conn, &claim).unwrap();
+
+    conn.execute("delete from active_worktree_session", [])
+        .unwrap();
+
+    let error = conn
+        .execute(
+            "update auto_run set status = 'running' where id = ?1",
+            [&persisted.run.id],
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("execution claim is stale"), "{error}");
+    assert_eq!(
+        crate::execution::heartbeat(&conn, &claim).unwrap_err(),
+        "execution claim is stale"
+    );
+}
 use std::fs;
 use std::process::Command;
 
@@ -2949,6 +3061,36 @@ fn review_poll_resolved_requirement_waits_without_review_comments() {
 
     assert!(!outcome.complete);
     assert_eq!(outcome.summary, "no review comments found yet");
+}
+
+#[test]
+fn review_poll_resolved_requirement_accepts_copilot_review_without_inline_comments() {
+    let temp = TempDir::new("review-poll-copilot-no-inline");
+    let repo = Repository {
+        root: temp.path().to_path_buf(),
+    };
+    let summary = test_pr_summary("feat/auto", "abc123", "2026-01-01T00:00:00Z");
+    let mut config = Config::load(&repo);
+    config.auto.review_requirement = crate::config::ReviewRequirement::Resolved;
+    let details = crate::remote::PrDetails {
+        reviews: vec![crate::remote::PrReview {
+            id: "review-1".to_string(),
+            author: "copilot-pull-request-reviewer".to_string(),
+            state: "COMMENTED".to_string(),
+            body: "Copilot reviewed 2 out of 2 changed files.".to_string(),
+            submitted_at: "2026-01-01T00:01:00Z".to_string(),
+        }],
+        ..crate::remote::PrDetails::default()
+    };
+    let mut persisted = AutoLaunch::new(temp.path(), temp.path(), "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+
+    let outcome =
+        evaluate_review_feedback(&config, &mut persisted, &summary, Some(&details)).unwrap();
+
+    assert!(outcome.complete);
+    assert!(outcome.fix_prompt.is_none());
 }
 
 #[test]

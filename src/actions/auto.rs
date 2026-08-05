@@ -123,7 +123,8 @@ impl Tui {
                 .config
                 .harness_adapter(&context.config.default_harness)?,
         )
-        .with_worktree_incarnation(incarnation);
+        .with_worktree_incarnation(incarnation)
+        .with_worktree_session_id(session.worktree_session_id.clone());
         let mut persisted = launch.create_run();
         crate::auto_flow::stabilization_observe::adopt_existing_pull_request(
             &context.repo,
@@ -151,6 +152,9 @@ impl Tui {
         let session_path = self.sessions[context.session_index].path.clone();
         let session_branch = self.sessions[context.session_index].branch.clone();
         let session_incarnation = self.sessions[context.session_index].incarnation.clone();
+        let worktree_session_id = self.sessions[context.session_index]
+            .worktree_session_id
+            .clone();
         let active_run_id = self.active_auto_runs.get(&session_path).cloned();
         if let Some(run_id) = active_run_id.as_ref() {
             self.load_auto_run_snapshot(&context.repo.root, run_id);
@@ -286,6 +290,7 @@ impl Tui {
                 .harness_adapter(&context.config.default_harness)?,
         )
         .with_worktree_incarnation(session_incarnation);
+        let launch = launch.with_worktree_session_id(worktree_session_id);
         let mut persisted = launch.create_run();
         if persisted.run.implementation_source == AutoImplementationSource::ExistingPullRequest {
             crate::auto_flow::stabilization_observe::adopt_existing_pull_request(

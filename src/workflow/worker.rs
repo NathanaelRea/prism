@@ -205,8 +205,10 @@ pub fn ensure_running() -> Result<(), String> {
                 state: DaemonState::Running,
                 ..
             } => {
-                if request_worker_replacement(&socket, &executable_identity)? {
-                    return Ok(());
+                match request_worker_replacement(&socket, &executable_identity)? {
+                    None => break,
+                    Some(true) => return Ok(()),
+                    Some(false) => {}
                 }
                 let shutdown_health = parse_health_response(&request_at(&socket, "shutdown")?)?;
                 if shutdown_health.active > 0 {
@@ -221,8 +223,10 @@ pub fn ensure_running() -> Result<(), String> {
                 ..
             } => {
                 if current.active > 0 {
-                    if request_worker_replacement(&socket, &executable_identity)? {
-                        return Ok(());
+                    match request_worker_replacement(&socket, &executable_identity)? {
+                        None => break,
+                        Some(true) => return Ok(()),
+                        Some(false) => {}
                     }
                     spawn_worker_replacement()?;
                     return Ok(());
@@ -334,16 +338,18 @@ fn wait_for_replacement(
 fn request_worker_replacement(
     socket: &WorkerSocketPath,
     executable_identity: &str,
-) -> Result<bool, String> {
-    let response = request_at(socket, "replace")?;
+) -> Result<Option<bool>, String> {
+    let Some(response) = request_if_worker_running(socket, "replace")? else {
+        return Ok(None);
+    };
     if !response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
-        return Ok(false);
+        return Ok(Some(false));
     }
     let health = parse_health_response(&response)?;
     if health.active == 0 {
         wait_for_replacement(socket, executable_identity, DAEMON_TRANSITION_TIMEOUT)?;
     }
-    Ok(true)
+    Ok(Some(true))
 }
 
 pub fn wake() -> Result<(), String> {
@@ -496,6 +502,25 @@ fn request_at(path: &WorkerSocketPath, command: &str) -> Result<String, String> 
     let stream = UnixStream::connect(path.as_path())
         .map_err(|error| format!("connect to Prism worker: {error}"))?;
     request_on_stream(stream, command)
+}
+
+fn request_if_worker_running(
+    path: &WorkerSocketPath,
+    command: &str,
+) -> Result<Option<String>, String> {
+    let stream = match UnixStream::connect(path.as_path()) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("connect to Prism worker: {error}")),
+    };
+    request_on_stream(stream, command).map(Some)
 }
 
 fn request_on_stream(mut stream: UnixStream, command: &str) -> Result<String, String> {
@@ -859,6 +884,7 @@ fn observe_interactive_agent(
             &association.harness_id,
             &session.branch,
             &session.path,
+            &session.worktree_session_id,
         )?
     {
         return match crate::opencode::poll_status_authoritative(&runtime) {
@@ -1161,6 +1187,7 @@ fn execute_claim(repo: &Repository, claim: &ExecutionClaim) {
     let state = match result {
         Ok(()) => workflow_release_state(repo, &claim.workflow).unwrap_or(DispatchState::Terminal),
         Err(error) => {
+            log_claim_lifecycle(repo, "executor_failed", claim, &error);
             if !ownership_lost.load(Ordering::Acquire) {
                 mark_domain_failed(repo, claim, &error);
             }
@@ -1235,12 +1262,20 @@ fn execute_auto(repo: &Repository, config: &Config, claim: &ExecutionClaim) -> R
             persisted.run.harness_id, persisted.run.adapter_id, harness_config.adapter
         ));
     }
+    let worktree_session_id = persisted
+        .run
+        .worktree_session_id
+        .as_deref()
+        .ok_or_else(|| {
+            "auto run has no Worktree Session identity; legacy runs cannot execute".to_string()
+        })?;
     let runtime = crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
         .prepare_server(
             repo,
             config,
             &persisted.run.branch,
             &persisted.run.worktree_path,
+            worktree_session_id,
         )?
         .map(|runtime| runtime.server_url);
     let executor = crate::auto_flow::AutoExecutorConfig::for_harness(
@@ -1282,8 +1317,21 @@ fn execute_plan(repo: &Repository, config: &Config, claim: &ExecutionClaim) -> R
             persisted.run.harness_id, persisted.run.adapter_id, harness_config.adapter
         ));
     }
+    let worktree_session_id = persisted
+        .run
+        .worktree_session_id
+        .as_deref()
+        .ok_or_else(|| {
+            "plan run has no Worktree Session identity; legacy runs cannot execute".to_string()
+        })?;
     let server_url = crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
-        .prepare_server(repo, config, "plan", &persisted.run.scope_path)?
+        .prepare_server(
+            repo,
+            config,
+            "plan",
+            &persisted.run.scope_path,
+            worktree_session_id,
+        )?
         .map(|runtime| runtime.server_url);
     let mut executor = crate::plan_run::PlanExecutorConfig::for_harness(
         persisted.run.harness_id.clone(),
@@ -1765,6 +1813,13 @@ mod tests {
         drop(listener);
 
         assert_eq!(probe_health_at(&socket).unwrap(), DaemonHealth::stopped());
+    }
+
+    #[test]
+    fn replacement_request_treats_a_removed_worker_socket_as_stopped() {
+        let (_runtime, socket) = test_socket_path();
+
+        assert_eq!(request_if_worker_running(&socket, "replace").unwrap(), None);
     }
 
     #[test]

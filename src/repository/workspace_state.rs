@@ -1102,6 +1102,14 @@ fn load_workflows(
     } else {
         "and (r.status in ('queued','running','paused','failed') or e.dispatch_state in ('queued','claimed','recovery_pending','paused'))"
     };
+    let active_identity = if table_exists(conn, "active_worktree_session")?
+        && table_has_column(conn, "auto_run", "worktree_session_id")?
+        && table_has_column(conn, "plan_run", "worktree_session_id")?
+    {
+        "exists(select 1 from active_worktree_session a where a.worktree_session_id = r.worktree_session_id)"
+    } else {
+        "0"
+    };
     let query = format!(
         "select 'auto', r.id, r.worktree_path, r.status, r.pause_requested, r.updated_unix_ms,
                 e.dispatch_state, e.daemon_instance_id, e.worker_id, e.lease_expires_unix_ms,
@@ -1109,7 +1117,8 @@ fn load_workflows(
                 (select s.step_key from auto_step_run s where s.run_id = r.id order by s.sequence desc limit 1),
                 (select s.status from auto_step_run s where s.run_id = r.id order by s.sequence desc limit 1),
                 (select count(*) from auto_step_run s where s.run_id = r.id and s.status = 'done'),
-                (select count(*) from auto_step_run s where s.run_id = r.id)
+                (select count(*) from auto_step_run s where s.run_id = r.id),
+                {active_identity}
          from auto_run r left join workflow_execution e on e.workflow_kind = 'auto' and e.run_id = r.id
          where r.repo_root = ?1 and r.archived_unix_ms is null {terminal_filter}
          union all
@@ -1119,7 +1128,8 @@ fn load_workflows(
                 (select r.step_name || ' ' || s.step || '/' || r.total_steps from plan_step_run s where s.run_id = r.id order by case s.status when 'running' then 0 when 'starting' then 1 when 'queued' then 2 else 3 end, s.step limit 1),
                 (select s.status from plan_step_run s where s.run_id = r.id order by case s.status when 'running' then 0 when 'starting' then 1 when 'queued' then 2 else 3 end, s.step limit 1),
                 (select count(*) from plan_step_run s where s.run_id = r.id and s.status in ('done','skipped')),
-                r.total_steps
+                r.total_steps,
+                {active_identity}
          from plan_run r left join workflow_execution e on e.workflow_kind = 'plan' and e.run_id = r.id
          where r.repo_root = ?1 and r.archived_unix_ms is null {terminal_filter}"
     );
@@ -1138,6 +1148,14 @@ fn load_workflows(
                 .transpose()
                 .map_err(|error| sql_value_error(6, error))?;
             let ownerless = true;
+            let execution_eligible = row.get::<_, i64>(17)? != 0;
+            let mut available_controls =
+                controls_for(lifecycle, pause_requested, dispatch_state, ownerless);
+            if !execution_eligible {
+                available_controls.pause = false;
+                available_controls.resume = false;
+                available_controls.recover = false;
+            }
             Ok(WorkflowSnapshot {
                 identity: WorkflowIdentity {
                     repository: absolute_path(repo_root),
@@ -1173,12 +1191,7 @@ fn load_workflows(
                     completed: row.get::<_, i64>(15)?.max(0) as usize,
                     total: row.get::<_, i64>(16)?.max(0) as usize,
                 },
-                available_controls: controls_for(
-                    lifecycle,
-                    pause_requested,
-                    dispatch_state,
-                    ownerless,
-                ),
+                available_controls,
                 updated_unix_ms: row.get(5)?,
             })
         })
@@ -1759,6 +1772,16 @@ fn table_exists(conn: &Connection, table: &str) -> Result<bool, String> {
     .map_err(|error| error.to_string())
 }
 
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
+    conn.query_row(
+        &format!("select exists(select 1 from pragma_table_info('{table}') where name = ?1)"),
+        [column],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value != 0)
+    .map_err(|error| error.to_string())
+}
+
 fn workflow_selector_matches(selector: &str, identity: &WorkflowIdentity) -> bool {
     selector == identity.display_id
         || selector
@@ -1895,13 +1918,13 @@ mod tests {
     fn insert_run(conn: &Connection, status: &str, paused: bool, dispatch: &str) {
         conn.execute(
             "insert into plan_run (
-               id, repo_root, scope_path, plan_path, plan_display, step_name,
+               id, repo_root, scope_path, worktree_session_id, plan_path, plan_display, step_name,
                start_step, total_steps, mode, status, pause_requested, selected_step,
                created_unix_ms, updated_unix_ms
-             ) values (
-               'plan-1', '/repo', '/repo', '/repo/plan.md', 'plan.md', 'phase',
+              ) values (
+               'plan-1', '/repo', '/repo', 'test-worktree-session', '/repo/plan.md', 'plan.md', 'phase',
                1, 1, 'sequential', ?1, ?2, 1, 10, 20
-             )",
+              )",
             params![status, paused],
         )
         .unwrap();

@@ -35,7 +35,10 @@ impl Tui {
             return Ok(());
         };
         let path = self.sessions[context.session_index].path.clone();
-        self.start_plan_run_for_scope(raw, context.repo, context.config, path)
+        let worktree_session_id = self.sessions[context.session_index]
+            .worktree_session_id
+            .clone();
+        self.start_plan_run_for_scope(raw, context.repo, context.config, path, worktree_session_id)
     }
 
     pub(super) fn start_plan_run_for_scope(
@@ -44,6 +47,7 @@ impl Tui {
         repo: crate::repo::Repository,
         config: crate::config::Config,
         scope_path: PathBuf,
+        worktree_session_id: String,
     ) -> Result<(), String> {
         if !config.selected_harness()?.describe().headless {
             return Err(format!(
@@ -59,10 +63,13 @@ impl Tui {
             false,
         )?;
         let mode = plan_run_mode_from_parallel_confirmation(parallel);
-        let launch = execution.launch(&repo.root, mode)?.with_harness(
-            config.default_harness.clone(),
-            config.harness_adapter(&config.default_harness)?,
-        );
+        let launch = execution
+            .launch(&repo.root, mode)?
+            .with_harness(
+                config.default_harness.clone(),
+                config.harness_adapter(&config.default_harness)?,
+            )
+            .with_worktree_session_id(worktree_session_id);
         let mut should_execute = true;
         let mut submitted = false;
         let persisted = crate::observability::with_writable_db(&repo, |conn| {
@@ -205,22 +212,29 @@ impl Tui {
         };
         let (_, server_port) = crate::opencode::parse_localhost_url(&server_url)?;
         let session = self.sessions[session_index].background_job_snapshot();
-        let plan_runtime =
-            crate::opencode::load_runtime(&repo, &plan_run.run.harness_id, "plan", &session.path)
-                .ok()
-                .flatten()
-                .filter(|runtime| runtime.server_url == server_url);
+        let plan_runtime = crate::opencode::load_runtime(
+            &repo,
+            &plan_run.run.harness_id,
+            "plan",
+            &session.path,
+            &session.worktree_session_id,
+        )
+        .ok()
+        .flatten()
+        .filter(|runtime| runtime.server_url == server_url);
         let mut runtime = crate::opencode::load_runtime(
             &repo,
             &plan_run.run.harness_id,
             &session.branch,
             &session.path,
+            &session.worktree_session_id,
         )?
         .unwrap_or_else(|| crate::opencode::OpencodeRuntime {
             repo_root: repo.root.display().to_string(),
             harness_id: plan_run.run.harness_id.clone(),
             branch: session.branch.clone(),
             worktree_path: session.path.display().to_string(),
+            worktree_session_id: Some(session.worktree_session_id.clone()),
             server_port,
             server_url: server_url.clone(),
             server_pid: plan_runtime.as_ref().and_then(|runtime| runtime.server_pid),
