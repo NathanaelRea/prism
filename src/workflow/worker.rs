@@ -205,7 +205,9 @@ pub fn ensure_running() -> Result<(), String> {
                 state: DaemonState::Running,
                 ..
             } => {
-                let response = request_at(&socket, "replace")?;
+                let Some(response) = request_if_worker_running(&socket, "replace")? else {
+                    break;
+                };
                 if response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
                     return wait_for_replacement(
                         &socket,
@@ -479,6 +481,25 @@ fn request_at(path: &WorkerSocketPath, command: &str) -> Result<String, String> 
     let stream = UnixStream::connect(path.as_path())
         .map_err(|error| format!("connect to Prism worker: {error}"))?;
     request_on_stream(stream, command)
+}
+
+fn request_if_worker_running(
+    path: &WorkerSocketPath,
+    command: &str,
+) -> Result<Option<String>, String> {
+    let stream = match UnixStream::connect(path.as_path()) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("connect to Prism worker: {error}")),
+    };
+    request_on_stream(stream, command).map(Some)
 }
 
 fn request_on_stream(mut stream: UnixStream, command: &str) -> Result<String, String> {
@@ -1771,6 +1792,13 @@ mod tests {
         drop(listener);
 
         assert_eq!(probe_health_at(&socket).unwrap(), DaemonHealth::stopped());
+    }
+
+    #[test]
+    fn replacement_request_treats_a_removed_worker_socket_as_stopped() {
+        let (_runtime, socket) = test_socket_path();
+
+        assert_eq!(request_if_worker_running(&socket, "replace").unwrap(), None);
     }
 
     #[test]
