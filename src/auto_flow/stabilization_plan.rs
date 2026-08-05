@@ -82,7 +82,7 @@ pub(crate) fn derive_blockers(snapshot: &StabilizationSnapshot) -> Vec<Stabiliza
         blockers.push(StabilizationBlocker::ReviewFeedbackFound);
     }
     if pull_request.review.resolved_comments_required
-        && pull_request.review.review_comment_count == 0
+        && pull_request.review.review_feedback_count == 0
     {
         blockers.push(StabilizationBlocker::ReviewFeedbackMissing);
     }
@@ -725,7 +725,7 @@ mod tests {
         let mut pr = clean_pr();
         pr.review.feedback_required = true;
         pr.review.resolved_comments_required = true;
-        pr.review.review_comment_count = 1;
+        pr.review.review_feedback_count = 1;
 
         let work = plan(&snapshot(Some(pr)));
 
@@ -1237,7 +1237,7 @@ mod tests {
                 decision: "APPROVED".to_string(),
                 feedback_required: false,
                 resolved_comments_required: false,
-                review_comment_count: 0,
+                review_feedback_count: 0,
                 approval_required: false,
                 approval_count: 0,
                 required_approvals: 0,

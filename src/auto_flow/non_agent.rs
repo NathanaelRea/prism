@@ -2532,6 +2532,9 @@ pub(super) fn evaluate_review_feedback(
         },
     )
     .inline_comments;
+    feedback
+        .review_bodies
+        .retain(|review| !crate::review::is_copilot_reviewer(&review.author));
     if feedback.is_actionable() {
         let prompt =
             render_auto_review_fix_prompt(summary.number, &persisted.run.branch, &feedback);
@@ -2543,20 +2546,25 @@ pub(super) fn evaluate_review_feedback(
         });
     }
     if config.auto.review_requirement == crate::config::ReviewRequirement::Resolved {
-        let review_comment_count = details
+        let review_feedback_count = details
             .review_comments
             .iter()
             .filter(|comment| !comment.body.trim().is_empty())
-            .count();
+            .count()
+            + details
+                .reviews
+                .iter()
+                .filter(|review| !review.body.trim().is_empty())
+                .count();
         return Ok(ReviewPollOutcome {
-            summary: if review_comment_count == 0 {
+            summary: if review_feedback_count == 0 {
                 "no review comments found yet".to_string()
             } else {
-                format!("all {review_comment_count} review comment(s) are resolved")
+                format!("all {review_feedback_count} review comment(s) are resolved")
             },
             fix_prompt: None,
             review_thread_ids: Vec::new(),
-            complete: review_comment_count > 0,
+            complete: review_feedback_count > 0,
         });
     }
     if !has_configured_reviewer_requested(summary, config) {

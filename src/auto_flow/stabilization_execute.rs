@@ -2817,7 +2817,7 @@ mod tests {
                     decision: "APPROVED".to_string(),
                     feedback_required: false,
                     resolved_comments_required: false,
-                    review_comment_count: 0,
+                    review_feedback_count: 0,
                     approval_required: false,
                     approval_count: 0,
                     required_approvals: 0,
