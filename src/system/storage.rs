@@ -751,6 +751,7 @@ fn apply_additive_schema_migrations(conn: &Connection) -> Result<(), StorageErro
     crate::integration::migrate_schema(conn).map_err(migration_error)?;
     crate::execution::migrate_schema(conn).map_err(migration_error)?;
     crate::remote::migrate_pr_cache_schema(conn).map_err(migration_error)?;
+    crate::notification::migrate_schema(conn).map_err(migration_error)?;
     Ok(())
 }
 
@@ -761,7 +762,8 @@ fn additive_schema_current(conn: &Connection) -> Result<bool, StorageError> {
         && table_has_column(conn, "workflow_execution", "execution_version")?
         && table_has_column(conn, "workflow_execution", "not_before_unix_ms")?
         && table_has_column(conn, "workflow_execution", "wake_reason")?
-        && table_has_column(conn, "workflow_execution", "workflow_revision")?)
+        && table_has_column(conn, "workflow_execution", "workflow_revision")?
+        && table_has_column(conn, "notification_outbox", "backend_accepted_unix_ms")?)
 }
 
 fn table_has_column(
@@ -1643,6 +1645,38 @@ mod tests {
 
         assert_eq!(user_version(&conn).unwrap(), CURRENT_SCHEMA_VERSION);
         assert_eq!(scheduling, (1, None, None, 0));
+        drop(conn);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn current_database_adds_durable_notification_outbox() {
+        let path = test_path("notification-outbox-migration");
+        {
+            let conn = open_writable(&path).unwrap();
+            conn.execute_batch(
+                "drop table notification_outbox;
+                 drop table notification_session;
+                 pragma user_version = 1;",
+            )
+            .unwrap();
+        }
+
+        let conn = open_writable(&path).unwrap();
+        let version: u32 = conn
+            .query_row("pragma user_version", [], |row| row.get(0))
+            .unwrap();
+        let outbox_count: i64 = conn
+            .query_row(
+                "select count(*) from sqlite_master
+                  where type = 'table' and name = 'notification_outbox'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(outbox_count, 1);
         drop(conn);
         let _ = fs::remove_file(path);
     }

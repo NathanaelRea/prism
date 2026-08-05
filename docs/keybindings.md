@@ -44,6 +44,7 @@ Prism uses a lazygit-style panel model.
 - `x` also aborts the selected Plan phase from the active Plan dashboard, or accepts `all` when prompted to abort all running phases.
 - `e` edits the selected Prism repository config and reloads after save.
 - `E` edits the Prism user config and reloads after save.
+- `w` discovers and opens the Worktrunk user config. If it is missing, Prism offers to create it through `wt config create`. Changes affect Prism and standalone `wt` commands; Prism does not parse or write this file.
 - `C` opens a picker of remote change requests for the selected repository and creates or selects a local worktree using the request's head branch name. An existing local branch is reused without resetting it.
 - `W` opens the in-app worktree column selector for the selected repository. Use `Space` to enable/disable a column, `J`/`K` to move an enabled column down/up, and `Enter` to save.
 - `L` from the Worktrees panel opens the selected repository's Worktrunk hook-log picker and a bounded sanitized log tail. A matching branch label affects ordering only and does not assert session identity or process liveness.

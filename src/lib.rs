@@ -15,7 +15,7 @@ mod repository;
 pub(crate) use repository::{git, lifecycle, repo, session, workspace, workspace_state, worktrunk};
 mod system;
 pub(crate) use system::{
-    desktop_notification, durability, json, platform, process, terminal, util,
+    desktop_notification, durability, json, notification, platform, process, terminal, util,
 };
 pub use system::{file_persistence, storage};
 mod telemetry;
