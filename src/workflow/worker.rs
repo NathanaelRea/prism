@@ -520,14 +520,11 @@ fn execute_claim(repo: &Repository, claim: &ExecutionClaim) {
     );
     let config = Config::load(repo);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        observability::with_writable_db(repo, |conn| {
-            execution::validate_claim(conn, claim)?;
-            execution::require_active_worktree_session(conn, &claim.workflow)
-        })
-        .and_then(|()| match claim.workflow.kind {
-            WorkflowKind::Auto => execute_auto(repo, &config, claim),
-            WorkflowKind::Plan => execute_plan(repo, &config, claim),
-        })
+        observability::with_writable_db(repo, |conn| execution::validate_claim(conn, claim))
+            .and_then(|()| match claim.workflow.kind {
+                WorkflowKind::Auto => execute_auto(repo, &config, claim),
+                WorkflowKind::Plan => execute_plan(repo, &config, claim),
+            })
     }))
     .unwrap_or_else(|_| Err("workflow executor panicked".to_string()));
     heartbeat_stop.store(true, Ordering::Release);
