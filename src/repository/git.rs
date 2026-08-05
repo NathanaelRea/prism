@@ -413,6 +413,28 @@ pub(crate) fn current_head_sha(path: &std::path::Path, config: &Config) -> Resul
     Ok(sha.trim().to_string())
 }
 
+pub(crate) fn is_ancestor(
+    path: &std::path::Path,
+    config: &Config,
+    ancestor: &str,
+    descendant: &str,
+) -> Result<bool, String> {
+    let output = run_output_allow_failure(
+        Command::new(config.tool("git")).arg("-C").arg(path).args([
+            "merge-base",
+            "--is-ancestor",
+            ancestor,
+            descendant,
+        ]),
+        ProcessPolicy::Metadata,
+    )?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!("check commit ancestry: {}", output.stderr.trim())),
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) fn push_current_branch(
     path: &std::path::Path,

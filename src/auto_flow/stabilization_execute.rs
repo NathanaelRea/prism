@@ -1028,9 +1028,13 @@ pub(crate) fn validate_and_begin_repair_commit(
                 repair_label(&kind)
             )
         })?;
-    if let WorkGuardDecision::Invalidated { reason } =
-        decide_work_guard(&kind, &original_guard, &observation.guard)
-    {
+    if let WorkGuardDecision::Invalidated { reason } = decide_repair_commit_guard(
+        config,
+        &persisted.run.worktree_path,
+        &kind,
+        &original_guard,
+        &observation.guard,
+    )? {
         let summary = format!("repair guard invalidated before commit: {reason}");
         super::finish_non_agent_step(
             conn,
@@ -1074,6 +1078,63 @@ pub(crate) fn validate_and_begin_repair_commit(
     );
     save_run_with_conn(conn, &persisted.run)?;
     Ok(RepairCommitGate::Ready)
+}
+
+fn decide_repair_commit_guard(
+    config: &Config,
+    path: &std::path::Path,
+    kind: &super::stabilization_model::RepairKind,
+    original: &WorkGuard,
+    current: &WorkGuard,
+) -> Result<WorkGuardDecision, String> {
+    if original.local_head_sha == current.local_head_sha {
+        return Ok(decide_work_guard(kind, original, current));
+    }
+
+    let mut expected = original.clone();
+    expected.local_head_sha = current.local_head_sha.clone();
+    if let invalid @ WorkGuardDecision::Invalidated { .. } =
+        decide_work_guard(kind, &expected, current)
+    {
+        return Ok(invalid);
+    }
+
+    let Some(original_head) = original.local_head_sha.as_deref() else {
+        return Ok(WorkGuardDecision::Invalidated {
+            reason: "local HEAD changed from an unknown repair baseline".to_string(),
+        });
+    };
+    let Some(current_head) = current.local_head_sha.as_deref() else {
+        return Ok(WorkGuardDecision::Invalidated {
+            reason: "local HEAD disappeared while the repair was in progress".to_string(),
+        });
+    };
+    if !crate::git::is_ancestor(path, config, original_head, current_head)? {
+        return Ok(WorkGuardDecision::Invalidated {
+            reason: "local HEAD was rewritten while the repair was in progress".to_string(),
+        });
+    }
+
+    Ok(WorkGuardDecision::Valid)
+}
+
+pub(crate) fn commit_repair_changes(
+    path: &std::path::Path,
+    config: &Config,
+    guarded_head: Option<&str>,
+    message: &str,
+) -> Result<crate::git::GitCommitResult, String> {
+    let current_head = crate::git::current_head_sha(path, config)?;
+    if guarded_head.is_some_and(|head| head != current_head)
+        && !crate::git::selected_dirty(path, config)?
+    {
+        return Ok(crate::git::GitCommitResult {
+            committed: true,
+            commit_sha: Some(current_head),
+            message: "agent committed changes".to_string(),
+        });
+    }
+    crate::git::commit_if_dirty(path, config, message)
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -792,6 +792,12 @@ pub(super) fn execute_commit_review_fix_step(
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
     let mut cache = crate::remote::load_pr_cache(repo, &persisted.run.branch);
+    if let Some(guard) = persisted.steps[step_index].work_guard.as_ref() {
+        cache.authorize_guarded_refresh(
+            guard.change_request_identity.as_ref(),
+            guard.pr_head_sha.as_deref(),
+        );
+    }
     crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
     crate::remote::dispatcher::refresh_change_request_cache(
         repo,
@@ -843,7 +849,15 @@ pub(super) fn execute_commit_review_fix_step(
         &stabilization_model::RepairKind::Review,
     );
     crate::execution::validate_installed_claim(conn)?;
-    let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
+    let result = stabilization_execute::commit_repair_changes(
+        &persisted.run.worktree_path,
+        config,
+        persisted.steps[step_index]
+            .work_guard
+            .as_ref()
+            .and_then(|guard| guard.local_head_sha.as_deref()),
+        &message,
+    )?;
     let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
     let outcome = stabilization_execute::complete_repair_commit(
         conn,
@@ -1039,6 +1053,12 @@ pub(super) fn execute_commit_ci_fix_step(
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
     let mut cache = crate::remote::load_pr_cache(repo, &persisted.run.branch);
+    if let Some(guard) = persisted.steps[step_index].work_guard.as_ref() {
+        cache.authorize_guarded_refresh(
+            guard.change_request_identity.as_ref(),
+            guard.pr_head_sha.as_deref(),
+        );
+    }
     crate::git::fetch_origin(&persisted.run.worktree_path, config)?;
     crate::remote::dispatcher::refresh_change_request_cache(
         repo,
@@ -1088,7 +1108,15 @@ pub(super) fn execute_commit_ci_fix_step(
     let message =
         stabilization_execute::repair_commit_message(config, &stabilization_model::RepairKind::Ci);
     crate::execution::validate_installed_claim(conn)?;
-    let result = crate::git::commit_if_dirty(&persisted.run.worktree_path, config, &message)?;
+    let result = stabilization_execute::commit_repair_changes(
+        &persisted.run.worktree_path,
+        config,
+        persisted.steps[step_index]
+            .work_guard
+            .as_ref()
+            .and_then(|guard| guard.local_head_sha.as_deref()),
+        &message,
+    )?;
     let local_head = crate::git::current_head_sha(&persisted.run.worktree_path, config).ok();
     let outcome = stabilization_execute::complete_repair_commit(
         conn,
@@ -2049,7 +2077,7 @@ pub(super) fn render_auto_review_fix_prompt(
     feedback: &ReviewFeedback<'_>,
 ) -> String {
     let mut prompt = format!(
-        "Resolve the actionable review feedback for PR #{pr_number} on branch {branch}. Stop without committing.\n\n"
+        "Resolve the actionable review feedback for PR #{pr_number} on branch {branch}. Commit your changes, but do not push.\n\n"
     );
     if !feedback.inline_comments.is_empty() {
         prompt.push_str("Inline review comments:\n\n");
