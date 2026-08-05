@@ -431,7 +431,19 @@ pub(crate) fn is_ancestor(
     match output.status.code() {
         Some(0) => Ok(true),
         Some(1) => Ok(false),
-        _ => Err(format!("check commit ancestry: {}", output.stderr.trim())),
+        _ => {
+            let diagnostic = output
+                .stderr
+                .lines()
+                .chain(output.stdout.lines())
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .unwrap_or("no diagnostic output");
+            Err(format!(
+                "check commit ancestry ({}): {diagnostic}",
+                output.status
+            ))
+        }
     }
 }
 

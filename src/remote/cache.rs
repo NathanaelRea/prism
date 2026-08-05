@@ -129,12 +129,7 @@ impl PrCache {
         let (Some(identity), Some(head_sha)) = (identity, head_sha) else {
             return;
         };
-        if self.summary.as_ref().is_some_and(|summary| {
-            summary.change_request_identity.as_ref() == Some(identity)
-                && summary.head_sha == head_sha
-        }) {
-            self.summary_observed_in_process = true;
-        }
+        self.reauthorize_guarded_summary(identity, head_sha);
     }
 
     #[cfg(test)]
