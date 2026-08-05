@@ -371,7 +371,7 @@ esac
     fs::write(
         repo.prism_dir().join("config.toml"),
         format!(
-            "config_version = 1\n[tools]\ngit = {:?}\n",
+            "[tools]\ngit = {:?}\n",
             git.display().to_string()
         ),
     )

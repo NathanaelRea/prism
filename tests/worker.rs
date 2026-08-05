@@ -264,7 +264,7 @@ fn bundled_coding_workflow_executes_through_the_generic_harness() {
     fs::write(
         home.join("prism/config.toml"),
         format!(
-            "config_version = 1\ndefault_harness = \"test\"\n\n[harnesses.test]\nadapter = \"generic\"\ninteractive_command = [\"{}\"]\nheadless_command = [\"{}\", \"{{prompt}}\"]\nheadless_prompt_transport = \"argument\"\noutput_format = \"text\"\n",
+            "default_harness = \"test\"\n\n[harnesses.test]\nadapter = \"generic\"\ninteractive_command = [\"{}\"]\nheadless_command = [\"{}\", \"{{prompt}}\"]\nheadless_prompt_transport = \"argument\"\noutput_format = \"text\"\n",
             harness.display(),
             harness.display(),
         ),

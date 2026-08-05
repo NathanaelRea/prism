@@ -117,28 +117,15 @@ pub fn run() -> Result<(), String> {
     result
 }
 
-fn run_config_command(
-    command: ConfigCommand,
-    repo: &Repository,
-    config: &Config,
-) -> Result<(), String> {
+fn run_config_command(command: ConfigCommand, repo: &Repository, config: &Config) -> Result<(), String> {
     match command {
         ConfigCommand::Show => config::print_config(repo, config),
         ConfigCommand::Example => print!("{}", config::config_example()),
-        ConfigCommand::Schema => print!("{}", config::GLOBAL_CONFIG_SCHEMA_JSON),
+        ConfigCommand::Schema => print!("{}", config::CONFIG_SCHEMA_JSON),
         ConfigCommand::Paths => {
             println!("user_config = {}", config.user_path.display());
             println!("repo_config = {}", config.repo_config_path.display());
-            println!("global_schema_url = {}", config::GLOBAL_CONFIG_SCHEMA_URL);
-            println!(
-                "repository_schema_url = {}",
-                config::REPOSITORY_CONFIG_SCHEMA_URL
-            );
-        }
-        ConfigCommand::Migrate(mode) => {
-            for line in config::migrate_config_files(config, mode)? {
-                println!("{line}");
-            }
+            println!("schema_url = {}", config::CONFIG_SCHEMA_URL);
         }
     }
     Ok(())

@@ -185,7 +185,7 @@ fn list_is_read_only_and_never_uses_network_tools() {
     fs::write(
         config_home.join("prism/config.toml"),
         format!(
-            "config_version = 1\n[tools]\ngit = \"{}\"\ngh = \"{}\"\n",
+            "[tools]\ngit = \"{}\"\ngh = \"{}\"\n",
             toml_escape(&bin.join("git").display().to_string()),
             toml_escape(&bin.join("gh").display().to_string())
         ),
@@ -447,7 +447,7 @@ fn config_discovery_commands_print_templates_schema_and_paths() {
     let schema = run(["config", "schema"], &repo, &config_home);
     assert!(schema.status.success(), "{}", stderr(&schema));
     let schema_stdout = stdout(&schema);
-    assert!(schema_stdout.contains(r#""title": "Prism Global Config V1""#));
+    assert!(schema_stdout.contains(r#""title": "Prism Config""#));
     assert!(schema_stdout.contains(r#""merge_method""#));
     assert!(schema_stdout.contains(r#""notifications""#));
 
@@ -854,7 +854,7 @@ fn real_prism_opencode_tmux_stack_ensures_reusable_agent_session() {
     fs::write(
         prism_config_dir.join("config.toml"),
         format!(
-            "config_version = 1\ndefault_harness = \"opencode\"\ndefault_base = \"main\"\nopencode_port_base = 43000\nopencode_port_span = 1000\n\n[harnesses.opencode]\nadapter = \"opencode\"\nprogram = \"{}\"\n\n[tools]\ntmux = \"{}\"\n",
+            "default_harness = \"opencode\"\ndefault_base = \"main\"\nopencode_port_base = 43000\nopencode_port_span = 1000\n\n[harnesses.opencode]\nadapter = \"opencode\"\nprogram = \"{}\"\n\n[tools]\ntmux = \"{}\"\n",
             toml_escape(&bin.join("opencode").display().to_string()),
             toml_escape(&bin.join("tmux").display().to_string()),
         ),

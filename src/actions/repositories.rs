@@ -867,7 +867,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
-    fn config_template_initialization_rejects_existing_unversioned_files() {
+    fn config_template_initialization_does_not_replace_existing_empty_files() {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -882,40 +882,11 @@ mod tests {
         std::fs::write(&user, "").unwrap();
         std::fs::write(&repo, "").unwrap();
 
-        let user_error = ensure_user_config_file(&user).unwrap_err();
-        let repo_error = ensure_repo_config_file(&repo, false).unwrap_err();
+        ensure_user_config_file(&user).unwrap();
+        ensure_repo_config_file(&repo, false).unwrap();
 
-        assert!(user_error.contains("version=missing"));
-        assert!(repo_error.contains("version=missing"));
         assert_eq!(std::fs::read_to_string(user).unwrap(), "");
         assert_eq!(std::fs::read_to_string(repo).unwrap(), "");
-        std::fs::remove_dir_all(directory).unwrap();
-    }
-
-    #[test]
-    fn config_template_initialization_creates_scope_specific_v1_files() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir().join(format!(
-            "prism-config-initialize-v1-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        let user = directory.join("user.toml");
-        let repo = directory.join("repo.toml");
-
-        ensure_user_config_file(&user).unwrap();
-        ensure_repo_config_file(&repo, true).unwrap();
-
-        let user = std::fs::read_to_string(user).unwrap();
-        let repo = std::fs::read_to_string(repo).unwrap();
-        assert!(user.contains(crate::config::GLOBAL_CONFIG_SCHEMA_URL));
-        assert!(repo.contains(crate::config::REPOSITORY_CONFIG_SCHEMA_URL));
-        assert!(user.contains("config_version = 1"));
-        assert!(repo.contains("config_version = 1"));
-        assert!(repo.contains("[worktrees]"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 
