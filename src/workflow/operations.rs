@@ -78,6 +78,10 @@ pub struct WorkflowProjection {
     pub completed_unix_ms: Option<i64>,
     pub steps: Vec<WorkflowStepProjection>,
     pub attempts: Vec<WorkflowAttemptProjection>,
+    pub artifacts: Vec<WorkflowArtifactProjection>,
+    pub approvals: Vec<WorkflowApprovalProjection>,
+    pub effects: Vec<WorkflowEffectProjection>,
+    pub gates: Vec<WorkflowGateProjection>,
     pub events: Vec<WorkflowAuditEvent>,
 }
 
@@ -88,6 +92,7 @@ pub struct WorkflowStepProjection {
     pub implementation: String,
     pub target_id: String,
     pub status: String,
+    pub input_json: String,
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -102,6 +107,61 @@ pub struct WorkflowAttemptProjection {
     pub process_start_time_ticks: Option<i64>,
     pub started_unix_ms: i64,
     pub finished_unix_ms: Option<i64>,
+    pub output: Vec<WorkflowOutputProjection>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct WorkflowOutputProjection {
+    pub sequence: i64,
+    pub stream: String,
+    pub body: Vec<u8>,
+    pub time_unix_ms: i64,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct WorkflowArtifactProjection {
+    pub id: String,
+    pub producing_attempt_id: Option<String>,
+    pub revision: i64,
+    pub digest: String,
+    pub size_bytes: i64,
+    pub sensitivity: String,
+    pub inline_body: Option<Vec<u8>>,
+    pub file_path: Option<String>,
+    pub created_unix_ms: i64,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct WorkflowApprovalProjection {
+    pub id: String,
+    pub step_id: Option<String>,
+    pub status: String,
+    pub requested_unix_ms: i64,
+    pub decided_unix_ms: Option<i64>,
+    pub decided_by: Option<String>,
+    pub decision_note: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct WorkflowEffectProjection {
+    pub id: String,
+    pub attempt_id: String,
+    pub effect_kind: String,
+    pub idempotency_key: String,
+    pub status: String,
+    pub request_json: String,
+    pub result_json: Option<String>,
+    pub created_unix_ms: i64,
+    pub updated_unix_ms: i64,
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct WorkflowGateProjection {
+    pub step_id: String,
+    pub gate_kind: String,
+    pub due_unix_ms: i64,
+    pub checkpoint_json: String,
+    pub poll_count: i64,
 }
 
 #[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -422,6 +482,7 @@ fn workflow_projection(run: crate::persistence::run_ledger::RunProjection) -> Wo
                 implementation: step.implementation,
                 target_id: step.target_id,
                 status: step.status,
+                input_json: step.input_json,
             })
             .collect(),
         attempts: run
@@ -438,6 +499,70 @@ fn workflow_projection(run: crate::persistence::run_ledger::RunProjection) -> Wo
                 process_start_time_ticks: attempt.process_start_time_ticks,
                 started_unix_ms: attempt.started_unix_ms,
                 finished_unix_ms: attempt.finished_unix_ms,
+                output: attempt
+                    .output
+                    .into_iter()
+                    .map(|output| WorkflowOutputProjection {
+                        sequence: output.sequence,
+                        stream: output.stream,
+                        body: output.body,
+                        time_unix_ms: output.time_unix_ms,
+                    })
+                    .collect(),
+            })
+            .collect(),
+        artifacts: run
+            .artifacts
+            .into_iter()
+            .map(|artifact| WorkflowArtifactProjection {
+                id: artifact.id,
+                producing_attempt_id: artifact.producing_attempt_id,
+                revision: artifact.revision,
+                digest: artifact.digest,
+                size_bytes: artifact.size_bytes,
+                sensitivity: artifact.sensitivity,
+                inline_body: artifact.inline_body,
+                file_path: artifact.file_path,
+                created_unix_ms: artifact.created_unix_ms,
+            })
+            .collect(),
+        approvals: run
+            .approvals
+            .into_iter()
+            .map(|approval| WorkflowApprovalProjection {
+                id: approval.id,
+                step_id: approval.step_id,
+                status: approval.status,
+                requested_unix_ms: approval.requested_unix_ms,
+                decided_unix_ms: approval.decided_unix_ms,
+                decided_by: approval.decided_by,
+                decision_note: approval.decision_note,
+            })
+            .collect(),
+        effects: run
+            .effects
+            .into_iter()
+            .map(|effect| WorkflowEffectProjection {
+                id: effect.id,
+                attempt_id: effect.attempt_id,
+                effect_kind: effect.effect_kind,
+                idempotency_key: effect.idempotency_key,
+                status: effect.status,
+                request_json: effect.request_json,
+                result_json: effect.result_json,
+                created_unix_ms: effect.created_unix_ms,
+                updated_unix_ms: effect.updated_unix_ms,
+            })
+            .collect(),
+        gates: run
+            .gates
+            .into_iter()
+            .map(|gate| WorkflowGateProjection {
+                step_id: gate.step_id,
+                gate_kind: gate.gate_kind,
+                due_unix_ms: gate.due_unix_ms,
+                checkpoint_json: gate.checkpoint_json,
+                poll_count: gate.poll_count,
             })
             .collect(),
         events: run
@@ -602,6 +727,10 @@ mod tests {
                     .write_immediate(|connection| {
                         Box::pin(async move {
                             sqlx::query("insert into plan_run (id, repo_root, scope_path, plan_path, plan_display, step_name, start_step, total_steps, mode, status, selected_step, created_unix_ms, updated_unix_ms) values ('plan-1', '/repo', '/repo', '/repo/plan.md', 'plan.md', 'phase', 1, 1, 'execute', 'completed', 1, 10, 20)")
+                                .execute(&mut *connection)
+                                .await
+                                .map_err(DatabaseError::Query)?;
+                            sqlx::query("insert into plan_step_run (run_id, step, prompt, status, started_unix_ms, finished_unix_ms, summary) values ('plan-1', 1, 'implement phase one', 'completed', 11, 19, 'done')")
                                 .execute(connection)
                                 .await
                                 .map_err(DatabaseError::Query)?;
@@ -644,6 +773,10 @@ mod tests {
                     .unwrap();
                 assert_eq!(imported.status, "succeeded");
                 assert_eq!(imported.repository.as_deref(), Some("/repo"));
+                assert_eq!(imported.steps.len(), 1);
+                assert_eq!(imported.steps[0].key, "phase-1");
+                assert_eq!(imported.steps[0].status, "succeeded");
+                assert_eq!(imported.steps[0].implementation, "legacy-history");
             });
         let _ = std::fs::remove_file(source_path);
         let _ = std::fs::remove_file(workflow_path);

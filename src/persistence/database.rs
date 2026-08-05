@@ -668,6 +668,39 @@ mod tests {
     }
 
     #[test]
+    fn historical_database_with_only_anchor_tables_matching_is_rejected() {
+        let path = test_path("partial-historical");
+        let options = writable_options(&path, true).unwrap();
+        let mut connection = connect(&path, options).unwrap();
+        block_on(async {
+            sqlx::raw_sql(include_str!("../../migrations/repository/0001_initial.sql"))
+                .execute(&mut connection)
+                .await?;
+            sqlx::query("drop table pr_cache")
+                .execute(&mut connection)
+                .await?;
+            sqlx::query("pragma user_version = 1")
+                .execute(&mut connection)
+                .await?;
+            sqlx::query(include_str!("../../sql/database/test_checkpoint.sql"))
+                .fetch_one(&mut connection)
+                .await?;
+            Ok(())
+        })
+        .unwrap();
+        drop(connection);
+        let before = std::fs::read(&path).unwrap();
+
+        assert!(matches!(
+            initialize(&path),
+            Err(DatabaseError::UnknownHistoricalSchema { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!path.with_extension("db.pre-sqlx-backup").exists());
+        remove_database(&path);
+    }
+
+    #[test]
     fn released_pre_sqlx_database_is_backed_up_and_adopted() {
         let path = test_path("adopt");
         let options = writable_options(&path, true).unwrap();
@@ -685,7 +718,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        drop(connection);
+        block_on(connection.close()).unwrap();
 
         initialize(&path).unwrap();
 
@@ -695,6 +728,15 @@ mod tests {
         );
         let backup = path.with_extension("db.pre-sqlx-backup");
         assert!(backup.is_file());
+        let mut backup_connection = open_readonly(&backup).unwrap();
+        let preserved: String = block_on(async {
+            sqlx::query_scalar("select value from metadata where key = 'preserved'")
+                .fetch_one(&mut backup_connection)
+                .await
+        })
+        .unwrap();
+        assert_eq!(preserved, "yes");
+        drop(backup_connection);
         remove_database(&backup);
         remove_database(&path);
     }

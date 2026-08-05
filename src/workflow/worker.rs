@@ -421,22 +421,27 @@ pub fn launch_bundled_coding(
     launch_bundled("bundled_coding_launch", launch)
 }
 
-fn launch_bundled<T: serde::Serialize>(kind: &str, launch: T) -> Result<String, String> {
-    ensure_running()?;
-    let response = request(&serde_json::json!({"type": kind, "launch": launch}).to_string())?;
+fn workflow_request(request_value: serde_json::Value) -> Result<serde_json::Value, String> {
+    let response = request(&request_value.to_string())?;
     let response: serde_json::Value = serde_json::from_str(&response)
         .map_err(|error| format!("decode workflow worker response: {error}"))?;
     if response["ok"] == true {
-        response["run_id"]
-            .as_str()
-            .map(str::to_string)
-            .ok_or_else(|| "workflow worker omitted run id".to_string())
+        Ok(response)
     } else {
         Err(response["error"]
             .as_str()
-            .unwrap_or("workflow launch failed")
+            .unwrap_or("workflow operation failed")
             .to_string())
     }
+}
+
+fn launch_bundled<T: serde::Serialize>(kind: &str, launch: T) -> Result<String, String> {
+    ensure_running()?;
+    let response = workflow_request(serde_json::json!({"type": kind, "launch": launch}))?;
+    response["run_id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "workflow worker omitted run id".to_string())
 }
 
 fn request_at(path: &WorkerSocketPath, command: &str) -> Result<String, String> {
@@ -830,230 +835,192 @@ fn workflow_socket_response(operations: &crate::WorkflowOperations, request: &st
             );
         }
     };
-    let result =
-        crate::async_runtime::block_on(async {
-            match request {
-                WorkflowSocketRequest::WorkflowRegisterDefinition { definition } => operations
-                    .register_definition(crate::DefinitionSnapshot {
-                        id: &definition.id,
-                        name: &definition.name,
-                        revision: &definition.revision,
-                        source: &definition.source,
-                        trusted: definition.trusted,
-                        body_json: &definition.body_json,
-                        digest: &definition.digest,
-                        now_unix_ms: definition.now_unix_ms,
-                    })
+    let result = crate::async_runtime::block_on(async {
+        match request {
+            WorkflowSocketRequest::WorkflowRegisterDefinition { definition } => operations
+                .register_definition(crate::DefinitionSnapshot {
+                    id: &definition.id,
+                    name: &definition.name,
+                    revision: &definition.revision,
+                    source: &definition.source,
+                    trusted: definition.trusted,
+                    body_json: &definition.body_json,
+                    digest: &definition.digest,
+                    now_unix_ms: definition.now_unix_ms,
+                })
+                .await
+                .map(|()| serde_json::json!({"ok": true})),
+            WorkflowSocketRequest::WorkflowLaunch { run, steps } => operations
+                .launch_materialized(
+                    crate::LaunchWorkflow {
+                        run_id: &run.run_id,
+                        definition_snapshot_id: &run.definition_snapshot_id,
+                        repository: run.repository.as_deref(),
+                        idempotency_key: &run.idempotency_key,
+                        now_unix_ms: run.now_unix_ms,
+                    },
+                    steps
+                        .into_iter()
+                        .map(|step| crate::WorkflowStep {
+                            id: step.id,
+                            key: step.key,
+                            implementation: step.implementation,
+                            target_id: step.target_id,
+                            input_json: step.input_json,
+                            dependencies: step.dependencies,
+                            resources: step.resources,
+                        })
+                        .collect(),
+                )
+                .await
+                .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id})),
+            WorkflowSocketRequest::BundledPlanLaunch { launch } => {
+                crate::workflow::bundled::launch_plan(operations, launch)
                     .await
-                    .map(|()| serde_json::json!({"ok": true})),
-                WorkflowSocketRequest::WorkflowLaunch { run, steps } => operations
-                    .launch_materialized(
-                        crate::LaunchWorkflow {
-                            run_id: &run.run_id,
-                            definition_snapshot_id: &run.definition_snapshot_id,
-                            repository: run.repository.as_deref(),
-                            idempotency_key: &run.idempotency_key,
-                            now_unix_ms: run.now_unix_ms,
-                        },
-                        steps
-                            .into_iter()
-                            .map(|step| crate::WorkflowStep {
-                                id: step.id,
-                                key: step.key,
-                                implementation: step.implementation,
-                                target_id: step.target_id,
-                                input_json: step.input_json,
-                                dependencies: step.dependencies,
-                                resources: step.resources,
-                            })
-                            .collect(),
-                    )
+                    .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id}))
+            }
+            WorkflowSocketRequest::BundledCodingLaunch { launch } => {
+                crate::workflow::bundled::launch_coding(operations, launch)
                     .await
-                    .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id})),
-                WorkflowSocketRequest::BundledPlanLaunch { launch } => {
-                    crate::workflow::bundled::launch_plan(operations, launch)
-                        .await
-                        .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id}))
-                }
-                WorkflowSocketRequest::BundledCodingLaunch { launch } => {
-                    crate::workflow::bundled::launch_coding(operations, launch)
-                        .await
-                        .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id}))
-                }
-                WorkflowSocketRequest::WorkflowList { repository, limit } => operations
-                    .list(repository.as_deref(), limit)
-                    .await
-                    .map(|runs| serde_json::json!({"ok": true, "runs": runs})),
-                WorkflowSocketRequest::WorkflowInspect { run_id } => {
-                    operations.inspect(&run_id).await.map(|run| {
-                        let run = run.map(|run| serde_json::json!({
-                        "id": run.id,
-                        "definition_name": run.definition_name,
-                        "status": run.status,
-                        "repository": run.repository,
-                        "created_unix_ms": run.created_unix_ms,
-                        "updated_unix_ms": run.updated_unix_ms,
-                        "completed_unix_ms": run.completed_unix_ms,
-                        "steps": run.steps.into_iter().map(|step| serde_json::json!({
-                            "id": step.id,
-                            "key": step.key,
-                            "implementation": step.implementation,
-                            "target_id": step.target_id,
-                            "status": step.status,
-                        })).collect::<Vec<_>>(),
-                        "attempts": run.attempts.into_iter().map(|attempt| serde_json::json!({
-                            "id": attempt.id,
-                            "step_id": attempt.step_id,
-                            "status": attempt.status,
-                            "worker_id": attempt.worker_id,
-                            "target_id": attempt.target_id,
-                            "fencing_token": attempt.fencing_token,
-                            "process_id": attempt.process_id,
-                            "process_start_time_ticks": attempt.process_start_time_ticks,
-                            "started_unix_ms": attempt.started_unix_ms,
-                            "finished_unix_ms": attempt.finished_unix_ms,
-                        })).collect::<Vec<_>>(),
-                        "events": run.events.into_iter().map(|event| serde_json::json!({
-                            "sequence": event.sequence,
-                            "step_id": event.step_id,
-                            "attempt_id": event.attempt_id,
-                            "kind": event.kind,
-                            "time_unix_ms": event.time_unix_ms,
-                            "data_json": event.data_json,
-                        })).collect::<Vec<_>>(),
-                    }));
-                        serde_json::json!({"ok": true, "run": run})
-                    })
-                }
-                WorkflowSocketRequest::WorkflowCommand {
-                    run_id,
-                    command,
+                    .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id}))
+            }
+            WorkflowSocketRequest::WorkflowList { repository, limit } => operations
+                .list(repository.as_deref(), limit)
+                .await
+                .map(|runs| serde_json::json!({"ok": true, "runs": runs})),
+            WorkflowSocketRequest::WorkflowInspect { run_id } => operations
+                .inspect(&run_id)
+                .await
+                .map(|run| serde_json::json!({"ok": true, "run": run})),
+            WorkflowSocketRequest::WorkflowCommand {
+                run_id,
+                command,
+                now_unix_ms,
+            } => operations
+                .command(
+                    &run_id,
+                    match command {
+                        SocketWorkflowCommand::Pause => crate::WorkflowCommand::Pause,
+                        SocketWorkflowCommand::Resume => crate::WorkflowCommand::Resume,
+                        SocketWorkflowCommand::Cancel => crate::WorkflowCommand::Cancel,
+                        SocketWorkflowCommand::Retry => crate::WorkflowCommand::Retry,
+                    },
                     now_unix_ms,
-                } => operations
-                    .command(
-                        &run_id,
-                        match command {
-                            SocketWorkflowCommand::Pause => crate::WorkflowCommand::Pause,
-                            SocketWorkflowCommand::Resume => crate::WorkflowCommand::Resume,
-                            SocketWorkflowCommand::Cancel => crate::WorkflowCommand::Cancel,
-                            SocketWorkflowCommand::Retry => crate::WorkflowCommand::Retry,
-                        },
-                        now_unix_ms,
-                    )
-                    .await
-                    .map(|()| serde_json::json!({"ok": true})),
-                WorkflowSocketRequest::WorkflowRequestApproval {
-                    id,
-                    run_id,
-                    step_id,
+                )
+                .await
+                .map(|()| serde_json::json!({"ok": true})),
+            WorkflowSocketRequest::WorkflowRequestApproval {
+                id,
+                run_id,
+                step_id,
+                now_unix_ms,
+            } => operations
+                .request_approval(&id, &run_id, &step_id, now_unix_ms)
+                .await
+                .map(|()| serde_json::json!({"ok": true})),
+            WorkflowSocketRequest::WorkflowDecideApproval {
+                id,
+                decision,
+                decided_by,
+                note,
+                now_unix_ms,
+            } => operations
+                .decide_approval(
+                    &id,
+                    match decision {
+                        SocketApprovalDecision::Approve => crate::ApprovalDecision::Approve,
+                        SocketApprovalDecision::Reject => crate::ApprovalDecision::Reject,
+                    },
+                    &decided_by,
+                    note.as_deref(),
                     now_unix_ms,
-                } => operations
-                    .request_approval(&id, &run_id, &step_id, now_unix_ms)
-                    .await
-                    .map(|()| serde_json::json!({"ok": true})),
-                WorkflowSocketRequest::WorkflowDecideApproval {
-                    id,
-                    decision,
-                    decided_by,
-                    note,
-                    now_unix_ms,
-                } => operations
-                    .decide_approval(
-                        &id,
-                        match decision {
-                            SocketApprovalDecision::Approve => crate::ApprovalDecision::Approve,
-                            SocketApprovalDecision::Reject => crate::ApprovalDecision::Reject,
-                        },
-                        &decided_by,
-                        note.as_deref(),
-                        now_unix_ms,
-                    )
-                    .await
-                    .map(|()| serde_json::json!({"ok": true})),
-                WorkflowSocketRequest::WorkflowGrantAuthority {
-                    id,
-                    run_id,
-                    scope,
-                    granted_by,
+                )
+                .await
+                .map(|()| serde_json::json!({"ok": true})),
+            WorkflowSocketRequest::WorkflowGrantAuthority {
+                id,
+                run_id,
+                scope,
+                granted_by,
+                now_unix_ms,
+                expires_unix_ms,
+            } => operations
+                .grant_authority(
+                    &id,
+                    &run_id,
+                    &scope,
+                    &granted_by,
                     now_unix_ms,
                     expires_unix_ms,
-                } => operations
-                    .grant_authority(
-                        &id,
-                        &run_id,
-                        &scope,
-                        &granted_by,
-                        now_unix_ms,
-                        expires_unix_ms,
-                    )
-                    .await
-                    .map(|()| serde_json::json!({"ok": true})),
-                WorkflowSocketRequest::WorkflowRegisterTrigger {
-                    id,
-                    definition_snapshot_id,
-                    overlap_policy,
-                    config_json,
+                )
+                .await
+                .map(|()| serde_json::json!({"ok": true})),
+            WorkflowSocketRequest::WorkflowRegisterTrigger {
+                id,
+                definition_snapshot_id,
+                overlap_policy,
+                config_json,
+                enabled,
+            } => operations
+                .register_trigger(
+                    &id,
+                    &definition_snapshot_id,
+                    &overlap_policy,
+                    &config_json,
                     enabled,
-                } => operations
-                    .register_trigger(
-                        &id,
-                        &definition_snapshot_id,
-                        &overlap_policy,
-                        &config_json,
-                        enabled,
-                    )
-                    .await
-                    .map(|()| serde_json::json!({"ok": true})),
-                WorkflowSocketRequest::WorkflowRecordTriggerOccurrence {
-                    id,
-                    trigger_id,
-                    deduplication_key,
+                )
+                .await
+                .map(|()| serde_json::json!({"ok": true})),
+            WorkflowSocketRequest::WorkflowRecordTriggerOccurrence {
+                id,
+                trigger_id,
+                deduplication_key,
+                due_unix_ms,
+            } => operations
+                .record_trigger_occurrence(&id, &trigger_id, &deduplication_key, due_unix_ms)
+                .await
+                .map(|inserted| serde_json::json!({"ok": true, "inserted": inserted})),
+            WorkflowSocketRequest::WorkflowCompleteTrigger {
+                occurrence_id,
+                run_id,
+                checkpoint_json,
+                now_unix_ms,
+            } => operations
+                .complete_trigger(&occurrence_id, &run_id, &checkpoint_json, now_unix_ms)
+                .await
+                .map(|()| serde_json::json!({"ok": true})),
+            WorkflowSocketRequest::WorkflowWaitOnGate {
+                step_id,
+                gate_kind,
+                due_unix_ms,
+                checkpoint_json,
+                now_unix_ms,
+            } => operations
+                .wait_on_gate(
+                    &step_id,
+                    &gate_kind,
                     due_unix_ms,
-                } => operations
-                    .record_trigger_occurrence(&id, &trigger_id, &deduplication_key, due_unix_ms)
-                    .await
-                    .map(|inserted| serde_json::json!({"ok": true, "inserted": inserted})),
-                WorkflowSocketRequest::WorkflowCompleteTrigger {
-                    occurrence_id,
-                    run_id,
-                    checkpoint_json,
+                    &checkpoint_json,
                     now_unix_ms,
-                } => operations
-                    .complete_trigger(&occurrence_id, &run_id, &checkpoint_json, now_unix_ms)
-                    .await
-                    .map(|()| serde_json::json!({"ok": true})),
-                WorkflowSocketRequest::WorkflowWaitOnGate {
-                    step_id,
-                    gate_kind,
-                    due_unix_ms,
-                    checkpoint_json,
-                    now_unix_ms,
-                } => operations
-                    .wait_on_gate(
-                        &step_id,
-                        &gate_kind,
-                        due_unix_ms,
-                        &checkpoint_json,
-                        now_unix_ms,
-                    )
-                    .await
-                    .map(|()| serde_json::json!({"ok": true})),
-                WorkflowSocketRequest::WorkflowImportLegacy {
-                    source_path,
-                    importer_revision,
-                    now_unix_ms,
-                } => operations
-                    .import_legacy_repository(&source_path, &importer_revision, now_unix_ms)
-                    .await
-                    .map(|summary| {
-                        serde_json::json!({
-                            "ok": true,
-                            "imported": summary.imported,
-                            "already_imported": summary.already_imported,
-                        })
-                    }),
-            }
-        });
+                )
+                .await
+                .map(|()| serde_json::json!({"ok": true})),
+            WorkflowSocketRequest::WorkflowImportLegacy {
+                source_path,
+                importer_revision,
+                now_unix_ms,
+            } => operations
+                .import_legacy_repository(&source_path, &importer_revision, now_unix_ms)
+                .await
+                .map(|summary| {
+                    serde_json::json!({
+                        "ok": true,
+                        "imported": summary.imported,
+                        "already_imported": summary.already_imported,
+                    })
+                }),
+        }
+    });
     match result {
         Ok(Ok(value)) => format!("{value}\n"),
         Ok(Err(error)) => format!(

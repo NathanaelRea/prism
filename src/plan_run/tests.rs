@@ -1,5 +1,8 @@
 use super::*;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[test]
 fn launch_creates_queued_steps_with_prompts() {
@@ -1336,9 +1339,9 @@ fn skip_and_archive_plan_run_hide_it_from_recent_runs() {
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!(
-        "{prefix}-{}-{:?}",
+        "{prefix}-{}-{}",
         std::process::id(),
-        std::thread::current().id()
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
     ));
     let _ = std::fs::remove_dir_all(&path);
     std::fs::create_dir_all(&path).unwrap();

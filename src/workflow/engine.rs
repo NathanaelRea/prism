@@ -1436,6 +1436,19 @@ mod tests {
                 assert_eq!(status, "succeeded");
                 assert_eq!(output, b"bounded output");
                 assert_eq!(artifact, b"artifact body");
+                let projection = crate::WorkflowOperations::from_database(database.clone())
+                    .inspect("run")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(projection.steps[0].input_json, "{}");
+                assert_eq!(projection.attempts[0].output.len(), 1);
+                assert_eq!(projection.attempts[0].output[0].body, b"bounded output");
+                assert_eq!(projection.artifacts.len(), 1);
+                assert_eq!(
+                    projection.artifacts[0].inline_body.as_deref(),
+                    Some(b"artifact body".as_slice())
+                );
                 database.close().await;
             });
         let _ = std::fs::remove_file(path);

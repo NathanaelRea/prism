@@ -43,6 +43,10 @@ url = "2.5"
 [dev-dependencies]
 sha2 = "0.10"
 
+[[bench]]
+name = "workflow_control_plane"
+harness = false
+
 [target.'cfg(target_os = "linux")'.dependencies]
 notify-rust = { version = "4.18", default-features = false, features = [
   "d_vendored",

@@ -1,0 +1,56 @@
+{
+  "db_name": "SQLite",
+  "query": "select\n  'plan' as \"kind!: String\",\n  run_id as \"run_id!: String\",\n  cast(step as text) as \"source_step_id!: String\",\n  'phase-' || step as \"step_key!: String\",\n  status as \"status!: String\",\n  coalesce(started_unix_ms, 0) as \"available_unix_ms!: i64\",\n  json_object(\n    'prompt', prompt,\n    'summary', summary,\n    'error', error,\n    'exit_code', exit_code\n  ) as \"input_json!: String\"\nfrom plan_step_run\nunion all\nselect\n  'auto' as \"kind!: String\",\n  run_id as \"run_id!: String\",\n  cast(id as text) as \"source_step_id!: String\",\n  step_key || '-attempt-' || attempt as \"step_key!: String\",\n  status as \"status!: String\",\n  coalesce(started_unix_ms, 0) as \"available_unix_ms!: i64\",\n  json_object(\n    'reason', reason,\n    'summary', summary,\n    'error', error,\n    'commit_sha', commit_sha,\n    'head_sha', head_sha\n  ) as \"input_json!: String\"\nfrom auto_step_run\norder by 1, 2, 3\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "kind!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "run_id!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "source_step_id!: String",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "step_key!: String",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "status!: String",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "available_unix_ms!: i64",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "input_json!: String",
+        "ordinal": 6,
+        "type_info": "Null"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "fcf62f5d8f74d7166e2bb3813164b0c73079367d605f2676c4bf191c9550e4b4"
+}

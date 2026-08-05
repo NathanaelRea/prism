@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -21,6 +22,26 @@ struct LegacyRun {
     status: String,
     created_unix_ms: i64,
     updated_unix_ms: i64,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct LegacyStep {
+    kind: String,
+    run_id: String,
+    source_step_id: String,
+    step_key: String,
+    status: String,
+    available_unix_ms: i64,
+    input_json: String,
+}
+
+#[derive(Clone, Debug, FromRow)]
+struct LegacyEvent {
+    run_id: String,
+    source_event_id: i64,
+    time_unix_ms: i64,
+    kind: String,
+    data_json: String,
 }
 
 pub(crate) async fn import_legacy_repository(
@@ -78,7 +99,30 @@ pub(crate) async fn import_legacy_repository(
     .fetch_all(&mut source)
     .await
     .map_err(DatabaseError::Query)?;
+    let steps = sqlx::query_file_as!(LegacyStep, "sql/workflow_ledger/load_legacy_steps.sql")
+        .fetch_all(&mut source)
+        .await
+        .map_err(DatabaseError::Query)?;
+    let events = sqlx::query_file_as!(LegacyEvent, "sql/workflow_ledger/load_legacy_events.sql")
+        .fetch_all(&mut source)
+        .await
+        .map_err(DatabaseError::Query)?;
     source.close().await.map_err(DatabaseError::Query)?;
+
+    let mut steps_by_run = BTreeMap::<(String, String), Vec<LegacyStep>>::new();
+    for step in steps {
+        steps_by_run
+            .entry((step.kind.clone(), step.run_id.clone()))
+            .or_default()
+            .push(step);
+    }
+    let mut events_by_run = BTreeMap::<String, Vec<LegacyEvent>>::new();
+    for event in events {
+        events_by_run
+            .entry(event.run_id.clone())
+            .or_default()
+            .push(event);
+    }
 
     install_legacy_definitions(database, now_unix_ms).await?;
     let source_identity = canonical.to_string_lossy().into_owned();
@@ -93,6 +137,14 @@ pub(crate) async fn import_legacy_repository(
         let imported_run_id = format!("legacy:{source_key}:{}:{}", run.kind, run.id);
         let source_identity = source_identity.clone();
         let importer_revision = importer_revision.clone();
+        let legacy_steps = steps_by_run
+            .remove(&(run.kind.clone(), run.id.clone()))
+            .unwrap_or_default();
+        let legacy_events = if run.kind == "auto" {
+            events_by_run.remove(&run.id).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let inserted = database
             .write_immediate(|connection| {
                 Box::pin(async move {
@@ -145,6 +197,35 @@ pub(crate) async fn import_legacy_repository(
                         .execute(&mut *connection)
                         .await
                         .map_err(DatabaseError::Query)?;
+                    for step in legacy_steps {
+                        let step_id = format!("{imported_run_id}:step:{}", step.source_step_id);
+                        sqlx::query("insert into workflow_step (id, run_id, step_key, implementation, target_id, status, available_unix_ms, input_json) values (?, ?, ?, 'legacy-history', 'legacy', ?, ?, ?)")
+                            .bind(step_id)
+                            .bind(&imported_run_id)
+                            .bind(step.step_key)
+                            .bind(imported_step_status(&step.status))
+                            .bind(step.available_unix_ms)
+                            .bind(step.input_json)
+                            .execute(&mut *connection)
+                            .await
+                            .map_err(DatabaseError::Query)?;
+                    }
+                    let mut sequence = 1_i64;
+                    for event in legacy_events {
+                        sequence = sequence.saturating_add(1);
+                        sqlx::query("insert into audit_event (run_id, sequence, kind, time_unix_ms, data_json) values (?, ?, ?, ?, ?)")
+                            .bind(&imported_run_id)
+                            .bind(sequence)
+                            .bind(format!("legacy_auto_{}", event.kind))
+                            .bind(event.time_unix_ms)
+                            .bind(serde_json::json!({
+                                "source_event_id": event.source_event_id,
+                                "source_data_json": event.data_json,
+                            }).to_string())
+                            .execute(&mut *connection)
+                            .await
+                            .map_err(DatabaseError::Query)?;
+                    }
                     sqlx::query("insert into import_journal (source_database_identity, source_schema_version, legacy_run_identity, importer_revision, status, imported_run_id, updated_unix_ms) values (?, ?, ?, ?, 'completed', ?, ?) on conflict(source_database_identity, source_schema_version, legacy_run_identity, importer_revision) do update set status = 'completed', imported_run_id = excluded.imported_run_id, updated_unix_ms = excluded.updated_unix_ms")
                         .bind(&source_identity)
                         .bind(source_schema_version)
@@ -216,6 +297,15 @@ async fn install_legacy_definitions(
             })
         })
         .await
+}
+
+fn imported_step_status(status: &str) -> &'static str {
+    match status {
+        "completed" | "succeeded" | "done" => "succeeded",
+        "failed" | "error" => "failed",
+        "cancelled" | "canceled" | "aborted" => "cancelled",
+        _ => "waiting",
+    }
 }
 
 fn imported_status(status: &str, updated_unix_ms: i64) -> (&'static str, Option<i64>) {

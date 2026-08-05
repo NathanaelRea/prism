@@ -316,7 +316,10 @@ pub(super) async fn adopt_historical_repository_database(path: &Path) -> Result<
     {
         return Ok(());
     }
-    let mut connection = SqliteConnection::connect_with(&options(path, false, false)?)
+    // Classification is deliberately read-only. A database that is unknown, corrupt, or from a
+    // future Prism version must not gain a WAL, migration table, or any other side effect merely
+    // because Prism inspected it.
+    let mut connection = SqliteConnection::connect_with(&options(path, false, true)?)
         .await
         .map_err(|source| DatabaseError::Connect {
             path: path.into(),
@@ -347,17 +350,31 @@ pub(super) async fn adopt_historical_repository_database(path: &Path) -> Result<
         });
     }
     validate_integrity(&mut connection).await?;
-    drop(connection);
+    if schema_contract(&mut connection).await? != canonical_repository_schema_contract().await? {
+        return Err(DatabaseError::UnknownHistoricalSchema {
+            path: path.into(),
+            user_version,
+        });
+    }
 
     let backup = path.with_extension("db.pre-sqlx-backup");
     if !backup.exists() {
-        std::fs::copy(path, &backup).map_err(|source| DatabaseError::Backup {
-            path: path.into(),
-            backup: backup.clone(),
-            source,
-        })?;
+        // `VACUUM INTO` uses SQLite's own consistent snapshot machinery, so committed WAL pages
+        // are included. Copying only the main file can silently produce an incomplete recovery
+        // artifact when the historical database is in WAL mode.
+        let backup_name = backup.to_string_lossy().into_owned();
+        sqlx::query("vacuum into ?")
+            .bind(backup_name)
+            .execute(&mut connection)
+            .await
+            .map_err(|source| DatabaseError::Backup {
+                path: path.into(),
+                backup: backup.clone(),
+                source: std::io::Error::other(source.to_string()),
+            })?;
         set_owner_only(&backup)?;
     }
+    connection.close().await.map_err(DatabaseError::Query)?;
 
     let mut connection = SqliteConnection::connect_with(&options(path, false, false)?)
         .await
@@ -392,6 +409,40 @@ pub(super) async fn adopt_historical_repository_database(path: &Path) -> Result<
             Err(DatabaseError::Query(source))
         }
     }
+}
+
+async fn canonical_repository_schema_contract()
+-> Result<Vec<(String, String, String, String)>, DatabaseError> {
+    let mut canonical = SqliteConnection::connect("sqlite::memory:")
+        .await
+        .map_err(DatabaseError::Query)?;
+    REPOSITORY_MIGRATOR
+        .run(&mut canonical)
+        .await
+        .map_err(DatabaseError::Migrate)?;
+    schema_contract(&mut canonical).await
+}
+
+async fn schema_contract(
+    connection: &mut SqliteConnection,
+) -> Result<Vec<(String, String, String, String)>, DatabaseError> {
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "select type, name, tbl_name, coalesce(sql, '') from sqlite_master where name not like 'sqlite_%' and name <> '_sqlx_migrations' order by type, name",
+    )
+    .fetch_all(connection)
+    .await
+    .map_err(DatabaseError::Query)?;
+    Ok(rows
+        .into_iter()
+        .map(|(kind, name, table, sql)| {
+            let normalized = sql
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_lowercase();
+            (kind, name, table, normalized)
+        })
+        .collect())
 }
 
 async fn validate_integrity(connection: &mut SqliteConnection) -> Result<(), DatabaseError> {

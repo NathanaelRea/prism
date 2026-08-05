@@ -370,10 +370,7 @@ esac
     fs::create_dir_all(repo.prism_dir()).unwrap();
     fs::write(
         repo.prism_dir().join("config.toml"),
-        format!(
-            "[tools]\ngit = {:?}\n",
-            git.display().to_string()
-        ),
+        format!("[tools]\ngit = {:?}\n", git.display().to_string()),
     )
     .unwrap();
     let config = Config::load(&repo);

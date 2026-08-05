@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use sqlx::FromRow;
 
 use super::error::DatabaseError;
@@ -56,6 +58,10 @@ pub(crate) struct RunProjection {
     pub completed_unix_ms: Option<i64>,
     pub steps: Vec<StepProjection>,
     pub attempts: Vec<AttemptProjection>,
+    pub artifacts: Vec<ArtifactProjection>,
+    pub approvals: Vec<ApprovalProjection>,
+    pub effects: Vec<EffectProjection>,
+    pub gates: Vec<GateProjection>,
     pub events: Vec<AuditProjection>,
 }
 
@@ -66,9 +72,10 @@ pub(crate) struct StepProjection {
     pub implementation: String,
     pub target_id: String,
     pub status: String,
+    pub input_json: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttemptProjection {
     pub id: String,
     pub step_id: String,
@@ -80,6 +87,84 @@ pub(crate) struct AttemptProjection {
     pub process_start_time_ticks: Option<i64>,
     pub started_unix_ms: i64,
     pub finished_unix_ms: Option<i64>,
+    pub output: Vec<OutputProjection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+struct AttemptRow {
+    id: String,
+    step_id: String,
+    status: String,
+    worker_id: String,
+    target_id: String,
+    fencing_token: i64,
+    process_id: Option<i64>,
+    process_start_time_ticks: Option<i64>,
+    started_unix_ms: i64,
+    finished_unix_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub(crate) struct OutputProjection {
+    pub sequence: i64,
+    pub stream: String,
+    pub body: Vec<u8>,
+    pub time_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+struct AttemptOutputRow {
+    attempt_id: String,
+    sequence: i64,
+    stream: String,
+    body: Vec<u8>,
+    time_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub(crate) struct ArtifactProjection {
+    pub id: String,
+    pub producing_attempt_id: Option<String>,
+    pub revision: i64,
+    pub digest: String,
+    pub size_bytes: i64,
+    pub sensitivity: String,
+    pub inline_body: Option<Vec<u8>>,
+    pub file_path: Option<String>,
+    pub created_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub(crate) struct ApprovalProjection {
+    pub id: String,
+    pub step_id: Option<String>,
+    pub status: String,
+    pub requested_unix_ms: i64,
+    pub decided_unix_ms: Option<i64>,
+    pub decided_by: Option<String>,
+    pub decision_note: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub(crate) struct EffectProjection {
+    pub id: String,
+    pub attempt_id: String,
+    pub effect_kind: String,
+    pub idempotency_key: String,
+    pub status: String,
+    pub request_json: String,
+    pub result_json: Option<String>,
+    pub created_unix_ms: i64,
+    pub updated_unix_ms: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, FromRow)]
+pub(crate) struct GateProjection {
+    pub step_id: String,
+    pub gate_kind: String,
+    pub due_unix_ms: i64,
+    pub checkpoint_json: String,
+    pub poll_count: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
@@ -346,24 +431,95 @@ impl RunLedger {
             .await
             .map_err(DatabaseError::Query)?;
         let Some(row) = row else { return Ok(None) };
-        let steps = sqlx::query_as::<_, StepProjection>(
-            "select id, step_key as key, implementation, target_id, status from workflow_step where run_id = ? order by id",
+        let steps = sqlx::query_file_as!(
+            StepProjection,
+            "sql/workflow_ledger/inspect_steps.sql",
+            run_id
         )
-        .bind(run_id)
         .fetch_all(self.database.readers())
         .await
         .map_err(DatabaseError::Query)?;
-        let attempts = sqlx::query_as::<_, AttemptProjection>(
-            "select attempt.id, attempt.step_id, attempt.status, attempt.worker_id, attempt.target_id, attempt.fencing_token, attempt.process_id, attempt.process_start_time_ticks, attempt.started_unix_ms, attempt.finished_unix_ms from step_attempt attempt join workflow_step step on step.id = attempt.step_id where step.run_id = ? order by attempt.started_unix_ms, attempt.id",
+        let attempt_rows = sqlx::query_file_as!(
+            AttemptRow,
+            "sql/workflow_ledger/inspect_attempts.sql",
+            run_id
         )
-        .bind(run_id)
         .fetch_all(self.database.readers())
         .await
         .map_err(DatabaseError::Query)?;
-        let events = sqlx::query_as::<_, AuditProjection>(
-            "select sequence, step_id, attempt_id, kind, time_unix_ms, data_json from audit_event where run_id = ? order by sequence",
+        let output_rows = sqlx::query_file_as!(
+            AttemptOutputRow,
+            "sql/workflow_ledger/inspect_output.sql",
+            run_id
         )
-        .bind(run_id)
+        .fetch_all(self.database.readers())
+        .await
+        .map_err(DatabaseError::Query)?;
+        let mut output_by_attempt = BTreeMap::<String, Vec<OutputProjection>>::new();
+        for output in output_rows {
+            output_by_attempt
+                .entry(output.attempt_id)
+                .or_default()
+                .push(OutputProjection {
+                    sequence: output.sequence,
+                    stream: output.stream,
+                    body: output.body,
+                    time_unix_ms: output.time_unix_ms,
+                });
+        }
+        let attempts = attempt_rows
+            .into_iter()
+            .map(|attempt| AttemptProjection {
+                output: output_by_attempt.remove(&attempt.id).unwrap_or_default(),
+                id: attempt.id,
+                step_id: attempt.step_id,
+                status: attempt.status,
+                worker_id: attempt.worker_id,
+                target_id: attempt.target_id,
+                fencing_token: attempt.fencing_token,
+                process_id: attempt.process_id,
+                process_start_time_ticks: attempt.process_start_time_ticks,
+                started_unix_ms: attempt.started_unix_ms,
+                finished_unix_ms: attempt.finished_unix_ms,
+            })
+            .collect();
+        let artifacts = sqlx::query_file_as!(
+            ArtifactProjection,
+            "sql/workflow_ledger/inspect_artifacts.sql",
+            run_id
+        )
+        .fetch_all(self.database.readers())
+        .await
+        .map_err(DatabaseError::Query)?;
+        let approvals = sqlx::query_file_as!(
+            ApprovalProjection,
+            "sql/workflow_ledger/inspect_approvals.sql",
+            run_id
+        )
+        .fetch_all(self.database.readers())
+        .await
+        .map_err(DatabaseError::Query)?;
+        let effects = sqlx::query_file_as!(
+            EffectProjection,
+            "sql/workflow_ledger/inspect_effects.sql",
+            run_id
+        )
+        .fetch_all(self.database.readers())
+        .await
+        .map_err(DatabaseError::Query)?;
+        let gates = sqlx::query_file_as!(
+            GateProjection,
+            "sql/workflow_ledger/inspect_gates.sql",
+            run_id
+        )
+        .fetch_all(self.database.readers())
+        .await
+        .map_err(DatabaseError::Query)?;
+        let events = sqlx::query_file_as!(
+            AuditProjection,
+            "sql/workflow_ledger/inspect_events.sql",
+            run_id
+        )
         .fetch_all(self.database.readers())
         .await
         .map_err(DatabaseError::Query)?;
@@ -377,6 +533,10 @@ impl RunLedger {
             completed_unix_ms: row.completed_unix_ms,
             steps,
             attempts,
+            artifacts,
+            approvals,
+            effects,
+            gates,
             events,
         }))
     }

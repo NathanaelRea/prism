@@ -102,6 +102,8 @@ fn worker_socket_owns_generalized_workflow_mutations_and_inspection() {
     assert_eq!(inspected["run"]["id"], "run");
     assert_eq!(inspected["run"]["definition_name"], "socket-tracer");
     assert_eq!(inspected["run"]["status"], "runnable");
+    assert_eq!(inspected["run"]["steps"][0]["input_json"], "{}");
+    assert_eq!(inspected["run"]["artifacts"], serde_json::json!([]));
     let listed = worker_request(
         &runtime,
         serde_json::json!({"type": "workflow_list", "repository": null, "limit": 8}),
@@ -123,13 +125,12 @@ fn worker_socket_owns_generalized_workflow_mutations_and_inspection() {
         ),
         serde_json::json!({"ok": true})
     );
-    assert_eq!(
-        worker_request(
-            &runtime,
-            serde_json::json!({"type": "workflow_inspect", "run_id": "run"}),
-        )["run"]["status"],
-        "waiting"
+    let waiting = worker_request(
+        &runtime,
+        serde_json::json!({"type": "workflow_inspect", "run_id": "run"}),
     );
+    assert_eq!(waiting["run"]["status"], "waiting");
+    assert_eq!(waiting["run"]["approvals"][0]["status"], "pending");
     assert_eq!(
         worker_request(
             &runtime,

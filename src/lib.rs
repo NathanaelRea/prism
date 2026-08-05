@@ -38,7 +38,9 @@ pub use workflow::engine::{
 };
 pub use workflow::operations::{
     ApprovalDecision, ControlPlaneMetric, DefinitionSnapshot, LaunchWorkflow, LegacyImportSummary,
-    WorkflowAttemptProjection, WorkflowAuditEvent, WorkflowCommand, WorkflowOperationError,
-    WorkflowOperations, WorkflowProjection, WorkflowStep, WorkflowStepProjection,
+    WorkflowApprovalProjection, WorkflowArtifactProjection, WorkflowAttemptProjection,
+    WorkflowAuditEvent, WorkflowCommand, WorkflowEffectProjection, WorkflowGateProjection,
+    WorkflowOperationError, WorkflowOperations, WorkflowOutputProjection, WorkflowProjection,
+    WorkflowStep, WorkflowStepProjection,
 };
 pub(crate) use workflow::{ci, execution, plan, review, verify, worker};

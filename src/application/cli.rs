@@ -117,7 +117,11 @@ pub fn run() -> Result<(), String> {
     result
 }
 
-fn run_config_command(command: ConfigCommand, repo: &Repository, config: &Config) -> Result<(), String> {
+fn run_config_command(
+    command: ConfigCommand,
+    repo: &Repository,
+    config: &Config,
+) -> Result<(), String> {
     match command {
         ConfigCommand::Show => config::print_config(repo, config),
         ConfigCommand::Example => print!("{}", config::config_example()),
