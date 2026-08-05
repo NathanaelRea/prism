@@ -864,6 +864,51 @@ pub fn poll_status(runtime: &OpencodeRuntime) -> Result<OpencodeStatus, String> 
     )
 }
 
+pub fn poll_status_authoritative(runtime: &OpencodeRuntime) -> Result<OpencodeStatus, String> {
+    let Some(session_id) = runtime.opencode_session_id.as_deref() else {
+        return poll_status(runtime);
+    };
+    let server_url = &runtime.server_url;
+    if !check_health(server_url) {
+        return Err("OpenCode server is unavailable".to_string());
+    }
+    let worktree = Path::new(&runtime.worktree_path);
+    let session = get_session_in_directory(server_url, session_id, Some(worktree))?
+        .ok_or_else(|| format!("OpenCode session {session_id} is unavailable"))?;
+    let directory = session
+        .directory
+        .as_deref()
+        .map(Path::new)
+        .or(Some(worktree));
+    let mut state = fetch_session_state(server_url, session_id, directory)?;
+    if fetch_pending_permission(server_url, session_id, directory)? {
+        state = OpencodeState::NeedsInput;
+    }
+    let mut messages = fetch_message_summary(server_url, session_id, directory)?;
+    if state == OpencodeState::Idle
+        && let Some(message_state) = messages.latest_turn_state
+    {
+        state = message_state;
+    }
+    if state == OpencodeState::NeedsInput {
+        messages.active_tool = None;
+    }
+    let todos = fetch_todos(server_url, session_id, directory)?;
+    Ok(OpencodeStatus {
+        server_url: Some(server_url.clone()),
+        session_id: Some(session_id.to_string()),
+        title: session.title,
+        state,
+        detail: messages.latest_error,
+        latest_message: messages.latest_message,
+        latest_user_message: messages.latest_user_message,
+        recent_messages: messages.recent_messages,
+        active_tool: messages.active_tool,
+        todos,
+        last_updated_unix_ms: Some(unix_ms()),
+    })
+}
+
 pub fn poll_session_status(server_url: &str, session_id: &str) -> Result<OpencodeStatus, String> {
     poll_session_status_in_directory(server_url, session_id, None)
 }

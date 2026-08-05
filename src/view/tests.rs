@@ -213,6 +213,8 @@ fn renders_selected_sidebar_rows_with_focused_style() {
     let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     let buffer = render_to_buffer(&model, 120, 30);
     let (_, row) = sidebar_cell_containing(&buffer, "feature");
+    let (git_x, git_row) = sidebar_cell_containing(&buffer, "✓");
+    assert_eq!(git_row, row);
 
     assert_cell_style(
         &buffer,
@@ -233,7 +235,7 @@ fn renders_selected_sidebar_rows_with_focused_style() {
     );
     assert_cell_style(
         &buffer,
-        23,
+        git_x,
         row,
         Style::default()
             .fg(Color::Green)
@@ -436,6 +438,32 @@ fn worktree_sidebar_keeps_configured_columns_before_prompt_text() {
 
     assert!(row.contains("3"), "got {row:?}");
     assert!(row.contains("agent"), "got {row:?}");
+}
+
+#[test]
+fn wide_worktree_sidebar_uses_extra_space_for_branch_names() {
+    let mut config = test_config();
+    config.layout.sidebar_width = Some(72);
+    config.worktree_columns = vec!["owner".to_string()];
+    let mut session = test_session("feature/sidebar-width-fix", AgentState::Running);
+    session
+        .wt_columns
+        .insert("owner".to_string(), "agent".to_string());
+    let sessions = vec![session];
+    let model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    let buffer = render_to_buffer(&model, 120, 30);
+    let (_, row_y) = sidebar_cell_containing(&buffer, "feature/sid");
+    let row = region_text(&buffer, 0..72, row_y..row_y + 1);
+
+    assert!(row.contains("feature/sidebar-width-fix"), "got {row:?}");
+    assert!(row.contains("agent"), "got {row:?}");
+}
+
+#[test]
+fn worktree_branch_width_is_bounded_and_reserves_configured_columns() {
+    assert_eq!(worktree_branch_width(20, &[]), 12);
+    assert_eq!(worktree_branch_width(100, &[]), 32);
+    assert_eq!(worktree_branch_width(70, &[("owner", 12), ("url", 12)]), 22);
 }
 
 #[test]
@@ -967,6 +995,85 @@ fn prompt_dialog_sets_cursor_at_end_of_input() {
 }
 
 #[test]
+fn text_area_renders_input_on_new_lines_with_updated_controls() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
+    model.dialog = Some(DialogModel::TextArea {
+        title: "Create Pull Request".to_string(),
+        prompt: "Description:\n".to_string(),
+        input: "First line\nSecond line".to_string(),
+    });
+
+    let backend = render_to_backend(&model, 100, 24);
+    let buffer = backend.buffer();
+
+    assert_ne!(
+        find_line(buffer, "Description:"),
+        find_line(buffer, "First line")
+    );
+    assert_ne!(
+        find_line(buffer, "First line"),
+        find_line(buffer, "Second line")
+    );
+    assert!(
+        buffer_to_string(buffer)
+            .contains("Enter for new line, Ctrl+Enter to submit, Esc to cancel")
+    );
+    assert_eq!(
+        backend.cursor_position().y,
+        find_line(buffer, "Second line")
+    );
+}
+
+#[test]
+fn text_area_cursor_uses_full_width_after_first_input_line() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
+    let last_line = "abcdefghijklmnopqrstuvwxyz1234";
+    model.dialog = Some(DialogModel::TextArea {
+        title: "Create Pull Request".to_string(),
+        prompt: "Description: ".to_string(),
+        input: format!("First line\n{last_line}"),
+    });
+
+    let backend = render_to_backend(&model, 40, 20);
+    let buffer = backend.buffer();
+    let y = find_line(buffer, last_line);
+    let line_start = line_text(buffer, y)
+        .chars()
+        .position(|character| character == 'a')
+        .expect("last input line");
+
+    assert_eq!(
+        backend.cursor_position(),
+        Position::new(line_start as u16 + last_line.len() as u16, y)
+    );
+}
+
+#[test]
+fn text_area_scrolls_to_keep_long_input_and_controls_visible() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
+    model.dialog = Some(DialogModel::TextArea {
+        title: "Create Pull Request".to_string(),
+        prompt: "Description:\n".to_string(),
+        input: (1..=10)
+            .map(|line| format!("Line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    });
+
+    let backend = render_to_backend(&model, 100, 10);
+    let buffer = backend.buffer();
+
+    assert!(buffer_to_string(buffer).contains("Ctrl+Enter to submit"));
+    assert_eq!(backend.cursor_position().y, find_line(buffer, "Line 10"));
+}
+
+#[test]
 fn prompt_dialog_geometry_is_stable_and_tail_truncates_input() {
     let area = Rect::new(0, 0, 80, 20);
     let short = DialogModel::Prompt {
@@ -1346,9 +1453,17 @@ fn renders_stabilization_pending_push_in_worktree_main_panel() {
 fn worktree_main_panel_renders_review_gate() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
-    let mut summary = test_pr_summary();
-    summary.requested_reviewers = vec!["review-team".to_string()];
-    session.pr = PrCache::observed(summary, None);
+    session.pr = PrCache::observed(
+        test_pr_summary(),
+        Some(PrDetails {
+            review_comments: vec![PrReviewComment {
+                body: "please fix this".to_string(),
+                resolved: false,
+                ..PrReviewComment::default()
+            }],
+            ..PrDetails::default()
+        }),
+    );
     let sessions = vec![session];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.auto_dashboard = Some(stabilization_dashboard(
@@ -1360,7 +1475,7 @@ fn worktree_main_panel_renders_review_gate() {
     let buffer = render_to_string(&model, 120, 40);
 
     assert!(buffer.contains("review"));
-    assert!(buffer.contains("pending"));
+    assert!(buffer.contains("needs review"));
 }
 
 #[test]
@@ -1368,7 +1483,7 @@ fn worktree_main_panel_passes_review_gate_without_actionable_feedback() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
     let mut summary = test_pr_summary();
-    summary.review_decision = "UNKNOWN".to_string();
+    summary.review_decision = "CHANGES_REQUESTED".to_string();
     session.pr = PrCache::observed(
         summary,
         Some(PrDetails {
@@ -1396,7 +1511,7 @@ fn worktree_main_panel_passes_review_gate_without_actionable_feedback() {
 }
 
 #[test]
-fn worktree_main_panel_keeps_provider_review_requirement_actionable() {
+fn worktree_main_panel_ignores_provider_review_state_without_unresolved_comments() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
     let mut summary = test_pr_summary();
@@ -1405,15 +1520,14 @@ fn worktree_main_panel_keeps_provider_review_requirement_actionable() {
     let sessions = vec![session];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.auto_dashboard = Some(stabilization_dashboard(
-        StabilizationBlocker::ReviewApprovalMissing,
-        StabilizationWorkKind::WaitForReview,
+        StabilizationBlocker::ReadyForManualMerge,
+        StabilizationWorkKind::MarkReadyForManualMerge,
         None,
     ));
 
     let buffer = render_to_string(&model, 120, 40);
 
-    assert!(buffer.contains("missing"));
-    assert!(!buffer.contains("passed"));
+    assert!(buffer.contains("passed"));
 }
 
 #[test]

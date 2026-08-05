@@ -967,6 +967,32 @@ pub(crate) fn observe_plan_and_save(
     Ok(work)
 }
 
+pub(crate) fn observe_cached_plan_and_save(
+    conn: &rusqlite::Connection,
+    repo: &Repository,
+    config: &Config,
+    session: &crate::session::Session,
+    persisted: &mut PersistedAutoRun,
+) -> Result<StabilizationWorkItem, String> {
+    let snapshot = stabilization_observe::build_stabilization_snapshot(
+        repo,
+        session,
+        Some(&persisted.run),
+        config,
+    );
+    let work = stabilization_plan::plan(&snapshot);
+    apply_state(persisted, &work.state());
+    persisted.run.status = persisted.authoritative_status();
+    persisted.run.updated_unix_ms = unix_ms();
+    save_run_with_conn(conn, &persisted.run)?;
+    super::save_observed_change_request_identity(
+        conn,
+        &persisted.run.id,
+        work.guard.change_request_identity.as_ref(),
+    )?;
+    Ok(work)
+}
+
 pub(crate) fn repair_commit_message(
     config: &Config,
     kind: &super::stabilization_model::RepairKind,
@@ -1002,9 +1028,13 @@ pub(crate) fn validate_and_begin_repair_commit(
                 repair_label(&kind)
             )
         })?;
-    if let WorkGuardDecision::Invalidated { reason } =
-        decide_work_guard(&kind, &original_guard, &observation.guard)
-    {
+    if let WorkGuardDecision::Invalidated { reason } = decide_repair_commit_guard(
+        config,
+        &persisted.run.worktree_path,
+        &kind,
+        &original_guard,
+        &observation.guard,
+    )? {
         let summary = format!("repair guard invalidated before commit: {reason}");
         super::finish_non_agent_step(
             conn,
@@ -1048,6 +1078,63 @@ pub(crate) fn validate_and_begin_repair_commit(
     );
     save_run_with_conn(conn, &persisted.run)?;
     Ok(RepairCommitGate::Ready)
+}
+
+fn decide_repair_commit_guard(
+    config: &Config,
+    path: &std::path::Path,
+    kind: &super::stabilization_model::RepairKind,
+    original: &WorkGuard,
+    current: &WorkGuard,
+) -> Result<WorkGuardDecision, String> {
+    if original.local_head_sha == current.local_head_sha {
+        return Ok(decide_work_guard(kind, original, current));
+    }
+
+    let mut expected = original.clone();
+    expected.local_head_sha = current.local_head_sha.clone();
+    if let invalid @ WorkGuardDecision::Invalidated { .. } =
+        decide_work_guard(kind, &expected, current)
+    {
+        return Ok(invalid);
+    }
+
+    let Some(original_head) = original.local_head_sha.as_deref() else {
+        return Ok(WorkGuardDecision::Invalidated {
+            reason: "local HEAD changed from an unknown repair baseline".to_string(),
+        });
+    };
+    let Some(current_head) = current.local_head_sha.as_deref() else {
+        return Ok(WorkGuardDecision::Invalidated {
+            reason: "local HEAD disappeared while the repair was in progress".to_string(),
+        });
+    };
+    if !crate::git::is_ancestor(path, config, original_head, current_head)? {
+        return Ok(WorkGuardDecision::Invalidated {
+            reason: "local HEAD was rewritten while the repair was in progress".to_string(),
+        });
+    }
+
+    Ok(WorkGuardDecision::Valid)
+}
+
+pub(crate) fn commit_repair_changes(
+    path: &std::path::Path,
+    config: &Config,
+    guarded_head: Option<&str>,
+    message: &str,
+) -> Result<crate::git::GitCommitResult, String> {
+    let current_head = crate::git::current_head_sha(path, config)?;
+    if guarded_head.is_some_and(|head| head != current_head)
+        && !crate::git::selected_dirty(path, config)?
+    {
+        return Ok(crate::git::GitCommitResult {
+            committed: true,
+            commit_sha: Some(current_head),
+            message: "agent committed changes".to_string(),
+        });
+    }
+    crate::git::commit_if_dirty(path, config, message)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1586,14 +1673,8 @@ mod tests {
                     .as_mut()
                     .unwrap()
                     .review
-                    .actionable_reviews
-                    .push(ActionableReviewItem::ReviewBody {
-                        review_id: "review".to_string(),
-                        author: "reviewer".to_string(),
-                        state: "CHANGES_REQUESTED".to_string(),
-                        body: "fix this".to_string(),
-                        submitted_at: "now".to_string(),
-                    });
+                    .unresolved_threads
+                    .push(unresolved_review_thread());
                 snapshot
             },
             {
@@ -2421,14 +2502,8 @@ mod tests {
             .as_mut()
             .unwrap()
             .review
-            .actionable_reviews
-            .push(ActionableReviewItem::ReviewBody {
-                review_id: "new-review".to_string(),
-                author: "reviewer".to_string(),
-                state: "CHANGES_REQUESTED".to_string(),
-                body: "please revise".to_string(),
-                submitted_at: "later".to_string(),
-            });
+            .unresolved_threads
+            .push(unresolved_review_thread());
         cases.push(review);
         let mut ci = ready.clone();
         ci.pull_request.as_mut().unwrap().ci.aggregate = PrCheckState::Failed;
@@ -2545,6 +2620,19 @@ mod tests {
                 cleanup_after_merge: false,
             },
             pending_push: None,
+        }
+    }
+
+    fn unresolved_review_thread() -> ReviewThreadFact {
+        ReviewThreadFact {
+            thread_id: "thread-1".to_string(),
+            comment_id: "comment-1".to_string(),
+            path: "src/lib.rs".to_string(),
+            line: Some(12),
+            body: "please fix".to_string(),
+            author: "reviewer".to_string(),
+            resolved: false,
+            created_at: "now".to_string(),
         }
     }
 

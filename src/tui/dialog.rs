@@ -20,6 +20,45 @@ pub(super) fn ctrl_key(event: KeyEvent) -> bool {
     event.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TextInputAction {
+    Submit,
+    Cancel,
+    Backspace,
+    Insert(char),
+    Newline,
+    Ignore,
+}
+
+pub(super) fn text_input_action(event: KeyEvent, multiline: bool) -> TextInputAction {
+    match event.code {
+        KeyCode::Enter if !multiline || ctrl_key(event) => TextInputAction::Submit,
+        KeyCode::Enter if plain_key(event) => TextInputAction::Newline,
+        KeyCode::Esc | KeyCode::Char('c') if event.code == KeyCode::Esc || ctrl_key(event) => {
+            TextInputAction::Cancel
+        }
+        KeyCode::Backspace => TextInputAction::Backspace,
+        KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => TextInputAction::Insert(ch),
+        _ => TextInputAction::Ignore,
+    }
+}
+
+fn text_input_model(title: &str, prompt: &str, input: &str, multiline: bool) -> view::DialogModel {
+    if multiline {
+        view::DialogModel::TextArea {
+            title: title.to_string(),
+            prompt: prompt.to_string(),
+            input: input.to_string(),
+        }
+    } else {
+        view::DialogModel::Prompt {
+            title: title.to_string(),
+            prompt: prompt.to_string(),
+            input: input.to_string(),
+        }
+    }
+}
+
 pub(super) fn confirmation_result(input: &str, default: bool) -> Option<bool> {
     match input.trim().to_ascii_lowercase().as_str() {
         "" => Some(default),
@@ -108,12 +147,13 @@ impl Tui {
             "R            edit repositories/order/keys/remove in repos.toml",
             "C            repos: open a worktree for a remote pull request",
             "c            repos: create worktree session in selected repo",
-            "+ / -        worktrees: raise/lower visibility sort",
+            "> / <        worktrees: raise/lower priority",
             "x            worktrees: abort selected agent session when supported",
             "M            worktrees: migrate selected worktree to the default harness",
             "H            choose the global default harness or add a generic harness",
             "e            edit selected repository config, then reload",
             "E            edit user config, then reload",
+            "w            edit Worktrunk user config; affects Prism and standalone wt",
             "W            repos: edit visible worktree columns in repo config",
             "o            worktrees: open the selected Worktrunk development URL",
             "L            worktrees: inspect bounded Worktrunk hook logs",
@@ -291,12 +331,29 @@ impl Tui {
         prompt: &str,
         initial: &str,
     ) -> Result<Option<String>, String> {
+        self.text_input_dialog(runtime, title, prompt, initial, false)
+    }
+
+    pub(crate) fn text_area_dialog(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        title: &str,
+        prompt: &str,
+        initial: &str,
+    ) -> Result<Option<String>, String> {
+        self.text_input_dialog(runtime, title, prompt, initial, true)
+    }
+
+    fn text_input_dialog(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        title: &str,
+        prompt: &str,
+        initial: &str,
+        multiline: bool,
+    ) -> Result<Option<String>, String> {
         let mut input = initial.to_string();
-        self.dialog = Some(view::DialogModel::Prompt {
-            title: title.to_string(),
-            prompt: prompt.to_string(),
-            input: input.clone(),
-        });
+        self.dialog = Some(text_input_model(title, prompt, &input, multiline));
         self.draw(runtime)?;
         loop {
             if self.tick_tui_action_jobs().any() {
@@ -312,32 +369,27 @@ impl Tui {
             if event.kind != KeyEventKind::Press {
                 continue;
             }
-            match event.code {
-                KeyCode::Enter => {
+            match text_input_action(event, multiline) {
+                TextInputAction::Submit => {
                     self.dialog = None;
                     self.draw(runtime)?;
                     return Ok(Some(input));
                 }
-                KeyCode::Esc | KeyCode::Char('c')
-                    if event.code == KeyCode::Esc || ctrl_key(event) =>
-                {
+                TextInputAction::Cancel => {
                     self.dialog = None;
                     self.draw(runtime)?;
                     return Ok(None);
                 }
-                KeyCode::Backspace => {
+                TextInputAction::Backspace => {
                     input.pop();
                 }
-                KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => {
+                TextInputAction::Insert(ch) => {
                     input.push(ch);
                 }
-                _ => {}
+                TextInputAction::Newline => input.push('\n'),
+                TextInputAction::Ignore => {}
             }
-            self.dialog = Some(view::DialogModel::Prompt {
-                title: title.to_string(),
-                prompt: prompt.to_string(),
-                input: input.clone(),
-            });
+            self.dialog = Some(text_input_model(title, prompt, &input, multiline));
             self.draw(runtime)?;
         }
     }

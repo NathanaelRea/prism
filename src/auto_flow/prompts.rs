@@ -109,7 +109,7 @@ pub(super) fn auto_verify_fix_prompt(run: &AutoRun, step: &AutoStepRun) -> Strin
 
 pub(super) fn auto_review_fix_prompt(run: &AutoRun, step: &AutoStepRun) -> String {
     format!(
-        "Resolve the review feedback for this branch, then stop without committing.\n\nOriginal task:\n{}\n\nReview context:\n{}",
+        "Resolve the review feedback for this branch and commit your changes, but do not push.\n\nOriginal task:\n{}\n\nReview context:\n{}",
         run.initial_prompt,
         step.reason
             .as_deref()
@@ -119,7 +119,7 @@ pub(super) fn auto_review_fix_prompt(run: &AutoRun, step: &AutoStepRun) -> Strin
 
 pub(super) fn auto_ci_fix_prompt(run: &AutoRun, step: &AutoStepRun) -> String {
     format!(
-        "CI failed for this branch. Fix the failure, then stop without committing.\n\nOriginal task:\n{}\n\nCI context:\n{}",
+        "CI failed for this branch. Fix the failure and commit your changes, but do not push.\n\nOriginal task:\n{}\n\nCI context:\n{}",
         run.initial_prompt,
         step.reason
             .as_deref()

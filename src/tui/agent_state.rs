@@ -1,4 +1,5 @@
 use crate::agent::AgentState;
+#[cfg(test)]
 use crate::desktop_notification::AgentObservation;
 use crate::repo::Repository;
 use crate::session::WorktreeSessionKey;
@@ -89,31 +90,37 @@ impl Tui {
         session_index: usize,
         mode: AgentObservationMode,
     ) {
-        let Some(session) = self.sessions.get(session_index) else {
-            return;
-        };
-        let Some(managed) = self.repos.get(session.repo_index) else {
-            return;
-        };
-        let key = session.identity_key(&managed.identity);
-        let state = session.agent_state;
-        let config = managed.config.notifications;
-        let observation = AgentObservation {
-            session: &key,
-            repo_label: &session.repo_label,
-            branch: &session.branch,
-            state,
-            config,
-        };
-        match mode {
-            AgentObservationMode::Baseline => self.desktop_notifier.baseline(observation),
-            AgentObservationMode::Transition => self.desktop_notifier.observe(observation),
-            AgentObservationMode::AttachedLiveness => {
-                self.desktop_notifier.observe_attached_liveness(observation)
+        #[cfg(not(test))]
+        let _ = (session_index, mode);
+        #[cfg(test)]
+        {
+            let Some(session) = self.sessions.get(session_index) else {
+                return;
+            };
+            let Some(managed) = self.repos.get(session.repo_index) else {
+                return;
+            };
+            let key = session.identity_key(&managed.identity);
+            let state = session.agent_state;
+            let config = managed.config.notifications;
+            let observation = AgentObservation {
+                session: &key,
+                repo_label: &session.repo_label,
+                branch: &session.branch,
+                state,
+                config,
+            };
+            match mode {
+                AgentObservationMode::Baseline => self.desktop_notifier.baseline(observation),
+                AgentObservationMode::Transition => self.desktop_notifier.observe(observation),
+                AgentObservationMode::AttachedLiveness => {
+                    self.desktop_notifier.observe_attached_liveness(observation)
+                }
             }
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn reseed_desktop_notifications(&mut self) {
         let observations = self
             .sessions

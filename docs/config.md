@@ -124,11 +124,13 @@ and doctor/debug troubleshooting.
 
 Desktop notifications are enabled by default for sessions waiting for input and for failures; `failed` also covers sessions that need to be restarted. Successful completion notifications default to off. The global switch and category switches may be overridden globally or in a repository config. Reloading config with `E` or `e` changes subsequent notifications without reporting sessions that are already blocked or finished.
 
-Prism uses the desktop notification service directly and does not run `notify-send` or detect a desktop environment. GNOME, KDE, and similar Linux desktops normally provide a notification server. Minimal Wayland compositors such as Hyprland and Sway require a daemon such as `mako`, `swaync`, or `dunst`. A missing server is non-fatal.
+The Prism Worker observes interactive Agent Sessions and owns a durable notification outbox. The first observation establishes a baseline, so starting or upgrading Prism does not replay existing attention states. Newer state changes supersede obsolete pending notifications, and notifications expire after ten minutes rather than arriving as a stale burst. `backend_accepted_unix_ms` records when the platform backend accepted a notification; desktop systems do not report whether a user saw it.
 
-On macOS, Notification Center owns permission prompts, Focus mode, and display preferences. Headless, container, and SSH sessions may have no graphical notification service; Prism does not forward notifications to the SSH client.
+On Linux, the worker uses the desktop notification service directly and does not run `notify-send` or detect a desktop environment. Notifications therefore continue while Prism is attached to tmux or the dashboard is closed. GNOME, KDE, and similar desktops normally provide a notification server. Minimal Wayland compositors such as Hyprland and Sway require a daemon such as `mako`, `swaync`, or `dunst`. A missing server is non-fatal and delivery is retried until the notification expires.
 
-Notifications are best effort and contain only the repository label, branch, and state description. They are emitted while the Prism dashboard event loop is running. Delivery can be delayed while Prism is blocked in an attached tmux client, and stops after Prism exits.
+On macOS, the worker forwards notifications to the most recently connected Prism dashboard, which asks its terminal to notify through the OSC 9 terminal protocol. Notification Center therefore lists the terminal, such as Ghostty, as the sender; enable notifications for that terminal and check its Focus and display preferences. The terminal must support OSC 9. Notifications remain pending while no dashboard is connected and expire after ten minutes. Headless and container sessions have no terminal notification service; an SSH client's support depends on whether it forwards the control sequence.
+
+Notifications are best effort and contain only the repository label, branch, and state description. OpenCode provides semantic input, completion, and failure observations. Other interactive harnesses currently provide tmux process-liveness observations, so Prism can report their completion but cannot infer input-required state by scraping terminal output.
 
 ## Harnesses
 
@@ -272,6 +274,8 @@ Use `W` in the TUI to open the selected repository's worktree column selector. T
 ## Worktrunk Environments
 
 Prism requires Worktrunk 0.58.0 or newer and currently tests against 0.71.0. Worktrunk project configuration belongs in the managed repository's `.config/wt.toml`; Prism reads the same machine output as standalone `wt list` and does not duplicate that configuration.
+
+Worktrunk's personal worktree path policy belongs in its user configuration. Press `w` to discover and open that file through Worktrunk. If the file is missing, Prism offers to create it with `wt config create`; Prism never parses or writes the file itself. The dialog makes explicit that changes affect both Prism and standalone `wt` commands. Use Worktrunk's top-level `worktree-path` for a global policy or its user-level `[projects."<identifier>"]` table for a personal repository override.
 
 Run long-lived development servers from a background `post-start` hook, not a blocking `pre-start` hook. `wt step tether` makes Worktrunk responsible for terminating the process tree when the worktree is removed:
 

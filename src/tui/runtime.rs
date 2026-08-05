@@ -7,7 +7,8 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{
         self, DisableFocusChange, EnableFocusChange, EnableMouseCapture, Event, KeyEvent,
-        MouseEvent,
+        KeyboardEnhancementFlags, MouseEvent, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{
@@ -46,6 +47,7 @@ impl TerminalRuntime {
             EnterAlternateScreen,
             EnableMouseCapture,
             EnableFocusChange,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
             Hide
         )
         .map_err(|error| error.to_string())
@@ -57,7 +59,13 @@ impl TerminalRuntime {
         let terminal = match Terminal::new(backend).map_err(|error| error.to_string()) {
             Ok(terminal) => terminal,
             Err(error) => {
-                let _ = execute!(io::stdout(), DisableFocusChange, LeaveAlternateScreen, Show);
+                let _ = execute!(
+                    io::stdout(),
+                    PopKeyboardEnhancementFlags,
+                    DisableFocusChange,
+                    LeaveAlternateScreen,
+                    Show
+                );
                 let _ = disable_raw_mode();
                 return Err(error);
             }
@@ -120,6 +128,7 @@ impl TerminalRuntime {
                 EnterAlternateScreen,
                 EnableMouseCapture,
                 EnableFocusChange,
+                PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
                 Hide
             )
             .map_err(|error| error.to_string())?;
@@ -219,6 +228,7 @@ impl TerminalRuntime {
         execute!(
             io::stdout(),
             crossterm::event::DisableMouseCapture,
+            PopKeyboardEnhancementFlags,
             DisableFocusChange,
             LeaveAlternateScreen,
             Clear(ClearType::All),
@@ -235,6 +245,7 @@ impl Drop for TerminalRuntime {
         let _ = execute!(
             io::stdout(),
             crossterm::event::DisableMouseCapture,
+            PopKeyboardEnhancementFlags,
             DisableFocusChange,
             LeaveAlternateScreen,
             Show

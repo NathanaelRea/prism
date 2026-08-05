@@ -60,8 +60,8 @@ impl KeyInput {
             KeyCode::Char('r') if plain_char(event) => Key::Refresh,
             KeyCode::Char('o') if plain_char(event) => Key::OpenDevelopmentUrl,
             KeyCode::Char('L') if plain_char(event) => Key::WorktrunkLogs,
-            KeyCode::Char('+') if plain_char(event) => Key::VisibilityUp,
-            KeyCode::Char('-') if plain_char(event) => Key::VisibilityDown,
+            KeyCode::Char('>') if plain_char(event) => Key::VisibilityUp,
+            KeyCode::Char('<') if plain_char(event) => Key::VisibilityDown,
             KeyCode::Char('0') if plain_char(event) => Key::FocusMain,
             KeyCode::Char('1') if plain_char(event) => Key::FocusStatus,
             KeyCode::Char('2') if plain_char(event) => Key::FocusRepos,
@@ -78,6 +78,7 @@ impl KeyInput {
             KeyCode::Char('R') if plain_char(event) => Key::ManageRepos,
             KeyCode::Char('e') if plain_char(event) => Key::EditConfig,
             KeyCode::Char('E') if plain_char(event) => Key::EditUserConfig,
+            KeyCode::Char('w') if plain_char(event) => Key::EditWorktrunkUserConfig,
             KeyCode::Char('H') if plain_char(event) => Key::SelectHarness,
             KeyCode::Char('D') if plain_char(event) => Key::Delete,
             KeyCode::Char('U') if plain_char(event) => Key::Unarchive,
@@ -204,6 +205,7 @@ pub enum Key {
     DeletePermanent,
     EditConfig,
     EditUserConfig,
+    EditWorktrunkUserConfig,
     SelectHarness,
     Search,
     Quit,
@@ -427,6 +429,10 @@ mod tests {
         );
         assert_eq!(map(&mut input, key(KeyCode::Char('e'))), Key::EditConfig);
         assert_eq!(
+            map(&mut input, key(KeyCode::Char('w'))),
+            Key::EditWorktrunkUserConfig
+        );
+        assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('E'))),
             Key::EditUserConfig
         );
@@ -445,15 +451,16 @@ mod tests {
     }
 
     #[test]
-    fn key_input_requires_plus_for_visibility_up() {
+    fn key_input_uses_angle_brackets_for_visibility() {
         let mut input = KeyInput::default();
-        assert_eq!(map(&mut input, key(KeyCode::Char('='))), Key::Other);
+        assert_eq!(map(&mut input, shift_key(KeyCode::Char('+'))), Key::Other);
+        assert_eq!(map(&mut input, key(KeyCode::Char('-'))), Key::Other);
         assert_eq!(
-            map(&mut input, shift_key(KeyCode::Char('+'))),
+            map(&mut input, shift_key(KeyCode::Char('>'))),
             Key::VisibilityUp
         );
         assert_eq!(
-            map(&mut input, key(KeyCode::Char('-'))),
+            map(&mut input, shift_key(KeyCode::Char('<'))),
             Key::VisibilityDown
         );
     }

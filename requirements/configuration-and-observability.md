@@ -4,6 +4,10 @@
 
 - **Behavior**: `E` edits and reloads global settings, distinct from `e` editing
   the selected repository's settings.
+- **Behavior**: `w` discovers the Worktrunk user configuration through
+  machine-readable Worktrunk output, offers to create a missing file through
+  Worktrunk, and opens it in the user's editor after explaining that changes
+  affect Prism and standalone `wt`. Prism does not parse or write this file.
 - **Invariant**: Effective repository configuration applies built-in defaults,
   then global settings, then repository settings. Unspecified repository values
   inherit their effective global values.
@@ -45,10 +49,15 @@
   Session transitions and may be overridden per repository.
 - **Invariant**: Enabling or reloading notifications establishes current Agent
   Session states as a baseline and never reports persisted attention states.
-- **Constraint**: Desktop notification delivery is best effort, nonblocking, and
-  limited to accepted transitions while the dashboard event loop runs. Missing
-  graphical services, queue pressure, and backend failures never change session
-  state or fail a workflow.
+- **Behavior**: The Prism Worker observes interactive Agent Sessions and records
+  accepted transitions in a durable per-repository outbox. New observations
+  supersede obsolete pending notifications, and undelivered notifications expire
+  after ten minutes rather than replaying as a stale burst.
+- **Constraint**: Desktop notification delivery is best effort and independent
+  from workflow state. Missing graphical services, queue pressure, expired
+  notifications, and backend failures never change session state or fail a
+  workflow. A backend-accepted timestamp is delivery evidence; Prism cannot know
+  whether the desktop displayed a notification or whether a user saw it.
 
 ## Verification Commands
 

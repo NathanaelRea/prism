@@ -91,7 +91,7 @@ impl Tui {
                 })
                 .collect::<Vec<_>>();
             for index in cleared {
-                self.queue_pr_persistence(index, false);
+                self.queue_pr_persistence(index, false, false);
                 changed = true;
             }
             if (force || summaries_due) && !summary_in_flight {
@@ -294,7 +294,7 @@ impl Tui {
                             .filter(|(_, session)| session.repo_index == repo_index)
                         {
                             if session.pr.record_remote_unavailable(error.clone()) {
-                                persistence.push(index);
+                                persistence.push((index, false));
                             }
                         }
                     } else {
@@ -324,18 +324,22 @@ impl Tui {
                             }) else {
                                 continue;
                             };
+                            let before_summary = self.sessions[index].pr.summary().cloned();
                             if apply_pr_summary_poll_result(
                                 &mut self.sessions[index].pr,
                                 poll_started_at,
                                 observation,
                                 &refreshed,
                             ) {
-                                persistence.push(index);
+                                persistence.push((
+                                    index,
+                                    before_summary != self.sessions[index].pr.summary().cloned(),
+                                ));
                             }
                         }
                     }
-                    for index in persistence {
-                        self.queue_pr_persistence(index, false);
+                    for (index, remote_update) in persistence {
+                        self.queue_pr_persistence(index, false, remote_update);
                     }
                     if let Some(summaries) = summary_evidence {
                         self.reconcile_remote_mutation_summaries(
@@ -374,10 +378,11 @@ impl Tui {
                     let session_index = (0..self.sessions.len())
                         .find(|index| key_for_index(*index).as_ref() == Some(&key));
                     if let Some(session_index) = session_index {
-                        let applied = {
+                        let (applied, remote_update) = {
                             let session = &mut self.sessions[session_index];
                             let before = pr_cache_render_signature(&session.pr);
                             let before_comments = pr_cache_comment_count(&session.pr);
+                            let before_details = session.pr.details().cloned();
                             let applied = apply_pr_details_poll_result(&mut session.pr, *cache);
                             if applied
                                 && pr_cache_comment_count(&session.pr) > before_comments
@@ -386,10 +391,12 @@ impl Tui {
                                 session.unseen_comments = true;
                             }
                             changed |= before != pr_cache_render_signature(&session.pr);
-                            applied
+                            let remote_update =
+                                applied && before_details != session.pr.details().cloned();
+                            (applied, remote_update)
                         };
                         if applied {
-                            self.queue_pr_persistence(session_index, true);
+                            self.queue_pr_persistence(session_index, true, remote_update);
                             let repository = self.repos[self.sessions[session_index].repo_index]
                                 .identity
                                 .clone();
@@ -403,8 +410,16 @@ impl Tui {
                     version,
                     details,
                     result,
+                    remote_update,
+                    status_label,
+                    auto_run,
                 } => {
                     if self.pr_persistence_versions.get(&key).copied() != Some(version) {
+                        if remote_update
+                            && let Some(request) = self.pr_persistence_pending.get_mut(&key)
+                        {
+                            request.remote_update = true;
+                        }
                         continue;
                     }
                     let session_index = self.sessions.iter().position(|session| {
@@ -417,9 +432,16 @@ impl Tui {
                         self.sessions[index]
                             .pr
                             .record_background_persistence_result(details, result);
+                        if remote_update && let Some(status_label) = status_label {
+                            changed |= self.sessions[index].status_label != status_label;
+                            self.sessions[index].status_label = status_label;
+                        }
                         changed |= before != pr_cache_render_signature(&self.sessions[index].pr);
                     } else if !self.pr_persistence_pending.contains_key(&key) {
                         self.pr_persistence_versions.remove(&key);
+                    }
+                    if let Ok(Some(run)) = auto_run {
+                        changed |= self.remember_auto_run(*run);
                     }
                 }
             }
@@ -428,7 +450,12 @@ impl Tui {
         changed
     }
 
-    pub(super) fn queue_pr_persistence(&mut self, session_index: usize, details: bool) {
+    pub(super) fn queue_pr_persistence(
+        &mut self,
+        session_index: usize,
+        details: bool,
+        mut remote_update: bool,
+    ) {
         let Some(session) = self.sessions.get(session_index) else {
             return;
         };
@@ -447,6 +474,10 @@ impl Tui {
             .entry(key.clone())
             .and_modify(|version| *version = version.saturating_add(1))
             .or_insert(1);
+        remote_update |= self
+            .pr_persistence_pending
+            .get(&key)
+            .is_some_and(|request| request.remote_update);
         self.pr_persistence_pending.insert(
             key.clone(),
             PrPersistenceRequest {
@@ -456,6 +487,10 @@ impl Tui {
                 repo: managed.repo.clone(),
                 branch: session.branch.clone(),
                 cache: session.pr.clone(),
+                remote_update,
+                session: session.background_job_snapshot(),
+                config: managed.config.clone(),
+                auto_run_id: self.active_auto_runs.get(&session.path).cloned(),
             },
         );
     }
@@ -475,7 +510,7 @@ impl Tui {
             .unwrap_or_default();
         let key = pr_poll_key(&managed.identity, generation, session);
         if self.pr_persistence_versions.contains_key(&key) {
-            self.queue_pr_persistence(session_index, details);
+            self.queue_pr_persistence(session_index, details, false);
             self.start_pr_persistence_jobs();
         }
     }
@@ -486,7 +521,7 @@ impl Tui {
         };
         session.pr = crate::remote::PrCache::default();
         session.unseen_comments = false;
-        self.queue_pr_persistence(session_index, false);
+        self.queue_pr_persistence(session_index, false, false);
         self.start_pr_persistence_jobs();
     }
 
@@ -512,11 +547,47 @@ impl Tui {
                 move |_| {
                     let result =
                         persist_pr_cache_snapshot(&request.repo, &request.branch, &request.cache);
+                    let (status_label, auto_run) = if result.is_ok() && request.remote_update {
+                        let status_label = Some(crate::git::git_status_label(
+                            &request.session.path,
+                            &request.config,
+                        ));
+                        let auto_run = request.auto_run_id.as_deref().map_or(Ok(None), |run_id| {
+                            crate::observability::with_writable_db(&request.repo, |conn| {
+                                let Some(mut run) = crate::auto_flow::load_auto_run(conn, run_id)?
+                                else {
+                                    return Ok(None);
+                                };
+                                let mut session = request.session;
+                                session.pr = request.cache.clone();
+                                crate::auto_flow::stabilization_execute::observe_cached_plan_and_save(
+                                    conn,
+                                    &request.repo,
+                                    &request.config,
+                                    &session,
+                                    &mut run,
+                                )?;
+                                Ok(Some(Box::new(run)))
+                            })
+                        });
+                        if let Err(error) = &auto_run {
+                            let _ = append_runtime_message(
+                                &request.repo,
+                                &format!("remote gate state refresh failed: {error}"),
+                            );
+                        }
+                        (status_label, auto_run)
+                    } else {
+                        (None, Ok(None))
+                    };
                     Ok(Some(TuiJobPayload::PrPoll(PrPollResult::Persistence {
                         key: request.key,
                         version: request.version,
                         details: request.details,
                         result,
+                        remote_update: request.remote_update,
+                        status_label,
+                        auto_run,
                     })))
                 },
             );

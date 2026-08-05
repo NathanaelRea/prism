@@ -613,7 +613,8 @@ impl Tui {
                 }
                 Ok(())
             }
-            RemoteActionValue::ChangeRequests(_)
+            RemoteActionValue::WorktrunkUserConfig(_)
+            | RemoteActionValue::ChangeRequests(_)
             | RemoteActionValue::CreatePrepared(_)
             | RemoteActionValue::MergeAuthorization { .. }
             | RemoteActionValue::NotApplicable

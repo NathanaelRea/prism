@@ -27,6 +27,7 @@ Prism uses a lazygit-style panel model.
 - Unavailable `Space g` actions are shown in dark gray and ignored. Remote actions require a known change request and provider capability; repair actions also require a headless-capable harness.
 - `P` opens plan mode from the selected repo or worktree, selects a Markdown plan with `fzf`, and runs each phase through the selected harness. Active plan runs render automatically in the Worktrees main panel for the selected worktree.
 - `A` starts or focuses Auto Flow for the selected non-default worktree. Focusing a run blocked by actionable inline review feedback refreshes its provider and, when supported, offers to mark all unresolved conversations resolved; the confirmation defaults to No.
+- `>` / `<` raises/lowers the selected worktree priority.
 - `u` pauses/resumes the selected Auto Flow or plan run from Status or the Worktrees main panel; paused Auto Flow resumes only after a dialog describes the next step.
 - `f` retries failed Auto Flow or Plan steps from the active dashboard.
 - `B` retries Auto Flow or Plan execution from the selected step.
@@ -43,6 +44,7 @@ Prism uses a lazygit-style panel model.
 - `x` also aborts the selected Plan phase from the active Plan dashboard, or accepts `all` when prompted to abort all running phases.
 - `e` edits the selected Prism repository config and reloads after save.
 - `E` edits the Prism user config and reloads after save.
+- `w` discovers and opens the Worktrunk user config. If it is missing, Prism offers to create it through `wt config create`. Changes affect Prism and standalone `wt` commands; Prism does not parse or write this file.
 - `C` opens a picker of remote change requests for the selected repository and creates or selects a local worktree using the request's head branch name. An existing local branch is reused without resetting it.
 - `W` opens the in-app worktree column selector for the selected repository. Use `Space` to enable/disable a column, `J`/`K` to move an enabled column down/up, and `Enter` to save.
 - `L` from the Worktrees panel opens the selected repository's Worktrunk hook-log picker and a bounded sanitized log tail. A matching branch label affects ordering only and does not assert session identity or process liveness.

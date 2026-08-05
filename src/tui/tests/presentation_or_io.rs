@@ -8,10 +8,11 @@ use ratatui::text::Line;
 
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
+use crate::auto_flow::stabilization_model::StabilizationBlocker;
 use crate::config::Config;
 use crate::opencode::{OpencodeState, OpencodeStatus};
 use crate::plan_run::{PlanOutputKind, PlanOutputLine};
-use crate::remote::PrCache;
+use crate::remote::{PrCache, PrDetails, PrReviewComment};
 use crate::repo::Repository;
 
 use super::super::{
@@ -19,7 +20,8 @@ use super::super::{
     PrSummarySessionResult, TmuxPortalCapture, TmuxPortalResult, TmuxPortalSnapshot, Tui,
 };
 use super::support::{
-    test_config, test_plan_run_with_steps, test_pr_summary, test_session, unique_temp_dir,
+    test_auto_run, test_config, test_plan_run_with_steps, test_pr_summary, test_session,
+    unique_temp_dir,
 };
 
 #[test]
@@ -110,6 +112,118 @@ fn applying_pr_poll_result_does_no_io_on_tui_thread() {
     assert!(changes.pull_requests);
     assert_eq!(tui.sessions[0].pr.summary().unwrap().number, 1);
     assert_eq!(tui.sessions[0].agent_state, AgentState::Running);
+
+    drop(tui);
+    let _ = fs::remove_dir_all(temp);
+}
+
+#[test]
+fn remote_review_update_replans_auto_flow_and_refreshes_worktree_status() {
+    let temp = unique_temp_dir("prism-tui-remote-gate-replan-test");
+    let worktree = temp.join("feature");
+    fs::create_dir_all(&worktree).unwrap();
+    let git = temp.join("git");
+    fs::write(
+        &git,
+        "#!/bin/sh\ncase \"$*\" in *\"status --short --branch\"*) printf '## feature...origin/feature [ahead 1]\\n' ;; esac\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&git).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&git, permissions).unwrap();
+
+    let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
+    let mut config = test_config();
+    config
+        .tools
+        .insert("git".to_string(), git.display().to_string());
+    let mut session = test_session(0, &temp.display().to_string(), "feature");
+    session.status_label = "clean".to_string();
+    let mut requested_changes = test_pr_summary(false);
+    requested_changes.review_decision = "CHANGES_REQUESTED".to_string();
+    requested_changes.check_status = "passed".to_string();
+    session.pr = PrCache::observed(
+        requested_changes,
+        Some(PrDetails {
+            review_comments: vec![PrReviewComment {
+                thread_id: "thread-1".to_string(),
+                body: "please fix this".to_string(),
+                resolved: false,
+                ..PrReviewComment::default()
+            }],
+            ..PrDetails::default()
+        }),
+    );
+    let mut tui = Tui::new_single(repo.clone(), config, vec![session]);
+
+    let mut run = test_auto_run("auto", &worktree.display().to_string(), 1);
+    run.run.repo_root = temp.display().to_string();
+    run.run.branch = "feature".to_string();
+    run.run.stabilization_blocker = Some(StabilizationBlocker::ReviewFeedbackFound);
+    crate::observability::with_writable_db(&repo, |conn| {
+        crate::auto_flow::save_auto_run(conn, &mut run)
+    })
+    .unwrap();
+    tui.remember_auto_run(run);
+
+    let repository = tui.repos[0].identity.clone();
+    let session_key = tui.sessions[0].identity_key(&repository);
+    let poll_started_at = Instant::now();
+    tui.sessions[0].pr.begin_summary_poll(poll_started_at);
+    let mut approved = test_pr_summary(false);
+    approved.review_decision = "APPROVED".to_string();
+    approved.check_status = "passed".to_string();
+    tui.pr_poll_tx
+        .send(PrPollResult::Summary {
+            repository: repository.clone(),
+            sessions: vec![session_key.clone()],
+            github_remote_configured: true,
+            capabilities: None,
+            summaries: Ok(vec![approved.clone()]),
+            observations: Ok(vec![PrSummarySessionResult {
+                key: session_key,
+                summary: Some(approved),
+            }]),
+            remote_branch_heads: BTreeMap::new(),
+            refreshed: "now".to_string(),
+            poll_started_at,
+        })
+        .unwrap();
+
+    tui.drain_pr_poll_results();
+    let wait_started = Instant::now();
+    while (!tui.pr_persistence_in_flight.is_empty() || !tui.pr_persistence_pending.is_empty())
+        && wait_started.elapsed() < Duration::from_secs(3)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+        tui.drain_pr_poll_results();
+    }
+
+    let generation = tui.worktree_generations[&tui.sessions[0].identity_key(&repository)];
+    let key =
+        PrPollKey::for_repository_session_generation(&repository, &tui.sessions[0], generation);
+    let mut resolved_details = tui.sessions[0].pr.begin_details_poll();
+    resolved_details.replace_details_for_test(PrDetails::default());
+    tui.pr_poll_tx
+        .send(PrPollResult::Details {
+            key,
+            cache: Box::new(resolved_details),
+        })
+        .unwrap();
+    tui.drain_pr_poll_results();
+    let wait_started = Instant::now();
+    while (!tui.pr_persistence_in_flight.is_empty() || !tui.pr_persistence_pending.is_empty())
+        && wait_started.elapsed() < Duration::from_secs(3)
+    {
+        std::thread::sleep(Duration::from_millis(10));
+        tui.drain_pr_poll_results();
+    }
+
+    assert_eq!(tui.sessions[0].status_label, "ahead 1");
+    assert_ne!(
+        tui.auto_runs["auto"].run.stabilization_blocker,
+        Some(StabilizationBlocker::ReviewFeedbackFound)
+    );
 
     drop(tui);
     let _ = fs::remove_dir_all(temp);

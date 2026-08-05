@@ -40,6 +40,9 @@ pub(crate) enum PrPollResult {
         version: u64,
         details: bool,
         result: Result<(), String>,
+        remote_update: bool,
+        status_label: Option<String>,
+        auto_run: Result<Option<Box<PersistedAutoRun>>, String>,
     },
 }
 
@@ -55,6 +58,10 @@ pub(crate) struct PrPersistenceRequest {
     pub(crate) repo: Repository,
     pub(crate) branch: String,
     pub(crate) cache: PrCache,
+    pub(crate) remote_update: bool,
+    pub(crate) session: Session,
+    pub(crate) config: Config,
+    pub(crate) auto_run_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]

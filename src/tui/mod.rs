@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{AutoOutputLine, PersistedAutoRun};
 use crate::config::Config;
+#[cfg(test)]
 use crate::desktop_notification::DesktopNotifier;
 use crate::input::{Key, KeyInput};
 use crate::plan_run::{PersistedPlanRun, PlanOutputLine};
@@ -40,12 +41,12 @@ mod workflow;
 mod tests;
 
 use agent_state::AgentStatePersistenceRequest;
-use dialog::{choice_list, ctrl_key};
 #[cfg(test)]
 use dialog::{
-    confirmation_result, move_enabled_ordered_item, selectable_choice_key, toggle_item_in_place,
-    toggle_ordered_item,
+    TextInputAction, confirmation_result, move_enabled_ordered_item, selectable_choice_key,
+    text_input_action, toggle_item_in_place, toggle_ordered_item,
 };
+use dialog::{choice_list, ctrl_key};
 pub(crate) use git_actions::GitAction;
 use job_orchestration::ShutdownReason;
 pub(crate) use job_orchestration::{TuiJobKey, TuiJobKind, TuiJobPayload};
@@ -86,6 +87,7 @@ pub struct Tui {
     pub(crate) repos: Vec<ManagedRepo>,
     pub(crate) current_repo: usize,
     pub(crate) sessions: Vec<Session>,
+    #[cfg(test)]
     pub(crate) desktop_notifier: DesktopNotifier,
     pub(crate) session_repository_identities: BTreeMap<usize, WorktreeRepositoryKey>,
     pub(crate) worktree_generations: BTreeMap<WorktreeSessionKey, u64>,
@@ -329,6 +331,7 @@ impl Tui {
             repos,
             current_repo,
             sessions,
+            #[cfg(test)]
             desktop_notifier: DesktopNotifier::new(),
             session_repository_identities,
             worktree_generations,
@@ -448,6 +451,7 @@ impl Tui {
             .map(|repo| repo.repo.root.clone());
         tui.load_remote_mutation_reconciliation_markers();
         tui.ensure_navigation_valid();
+        #[cfg(test)]
         tui.reseed_desktop_notifications();
         tui
     }
@@ -577,6 +581,8 @@ impl Tui {
         shutdown: &ShutdownNotification,
     ) -> Result<ShutdownReason, String> {
         crate::worker::ensure_running()?;
+        #[cfg(target_os = "macos")]
+        let _notification_subscription = crate::worker::subscribe_notifications()?;
         self.offer_interrupted_run_recovery(runtime)?;
         self.refresh_sessions_after_tmux()?;
         self.poll_tmux_portal();
@@ -1039,6 +1045,13 @@ impl Tui {
                     pending_g = false;
                     if let Err(error) = self.edit_user_config(runtime) {
                         self.show_error("edit user config failed", &error)?;
+                    }
+                }
+                Key::EditWorktrunkUserConfig => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    if let Err(error) = self.edit_worktrunk_user_config(runtime) {
+                        self.show_error("edit Worktrunk user config failed", &error)?;
                     }
                 }
                 Key::SelectHarness => {

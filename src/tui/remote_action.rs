@@ -113,6 +113,7 @@ pub(super) fn remote_action_timeout(abandon_cancelable: bool) -> Option<Duration
 }
 
 pub(crate) enum RemoteActionValue {
+    WorktrunkUserConfig(crate::worktrunk::UserConfigLocation),
     ChangeRequests(Vec<PrSummary>),
     Cache(Box<PrCache>),
     Resolved {

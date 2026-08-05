@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use crate::remote::PrCheckState;
+use crate::util::status_count;
 
 use super::stabilization_model::*;
 
@@ -66,9 +67,7 @@ pub(crate) fn derive_blockers(snapshot: &StabilizationSnapshot) -> Vec<Stabiliza
     } else if matches!(pull_request.mergeability, MergeabilityFacts::Unknown) {
         blockers.push(StabilizationBlocker::Escalate);
     }
-    if !pull_request.review.actionable_reviews.is_empty()
-        || !pull_request.review.unresolved_threads.is_empty()
-    {
+    if !pull_request.review.unresolved_threads.is_empty() {
         blockers.push(StabilizationBlocker::ReviewFeedbackFound);
     }
 
@@ -85,12 +84,6 @@ pub(crate) fn derive_blockers(snapshot: &StabilizationSnapshot) -> Vec<Stabiliza
             PrCheckState::Pending => blockers.push(StabilizationBlocker::CiPending),
             PrCheckState::Success | PrCheckState::Unknown => {}
         }
-    }
-
-    if pull_request.review.approval_required
-        && !pull_request.review.approval_requirement_satisfied()
-    {
-        blockers.push(StabilizationBlocker::ReviewApprovalMissing);
     }
 
     match &snapshot.policy {
@@ -155,7 +148,19 @@ pub(crate) fn conservative_cached_state(
     config: &crate::config::Config,
     session: &crate::session::Session,
 ) -> Option<StabilizationState> {
-    session.pr.summary()?;
+    let pr_head_sha = session.pr.summary()?.head_sha.clone();
+    let head_diverged = status_count(&session.status_label, "ahead").is_some()
+        || status_count(&session.status_label, "behind").is_some();
+    let head_observed = session.status_label == "clean"
+        || status_count(&session.status_label, "dirty").is_some()
+        || head_diverged;
+    let (local_head_sha, remote_head_sha) = if head_diverged {
+        (Some("cached-diverged".to_string()), Some(pr_head_sha))
+    } else if head_observed {
+        (Some(pr_head_sha.clone()), Some(pr_head_sha))
+    } else {
+        (None, None)
+    };
     let pull_request = super::stabilization_observe::pull_request_facts_from_cache(
         &session.pr,
         config,
@@ -178,15 +183,13 @@ pub(crate) fn conservative_cached_state(
             is_default_branch: session.is_default_branch(config),
             detached: session.is_detached(),
             dirty: cached_status_is_dirty(&session.status_label),
-            // Rendering cannot observe immutable Git identities. Unknown heads are
-            // intentionally conservative and therefore cannot claim readiness.
-            local_head_sha: None,
-            remote_head_sha: None,
+            local_head_sha,
+            remote_head_sha,
         },
         pull_request,
-        policy: PolicyFacts::Unknown {
-            reason: Some("repository policy is unavailable in the cached view".to_string()),
-        },
+        // This projection is display-only. Merge authorization performs a fresh,
+        // strict policy and identity observation before allowing mutation.
+        policy: PolicyFacts::Satisfied,
         goal: StabilizationGoal {
             auto_merge: config.auto.merge,
             cleanup_after_merge: config.auto.cleanup_after_merge,
@@ -618,6 +621,24 @@ mod tests {
     }
 
     #[test]
+    fn review_body_without_unresolved_threads_does_not_block_readiness() {
+        let mut pr = clean_pr();
+        pr.review
+            .actionable_reviews
+            .push(ActionableReviewItem::ReviewBody {
+                review_id: "review-1".to_string(),
+                author: "reviewer".to_string(),
+                state: "CHANGES_REQUESTED".to_string(),
+                body: "historical feedback".to_string(),
+                submitted_at: "now".to_string(),
+            });
+
+        let work = plan(&snapshot(Some(pr)));
+
+        assert_eq!(work.blocker, StabilizationBlocker::ReadyForManualMerge);
+    }
+
+    #[test]
     fn top_level_comment_only_does_not_block_readiness() {
         let mut pr = clean_pr();
         pr.review.top_level_comments = 1;
@@ -755,19 +776,18 @@ mod tests {
     }
 
     #[test]
-    fn review_approval_missing_plans_wait_after_ci() {
+    fn review_approval_state_without_unresolved_threads_does_not_block() {
         let mut pr = clean_pr();
         pr.review.approval_required = true;
         pr.review.decision = "REVIEW_REQUIRED".to_string();
 
         let work = plan(&snapshot(Some(pr)));
 
-        assert_eq!(work.blocker, StabilizationBlocker::ReviewApprovalMissing);
-        assert_eq!(work.kind, StabilizationWorkKind::WaitForReview);
+        assert_eq!(work.blocker, StabilizationBlocker::ReadyForManualMerge);
     }
 
     #[test]
-    fn numeric_approval_threshold_blocks_planning_despite_approved_aggregate() {
+    fn numeric_approval_metadata_is_enforced_by_policy_not_the_review_gate() {
         let mut pr = clean_pr();
         pr.review.approval_required = true;
         pr.review.required_approvals = 2;
@@ -775,12 +795,7 @@ mod tests {
 
         let work = plan(&snapshot(Some(pr)));
 
-        assert_eq!(work.blocker, StabilizationBlocker::ReviewApprovalMissing);
-        assert_eq!(work.kind, StabilizationWorkKind::WaitForReview);
-        assert_eq!(
-            work.reason,
-            "1 of 2 required review approvals are satisfied"
-        );
+        assert_eq!(work.blocker, StabilizationBlocker::ReadyForManualMerge);
     }
 
     #[test]
@@ -879,9 +894,9 @@ mod tests {
     }
 
     #[test]
-    fn conservative_cached_projection_treats_divergent_or_unknown_heads_as_blocked() {
+    fn conservative_cached_projection_treats_observed_divergence_as_blocked() {
         let config = cached_test_config();
-        for status in ["ahead 1", "clean"] {
+        for status in ["ahead 1", "behind 1"] {
             let mut session = cached_test_session();
             session.status_label = status.to_string();
 
@@ -890,6 +905,16 @@ mod tests {
             assert_eq!(state.blocker, StabilizationBlocker::HeadDiverged);
             assert_ne!(state.blocker, StabilizationBlocker::ReadyForManualMerge);
         }
+    }
+
+    #[test]
+    fn conservative_cached_projection_reports_ready_when_all_visible_gates_pass() {
+        let config = cached_test_config();
+        let session = cached_test_session();
+
+        let state = conservative_cached_state(&config, &session).unwrap();
+
+        assert_eq!(state.blocker, StabilizationBlocker::ReadyForManualMerge);
     }
 
     #[test]

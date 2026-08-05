@@ -103,6 +103,13 @@ impl PrCache {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_details_for_test(&mut self, details: PrDetails) {
+        self.details = Some(details);
+        self.details_association = self.summary_identity();
+        self.details_quality = PrObservationQuality::Fresh;
+    }
+
     pub(crate) fn require_reconciliation(&mut self, reason: &str) {
         if self.summary.is_some() {
             self.summary_quality = PrObservationQuality::PreservedStale;
@@ -112,6 +119,17 @@ impl PrCache {
         }
         self.summary_error = Some(reason.to_string());
         self.rebuild_error();
+    }
+
+    pub(crate) fn authorize_guarded_refresh(
+        &mut self,
+        identity: Option<&crate::remote::CanonicalChangeRequestIdentity>,
+        head_sha: Option<&str>,
+    ) {
+        let (Some(identity), Some(head_sha)) = (identity, head_sha) else {
+            return;
+        };
+        self.reauthorize_guarded_summary(identity, head_sha);
     }
 
     #[cfg(test)]
@@ -586,7 +604,7 @@ impl PrCheckState {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PrDetails {
     pub comments: Vec<PrComment>,
     pub reviews: Vec<PrReview>,
@@ -626,7 +644,7 @@ pub struct CiFailure {
     pub log_tail: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PrComment {
     #[serde(default)]
     pub id: String,
@@ -636,7 +654,7 @@ pub struct PrComment {
     pub created_at: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PrReview {
     #[serde(default)]
     pub id: String,
@@ -647,7 +665,7 @@ pub struct PrReview {
     pub submitted_at: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PrReviewComment {
     #[serde(default)]
     pub thread_id: String,

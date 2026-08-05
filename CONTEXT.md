@@ -169,6 +169,12 @@ leases, and supervises execution. Closing the TUI does not stop it. It is not a
 login service and does not automatically restart interrupted work after the
 daemon or machine stops.
 
+The Prism Worker also observes interactive Agent Sessions and owns desktop
+notification transition state, durable delivery intent, supersession, expiry,
+and retry policy. Platform delivery remains behind adapters: Linux uses the
+desktop notification service, while macOS forwards semantic notifications to
+an active TUI terminal subscription.
+
 Managed executor database connections install claim-bound SQLite guards. The
 guards reject run, step, output, event, and process writes unless the connection
 still owns the current unexpired fencing token; linked Plan writes use their

@@ -266,6 +266,31 @@ fn auto_prompt_template_overrides_default_and_renders_context() {
 }
 
 #[test]
+fn repair_prompts_require_commits_but_leave_pushes_to_prism() {
+    let repo = PathBuf::from("/repo/prism");
+    let persisted = AutoLaunch::new(&repo, &repo.join("feature"), "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+    let config = test_config();
+
+    for step_key in [AutoStepKey::FixReview, AutoStepKey::FixCi] {
+        let prompt = prompt_for_step(
+            &config,
+            &persisted.run,
+            &AutoStepRun::queued(
+                &persisted.run.id,
+                2,
+                step_key,
+                1,
+                Some("repair context".to_string()),
+            ),
+        );
+        assert!(prompt.contains("commit your changes, but do not push"));
+        assert!(!prompt.contains("without committing"));
+    }
+}
+
+#[test]
 fn plan_approval_pauses_and_resume_queues_run_plan() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
@@ -1444,7 +1469,7 @@ fn invalidated_repair_guard_replans_without_creating_a_commit() {
 
 #[cfg(unix)]
 #[test]
-fn ci_repair_commit_enters_pending_push_with_guard_data() {
+fn agent_committed_ci_repair_enters_pending_push_with_guard_data() {
     let temp = TempDir::new("ci-repair-pending-push");
     let origin = temp.path().join("origin.git");
     let work = temp.path().join("work");
@@ -1456,6 +1481,9 @@ fn ci_repair_commit_enters_pending_push_with_guard_data() {
     seed_pr_cache(&repo, "feat/auto", &remote_head);
 
     fs::write(work.join("ci.txt"), "ci fix\n").unwrap();
+    run_git(&work, &["add", "ci.txt"]);
+    run_git(&work, &["commit", "-m", "agent CI fix"]);
+    let agent_commit = git_output(&work, &["rev-parse", "HEAD"]);
     let mut config = test_config();
     configure_pr_observation(&temp, &mut config, "feat/auto", &remote_head);
     config.prompt_templates.insert(
@@ -1492,6 +1520,7 @@ fn ci_repair_commit_enters_pending_push_with_guard_data() {
     let guard = persisted.run.pending_push.as_ref().expect("pending push");
     let commit = git_output(&work, &["rev-parse", "HEAD"]);
     assert_eq!(guard.repair_kind, stabilization_model::RepairKind::Ci);
+    assert_eq!(guard.commit_sha, agent_commit);
     assert_eq!(guard.commit_sha, commit);
     assert_eq!(guard.expected_local_head_sha, commit);
     assert_eq!(
@@ -1505,7 +1534,7 @@ fn ci_repair_commit_enters_pending_push_with_guard_data() {
     assert!(guard.guarded_review_thread_ids.is_empty());
     assert_eq!(
         git_output(&work, &["log", "-1", "--pretty=%s"]),
-        "fix: ci template"
+        "agent CI fix"
     );
     assert_eq!(
         git_output(&work, &["rev-parse", "origin/feat/auto"]),
