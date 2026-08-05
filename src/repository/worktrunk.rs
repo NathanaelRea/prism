@@ -24,6 +24,9 @@ pub(crate) const SWITCH_PROCESS: ProcessDescriptor = ProcessDescriptor::new("wt.
 #[allow(dead_code)]
 pub(crate) const REMOVE_PROCESS: ProcessDescriptor = ProcessDescriptor::new("wt.remove");
 pub(crate) const APPROVALS_PROCESS: ProcessDescriptor = ProcessDescriptor::new("wt.approvals");
+pub(crate) const CONFIG_SHOW_PROCESS: ProcessDescriptor = ProcessDescriptor::new("wt.config_show");
+pub(crate) const CONFIG_CREATE_PROCESS: ProcessDescriptor =
+    ProcessDescriptor::new("wt.config_create");
 #[allow(dead_code)]
 pub(crate) const LOGS_PROCESS: ProcessDescriptor = ProcessDescriptor::new("wt.logs");
 
@@ -65,6 +68,12 @@ pub(crate) struct SwitchOutcome {
 pub(crate) struct RemoveOutcome {
     pub path: PathBuf,
     pub branch: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct UserConfigLocation {
+    pub path: PathBuf,
+    pub exists: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,6 +356,17 @@ struct HookLogJson {
     size: u64,
 }
 
+#[derive(Deserialize)]
+struct ConfigShowEnvelope {
+    user: ConfigShowUser,
+}
+
+#[derive(Deserialize)]
+struct ConfigShowUser {
+    path: PathBuf,
+    exists: bool,
+}
+
 pub(crate) fn switch_worktree(
     request: SwitchRequest<'_>,
 ) -> Result<SwitchOutcome, WorktrunkFailure> {
@@ -405,6 +425,41 @@ pub(crate) fn approval_command_display(repo: &Repository, config: &Config) -> St
     observability::command_display(&approvals_command(repo, config))
 }
 
+pub(crate) fn discover_user_config(
+    repo: &Repository,
+    config: &Config,
+) -> Result<UserConfigLocation, WorktrunkFailure> {
+    let mut command = config_show_command(repo, config);
+    let output = run_output_named(&mut command, ProcessPolicy::Metadata, CONFIG_SHOW_PROCESS)
+        .map_err(|error| WorktrunkFailure::process(&command, error))?;
+    if !output.status.success() {
+        return Err(WorktrunkFailure::from_output(&command, &output));
+    }
+    parse_config_show_output(&command, &output)
+}
+
+pub(crate) fn create_user_config(
+    repo: &Repository,
+    config: &Config,
+) -> Result<(), WorktrunkFailure> {
+    let mut command = config_create_command(repo, config);
+    let output = run_output_named(
+        &mut command,
+        ProcessPolicy::LocalMutation,
+        CONFIG_CREATE_PROCESS,
+    )
+    .map_err(|error| WorktrunkFailure::process(&command, error))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(WorktrunkFailure::from_output(&command, &output))
+    }
+}
+
+pub(crate) fn user_config_create_command_display(repo: &Repository, config: &Config) -> String {
+    observability::command_display(&config_create_command(repo, config))
+}
+
 pub(crate) fn is_approval_failure(output: &str) -> bool {
     APPROVAL_FAILURE_RE.is_match(output)
 }
@@ -459,6 +514,25 @@ fn parse_hook_log_output(
             size: entry.size,
         })
         .collect())
+}
+
+fn parse_config_show_output(
+    command: &Command,
+    output: &ProcessOutput,
+) -> Result<UserConfigLocation, WorktrunkFailure> {
+    let envelope = serde_json::from_str::<ConfigShowEnvelope>(&output.stdout)
+        .map_err(|error| WorktrunkFailure::malformed(command, output, error))?;
+    if envelope.user.path.as_os_str().is_empty() {
+        return Err(WorktrunkFailure::malformed(
+            command,
+            output,
+            "user config path is empty",
+        ));
+    }
+    Ok(UserConfigLocation {
+        path: envelope.user.path,
+        exists: envelope.user.exists,
+    })
 }
 
 pub(crate) fn read_hook_log_tail(repo: &Repository, path: &Path) -> Result<Vec<String>, String> {
@@ -726,6 +800,21 @@ fn list_command(repo: &Repository, config: &Config) -> Command {
         .arg("-C")
         .arg(&repo.root)
         .args(["list", "--format=json"]);
+    command
+}
+
+fn config_show_command(repo: &Repository, config: &Config) -> Command {
+    let mut command = Command::new(config.tool(&config.worktree_command));
+    command
+        .arg("-C")
+        .arg(&repo.root)
+        .args(["config", "show", "--format=json"]);
+    command
+}
+
+fn config_create_command(repo: &Repository, config: &Config) -> Command {
+    let mut command = Command::new(config.tool(&config.worktree_command));
+    command.arg("-C").arg(&repo.root).args(["config", "create"]);
     command
 }
 
@@ -1198,6 +1287,8 @@ mod tests {
     fn real_worktrunk_create_observe_remove_smoke() {
         let wt = std::env::var("PRISM_TEST_WORKTRUNK")
             .expect("PRISM_TEST_WORKTRUNK must point to Worktrunk");
+        let wt_config = std::env::var("WORKTRUNK_CONFIG_PATH")
+            .expect("WORKTRUNK_CONFIG_PATH must isolate the Worktrunk user config");
         let temp = unique_temp_dir("prism real worktrunk smoke");
         let root = temp.join("repo with spaces");
         fs::create_dir_all(&root).unwrap();
@@ -1220,6 +1311,11 @@ mod tests {
         let repo = Repository::with_config_dir_for_test(root, temp.join("prism-config"));
         let mut config = crate::test_support::test_config();
         config.tools.insert("wt".to_string(), wt);
+        let location = discover_user_config(&repo, &config).unwrap();
+        assert_eq!(location.path, PathBuf::from(&wt_config));
+        assert!(!location.exists);
+        create_user_config(&repo, &config).unwrap();
+        assert!(discover_user_config(&repo, &config).unwrap().exists);
         let created = switch_worktree(SwitchRequest {
             repo: &repo,
             config: &config,
@@ -1273,6 +1369,73 @@ mod tests {
                 "feat/topic with space;λ",
             ]
         );
+    }
+
+    #[test]
+    fn config_commands_use_selected_repository_and_machine_output() {
+        let repo = Repository::with_config_dir_for_test(
+            PathBuf::from("/repo/space and ünicode"),
+            PathBuf::from("/config"),
+        );
+        let config = crate::test_support::test_config();
+
+        assert_eq!(
+            config_show_command(&repo, &config)
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec![
+                "-C",
+                "/repo/space and ünicode",
+                "config",
+                "show",
+                "--format=json",
+            ]
+        );
+        assert_eq!(
+            config_create_command(&repo, &config)
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            vec!["-C", "/repo/space and ünicode", "config", "create"]
+        );
+    }
+
+    #[test]
+    fn config_show_parses_existing_and_missing_user_config_locations() {
+        let existing = parse_config_show_fixture(
+            r#"{"user":{"path":"/home/user/.config/worktrunk/config.toml","exists":true,"config":{}},"project":{}}"#,
+        )
+        .unwrap();
+        let missing = parse_config_show_fixture(
+            r#"{"user":{"path":"/home/user/.config/worktrunk/config.toml","exists":false,"config":null}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            existing,
+            UserConfigLocation {
+                path: PathBuf::from("/home/user/.config/worktrunk/config.toml"),
+                exists: true,
+            }
+        );
+        assert!(!missing.exists);
+        assert_eq!(missing.path, existing.path);
+    }
+
+    #[test]
+    fn config_show_rejects_missing_or_empty_user_config_locations() {
+        for fixture in [
+            r#"{}"#,
+            r#"{"user":null}"#,
+            r#"{"user":{"path":"","exists":false}}"#,
+            r#"{"user":{"path":"/config.toml"}}"#,
+        ] {
+            assert_eq!(
+                parse_config_show_fixture(fixture).unwrap_err().kind,
+                FailureKind::MalformedOutput
+            );
+        }
     }
 
     #[test]
@@ -1725,6 +1888,21 @@ mod tests {
             stderr_truncated: false,
         };
         parse_hook_log_output(&command, &output)
+    }
+
+    fn parse_config_show_fixture(stdout: &str) -> Result<UserConfigLocation, WorktrunkFailure> {
+        let mut command = Command::new("wt");
+        command.args(["config", "show", "--format=json"]);
+        let output = ProcessOutput {
+            status: success_status(),
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            stdout_total_bytes: stdout.len() as u64,
+            stdout_truncated: false,
+            stderr_total_bytes: 0,
+            stderr_truncated: false,
+        };
+        parse_config_show_output(&command, &output)
     }
 
     fn parse_remove_fixture(

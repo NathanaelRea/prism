@@ -50,7 +50,6 @@ jobs:
           export WORKTRUNK_CONFIG_PATH="$smoke_root/worktrunk.toml"
           export WORKTRUNK_WORKTREE_PATH="$smoke_root/worktrees/{{ branch | sanitize }}"
           export PRISM_TEST_WORKTRUNK="$(command -v wt)"
-          : > "$WORKTRUNK_CONFIG_PATH"
           cargo test repository::worktrunk::tests::real_worktrunk_create_observe_remove_smoke \
             -- --ignored --exact
       - name: Test real OpenCode integration

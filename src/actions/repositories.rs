@@ -299,6 +299,114 @@ impl Tui {
         Ok(())
     }
 
+    pub(crate) fn edit_worktrunk_user_config(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+    ) -> Result<(), String> {
+        let context = self
+            .selected_repo_context()
+            .ok_or_else(|| "no selected repository".to_string())?;
+        let mut location = self.discover_worktrunk_user_config(raw, &context)?;
+        let mut lines = vec![
+            crate::view::DialogLine {
+                text: "Worktree locations are managed by Worktrunk.".to_string(),
+                attention: false,
+            },
+            crate::view::DialogLine {
+                text: "Changes to this user config affect Prism and standalone wt commands."
+                    .to_string(),
+                attention: true,
+            },
+            crate::view::DialogLine {
+                text: format!("Config: {}", location.path.display()),
+                attention: false,
+            },
+        ];
+        let (prompt, default) = if location.exists {
+            ("Open the Worktrunk user config in your editor?", true)
+        } else {
+            lines.push(crate::view::DialogLine {
+                text: crate::worktrunk::user_config_create_command_display(
+                    &context.repo,
+                    &context.config,
+                ),
+                attention: false,
+            });
+            ("Create the Worktrunk user config and open it?", false)
+        };
+        if !self.confirm_dialog(raw, "Worktrunk Configuration", lines, prompt, default)? {
+            return Ok(());
+        }
+        if !location.exists {
+            let repo = context.repo.clone();
+            let config = context.config.clone();
+            let RemoteActionValue::Complete = self.run_remote_action(
+                raw,
+                crate::tui::RemoteActionRequest {
+                    key: TuiJobKey::Repository(self.repos[context.repo_index].identity.clone()),
+                    generation: self.session_inventory_generation,
+                    name: "worktrunk-config-create",
+                    title: "Worktrunk Configuration",
+                    message: "Creating Worktrunk user config",
+                    abandon_cancelable: false,
+                    mutation: None,
+                },
+                move || {
+                    crate::worktrunk::create_user_config(&repo, &config)
+                        .map_err(|error| error.to_string())?;
+                    Ok(RemoteActionValue::Complete)
+                },
+            )?
+            else {
+                return Err("Worktrunk config creation returned an unexpected result".to_string());
+            };
+            location = self.discover_worktrunk_user_config(raw, &context)?;
+            if !location.exists {
+                return Err(format!(
+                    "Worktrunk created its user config, but {} is still unavailable",
+                    location.path.display()
+                ));
+            }
+        }
+        let mut editor = editor_command(&location.path)?;
+        raw.suspend_for(|| crate::process::run_status_inherited(&mut editor))?;
+        for repo_index in 0..self.repos.len() {
+            self.request_worktrunk_refreshes(repo_index);
+        }
+        self.show_message("Worktrunk config closed; refreshing observations")?;
+        Ok(())
+    }
+
+    fn discover_worktrunk_user_config(
+        &mut self,
+        raw: &mut crate::tui_runtime::TerminalRuntime,
+        context: &SelectedRepoContext,
+    ) -> Result<crate::worktrunk::UserConfigLocation, String> {
+        let repo = context.repo.clone();
+        let config = context.config.clone();
+        let RemoteActionValue::WorktrunkUserConfig(location) = self.run_remote_action(
+            raw,
+            crate::tui::RemoteActionRequest {
+                key: TuiJobKey::Repository(self.repos[context.repo_index].identity.clone()),
+                generation: self.session_inventory_generation,
+                name: "worktrunk-config-show",
+                title: "Worktrunk Configuration",
+                message: "Locating Worktrunk user config",
+                abandon_cancelable: true,
+                mutation: None,
+            },
+            move || {
+                crate::worktrunk::discover_user_config(&repo, &config)
+                    .map(RemoteActionValue::WorktrunkUserConfig)
+                    .map_err(|error| error.to_string())
+            },
+        )?
+        else {
+            return Err("Worktrunk config discovery returned an unexpected result".to_string());
+        };
+        Ok(location)
+    }
+
     pub(crate) fn edit_worktree_columns(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,

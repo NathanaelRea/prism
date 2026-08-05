@@ -52,8 +52,9 @@ use crate::tui::{
     DefaultBranchPollResult, DeleteSessionKey, DeleteSessionResult, GitAction, ManagedRepo,
     OpencodeEventResult, OpencodeListenerKey, OpencodePollKey, OpencodePollResult,
     PrPersistenceRequest, PrPollKey, PrPollResult, PrSummarySessionResult, RemoteActionValue,
-    RemoteMergeOutcome, RemotePushPrepared, SessionRefreshResult, SessionRefreshSnapshot,
-    TUI_ACTION_JOB_TIMEOUT, Tui, TuiJobKey, TuiJobKind, TuiJobPayload, WtObservation, WtPollResult,
+    RemoteMergeOutcome, RemotePushPrepared, SelectedRepoContext, SessionRefreshResult,
+    SessionRefreshSnapshot, TUI_ACTION_JOB_TIMEOUT, Tui, TuiJobKey, TuiJobKind, TuiJobPayload,
+    WtObservation, WtPollResult,
 };
 use crate::tui_jobs::CoalescedFacet;
 
