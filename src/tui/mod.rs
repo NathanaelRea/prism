@@ -3,8 +3,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{MouseButton, MouseEventKind};
-
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{AutoOutputLine, PersistedAutoRun};
 use crate::config::Config;
@@ -605,9 +603,8 @@ impl Tui {
             let key = match event {
                 RuntimeEvent::Key(event) => key_input.map_event(event),
                 RuntimeEvent::Mouse(event) => {
-                    if matches!(event.kind, MouseEventKind::Down(MouseButton::Left)) {
-                        let area = runtime.area()?;
-                        self.handle_mouse_click(event.column, event.row, area);
+                    let area = runtime.area()?;
+                    if self.handle_mouse_event(event, area) {
                         self.draw(runtime)?;
                     } else {
                         crate::flight_recorder::finish_pending_input_without_frame();

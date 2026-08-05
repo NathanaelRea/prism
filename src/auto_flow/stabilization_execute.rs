@@ -1048,6 +1048,32 @@ pub(crate) fn observe_plan_and_save(
     Ok(work)
 }
 
+pub(crate) fn observe_cached_plan_and_save(
+    conn: &rusqlite::Connection,
+    repo: &Repository,
+    config: &Config,
+    session: &crate::session::Session,
+    persisted: &mut PersistedAutoRun,
+) -> Result<StabilizationWorkItem, String> {
+    let snapshot = stabilization_observe::build_stabilization_snapshot(
+        repo,
+        session,
+        Some(&persisted.run),
+        config,
+    );
+    let work = stabilization_plan::plan(&snapshot);
+    apply_state(persisted, &work.state());
+    persisted.run.status = persisted.authoritative_status();
+    persisted.run.updated_unix_ms = unix_ms();
+    save_run_with_conn(conn, &persisted.run)?;
+    super::save_observed_change_request_identity(
+        conn,
+        &persisted.run.id,
+        work.guard.change_request_identity.as_ref(),
+    )?;
+    Ok(work)
+}
+
 pub(crate) fn repair_commit_message(
     config: &Config,
     kind: &super::stabilization_model::RepairKind,
@@ -1722,15 +1748,7 @@ mod tests {
                 let mut snapshot = ready_manual_merge_snapshot();
                 let review = &mut snapshot.pull_request.as_mut().unwrap().review;
                 review.feedback_required = true;
-                review
-                    .actionable_reviews
-                    .push(ActionableReviewItem::ReviewBody {
-                        review_id: "review".to_string(),
-                        author: "reviewer".to_string(),
-                        state: "CHANGES_REQUESTED".to_string(),
-                        body: "fix this".to_string(),
-                        submitted_at: "now".to_string(),
-                    });
+                review.unresolved_threads.push(unresolved_review_thread());
                 snapshot
             },
             {
@@ -2556,14 +2574,8 @@ mod tests {
         let review_facts = &mut review.pull_request.as_mut().unwrap().review;
         review_facts.feedback_required = true;
         review_facts
-            .actionable_reviews
-            .push(ActionableReviewItem::ReviewBody {
-                review_id: "new-review".to_string(),
-                author: "reviewer".to_string(),
-                state: "CHANGES_REQUESTED".to_string(),
-                body: "please revise".to_string(),
-                submitted_at: "later".to_string(),
-            });
+            .unresolved_threads
+            .push(unresolved_review_thread());
         cases.push(review);
         let mut ci = ready.clone();
         ci.pull_request.as_mut().unwrap().ci.aggregate = PrCheckState::Failed;
@@ -2683,6 +2695,19 @@ mod tests {
                 cleanup_after_merge: false,
             },
             pending_push: None,
+        }
+    }
+
+    fn unresolved_review_thread() -> ReviewThreadFact {
+        ReviewThreadFact {
+            thread_id: "thread-1".to_string(),
+            comment_id: "comment-1".to_string(),
+            path: "src/lib.rs".to_string(),
+            line: Some(12),
+            body: "please fix".to_string(),
+            author: "reviewer".to_string(),
+            resolved: false,
+            created_at: "now".to_string(),
         }
     }
 

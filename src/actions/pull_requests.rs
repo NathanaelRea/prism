@@ -27,6 +27,17 @@ pub(super) fn unresolved_review_thread_ids(details: &crate::remote::PrDetails) -
     )
 }
 
+pub(super) fn ensure_review_resolution_head(
+    summary: &crate::remote::PrSummary,
+    expected_head_sha: &str,
+) -> Result<(), String> {
+    if summary.head_sha == expected_head_sha {
+        Ok(())
+    } else {
+        Err("pushed commit is not yet authoritatively visible on the pull request".to_string())
+    }
+}
+
 pub(super) fn pr_target_choice_list(origin: &str, upstream: &str) -> crate::view::ChoiceList {
     crate::view::ChoiceList {
         title: "Create Pull Request Target".to_string(),
@@ -214,8 +225,14 @@ pub(super) fn run_browser_opener(
 
 impl Tui {
     pub(crate) fn apply_remote_cache_result(&mut self, session_index: usize, cache: PrCache) {
+        let remote_update = self.sessions.get(session_index).is_some_and(|session| {
+            session.pr.summary() != cache.summary() || session.pr.details() != cache.details()
+        });
         if let Some(session) = self.sessions.get_mut(session_index) {
             session.pr = cache;
+        }
+        if remote_update {
+            self.queue_pr_persistence(session_index, true, true);
         }
     }
 
@@ -234,7 +251,7 @@ impl Tui {
             Ok(Some(summary)),
             &crate::util::timestamp_label(),
         );
-        self.queue_pr_persistence(session_index, false);
+        self.queue_pr_persistence(session_index, false, true);
     }
 
     pub(crate) fn resolve_review_comments(
@@ -978,12 +995,11 @@ impl Tui {
         if self.push_guarded_pending_repair(raw, selected, &context.repo, &context.config)? {
             return Ok(());
         }
-        if self.resolve_blocking_review_threads(raw, selected, &context.repo, &context.config)? {
-            return Ok(());
-        }
 
         let repo = context.repo.clone();
         let config = context.config.clone();
+        let follow_up_repo = repo.clone();
+        let follow_up_config = config.clone();
         let mut cache = self.sessions[selected].pr.clone();
         let worktree = self.sessions[selected]
             .identity_key(&self.repos[self.sessions[selected].repo_index].identity);
@@ -996,6 +1012,7 @@ impl Tui {
         let job_branch = branch.clone();
         let expected_push_guard =
             crate::remote::dispatcher::prepare_push(&path, &context.config, &branch)?;
+        let expected_pushed_head_sha = expected_push_guard.expected_head_sha.clone();
         let expected_push_target = remote_push_mutation_target(&expected_push_guard);
         let reconciliation_target = expected_push_target.clone();
         let RemoteActionValue::PushPrepared(prepared) = self.run_remote_action(
@@ -1063,6 +1080,15 @@ impl Tui {
             return Err("push returned an unexpected result".to_string());
         };
         self.apply_remote_cache_result(selected, prepared.cache);
+        if self.sessions[selected].pr.has_summary() {
+            self.resolve_blocking_review_threads(
+                raw,
+                selected,
+                &follow_up_repo,
+                &follow_up_config,
+                Some(expected_pushed_head_sha),
+            )?;
+        }
         if !self.sessions[selected].pr.has_summary() {
             let source_push = prepared
                 .push_guard
@@ -1260,6 +1286,7 @@ impl Tui {
         selected: usize,
         repo: &crate::repo::Repository,
         config: &crate::config::Config,
+        expected_pr_head_sha: Option<String>,
     ) -> Result<bool, String> {
         let path = self.sessions[selected].path.clone();
         let Some(run_id) = self.active_auto_runs.get(&path).cloned() else {
@@ -1320,6 +1347,9 @@ impl Tui {
                         .trusted_summary()?
                         .cloned()
                         .ok_or_else(|| "pull request summary is unavailable".to_string())?;
+                    if let Some(expected_head_sha) = expected_pr_head_sha.as_deref() {
+                        ensure_review_resolution_head(&summary, expected_head_sha)?;
+                    }
                     if thread_ids.is_empty() {
                         crate::observability::with_writable_db(&repo, |conn| {
                             crate::auto_flow::stabilization_execute::observe_plan_and_save(

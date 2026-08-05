@@ -100,8 +100,8 @@ use plans::plan_run_mode_from_parallel_confirmation;
 use polling::status_label_with_behind;
 #[cfg(test)]
 use pull_requests::{
-    apply_bulk_review_resolution, open_http_url_in_browser, pr_target_choice_list,
-    remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
+    apply_bulk_review_resolution, ensure_review_resolution_head, open_http_url_in_browser,
+    pr_target_choice_list, remote_pr_choice_keys, remote_pr_worktree_branch, run_browser_opener,
     unresolved_review_thread_ids, validate_push_target_after_checks,
 };
 #[cfg(test)]

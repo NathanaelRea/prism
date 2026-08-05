@@ -418,16 +418,7 @@ fn review_gate_label(
     }
     let requirement = config.auto.review_requirement;
     match requirement {
-        crate::config::ReviewRequirement::None => {
-            if summary
-                .review_decision
-                .eq_ignore_ascii_case("review_required")
-            {
-                "missing".to_string()
-            } else {
-                "passed".to_string()
-            }
-        }
+        crate::config::ReviewRequirement::None => "passed".to_string(),
         crate::config::ReviewRequirement::Resolved => {
             let Ok(Some(details)) = session.pr.trusted_details() else {
                 return "unknown".to_string();
@@ -515,6 +506,7 @@ fn gate_style(label: &str) -> Style {
     } else if normalized.contains("pending")
         || normalized.contains("unknown")
         || normalized.contains("feedback")
+        || normalized.contains("needs review")
     {
         attention_style()
     } else if normalized.contains("pass")

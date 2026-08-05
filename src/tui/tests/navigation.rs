@@ -1,6 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 
+use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
+
 use crate::auto_flow::AutoRunStatus;
 use crate::remote::PrCache;
 use crate::view::{RepoMainView, WorktreeMainView};
@@ -194,6 +197,27 @@ fn main_panel_scrolls_when_pr_comments_are_selectable() {
 
     assert_eq!(tui.main_scroll, 0);
     assert_eq!(tui.selected_comment, 0);
+}
+
+#[test]
+fn mouse_wheel_scrolls_only_when_pointer_is_over_main_panel() {
+    let mut tui = test_tui();
+    let area = Rect::new(0, 0, 120, 30);
+    let mouse = |kind, column| MouseEvent {
+        kind,
+        column,
+        row: 10,
+        modifiers: KeyModifiers::NONE,
+    };
+
+    assert!(tui.handle_mouse_event(mouse(MouseEventKind::ScrollDown, 80), area));
+    assert_eq!(tui.main_scroll, 1);
+
+    assert!(tui.handle_mouse_event(mouse(MouseEventKind::ScrollUp, 80), area));
+    assert_eq!(tui.main_scroll, 0);
+
+    assert!(!tui.handle_mouse_event(mouse(MouseEventKind::ScrollDown, 10), area));
+    assert_eq!(tui.main_scroll, 0);
 }
 
 #[test]
