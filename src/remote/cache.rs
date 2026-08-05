@@ -121,6 +121,17 @@ impl PrCache {
         self.rebuild_error();
     }
 
+    pub(crate) fn authorize_guarded_refresh(
+        &mut self,
+        identity: Option<&crate::remote::CanonicalChangeRequestIdentity>,
+        head_sha: Option<&str>,
+    ) {
+        let (Some(identity), Some(head_sha)) = (identity, head_sha) else {
+            return;
+        };
+        self.reauthorize_guarded_summary(identity, head_sha);
+    }
+
     #[cfg(test)]
     pub(crate) fn stale_for_test(details: Option<PrDetails>, error: &str) -> Self {
         Self {
