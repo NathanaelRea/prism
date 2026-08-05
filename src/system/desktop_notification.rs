@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "macos")]
+use std::io::Write;
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -46,6 +48,12 @@ struct Delivery {
     body: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeliveryMechanism {
+    NativeService,
+    TerminalOsc9,
+}
+
 enum DispatchMessage {
     Delivery(Delivery),
     #[cfg(test)]
@@ -70,14 +78,7 @@ pub(crate) struct DesktopNotifier {
 
 impl DesktopNotifier {
     pub(crate) fn new() -> Self {
-        Self::with_delivery(|delivery| {
-            notify_rust::Notification::new()
-                .summary(&delivery.title)
-                .body(&delivery.body)
-                .show()
-                .map(|_| ())
-                .map_err(|_| "backend")
-        })
+        Self::with_delivery(deliver_desktop_notification)
     }
 
     #[cfg(test)]
@@ -258,6 +259,59 @@ impl DesktopNotifier {
             let _ = rx.recv_timeout(Duration::from_secs(1));
         }
     }
+}
+
+fn delivery_mechanism(os: crate::platform::SupportedOs) -> DeliveryMechanism {
+    match os {
+        crate::platform::SupportedOs::Linux => DeliveryMechanism::NativeService,
+        crate::platform::SupportedOs::MacOs => DeliveryMechanism::TerminalOsc9,
+    }
+}
+
+fn deliver_desktop_notification(delivery: &Delivery) -> Result<(), &'static str> {
+    #[cfg(target_os = "linux")]
+    {
+        debug_assert_eq!(
+            delivery_mechanism(crate::platform::current_os()),
+            DeliveryMechanism::NativeService
+        );
+        notify_rust::Notification::new()
+            .summary(&delivery.title)
+            .body(&delivery.body)
+            .show()
+            .map(|_| ())
+            .map_err(|_| "backend")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        debug_assert_eq!(
+            delivery_mechanism(crate::platform::current_os()),
+            DeliveryMechanism::TerminalOsc9
+        );
+        let mut terminal = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/tty")
+            .map_err(|_| "terminal_open")?;
+        terminal
+            .write_all(&terminal_notification_payload(delivery))
+            .map_err(|_| "terminal_write")
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn terminal_notification_payload(delivery: &Delivery) -> Vec<u8> {
+    let text = format!("{}: {}", delivery.title, delivery.body);
+    let sanitized = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    format!("\x1b]9;{sanitized}\x1b\\").into_bytes()
 }
 
 impl Drop for DesktopNotifier {
@@ -528,5 +582,23 @@ mod tests {
         notifier.seed([observation(&session, AgentState::Running, config())]);
         notifier.observe(observation(&session, AgentState::ExitedError, config()));
         notifier.flush();
+    }
+
+    #[test]
+    fn macos_delivery_uses_a_sanitized_terminal_notification() {
+        assert_eq!(
+            delivery_mechanism(crate::platform::SupportedOs::MacOs),
+            DeliveryMechanism::TerminalOsc9
+        );
+        let payload = terminal_notification_payload(&Delivery {
+            kind: NotificationKind::Failed,
+            title: "Prism: Failed".to_string(),
+            body: "repo: branch failed\u{1b}]9;injected".to_string(),
+        });
+
+        assert_eq!(
+            payload,
+            b"\x1b]9;Prism: Failed: repo: branch failed ]9;injected\x1b\\"
+        );
     }
 }
