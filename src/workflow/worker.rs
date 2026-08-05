@@ -115,7 +115,11 @@ fn probe_health_at(path: &WorkerSocketPath) -> Result<DaemonHealth, String> {
         }
         Err(error) => return Err(format!("connect to Prism worker: {error}")),
     };
-    parse_health_response(&request_on_stream(stream, "health")?)
+    let response = request_on_stream(stream, "health")?;
+    if response.is_empty() {
+        return Ok(DaemonHealth::stopped());
+    }
+    parse_health_response(&response)
 }
 
 fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
