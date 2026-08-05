@@ -124,9 +124,9 @@ and doctor/debug troubleshooting.
 
 Desktop notifications are enabled by default for sessions waiting for input and for failures; `failed` also covers sessions that need to be restarted. Successful completion notifications default to off. The global switch and category switches may be overridden globally or in a repository config. Reloading config with `E` or `e` changes subsequent notifications without reporting sessions that are already blocked or finished.
 
-Prism uses the desktop notification service directly and does not run `notify-send` or detect a desktop environment. GNOME, KDE, and similar Linux desktops normally provide a notification server. Minimal Wayland compositors such as Hyprland and Sway require a daemon such as `mako`, `swaync`, or `dunst`. A missing server is non-fatal.
+On Linux, Prism uses the desktop notification service directly and does not run `notify-send` or detect a desktop environment. GNOME, KDE, and similar desktops normally provide a notification server. Minimal Wayland compositors such as Hyprland and Sway require a daemon such as `mako`, `swaync`, or `dunst`. A missing server is non-fatal.
 
-On macOS, Notification Center owns permission prompts, Focus mode, and display preferences. Headless, container, and SSH sessions may have no graphical notification service; Prism does not forward notifications to the SSH client.
+On macOS, Prism asks the terminal to notify through the OSC 9 terminal protocol. Notification Center therefore lists the terminal, such as Ghostty, as the sender; enable notifications for that terminal and check its Focus and display preferences. The terminal must support OSC 9. Headless and container sessions have no terminal notification service; an SSH client's support depends on whether it forwards the control sequence.
 
 Notifications are best effort and contain only the repository label, branch, and state description. They are emitted while the Prism dashboard event loop is running. Delivery can be delayed while Prism is blocked in an attached tmux client, and stops after Prism exits.
 
