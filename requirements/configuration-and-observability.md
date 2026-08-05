@@ -4,6 +4,10 @@
 
 - **Behavior**: `E` edits and reloads global settings, distinct from `e` editing
   the selected repository's settings.
+- **Behavior**: `w` discovers the Worktrunk user configuration through
+  machine-readable Worktrunk output, offers to create a missing file through
+  Worktrunk, and opens it in the user's editor after explaining that changes
+  affect Prism and standalone `wt`. Prism does not parse or write this file.
 - **Invariant**: Effective repository configuration applies built-in defaults,
   then global settings, then repository settings. Unspecified repository values
   inherit their effective global values.

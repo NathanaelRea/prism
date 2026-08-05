@@ -273,6 +273,8 @@ Use `W` in the TUI to open the selected repository's worktree column selector. T
 
 Prism requires Worktrunk 0.58.0 or newer and currently tests against 0.71.0. Worktrunk project configuration belongs in the managed repository's `.config/wt.toml`; Prism reads the same machine output as standalone `wt list` and does not duplicate that configuration.
 
+Worktrunk's personal worktree path policy belongs in its user configuration. Press `w` to discover and open that file through Worktrunk. If the file is missing, Prism offers to create it with `wt config create`; Prism never parses or writes the file itself. The dialog makes explicit that changes affect both Prism and standalone `wt` commands. Use Worktrunk's top-level `worktree-path` for a global policy or its user-level `[projects."<identifier>"]` table for a personal repository override.
+
 Run long-lived development servers from a background `post-start` hook, not a blocking `pre-start` hook. `wt step tether` makes Worktrunk responsible for terminating the process tree when the worktree is removed:
 
 ```toml

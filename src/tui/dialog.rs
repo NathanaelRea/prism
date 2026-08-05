@@ -114,6 +114,7 @@ impl Tui {
             "H            choose the global default harness or add a generic harness",
             "e            edit selected repository config, then reload",
             "E            edit user config, then reload",
+            "w            edit Worktrunk user config; affects Prism and standalone wt",
             "W            repos: edit visible worktree columns in repo config",
             "o            worktrees: open the selected Worktrunk development URL",
             "L            worktrees: inspect bounded Worktrunk hook logs",
