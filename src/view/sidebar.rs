@@ -189,7 +189,9 @@ fn repo_health_token(
     })
 }
 
-const WORKTREE_BRANCH_WIDTH: usize = 12;
+const WORKTREE_BRANCH_MIN_WIDTH: usize = 12;
+const WORKTREE_BRANCH_MAX_WIDTH: usize = 32;
+const WORKTREE_FIXED_WIDTH: usize = 20;
 
 pub(super) fn render_worktrees(
     frame: &mut Frame<'_>,
@@ -207,14 +209,6 @@ pub(super) fn render_worktrees(
         )))]
     } else {
         let repo_mode = model.worktree_list_mode == WorktreeListMode::Repo;
-        let configured_column_widths = if repo_mode {
-            configured_worktree_column_widths(
-                area.width.saturating_sub(2) as usize,
-                &model.config.worktree_columns,
-            )
-        } else {
-            Vec::new()
-        };
         let repo_width = model
             .worktrees
             .iter()
@@ -222,9 +216,18 @@ pub(super) fn render_worktrees(
             .max()
             .unwrap_or(4)
             .clamp(4, 10);
+        let inner_width = area.width.saturating_sub(2) as usize;
+        let content_width = inner_width.saturating_sub(if repo_mode { 0 } else { repo_width + 1 });
+        let configured_column_widths = if repo_mode {
+            configured_worktree_column_widths(content_width, &model.config.worktree_columns)
+        } else {
+            Vec::new()
+        };
+        let branch_width = worktree_branch_width(content_width, &configured_column_widths);
         let mut rows = vec![worktree_header_row(
             repo_mode,
             repo_width,
+            branch_width,
             &configured_column_widths,
         )];
         rows.extend(model.worktrees.iter().map(|worktree| {
@@ -238,7 +241,11 @@ pub(super) fn render_worktrees(
                     muted_style(),
                 ));
             }
-            spans.extend(worktree_base_spans(worktree, model.config.icon_style));
+            spans.extend(worktree_base_spans(
+                worktree,
+                model.config.icon_style,
+                branch_width,
+            ));
             if repo_mode {
                 spans.extend(configured_column_widths.iter().map(|(key, width)| {
                     let value = worktree
@@ -316,6 +323,7 @@ pub(super) fn render_worktrees(
 pub(super) fn worktree_header_row(
     repo_mode: bool,
     repo_width: usize,
+    branch_width: usize,
     configured_column_widths: &[(&str, usize)],
 ) -> ListItem<'static> {
     if !repo_mode {
@@ -323,11 +331,11 @@ pub(super) fn worktree_header_row(
             format!("{:<repo_width$} ", "repo"),
             muted_style(),
         )];
-        spans.extend(worktree_base_header_spans());
+        spans.extend(worktree_base_header_spans(branch_width));
         return ListItem::new(Line::from(spans));
     }
     ListItem::new(Line::from(
-        worktree_base_header_spans()
+        worktree_base_header_spans(branch_width)
             .into_iter()
             .chain(configured_column_widths.iter().map(|(key, width)| {
                 Span::styled(
@@ -339,13 +347,10 @@ pub(super) fn worktree_header_row(
     ))
 }
 
-fn worktree_base_header_spans() -> Vec<Span<'static>> {
+fn worktree_base_header_spans(branch_width: usize) -> Vec<Span<'static>> {
     vec![
         Span::styled("↕ ", muted_style()),
-        Span::styled(
-            format!("{:<width$} ", "branch", width = WORKTREE_BRANCH_WIDTH),
-            muted_style(),
-        ),
+        Span::styled(format!("{:<branch_width$} ", "branch"), muted_style()),
         Span::styled("K ", muted_style()),
         Span::styled("A ", muted_style()),
         Span::styled("P ", muted_style()),
@@ -359,6 +364,7 @@ fn worktree_base_header_spans() -> Vec<Span<'static>> {
 fn worktree_base_spans(
     worktree: &crate::view::WorktreeRow,
     icon_style: IconStyle,
+    branch_width: usize,
 ) -> Vec<Span<'static>> {
     let (pr_label, pr_style) = worktree_pr_column(worktree, icon_style);
     let (git_label, git_style) = worktree_git_column(worktree, icon_style);
@@ -380,9 +386,8 @@ fn worktree_base_spans(
             visibility_style(worktree.visibility),
         ),
         Span::raw(format!(
-            "{:<width$} ",
-            truncate_column(&worktree.branch, WORKTREE_BRANCH_WIDTH),
-            width = WORKTREE_BRANCH_WIDTH
+            "{:<branch_width$} ",
+            truncate_column(&worktree.branch, branch_width),
         )),
         Span::styled(
             format!("{} ", classification_marker(worktree.classification)),
@@ -458,7 +463,7 @@ pub(super) fn configured_worktree_column_widths(
     if configured_columns.is_empty() {
         return Vec::new();
     }
-    let base_width = 32;
+    let base_width = WORKTREE_FIXED_WIDTH + WORKTREE_BRANCH_MIN_WIDTH;
     let available = inner_width.saturating_sub(base_width);
     if available < 6 {
         return Vec::new();
@@ -472,6 +477,19 @@ pub(super) fn configured_worktree_column_widths(
         .iter()
         .map(|column| (column.as_str(), value_width.clamp(4, 12)))
         .collect()
+}
+
+pub(super) fn worktree_branch_width(
+    content_width: usize,
+    configured_column_widths: &[(&str, usize)],
+) -> usize {
+    let configured_width = configured_column_widths
+        .iter()
+        .map(|(_, width)| width + 2)
+        .sum::<usize>();
+    content_width
+        .saturating_sub(WORKTREE_FIXED_WIDTH + configured_width)
+        .clamp(WORKTREE_BRANCH_MIN_WIDTH, WORKTREE_BRANCH_MAX_WIDTH)
 }
 
 pub(super) fn truncate_column(value: &str, width: usize) -> String {
