@@ -520,11 +520,14 @@ fn execute_claim(repo: &Repository, claim: &ExecutionClaim) {
     );
     let config = Config::load(repo);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        observability::with_writable_db(repo, |conn| execution::validate_claim(conn, claim))
-            .and_then(|()| match claim.workflow.kind {
-                WorkflowKind::Auto => execute_auto(repo, &config, claim),
-                WorkflowKind::Plan => execute_plan(repo, &config, claim),
-            })
+        observability::with_writable_db(repo, |conn| {
+            execution::validate_claim(conn, claim)?;
+            execution::require_active_worktree_session(conn, &claim.workflow)
+        })
+        .and_then(|()| match claim.workflow.kind {
+            WorkflowKind::Auto => execute_auto(repo, &config, claim),
+            WorkflowKind::Plan => execute_plan(repo, &config, claim),
+        })
     }))
     .unwrap_or_else(|_| Err("workflow executor panicked".to_string()));
     heartbeat_stop.store(true, Ordering::Release);
@@ -533,6 +536,7 @@ fn execute_claim(repo: &Repository, claim: &ExecutionClaim) {
     let state = match result {
         Ok(()) => workflow_release_state(repo, &claim.workflow).unwrap_or(DispatchState::Terminal),
         Err(error) => {
+            log_claim_lifecycle(repo, "executor_failed", claim, &error);
             if !ownership_lost.load(Ordering::Acquire) {
                 mark_domain_failed(repo, claim, &error);
             }
@@ -607,12 +611,20 @@ fn execute_auto(repo: &Repository, config: &Config, claim: &ExecutionClaim) -> R
             persisted.run.harness_id, persisted.run.adapter_id, harness_config.adapter
         ));
     }
+    let worktree_session_id = persisted
+        .run
+        .worktree_session_id
+        .as_deref()
+        .ok_or_else(|| {
+            "auto run has no Worktree Session identity; legacy runs cannot execute".to_string()
+        })?;
     let runtime = crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
         .prepare_server(
             repo,
             config,
             &persisted.run.branch,
             &persisted.run.worktree_path,
+            worktree_session_id,
         )?
         .map(|runtime| runtime.server_url);
     let executor = crate::auto_flow::AutoExecutorConfig::for_harness(
@@ -654,8 +666,21 @@ fn execute_plan(repo: &Repository, config: &Config, claim: &ExecutionClaim) -> R
             persisted.run.harness_id, persisted.run.adapter_id, harness_config.adapter
         ));
     }
+    let worktree_session_id = persisted
+        .run
+        .worktree_session_id
+        .as_deref()
+        .ok_or_else(|| {
+            "plan run has no Worktree Session identity; legacy runs cannot execute".to_string()
+        })?;
     let server_url = crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
-        .prepare_server(repo, config, "plan", &persisted.run.scope_path)?
+        .prepare_server(
+            repo,
+            config,
+            "plan",
+            &persisted.run.scope_path,
+            worktree_session_id,
+        )?
         .map(|runtime| runtime.server_url);
     let mut executor = crate::plan_run::PlanExecutorConfig::for_harness(
         persisted.run.harness_id.clone(),

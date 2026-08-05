@@ -889,11 +889,15 @@ fn run_auto_command(
     if selected_dirty(&repo.root, config)? {
         return Err("Auto Flow requires a clean worktree at launch".to_string());
     }
-    let launch_options = auto_launch_options_for_command(repo, branch, command)?;
-    let launch = AutoLaunch::with_options(&repo.root, &repo.root, launch_options)?.with_harness(
-        config.default_harness.clone(),
-        config.harness_adapter(&config.default_harness)?,
-    );
+    let launch_options = auto_launch_options_for_command(repo, branch.clone(), command)?;
+    let worktree_session_id =
+        crate::session::ensure_worktree_session_identity(repo, &repo.root, &branch)?;
+    let launch = AutoLaunch::with_options(&repo.root, &repo.root, launch_options)?
+        .with_harness(
+            config.default_harness.clone(),
+            config.harness_adapter(&config.default_harness)?,
+        )
+        .with_worktree_session_id(worktree_session_id);
     let mut persisted = launch.create_run();
     observability::with_writable_db(repo, |conn| submit_auto_run(conn, &mut persisted))?;
     crate::worker::ensure_running()?;

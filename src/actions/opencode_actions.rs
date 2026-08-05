@@ -75,6 +75,7 @@ impl Tui {
             let harness_id = harness_config.default_harness.clone();
             let branch = session.branch.clone();
             let path = session.path.clone();
+            let worktree_session_id = session.worktree_session_id.clone();
             self.opencode_polls_in_flight.insert(key.clone());
             self.opencode_last_polled.insert(key.clone(), now);
             let job_key = key.clone();
@@ -86,14 +87,15 @@ impl Tui {
                 format!("prism-opencode-poll-{}", session_index),
                 move |_| {
                     let status =
-                        load_runtime(&repo, &harness_id, &branch, &path).and_then(|runtime| {
-                            let Some(runtime) = runtime else {
-                                return Err("no OpenCode runtime exists yet".to_string());
-                            };
-                            let runtime =
-                                opencode::refresh_opencode_session(&repo, runtime, &path)?;
-                            opencode::poll_status(&runtime)
-                        });
+                        load_runtime(&repo, &harness_id, &branch, &path, &worktree_session_id)
+                            .and_then(|runtime| {
+                                let Some(runtime) = runtime else {
+                                    return Err("no OpenCode runtime exists yet".to_string());
+                                };
+                                let runtime =
+                                    opencode::refresh_opencode_session(&repo, runtime, &path)?;
+                                opencode::poll_status(&runtime)
+                            });
                     Ok(Some(TuiJobPayload::OpencodePoll(OpencodePollResult {
                         key: job_key,
                         started_at: now,
@@ -549,6 +551,7 @@ impl Tui {
                 &session_config,
                 &self.sessions[selected].branch,
                 &self.sessions[selected].path,
+                &self.sessions[selected].worktree_session_id,
             )?
             .ok_or_else(|| "selected harness has no native session protocol".to_string())?;
         let Some(session_id) = runtime.opencode_session_id.clone() else {
@@ -613,18 +616,23 @@ impl Tui {
                 continue;
             }
             let harness_id = harness_config.default_harness.clone();
-            let runtime =
-                match load_runtime(&managed.repo, &harness_id, &session.branch, &session.path) {
-                    Ok(Some(runtime)) => runtime,
-                    Ok(None) => continue,
-                    Err(error) => {
-                        errors.push(format!(
-                            "load OpenCode runtime for {}: {error}",
-                            session.branch
-                        ));
-                        continue;
-                    }
-                };
+            let runtime = match load_runtime(
+                &managed.repo,
+                &harness_id,
+                &session.branch,
+                &session.path,
+                &session.worktree_session_id,
+            ) {
+                Ok(Some(runtime)) => runtime,
+                Ok(None) => continue,
+                Err(error) => {
+                    errors.push(format!(
+                        "load OpenCode runtime for {}: {error}",
+                        session.branch
+                    ));
+                    continue;
+                }
+            };
             let Some(pid) = runtime.server_pid else {
                 continue;
             };

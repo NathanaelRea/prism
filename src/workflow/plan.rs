@@ -213,6 +213,10 @@ pub fn run_plan_mode(cwd: &Path, config: &Config, path: Option<&Path>) -> Result
     let repo = Repository {
         root: execution.cwd.clone(),
     };
+    let branch = crate::git::current_branch_name(&execution.cwd, config)?
+        .unwrap_or_else(|| "(detached)".to_string());
+    let worktree_session_id =
+        crate::session::ensure_worktree_session_identity(&repo, &execution.cwd, &branch)?;
     let launch = PlanLaunch::new(
         &repo.root,
         &execution.cwd,
@@ -225,10 +229,11 @@ pub fn run_plan_mode(cwd: &Path, config: &Config, path: Option<&Path>) -> Result
     .with_harness(
         config.default_harness.clone(),
         selected_harness.adapter.clone(),
-    );
+    )
+    .with_worktree_session_id(worktree_session_id.clone());
     let server_url = {
         let harness = crate::harness::Harness::new(&config.default_harness, &selected_harness);
-        match harness.prepare_server(&repo, config, "plan", &execution.cwd) {
+        match harness.prepare_server(&repo, config, &branch, &execution.cwd, &worktree_session_id) {
             Ok(runtime) => runtime.map(|runtime| runtime.server_url),
             Err(error) => {
                 eprintln!(

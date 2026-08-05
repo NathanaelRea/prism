@@ -2539,6 +2539,7 @@ fn test_session(path: PathBuf, branch: &str) -> Session {
         repo_label: "repo".to_string(),
         repo_key: None,
         path: path.clone(),
+        worktree_session_id: "test-worktree-session".to_string(),
         incarnation: String::new(),
         path_display: path.display().to_string(),
         branch: branch.to_string(),

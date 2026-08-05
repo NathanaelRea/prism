@@ -297,6 +297,11 @@ impl Tui {
     pub(super) fn remember_plan_run_snapshot(&mut self, run: PersistedPlanRun) -> bool {
         let run_id = run.run.id.clone();
         let scope_path = run.run.scope_path.clone();
+        let belongs_to_live_session = run.run.worktree_session_id.as_deref().is_some_and(|id| {
+            self.sessions
+                .iter()
+                .any(|session| session.path == scope_path && session.worktree_session_id == id)
+        });
         let selected_step = self.resolved_plan_step_selection(&run);
         self.selected_plan_step_by_run
             .insert(run_id.clone(), selected_step);
@@ -304,7 +309,7 @@ impl Tui {
             .active_plan_runs
             .get(&scope_path)
             .is_some_and(|selected| selected == &run_id || self.plan_runs.contains_key(selected));
-        if !selected_run_is_known {
+        if belongs_to_live_session && !selected_run_is_known {
             self.active_plan_runs.insert(scope_path, run_id.clone());
         }
         let changed = self.plan_runs.get(&run_id) != Some(&run);
@@ -472,7 +477,11 @@ impl Tui {
         let is_active = matches!(
             run.run.status,
             AutoRunStatus::Queued | AutoRunStatus::Running | AutoRunStatus::Paused
-        );
+        ) && run.run.worktree_session_id.as_deref().is_some_and(|id| {
+            self.sessions.iter().any(|session| {
+                session.path == run.run.worktree_path && session.worktree_session_id == id
+            })
+        });
         if is_active {
             let replace_active = self
                 .active_auto_runs
@@ -690,6 +699,15 @@ impl Tui {
     }
 
     pub(super) fn auto_run_id_for_worktree(&self, worktree_path: &Path) -> Option<&String> {
+        if self.focused_panel == PanelFocus::Status
+            && let Some(run_id) = self.selected_auto_run.as_ref()
+            && self
+                .auto_runs
+                .get(run_id)
+                .is_some_and(|run| run.run.worktree_path == worktree_path)
+        {
+            return Some(run_id);
+        }
         if let Some(run_id) = self.active_auto_runs.get(worktree_path) {
             return Some(run_id);
         }
@@ -829,10 +847,6 @@ impl Tui {
     pub(super) fn selected_status_auto_run_id(&self) -> Option<&str> {
         if let Some(run_id) = self.selected_auto_run.as_deref()
             && self.auto_runs.contains_key(run_id)
-            && self
-                .active_auto_runs
-                .values()
-                .any(|active| active == run_id)
         {
             return Some(run_id);
         }

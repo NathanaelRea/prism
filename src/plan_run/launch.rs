@@ -6,6 +6,7 @@ pub struct PlanLaunch {
     pub adapter_id: String,
     pub repo_root: String,
     pub scope_path: PathBuf,
+    pub worktree_session_id: Option<String>,
     pub plan_path: PathBuf,
     pub plan_display: String,
     pub step_name: String,
@@ -38,6 +39,11 @@ impl PlanLaunch {
             adapter_id: "opencode".to_string(),
             repo_root: repo_root.display().to_string(),
             scope_path: scope_path.to_path_buf(),
+            worktree_session_id: if cfg!(test) {
+                Some("test-worktree-session".to_string())
+            } else {
+                None
+            },
             plan_path: plan_path.to_path_buf(),
             plan_display: display_plan_path(scope_path, plan_path),
             step_name: step_name.into(),
@@ -57,6 +63,11 @@ impl PlanLaunch {
         self
     }
 
+    pub(crate) fn with_worktree_session_id(mut self, id: impl Into<String>) -> Self {
+        self.worktree_session_id = Some(id.into());
+        self
+    }
+
     pub fn create_run(&self) -> PersistedPlanRun {
         let now = unix_ms();
         let id = self.default_run_id(now);
@@ -66,6 +77,7 @@ impl PlanLaunch {
             adapter_id: self.adapter_id.clone(),
             repo_root: self.repo_root.clone(),
             scope_path: self.scope_path.clone(),
+            worktree_session_id: self.worktree_session_id.clone(),
             plan_path: self.plan_path.clone(),
             plan_display: self.plan_display.clone(),
             step_name: self.step_name.clone(),

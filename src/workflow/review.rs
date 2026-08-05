@@ -691,6 +691,7 @@ mod tests {
             repo_label: "repo".to_string(),
             repo_key: None,
             path: PathBuf::from("/repo/worktree"),
+            worktree_session_id: "test-feature".to_string(),
             incarnation: String::new(),
             path_display: "/repo/worktree".to_string(),
             branch: "feature".to_string(),

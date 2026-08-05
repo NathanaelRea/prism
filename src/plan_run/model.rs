@@ -9,6 +9,7 @@ pub struct PlanRun {
     pub adapter_id: String,
     pub repo_root: String,
     pub scope_path: PathBuf,
+    pub worktree_session_id: Option<String>,
     pub plan_path: PathBuf,
     pub plan_display: String,
     pub step_name: String,

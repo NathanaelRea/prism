@@ -222,8 +222,14 @@ fn repeated_dashboard_rendering_uses_only_cached_output() {
 fn returning_from_tmux_does_not_wait_for_worktree_refresh() {
     let temp = unique_temp_dir("prism-tmux-return-refresh-test");
     let worktree = temp.join("feature");
+    let git_dir = temp.join("gitdir");
     fs::create_dir_all(&worktree).unwrap();
-    fs::write(worktree.join(".git"), "gitdir: /tmp/gitdir\n").unwrap();
+    fs::create_dir_all(&git_dir).unwrap();
+    fs::write(
+        worktree.join(".git"),
+        format!("gitdir: {}\n", git_dir.display()),
+    )
+    .unwrap();
     let git = temp.join("git");
     let refresh_gate = temp.join("allow-refresh");
     fs::write(

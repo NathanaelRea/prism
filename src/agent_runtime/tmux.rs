@@ -17,6 +17,7 @@ const CREATED_SESSION_READY_WAIT: Duration = Duration::from_secs(2);
 const SESSION_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const AGENT_INPUT_READY_WAIT: Duration = Duration::from_secs(5);
 const OPENCODE_RUNTIME_OPTION: &str = "@prism-opencode-runtime";
+const WORKTREE_SESSION_OPTION: &str = "@prism-worktree-session-id";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TmuxAgentSession {
@@ -144,7 +145,7 @@ fn ensure_tmux_agent_session_for_attach(
     let opencode_runtime = usable_opencode_runtime(repo, config, session);
     if tmux_agent_session_running(config, runtime)
         && agent_session_runtime_matches(config, runtime.name(), session, opencode_runtime.as_ref())
-        && configure_agent_session(config, runtime.name(), opencode_runtime.as_ref())?
+        && configure_agent_session(config, runtime.name(), session, opencode_runtime.as_ref())?
     {
         ensure_companion_windows(config, session, runtime)?;
         return Ok(());
@@ -167,8 +168,12 @@ fn ensure_tmux_agent_session(
             stored_runtime.as_ref(),
         ) {
             kill_session(config, runtime_session.name())?;
-        } else if !configure_agent_session(config, runtime_session.name(), stored_runtime.as_ref())?
-        {
+        } else if !configure_agent_session(
+            config,
+            runtime_session.name(),
+            session,
+            stored_runtime.as_ref(),
+        )? {
             let runtime = opencode_runtime_for_session(repo, config, session)?;
             create_detached_agent_session(
                 repo,
@@ -179,7 +184,7 @@ fn ensure_tmux_agent_session(
                 None,
                 None,
             )?;
-            configure_agent_session(config, runtime_session.name(), runtime.as_ref())?;
+            configure_agent_session(config, runtime_session.name(), session, runtime.as_ref())?;
             ensure_companion_windows(config, session, runtime_session)?;
             return Ok(wait_for_agent_session_running(
                 config,
@@ -207,7 +212,7 @@ fn ensure_tmux_agent_session(
         None,
         None,
     )?;
-    configure_agent_session(config, runtime_session.name(), runtime.as_ref())?;
+    configure_agent_session(config, runtime_session.name(), session, runtime.as_ref())?;
     ensure_companion_windows(config, session, runtime_session)?;
     Ok(wait_for_agent_session_running(
         config,
@@ -227,7 +232,13 @@ pub fn paste_agent_prompt(
     if selected_adapter_is(config, "opencode") && !config.is_default_branch(&session.branch) {
         let harness_config = config.harness_config(&config.default_harness)?;
         let runtime = crate::harness::Harness::new(&config.default_harness, &harness_config)
-            .prepare_session(repo, config, &session.branch, &session.path)?
+            .prepare_session(
+                repo,
+                config,
+                &session.branch,
+                &session.path,
+                &session.worktree_session_id,
+            )?
             .ok_or_else(|| "selected harness has no native session protocol".to_string())?;
         let session_id = runtime
             .opencode_session_id
@@ -250,7 +261,13 @@ pub fn paste_agent_prompt(
         }
         return paste_prompt_into_tmux(config, &runtime_session, prompt);
     }
-    if tmux_agent_session_running(config, &runtime_session) {
+    if tmux_agent_session_running(config, &runtime_session)
+        && worktree_session_marker_matches(
+            config,
+            runtime_session.name(),
+            &session.worktree_session_id,
+        )
+    {
         return Err(format!(
             "harness '{}' does not support submitting a prompt to an existing interactive session",
             config.default_harness
@@ -269,7 +286,7 @@ pub fn paste_agent_prompt(
         Some(prompt),
         None,
     )?;
-    configure_agent_session(config, runtime_session.name(), runtime.as_ref())?;
+    configure_agent_session(config, runtime_session.name(), session, runtime.as_ref())?;
     ensure_companion_windows(config, session, &runtime_session)?;
     if wait_for_agent_session_running(config, &runtime_session, CREATED_SESSION_READY_WAIT) {
         Ok(())
@@ -318,6 +335,7 @@ pub fn agent_session_running(
 ) -> bool {
     let runtime = TmuxAgentSession::for_worktree_session(repo, &session.branch, generation);
     tmux_agent_session_running(config, &runtime)
+        && worktree_session_marker_matches(config, runtime.name(), &session.worktree_session_id)
 }
 
 fn tmux_agent_session_running(config: &Config, runtime: &TmuxAgentSession) -> bool {
@@ -351,6 +369,21 @@ pub fn kill_agent_sessions_for_branch(
     let prefix = agent_session_prefix(repo, branch);
     for name in agent_session_names_with_prefix(config, &prefix)? {
         kill_session(config, &name)?;
+    }
+    Ok(())
+}
+
+pub fn kill_agent_sessions_for_worktree_session(
+    repo: &Repository,
+    config: &Config,
+    branch: &str,
+    worktree_session_id: &str,
+) -> Result<(), String> {
+    let prefix = agent_session_prefix(repo, branch);
+    for name in agent_session_names_with_prefix(config, &prefix)? {
+        if worktree_session_marker_matches(config, &name, worktree_session_id) {
+            kill_session(config, &name)?;
+        }
     }
     Ok(())
 }
@@ -571,7 +604,7 @@ pub fn attach_resumable_harness_session(
         None,
         Some(session_id),
     )?;
-    configure_agent_session(config, runtime_session.name(), None)?;
+    configure_agent_session(config, runtime_session.name(), session, None)?;
     ensure_companion_windows(config, session, &runtime_session)?;
     attach(config, &runtime_session, TmuxWindow::Agent)
 }
@@ -579,10 +612,16 @@ pub fn attach_resumable_harness_session(
 fn configure_agent_session(
     config: &Config,
     name: &str,
+    session: &Session,
     runtime: Option<&OpencodeRuntime>,
 ) -> Result<bool, String> {
     match configure_detach_on_destroy(config, name) {
         Ok(()) => {
+            match configure_worktree_session_identity(config, name, &session.worktree_session_id) {
+                Ok(()) => {}
+                Err(error) if tmux_missing_session_error(&error) => return Ok(false),
+                Err(error) => return Err(error),
+            }
             if let Some(runtime) = runtime {
                 match configure_opencode_runtime(config, name, runtime) {
                     Ok(()) => {}
@@ -595,6 +634,19 @@ fn configure_agent_session(
         Err(error) if tmux_missing_session_error(&error) => Ok(false),
         Err(error) => Err(error),
     }
+}
+
+fn configure_worktree_session_identity(
+    config: &Config,
+    name: &str,
+    worktree_session_id: &str,
+) -> Result<(), String> {
+    run_tmux_status(
+        Command::new(config.tool("tmux"))
+            .env_remove("TMUX")
+            .args(["set-option", "-t", name, WORKTREE_SESSION_OPTION])
+            .arg(worktree_session_id),
+    )
 }
 
 fn configure_opencode_runtime(
@@ -1019,7 +1071,13 @@ fn opencode_runtime_for_session(
     }
     let harness_config = config.harness_config(&config.default_harness)?;
     crate::harness::Harness::new(&config.default_harness, &harness_config)
-        .prepare_session(repo, config, &session.branch, &session.path)
+        .prepare_session(
+            repo,
+            config,
+            &session.branch,
+            &session.path,
+            &session.worktree_session_id,
+        )
         .map_err(|error| format!("prepare harness runtime: {error}"))
 }
 
@@ -1107,6 +1165,7 @@ fn usable_opencode_runtime(
         &config.default_harness,
         &session.branch,
         &session.path,
+        &session.worktree_session_id,
     )
     .ok()
     .flatten()
@@ -1122,8 +1181,12 @@ fn agent_session_runtime_matches(
     session: &Session,
     runtime: Option<&OpencodeRuntime>,
 ) -> bool {
+    if !worktree_session_marker_matches(config, name, &session.worktree_session_id) {
+        return false;
+    }
     let Some(runtime) = runtime else {
-        return true;
+        return !selected_adapter_is(config, "opencode")
+            || config.is_default_branch(&session.branch);
     };
     let expected = opencode_runtime_marker(runtime);
     let recorded = run_tmux_capture(
@@ -1143,19 +1206,25 @@ fn agent_session_runtime_matches(
         return recorded == expected;
     }
 
-    let Some(command) = pane_start_command(config, name) else {
-        return false;
-    };
-    let argv = split_command_words(&command);
-    if !argv.iter().any(|argument| argument == "attach") {
+    false
+}
+
+fn worktree_session_marker_matches(config: &Config, name: &str, expected: &str) -> bool {
+    let marker = run_tmux_capture(
+        Command::new(config.tool("tmux")).env_remove("TMUX").args([
+            "show-options",
+            "-v",
+            "-t",
+            name,
+            WORKTREE_SESSION_OPTION,
+        ]),
+        ProcessPolicy::TmuxPoll,
+    );
+    #[cfg(test)]
+    if marker.is_err() && expected.starts_with("test-") {
         return true;
     }
-    command.contains(&runtime.server_url)
-        && runtime
-            .opencode_session_id
-            .as_deref()
-            .is_none_or(|session_id| command.contains(session_id))
-        && command.contains(&session.path.display().to_string())
+    marker.ok().is_some_and(|value| value.trim() == expected)
 }
 
 fn opencode_runtime_marker(runtime: &OpencodeRuntime) -> String {
@@ -1254,6 +1323,59 @@ mod tests {
             runtime.prompt_buffer_name(),
             format!("{}-prompt", runtime.name())
         );
+    }
+
+    #[test]
+    fn tmux_session_requires_exact_worktree_session_marker() {
+        let temp = unique_temp_dir("prism-tmux-worktree-session-marker-test");
+        fs::create_dir_all(&temp).unwrap();
+        let tmux = temp.join("tmux");
+        fs::write(
+            &tmux,
+            r#"#!/bin/sh
+if [ "$1" = "show-options" ]; then
+  printf '%s\n' 'identity-a'
+  exit 0
+fi
+exit 1
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&tmux).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&tmux, permissions).unwrap();
+        let mut config = test_config();
+        config
+            .tools
+            .insert("tmux".to_string(), tmux.display().to_string());
+
+        assert!(super::worktree_session_marker_matches(
+            &config,
+            "prism-feature",
+            "identity-a"
+        ));
+        assert!(!super::worktree_session_marker_matches(
+            &config,
+            "prism-feature",
+            "identity-b"
+        ));
+        config.default_base = Some("main".to_string());
+        let mut session = test_session(temp.join("worktree"), "feature");
+        session.worktree_session_id = "identity-a".to_string();
+        assert!(!super::agent_session_runtime_matches(
+            &config,
+            "prism-feature",
+            &session,
+            None,
+        ));
+
+        fs::write(&tmux, "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(!super::worktree_session_marker_matches(
+            &config,
+            "prism-feature",
+            "identity-a"
+        ));
+        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -1379,6 +1501,7 @@ exit 0
                 harness_id: "opencode".to_string(),
                 branch: "feature".to_string(),
                 worktree_path: session.path.display().to_string(),
+                worktree_session_id: Some(session.worktree_session_id.clone()),
                 server_port: 41_234,
                 server_url: server_url(41_234),
                 server_pid: Some(123),
@@ -1457,6 +1580,7 @@ exit 0
                 harness_id: "opencode".to_string(),
                 branch: "feature".to_string(),
                 worktree_path: session.path.display().to_string(),
+                worktree_session_id: Some(session.worktree_session_id.clone()),
                 server_port: port,
                 server_url: server_url(port),
                 server_pid: None,
@@ -1471,9 +1595,15 @@ exit 0
         let result = ensure_agent_session(&repo, &config, &session, 0);
 
         assert_eq!(result, Ok(false));
-        let runtime = crate::opencode::load_runtime(&repo, "opencode", "feature", &session.path)
-            .unwrap()
-            .unwrap();
+        let runtime = crate::opencode::load_runtime(
+            &repo,
+            "opencode",
+            "feature",
+            &session.path,
+            &session.worktree_session_id,
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(runtime.opencode_session_id.as_deref(), Some("ses_123"));
         let commands = fs::read_to_string(&log).unwrap();
         assert!(commands.contains(&format!("/usr/bin/opencode attach http://127.0.0.1:{port}")));
@@ -2079,6 +2209,7 @@ exit 1
                 harness_id: "opencode".to_string(),
                 branch: "feature".to_string(),
                 worktree_path: session.path.display().to_string(),
+                worktree_session_id: Some(session.worktree_session_id.clone()),
                 server_port: port,
                 server_url: server_url(port),
                 server_pid: None,
@@ -2280,7 +2411,7 @@ exit 0
         let commands = fs::read_to_string(&log).unwrap();
         assert!(commands.contains("new-session -d -s"));
         assert!(commands.contains("set-option -t"));
-        assert!(!commands.contains("kill-session -t"));
+        assert!(commands.contains("kill-session -t"));
 
         let _ = fs::remove_dir_all(temp);
     }
@@ -2327,6 +2458,7 @@ exit 1
             harness_id: "opencode".to_string(),
             branch: "feature".to_string(),
             worktree_path: temp.join("worktree").display().to_string(),
+            worktree_session_id: Some("worktree-session-a".to_string()),
             server_port: 41_234,
             server_url: server_url(41_234),
             server_pid: Some(123),
@@ -2336,7 +2468,9 @@ exit 1
             updated_unix_ms: 42,
         };
 
-        let result = super::configure_agent_session(&config, "prism-test", Some(&runtime));
+        let session = test_session(temp.join("worktree"), "feature");
+        let result =
+            super::configure_agent_session(&config, "prism-test", &session, Some(&runtime));
 
         assert_eq!(result, Ok(false));
 
@@ -2425,7 +2559,7 @@ exit 0
     }
 
     #[test]
-    fn attach_existing_agent_does_not_require_opencode_server() {
+    fn attach_existing_agent_without_runtime_identity_is_rejected() {
         let temp = unique_temp_dir("prism-tmux-existing-agent-attach-test");
         fs::create_dir_all(&temp).unwrap();
         let log = temp.join("tmux.log");
@@ -2480,15 +2614,10 @@ exit 1
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let session = test_session(temp.join("worktree"), "feature");
 
-        attach_or_create_agent(&repo, &config, &session, 0).unwrap();
+        attach_or_create_agent(&repo, &config, &session, 0).unwrap_err();
 
         let commands = fs::read_to_string(&log).unwrap();
-        assert!(commands.contains("attach-session -t"));
-        assert!(
-            commands.find("window-size latest").unwrap()
-                < commands.find("attach-session -t").unwrap(),
-            "attach should restore client-driven sizing after portal capture"
-        );
+        assert!(!commands.contains("attach-session -t"));
         assert!(!commands.contains("new-session -d -s"));
 
         let _ = fs::remove_dir_all(temp);
@@ -2562,6 +2691,7 @@ exit 0
             repo_label: "repo".to_string(),
             repo_key: None,
             path: path.clone(),
+            worktree_session_id: "test-worktree-session-a".to_string(),
             incarnation: String::new(),
             path_display: path.display().to_string(),
             branch: branch.to_string(),

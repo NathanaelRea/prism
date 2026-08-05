@@ -357,11 +357,25 @@ fn list_and_control_project_and_mutate_managed_plan_state() {
     let db_path = stdout(&path_output).trim().to_string();
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     conn.execute(
+        "insert into worktree_session
+         (id, repo_root, initial_branch, initial_worktree_path, created_unix_ms)
+         values ('control-session', ?1, 'main', ?1, 1)",
+        [repo.display().to_string()],
+    )
+    .unwrap();
+    conn.execute(
+        "insert into active_worktree_session
+         (worktree_session_id, repo_root, branch, worktree_path, worktree_incarnation, observed_unix_ms)
+         values ('control-session', ?1, 'main', ?1, 'test', 1)",
+        [repo.display().to_string()],
+    )
+    .unwrap();
+    conn.execute(
         "insert into plan_run (
-           id, harness_id, adapter_id, repo_root, scope_path, plan_path, plan_display,
+           id, harness_id, adapter_id, repo_root, scope_path, worktree_session_id, plan_path, plan_display,
            step_name, start_step, total_steps, mode, status, pause_requested,
            selected_step, created_unix_ms, updated_unix_ms
-         ) values ('plan-control-12345678', 'opencode', 'opencode', ?1, ?1, ?2,
+         ) values ('plan-control-12345678', 'opencode', 'opencode', ?1, ?1, 'control-session', ?2,
                    'plan.md', 'phase', 1, 2, 'sequential', 'queued', 0, 1, 10, 20)",
         rusqlite::params![
             repo.display().to_string(),

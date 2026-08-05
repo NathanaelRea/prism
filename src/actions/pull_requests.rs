@@ -61,6 +61,7 @@ fn session_for_remote_action(session: &crate::session::Session) -> crate::sessio
         repo_label: session.repo_label.clone(),
         repo_key: session.repo_key,
         path: session.path.clone(),
+        worktree_session_id: session.worktree_session_id.clone(),
         incarnation: session.incarnation.clone(),
         path_display: session.path_display.clone(),
         branch: session.branch.clone(),
@@ -787,6 +788,7 @@ impl Tui {
                     initial_prompt,
                 },
             )?
+            .with_worktree_session_id(self.sessions[selected].worktree_session_id.clone())
             .with_harness(
                 config.default_harness.clone(),
                 config.harness_adapter(&config.default_harness)?,
