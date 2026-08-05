@@ -1,16 +1,29 @@
+#[cfg(test)]
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(target_os = "macos")]
+use std::io::Write;
+#[cfg(test)]
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
+#[cfg(test)]
 use std::thread::{self, JoinHandle};
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use crate::agent::AgentState;
+#[cfg(test)]
 use crate::config::NotificationConfig;
+#[cfg(test)]
 use crate::session::WorktreeSessionKey;
 
+#[cfg(test)]
 const QUEUE_CAPACITY: usize = 32;
+#[cfg(test)]
 const FAILURE_COOLDOWN: Duration = Duration::from_secs(60);
+#[cfg(test)]
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum NotificationKind {
     NeedsInput,
@@ -19,6 +32,7 @@ enum NotificationKind {
     NeedsRestart,
 }
 
+#[cfg(test)]
 impl NotificationKind {
     fn label(self) -> &'static str {
         match self {
@@ -39,6 +53,7 @@ impl NotificationKind {
     }
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Delivery {
     kind: NotificationKind,
@@ -46,12 +61,14 @@ struct Delivery {
     body: String,
 }
 
+#[cfg(test)]
 enum DispatchMessage {
     Delivery(Delivery),
     #[cfg(test)]
     Barrier(std::sync::mpsc::Sender<()>),
 }
 
+#[cfg(test)]
 pub(crate) struct AgentObservation<'a> {
     pub session: &'a WorktreeSessionKey,
     pub repo_label: &'a str,
@@ -60,24 +77,31 @@ pub(crate) struct AgentObservation<'a> {
     pub config: NotificationConfig,
 }
 
+#[cfg(test)]
 pub(crate) struct DesktopNotifier {
     states: BTreeMap<WorktreeSessionKey, AgentState>,
     suppressed_returns: BTreeMap<WorktreeSessionKey, AgentState>,
+    #[cfg(test)]
     sender: Option<SyncSender<DispatchMessage>>,
+    #[cfg(test)]
     dispatcher: Option<JoinHandle<()>>,
+    #[cfg(test)]
     last_queue_failures: BTreeMap<(NotificationKind, &'static str), Instant>,
 }
 
+#[cfg(test)]
 impl DesktopNotifier {
     pub(crate) fn new() -> Self {
-        Self::with_delivery(|delivery| {
-            notify_rust::Notification::new()
-                .summary(&delivery.title)
-                .body(&delivery.body)
-                .show()
-                .map(|_| ())
-                .map_err(|_| "backend")
-        })
+        Self {
+            states: BTreeMap::new(),
+            suppressed_returns: BTreeMap::new(),
+            #[cfg(test)]
+            sender: None,
+            #[cfg(test)]
+            dispatcher: None,
+            #[cfg(test)]
+            last_queue_failures: BTreeMap::new(),
+        }
     }
 
     #[cfg(test)]
@@ -91,6 +115,7 @@ impl DesktopNotifier {
         (notifier, deliveries)
     }
 
+    #[cfg(test)]
     fn with_delivery<F>(deliver: F) -> Self
     where
         F: Fn(&Delivery) -> Result<(), &'static str> + Send + 'static,
@@ -98,6 +123,7 @@ impl DesktopNotifier {
         Self::with_delivery_capacity(QUEUE_CAPACITY, deliver)
     }
 
+    #[cfg(test)]
     fn with_delivery_capacity<F>(capacity: usize, deliver: F) -> Self
     where
         F: Fn(&Delivery) -> Result<(), &'static str> + Send + 'static,
@@ -202,24 +228,28 @@ impl DesktopNotifier {
         if !enabled(observation.config, kind) {
             return;
         }
-        let subject = if observation.repo_label.is_empty() {
-            observation.branch.to_string()
-        } else {
-            format!("{}: {}", observation.repo_label, observation.branch)
-        };
-        let suffix = match kind {
-            NotificationKind::NeedsInput => "is waiting for input",
-            NotificationKind::Completed => "finished",
-            NotificationKind::Failed => "failed",
-            NotificationKind::NeedsRestart => "needs to be restarted",
-        };
-        self.enqueue(Delivery {
-            kind,
-            title: format!("Prism: {}", kind.title()),
-            body: format!("{subject} {suffix}"),
-        });
+        #[cfg(test)]
+        {
+            let subject = if observation.repo_label.is_empty() {
+                observation.branch.to_string()
+            } else {
+                format!("{}: {}", observation.repo_label, observation.branch)
+            };
+            let suffix = match kind {
+                NotificationKind::NeedsInput => "is waiting for input",
+                NotificationKind::Completed => "finished",
+                NotificationKind::Failed => "failed",
+                NotificationKind::NeedsRestart => "needs to be restarted",
+            };
+            self.enqueue(Delivery {
+                kind,
+                title: format!("Prism: {}", kind.title()),
+                body: format!("{subject} {suffix}"),
+            });
+        }
     }
 
+    #[cfg(test)]
     fn enqueue(&mut self, delivery: Delivery) {
         let kind = delivery.kind;
         let failure = match self.sender.as_ref() {
@@ -260,6 +290,44 @@ impl DesktopNotifier {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn deliver_native_notification(title: &str, body: &str) -> Result<(), &'static str> {
+    notify_rust::Notification::new()
+        .summary(title)
+        .body(body)
+        .show()
+        .map(|_| ())
+        .map_err(|_| "backend")
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn deliver_terminal_notification(title: &str, body: &str) -> Result<(), &'static str> {
+    let mut terminal = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|_| "terminal_open")?;
+    terminal
+        .write_all(&terminal_notification_payload(title, body))
+        .map_err(|_| "terminal_write")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn terminal_notification_payload(title: &str, body: &str) -> Vec<u8> {
+    let text = format!("{title}: {body}");
+    let sanitized = text
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    format!("\x1b]9;{sanitized}\x1b\\").into_bytes()
+}
+
+#[cfg(test)]
 impl Drop for DesktopNotifier {
     fn drop(&mut self) {
         self.sender.take();
@@ -276,6 +344,7 @@ impl Drop for DesktopNotifier {
     }
 }
 
+#[cfg(test)]
 fn transition(previous: AgentState, current: AgentState) -> Option<NotificationKind> {
     if !matches!(previous, AgentState::Attached | AgentState::Running) {
         return None;
@@ -289,6 +358,7 @@ fn transition(previous: AgentState, current: AgentState) -> Option<NotificationK
     }
 }
 
+#[cfg(test)]
 fn enabled(config: NotificationConfig, kind: NotificationKind) -> bool {
     config.enabled
         && match kind {
@@ -298,6 +368,7 @@ fn enabled(config: NotificationConfig, kind: NotificationKind) -> bool {
         }
 }
 
+#[cfg(test)]
 fn emit_failure(action: &'static str, category: &'static str, kind: NotificationKind) {
     crate::observability::emit_deferred(crate::observability::EventInput {
         level: crate::observability::LogLevel::Warn,
@@ -528,5 +599,16 @@ mod tests {
         notifier.seed([observation(&session, AgentState::Running, config())]);
         notifier.observe(observation(&session, AgentState::ExitedError, config()));
         notifier.flush();
+    }
+
+    #[test]
+    fn macos_delivery_uses_a_sanitized_terminal_notification() {
+        let payload =
+            terminal_notification_payload("Prism: Failed", "repo: branch failed\u{1b}]9;injected");
+
+        assert_eq!(
+            payload,
+            b"\x1b]9;Prism: Failed: repo: branch failed ]9;injected\x1b\\"
+        );
     }
 }

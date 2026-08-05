@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{AutoOutputLine, PersistedAutoRun};
 use crate::config::Config;
+#[cfg(test)]
 use crate::desktop_notification::DesktopNotifier;
 use crate::input::{Key, KeyInput};
 use crate::plan_run::{PersistedPlanRun, PlanOutputLine};
@@ -86,6 +87,7 @@ pub struct Tui {
     pub(crate) repos: Vec<ManagedRepo>,
     pub(crate) current_repo: usize,
     pub(crate) sessions: Vec<Session>,
+    #[cfg(test)]
     pub(crate) desktop_notifier: DesktopNotifier,
     pub(crate) session_repository_identities: BTreeMap<usize, WorktreeRepositoryKey>,
     pub(crate) worktree_generations: BTreeMap<WorktreeSessionKey, u64>,
@@ -329,6 +331,7 @@ impl Tui {
             repos,
             current_repo,
             sessions,
+            #[cfg(test)]
             desktop_notifier: DesktopNotifier::new(),
             session_repository_identities,
             worktree_generations,
@@ -448,6 +451,7 @@ impl Tui {
             .map(|repo| repo.repo.root.clone());
         tui.load_remote_mutation_reconciliation_markers();
         tui.ensure_navigation_valid();
+        #[cfg(test)]
         tui.reseed_desktop_notifications();
         tui
     }
@@ -577,6 +581,8 @@ impl Tui {
         shutdown: &ShutdownNotification,
     ) -> Result<ShutdownReason, String> {
         crate::worker::ensure_running()?;
+        #[cfg(target_os = "macos")]
+        let _notification_subscription = crate::worker::subscribe_notifications()?;
         self.offer_interrupted_run_recovery(runtime)?;
         self.refresh_sessions_after_tmux()?;
         self.poll_tmux_portal();
