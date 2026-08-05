@@ -333,7 +333,10 @@ pub(super) fn auto_checklist_lines(
             selected_step_run_id,
             output_tail,
         ));
-    } else {
+    } else if matches!(
+        run.implementation_source,
+        AutoImplementationSource::ExistingPlan | AutoImplementationSource::DraftPlan
+    ) {
         let plan_name = dashboard
             .linked_plan_dashboard
             .as_ref()
@@ -360,23 +363,25 @@ pub(super) fn auto_checklist_lines(
         }
     }
 
-    push_local_validation_loop(&mut lines, steps, selected_step_run_id, output_tail);
-    lines.push(checklist_line_for_key(
-        0,
-        steps,
-        AutoStepKey::CommitImpl,
-        "Commit implementation".to_string(),
-        selected_step_run_id,
-        output_tail,
-    ));
-    lines.push(checklist_line_for_key(
-        0,
-        steps,
-        AutoStepKey::PushPr,
-        "Create or update PR".to_string(),
-        selected_step_run_id,
-        output_tail,
-    ));
+    if run.implementation_source != AutoImplementationSource::ExistingPullRequest {
+        push_local_validation_loop(&mut lines, steps, selected_step_run_id, output_tail);
+        lines.push(checklist_line_for_key(
+            0,
+            steps,
+            AutoStepKey::CommitImpl,
+            "Commit implementation".to_string(),
+            selected_step_run_id,
+            output_tail,
+        ));
+        lines.push(checklist_line_for_key(
+            0,
+            steps,
+            AutoStepKey::PushPr,
+            "Create or update PR".to_string(),
+            selected_step_run_id,
+            output_tail,
+        ));
+    }
     push_review_loop(&mut lines, steps, selected_step_run_id, output_tail);
     push_ci_loop(&mut lines, steps, selected_step_run_id, output_tail);
     lines.push(checklist_line_for_key(

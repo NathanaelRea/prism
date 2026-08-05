@@ -4,6 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 const DEFAULT_LEASE_MS: i64 = 15_000;
+pub const LEGACY_EXECUTION_VERSION: i64 = 1;
 static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
@@ -108,6 +109,7 @@ pub struct ExecutionClaim {
     pub worker_id: String,
     pub daemon_instance_id: String,
     pub fencing_token: i64,
+    pub workflow_revision: i64,
 }
 
 pub fn new_instance_id(prefix: &str) -> String {
@@ -120,6 +122,7 @@ pub fn new_instance_id(prefix: &str) -> String {
 }
 
 pub fn migrate_schema(conn: &Connection) -> Result<(), String> {
+    validate_scheduling_schema(conn, false)?;
     conn.execute_batch(
         "
         create table if not exists workflow_execution (
@@ -136,6 +139,10 @@ pub fn migrate_schema(conn: &Connection) -> Result<(), String> {
           requeue_requested integer not null default 0,
           interruption_generation integer not null default 0,
           recovery_decided_unix_ms integer,
+          execution_version integer not null default 1,
+          not_before_unix_ms integer,
+          wake_reason text,
+          workflow_revision integer not null default 0,
           created_unix_ms integer not null,
           updated_unix_ms integer not null,
           primary key (workflow_kind, run_id),
@@ -184,14 +191,36 @@ pub fn migrate_schema(conn: &Connection) -> Result<(), String> {
         ",
     )
     .map_err(|error| format!("create workflow execution schema: {error}"))?;
-    if !table_has_column(conn, "workflow_execution", "requeue_requested")? {
-        conn.execute(
-            "alter table workflow_execution
-             add column requeue_requested integer not null default 0",
-            [],
-        )
-        .map_err(|error| format!("add workflow requeue intent: {error}"))?;
+    for (column, definition) in [
+        ("worker_id", "text"),
+        ("daemon_instance_id", "text"),
+        ("lease_expires_unix_ms", "integer"),
+        ("heartbeat_unix_ms", "integer"),
+        ("executor_pid", "integer"),
+        ("executor_process_identity", "text"),
+        ("requeue_requested", "integer not null default 0"),
+        ("interruption_generation", "integer not null default 0"),
+        ("recovery_decided_unix_ms", "integer"),
+        ("execution_version", "integer not null default 1"),
+        ("not_before_unix_ms", "integer"),
+        ("wake_reason", "text"),
+        ("workflow_revision", "integer not null default 0"),
+    ] {
+        if !table_has_column(conn, "workflow_execution", column)? {
+            conn.execute(
+                &format!("alter table workflow_execution add column {column} {definition}"),
+                [],
+            )
+            .map_err(|error| format!("add workflow execution column {column}: {error}"))?;
+        }
     }
+    conn.execute_batch(
+        "drop index if exists workflow_execution_dispatch_idx;
+         create index workflow_execution_dispatch_idx
+           on workflow_execution(dispatch_state, not_before_unix_ms, created_unix_ms);",
+    )
+    .map_err(|error| format!("create due workflow dispatch index: {error}"))?;
+    validate_scheduling_schema(conn, true)?;
     Ok(())
 }
 
@@ -212,8 +241,11 @@ pub fn enqueue(conn: &Connection, workflow: &WorkflowIdentity) -> Result<(), Str
                executor_pid = null,
                executor_process_identity = null,
                requeue_requested = 0,
+               not_before_unix_ms = null,
+               wake_reason = null,
                recovery_decided_unix_ms = null,
                fencing_token = workflow_execution.fencing_token + 1,
+               workflow_revision = workflow_execution.workflow_revision + 1,
                updated_unix_ms = excluded.updated_unix_ms
              where workflow_execution.dispatch_state != 'claimed'",
             params![workflow.kind.label(), workflow.run_id, now],
@@ -222,7 +254,8 @@ pub fn enqueue(conn: &Connection, workflow: &WorkflowIdentity) -> Result<(), Str
     if changed == 0 {
         let requested = conn
             .execute(
-                "update workflow_execution set requeue_requested = 1, updated_unix_ms = ?1
+                "update workflow_execution set requeue_requested = 1,
+                   workflow_revision = workflow_revision + 1, updated_unix_ms = ?1
                  where workflow_kind = ?2 and run_id = ?3 and dispatch_state = 'claimed'",
                 params![now, workflow.kind.label(), workflow.run_id],
             )
@@ -251,18 +284,30 @@ pub fn dispatch_state(
 }
 
 pub fn queued(conn: &Connection, limit: usize) -> Result<Vec<WorkflowIdentity>, String> {
+    queued_at(conn, limit, now_ms())
+}
+
+fn queued_at(
+    conn: &Connection,
+    limit: usize,
+    now_unix_ms: i64,
+) -> Result<Vec<WorkflowIdentity>, String> {
     let mut statement = conn
         .prepare(
             "select workflow_kind, run_id from workflow_execution
-             where dispatch_state = 'queued'
-             order by created_unix_ms, workflow_kind, run_id
-             limit ?1",
+              where dispatch_state = 'queued'
+                and execution_version = ?1
+                and (not_before_unix_ms <= ?2
+                  or (not_before_unix_ms is null and wake_reason is null))
+              order by coalesce(not_before_unix_ms, created_unix_ms), workflow_kind, run_id
+              limit ?3",
         )
         .map_err(|error| format!("prepare queued workflow query: {error}"))?;
     let rows = statement
-        .query_map([limit as i64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
+        .query_map(
+            params![LEGACY_EXECUTION_VERSION, now_unix_ms, limit as i64],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
         .map_err(|error| format!("query queued workflows: {error}"))?;
     let mut workflows = Vec::new();
     for row in rows {
@@ -304,10 +349,14 @@ fn claim_with_lease(
             "update workflow_execution set
                dispatch_state = 'claimed', worker_id = ?1, daemon_instance_id = ?2,
                heartbeat_unix_ms = ?3, lease_expires_unix_ms = ?4,
-               fencing_token = fencing_token + 1, executor_pid = ?5,
+               fencing_token = fencing_token + 1, workflow_revision = workflow_revision + 1,
+               executor_pid = ?5,
                executor_process_identity = ?6,
                updated_unix_ms = ?3
-             where workflow_kind = ?7 and run_id = ?8 and dispatch_state = 'queued'",
+              where workflow_kind = ?7 and run_id = ?8 and dispatch_state = 'queued'
+                and execution_version = ?9
+                and (not_before_unix_ms <= ?3
+                  or (not_before_unix_ms is null and wake_reason is null))",
             params![
                 worker_id,
                 daemon_instance_id,
@@ -317,6 +366,7 @@ fn claim_with_lease(
                 worker_id,
                 workflow.kind.label(),
                 workflow.run_id,
+                LEGACY_EXECUTION_VERSION,
             ],
         )
         .map_err(|error| format!("claim workflow: {error}"))?;
@@ -328,10 +378,10 @@ fn claim_with_lease(
     }
     let token = tx
         .query_row(
-            "select fencing_token from workflow_execution
-             where workflow_kind = ?1 and run_id = ?2",
+            "select fencing_token, workflow_revision from workflow_execution
+              where workflow_kind = ?1 and run_id = ?2",
             params![workflow.kind.label(), workflow.run_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .map_err(|error| format!("load workflow fencing token: {error}"))?;
     tx.commit()
@@ -341,7 +391,8 @@ fn claim_with_lease(
         workflow: workflow.clone(),
         worker_id: worker_id.to_string(),
         daemon_instance_id: daemon_instance_id.to_string(),
-        fencing_token: token,
+        fencing_token: token.0,
+        workflow_revision: token.1,
     }))
 }
 
@@ -373,7 +424,8 @@ pub fn heartbeat(conn: &Connection, claim: &ExecutionClaim) -> Result<(), String
            worker_id = null, daemon_instance_id = null, lease_expires_unix_ms = null,
            requeue_requested = 0,
            interruption_generation = interruption_generation + 1,
-           fencing_token = fencing_token + 1, updated_unix_ms = ?1
+           fencing_token = fencing_token + 1,
+           workflow_revision = workflow_revision + 1, updated_unix_ms = ?1
          where workflow_kind = ?2 and run_id = ?3 and dispatch_state = 'claimed'
            and worker_id = ?4 and daemon_instance_id = ?5 and fencing_token = ?6
            and lease_expires_unix_ms <= ?1",
@@ -512,6 +564,122 @@ pub fn install_claim_guards(conn: &Connection, claim: &ExecutionClaim) -> Result
                 .map_err(|error| format!("install execution claim guard for {table}: {error}"))?;
         }
     }
+    for operation in ["insert", "update", "delete"] {
+        let rows = match operation {
+            "insert" => vec!["new"],
+            "delete" => vec!["old"],
+            _ => vec!["old", "new"],
+        };
+        let ownership = rows
+            .into_iter()
+            .map(|row| {
+                format!(
+                    "exists (
+                       select 1 from _prism_execution_claim_guard g
+                       where g.workflow_kind = 'auto'
+                         and (g.run_id = {row}.run_id
+                           or ({row}.lane_key is not null and exists (
+                             select 1 from merge_intent owned
+                             where owned.run_id = g.run_id
+                               and owned.state = 'armed'
+                               and owned.placement in ('reserved', 'updating', 'submitting', 'submitted')
+                               and owned.lane_key = {row}.lane_key
+                           )))
+                     )"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" and ");
+        let trigger = format!(
+            "drop trigger if exists temp._prism_guard_merge_intent_{operation};
+             create temp trigger _prism_guard_merge_intent_{operation}
+             before {operation} on main.merge_intent
+             when not (({ownership}) and ({current_claim}))
+             begin
+               select raise(abort, 'execution claim is stale');
+             end;"
+        );
+        conn.execute_batch(&trigger)
+            .map_err(|error| format!("install execution claim guard for merge_intent: {error}"))?;
+    }
+    for operation in ["insert", "update", "delete"] {
+        let rows = match operation {
+            "insert" => vec!["new"],
+            "delete" => vec!["old"],
+            _ => vec!["old", "new"],
+        };
+        let ownership = if operation == "insert" {
+            "exists (
+               select 1 from _prism_execution_claim_guard g
+               where g.workflow_kind = 'auto' and exists (
+                 select 1 from merge_intent owned
+                 where owned.run_id = g.run_id and owned.state = 'armed'
+               )
+             )"
+            .to_string()
+        } else {
+            let reservation_ownership = if operation == "update" {
+                "owned.id = old.reserved_intent_id
+                 or (
+                   old.reserved_intent_id is null
+                   and owned.id = new.reserved_intent_id
+                   and owned.id = (
+                     select candidate.id from merge_intent candidate
+                     where candidate.lane_key = new.lane_key
+                       and candidate.state = 'armed'
+                       and candidate.placement in ('ready', 'backlogged')
+                       and candidate.ready_sequence is not null
+                     order by candidate.ready_sequence, candidate.id limit 1
+                   )
+                 )"
+            } else {
+                "owned.id = old.reserved_intent_id"
+            };
+            let readiness_sequence_ownership = if operation == "update" {
+                "or (
+                   owned.placement = 'ready'
+                   and owned.ready_sequence = old.next_ready_sequence
+                   and old.reserved_intent_id is new.reserved_intent_id
+                   and new.next_ready_sequence = old.next_ready_sequence + 1
+                 )"
+            } else {
+                ""
+            };
+            rows.into_iter()
+                .map(|row| {
+                    format!(
+                        "exists (
+                           select 1 from _prism_execution_claim_guard g
+                           where g.workflow_kind = 'auto' and exists (
+                             select 1 from merge_intent owned
+                              where owned.run_id = g.run_id
+                                and owned.state = 'armed'
+                                and owned.lane_key = {row}.lane_key
+                                 and (
+                                   owned.placement in ('reserved', 'updating', 'submitting', 'submitted')
+                                   or {reservation_ownership}
+                                   {readiness_sequence_ownership}
+                                 )
+                            )
+                         )"
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" and ")
+        };
+        let trigger = format!(
+            "drop trigger if exists temp._prism_guard_integration_lane_{operation};
+             create temp trigger _prism_guard_integration_lane_{operation}
+             before {operation} on main.integration_lane
+             when not (({ownership}) and ({current_claim}))
+             begin
+               select raise(abort, 'execution claim is stale');
+             end;"
+        );
+        conn.execute_batch(&trigger).map_err(|error| {
+            format!("install execution claim guard for integration_lane: {error}")
+        })?;
+    }
     Ok(())
 }
 
@@ -563,8 +731,11 @@ pub fn release(
             "update workflow_execution set
                 dispatch_state = case when requeue_requested = 1 then 'queued' else ?1 end,
                 worker_id = null, daemon_instance_id = null,
-                lease_expires_unix_ms = null, executor_pid = null,
-                executor_process_identity = null, requeue_requested = 0, updated_unix_ms = ?2
+                lease_expires_unix_ms = null, heartbeat_unix_ms = null, executor_pid = null,
+                executor_process_identity = null,
+                not_before_unix_ms = null, wake_reason = null,
+                requeue_requested = 0, workflow_revision = workflow_revision + 1,
+                updated_unix_ms = ?2
              where workflow_kind = ?3 and run_id = ?4 and dispatch_state = 'claimed'
                 and worker_id = ?5 and daemon_instance_id = ?6 and fencing_token = ?7
                 and lease_expires_unix_ms > ?2",
@@ -582,6 +753,51 @@ pub fn release(
     require_current_claim(changed)
 }
 
+#[cfg_attr(
+    not(test),
+    allow(
+        dead_code,
+        reason = "used by the durable activation cohort when passive waits are cut over"
+    )
+)]
+pub fn park(
+    conn: &Connection,
+    claim: &ExecutionClaim,
+    not_before_unix_ms: Option<i64>,
+    wake_reason: &str,
+) -> Result<(), String> {
+    if wake_reason.trim().is_empty() {
+        return Err("parked workflow requires a wake reason".to_string());
+    }
+    let now = now_ms();
+    let changed = conn
+        .execute(
+            "update workflow_execution set
+               dispatch_state = 'queued', worker_id = null, daemon_instance_id = null,
+               lease_expires_unix_ms = null, heartbeat_unix_ms = null,
+               executor_pid = null, executor_process_identity = null,
+               not_before_unix_ms = case when requeue_requested = 1 then null else ?1 end,
+               wake_reason = case when requeue_requested = 1 then null else ?2 end,
+               requeue_requested = 0, workflow_revision = workflow_revision + 1,
+               updated_unix_ms = ?3
+             where workflow_kind = ?4 and run_id = ?5 and dispatch_state = 'claimed'
+               and worker_id = ?6 and daemon_instance_id = ?7 and fencing_token = ?8
+               and lease_expires_unix_ms > ?3",
+            params![
+                not_before_unix_ms,
+                wake_reason,
+                now,
+                claim.workflow.kind.label(),
+                claim.workflow.run_id,
+                claim.worker_id,
+                claim.daemon_instance_id,
+                claim.fencing_token,
+            ],
+        )
+        .map_err(|error| format!("park workflow: {error}"))?;
+    require_current_claim(changed)
+}
+
 pub fn mark_abandoned(conn: &Connection, daemon_instance_id: &str) -> Result<usize, String> {
     let now = now_ms();
     conn.execute(
@@ -590,7 +806,8 @@ pub fn mark_abandoned(conn: &Connection, daemon_instance_id: &str) -> Result<usi
            executor_pid = null, executor_process_identity = null,
            requeue_requested = 0,
            interruption_generation = interruption_generation + 1,
-           fencing_token = fencing_token + 1, updated_unix_ms = ?1
+           fencing_token = fencing_token + 1,
+           workflow_revision = workflow_revision + 1, updated_unix_ms = ?1
           where dispatch_state = 'claimed'
             and (daemon_instance_id != ?2 or lease_expires_unix_ms <= ?1)",
         params![now, daemon_instance_id],
@@ -636,9 +853,11 @@ pub fn apply_recovery_decision(
             .execute(
                 "update workflow_execution set dispatch_state = ?1,
                    recovery_decided_unix_ms = ?2, updated_unix_ms = ?2,
-                   requeue_requested = 0,
-                   fencing_token = fencing_token + 1,
-                   interruption_generation = interruption_generation + 1
+                    requeue_requested = 0,
+                    fencing_token = fencing_token + 1,
+                    not_before_unix_ms = null, wake_reason = null,
+                    workflow_revision = workflow_revision + 1,
+                    interruption_generation = interruption_generation + 1
                  where workflow_kind = ?3 and run_id = ?4
                    and dispatch_state = 'recovery_pending'
                    and interruption_generation = ?5",
@@ -824,6 +1043,77 @@ fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool
     Ok(false)
 }
 
+fn validate_scheduling_schema(conn: &Connection, require_all: bool) -> Result<(), String> {
+    let mut found = 0;
+    for (column, expected_type, expected_required, expected_default) in [
+        ("execution_version", "integer", true, Some("1")),
+        ("not_before_unix_ms", "integer", false, None),
+        ("wake_reason", "text", false, None),
+        ("workflow_revision", "integer", true, Some("0")),
+    ] {
+        let definition = conn
+            .query_row(
+                "select type, \"notnull\", dflt_value from pragma_table_info('workflow_execution')
+                 where name = ?1",
+                [column],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)? != 0,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("inspect workflow scheduling column {column}: {error}"))?;
+        let Some((declared_type, required, default)) = definition else {
+            if require_all {
+                return Err(format!(
+                    "workflow execution schema is missing required column {column}"
+                ));
+            }
+            continue;
+        };
+        found += 1;
+        let normalized_default = default.as_deref().map(normalize_sql_default);
+        if !declared_type.eq_ignore_ascii_case(expected_type)
+            || required != expected_required
+            || normalized_default != expected_default
+        {
+            return Err(format!(
+                "workflow execution column {column} has an incompatible definition"
+            ));
+        }
+    }
+    if !require_all && found < 4 {
+        return Ok(());
+    }
+    let invalid: i64 = conn
+        .query_row(
+            "select count(*) from workflow_execution
+             where typeof(execution_version) != 'integer' or execution_version != ?1
+                or typeof(workflow_revision) != 'integer' or workflow_revision < 0
+                or (not_before_unix_ms is not null
+                    and typeof(not_before_unix_ms) != 'integer')
+                or (wake_reason is not null and typeof(wake_reason) != 'text')
+                or (wake_reason is not null and trim(wake_reason) = '')
+                or (not_before_unix_ms is not null and wake_reason is null)",
+            [LEGACY_EXECUTION_VERSION],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("validate workflow scheduling values: {error}"))?;
+    if invalid != 0 {
+        return Err("workflow execution scheduling values are invalid".to_string());
+    }
+    Ok(())
+}
+
+fn normalize_sql_default(default: &str) -> &str {
+    default
+        .trim()
+        .trim_matches(|character| matches!(character, '(' | ')' | '\'' | '"'))
+}
+
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -875,10 +1165,19 @@ mod tests {
                     step_run_id integer, line_number integer, time_unix_ms integer,
                     kind text, text text
                   );
-                  create table auto_event (
-                    id integer primary key, run_id text, step_run_id integer,
-                    time_unix_ms integer, kind text, data_json text
-                  );",
+                   create table auto_event (
+                     id integer primary key, run_id text, step_run_id integer,
+                     time_unix_ms integer, kind text, data_json text
+                   );
+                   create table merge_intent (
+                     id integer primary key, run_id text, generation integer, state text,
+                     placement text, lane_key text, head_sha text, ready_sequence integer,
+                     created_unix_ms integer, updated_unix_ms integer
+                   );
+                   create table integration_lane (
+                     lane_key text primary key, next_ready_sequence integer,
+                     reserved_intent_id integer, updated_unix_ms integer
+                   );",
             )
             .unwrap();
         migrate_schema(&first).unwrap();
@@ -899,6 +1198,167 @@ mod tests {
         assert!(second_claim.is_none());
         drop(first);
         drop(second);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn due_selection_excludes_future_and_signal_waits() {
+        let (path, first, second) = connections("due-selection");
+        for run_id in ["due", "future", "signal"] {
+            enqueue(&first, &WorkflowIdentity::new(WorkflowKind::Plan, run_id)).unwrap();
+        }
+        first
+            .execute(
+                "update workflow_execution set not_before_unix_ms = 100, wake_reason = 'timer'
+                 where run_id = 'due'",
+                [],
+            )
+            .unwrap();
+        first
+            .execute(
+                "update workflow_execution set not_before_unix_ms = 101, wake_reason = 'timer'
+                 where run_id = 'future'",
+                [],
+            )
+            .unwrap();
+        first
+            .execute(
+                "update workflow_execution set wake_reason = 'dependency' where run_id = 'signal'",
+                [],
+            )
+            .unwrap();
+        first
+            .execute(
+                "update workflow_execution set execution_version = 2 where run_id = 'future'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            queued_at(&first, 10, 100).unwrap(),
+            vec![WorkflowIdentity::new(WorkflowKind::Plan, "due")]
+        );
+        assert_eq!(
+            queued_at(&first, 10, i64::MAX).unwrap(),
+            vec![WorkflowIdentity::new(WorkflowKind::Plan, "due")]
+        );
+
+        drop(first);
+        drop(second);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn migration_rejects_malformed_scheduling_columns_before_mutation() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "create table workflow_execution (
+               workflow_kind text not null, run_id text not null, dispatch_state text not null,
+               fencing_token integer not null default 0,
+               execution_version integer default 1,
+               created_unix_ms integer not null, updated_unix_ms integer not null,
+               primary key (workflow_kind, run_id)
+             );",
+        )
+        .unwrap();
+
+        let error = migrate_schema(&conn).unwrap_err();
+
+        assert!(error.contains("execution_version"), "{error}");
+        assert!(!table_has_column(&conn, "workflow_execution", "not_before_unix_ms").unwrap());
+    }
+
+    #[test]
+    fn migration_rejects_unsupported_execution_versions() {
+        let (path, first, second) = connections("execution-version");
+        let workflow = WorkflowIdentity::new(WorkflowKind::Plan, "future-plan");
+        enqueue(&first, &workflow).unwrap();
+        first
+            .execute(
+                "update workflow_execution set execution_version = 2 where run_id = 'future-plan'",
+                [],
+            )
+            .unwrap();
+
+        let error = migrate_schema(&first).unwrap_err();
+
+        assert_eq!(error, "workflow execution scheduling values are invalid");
+        drop(first);
+        drop(second);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn migration_rejects_invalid_scheduling_storage_classes() {
+        let (path, first, second) = connections("scheduling-types");
+        let workflow = WorkflowIdentity::new(WorkflowKind::Plan, "malformed-plan");
+        enqueue(&first, &workflow).unwrap();
+        first
+            .execute(
+                "update workflow_execution set workflow_revision = 'invalid'
+                 where run_id = 'malformed-plan'",
+                [],
+            )
+            .unwrap();
+
+        assert_eq!(
+            migrate_schema(&first).unwrap_err(),
+            "workflow execution scheduling values are invalid"
+        );
+        drop(first);
+        drop(second);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn parking_releases_the_claim_with_one_fenced_transition() {
+        let (path, mut owner, observer) = connections("park");
+        let workflow = WorkflowIdentity::new(WorkflowKind::Auto, "auto-park");
+        enqueue(&owner, &workflow).unwrap();
+        let claim = claim(&mut owner, &workflow, "daemon", "worker")
+            .unwrap()
+            .unwrap();
+
+        park(&owner, &claim, Some(i64::MAX), "review_poll").unwrap();
+
+        assert_eq!(
+            dispatch_state(&observer, &workflow).unwrap(),
+            Some(DispatchState::Queued)
+        );
+        assert!(queued_at(&observer, 10, i64::MAX - 1).unwrap().is_empty());
+        assert_eq!(queued_at(&observer, 10, i64::MAX).unwrap(), vec![workflow]);
+        assert_eq!(validate_claim(&observer, &claim), Err(stale_claim_error()));
+
+        drop(owner);
+        drop(observer);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn explicit_requeue_racing_with_park_invalidates_the_timer() {
+        let (path, mut owner, requester) = connections("requeue-park");
+        let workflow = WorkflowIdentity::new(WorkflowKind::Plan, "plan-park");
+        enqueue(&owner, &workflow).unwrap();
+        let claim = claim(&mut owner, &workflow, "daemon", "worker")
+            .unwrap()
+            .unwrap();
+
+        enqueue(&requester, &workflow).unwrap();
+        park(&owner, &claim, Some(i64::MAX), "ci_poll").unwrap();
+
+        assert_eq!(queued_at(&requester, 10, 0).unwrap(), vec![workflow]);
+        let scheduling: (Option<i64>, Option<String>) = requester
+            .query_row(
+                "select not_before_unix_ms, wake_reason from workflow_execution
+                 where workflow_kind = 'plan' and run_id = 'plan-park'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(scheduling, (None, None));
+
+        drop(owner);
+        drop(requester);
         let _ = fs::remove_file(path);
     }
 
@@ -1303,6 +1763,33 @@ mod tests {
                 [&workflow.run_id],
             )
             .unwrap();
+        managed
+            .execute(
+                "insert into merge_intent (
+                   id, run_id, generation, state, placement, lane_key,
+                   created_unix_ms, updated_unix_ms
+                 ) values (30, ?1, 1, 'armed', 'reserved', 'github|example|repo|main', 1, 1)",
+                [&workflow.run_id],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "insert into integration_lane (
+                   lane_key, next_ready_sequence, reserved_intent_id, updated_unix_ms
+                 ) values ('github|example|repo|main', 2, 30, 1)",
+                [],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "insert into merge_intent (
+                   id, run_id, generation, state, placement, lane_key,
+                   created_unix_ms, updated_unix_ms
+                 ) values (31, 'next-auto', 1, 'armed', 'backlogged',
+                   'github|example|repo|main', 1, 1)",
+                [],
+            )
+            .unwrap();
         install_claim_guards(&managed, &claim).unwrap();
         managed
             .execute(
@@ -1347,12 +1834,68 @@ mod tests {
             "update auto_step_run set status = 'done' where id = 10",
             "update auto_output_line set text = 'two' where step_run_id = 10",
             "update auto_event set kind = 'finished' where id = 20",
+            "update merge_intent set updated_unix_ms = 2 where id = 30",
+            "update merge_intent set updated_unix_ms = 2 where id = 31",
+            "update integration_lane set updated_unix_ms = 2 where reserved_intent_id = 30",
             "update plan_run set updated_unix_ms = 2 where id = 'linked-plan'",
             "update plan_step_run set status = 'done' where run_id = 'linked-plan'",
             "update plan_output_line set text = 'two' where run_id = 'linked-plan'",
         ] {
             managed.execute(statement, []).unwrap();
         }
+        managed
+            .execute(
+                "update merge_intent set state = 'merged', placement = 'merged' where id = 30",
+                [],
+            )
+            .unwrap();
+        assert_stale(managed.execute(
+            "update merge_intent set updated_unix_ms = 4 where id = 31",
+            [],
+        ));
+        managed
+            .execute(
+                "update merge_intent set state = 'armed', placement = 'reserved' where id = 30",
+                [],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "update merge_intent set ready_sequence = 1 where id = 31",
+                [],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "update integration_lane set reserved_intent_id = null
+                 where lane_key = 'github|example|repo|main'",
+                [],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "update merge_intent set placement = 'backlogged', ready_sequence = 2 where id = 30",
+                [],
+            )
+            .unwrap();
+        assert_stale(managed.execute(
+            "update integration_lane set reserved_intent_id = 30
+             where lane_key = 'github|example|repo|main'",
+            [],
+        ));
+        managed
+            .execute(
+                "update merge_intent set placement = 'reserved' where id = 30",
+                [],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "update integration_lane set reserved_intent_id = 30
+                 where lane_key = 'github|example|repo|main'",
+                [],
+            )
+            .unwrap();
 
         other
             .execute(
@@ -1367,6 +1910,9 @@ mod tests {
             "update auto_step_run set status = 'failed' where id = 10",
             "update auto_output_line set text = 'stale' where step_run_id = 10",
             "update auto_event set kind = 'stale' where id = 20",
+            "update merge_intent set updated_unix_ms = 3 where id = 30",
+            "update merge_intent set updated_unix_ms = 3 where id = 31",
+            "update integration_lane set updated_unix_ms = 3 where reserved_intent_id = 30",
             "update plan_run set updated_unix_ms = 3 where id = 'linked-plan'",
             "update plan_step_run set status = 'failed' where run_id = 'linked-plan'",
             "update plan_output_line set text = 'stale' where run_id = 'linked-plan'",
@@ -1398,6 +1944,62 @@ mod tests {
 
         assert_stale(managed.execute(
             "update plan_run set updated_unix_ms = 2 where id = 'unrelated'",
+            [],
+        ));
+
+        drop(managed);
+        drop(other);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn auto_claim_can_allocate_ready_sequence_for_its_not_ready_intent() {
+        let (path, mut managed, other) = connections("auto-ready-sequence-guard");
+        let workflow = WorkflowIdentity::new(WorkflowKind::Auto, "auto-ready");
+        enqueue(&managed, &workflow).unwrap();
+        let claim = claim(&mut managed, &workflow, "daemon", "worker")
+            .unwrap()
+            .unwrap();
+        managed
+            .execute(
+                "insert into merge_intent (
+                   id, run_id, generation, state, placement, lane_key, head_sha,
+                   created_unix_ms, updated_unix_ms
+                 ) values (30, ?1, 1, 'armed', 'not_ready', 'github|example|repo|main',
+                   'head', 1, 1)",
+                [&workflow.run_id],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "insert into integration_lane (
+                   lane_key, next_ready_sequence, reserved_intent_id, updated_unix_ms
+                 ) values ('github|example|repo|main', 1, null, 1)",
+                [],
+            )
+            .unwrap();
+        install_claim_guards(&managed, &claim).unwrap();
+
+        managed
+            .execute(
+                "update merge_intent
+                 set placement = 'ready', ready_sequence = 1, updated_unix_ms = 2
+                 where id = 30",
+                [],
+            )
+            .unwrap();
+        managed
+            .execute(
+                "update integration_lane
+                 set next_ready_sequence = 2, updated_unix_ms = 2
+                 where lane_key = 'github|example|repo|main'",
+                [],
+            )
+            .unwrap();
+        assert_stale(managed.execute(
+            "update integration_lane
+             set next_ready_sequence = 3, updated_unix_ms = 3
+             where lane_key = 'github|example|repo|main'",
             [],
         ));
 

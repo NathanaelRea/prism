@@ -66,6 +66,7 @@ fn remote_pr_choice_label(summary: &crate::remote::PrSummary) -> String {
     )
 }
 
+#[allow(dead_code)]
 fn session_for_remote_action(session: &crate::session::Session) -> crate::session::Session {
     crate::session::Session {
         repo_index: session.repo_index,
@@ -1471,6 +1472,7 @@ impl Tui {
         self.text_area_dialog(raw, "Create Pull Request", "Description:\n", "")
     }
 
+    #[allow(dead_code)]
     pub(crate) fn merge_selected_pr(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,

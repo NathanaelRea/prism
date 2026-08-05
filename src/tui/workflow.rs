@@ -689,6 +689,18 @@ impl Tui {
         })
     }
 
+    pub(super) fn permanent_delete_targets_worktree(&self) -> bool {
+        self.focused_panel == PanelFocus::Worktrees
+    }
+
+    pub(super) fn dismiss_selected_workflow(&mut self) -> Result<bool, String> {
+        if self.dismiss_selected_auto_run()? {
+            Ok(true)
+        } else {
+            self.dismiss_selected_plan_run()
+        }
+    }
+
     pub(super) fn auto_run_id_for_worktree(&self, worktree_path: &Path) -> Option<&String> {
         if let Some(run_id) = self.active_auto_runs.get(worktree_path) {
             return Some(run_id);

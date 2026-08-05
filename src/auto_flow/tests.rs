@@ -271,6 +271,114 @@ fn existing_plan_queues_run_plan() {
 }
 
 #[test]
+fn existing_pull_request_source_skips_implementation_pipeline() {
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted = AutoLaunch::with_options(
+        &repo,
+        &repo.join("feature"),
+        AutoLaunchOptions {
+            branch: "feat/auto".to_string(),
+            mode: AutoRunMode::Standard,
+            implementation_source: AutoImplementationSource::ExistingPullRequest,
+            plan_path: None,
+            plan_run_mode: PlanRunMode::Sequential,
+            variant: "existing-pr".to_string(),
+            agent_profile: None,
+            initial_prompt: "Stabilize existing pull request".to_string(),
+        },
+    )
+    .unwrap()
+    .create_run();
+    persisted.steps[0].status = AutoStepStatus::Done;
+
+    assert!(next_state_machine_step_needed(&persisted));
+    assert!(!implementation_follow_up_step_needed(&persisted));
+    assert!(persisted.steps.iter().all(|step| !matches!(
+        step.step_key,
+        AutoStepKey::Implement
+            | AutoStepKey::RunPlan
+            | AutoStepKey::LocalVerify
+            | AutoStepKey::CommitImpl
+            | AutoStepKey::PushPr
+    )));
+}
+
+#[test]
+fn auto_submission_rejects_a_second_active_run_for_the_worktree() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    crate::execution::migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let worktree = repo.join("feature");
+    let mut first = AutoLaunch::new(&repo, &worktree, "feat/auto", "First task")
+        .unwrap()
+        .create_run();
+    let mut second = AutoLaunch::new(&repo, &worktree, "feat/auto", "Second task")
+        .unwrap()
+        .create_run();
+
+    submit_auto_run(&conn, &mut first).unwrap();
+    let error = submit_auto_run(&conn, &mut second).unwrap_err();
+
+    assert_eq!(
+        error,
+        format!("worktree already has active Auto Flow run {}", first.run.id)
+    );
+    assert!(load_auto_run(&conn, &second.run.id).unwrap().is_none());
+}
+
+#[test]
+#[cfg(unix)]
+fn existing_pull_request_adoption_allows_stabilization_to_report_head_divergence() {
+    let temp = TempDir::new("adopt-existing-pr-diverged");
+    let origin = temp.path().join("origin.git");
+    let work = temp.path().join("work");
+    setup_git_worktree(&origin, &work);
+    run_git(&work, &["push", "-u", "origin", "feat/auto"]);
+    let repo = Repository::with_config_dir_for_test(work.clone(), temp.path().join("prism-config"));
+    let mut config = Config::load(&repo);
+    let pr_head = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    configure_pr_observation(&temp, &mut config, "feat/auto", pr_head);
+    let mut persisted = AutoLaunch::with_options(
+        &work,
+        &work,
+        AutoLaunchOptions {
+            branch: "feat/auto".to_string(),
+            mode: AutoRunMode::Standard,
+            implementation_source: AutoImplementationSource::ExistingPullRequest,
+            plan_path: None,
+            plan_run_mode: PlanRunMode::Sequential,
+            variant: "existing-pr".to_string(),
+            agent_profile: None,
+            initial_prompt: "Stabilize existing pull request".to_string(),
+        },
+    )
+    .unwrap()
+    .create_run();
+
+    stabilization_observe::adopt_existing_pull_request(&repo, &config, &mut persisted).unwrap();
+
+    assert_eq!(persisted.run.pr_number, Some(42));
+    assert_eq!(
+        crate::remote::load_pr_cache(&repo, "feat/auto")
+            .summary()
+            .map(|summary| summary.head_sha.as_str()),
+        Some(pr_head)
+    );
+    let snapshot = stabilization_observe::build_auto_run_stabilization_snapshot(
+        &repo,
+        &persisted.run,
+        &config,
+    );
+    assert!(snapshot.pull_request.is_some());
+    assert!(
+        stabilization_plan::derive_blockers(&snapshot)
+            .contains(&stabilization_model::StabilizationBlocker::HeadDiverged)
+    );
+}
+
+#[test]
 #[cfg(unix)]
 fn prompt_implementation_pr_delegates_to_stabilization_ready_state() {
     let temp = TempDir::new("stabilization-ready-delegation");
@@ -281,6 +389,7 @@ fn prompt_implementation_pr_delegates_to_stabilization_ready_state() {
     let head = git_output(&work, &["rev-parse", "HEAD"]);
     let repo = Repository::with_config_dir_for_test(work.clone(), temp.path().join("prism-config"));
     let mut config = Config::load(&repo);
+    config.auto.review_requirement = crate::config::ReviewRequirement::None;
     configure_pr_observation(&temp, &mut config, "feat/auto", &head);
     seed_pr_cache(&repo, "feat/auto", &head);
     crate::remote::save_repo_policy_cache(
@@ -829,6 +938,7 @@ fn auto_control_abort_run_only_aborts_active_or_pending_steps() {
     persisted.run.status = AutoRunStatus::Running;
     persisted.run.pause_requested = true;
     save_auto_run(&conn, &mut persisted).unwrap();
+    crate::integration::arm_merge_intent(&conn, &persisted.run.id).unwrap();
 
     let outcome =
         apply_auto_run_control(&conn, &persisted.run.id, AutoRunControlIntent::AbortRun).unwrap();
@@ -842,6 +952,11 @@ fn auto_control_abort_run_only_aborts_active_or_pending_steps() {
         outcome.run.steps[1..]
             .iter()
             .all(|step| step.status == AutoStepStatus::Aborted)
+    );
+    assert!(
+        crate::integration::active_merge_intent(&conn, &persisted.run.id)
+            .unwrap()
+            .is_none()
     );
 }
 
@@ -1683,7 +1798,7 @@ fn schema_migration_preserves_and_fails_old_active_auto_runs_once() {
             |row| row.get::<_, i64>(0)
         )
         .unwrap(),
-        7
+        8
     );
 }
 
@@ -1716,7 +1831,7 @@ fn future_auto_schema_version_fails_without_changing_rows() {
            id integer primary key check (id = 1),
            version integer not null
          );
-         insert into auto_schema_version (id, version) values (1, 8);
+         insert into auto_schema_version (id, version) values (1, 9);
          create table auto_run (id text primary key);
          insert into auto_run (id) values ('future');",
     )
@@ -1738,12 +1853,12 @@ fn future_auto_schema_version_fails_without_changing_rows() {
             |row| row.get::<_, i64>(0)
         )
         .unwrap(),
-        8
+        9
     );
 }
 
 #[test]
-fn schema_round_trips_prompt_existing_plan_and_draft_plan_sources() {
+fn schema_round_trips_auto_implementation_sources() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
     let repo = PathBuf::from("/repo/prism");
@@ -1796,16 +1911,36 @@ fn schema_round_trips_prompt_existing_plan_and_draft_plan_sources() {
     )
     .unwrap()
     .create_run();
+    let mut existing_pull_request = AutoLaunch::with_options(
+        &repo,
+        &repo.join("existing-pr"),
+        AutoLaunchOptions {
+            branch: "feat/existing-pr".to_string(),
+            mode: AutoRunMode::Standard,
+            implementation_source: AutoImplementationSource::ExistingPullRequest,
+            plan_path: None,
+            plan_run_mode: PlanRunMode::Sequential,
+            variant: "existing-pr".to_string(),
+            agent_profile: None,
+            initial_prompt: "Stabilize existing pull request".to_string(),
+        },
+    )
+    .unwrap()
+    .create_run();
 
     save_auto_run(&conn, &mut prompt).unwrap();
     save_auto_run(&conn, &mut existing_plan).unwrap();
     save_auto_run(&conn, &mut draft_plan).unwrap();
+    save_auto_run(&conn, &mut existing_pull_request).unwrap();
 
     let prompt = load_auto_run(&conn, &prompt.run.id).unwrap().unwrap();
     let existing_plan = load_auto_run(&conn, &existing_plan.run.id)
         .unwrap()
         .unwrap();
     let draft_plan = load_auto_run(&conn, &draft_plan.run.id).unwrap().unwrap();
+    let existing_pull_request = load_auto_run(&conn, &existing_pull_request.run.id)
+        .unwrap()
+        .unwrap();
 
     assert_eq!(
         prompt.run.implementation_source,
@@ -1824,6 +1959,10 @@ fn schema_round_trips_prompt_existing_plan_and_draft_plan_sources() {
     assert_eq!(
         draft_plan.run.implementation_source,
         AutoImplementationSource::DraftPlan
+    );
+    assert_eq!(
+        existing_pull_request.run.implementation_source,
+        AutoImplementationSource::ExistingPullRequest
     );
     assert_eq!(draft_plan.run.plan_path, Some(repo.join("draft/plan.md")));
 }
@@ -1965,6 +2104,105 @@ fn stale_reconciliation_marks_active_steps_failed() {
     assert!(output.iter().any(|line| {
         line.kind == AutoOutputKind::Error && line.text.contains("Prism restarted")
     }));
+}
+
+#[test]
+fn stale_reconciliation_preserves_submitted_merge_for_observation() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted = AutoLaunch::new(
+        &repo,
+        &repo.join("feature"),
+        "feat/auto",
+        "Integrate pull request",
+    )
+    .unwrap()
+    .create_run();
+    persisted.steps.clear();
+    push_test_step(
+        &mut persisted,
+        1,
+        AutoStepKey::Merge,
+        AutoStepStatus::Running,
+    );
+    persisted.run.status = AutoRunStatus::Running;
+    save_auto_run(&conn, &mut persisted).unwrap();
+    crate::integration::arm_merge_intent(&conn, &persisted.run.id).unwrap();
+    crate::integration::synchronize_generation(
+        &conn,
+        &persisted.run.id,
+        &crate::integration::CandidateGeneration {
+            change_request_identity: crate::remote::test_change_request_identity(),
+            target_branch: "main".to_string(),
+            pr_number: 42,
+            head_sha: "head".to_string(),
+        },
+    )
+    .unwrap();
+    crate::integration::publish_ready(&conn, &persisted.run.id, "head").unwrap();
+    crate::integration::mark_submitting(&conn, &persisted.run.id).unwrap();
+    crate::integration::mark_submitted(&conn, &persisted.run.id).unwrap();
+
+    assert!(reconcile_stale_auto_run(&conn, &mut persisted).unwrap());
+
+    assert_eq!(persisted.steps[0].status, AutoStepStatus::Waiting);
+    assert_eq!(
+        crate::integration::active_merge_intent(&conn, &persisted.run.id)
+            .unwrap()
+            .unwrap()
+            .placement,
+        crate::integration::IntegrationPlacement::Submitted
+    );
+}
+
+#[test]
+fn stale_reconciliation_requeues_updating_branch_for_effect_reconciliation() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = PathBuf::from("/repo/prism");
+    let mut persisted = AutoLaunch::new(
+        &repo,
+        &repo.join("feature"),
+        "feat/auto",
+        "Update pull request",
+    )
+    .unwrap()
+    .create_run();
+    persisted.steps.clear();
+    push_test_step(
+        &mut persisted,
+        1,
+        AutoStepKey::UpdateBranch,
+        AutoStepStatus::Running,
+    );
+    persisted.run.status = AutoRunStatus::Running;
+    save_auto_run(&conn, &mut persisted).unwrap();
+    crate::integration::arm_merge_intent(&conn, &persisted.run.id).unwrap();
+    crate::integration::synchronize_generation(
+        &conn,
+        &persisted.run.id,
+        &crate::integration::CandidateGeneration {
+            change_request_identity: crate::remote::test_change_request_identity(),
+            target_branch: "main".to_string(),
+            pr_number: 42,
+            head_sha: "head".to_string(),
+        },
+    )
+    .unwrap();
+    crate::integration::publish_ready(&conn, &persisted.run.id, "head").unwrap();
+    crate::integration::mark_updating(&conn, &persisted.run.id).unwrap();
+
+    assert!(reconcile_stale_auto_run(&conn, &mut persisted).unwrap());
+
+    assert_eq!(persisted.steps[0].status, AutoStepStatus::Queued);
+    assert_eq!(
+        crate::integration::active_merge_intent(&conn, &persisted.run.id)
+            .unwrap()
+            .unwrap()
+            .placement,
+        crate::integration::IntegrationPlacement::Updating
+    );
 }
 
 #[test]
@@ -2253,6 +2491,49 @@ fn initial_change_request_push_runs_pre_pr_then_pre_push_checks() {
 
     assert!(pre_pr.exists());
     assert!(pre_push.exists());
+}
+
+#[test]
+fn reserved_base_update_rejects_mutated_pre_push_state() {
+    let repository = crate::remote::test_change_request_identity()
+        .source_repository()
+        .unwrap();
+    let expected = crate::remote::dispatcher::PushGuard {
+        repository,
+        remote: "origin".to_string(),
+        remote_branch: "feat/auto".to_string(),
+        local_branch: "feat/auto".to_string(),
+        expected_head_sha: "merged-head".to_string(),
+        set_upstream: false,
+    };
+
+    non_agent::validate_base_update_push_guard(&expected, &expected, "merged-head", false).unwrap();
+
+    let mut changed_head = expected.clone();
+    changed_head.expected_head_sha = "check-commit".to_string();
+    assert!(
+        non_agent::validate_base_update_push_guard(&expected, &changed_head, "merged-head", false,)
+            .unwrap_err()
+            .contains("push guard changed")
+    );
+
+    let mut changed_destination = expected.clone();
+    changed_destination.remote_branch = "other".to_string();
+    assert!(
+        non_agent::validate_base_update_push_guard(
+            &expected,
+            &changed_destination,
+            "merged-head",
+            false,
+        )
+        .unwrap_err()
+        .contains("push guard changed")
+    );
+    assert!(
+        non_agent::validate_base_update_push_guard(&expected, &expected, "merged-head", true,)
+            .unwrap_err()
+            .contains("became dirty")
+    );
 }
 
 #[test]
@@ -2579,7 +2860,8 @@ fn review_poll_skips_feedback_at_or_before_baseline() {
         root: temp.path().to_path_buf(),
     };
     let summary = test_pr_summary("feat/auto", "abc123", "2026-01-01T00:05:00Z");
-    let config = Config::load(&repo);
+    let mut config = Config::load(&repo);
+    config.auto.review_requirement = crate::config::ReviewRequirement::Approved;
     let details = crate::remote::PrDetails {
         comments: vec![crate::remote::PrComment {
             id: "comment-1".to_string(),
@@ -2606,6 +2888,94 @@ fn review_poll_skips_feedback_at_or_before_baseline() {
     assert!(outcome.fix_prompt.is_none());
     assert!(outcome.complete);
     assert!(outcome.summary.contains("no actionable review feedback"));
+}
+
+#[test]
+fn review_poll_keeps_old_unresolved_threads_actionable() {
+    let temp = TempDir::new("review-poll-old-thread");
+    let repo = Repository {
+        root: temp.path().to_path_buf(),
+    };
+    let summary = test_pr_summary("feat/auto", "abc123", "2026-01-01T00:05:00Z");
+    let mut config = Config::load(&repo);
+    config.auto.review_requirement = crate::config::ReviewRequirement::Approved;
+    let details = crate::remote::PrDetails {
+        review_comments: vec![crate::remote::PrReviewComment {
+            thread_id: "thread-old".to_string(),
+            body: "still unresolved".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            resolved: false,
+            ..crate::remote::PrReviewComment::default()
+        }],
+        ..crate::remote::PrDetails::default()
+    };
+    let mut persisted = AutoLaunch::new(temp.path(), temp.path(), "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+    persisted.run.review_baseline_json = Some(
+        serde_json::to_string(&ReviewBaseline {
+            head_sha: "abc123".to_string(),
+            updated_at: "2026-01-01T00:05:00Z".to_string(),
+        })
+        .unwrap(),
+    );
+
+    let outcome =
+        evaluate_review_feedback(&config, &mut persisted, &summary, Some(&details)).unwrap();
+
+    assert!(outcome.fix_prompt.is_some());
+    assert_eq!(outcome.review_thread_ids, vec!["thread-old".to_string()]);
+}
+
+#[test]
+fn review_poll_resolved_requirement_waits_without_review_comments() {
+    let temp = TempDir::new("review-poll-resolved-missing");
+    let repo = Repository {
+        root: temp.path().to_path_buf(),
+    };
+    let config = Config::load(&repo);
+    let summary = test_pr_summary("feat/auto", "abc123", "2026-01-01T00:00:00Z");
+    let mut persisted = AutoLaunch::new(temp.path(), temp.path(), "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+
+    let outcome = evaluate_review_feedback(
+        &config,
+        &mut persisted,
+        &summary,
+        Some(&crate::remote::PrDetails::default()),
+    )
+    .unwrap();
+
+    assert!(!outcome.complete);
+    assert_eq!(outcome.summary, "no review comments found yet");
+}
+
+#[test]
+fn review_poll_resolved_requirement_completes_with_a_resolved_comment() {
+    let temp = TempDir::new("review-poll-resolved-complete");
+    let repo = Repository {
+        root: temp.path().to_path_buf(),
+    };
+    let config = Config::load(&repo);
+    let summary = test_pr_summary("feat/auto", "abc123", "2026-01-01T00:00:00Z");
+    let details = crate::remote::PrDetails {
+        review_comments: vec![crate::remote::PrReviewComment {
+            body: "handled feedback".to_string(),
+            resolved: true,
+            ..crate::remote::PrReviewComment::default()
+        }],
+        ..crate::remote::PrDetails::default()
+    };
+    let mut persisted = AutoLaunch::new(temp.path(), temp.path(), "feat/auto", "Implement auto")
+        .unwrap()
+        .create_run();
+
+    let outcome =
+        evaluate_review_feedback(&config, &mut persisted, &summary, Some(&details)).unwrap();
+
+    assert!(outcome.complete);
+    assert_eq!(outcome.summary, "all 1 review comment(s) are resolved");
 }
 
 #[test]
@@ -2680,6 +3050,56 @@ fn merge_success_queues_cleanup_separately() {
 }
 
 #[test]
+fn merged_run_finishes_cleanup_without_another_pause() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    let repo = Repository {
+        root: PathBuf::from("/repo/prism"),
+    };
+    let mut persisted = AutoLaunch::new(
+        &repo.root,
+        &repo.root.join("feature"),
+        "feat/auto",
+        "Implement auto",
+    )
+    .unwrap()
+    .create_run();
+    persisted.run.implementation_source = AutoImplementationSource::ExistingPullRequest;
+    persisted.run.stabilization_status = Some(stabilization_model::StabilizationStatus::Done);
+    persisted.steps.clear();
+    push_test_step(&mut persisted, 1, AutoStepKey::Merge, AutoStepStatus::Done);
+    push_test_step(
+        &mut persisted,
+        2,
+        AutoStepKey::Cleanup,
+        AutoStepStatus::Queued,
+    );
+    save_auto_run(&conn, &mut persisted).unwrap();
+    let mut config = test_config();
+    config.auto.cleanup_after_merge = false;
+
+    pause_before_next_auto_step_with_context(&conn, &repo, &config, &mut persisted).unwrap();
+
+    assert!(!persisted.run.pause_requested);
+    assert_ne!(persisted.run.status, AutoRunStatus::Paused);
+
+    let executor =
+        AutoExecutorConfig::new("unused", None, persisted.run.worktree_path.clone(), "Auto");
+    execute_auto_initial_step(
+        &conn,
+        &repo,
+        &config,
+        &mut persisted,
+        &executor,
+        &mut Vec::new(),
+    )
+    .unwrap();
+
+    assert_eq!(persisted.run.status, AutoRunStatus::Done);
+    assert_eq!(persisted.steps[1].status, AutoStepStatus::Skipped);
+}
+
+#[test]
 fn manual_merge_skip_completes_run_without_cleanup() {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
@@ -2710,6 +3130,54 @@ fn manual_merge_skip_completes_run_without_cleanup() {
 }
 
 #[test]
+fn reserved_integration_runs_merge_without_another_pause() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    crate::execution::migrate_schema(&conn).unwrap();
+    let repo = Repository {
+        root: PathBuf::from("/repo/prism"),
+    };
+    let mut persisted = AutoLaunch::new(
+        &repo.root,
+        &repo.root.join("feature"),
+        "feature",
+        "Integrate",
+    )
+    .unwrap()
+    .create_run();
+    persisted.steps.clear();
+    push_test_step(
+        &mut persisted,
+        1,
+        AutoStepKey::Merge,
+        AutoStepStatus::Queued,
+    );
+    save_auto_run(&conn, &mut persisted).unwrap();
+    crate::integration::arm_merge_intent(&conn, &persisted.run.id).unwrap();
+    crate::integration::synchronize_generation(
+        &conn,
+        &persisted.run.id,
+        &crate::integration::CandidateGeneration {
+            change_request_identity: crate::remote::test_change_request_identity(),
+            target_branch: "main".to_string(),
+            pr_number: 42,
+            head_sha: "head".to_string(),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        crate::integration::publish_ready(&conn, &persisted.run.id, "head").unwrap(),
+        crate::integration::IntegrationPlacement::Reserved
+    );
+
+    pause_before_next_auto_step_with_context(&conn, &repo, &test_config(), &mut persisted).unwrap();
+
+    assert!(!persisted.run.pause_requested);
+    assert_ne!(persisted.run.status, AutoRunStatus::Paused);
+}
+
+#[test]
 fn waiting_merge_reconciliation_keeps_pending_without_resubmitting() {
     let temp = TempDir::new("merge-reconcile-pending");
     let repo = Repository::with_config_dir_for_test(
@@ -2718,7 +3186,24 @@ fn waiting_merge_reconciliation_keeps_pending_without_resubmitting() {
     );
     let conn = rusqlite::Connection::open_in_memory().unwrap();
     migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    crate::execution::migrate_schema(&conn).unwrap();
     let mut persisted = waiting_merge_run(&conn, temp.path());
+    crate::integration::arm_merge_intent(&conn, &persisted.run.id).unwrap();
+    crate::integration::synchronize_generation(
+        &conn,
+        &persisted.run.id,
+        &crate::integration::CandidateGeneration {
+            change_request_identity: crate::remote::test_change_request_identity(),
+            target_branch: "main".to_string(),
+            pr_number: 42,
+            head_sha: "head".to_string(),
+        },
+    )
+    .unwrap();
+    crate::integration::publish_ready(&conn, &persisted.run.id, "head").unwrap();
+    crate::integration::mark_submitting(&conn, &persisted.run.id).unwrap();
+    crate::integration::mark_submitted(&conn, &persisted.run.id).unwrap();
     let observations = std::cell::Cell::new(0);
 
     for queue_state in [
@@ -2747,6 +3232,98 @@ fn waiting_merge_reconciliation_keeps_pending_without_resubmitting() {
             .summary
             .as_deref()
             .is_some_and(|summary| summary.contains("still pending"))
+    );
+}
+
+#[test]
+fn waiting_merge_observation_failure_keeps_submitted_lane_reserved() {
+    let temp = TempDir::new("merge-reconcile-observation-failure");
+    let repo = Repository::with_config_dir_for_test(
+        temp.path().to_path_buf(),
+        temp.path().join("prism-config"),
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    crate::execution::migrate_schema(&conn).unwrap();
+    let mut persisted = waiting_merge_run(&conn, temp.path());
+    crate::integration::arm_merge_intent(&conn, &persisted.run.id).unwrap();
+    crate::integration::synchronize_generation(
+        &conn,
+        &persisted.run.id,
+        &crate::integration::CandidateGeneration {
+            change_request_identity: crate::remote::test_change_request_identity(),
+            target_branch: "main".to_string(),
+            pr_number: 42,
+            head_sha: "head".to_string(),
+        },
+    )
+    .unwrap();
+    crate::integration::publish_ready(&conn, &persisted.run.id, "head").unwrap();
+    crate::integration::mark_submitting(&conn, &persisted.run.id).unwrap();
+    crate::integration::mark_submitted(&conn, &persisted.run.id).unwrap();
+
+    let progress = reconcile_waiting_merge_step_with(&conn, &repo, &mut persisted, 0, 100, |_| {
+        Err("provider timeout".to_string())
+    })
+    .unwrap();
+
+    assert_eq!(progress, MergeReconciliationProgress::Waiting);
+    assert_eq!(persisted.steps[0].status, AutoStepStatus::Waiting);
+    assert_eq!(
+        crate::integration::active_merge_intent(&conn, &persisted.run.id)
+            .unwrap()
+            .unwrap()
+            .placement,
+        crate::integration::IntegrationPlacement::Submitted
+    );
+}
+
+#[test]
+fn interrupted_unobserved_submission_is_rearmed_for_guarded_retry() {
+    let temp = TempDir::new("merge-reconcile-unobserved-submission");
+    let repo = Repository::with_config_dir_for_test(
+        temp.path().to_path_buf(),
+        temp.path().join("prism-config"),
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    crate::execution::migrate_schema(&conn).unwrap();
+    let mut persisted = waiting_merge_run(&conn, temp.path());
+    crate::integration::arm_merge_intent(&conn, &persisted.run.id).unwrap();
+    crate::integration::synchronize_generation(
+        &conn,
+        &persisted.run.id,
+        &crate::integration::CandidateGeneration {
+            change_request_identity: crate::remote::test_change_request_identity(),
+            target_branch: "main".to_string(),
+            pr_number: 42,
+            head_sha: "head".to_string(),
+        },
+    )
+    .unwrap();
+    crate::integration::publish_ready(&conn, &persisted.run.id, "head").unwrap();
+    crate::integration::mark_submitting(&conn, &persisted.run.id).unwrap();
+
+    let progress =
+        reconcile_waiting_merge_step_with(&conn, &repo, &mut persisted, 0, 100, |expected| {
+            Ok(waiting_merge_observation(
+                expected,
+                crate::remote::LifecycleState::Open,
+                crate::remote::QueueState::NotQueued,
+            ))
+        })
+        .unwrap();
+
+    assert_eq!(progress, MergeReconciliationProgress::RetrySubmission);
+    assert_eq!(persisted.steps[0].status, AutoStepStatus::Queued);
+    assert_eq!(
+        crate::integration::active_merge_intent(&conn, &persisted.run.id)
+            .unwrap()
+            .unwrap()
+            .placement,
+        crate::integration::IntegrationPlacement::Reserved
     );
 }
 
@@ -2855,6 +3432,53 @@ fn waiting_merge_reconciliation_escalates_terminal_unmerged_closure() {
 }
 
 #[test]
+fn waiting_merge_reconciliation_stops_when_provider_removes_queue_entry() {
+    let temp = TempDir::new("merge-reconcile-removed");
+    let repo = Repository::with_config_dir_for_test(
+        temp.path().to_path_buf(),
+        temp.path().join("prism-config"),
+    );
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    migrate_schema(&conn).unwrap();
+    crate::plan_run::migrate_schema(&conn).unwrap();
+    crate::execution::migrate_schema(&conn).unwrap();
+    let mut persisted = waiting_merge_run(&conn, temp.path());
+    crate::integration::arm_merge_intent(&conn, &persisted.run.id).unwrap();
+    crate::integration::synchronize_generation(
+        &conn,
+        &persisted.run.id,
+        &crate::integration::CandidateGeneration {
+            change_request_identity: crate::remote::test_change_request_identity(),
+            target_branch: "main".to_string(),
+            pr_number: 42,
+            head_sha: "head".to_string(),
+        },
+    )
+    .unwrap();
+    crate::integration::publish_ready(&conn, &persisted.run.id, "head").unwrap();
+    crate::integration::mark_submitting(&conn, &persisted.run.id).unwrap();
+    crate::integration::mark_submitted(&conn, &persisted.run.id).unwrap();
+
+    let error =
+        reconcile_waiting_merge_step_with(&conn, &repo, &mut persisted, 0, 100, |expected| {
+            Ok(waiting_merge_observation(
+                expected,
+                crate::remote::LifecycleState::Open,
+                crate::remote::QueueState::NotQueued,
+            ))
+        })
+        .unwrap_err();
+
+    assert!(error.contains("no longer queued"));
+    assert_eq!(persisted.steps[0].status, AutoStepStatus::Failed);
+    assert!(
+        crate::integration::active_merge_intent(&conn, &persisted.run.id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn restart_preserves_waiting_merge_for_reconciliation() {
     let temp = TempDir::new("merge-reconcile-restart");
     let database = temp.path().join("auto.db");
@@ -2900,6 +3524,7 @@ fn headless_merge_step_refreshes_and_blocks_unknown_policy() {
     run_git(&work, &["push", "-u", "origin", "feat/auto"]);
     let repo = Repository::with_config_dir_for_test(work.clone(), temp.path().join("prism-config"));
     let mut config = Config::load(&repo);
+    config.auto.review_requirement = crate::config::ReviewRequirement::None;
     config.auto.merge = true;
     config.auto.review_wait_enabled = false;
     let gh_log = temp.path().join("gh.log");

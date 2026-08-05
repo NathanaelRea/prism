@@ -4,6 +4,32 @@ pub(super) enum AutoStartupSource {
     Prompt,
     ExistingPlan,
     DraftPlan,
+    ExistingPullRequest,
+    Disable,
+}
+
+pub(super) fn auto_startup_choices(auto_active: bool) -> crate::view::ChoiceList {
+    let start_choice = |key, label| {
+        if auto_active {
+            crate::view::KeyChoice::disabled(key, label)
+        } else {
+            crate::view::KeyChoice::new(key, label)
+        }
+    };
+    crate::view::ChoiceList {
+        title: "Auto Flow".to_string(),
+        choices: vec![
+            if auto_active {
+                crate::view::KeyChoice::new("x", "disable Auto Flow")
+            } else {
+                crate::view::KeyChoice::disabled("x", "disable Auto Flow")
+            },
+            start_choice("r", "existing pull request"),
+            start_choice("p", "prompt"),
+            start_choice("e", "existing plan"),
+            start_choice("d", "draft plan"),
+        ],
+    }
 }
 
 pub(super) fn validate_existing_auto_plan(plan_path: &Path) -> Result<(), String> {
@@ -32,6 +58,89 @@ pub(super) fn next_auto_step_description(run: &PersistedAutoRun) -> Option<Strin
 }
 
 impl Tui {
+    pub(crate) fn toggle_selected_merge_intent(&mut self) -> Result<(), String> {
+        let context = self
+            .selected_worktree_context()
+            .ok_or_else(|| "no worktree selected".to_string())?;
+        let session_path = self.sessions[context.session_index].path.clone();
+        if let Some(run_id) = self.active_auto_runs.get(&session_path).cloned() {
+            let outcome = crate::observability::with_writable_db(&context.repo, |conn| {
+                crate::integration::toggle_merge_intent(conn, &run_id, context.config.auto.merge)
+            })?;
+            self.load_auto_run_snapshot(&context.repo.root, &run_id);
+            crate::worker::ensure_running()?;
+            crate::worker::wake()?;
+            return self.show_message(match outcome.state {
+                crate::integration::MergeIntentState::Armed => {
+                    "added pull request to the merge queue"
+                }
+                crate::integration::MergeIntentState::Withdrawn => {
+                    "removed pull request from the merge queue"
+                }
+                _ => "updated pull request merge intent",
+            });
+        }
+
+        let session = &self.sessions[context.session_index];
+        let summary = session.pr.trusted_summary()?.cloned().ok_or_else(|| {
+            "merge queue requires an active Auto Flow or open pull request".to_string()
+        })?;
+        let branch = session.branch.clone();
+        let incarnation = session.incarnation.clone();
+        let detached = session.is_detached();
+        if summary.merged || !summary.state.eq_ignore_ascii_case("OPEN") {
+            return Err("merge queue requires an open pull request".to_string());
+        }
+        if context.config.is_default_branch(&branch) || detached {
+            return Err("merge queue requires a non-default attached worktree".to_string());
+        }
+        if selected_dirty(&session_path, &context.config)? {
+            return Err("merge queue requires a clean worktree at launch".to_string());
+        }
+        if !context.config.selected_harness()?.describe().headless {
+            return Err(format!(
+                "harness '{}' does not support managed Auto Flow execution; configure headless_command and headless_prompt_transport",
+                context.config.default_harness
+            ));
+        }
+        let launch = AutoLaunch::with_options(
+            &context.repo.root,
+            &session_path,
+            AutoLaunchOptions {
+                branch: branch.clone(),
+                mode: AutoRunMode::Standard,
+                implementation_source: AutoImplementationSource::ExistingPullRequest,
+                plan_path: None,
+                plan_run_mode: PlanRunMode::Sequential,
+                variant: "existing-pr".to_string(),
+                agent_profile: None,
+                initial_prompt: format!("Stabilize existing pull request for branch {}", branch),
+            },
+        )?
+        .with_harness(
+            context.config.default_harness.clone(),
+            context
+                .config
+                .harness_adapter(&context.config.default_harness)?,
+        )
+        .with_worktree_incarnation(incarnation);
+        let mut persisted = launch.create_run();
+        crate::auto_flow::stabilization_observe::adopt_existing_pull_request(
+            &context.repo,
+            &context.config,
+            &mut persisted,
+        )?;
+        crate::observability::with_writable_db(&context.repo, |conn| {
+            crate::auto_flow::submit_auto_run_with_merge_intent(conn, &mut persisted)
+        })?;
+        let run_id = persisted.run.id.clone();
+        self.remember_auto_run(persisted);
+        self.selected_auto_run = Some(run_id);
+        crate::worker::ensure_running()?;
+        crate::worker::wake()?;
+        self.show_message("added pull request to the merge queue")
+    }
+
     pub(crate) fn start_or_focus_selected_auto_run(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
@@ -42,19 +151,26 @@ impl Tui {
         let session_path = self.sessions[context.session_index].path.clone();
         let session_branch = self.sessions[context.session_index].branch.clone();
         let session_incarnation = self.sessions[context.session_index].incarnation.clone();
+        let active_run_id = self.active_auto_runs.get(&session_path).cloned();
+        if let Some(run_id) = active_run_id.as_ref() {
+            self.load_auto_run_snapshot(&context.repo.root, run_id);
+            self.selected_auto_run = Some(run_id.clone());
+        }
+        let Some(source) = self.prompt_auto_implementation_source(raw, active_run_id.is_some())?
+        else {
+            return Ok(());
+        };
+        if matches!(source, AutoStartupSource::Disable) {
+            let Some(run_id) = self.active_auto_runs.get(&session_path).cloned() else {
+                self.show_message("Auto Flow is already disabled")?;
+                return Ok(());
+            };
+            return self.disable_auto_run(&context.repo, &session_path, &run_id);
+        }
         if let Some(run_id) = self.active_auto_runs.get(&session_path).cloned() {
             self.load_auto_run_snapshot(&context.repo.root, &run_id);
             self.selected_auto_run = Some(run_id);
-            if self.resolve_blocking_review_threads(
-                raw,
-                context.session_index,
-                &context.repo,
-                &context.config,
-                None,
-            )? {
-                return Ok(());
-            }
-            self.show_message("focused Auto Flow run")?;
+            self.show_message("Auto Flow became active; press A again to disable it")?;
             return Ok(());
         }
         if !context.config.selected_harness()?.describe().headless {
@@ -75,9 +191,6 @@ impl Tui {
             return Err("Auto Flow requires a clean worktree at launch".to_string());
         }
         let _ = refresh_repo_policy_cache(&context.repo, &session_path, &context.config);
-        let Some(source) = self.prompt_auto_implementation_source(raw)? else {
-            return Ok(());
-        };
         let (mode, implementation_source, plan_path, plan_run_mode, variant, prompt) = match source
         {
             AutoStartupSource::Prompt => {
@@ -142,6 +255,15 @@ impl Tui {
                     prompt.trim().to_string(),
                 )
             }
+            AutoStartupSource::ExistingPullRequest => (
+                AutoRunMode::Standard,
+                AutoImplementationSource::ExistingPullRequest,
+                None,
+                PlanRunMode::Sequential,
+                "existing-pr".to_string(),
+                format!("Stabilize existing pull request for branch {session_branch}"),
+            ),
+            AutoStartupSource::Disable => unreachable!("disable is handled before launch"),
         };
         let launch = AutoLaunch::with_options(
             &context.repo.root,
@@ -165,6 +287,13 @@ impl Tui {
         )
         .with_worktree_incarnation(session_incarnation);
         let mut persisted = launch.create_run();
+        if persisted.run.implementation_source == AutoImplementationSource::ExistingPullRequest {
+            crate::auto_flow::stabilization_observe::adopt_existing_pull_request(
+                &context.repo,
+                &context.config,
+                &mut persisted,
+            )?;
+        }
         crate::observability::with_writable_db(&context.repo, |conn| {
             crate::auto_flow::submit_auto_run(conn, &mut persisted)
         })?;
@@ -180,23 +309,46 @@ impl Tui {
     pub(super) fn prompt_auto_implementation_source(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
+        auto_active: bool,
     ) -> Result<Option<AutoStartupSource>, String> {
-        let answer = self.prompt_choice_dialog(
-            raw,
-            crate::view::ChoiceList {
-                title: "Auto Flow: Implementation Source".to_string(),
-                choices: [("p", "prompt"), ("e", "existing plan"), ("d", "draft plan")]
-                    .into_iter()
-                    .map(|(key, label)| crate::view::KeyChoice::new(key, label))
-                    .collect(),
-            },
-        )?;
+        let answer = self.prompt_choice_dialog(raw, auto_startup_choices(auto_active))?;
         Ok(match answer.as_deref() {
             Some("p") => Some(AutoStartupSource::Prompt),
             Some("e") => Some(AutoStartupSource::ExistingPlan),
             Some("d") => Some(AutoStartupSource::DraftPlan),
+            Some("r") => Some(AutoStartupSource::ExistingPullRequest),
+            Some("x") => Some(AutoStartupSource::Disable),
             _ => None,
         })
+    }
+
+    fn disable_auto_run(
+        &mut self,
+        repo: &Repository,
+        worktree_path: &Path,
+        run_id: &str,
+    ) -> Result<(), String> {
+        let receipt = crate::workspace_state::control_repository_workflow(
+            repo,
+            crate::workspace_state::ControlAction::Stop,
+            "auto",
+            run_id,
+        )?;
+        self.invalidate_workflow_snapshots();
+        self.load_auto_run_snapshot(&repo.root, run_id);
+        self.active_auto_runs.remove(worktree_path);
+        if self.selected_auto_run.as_deref() == Some(run_id) {
+            self.selected_auto_run = None;
+        }
+        if receipt.warnings.is_empty() {
+            self.show_message("disabled Auto Flow")?;
+        } else {
+            self.show_message(&format!(
+                "Auto Flow stopped with cancellation warnings: {}",
+                receipt.warnings.join("; ")
+            ))?;
+        }
+        Ok(())
     }
 
     pub(super) fn prompt_auto_plan_run_mode(

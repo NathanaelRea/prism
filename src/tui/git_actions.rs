@@ -9,7 +9,7 @@ pub(crate) enum GitAction {
     OpenPr,
     SubmitReview,
     Push,
-    Merge,
+    MergeIntent,
     CiFix,
     ReviewFix,
     ResolveAllComments,
@@ -60,6 +60,14 @@ impl Tui {
         if action == GitAction::Push {
             return true;
         }
+        if action == GitAction::MergeIntent {
+            if self.active_auto_runs.contains_key(&session.path) {
+                return true;
+            }
+            return session.pr.summary().is_some_and(|summary| {
+                !summary.merged && summary.state.eq_ignore_ascii_case("OPEN")
+            });
+        }
         let Some(summary) = session.pr.summary() else {
             return false;
         };
@@ -108,10 +116,6 @@ impl Tui {
                     .selected_harness()
                     .is_ok_and(|harness| harness.describe().headless);
         }
-        if action == GitAction::Merge {
-            return self.remote_support_for_action(action, Some(summary))
-                == Some(crate::remote::SupportLevel::Supported);
-        }
         true
     }
 
@@ -131,7 +135,7 @@ impl Tui {
         Some(match action {
             GitAction::OpenPr => capabilities.fetch_change_request,
             GitAction::Push => capabilities.create_change_request,
-            GitAction::Merge => capabilities.guarded_merge,
+            GitAction::MergeIntent => return None,
             GitAction::CiFix => capabilities.ci_logs,
             GitAction::ReviewFix => capabilities.review_threads,
             GitAction::ResolveAllComments => capabilities.resolve_review_thread,
@@ -140,20 +144,14 @@ impl Tui {
     }
 
     pub(super) fn remote_action_reason(&self, action: GitAction) -> Option<String> {
+        if action == GitAction::MergeIntent {
+            return (!self.git_action_enabled(action))
+                .then(|| "requires Auto Flow or an open PR".to_string());
+        }
         let summary = self
             .selected_worktree_context()
             .and_then(|context| self.sessions.get(context.session_index))
             .and_then(|session| session.pr.summary());
-        if action == GitAction::Merge
-            && let Some(reason) = self
-                .selected_worktree_context()
-                .and_then(|context| self.sessions.get(context.session_index))
-                .and_then(|session| self.repos.get(session.repo_index))
-                .and_then(|repo| repo.remote_capabilities.as_ref())
-                .and_then(|capabilities| capabilities.guarded_merge_reason.clone())
-        {
-            return Some(reason);
-        }
         match self.remote_support_for_action(action, summary) {
             Some(crate::remote::SupportLevel::Conditional) => {
                 Some("conditional support not established".to_string())

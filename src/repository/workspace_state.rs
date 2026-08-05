@@ -1243,6 +1243,7 @@ fn controls_for(
     ownerless: bool,
 ) -> AvailableControls {
     let terminal = lifecycle.terminal();
+    let stranded = !terminal && dispatch == Some(execution::DispatchState::Terminal);
     AvailableControls {
         pause: ownerless
             && !terminal
@@ -1255,7 +1256,8 @@ fn controls_for(
             && !terminal
             && (pause_requested
                 || lifecycle == WorkflowLifecycle::Paused
-                || dispatch == Some(execution::DispatchState::Paused))
+                || dispatch == Some(execution::DispatchState::Paused)
+                || stranded)
             && dispatch != Some(execution::DispatchState::RecoveryPending),
         stop: ownerless && !terminal,
         recover: ownerless && dispatch == Some(execution::DispatchState::RecoveryPending),
@@ -1368,7 +1370,10 @@ fn apply_control_transaction(
             }
         }
         ControlAction::Resume => {
-            if !workflow.pause_requested
+            let stranded = !workflow.lifecycle.terminal()
+                && workflow.dispatch.state == Some(execution::DispatchState::Terminal);
+            if !stranded
+                && !workflow.pause_requested
                 && workflow.lifecycle != WorkflowLifecycle::Paused
                 && workflow.dispatch.state != Some(execution::DispatchState::Paused)
             {
@@ -1411,12 +1416,18 @@ fn apply_control_transaction(
                 }
             };
             if resumed_state == "queued" {
-                enqueue_dispatch(&tx, workflow, now)?;
+                enqueue_dispatch(&tx, workflow)?;
             }
             resumed_state.to_string()
         }
         ControlAction::Stop => {
             let cancellation = recorded_cancellation(&tx, workflow)?;
+            if workflow.identity.kind == WorkflowKind::Auto {
+                crate::integration::withdraw_merge_intent_in_transaction(
+                    &tx,
+                    &workflow.identity.run_id,
+                )?;
+            }
             tx.execute(&format!("update {step_table} set status = 'aborted', finished_unix_ms = ?1, error = coalesce(error, 'aborted'), execution_process_id = null, execution_process_start_time_ticks = null, process_id = null where run_id = ?2 and status in ('queued','starting','running','waiting')"), params![now, workflow.identity.run_id]).map_err(|error| format!("abort workflow steps: {error}"))?;
             let changed = tx.execute(&format!("update {run_table} set pause_requested = 0, status = 'aborted', updated_unix_ms = ?1 where id = ?2 and status not in ('done','aborted')"), params![now, workflow.identity.run_id]).map_err(|error| format!("stop workflow: {error}"))?;
             if changed != 1 {
@@ -1502,16 +1513,18 @@ fn set_dispatch(
     state: &str,
     now: i64,
 ) -> Result<(), String> {
-    conn.execute("update workflow_execution set dispatch_state = ?1, worker_id = null, daemon_instance_id = null, lease_expires_unix_ms = null, executor_pid = null, executor_process_identity = null, requeue_requested = 0, fencing_token = fencing_token + 1, updated_unix_ms = ?2 where workflow_kind = ?3 and run_id = ?4", params![state, now, workflow.identity.kind.label(), workflow.identity.run_id]).map_err(|error| format!("update workflow dispatch: {error}"))?;
+    conn.execute("update workflow_execution set dispatch_state = ?1, worker_id = null, daemon_instance_id = null, lease_expires_unix_ms = null, heartbeat_unix_ms = null, executor_pid = null, executor_process_identity = null, requeue_requested = 0, not_before_unix_ms = null, wake_reason = null, fencing_token = fencing_token + 1, workflow_revision = workflow_revision + 1, updated_unix_ms = ?2 where workflow_kind = ?3 and run_id = ?4", params![state, now, workflow.identity.kind.label(), workflow.identity.run_id]).map_err(|error| format!("update workflow dispatch: {error}"))?;
     Ok(())
 }
 
-fn enqueue_dispatch(
-    conn: &Connection,
-    workflow: &WorkflowSnapshot,
-    now: i64,
-) -> Result<(), String> {
-    conn.execute("insert into workflow_execution (workflow_kind, run_id, dispatch_state, fencing_token, requeue_requested, interruption_generation, created_unix_ms, updated_unix_ms) values (?1, ?2, 'queued', 0, 0, 0, ?3, ?3) on conflict(workflow_kind, run_id) do update set dispatch_state = case when workflow_execution.dispatch_state = 'claimed' then 'claimed' else 'queued' end, requeue_requested = case when workflow_execution.dispatch_state = 'claimed' then 1 else 0 end, worker_id = case when workflow_execution.dispatch_state = 'claimed' then worker_id else null end, daemon_instance_id = case when workflow_execution.dispatch_state = 'claimed' then daemon_instance_id else null end, updated_unix_ms = excluded.updated_unix_ms", params![workflow.identity.kind.label(), workflow.identity.run_id, now]).map_err(|error| format!("queue workflow: {error}"))?;
+fn enqueue_dispatch(conn: &Connection, workflow: &WorkflowSnapshot) -> Result<(), String> {
+    crate::execution::enqueue(
+        conn,
+        &crate::execution::WorkflowIdentity::new(
+            workflow.identity.kind,
+            workflow.identity.run_id.clone(),
+        ),
+    )?;
     Ok(())
 }
 
@@ -1826,9 +1839,12 @@ mod tests {
                workflow_kind text not null, run_id text not null, dispatch_state text not null,
                worker_id text, daemon_instance_id text, lease_expires_unix_ms integer,
                heartbeat_unix_ms integer, fencing_token integer not null,
-               executor_pid integer, executor_process_identity text,
-               requeue_requested integer not null default 0, interruption_generation integer not null,
-               created_unix_ms integer not null, updated_unix_ms integer not null,
+                executor_pid integer, executor_process_identity text,
+                requeue_requested integer not null default 0, interruption_generation integer not null,
+                recovery_decided_unix_ms integer, execution_version integer not null default 1,
+                not_before_unix_ms integer, wake_reason text,
+                workflow_revision integer not null default 0,
+                created_unix_ms integer not null, updated_unix_ms integer not null,
                primary key (workflow_kind, run_id)
              );",
         )
@@ -2023,6 +2039,42 @@ mod tests {
             )
             .unwrap();
         assert_eq!(dispatch, ("claimed".to_string(), 0));
+    }
+
+    #[test]
+    fn nonterminal_workflow_with_terminal_dispatch_can_be_resumed() {
+        let mut conn = connection();
+        insert_run(&conn, "queued", false, "terminal");
+        conn.execute(
+            "insert into plan_step_run (run_id, step, prompt, status)
+             values ('plan-1', 1, 'phase', 'queued')",
+            [],
+        )
+        .unwrap();
+        let workflow = workflow("queued", false, "terminal");
+
+        assert!(
+            controls_for(
+                workflow.lifecycle,
+                workflow.pause_requested,
+                workflow.dispatch.state,
+                true,
+            )
+            .resume
+        );
+        let (state, _) =
+            apply_control_transaction(&mut conn, &workflow, ControlAction::Resume).unwrap();
+
+        assert_eq!(state, "queued");
+        let persisted: (String, i64, String) = conn
+            .query_row(
+                "select p.status, p.pause_requested, e.dispatch_state
+                 from plan_run p join workflow_execution e on e.run_id = p.id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(persisted, ("queued".to_string(), 0, "queued".to_string()));
     }
 
     #[test]

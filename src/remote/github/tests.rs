@@ -2045,10 +2045,15 @@ fn graphql_queue_state_distinguishes_native_entry_absence_and_unobserved() {
             r#"{"data":{"repository":{"pullRequests":{"nodes":[{"number":42,"mergeQueueEntry":null}],"pageInfo":{"hasNextPage":false}}}}}"#,
         )
         .unwrap();
+    let auto_merge = try_parse_pr_summary_index(
+            r#"{"data":{"repository":{"pullRequests":{"nodes":[{"number":42,"mergeQueueEntry":null,"autoMergeRequest":{"enabledAt":"2026-08-02T00:00:00Z"}}],"pageInfo":{"hasNextPage":false}}}}}"#,
+        )
+        .unwrap();
     let direct: GithubPullRequest = serde_json::from_str(r#"{"number":42}"#).unwrap();
 
     assert_eq!(queued[0].queue_state, "AWAITING_CHECKS");
     assert_eq!(not_queued[0].queue_state, "not_queued");
+    assert_eq!(auto_merge[0].queue_state, "queued");
     assert_eq!(
         pr_summary_from_node(&direct, None).unwrap().queue_state,
         "unknown"

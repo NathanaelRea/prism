@@ -381,7 +381,7 @@ fn guarded_merge_requires_exact_identity_head_target_and_open_lifecycle() {
         target_branch: "release/next".to_string(),
         expected_source_sha: "abc123".to_string(),
         method: MergeMethod::Squash,
-        native_guard: None,
+        submission_mode: MergeSubmissionMode::Immediate,
     };
     let mut summary = ChangeRequestSummary {
         change_request: ChangeRequest {

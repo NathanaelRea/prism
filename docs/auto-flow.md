@@ -16,6 +16,11 @@ Start or focus it from the TUI with `A` on a selected non-default worktree. New 
 - prompt: enter an initial prompt and run the current one-shot implementation step
 - plan file: select an existing Markdown plan and run its phases before local verification
 - draft plan: enter a task prompt, draft `plan.md`, pause for review/approval, then run the approved plan phases
+- existing pull request: adopt the selected worktree's open pull request and begin directly at Change Request Stabilization
+
+When the selected worktree already has an active Auto Flow run, `A` disables the
+start options and offers `x` to disable Auto Flow. Disabling stops managed work
+and releases the worktree while retaining the run's audit history.
 
 Start or resume Auto Flow from the CLI with:
 
@@ -23,6 +28,7 @@ Start or resume Auto Flow from the CLI with:
 prism --repo /work/project auto "implement the task"
 prism --repo /work/project auto run-plan plan.md
 prism --repo /work/project auto plan "draft and review a plan before coding"
+prism --repo /work/project auto pr
 ```
 
 Compatibility notes:
@@ -44,15 +50,15 @@ Safety defaults:
 - managed review and CI repairs verify locally, create a repair commit, and enter guarded pending-push by default
 - review bodies and unresolved inline review threads can authorize review repair; top-level change-request comments remain advisory
 - pending repair commits are not pushed automatically unless `auto.push_repairs = true`; inspect the commit diff and use `Space g P` to push through the guard
-- `auto.merge = false` and `auto.cleanup_after_merge = false` by default
+- `auto.merge = false` and `auto.cleanup_after_merge = true` by default
 
 Useful per-repository options:
 
 ```toml
 [auto]
 merge = false
-cleanup_after_merge = false
-require_review_approval = false
+cleanup_after_merge = true
+review_requirement = "resolved"
 push_initial = true
 push_repairs = false
 review_wait_enabled = true
@@ -91,6 +97,16 @@ Pending push behavior:
 - If local or remote branch state moved away from the guard, Prism invalidates the pending push and replans instead of pushing blindly.
 - Review repair pushes resolve only the guarded review thread IDs captured when the repair work was planned.
 - The guarded obligation is persisted before either an automatic or user-approved repair push, so a restart cannot lose an in-flight effect.
+
+Merge queue behavior:
+
+- `Space g M` toggles durable merge intent for the selected worktree. It can be armed while Auto Flow is still running or for an existing open pull request; an existing pull request is adopted into Auto Flow automatically.
+- Ready pull-request generations enter a repository- and target-branch-scoped FIFO integration lane. A queue of one proceeds immediately after a fresh guarded observation.
+- Review and pull-request CI continue independently across worktrees. Prism reserves only the first all-green generation for integration.
+- A behind pull request uses a required native provider queue when available. Otherwise Prism updates only the reserved worktree with the exact observed base, pushes that merge commit, and reruns review and CI gates before merging.
+- While reserved, review and CI repairs, guarded repair pushes, base updates, and merge proceed without another approval pause. Exhausted repair or a conclusive failure releases the lane for the next ready pull request.
+- Toggling merge intent off withdraws work that has not started an integration mutation. Provider-submitted merges cannot be withdrawn until provider dequeue support is available.
+- `auto.merge = true` remains the repository default; `Space g M` records a per-run override.
 
 Change Request Cache refresh behavior:
 

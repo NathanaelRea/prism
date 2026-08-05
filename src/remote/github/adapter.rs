@@ -280,8 +280,20 @@ impl<'a> GitHubAdapter<'a> {
             target_project,
         )
         .map_err(|error| github_provider_error(RemoteOperation::MergeChangeRequest, error))?;
-        let summary =
-            self.observe_change_request_for(&request.id, RemoteOperation::MergeChangeRequest)?;
+        let summary = match self
+            .observe_change_request_for(&request.id, RemoteOperation::MergeChangeRequest)
+        {
+            Ok(summary) => summary,
+            Err(error) => {
+                return Ok(MergeMutationResult {
+                    outcome: super::super::MergeMutationOutcome::Uncertain,
+                    native_state: format!(
+                        "merge accepted; post-mutation observation failed: {error}"
+                    ),
+                    summary: before,
+                });
+            }
+        };
         if summary.change_request.head_sha != request.expected_source_sha {
             return Err(github_error(
                 RemoteOperation::MergeChangeRequest,

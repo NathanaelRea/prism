@@ -795,7 +795,10 @@ fn debug_integrity_reports_healthy_database_read_only() {
     assert!(output.status.success(), "{}", stderr(&output));
     let output = stdout(&output);
     assert!(output.contains(&format!("path = {path}")));
-    assert!(output.contains("user_version = 1"));
+    assert!(output.contains(&format!(
+        "user_version = {}",
+        prism::storage::CURRENT_SCHEMA_VERSION
+    )));
     assert!(output.contains("journal_mode = wal"));
     assert!(output.contains("main_bytes = "));
     assert!(output.contains("wal_bytes = "));
