@@ -1820,20 +1820,24 @@ mod tests {
                 worker.register_builtins().unwrap();
                 let (_shutdown, receiver) = watch::channel(false);
                 let first = tokio::spawn(worker.run(receiver));
-                for _ in 0..100 {
-                    if operations
-                        .inspect("run")
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .attempts
-                        .iter()
-                        .any(|attempt| attempt.process_id.is_some())
-                    {
-                        break;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if operations
+                            .inspect("run")
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .attempts
+                            .iter()
+                            .any(|attempt| attempt.process_id.is_some())
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
                     }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
+                })
+                .await
+                .expect("command process should be recorded before simulating a crash");
                 first.abort();
                 let _ = first.await;
                 tokio::time::sleep(Duration::from_millis(120)).await;
@@ -1844,14 +1848,18 @@ mod tests {
                 replacement.register_builtins().unwrap();
                 let (shutdown, receiver) = watch::channel(false);
                 let replacement = tokio::spawn(replacement.run(receiver));
-                for _ in 0..100 {
-                    if operations.inspect("run").await.unwrap().unwrap().status
-                        == "recovery_required"
-                    {
-                        break;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if operations.inspect("run").await.unwrap().unwrap().status
+                            == "recovery_required"
+                        {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
                     }
-                    tokio::time::sleep(Duration::from_millis(5)).await;
-                }
+                })
+                .await
+                .expect("replacement worker should require explicit recovery");
                 assert_eq!(
                     operations.inspect("run").await.unwrap().unwrap().status,
                     "recovery_required"

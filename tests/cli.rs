@@ -601,7 +601,10 @@ fn db_query_rejects_writes_after_shell_initializes_database() {
     assert!(init_output.status.success(), "{}", stderr(&init_output));
 
     let output = run(
-        ["db", "insert into plan_run(id) values ('not-allowed')"],
+        [
+            "db",
+            "insert into metadata(key, value) values ('not-allowed', 'value')",
+        ],
         &repo,
         &config_home,
     );
