@@ -3,7 +3,7 @@ use std::path::Path;
 use sqlx::{Connection, SqliteConnection};
 
 use super::error::DatabaseError;
-use super::pools::{options, set_owner_only, validate_integrity};
+use super::pools::{close_connection, options, set_owner_only, validate_integrity};
 
 pub(super) const SQLX_OWNED_USER_VERSION: i64 = 2_147_483_647;
 
@@ -54,41 +54,47 @@ pub(super) async fn adopt_historical_repository_database(
             path: path.into(),
             source,
         })?;
-    if sqlx_migration_table_exists(&mut connection).await? {
-        let user_version: i64 = sqlx::query_scalar("pragma user_version")
-            .fetch_one(&mut connection)
-            .await
-            .map_err(DatabaseError::Query)?;
-        // The ownership fence predates every supported SQLx repository database. A migration
-        // journal without it came from an unreleased development build; reject it before SQLx
-        // reports a misleading checksum error or attempts any later migration.
-        return if user_version == SQLX_OWNED_USER_VERSION {
-            Ok(())
-        } else {
-            Err(DatabaseError::NonCanonicalRepositorySchema { path: path.into() })
-        };
-    }
-    let schema = classify_legacy_repository(&mut connection, path).await?;
-    validate_integrity(&mut connection).await?;
-    refuse_protected_legacy_execution(&mut connection, path).await?;
+    let inspection = async {
+        if sqlx_migration_table_exists(&mut connection).await? {
+            let user_version: i64 = sqlx::query_scalar("pragma user_version")
+                .fetch_one(&mut connection)
+                .await
+                .map_err(DatabaseError::Query)?;
+            // The ownership fence predates every supported SQLx repository database. A migration
+            // journal without it came from an unreleased development build; reject it before SQLx
+            // reports a misleading checksum error or attempts any later migration.
+            return if user_version == SQLX_OWNED_USER_VERSION {
+                Ok(None)
+            } else {
+                Err(DatabaseError::NonCanonicalRepositorySchema { path: path.into() })
+            };
+        }
+        let schema = classify_legacy_repository(&mut connection, path).await?;
+        validate_integrity(&mut connection).await?;
+        refuse_protected_legacy_execution(&mut connection, path).await?;
 
-    let backup = path.with_extension("db.pre-sqlx-backup");
-    if !backup.exists() {
-        // `VACUUM INTO` uses SQLite's consistent snapshot machinery, including committed WAL
-        // pages. A plain file copy can silently omit committed state in WAL mode.
-        let backup_name = backup.to_string_lossy().into_owned();
-        sqlx::query("vacuum into ?")
-            .bind(backup_name)
-            .execute(&mut connection)
-            .await
-            .map_err(|source| DatabaseError::Backup {
-                path: path.into(),
-                backup: backup.clone(),
-                source: std::io::Error::other(source.to_string()),
-            })?;
-        set_owner_only(&backup)?;
+        let backup = path.with_extension("db.pre-sqlx-backup");
+        if !backup.exists() {
+            // `VACUUM INTO` uses SQLite's consistent snapshot machinery, including committed WAL
+            // pages. A plain file copy can silently omit committed state in WAL mode.
+            let backup_name = backup.to_string_lossy().into_owned();
+            sqlx::query("vacuum into ?")
+                .bind(backup_name)
+                .execute(&mut connection)
+                .await
+                .map_err(|source| DatabaseError::Backup {
+                    path: path.into(),
+                    backup: backup.clone(),
+                    source: std::io::Error::other(source.to_string()),
+                })?;
+            set_owner_only(&backup)?;
+        }
+        Ok(Some(schema))
     }
-    connection.close().await.map_err(DatabaseError::Query)?;
+    .await;
+    let Some(schema) = close_connection(connection, inspection).await? else {
+        return Ok(());
+    };
 
     let mut connection = SqliteConnection::connect_with(&options(path, false, false)?)
         .await
@@ -170,7 +176,7 @@ pub(super) async fn adopt_historical_repository_database(
     }
     .await;
 
-    match adoption {
+    let result = match adoption {
         Ok(()) => sqlx::query("commit")
             .execute(&mut connection)
             .await
@@ -178,10 +184,10 @@ pub(super) async fn adopt_historical_repository_database(
             .map_err(DatabaseError::Query),
         Err(error) => {
             let _ = sqlx::query("rollback").execute(&mut connection).await;
-            let _ = connection.close().await;
             Err(error)
         }
-    }
+    };
+    close_connection(connection, result).await
 }
 
 pub(super) async fn validate_canonical_repository_database(
@@ -194,18 +200,22 @@ pub(super) async fn validate_canonical_repository_database(
             path: path.into(),
             source,
         })?;
-    let user_version: i64 = sqlx::query_scalar("pragma user_version")
-        .fetch_one(&mut connection)
-        .await
-        .map_err(DatabaseError::Query)?;
-    let contract = schema_contract(&mut connection).await?;
-    if user_version != SQLX_OWNED_USER_VERSION
-        || !sqlx_migration_table_exists(&mut connection).await?
-        || !canonical_repository_schema_matches(&mut connection, &contract, migrator).await?
-    {
-        return Err(DatabaseError::NonCanonicalRepositorySchema { path: path.into() });
+    let result = async {
+        let user_version: i64 = sqlx::query_scalar("pragma user_version")
+            .fetch_one(&mut connection)
+            .await
+            .map_err(DatabaseError::Query)?;
+        let contract = schema_contract(&mut connection).await?;
+        if user_version != SQLX_OWNED_USER_VERSION
+            || !sqlx_migration_table_exists(&mut connection).await?
+            || !canonical_repository_schema_matches(&mut connection, &contract, migrator).await?
+        {
+            return Err(DatabaseError::NonCanonicalRepositorySchema { path: path.into() });
+        }
+        validate_integrity(&mut connection).await
     }
-    validate_integrity(&mut connection).await
+    .await;
+    close_connection(connection, result).await
 }
 
 async fn classify_legacy_repository(

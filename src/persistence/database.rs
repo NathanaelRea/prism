@@ -59,13 +59,6 @@ pub(crate) fn connect_writable(path: &Path) -> Result<SqliteConnection, Database
 }
 
 pub(crate) fn open_readonly(path: &Path) -> Result<SqliteConnection, DatabaseError> {
-    open_readonly_with_timeout(path, Duration::ZERO)
-}
-
-fn open_readonly_with_timeout(
-    path: &Path,
-    busy_timeout: Duration,
-) -> Result<SqliteConnection, DatabaseError> {
     if !path.exists() {
         return Err(DatabaseError::Connect {
             path: path.to_path_buf(),
@@ -82,7 +75,7 @@ fn open_readonly_with_timeout(
         .read_only(true)
         .create_if_missing(false)
         .foreign_keys(true)
-        .busy_timeout(busy_timeout);
+        .busy_timeout(Duration::ZERO);
     let mut connection = connect(path, options)?;
     // SQLX_RUNTIME_SQL: SQLite connection policy PRAGMAs are runtime-only statements.
     block_on(sqlx::query("pragma query_only = on").execute(&mut connection))?;
@@ -100,37 +93,39 @@ fn connect(path: &Path, options: SqliteConnectOptions) -> Result<SqliteConnectio
 
 pub(crate) fn load_metadata(path: &Path, key: &str) -> Result<Option<String>, DatabaseError> {
     let mut connection = open_writable(path)?;
-    block_on(async {
+    let result = block_on(async {
         sqlx::query_file_scalar!("sql/metadata/load.sql", key)
             .fetch_optional(&mut connection)
             .await
-    })
+    });
+    finish_connection(connection, result)
 }
 
 pub(crate) fn upsert_metadata(path: &Path, key: &str, value: &str) -> Result<(), DatabaseError> {
     let mut connection = open_writable(path)?;
-    block_on(async {
+    let result = block_on(async {
         sqlx::query_file!("sql/metadata/upsert.sql", key, value)
             .execute(&mut connection)
             .await?;
         Ok(())
-    })
+    });
+    finish_connection(connection, result)
 }
 
 pub(crate) fn delete_metadata(path: &Path, key: &str) -> Result<(), DatabaseError> {
     let mut connection = open_writable(path)?;
-    block_on(async {
+    let result = block_on(async {
         sqlx::query_file!("sql/metadata/delete.sql", key)
             .execute(&mut connection)
             .await?;
         Ok(())
-    })
+    });
+    finish_connection(connection, result)
 }
 
 pub(crate) fn run_operator_query(path: &Path, query: &str) -> Result<Vec<Vec<String>>, String> {
-    let mut connection = open_readonly_with_timeout(path, super::pools::WRITER_BUSY_TIMEOUT)
-        .map_err(|error| error.to_string())?;
-    block_on(async {
+    let mut connection = open_readonly(path).map_err(|error| error.to_string())?;
+    let result = block_on(async {
         // SQLX_RUNTIME_SQL: `prism db` intentionally executes operator-supplied read-only SQL.
         let rows = sqlx::query(query).fetch_all(&mut connection).await?;
         rows.iter()
@@ -142,8 +137,8 @@ pub(crate) fn run_operator_query(path: &Path, query: &str) -> Result<Vec<Vec<Str
                     .collect()
             })
             .collect()
-    })
-    .map_err(|error| error.to_string())
+    });
+    finish_connection(connection, result).map_err(|error| error.to_string())
 }
 
 fn sqlite_value_to_string(
@@ -186,6 +181,14 @@ pub(super) fn block_on<T>(
     crate::async_runtime::block_on(future)
         .map_err(DatabaseError::Runtime)?
         .map_err(DatabaseError::Query)
+}
+
+fn finish_connection<T>(
+    connection: SqliteConnection,
+    result: Result<T, DatabaseError>,
+) -> Result<T, DatabaseError> {
+    crate::async_runtime::block_on(super::pools::close_connection(connection, result))
+        .map_err(DatabaseError::Runtime)?
 }
 
 #[cfg(test)]
@@ -273,7 +276,7 @@ pub(crate) struct TestDatabase {
 
 #[cfg(test)]
 pub(crate) struct TestConnection {
-    connection: SqliteConnection,
+    connection: Option<SqliteConnection>,
 }
 
 #[cfg(test)]
@@ -307,7 +310,7 @@ impl TestDatabase {
         values: impl AsRef<[TestValue]>,
     ) -> Result<u64, String> {
         let mut connection = connect_writable(&self.path).map_err(|error| error.to_string())?;
-        block_on(async {
+        let result = block_on(async {
             // SQLX_RUNTIME_SQL: test-only binding adapter receives fixture SQL from callers.
             let mut query = sqlx::query(statement);
             for value in values.as_ref() {
@@ -321,18 +324,18 @@ impl TestDatabase {
                 .execute(&mut connection)
                 .await
                 .map(|result| result.rows_affected())
-        })
-        .map_err(|error| error.to_string())
+        });
+        finish_connection(connection, result).map_err(|error| error.to_string())
     }
 
     pub(crate) fn execute_batch(&self, statements: &str) -> Result<(), String> {
         let mut connection = connect_writable(&self.path).map_err(|error| error.to_string())?;
-        block_on(async {
+        let result = block_on(async {
             // SQLX_RUNTIME_SQL: test-only batch adapter receives fixture SQL from callers.
             sqlx::raw_sql(statements).execute(&mut connection).await?;
             Ok(())
-        })
-        .map_err(|error| error.to_string())
+        });
+        finish_connection(connection, result).map_err(|error| error.to_string())
     }
 
     pub(crate) fn query_row<T>(
@@ -342,7 +345,7 @@ impl TestDatabase {
         map: impl FnOnce(&TestRow) -> Result<T, sqlx::Error>,
     ) -> Result<T, String> {
         let mut connection = connect_writable(&self.path).map_err(|error| error.to_string())?;
-        let row = block_on(async {
+        let result = block_on(async {
             // SQLX_RUNTIME_SQL: test-only binding adapter receives fixture SQL from callers.
             let mut query = sqlx::query(statement);
             for value in values.as_ref() {
@@ -353,8 +356,8 @@ impl TestDatabase {
                 };
             }
             query.fetch_one(&mut connection).await
-        })
-        .map_err(|error| error.to_string())?;
+        });
+        let row = finish_connection(connection, result).map_err(|error| error.to_string())?;
         map(&TestRow(row)).map_err(|error| error.to_string())
     }
 }
@@ -364,19 +367,23 @@ impl TestConnection {
     pub(crate) fn open_writable(path: &Path) -> Result<Self, String> {
         super::storage::prepare_writable(path).map_err(|error| error.to_string())?;
         let connection = connect_writable(path).map_err(|error| error.to_string())?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection: Some(connection),
+        })
     }
 
     pub(crate) fn open_readonly(path: &Path) -> Result<Self, String> {
         let connection = open_readonly(path).map_err(|error| error.to_string())?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection: Some(connection),
+        })
     }
 
     pub(crate) fn execute_batch(&mut self, statements: &str) -> Result<(), String> {
         block_on(async {
             // SQLX_RUNTIME_SQL: test-only connection fixture receives SQL from test callers.
             sqlx::raw_sql(statements)
-                .execute(&mut self.connection)
+                .execute(self.connection.as_mut().expect("test connection is open"))
                 .await?;
             Ok(())
         })
@@ -388,7 +395,7 @@ impl TestConnection {
             // SQLX_RUNTIME_SQL: test-only assertion helper receives fixture SQL from callers.
             sqlx::query_scalar::<_, bool>(query)
                 .bind(value)
-                .fetch_one(&mut self.connection)
+                .fetch_one(self.connection.as_mut().expect("test connection is open"))
                 .await
         })
         .map_err(|error| error.to_string())
@@ -398,7 +405,7 @@ impl TestConnection {
         block_on(async {
             // SQLX_RUNTIME_SQL: test-only assertion helper receives fixture SQL from callers.
             sqlx::query_scalar::<_, i64>(query)
-                .fetch_one(&mut self.connection)
+                .fetch_one(self.connection.as_mut().expect("test connection is open"))
                 .await
         })
         .map_err(|error| error.to_string())
@@ -408,7 +415,7 @@ impl TestConnection {
         block_on(async {
             // SQLX_RUNTIME_SQL: test-only assertion helper receives fixture SQL from callers.
             sqlx::query_scalar::<_, String>(query)
-                .fetch_one(&mut self.connection)
+                .fetch_one(self.connection.as_mut().expect("test connection is open"))
                 .await
         })
         .map_err(|error| error.to_string())
@@ -423,10 +430,19 @@ impl TestConnection {
             // SQLX_RUNTIME_SQL: test-only assertion helper receives fixture SQL from callers.
             sqlx::query_scalar::<_, String>(query)
                 .bind(value)
-                .fetch_one(&mut self.connection)
+                .fetch_one(self.connection.as_mut().expect("test connection is open"))
                 .await
         })
         .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestConnection {
+    fn drop(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            let _ = crate::async_runtime::block_on(connection.close());
+        }
     }
 }
 
@@ -500,17 +516,6 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        remove_database(&path);
-    }
-
-    #[test]
-    fn operator_queries_wait_for_transient_database_locks() {
-        let path = test_path("operator-query-timeout");
-        initialize(&path).unwrap();
-
-        let values = run_operator_query(&path, "pragma busy_timeout").unwrap();
-
-        assert_eq!(values, vec![vec!["5000".to_string()]]);
         remove_database(&path);
     }
 

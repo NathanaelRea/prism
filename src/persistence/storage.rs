@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use sqlx::{Row, SqliteConnection};
+use sqlx::{Connection, Row, SqliteConnection};
 
 pub const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -344,11 +344,13 @@ fn record_open(
 }
 
 pub fn prepare_writable(path: &Path) -> Result<(), StorageError> {
-    open_writable(path).map(drop)
+    let connection = open_writable(path)?;
+    finish_connection(connection, Ok(()), "close writable database")
 }
 
 pub fn verify_readonly(path: &Path) -> Result<(), StorageError> {
-    open_readonly(path).map(drop)
+    let connection = open_readonly(path)?;
+    finish_connection(connection, Ok(()), "close read-only database")
 }
 
 pub(crate) fn record_storage_error(error: &StorageError) {
@@ -442,10 +444,13 @@ fn journal_mode(connection: &mut SqliteConnection) -> Result<String, StorageErro
 
 pub fn quick_check_readonly(path: &Path) -> Result<StorageCheckReport, StorageError> {
     let mut connection = open_readonly_inner(path)?;
-    Ok(StorageCheckReport {
-        quick_check: quick_check(&mut connection)?,
-        foreign_key_check: foreign_key_check(&mut connection)?,
-    })
+    let result = (|| {
+        Ok(StorageCheckReport {
+            quick_check: quick_check(&mut connection)?,
+            foreign_key_check: foreign_key_check(&mut connection)?,
+        })
+    })();
+    finish_connection(connection, result, "close read-only database")
 }
 
 pub(crate) fn verify_unclean_database_readonly(
@@ -588,30 +593,37 @@ pub(crate) fn print_integrity(path: &Path) -> Result<(), StorageError> {
             first_error.get_or_insert(error);
         }
     }
-    first_error.map_or(Ok(()), Err)
+    finish_connection(
+        connection,
+        first_error.map_or(Ok(()), Err),
+        "close read-only database",
+    )
 }
 
 pub(crate) fn passive_checkpoint_status(path: &Path) -> Result<WalStatus, StorageError> {
     let mut connection = open_writable(path)?;
-    let started = Instant::now();
-    let (checkpoint_busy, checkpoint_log_frames, checkpointed_frames) = run_sqlx(async {
-        // SQLX_RUNTIME_SQL: WAL checkpoint control is a runtime-only SQLite PRAGMA.
-        sqlx::query_as::<_, (i64, i64, i64)>("pragma wal_checkpoint(passive)")
-            .fetch_one(&mut connection)
-            .await
-    })
-    .map_err(|error| {
-        StorageError::from_sqlx("run passive WAL checkpoint", error, started.elapsed())
-    })?;
-    let (main_bytes, wal_bytes, shm_bytes) = database_file_sizes(path)?;
-    Ok(WalStatus {
-        main_bytes,
-        wal_bytes,
-        shm_bytes,
-        checkpoint_busy,
-        checkpoint_log_frames,
-        checkpointed_frames,
-    })
+    let result = (|| {
+        let started = Instant::now();
+        let (checkpoint_busy, checkpoint_log_frames, checkpointed_frames) = run_sqlx(async {
+            // SQLX_RUNTIME_SQL: WAL checkpoint control is a runtime-only SQLite PRAGMA.
+            sqlx::query_as::<_, (i64, i64, i64)>("pragma wal_checkpoint(passive)")
+                .fetch_one(&mut connection)
+                .await
+        })
+        .map_err(|error| {
+            StorageError::from_sqlx("run passive WAL checkpoint", error, started.elapsed())
+        })?;
+        let (main_bytes, wal_bytes, shm_bytes) = database_file_sizes(path)?;
+        Ok(WalStatus {
+            main_bytes,
+            wal_bytes,
+            shm_bytes,
+            checkpoint_busy,
+            checkpoint_log_frames,
+            checkpointed_frames,
+        })
+    })();
+    finish_connection(connection, result, "close writable database")
 }
 
 pub(crate) fn monitor_wal_growth(path: &Path) {
@@ -666,6 +678,23 @@ fn run_sqlx<T>(
     future: impl std::future::Future<Output = Result<T, sqlx::Error>>,
 ) -> Result<T, sqlx::Error> {
     crate::async_runtime::block_on(future).map_err(sqlx::Error::Io)?
+}
+
+fn finish_connection<T>(
+    connection: SqliteConnection,
+    result: Result<T, StorageError>,
+    close_context: &'static str,
+) -> Result<T, StorageError> {
+    let started = Instant::now();
+    let close = run_sqlx(connection.close())
+        .map_err(|error| StorageError::from_sqlx(close_context, error, started.elapsed()));
+    match result {
+        Err(error) => Err(error),
+        Ok(value) => {
+            close?;
+            Ok(value)
+        }
+    }
 }
 
 fn database_file_sizes(path: &Path) -> Result<(u64, u64, u64), StorageError> {

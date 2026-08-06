@@ -54,7 +54,7 @@ impl ObservabilityStore {
         let options = writable_options(&self.path, false)?;
         block_on(async {
             let mut connection = SqliteConnection::connect_with(&options).await?;
-            sqlx::query_file!(
+            let result = sqlx::query_file!(
                 "sql/observability/insert_event.sql",
                 event.time_unix_ms,
                 event.level,
@@ -69,8 +69,9 @@ impl ObservabilityStore {
                 event.data_json,
             )
             .execute(&mut connection)
-            .await?;
-            Ok(())
+            .await
+            .map(|_| ());
+            finish_connection(connection, result).await
         })
     }
 
@@ -78,7 +79,7 @@ impl ObservabilityStore {
         let options = writable_options(&self.path, false)?;
         block_on(async {
             let mut connection = SqliteConnection::connect_with(&options).await?;
-            sqlx::query_file!(
+            let result = sqlx::query_file!(
                 "sql/observability/insert_startup_phase.sql",
                 phase.run_id,
                 phase.phase,
@@ -88,8 +89,9 @@ impl ObservabilityStore {
                 phase.error,
             )
             .execute(&mut connection)
-            .await?;
-            Ok(())
+            .await
+            .map(|_| ());
+            finish_connection(connection, result).await
         })
     }
 
@@ -101,10 +103,10 @@ impl ObservabilityStore {
         let options = writable_options(&self.path, false)?;
         block_on(async {
             let mut connection = SqliteConnection::connect_with(&options).await?;
-            super::database::begin_immediate_query()
-                .execute(&mut connection)
-                .await?;
-            let result: Result<(), sqlx::Error> = async {
+            let result = async {
+                super::database::begin_immediate_query()
+                    .execute(&mut connection)
+                    .await?;
                 for stale_run_id in stale_run_ids {
                     sqlx::query_file!(
                         "sql/observability/mark_startup_run_unclean.sql",
@@ -134,8 +136,7 @@ impl ObservabilityStore {
                     .execute(&mut connection)
                     .await;
             }
-            result?;
-            connection.close().await
+            finish_connection(connection, result).await
         })
     }
 
@@ -149,7 +150,7 @@ impl ObservabilityStore {
         let options = writable_options(&self.path, false)?;
         block_on(async {
             let mut connection = SqliteConnection::connect_with(&options).await?;
-            sqlx::query_file!(
+            let result = sqlx::query_file!(
                 "sql/observability/finish_startup_run.sql",
                 time_finished_unix_ms,
                 status,
@@ -157,8 +158,23 @@ impl ObservabilityStore {
                 run_id,
             )
             .execute(&mut connection)
-            .await?;
-            Ok(())
+            .await
+            .map(|_| ());
+            finish_connection(connection, result).await
         })
+    }
+}
+
+async fn finish_connection<T>(
+    connection: SqliteConnection,
+    result: Result<T, sqlx::Error>,
+) -> Result<T, sqlx::Error> {
+    let close = connection.close().await;
+    match result {
+        Err(error) => Err(error),
+        Ok(value) => {
+            close?;
+            Ok(value)
+        }
     }
 }

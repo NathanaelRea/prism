@@ -1781,14 +1781,14 @@ mod tests {
     }
 
     fn table_exists(path: &Path, table: &str) -> bool {
-        retry_locked_read(|| {
-            let mut connection = crate::persistence::database::TestConnection::open_readonly(path)?;
-            connection.scalar_bool(
+        let mut connection =
+            crate::persistence::database::TestConnection::open_readonly(path).unwrap();
+        connection
+            .scalar_bool(
                 "select exists(select 1 from sqlite_master where type = 'table' and name = ?1)",
                 table,
             )
-        })
-        .unwrap()
+            .unwrap()
     }
 
     fn execute_at(path: &Path, sql: &str) -> Result<(), String> {
@@ -1804,29 +1804,13 @@ mod tests {
     }
 
     fn scalar_i64(path: &Path, query: &str) -> Result<i64, String> {
-        retry_locked_read(|| {
-            let mut connection = crate::persistence::database::TestConnection::open_readonly(path)?;
-            connection.scalar_i64(query)
-        })
+        let mut connection = crate::persistence::database::TestConnection::open_readonly(path)?;
+        connection.scalar_i64(query)
     }
 
     fn scalar_string(path: &Path, query: &str) -> Result<String, String> {
-        retry_locked_read(|| {
-            let mut connection = crate::persistence::database::TestConnection::open_readonly(path)?;
-            connection.scalar_string(query)
-        })
-    }
-
-    fn retry_locked_read<T>(mut read: impl FnMut() -> Result<T, String>) -> Result<T, String> {
-        for _ in 0..100 {
-            match read() {
-                Err(error) if error.contains("database is locked") => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                result => return result,
-            }
-        }
-        read()
+        let mut connection = crate::persistence::database::TestConnection::open_readonly(path)?;
+        connection.scalar_string(query)
     }
 
     fn test_path(label: &str) -> PathBuf {

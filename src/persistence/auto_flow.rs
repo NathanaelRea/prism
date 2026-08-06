@@ -1,7 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
-use sqlx::sqlite::{SqliteJournalMode, SqliteSynchronous};
 use sqlx::{Connection, SqliteConnection};
 
 use crate::auto_flow::{
@@ -480,16 +478,8 @@ async fn upsert_step(
 }
 
 fn options(path: &Path) -> Result<sqlx::sqlite::SqliteConnectOptions, String> {
-    sqlx::sqlite::SqliteConnectOptions::from_str(&path.to_string_lossy())
+    super::database::writable_options(path, false)
         .map_err(|error| format!("open Auto Flow database {}: {error}", path.display()))
-        .map(|options| {
-            options
-                .create_if_missing(false)
-                .foreign_keys(true)
-                .journal_mode(SqliteJournalMode::Wal)
-                .synchronous(SqliteSynchronous::Full)
-                .busy_timeout(std::time::Duration::from_secs(5))
-        })
 }
 
 fn block<T>(
@@ -507,7 +497,15 @@ fn write<T>(
     let options = options(path)?;
     block(async {
         let mut connection = SqliteConnection::connect_with(&options).await?;
-        operation(&mut connection).await
+        let result = operation(&mut connection).await;
+        let close = connection.close().await;
+        match result {
+            Err(error) => Err(error),
+            Ok(value) => {
+                close?;
+                Ok(value)
+            }
+        }
     })
 }
 

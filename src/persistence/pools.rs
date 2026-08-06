@@ -233,12 +233,29 @@ async fn migrate(path: &Path, migrator: &sqlx::migrate::Migrator) -> Result<(), 
             path: path.into(),
             source,
         })?;
-    migrator
-        .run(&mut connection)
-        .await
-        .map_err(DatabaseError::Migrate)?;
-    validate_integrity(&mut connection).await?;
-    connection.close().await.map_err(DatabaseError::Query)
+    let result = async {
+        migrator
+            .run(&mut connection)
+            .await
+            .map_err(DatabaseError::Migrate)?;
+        validate_integrity(&mut connection).await
+    }
+    .await;
+    close_connection(connection, result).await
+}
+
+pub(super) async fn close_connection<T>(
+    connection: SqliteConnection,
+    result: Result<T, DatabaseError>,
+) -> Result<T, DatabaseError> {
+    let close = connection.close().await.map_err(DatabaseError::Query);
+    match result {
+        Err(error) => Err(error),
+        Ok(value) => {
+            close?;
+            Ok(value)
+        }
+    }
 }
 
 pub(super) fn options(
@@ -304,19 +321,23 @@ async fn reject_wrong_workflow_database(path: &Path) -> Result<(), DatabaseError
             path: path.into(),
             source,
         })?;
-    let workflow_identity: i64 = sqlx::query_scalar(
-        "select count(*) from sqlite_master where type = 'table' and name = 'workflow_database_identity'",
-    ).fetch_one(&mut connection).await.map_err(DatabaseError::Query)?;
-    let repository_marker: i64 = sqlx::query_scalar(
-        "select count(*) from sqlite_master where type = 'table' and name in ('workflow_execution','plan_run')",
-    ).fetch_one(&mut connection).await.map_err(DatabaseError::Query)?;
-    if workflow_identity == 0 && repository_marker > 0 {
-        return Err(DatabaseError::WrongDatabase {
-            path: path.into(),
-            expected: "workflow",
-        });
+    let result = async {
+        let workflow_identity: i64 = sqlx::query_scalar(
+            "select count(*) from sqlite_master where type = 'table' and name = 'workflow_database_identity'",
+        ).fetch_one(&mut connection).await.map_err(DatabaseError::Query)?;
+        let repository_marker: i64 = sqlx::query_scalar(
+            "select count(*) from sqlite_master where type = 'table' and name in ('workflow_execution','plan_run')",
+        ).fetch_one(&mut connection).await.map_err(DatabaseError::Query)?;
+        if workflow_identity == 0 && repository_marker > 0 {
+            return Err(DatabaseError::WrongDatabase {
+                path: path.into(),
+                expected: "workflow",
+            });
+        }
+        Ok(())
     }
-    Ok(())
+    .await;
+    close_connection(connection, result).await
 }
 
 pub(super) async fn validate_integrity(
