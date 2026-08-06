@@ -314,7 +314,11 @@ async fn reject_wrong_workflow_database(path: &Path) -> Result<(), DatabaseError
     {
         return Ok(());
     }
-    let mut connection = SqliteConnection::connect_with(&options(path, false, true)?)
+    // Opening is a bounded startup operation, not a latency-sensitive projection read. A prior
+    // process or pool may still be releasing its WAL lock, so classification must tolerate that
+    // transient handoff while remaining read-only.
+    let inspection_options = options(path, false, true)?.busy_timeout(WRITER_BUSY_TIMEOUT);
+    let mut connection = SqliteConnection::connect_with(&inspection_options)
         .await
         .map_err(|source| DatabaseError::Connect {
             path: path.into(),
@@ -364,4 +368,72 @@ pub(super) async fn validate_integrity(
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    #[test]
+    fn workflow_open_waits_for_a_transient_classification_lock() {
+        let directory = std::env::temp_dir().join(format!(
+            "prism-workflow-open-lock-{}-{}",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = directory.join("workflow.db");
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                prepare_parent(&path).unwrap();
+                migrate(&path, &WORKFLOW_MIGRATOR).await.unwrap();
+
+                let mut blocker =
+                    SqliteConnection::connect_with(&options(&path, false, false).unwrap())
+                        .await
+                        .unwrap();
+                let locking_mode: String = sqlx::query_scalar("pragma locking_mode = exclusive")
+                    .fetch_one(&mut blocker)
+                    .await
+                    .unwrap();
+                assert_eq!(locking_mode, "exclusive");
+                sqlx::query("begin exclusive")
+                    .execute(&mut blocker)
+                    .await
+                    .unwrap();
+                sqlx::query("insert into control_plane_metric (name, value, labels_json, time_unix_ms) values ('lock', 1, '{}', 1)")
+                    .execute(&mut blocker)
+                    .await
+                    .unwrap();
+
+                let reopen_path = path.clone();
+                let reopening = std::thread::spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(WorkflowDatabase::open(&reopen_path))
+                });
+                std::thread::sleep(Duration::from_millis(50));
+                sqlx::query("commit")
+                    .execute(&mut blocker)
+                    .await
+                    .unwrap();
+                blocker.close().await.unwrap();
+
+                let reopened = reopening
+                    .join()
+                    .unwrap()
+                    .expect("workflow open should wait for a transient SQLite lock");
+                reopened.close().await;
+            });
+        let _ = std::fs::remove_dir_all(directory);
+    }
 }
