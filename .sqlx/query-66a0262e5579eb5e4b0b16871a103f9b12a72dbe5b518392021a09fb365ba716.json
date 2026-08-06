@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "select state, updated_unix_ms from agent_state where branch = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "state",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "updated_unix_ms",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "66a0262e5579eb5e4b0b16871a103f9b12a72dbe5b518392021a09fb365ba716"
+}

@@ -1,0 +1,68 @@
+{
+  "db_name": "SQLite",
+  "query": "select\n  id as \"id!: String\",\n  attempt_id as \"attempt_id!: String\",\n  effect_kind as \"effect_kind!: String\",\n  idempotency_key as \"idempotency_key!: String\",\n  status as \"status!: String\",\n  request_json as \"request_json!: String\",\n  result_json,\n  created_unix_ms as \"created_unix_ms!: i64\",\n  updated_unix_ms as \"updated_unix_ms!: i64\"\nfrom effect_intent\nwhere run_id = ?\norder by created_unix_ms, id\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "attempt_id!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "effect_kind!: String",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "idempotency_key!: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "status!: String",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "request_json!: String",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "result_json",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_unix_ms!: i64",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "updated_unix_ms!: i64",
+        "ordinal": 8,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "44109d88552da292721930650809632da6048a12fe22881899e64df80fd38965"
+}

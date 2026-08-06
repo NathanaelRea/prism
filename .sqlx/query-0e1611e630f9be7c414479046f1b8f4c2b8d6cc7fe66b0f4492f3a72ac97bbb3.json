@@ -1,0 +1,50 @@
+{
+  "db_name": "SQLite",
+  "query": "select branch as \"branch!\", worktree_path, worktree_incarnation, branch_oid,\n       worktree_removed, branch_deleted\nfrom pending_worktree_deletion\nwhere branch = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "branch!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "worktree_path",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "worktree_incarnation",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "branch_oid",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "worktree_removed",
+        "ordinal": 4,
+        "type_info": "Integer"
+      },
+      {
+        "name": "branch_deleted",
+        "ordinal": 5,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "0e1611e630f9be7c414479046f1b8f4c2b8d6cc7fe66b0f4492f3a72ac97bbb3"
+}

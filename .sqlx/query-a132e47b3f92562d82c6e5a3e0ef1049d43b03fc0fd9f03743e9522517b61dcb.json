@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select run.id as \"id!\"\nfrom auto_run run\nwhere run.repo_root = ?\n  and run.archived_unix_ms is null\n  and run.variant = 'repair'\n  and run.status in ('done', 'aborted')\n  and not exists (\n    select 1 from auto_run newer\n    where newer.repo_root = run.repo_root\n      and newer.worktree_path = run.worktree_path\n      and newer.archived_unix_ms is null\n      and newer.variant = 'repair'\n      and newer.status in ('done', 'aborted')\n      and newer.updated_unix_ms > run.updated_unix_ms\n  )\norder by run.updated_unix_ms desc\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "a132e47b3f92562d82c6e5a3e0ef1049d43b03fc0fd9f03743e9522517b61dcb"
+}

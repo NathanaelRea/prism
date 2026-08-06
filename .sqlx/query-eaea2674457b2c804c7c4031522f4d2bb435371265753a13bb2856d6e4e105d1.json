@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "delete from worktree_harness where branch = ? and worktree_path = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "eaea2674457b2c804c7c4031522f4d2bb435371265753a13bb2856d6e4e105d1"
+}

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select worktree\nfrom task_metadata\nwhere branch = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "worktree",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7718f7f9f7b7f3afd7d5f8c8812f2096889687534bf29e52fa9348dd94f574b0"
+}

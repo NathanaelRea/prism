@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "select id as \"id!: String\", status, time_finished_unix_ms\nfrom startup_run\norder by time_started_unix_ms desc\nlimit 1\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "status",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "time_finished_unix_ms",
+        "ordinal": 2,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "74ef839b28a0de282469e6c6fa87807849dc4d6341c6d0f38fbb1356f4b68e94"
+}

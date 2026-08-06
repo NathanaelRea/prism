@@ -212,7 +212,7 @@ pub(crate) fn stabilization_panel_model(
             .as_ref()
             .map(|blocker| ci_gate_label(session, blocker))
             .unwrap_or_default(),
-        review: review_gate_label(model.config, session, blocker.as_ref()),
+        review: review_gate_label(session),
         merge: merge_gate_label(session),
         policy: blocker.as_ref().map(policy_gate_label).unwrap_or_default(),
     }
@@ -392,58 +392,14 @@ fn ci_blockers_ruled_out(blocker: &StabilizationBlocker) -> bool {
     )
 }
 
-fn review_gate_label(
-    config: &crate::config::Config,
-    session: &Session,
-    blocker: Option<&StabilizationBlocker>,
-) -> String {
-    let Some(summary) = session.pr.summary() else {
+fn review_gate_label(session: &Session) -> String {
+    if session.pr.summary().is_none() {
         return "unknown".to_string();
-    };
-    match blocker {
-        Some(StabilizationBlocker::ReviewFeedbackFound) => return "feedback".to_string(),
-        Some(
-            StabilizationBlocker::ReviewFeedbackMissing
-            | StabilizationBlocker::ReviewApprovalMissing,
-        ) => return "missing".to_string(),
-        Some(
-            StabilizationBlocker::PendingPush
-            | StabilizationBlocker::DirtyWorktree
-            | StabilizationBlocker::ObservationFailed
-            | StabilizationBlocker::DraftPullRequest
-            | StabilizationBlocker::WrongBase
-            | StabilizationBlocker::HeadDiverged,
-        ) => return "unknown".to_string(),
-        _ => {}
     }
-    let requirement = config.auto.review_requirement;
-    match requirement {
-        crate::config::ReviewRequirement::None => "passed".to_string(),
-        crate::config::ReviewRequirement::Resolved => {
-            let Ok(Some(details)) = session.pr.trusted_details() else {
-                return "unknown".to_string();
-            };
-            let mut comments = details
-                .review_comments
-                .iter()
-                .filter(|comment| !comment.body.trim().is_empty());
-            let Some(first) = comments.next() else {
-                return "missing".to_string();
-            };
-            if first.resolved && comments.all(|comment| comment.resolved) {
-                "passed".to_string()
-            } else {
-                "feedback".to_string()
-            }
-        }
-        crate::config::ReviewRequirement::Approved => {
-            if summary.review_decision.eq_ignore_ascii_case("approved") {
-                "approved".to_string()
-            } else {
-                "missing".to_string()
-            }
-        }
+    if has_unresolved_review_comments(session) {
+        return "needs review".to_string();
     }
+    "passed".to_string()
 }
 
 fn merge_gate_label(session: &Session) -> String {
@@ -485,6 +441,15 @@ fn merge_blocked(summary: &crate::remote::PrSummary) -> bool {
             .as_str(),
         "DIRTY" | "BLOCKED" | "BEHIND"
     )
+}
+
+fn has_unresolved_review_comments(session: &Session) -> bool {
+    session.pr.details().is_some_and(|details| {
+        details
+            .review_comments
+            .iter()
+            .any(|comment| !comment.resolved)
+    })
 }
 
 fn stabilization_state_style(label: &str) -> Style {

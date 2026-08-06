@@ -431,12 +431,6 @@ impl ForgejoAdapter {
         &self,
         request: GuardedMerge,
     ) -> Result<MergeMutationResult, RemoteError> {
-        if request.submission_mode == super::MergeSubmissionMode::NativeQueue {
-            return Err(unsupported(
-                RemoteOperation::MergeChangeRequest,
-                "Forgejo native merge queues are not supported",
-            ));
-        }
         if request.id.repository() != &request.target_repository {
             return Err(validation_error(
                 RemoteOperation::MergeChangeRequest,
@@ -2661,7 +2655,7 @@ mod tests {
                 target_branch: "main".to_string(),
                 expected_source_sha: "abc123".to_string(),
                 method: MergeMethod::Squash,
-                submission_mode: super::super::MergeSubmissionMode::Immediate,
+                native_guard: None,
             })
             .unwrap_err();
         assert_eq!(error.class(), RemoteErrorClass::Unsupported);
@@ -2702,7 +2696,7 @@ mod tests {
                 target_branch: "main".to_string(),
                 expected_source_sha: "abc123".to_string(),
                 method: MergeMethod::Squash,
-                submission_mode: super::super::MergeSubmissionMode::Immediate,
+                native_guard: None,
             })
             .unwrap();
         assert_eq!(summary.outcome, super::super::MergeMutationOutcome::Merged);
@@ -2744,7 +2738,7 @@ mod tests {
                 target_branch: "main".to_string(),
                 expected_source_sha: "abc123".to_string(),
                 method: MergeMethod::Squash,
-                submission_mode: super::super::MergeSubmissionMode::Immediate,
+                native_guard: None,
             })
             .unwrap();
 
@@ -2787,7 +2781,7 @@ mod tests {
                     target_branch: "main".to_string(),
                     expected_source_sha: "abc123".to_string(),
                     method: MergeMethod::Squash,
-                    submission_mode: super::super::MergeSubmissionMode::Immediate,
+                    native_guard: None,
                 })
                 .unwrap_err();
             assert_eq!(error.class(), expected_class);
@@ -2820,7 +2814,7 @@ mod tests {
                 target_branch: "main".to_string(),
                 expected_source_sha: "abc123".to_string(),
                 method: MergeMethod::Squash,
-                submission_mode: super::super::MergeSubmissionMode::Immediate,
+                native_guard: None,
             })
             .unwrap_err();
         assert_eq!(error.class(), RemoteErrorClass::Unsupported);
@@ -3090,7 +3084,7 @@ mod tests {
             target_branch: "main".to_string(),
             expected_source_sha: expected_source_sha.to_string(),
             method: MergeMethod::Merge,
-            submission_mode: super::super::MergeSubmissionMode::Immediate,
+            native_guard: None,
         };
         let stale = adapter
             .merge_change_request(merge_request("0000000000000000000000000000000000000000"))

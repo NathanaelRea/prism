@@ -10,7 +10,6 @@ mod forgejo;
 mod github;
 mod gitlab;
 mod http;
-mod migrations;
 mod model;
 mod store;
 
@@ -32,26 +31,23 @@ pub(crate) use discovery::{
 #[cfg(test)]
 pub(crate) use discovery::{DiscoveryError, GitRemoteParser, GitTransport};
 pub(crate) use error::{RemoteError, RemoteErrorClass, RemoteOperation, RetryHint, Retryability};
-pub(crate) use migrations::migrate_pr_cache_schema;
-#[cfg(test)]
-pub(crate) use model::HeadAssociation;
 pub(crate) use model::{
     CanonicalChangeRequestIdentity, ChangeRequest, ChangeRequestDetails, ChangeRequestId,
     ChangeRequestSummary, CheckContext, CheckState, CiFailure, Comment, CreateChangeRequest,
     FetchChangeRequest, GuardedMerge, HostIdentity, IdentityError, LifecycleState, MergeMethod,
-    MergeMutationOutcome, MergeMutationResult, MergeSubmissionMode, MergeabilityState,
-    NativeChangeRequestId, NativeReviewThreadId, NativeStateEvidence, Observation, PolicyFacts,
-    ProviderKind, QueueState, RemoteBase, RemoteRepository, RemoteRepositoryId, RepositoryPolicy,
-    ResolveReviewThread, Review, ReviewDecision, ReviewSubmissionKind, ReviewThread, SubmitReview,
-    WebScheme,
+    MergeMutationOutcome, MergeMutationResult, MergeabilityState, NativeChangeRequestId,
+    NativeReviewThreadId, NativeStateEvidence, Observation, PolicyFacts, ProviderKind, QueueState,
+    RemoteBase, RemoteRepository, RemoteRepositoryId, RepositoryPolicy, ResolveReviewThread,
+    Review, ReviewDecision, ReviewSubmissionKind, ReviewThread, SubmitReview, WebScheme,
 };
+#[cfg(test)]
+pub(crate) use model::{HeadAssociation, NativeMergeGuard};
 #[cfg(test)]
 pub(crate) use store::record_pr_summary;
 #[cfg(test)]
 pub(crate) use store::save_repo_policy_cache;
 pub(crate) use store::{
-    load_pr_cache, load_repo_policy_cache_for_repository, persist_pr_cache_snapshot,
-    remove_pr_cache_with_conn,
+    load_pr_cache, load_repo_policy_cache_for_identity, persist_pr_cache_snapshot,
 };
 #[cfg(test)]
 pub(crate) use store::{save_pr_cache, save_pr_details_cache};

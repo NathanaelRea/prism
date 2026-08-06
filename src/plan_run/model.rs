@@ -9,7 +9,6 @@ pub struct PlanRun {
     pub adapter_id: String,
     pub repo_root: String,
     pub scope_path: PathBuf,
-    pub worktree_session_id: Option<String>,
     pub plan_path: PathBuf,
     pub plan_display: String,
     pub step_name: String,
@@ -134,14 +133,14 @@ pub struct PlanStatusCounts {
 pub type PlanAgentEvent = crate::harness::AgentEvent;
 
 impl PlanRunMode {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Sequential => "sequential",
             Self::Parallel => "parallel",
         }
     }
 
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "sequential" => Ok(Self::Sequential),
             "parallel" => Ok(Self::Parallel),
@@ -151,7 +150,7 @@ impl PlanRunMode {
 }
 
 impl PlanRunStatus {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Draft => "draft",
             Self::Queued => "queued",
@@ -163,7 +162,7 @@ impl PlanRunStatus {
         }
     }
 
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "draft" => Ok(Self::Draft),
             "queued" => Ok(Self::Queued),
@@ -178,7 +177,7 @@ impl PlanRunStatus {
 }
 
 impl PlanStepStatus {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Starting => "starting",
@@ -190,7 +189,7 @@ impl PlanStepStatus {
         }
     }
 
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "queued" => Ok(Self::Queued),
             "starting" => Ok(Self::Starting),
@@ -205,7 +204,7 @@ impl PlanStepStatus {
 }
 
 impl PlanOutputKind {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Assistant => "assistant",
             Self::Tool => "tool",
@@ -219,7 +218,7 @@ impl PlanOutputKind {
         }
     }
 
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "assistant" => Ok(Self::Assistant),
             "tool" => Ok(Self::Tool),

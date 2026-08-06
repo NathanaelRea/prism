@@ -315,7 +315,6 @@ pub(crate) fn ensure_latest_session(
         &config.default_harness,
         &session.branch,
         &session.path,
-        &session.worktree_session_id,
     )?;
     Ok(EnsuredAgentSession {
         generation,
@@ -485,16 +484,10 @@ pub(crate) fn reconcile_session_refresh(current: &mut AgentState, previous: Agen
     *current = previous;
 }
 
-pub(crate) fn remove_state_with_conn(
-    conn: &rusqlite::Connection,
-    branch: &str,
-) -> Result<(), String> {
-    conn.execute(
-        "delete from agent_state where branch = ?1",
-        rusqlite::params![branch],
-    )
-    .map_err(|error| format!("remove Agent Session state: {error}"))?;
-    Ok(())
+pub(crate) fn remove_state(repo: &Repository, branch: &str) -> Result<(), String> {
+    crate::persistence::session::SessionStore::open(&crate::observability::db_path(repo))
+        .and_then(|store| store.remove_agent_state(branch))
+        .map_err(|error| format!("remove Agent Session state: {error}"))
 }
 
 pub(crate) fn remove_owned_log(repo: &Repository, branch: &str) -> Result<(), String> {
@@ -510,15 +503,6 @@ pub(crate) fn remove_owned_log(repo: &Repository, branch: &str) -> Result<(), St
 
 pub(crate) fn shutdown(repo: &Repository, config: &Config, branch: &str) -> Result<(), String> {
     tmux::kill_agent_sessions_for_branch(repo, config, branch)
-}
-
-pub(crate) fn shutdown_worktree_session(
-    repo: &Repository,
-    config: &Config,
-    branch: &str,
-    worktree_session_id: &str,
-) -> Result<(), String> {
-    tmux::kill_agent_sessions_for_worktree_session(repo, config, branch, worktree_session_id)
 }
 
 #[cfg(test)]
@@ -762,7 +746,6 @@ mod tests {
             repo_label: "repo".to_string(),
             repo_key: None,
             path: PathBuf::from("/tmp/prism-agent-session-test/worktree"),
-            worktree_session_id: "test-worktree-session-a".to_string(),
             incarnation: String::new(),
             path_display: "worktree".to_string(),
             branch: branch.to_string(),

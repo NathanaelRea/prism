@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "select dispatch_state, interruption_generation\nfrom workflow_execution\nwhere run_id = 'plan-control-12345678'\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "dispatch_state",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "interruption_generation",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "c991d6b39031dea996e1981e9d1f2aef6128511eee620f44e8ff804df57a667a"
+}

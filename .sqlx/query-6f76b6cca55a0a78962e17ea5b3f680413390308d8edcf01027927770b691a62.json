@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select id as \"id!: String\"\nfrom plan_run\nwhere repo_root = ? and scope_path = ? and plan_path = ? and step_name = ?\n  and start_step = ? and total_steps = ? and mode = ? and harness_id = ? and adapter_id = ?\n  and archived_unix_ms is null and status in ('queued', 'running', 'paused')\norder by updated_unix_ms desc\nlimit 1\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 9
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "6f76b6cca55a0a78962e17ea5b3f680413390308d8edcf01027927770b691a62"
+}

@@ -1,3 +1,4 @@
+pub(crate) mod async_runtime;
 pub(crate) mod desktop_notification;
 pub(crate) mod durability;
 pub mod file_persistence;

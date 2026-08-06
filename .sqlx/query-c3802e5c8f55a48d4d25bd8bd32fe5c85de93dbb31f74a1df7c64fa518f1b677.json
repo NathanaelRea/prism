@@ -1,0 +1,212 @@
+{
+  "db_name": "SQLite",
+  "query": "select branch as \"branch!\", number as \"number!\", provider as \"provider!\",\n       canonical_host as \"canonical_host!\", project_path as \"project_path!\",\n       native_cr_id as \"native_cr_id!\", display_number as \"display_number!\",\n       source_provider as \"source_provider!\",\n       source_canonical_host as \"source_canonical_host!\",\n       source_project_path as \"source_project_path!\",\n       target_provider as \"target_provider!\",\n       target_canonical_host as \"target_canonical_host!\",\n       target_project_path as \"target_project_path!\", title as \"title!\",\n       author as \"author!\", body as \"body!\", url as \"url!\", state as \"state!\",\n       review_decision as \"review_decision!\",\n       requested_reviewers as \"requested_reviewers!\", head_ref as \"head_ref!\",\n       base_ref as \"base_ref!\", head_sha as \"head_sha!\", updated_at as \"updated_at!\",\n       check_status as \"check_status!\", merge_state_status as \"merge_state_status!\",\n       queue_state as \"queue_state!\", comment_count as \"comment_count!\",\n       merged as \"merged!\", draft as \"draft!\", last_refreshed as \"last_refreshed!\",\n       observation_error, native_state_evidence as \"native_state_evidence!\"\nfrom pr_cache\nwhere branch = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "branch!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "number!",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "provider!",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "canonical_host!",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "project_path!",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "native_cr_id!",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "display_number!",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "source_provider!",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "source_canonical_host!",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "source_project_path!",
+        "ordinal": 9,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_provider!",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_canonical_host!",
+        "ordinal": 11,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_project_path!",
+        "ordinal": 12,
+        "type_info": "Text"
+      },
+      {
+        "name": "title!",
+        "ordinal": 13,
+        "type_info": "Text"
+      },
+      {
+        "name": "author!",
+        "ordinal": 14,
+        "type_info": "Text"
+      },
+      {
+        "name": "body!",
+        "ordinal": 15,
+        "type_info": "Text"
+      },
+      {
+        "name": "url!",
+        "ordinal": 16,
+        "type_info": "Text"
+      },
+      {
+        "name": "state!",
+        "ordinal": 17,
+        "type_info": "Text"
+      },
+      {
+        "name": "review_decision!",
+        "ordinal": 18,
+        "type_info": "Text"
+      },
+      {
+        "name": "requested_reviewers!",
+        "ordinal": 19,
+        "type_info": "Text"
+      },
+      {
+        "name": "head_ref!",
+        "ordinal": 20,
+        "type_info": "Text"
+      },
+      {
+        "name": "base_ref!",
+        "ordinal": 21,
+        "type_info": "Text"
+      },
+      {
+        "name": "head_sha!",
+        "ordinal": 22,
+        "type_info": "Text"
+      },
+      {
+        "name": "updated_at!",
+        "ordinal": 23,
+        "type_info": "Text"
+      },
+      {
+        "name": "check_status!",
+        "ordinal": 24,
+        "type_info": "Text"
+      },
+      {
+        "name": "merge_state_status!",
+        "ordinal": 25,
+        "type_info": "Text"
+      },
+      {
+        "name": "queue_state!",
+        "ordinal": 26,
+        "type_info": "Text"
+      },
+      {
+        "name": "comment_count!",
+        "ordinal": 27,
+        "type_info": "Integer"
+      },
+      {
+        "name": "merged!",
+        "ordinal": 28,
+        "type_info": "Integer"
+      },
+      {
+        "name": "draft!",
+        "ordinal": 29,
+        "type_info": "Integer"
+      },
+      {
+        "name": "last_refreshed!",
+        "ordinal": 30,
+        "type_info": "Text"
+      },
+      {
+        "name": "observation_error",
+        "ordinal": 31,
+        "type_info": "Text"
+      },
+      {
+        "name": "native_state_evidence!",
+        "ordinal": 32,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "c3802e5c8f55a48d4d25bd8bd32fe5c85de93dbb31f74a1df7c64fa518f1b677"
+}

@@ -1,0 +1,146 @@
+{
+  "db_name": "SQLite",
+  "query": "select\n  id as \"id!\", run_id as \"run_id!\", sequence as \"sequence!\",\n  step_key as \"step_key!\", reason, status as \"status!\", attempt as \"attempt!\",\n  started_unix_ms, finished_unix_ms, execution_state, session_endpoint,\n  session_id, execution_process_id, plan_run_id, commit_sha, head_sha,\n  work_guard_json, blocker, summary, error, session_adapter_id,\n  execution_process_start_time_ticks\nfrom auto_step_run\nwhere run_id = ?\norder by sequence\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "run_id!",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "sequence!",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "step_key!",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "reason",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "status!",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "attempt!",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "started_unix_ms",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "finished_unix_ms",
+        "ordinal": 8,
+        "type_info": "Integer"
+      },
+      {
+        "name": "execution_state",
+        "ordinal": 9,
+        "type_info": "Text"
+      },
+      {
+        "name": "session_endpoint",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "session_id",
+        "ordinal": 11,
+        "type_info": "Text"
+      },
+      {
+        "name": "execution_process_id",
+        "ordinal": 12,
+        "type_info": "Integer"
+      },
+      {
+        "name": "plan_run_id",
+        "ordinal": 13,
+        "type_info": "Text"
+      },
+      {
+        "name": "commit_sha",
+        "ordinal": 14,
+        "type_info": "Text"
+      },
+      {
+        "name": "head_sha",
+        "ordinal": 15,
+        "type_info": "Text"
+      },
+      {
+        "name": "work_guard_json",
+        "ordinal": 16,
+        "type_info": "Text"
+      },
+      {
+        "name": "blocker",
+        "ordinal": 17,
+        "type_info": "Text"
+      },
+      {
+        "name": "summary",
+        "ordinal": 18,
+        "type_info": "Text"
+      },
+      {
+        "name": "error",
+        "ordinal": 19,
+        "type_info": "Text"
+      },
+      {
+        "name": "session_adapter_id",
+        "ordinal": 20,
+        "type_info": "Text"
+      },
+      {
+        "name": "execution_process_start_time_ticks",
+        "ordinal": 21,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "e1aebf63dec1d9a08337a11cb6328dc5c44d5ffcafbc3bc1d572ee9f54c29cc0"
+}

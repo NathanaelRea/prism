@@ -1,8 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File, OpenOptions};
-#[cfg(any(target_os = "macos", test))]
-use std::io::{BufRead, BufReader};
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
@@ -16,21 +14,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::execution::{self, DispatchState, ExecutionClaim, WorkflowIdentity, WorkflowKind};
+use crate::execution;
 use crate::notification::{NotificationCoordinator, NotificationObservation, PendingNotification};
 use crate::platform::SupportedOs;
 use crate::process::DetachedProcessPolicy;
 use crate::repo::Repository;
-use crate::util::stable_hash;
 use crate::{observability, workspace};
 
 const PROTOCOL_VERSION: u32 = 1;
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const NOTIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const NOTIFICATION_RETRY_INTERVAL: Duration = Duration::from_secs(10);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const DAEMON_TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
-const GLOBAL_CONCURRENCY: usize = 4;
 const SOCKET_PATH_BUDGET: usize = 103;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -79,7 +73,6 @@ pub struct DaemonHealth {
     pub protocol_version: Option<u32>,
     pub instance_id: Option<String>,
     pub pid: Option<u32>,
-    pub executable_identity: Option<String>,
     pub active: usize,
     pub notifications: bool,
 }
@@ -91,7 +84,6 @@ impl DaemonHealth {
             protocol_version: None,
             instance_id: None,
             pid: None,
-            executable_identity: None,
             active: 0,
             notifications: false,
         }
@@ -115,10 +107,20 @@ fn probe_health_at(path: &WorkerSocketPath) -> Result<DaemonHealth, String> {
         }
         Err(error) => return Err(format!("connect to Prism worker: {error}")),
     };
-    let response = request_on_stream(stream, "health")?;
-    if response.is_empty() {
-        return Ok(DaemonHealth::stopped());
-    }
+    let response = match request_on_stream_raw(stream, "health") {
+        Ok(response) => response,
+        Err((_, error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotConnected
+            ) =>
+        {
+            return Ok(DaemonHealth::stopped());
+        }
+        Err(error) => return Err(format_request_error(error)),
+    };
     parse_health_response(&response)
 }
 
@@ -141,7 +143,6 @@ fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
     let mut pid: Option<u32> = None;
     let mut state = None;
     let mut active = None;
-    let mut executable_identity = None;
     let mut notifications = false;
     for field in fields {
         if let Some(value) = field.strip_prefix("pid=") {
@@ -154,8 +155,6 @@ fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
             });
         } else if let Some(value) = field.strip_prefix("active=") {
             active = value.parse().ok();
-        } else if let Some(value) = field.strip_prefix("exe=") {
-            executable_identity = Some(value.to_string());
         } else if let Some(value) = field.strip_prefix("notifications=") {
             notifications = value == "1";
         }
@@ -165,7 +164,6 @@ fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
         protocol_version: Some(version),
         instance_id: Some(instance_id.to_string()),
         pid: Some(pid.ok_or_else(|| format!("missing Prism daemon PID: {response}"))?),
-        executable_identity,
         active: active.ok_or_else(|| format!("missing Prism daemon active count: {response}"))?,
         notifications,
     })
@@ -173,7 +171,6 @@ fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
 
 pub fn ensure_running() -> Result<(), String> {
     let socket = validated_socket_path()?;
-    let executable_identity = current_executable_identity()?;
     if std::env::var_os("PRISM_WAIT_FOR_WORKER_DRAIN").is_some() {
         loop {
             match probe_health_at(&socket)? {
@@ -181,69 +178,37 @@ pub fn ensure_running() -> Result<(), String> {
                     state: DaemonState::Stopped,
                     ..
                 } => break,
-                health @ DaemonHealth {
+                DaemonHealth {
                     state: DaemonState::Running,
                     notifications: true,
                     ..
-                } if daemon_uses_executable(&health, &executable_identity) => return Ok(()),
+                } => return Ok(()),
                 _ => thread::sleep(Duration::from_millis(250)),
             }
         }
     }
-    let mut health = probe_health_at(&socket)?;
-    loop {
-        match health {
-            current @ DaemonHealth {
-                state: DaemonState::Running,
-                ..
-            } if daemon_uses_executable(&current, &executable_identity)
-                && current.notifications =>
-            {
-                return Ok(());
-            }
-            DaemonHealth {
-                state: DaemonState::Running,
-                ..
-            } => {
-                match request_worker_replacement(&socket, &executable_identity)? {
-                    None => break,
-                    Some(true) => return Ok(()),
-                    Some(false) => {}
-                }
-                let shutdown_health = parse_health_response(&request_at(&socket, "shutdown")?)?;
-                if shutdown_health.active > 0 {
-                    spawn_worker_replacement()?;
-                    return Ok(());
-                }
-                wait_for_socket_to_close(&socket, DAEMON_TRANSITION_TIMEOUT)?;
-                break;
-            }
-            current @ DaemonHealth {
-                state: DaemonState::Draining,
-                ..
-            } => {
-                if current.active > 0 {
-                    match request_worker_replacement(&socket, &executable_identity)? {
-                        None => break,
-                        Some(true) => return Ok(()),
-                        Some(false) => {}
-                    }
-                    spawn_worker_replacement()?;
-                    return Ok(());
-                }
-                health = wait_for_drain_transition(DAEMON_TRANSITION_TIMEOUT, || {
-                    probe_health_at(&socket)
-                })?;
-            }
-            DaemonHealth {
-                state: DaemonState::Stopped,
-                ..
-            } => break,
+    if wait_for_existing_daemon(DAEMON_TRANSITION_TIMEOUT, || probe_health_at(&socket))? {
+        let health = probe_health_at(&socket)?;
+        if health.notifications {
+            return Ok(());
         }
+        let shutdown_health = parse_health_response(&request_at(&socket, "shutdown")?)?;
+        if shutdown_health.active > 0 {
+            spawn_worker_replacement()?;
+            return Ok(());
+        }
+        wait_for_socket_to_close(&socket, DAEMON_TRANSITION_TIMEOUT)?;
     }
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve Prism worker executable: {error}"))?;
-    start_worker(installed_executable_path(&executable))?;
+    let mut command = Command::new(executable);
+    command.args(["worker", "serve"]);
+    crate::process::spawn_detached_named(
+        &mut command,
+        DetachedProcessPolicy::WorkerDaemon,
+        crate::process::ProcessDescriptor::new("prism.worker.serve"),
+    )
+    .map_err(|error| format!("start Prism worker daemon: {error}"))?;
 
     let deadline = Instant::now() + DAEMON_TRANSITION_TIMEOUT;
     let mut last_error = "worker did not become ready".to_string();
@@ -263,22 +228,6 @@ pub fn ensure_running() -> Result<(), String> {
     Err(last_error)
 }
 
-fn start_worker(executable: PathBuf) -> Result<(), String> {
-    let mut command = Command::new(executable);
-    command.args(["worker", "serve"]);
-    crate::process::spawn_detached_named(
-        &mut command,
-        DetachedProcessPolicy::WorkerDaemon,
-        crate::process::ProcessDescriptor::new("prism.worker.serve"),
-    )
-    .map_err(|error| format!("start Prism worker daemon: {error}"))?;
-    Ok(())
-}
-
-fn daemon_uses_executable(health: &DaemonHealth, executable_identity: &str) -> bool {
-    health.executable_identity.as_deref() == Some(executable_identity)
-}
-
 fn spawn_worker_replacement() -> Result<(), String> {
     let executable = std::env::current_exe()
         .map_err(|error| format!("resolve replacement Prism worker executable: {error}"))?;
@@ -295,61 +244,36 @@ fn spawn_worker_replacement() -> Result<(), String> {
     .map_err(|error| format!("schedule replacement Prism worker: {error}"))
 }
 
-fn wait_for_drain_transition(
+fn wait_for_existing_daemon(
     timeout: Duration,
     mut probe: impl FnMut() -> Result<DaemonHealth, String>,
-) -> Result<DaemonHealth, String> {
+) -> Result<bool, String> {
     let deadline = Instant::now() + timeout;
     loop {
-        let health = probe()?;
-        if health.state != DaemonState::Draining {
-            return Ok(health);
+        match probe() {
+            Ok(DaemonHealth {
+                state: DaemonState::Running,
+                ..
+            }) => return Ok(true),
+            Ok(DaemonHealth {
+                state: DaemonState::Draining,
+                active,
+                ..
+            }) => {
+                if Instant::now() >= deadline {
+                    return Err(format!(
+                        "timed out waiting for Prism worker daemon to finish draining ({active} active)"
+                    ));
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+            Ok(DaemonHealth {
+                state: DaemonState::Stopped,
+                ..
+            }) => return Ok(false),
+            Err(error) => return Err(error),
         }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "timed out waiting for Prism worker daemon to finish draining ({} active)",
-                health.active
-            ));
-        }
-        thread::sleep(Duration::from_millis(25));
     }
-}
-
-fn wait_for_replacement(
-    socket: &WorkerSocketPath,
-    executable_identity: &str,
-    timeout: Duration,
-) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
-    let mut active = 0;
-    while Instant::now() < deadline {
-        match probe_health_at(socket) {
-            Ok(health) if daemon_uses_executable(&health, executable_identity) => return Ok(()),
-            Ok(health) => active = health.active,
-            Err(_) => {}
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    Err(format!(
-        "Prism worker is draining before replacement ({active} active)"
-    ))
-}
-
-fn request_worker_replacement(
-    socket: &WorkerSocketPath,
-    executable_identity: &str,
-) -> Result<Option<bool>, String> {
-    let Some(response) = request_if_worker_running(socket, "replace")? else {
-        return Ok(None);
-    };
-    if !response.starts_with(&format!("ok {PROTOCOL_VERSION} ")) {
-        return Ok(Some(false));
-    }
-    let health = parse_health_response(&response)?;
-    if health.active == 0 {
-        wait_for_replacement(socket, executable_identity, DAEMON_TRANSITION_TIMEOUT)?;
-    }
-    Ok(Some(true))
 }
 
 pub fn wake() -> Result<(), String> {
@@ -498,46 +422,177 @@ fn request(command: &str) -> Result<String, String> {
     request_at(&validated_socket_path()?, command)
 }
 
+pub fn launch_bundled_plan(
+    launch: crate::workflow::bundled::BundledPlanLaunch,
+) -> Result<String, String> {
+    launch_bundled("bundled_plan_launch", launch)
+}
+
+pub fn launch_bundled_coding(
+    launch: crate::workflow::bundled::BundledCodingLaunch,
+) -> Result<String, String> {
+    launch_bundled("bundled_coding_launch", launch)
+}
+
+fn workflow_request(request_value: serde_json::Value) -> Result<serde_json::Value, String> {
+    let response = request(&request_value.to_string())?;
+    let response: serde_json::Value = serde_json::from_str(&response)
+        .map_err(|error| format!("decode workflow worker response: {error}"))?;
+    if response["ok"] == true {
+        Ok(response)
+    } else {
+        Err(response["error"]
+            .as_str()
+            .unwrap_or("workflow operation failed")
+            .to_string())
+    }
+}
+
+fn launch_bundled<T: serde::Serialize>(kind: &str, launch: T) -> Result<String, String> {
+    ensure_running()?;
+    let response = workflow_request(serde_json::json!({"type": kind, "launch": launch}))?;
+    response["run_id"]
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| "workflow worker omitted run id".to_string())
+}
+
+/// Read the authoritative global run ledger through the worker projection API.
+pub fn list_workflows(
+    repository: Option<&Path>,
+    limit: usize,
+) -> Result<Vec<crate::WorkflowProjection>, String> {
+    let repository = repository.map(|path| path.display().to_string());
+    let response = workflow_request(serde_json::json!({
+        "type": "workflow_list",
+        "repository": repository,
+        "limit": limit,
+    }))?;
+    serde_json::from_value(response["runs"].clone())
+        .map_err(|error| format!("decode workflow list projection: {error}"))
+}
+
+pub fn command_workflow(run_id: &str, command: crate::WorkflowCommand) -> Result<(), String> {
+    ensure_running()?;
+    workflow_request(serde_json::json!({
+        "type": "workflow_command",
+        "run_id": run_id,
+        "command": command,
+        "now_unix_ms": execution::now_ms(),
+    }))?;
+    Ok(())
+}
+
 fn request_at(path: &WorkerSocketPath, command: &str) -> Result<String, String> {
     let stream = UnixStream::connect(path.as_path())
         .map_err(|error| format!("connect to Prism worker: {error}"))?;
     request_on_stream(stream, command)
 }
 
-fn request_if_worker_running(
-    path: &WorkerSocketPath,
-    command: &str,
-) -> Result<Option<String>, String> {
-    let stream = match UnixStream::connect(path.as_path()) {
-        Ok(stream) => stream,
-        Err(error)
-            if matches!(
-                error.kind(),
-                std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
-            ) =>
-        {
-            return Ok(None);
-        }
-        Err(error) => return Err(format!("connect to Prism worker: {error}")),
-    };
-    request_on_stream(stream, command).map(Some)
+fn request_on_stream(stream: UnixStream, command: &str) -> Result<String, String> {
+    request_on_stream_raw(stream, command).map_err(format_request_error)
 }
 
-fn request_on_stream(mut stream: UnixStream, command: &str) -> Result<String, String> {
+fn request_on_stream_raw(
+    mut stream: UnixStream,
+    command: &str,
+) -> Result<String, (&'static str, std::io::Error)> {
     stream
         .set_read_timeout(Some(Duration::from_secs(1)))
-        .map_err(|error| format!("configure Prism worker socket: {error}"))?;
+        .map_err(|error| ("configure Prism worker socket", error))?;
     stream
         .write_all(format!("{command}\n").as_bytes())
-        .map_err(|error| format!("write Prism worker request: {error}"))?;
+        .map_err(|error| ("write Prism worker request", error))?;
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
-        .map_err(|error| format!("read Prism worker response: {error}"))?;
+        .map_err(|error| ("read Prism worker response", error))?;
     Ok(response.trim().to_string())
 }
 
+fn format_request_error((action, error): (&str, std::io::Error)) -> String {
+    format!("{action}: {error}")
+}
+
 pub fn serve() -> Result<(), String> {
+    // One long-lived runtime supervises the generalized async control plane. The blocking Unix
+    // socket adapter only translates requests; it does not run a second scheduling engine.
+    let async_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|error| format!("create Prism worker runtime: {error}"))?;
+    async_runtime.block_on(async {
+        let mut worker = crate::workflow::engine::WorkflowWorker::open_default(
+            execution::new_instance_id("workflow-worker"),
+            crate::workflow::engine::WorkerConfig::default(),
+        )
+        .await
+        .map_err(|error| format!("open workflow control plane: {error}"))?;
+        worker
+            .register_builtins()
+            .map_err(|error| format!("register workflow implementations: {error}"))?;
+        let operations = worker.operations();
+        crate::workflow::bundled::install(&operations)
+            .await
+            .map_err(|error| format!("install bundled workflow definitions: {error}"))?;
+        import_legacy_repositories(&operations).await?;
+        let (shutdown, shutdown_receiver) = tokio::sync::watch::channel(false);
+        let control_plane_failure = Arc::new(Mutex::new(None::<String>));
+        let failure = Arc::clone(&control_plane_failure);
+        let control_plane = tokio::spawn(async move {
+            if let Err(error) = worker.run(shutdown_receiver).await
+                && let Ok(mut current) = failure.lock()
+            {
+                *current = Some(error.to_string());
+            }
+        });
+        // Socket polling is blocking, so isolate the protocol adapter from runtime worker threads.
+        let socket_failure = Arc::clone(&control_plane_failure);
+        let socket =
+            tokio::task::spawn_blocking(move || serve_socket(&socket_failure, &operations));
+        let socket_result = socket
+            .await
+            .map_err(|error| format!("join workflow socket adapter: {error}"))?;
+        let _ = shutdown.send(true);
+        control_plane
+            .await
+            .map_err(|error| format!("join workflow control plane: {error}"))?;
+        socket_result
+    })
+}
+
+async fn import_legacy_repositories(operations: &crate::WorkflowOperations) -> Result<(), String> {
+    const IMPORTER_REVISION: &str = "workflow-ledger-v1";
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0);
+    for entry in crate::workspace::load_entries()? {
+        let repository = crate::repo::Repository { root: entry.root };
+        let source = repository.prism_dir().join("prism.db");
+        if !source.exists() {
+            continue;
+        }
+        operations
+            .import_legacy_repository(&source, IMPORTER_REVISION, now_unix_ms)
+            .await
+            .map_err(|error| {
+                format!(
+                    "import legacy workflow history from {} before worker startup: {error}",
+                    source.display()
+                )
+            })?;
+    }
+    Ok(())
+}
+
+fn serve_socket(
+    control_plane_failure: &Arc<Mutex<Option<String>>>,
+    operations: &crate::WorkflowOperations,
+) -> Result<(), String> {
     let runtime = runtime_dir();
     let socket = WorkerSocketPath::for_runtime(&runtime)?;
     if let Ok(metadata) = fs::symlink_metadata(&runtime) {
@@ -557,7 +612,7 @@ pub fn serve() -> Result<(), String> {
     fs::create_dir_all(&runtime).map_err(|error| format!("create worker runtime dir: {error}"))?;
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700))
         .map_err(|error| format!("secure worker runtime dir: {error}"))?;
-    let worker_lock = acquire_lock(&runtime.join("worker.lock"))?;
+    let _lock = acquire_lock(&runtime.join("worker.lock"))?;
     if socket.as_path().exists() {
         match UnixStream::connect(socket.as_path()) {
             Ok(_) => {
@@ -581,10 +636,6 @@ pub fn serve() -> Result<(), String> {
     }
 
     let instance_id = execution::new_instance_id("daemon");
-    let executable = std::env::current_exe()
-        .map_err(|error| format!("resolve Prism worker executable: {error}"))?;
-    let executable = installed_executable_path(&executable);
-    let started_executable_identity = executable_identity(&executable)?;
     classify_abandoned(&instance_id)?;
     log_daemon_lifecycle("daemon_start", &instance_id);
     let listener = UnixListener::bind(socket.as_path()).map_err(|error| {
@@ -608,24 +659,29 @@ pub fn serve() -> Result<(), String> {
         .name("prism-notification-observer".to_string())
         .spawn(move || notification_loop(observer_stop, observer_subscriber))
         .map_err(|error| format!("start notification observer: {error}"))?;
-    let mut next_poll = Instant::now();
     let mut draining = false;
-    let mut restart_after_drain = false;
     loop {
+        if let Some(error) = control_plane_failure
+            .lock()
+            .map_err(|_| "workflow control-plane supervisor state is poisoned".to_string())?
+            .clone()
+        {
+            notification_stop.store(true, Ordering::Release);
+            return Err(format!("workflow control plane failed: {error}"));
+        }
         match listener.accept() {
             Ok((mut stream, _)) => {
-                let control = respond(
+                if respond(
                     &mut stream,
                     &instance_id,
-                    &started_executable_identity,
                     &active,
                     &notification_subscriber,
+                    Some(operations),
                     draining,
-                );
-                if matches!(control, WorkerControl::Drain | WorkerControl::Replace) {
+                ) {
+                    draining = true;
                     notification_stop.store(true, Ordering::Release);
                 }
-                control.apply(&mut next_poll, &mut draining, &mut restart_after_drain);
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(format!("accept Prism worker connection: {error}")),
@@ -638,92 +694,68 @@ pub fn serve() -> Result<(), String> {
         {
             break;
         }
-        if !draining && Instant::now() >= next_poll {
-            if executable_identity(&executable)
-                .is_ok_and(|identity| identity != started_executable_identity)
-            {
-                draining = true;
-                restart_after_drain = true;
-                continue;
-            }
-            schedule_queued(&instance_id, Arc::clone(&active));
-            next_poll = Instant::now() + POLL_INTERVAL;
-        }
         thread::sleep(Duration::from_millis(50));
     }
     notification_stop.store(true, Ordering::Release);
     log_daemon_lifecycle("daemon_stop", &instance_id);
-    fs::remove_file(socket.as_path()).map_err(|error| format!("remove worker socket: {error}"))?;
-    drop(listener);
-    drop(worker_lock);
-    if restart_after_drain {
-        start_worker(executable)?;
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WorkerControl {
-    Continue,
-    Wake,
-    Drain,
-    Replace,
-}
-
-impl WorkerControl {
-    fn apply(self, next_poll: &mut Instant, draining: &mut bool, restart_after_drain: &mut bool) {
-        match self {
-            Self::Continue => {}
-            Self::Wake => *next_poll = Instant::now(),
-            Self::Drain => *draining = true,
-            Self::Replace => {
-                *draining = true;
-                *restart_after_drain = true;
-            }
-        }
-    }
+    fs::remove_file(socket.as_path()).map_err(|error| format!("remove worker socket: {error}"))
 }
 
 fn respond(
     stream: &mut UnixStream,
     instance_id: &str,
-    executable_identity: &str,
     active: &Arc<Mutex<BTreeSet<PathBuf>>>,
     notification_subscriber: &Arc<Mutex<Vec<UnixStream>>>,
+    operations: Option<&crate::WorkflowOperations>,
     draining: bool,
-) -> WorkerControl {
-    let mut request = [0_u8; 64];
-    let size = stream.read(&mut request).unwrap_or(0);
-    let command = String::from_utf8_lossy(&request[..size]);
+) -> bool {
+    const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+    let mut command = String::new();
+    let read = BufReader::new(&mut *stream)
+        .take((MAX_REQUEST_BYTES + 1) as u64)
+        .read_line(&mut command);
+    if read.is_err() || command.len() > MAX_REQUEST_BYTES {
+        let _ = stream.write_all(b"error invalid-request\n");
+        return false;
+    }
+    let command = command.trim();
     let active = active
         .lock()
         .map(|active| active.len())
         .unwrap_or(usize::MAX);
     let mut new_notification_subscriber = None;
-    let response = match command.trim() {
-        "health" | "wake" => format!(
-            "ok {PROTOCOL_VERSION} {instance_id} pid={} state={} active={active} exe={executable_identity} notifications=1\n",
-            std::process::id(),
-            if draining { "draining" } else { "running" }
-        ),
-        "shutdown" => format!(
-            "ok {PROTOCOL_VERSION} {instance_id} pid={} state=draining active={active} exe={executable_identity} notifications=1\n",
-            std::process::id()
-        ),
-        "replace" => format!(
-            "ok {PROTOCOL_VERSION} {instance_id} pid={} state=draining active={active} exe={executable_identity} notifications=1\n",
-            std::process::id()
-        ),
-        "subscribe-notifications" if !draining => match stream.try_clone() {
-            Ok(subscriber) => {
-                let _ = subscriber.set_read_timeout(Some(Duration::from_secs(1)));
-                let _ = subscriber.set_write_timeout(Some(Duration::from_secs(1)));
-                new_notification_subscriber = Some(subscriber);
-                format!("ok {PROTOCOL_VERSION} subscribed\n")
-            }
-            Err(_) => "error subscribe-failed\n".to_string(),
-        },
-        _ => "error unknown-command\n".to_string(),
+    let response = if command.starts_with('{') {
+        operations.map_or_else(
+            || {
+                format!(
+                    "{}\n",
+                    serde_json::json!({"ok": false, "error": "workflow operations unavailable"})
+                )
+            },
+            |operations| workflow_socket_response(operations, command),
+        )
+    } else {
+        match command {
+            "health" | "wake" => format!(
+                "ok {PROTOCOL_VERSION} {instance_id} pid={} state={} active={active} notifications=1\n",
+                std::process::id(),
+                if draining { "draining" } else { "running" }
+            ),
+            "shutdown" => format!(
+                "ok {PROTOCOL_VERSION} {instance_id} pid={} state=draining active={active} notifications=1\n",
+                std::process::id()
+            ),
+            "subscribe-notifications" if !draining => match stream.try_clone() {
+                Ok(subscriber) => {
+                    let _ = subscriber.set_read_timeout(Some(Duration::from_secs(1)));
+                    let _ = subscriber.set_write_timeout(Some(Duration::from_secs(1)));
+                    new_notification_subscriber = Some(subscriber);
+                    format!("ok {PROTOCOL_VERSION} subscribed\n")
+                }
+                Err(_) => "error subscribe-failed\n".to_string(),
+            },
+            _ => "error unknown-command\n".to_string(),
+        }
     };
     if stream.write_all(response.as_bytes()).is_ok()
         && let Some(subscriber) = new_notification_subscriber
@@ -731,44 +763,352 @@ fn respond(
     {
         current.push(subscriber);
     }
-    match command.trim() {
-        "wake" if !draining => WorkerControl::Wake,
-        "shutdown" => WorkerControl::Drain,
-        "replace" => WorkerControl::Replace,
-        _ => WorkerControl::Continue,
-    }
+    command == "shutdown"
 }
 
-fn current_executable_identity() -> Result<String, String> {
-    let executable = std::env::current_exe()
-        .map_err(|error| format!("resolve Prism executable identity: {error}"))?;
-    executable_identity(&executable)
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+#[allow(
+    clippy::enum_variant_names,
+    reason = "the stable wire tags are deliberately namespaced with workflow_"
+)]
+enum WorkflowSocketRequest {
+    WorkflowRegisterDefinition {
+        definition: SocketDefinition,
+    },
+    WorkflowLaunch {
+        run: SocketRun,
+        steps: Vec<SocketStep>,
+    },
+    BundledPlanLaunch {
+        launch: crate::workflow::bundled::BundledPlanLaunch,
+    },
+    BundledCodingLaunch {
+        launch: crate::workflow::bundled::BundledCodingLaunch,
+    },
+    WorkflowList {
+        repository: Option<String>,
+        limit: usize,
+    },
+    WorkflowInspect {
+        run_id: String,
+    },
+    WorkflowCommand {
+        run_id: String,
+        command: SocketWorkflowCommand,
+        now_unix_ms: i64,
+    },
+    WorkflowRequestApproval {
+        id: String,
+        run_id: String,
+        step_id: String,
+        now_unix_ms: i64,
+    },
+    WorkflowDecideApproval {
+        id: String,
+        decision: SocketApprovalDecision,
+        decided_by: String,
+        note: Option<String>,
+        now_unix_ms: i64,
+    },
+    WorkflowGrantAuthority {
+        id: String,
+        run_id: String,
+        scope: String,
+        granted_by: String,
+        now_unix_ms: i64,
+        expires_unix_ms: Option<i64>,
+    },
+    WorkflowRegisterTrigger {
+        id: String,
+        definition_snapshot_id: String,
+        overlap_policy: String,
+        config_json: String,
+        enabled: bool,
+    },
+    WorkflowRecordTriggerOccurrence {
+        id: String,
+        trigger_id: String,
+        deduplication_key: String,
+        due_unix_ms: i64,
+    },
+    WorkflowCompleteTrigger {
+        occurrence_id: String,
+        run_id: String,
+        checkpoint_json: String,
+        now_unix_ms: i64,
+    },
+    WorkflowWaitOnGate {
+        step_id: String,
+        gate_kind: String,
+        due_unix_ms: i64,
+        checkpoint_json: String,
+        now_unix_ms: i64,
+    },
+    WorkflowImportLegacy {
+        source_path: PathBuf,
+        importer_revision: String,
+        now_unix_ms: i64,
+    },
 }
 
-fn executable_identity(executable: &Path) -> Result<String, String> {
-    let executable = installed_executable_path(executable);
-    let metadata = fs::metadata(&executable).map_err(|error| {
-        format!(
-            "inspect Prism executable identity {}: {error}",
-            executable.display()
-        )
-    })?;
-    Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
+#[derive(serde::Deserialize)]
+struct SocketDefinition {
+    id: String,
+    name: String,
+    revision: String,
+    source: String,
+    trusted: bool,
+    body_json: String,
+    digest: String,
+    now_unix_ms: i64,
 }
 
-fn installed_executable_path(executable: &Path) -> PathBuf {
-    if executable.exists() {
-        return executable.to_path_buf();
+#[derive(serde::Deserialize)]
+struct SocketRun {
+    run_id: String,
+    definition_snapshot_id: String,
+    repository: Option<String>,
+    idempotency_key: String,
+    now_unix_ms: i64,
+}
+
+#[derive(serde::Deserialize)]
+struct SocketStep {
+    id: String,
+    key: String,
+    implementation: String,
+    target_id: String,
+    input_json: String,
+    #[serde(default)]
+    dependencies: Vec<String>,
+    #[serde(default)]
+    resources: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SocketWorkflowCommand {
+    Pause,
+    Resume,
+    Cancel,
+    Retry,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SocketApprovalDecision {
+    Approve,
+    Reject,
+}
+
+fn workflow_socket_response(operations: &crate::WorkflowOperations, request: &str) -> String {
+    let request = match serde_json::from_str::<WorkflowSocketRequest>(request) {
+        Ok(request) => request,
+        Err(error) => {
+            return format!(
+                "{}\n",
+                serde_json::json!({"ok": false, "error": format!("invalid workflow request: {error}")})
+            );
+        }
+    };
+    let result = crate::async_runtime::block_on(async {
+        match request {
+            WorkflowSocketRequest::WorkflowRegisterDefinition { definition } => operations
+                .register_definition(crate::DefinitionSnapshot {
+                    id: &definition.id,
+                    name: &definition.name,
+                    revision: &definition.revision,
+                    source: &definition.source,
+                    trusted: definition.trusted,
+                    body_json: &definition.body_json,
+                    digest: &definition.digest,
+                    now_unix_ms: definition.now_unix_ms,
+                })
+                .await
+                .map(|()| serde_json::json!({"ok": true})),
+            WorkflowSocketRequest::WorkflowLaunch { run, steps } => operations
+                .launch_materialized(
+                    crate::LaunchWorkflow {
+                        run_id: &run.run_id,
+                        definition_snapshot_id: &run.definition_snapshot_id,
+                        repository: run.repository.as_deref(),
+                        idempotency_key: &run.idempotency_key,
+                        now_unix_ms: run.now_unix_ms,
+                    },
+                    steps
+                        .into_iter()
+                        .map(|step| crate::WorkflowStep {
+                            id: step.id,
+                            key: step.key,
+                            implementation: step.implementation,
+                            target_id: step.target_id,
+                            input_json: step.input_json,
+                            dependencies: step.dependencies,
+                            resources: step.resources,
+                        })
+                        .collect(),
+                )
+                .await
+                .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id})),
+            WorkflowSocketRequest::BundledPlanLaunch { launch } => {
+                crate::workflow::bundled::launch_plan(operations, launch)
+                    .await
+                    .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id}))
+            }
+            WorkflowSocketRequest::BundledCodingLaunch { launch } => {
+                crate::workflow::bundled::launch_coding(operations, launch)
+                    .await
+                    .map(|run_id| serde_json::json!({"ok": true, "run_id": run_id}))
+            }
+            WorkflowSocketRequest::WorkflowList { repository, limit } => operations
+                .list(repository.as_deref(), limit)
+                .await
+                .map(|runs| serde_json::json!({"ok": true, "runs": runs})),
+            WorkflowSocketRequest::WorkflowInspect { run_id } => operations
+                .inspect(&run_id)
+                .await
+                .map(|run| serde_json::json!({"ok": true, "run": run})),
+            WorkflowSocketRequest::WorkflowCommand {
+                run_id,
+                command,
+                now_unix_ms,
+            } => operations
+                .command(
+                    &run_id,
+                    match command {
+                        SocketWorkflowCommand::Pause => crate::WorkflowCommand::Pause,
+                        SocketWorkflowCommand::Resume => crate::WorkflowCommand::Resume,
+                        SocketWorkflowCommand::Cancel => crate::WorkflowCommand::Cancel,
+                        SocketWorkflowCommand::Retry => crate::WorkflowCommand::Retry,
+                    },
+                    now_unix_ms,
+                )
+                .await
+                .map(|()| serde_json::json!({"ok": true})),
+            WorkflowSocketRequest::WorkflowRequestApproval {
+                id,
+                run_id,
+                step_id,
+                now_unix_ms,
+            } => operations
+                .request_approval(&id, &run_id, &step_id, now_unix_ms)
+                .await
+                .map(|()| serde_json::json!({"ok": true})),
+            WorkflowSocketRequest::WorkflowDecideApproval {
+                id,
+                decision,
+                decided_by,
+                note,
+                now_unix_ms,
+            } => operations
+                .decide_approval(
+                    &id,
+                    match decision {
+                        SocketApprovalDecision::Approve => crate::ApprovalDecision::Approve,
+                        SocketApprovalDecision::Reject => crate::ApprovalDecision::Reject,
+                    },
+                    &decided_by,
+                    note.as_deref(),
+                    now_unix_ms,
+                )
+                .await
+                .map(|()| serde_json::json!({"ok": true})),
+            WorkflowSocketRequest::WorkflowGrantAuthority {
+                id,
+                run_id,
+                scope,
+                granted_by,
+                now_unix_ms,
+                expires_unix_ms,
+            } => operations
+                .grant_authority(
+                    &id,
+                    &run_id,
+                    &scope,
+                    &granted_by,
+                    now_unix_ms,
+                    expires_unix_ms,
+                )
+                .await
+                .map(|()| serde_json::json!({"ok": true})),
+            WorkflowSocketRequest::WorkflowRegisterTrigger {
+                id,
+                definition_snapshot_id,
+                overlap_policy,
+                config_json,
+                enabled,
+            } => operations
+                .register_trigger(
+                    &id,
+                    &definition_snapshot_id,
+                    &overlap_policy,
+                    &config_json,
+                    enabled,
+                )
+                .await
+                .map(|()| serde_json::json!({"ok": true})),
+            WorkflowSocketRequest::WorkflowRecordTriggerOccurrence {
+                id,
+                trigger_id,
+                deduplication_key,
+                due_unix_ms,
+            } => operations
+                .record_trigger_occurrence(&id, &trigger_id, &deduplication_key, due_unix_ms)
+                .await
+                .map(|inserted| serde_json::json!({"ok": true, "inserted": inserted})),
+            WorkflowSocketRequest::WorkflowCompleteTrigger {
+                occurrence_id,
+                run_id,
+                checkpoint_json,
+                now_unix_ms,
+            } => operations
+                .complete_trigger(&occurrence_id, &run_id, &checkpoint_json, now_unix_ms)
+                .await
+                .map(|()| serde_json::json!({"ok": true})),
+            WorkflowSocketRequest::WorkflowWaitOnGate {
+                step_id,
+                gate_kind,
+                due_unix_ms,
+                checkpoint_json,
+                now_unix_ms,
+            } => operations
+                .wait_on_gate(
+                    &step_id,
+                    &gate_kind,
+                    due_unix_ms,
+                    &checkpoint_json,
+                    now_unix_ms,
+                )
+                .await
+                .map(|()| serde_json::json!({"ok": true})),
+            WorkflowSocketRequest::WorkflowImportLegacy {
+                source_path,
+                importer_revision,
+                now_unix_ms,
+            } => operations
+                .import_legacy_repository(&source_path, &importer_revision, now_unix_ms)
+                .await
+                .map(|summary| {
+                    serde_json::json!({
+                        "ok": true,
+                        "imported": summary.imported,
+                        "already_imported": summary.already_imported,
+                    })
+                }),
+        }
+    });
+    match result {
+        Ok(Ok(value)) => format!("{value}\n"),
+        Ok(Err(error)) => format!(
+            "{}\n",
+            serde_json::json!({"ok": false, "error": error.to_string()})
+        ),
+        Err(error) => format!(
+            "{}\n",
+            serde_json::json!({"ok": false, "error": error.to_string()})
+        ),
     }
-    #[cfg(target_os = "linux")]
-    if let Some(path) = executable
-        .as_os_str()
-        .as_bytes()
-        .strip_suffix(b" (deleted)")
-    {
-        return PathBuf::from(std::ffi::OsStr::from_bytes(path));
-    }
-    executable.to_path_buf()
 }
 
 fn notification_loop(stop: Arc<AtomicBool>, subscriber: Arc<Mutex<Vec<UnixStream>>>) {
@@ -833,8 +1173,8 @@ fn observe_and_deliver_notifications(
                 ),
             }
         }
-        let result = observability::with_writable_db_mut(&repo, |conn| {
-            let mut coordinator = NotificationCoordinator::new(conn);
+        let result = (|| {
+            let coordinator = NotificationCoordinator::open(&observability::db_path(&repo))?;
             coordinator.abandon_uncertain(observed_unix_ms)?;
             coordinator.retain(live.iter(), observed_unix_ms)?;
             for (session, state) in &observations {
@@ -848,8 +1188,8 @@ fn observe_and_deliver_notifications(
                     observed_unix_ms,
                 })?;
             }
-            dispatch_pending_notifications(&mut coordinator, subscriber, observed_unix_ms)
-        });
+            dispatch_pending_notifications(&coordinator, subscriber, observed_unix_ms)
+        })();
         if let Err(error) = result {
             eprintln!(
                 "Prism notification observer cannot update {}: {error}",
@@ -884,7 +1224,6 @@ fn observe_interactive_agent(
             &association.harness_id,
             &session.branch,
             &session.path,
-            &session.worktree_session_id,
         )?
     {
         return normalize_opencode_observation(
@@ -934,7 +1273,7 @@ fn resolve_observed_state(
 }
 
 fn dispatch_pending_notifications(
-    coordinator: &mut NotificationCoordinator<'_>,
+    coordinator: &NotificationCoordinator,
     subscriber: &Arc<Mutex<Vec<UnixStream>>>,
     now_unix_ms: i64,
 ) -> Result<(), String> {
@@ -1054,370 +1393,9 @@ fn current_unix_ms() -> i64 {
 fn classify_abandoned(instance_id: &str) -> Result<(), String> {
     for entry in workspace::discover_valid_entries(workspace::load_entries()?) {
         observability::attach_run_repo(&entry.repo)?;
-        observability::with_writable_db(&entry.repo, |conn| {
-            execution::mark_abandoned(conn, instance_id).map(|_| ())
-        })?;
+        execution::mark_abandoned(&observability::db_path(&entry.repo), instance_id).map(|_| ())?;
     }
     Ok(())
-}
-
-fn schedule_queued(instance_id: &str, active: Arc<Mutex<BTreeSet<PathBuf>>>) {
-    let active_count = active
-        .lock()
-        .map(|active| active.len())
-        .unwrap_or(usize::MAX);
-    if active_count >= GLOBAL_CONCURRENCY {
-        return;
-    }
-    let entries = match workspace::load_entries() {
-        Ok(entries) => entries,
-        Err(error) => {
-            eprintln!("Prism worker cannot load repositories: {error}");
-            return;
-        }
-    };
-    for entry in workspace::discover_valid_entries(entries) {
-        let repo = entry.repo;
-        if let Err(error) = observability::attach_run_repo(&repo) {
-            eprintln!(
-                "Prism worker cannot attach repository {}: {error}",
-                repo.root.display()
-            );
-            continue;
-        }
-        let _ = observability::with_writable_db(&repo, |conn| {
-            execution::mark_abandoned(conn, instance_id).map(|_| ())
-        });
-        let queued = observability::with_writable_db(&repo, |conn| execution::queued(conn, 16));
-        let Ok(queued) = queued else {
-            continue;
-        };
-        for workflow in queued {
-            if active
-                .lock()
-                .map(|active| active.len())
-                .unwrap_or(usize::MAX)
-                >= GLOBAL_CONCURRENCY
-            {
-                return;
-            }
-            let Ok(worktree) = workflow_worktree(&repo, &workflow) else {
-                continue;
-            };
-            let config = Config::load(&repo);
-            if !matches!(legacy_worker_running(&repo, &config, &workflow), Ok(false)) {
-                continue;
-            }
-            let inserted = active
-                .lock()
-                .map(|mut active| active.insert(worktree.clone()))
-                .unwrap_or(false);
-            if !inserted {
-                continue;
-            }
-            let worker_id = execution::new_instance_id("executor");
-            let claim = observability::with_writable_db_mut(&repo, |conn| {
-                execution::claim(conn, &workflow, instance_id, &worker_id)
-            });
-            let Ok(Some(claim)) = claim else {
-                if let Ok(mut active) = active.lock() {
-                    active.remove(&worktree);
-                }
-                continue;
-            };
-            log_claim_lifecycle(&repo, "claim", &claim, "workflow claimed");
-            let active = Arc::clone(&active);
-            let executor_repo = repo.clone();
-            thread::spawn(move || {
-                execute_claim(&executor_repo, &claim);
-                if let Ok(mut active) = active.lock() {
-                    active.remove(&worktree);
-                }
-            });
-        }
-    }
-}
-
-pub fn legacy_worker_running(
-    repo: &Repository,
-    config: &Config,
-    workflow: &WorkflowIdentity,
-) -> Result<bool, String> {
-    let expected = format!(
-        "prism-{:016x}-worker-{}-{:016x}",
-        stable_hash(&repo.root),
-        workflow.kind.label(),
-        stable_hash(Path::new(&workflow.run_id))
-    );
-    crate::tmux::named_session_exists(config, &expected)
-        .map_err(|error| format!("inspect legacy tmux workers: {error}"))
-}
-
-fn workflow_worktree(repo: &Repository, workflow: &WorkflowIdentity) -> Result<PathBuf, String> {
-    observability::with_writable_db(repo, |conn| {
-        let (table, column) = match workflow.kind {
-            WorkflowKind::Auto => ("auto_run", "worktree_path"),
-            WorkflowKind::Plan => ("plan_run", "scope_path"),
-        };
-        conn.query_row(
-            &format!("select {column} from {table} where id = ?1"),
-            [&workflow.run_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map(PathBuf::from)
-        .map_err(|error| format!("load workflow worktree: {error}"))
-    })
-}
-
-fn execute_claim(repo: &Repository, claim: &ExecutionClaim) {
-    log_claim_lifecycle(repo, "executor_start", claim, "workflow executor started");
-    let heartbeat_stop = Arc::new(AtomicBool::new(false));
-    let ownership_lost = Arc::new(AtomicBool::new(false));
-    let heartbeat = spawn_heartbeat(
-        repo.clone(),
-        claim.clone(),
-        Arc::clone(&heartbeat_stop),
-        Arc::clone(&ownership_lost),
-    );
-    let config = Config::load(repo);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        observability::with_writable_db(repo, |conn| execution::validate_claim(conn, claim))
-            .and_then(|()| match claim.workflow.kind {
-                WorkflowKind::Auto => execute_auto(repo, &config, claim),
-                WorkflowKind::Plan => execute_plan(repo, &config, claim),
-            })
-    }))
-    .unwrap_or_else(|_| Err("workflow executor panicked".to_string()));
-    heartbeat_stop.store(true, Ordering::Release);
-    let _ = heartbeat.join();
-
-    let state = match result {
-        Ok(()) => workflow_release_state(repo, &claim.workflow).unwrap_or(DispatchState::Terminal),
-        Err(error) => {
-            log_claim_lifecycle(repo, "executor_failed", claim, &error);
-            if !ownership_lost.load(Ordering::Acquire) {
-                mark_domain_failed(repo, claim, &error);
-            }
-            DispatchState::Terminal
-        }
-    };
-    match observability::with_writable_db(repo, |conn| execution::release(conn, claim, state)) {
-        Ok(()) => log_claim_lifecycle(repo, "release", claim, state.label()),
-        Err(error) => log_claim_lifecycle(repo, "release_failed", claim, &error),
-    }
-    log_claim_lifecycle(repo, "executor_stop", claim, "workflow executor stopped");
-}
-
-fn spawn_heartbeat(
-    repo: Repository,
-    claim: ExecutionClaim,
-    stop: Arc<AtomicBool>,
-    ownership_lost: Arc<AtomicBool>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
-        while !stop.load(Ordering::Acquire) {
-            thread::sleep(Duration::from_millis(100));
-            if stop.load(Ordering::Acquire) {
-                break;
-            }
-            if Instant::now() < next_heartbeat {
-                continue;
-            }
-            if observability::with_writable_db(&repo, |conn| execution::heartbeat(conn, &claim))
-                .is_err()
-            {
-                let validation = observability::with_writable_db(&repo, |conn| {
-                    execution::validate_claim(conn, &claim)
-                });
-                if matches!(
-                    validation,
-                    Err(ref error) if execution::is_stale_claim_error(error)
-                ) {
-                    ownership_lost.store(true, Ordering::Release);
-                    log_claim_lifecycle(
-                        &repo,
-                        "heartbeat_lost",
-                        &claim,
-                        "execution ownership lost",
-                    );
-                    break;
-                }
-            }
-            next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
-        }
-    })
-}
-
-fn execute_auto(repo: &Repository, config: &Config, claim: &ExecutionClaim) -> Result<(), String> {
-    let run_id = &claim.workflow.run_id;
-    let mut persisted = observability::with_writable_db(repo, |conn| {
-        crate::auto_flow::load_auto_run(conn, run_id)
-    })?
-    .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
-    let harness_config = config
-        .harness_config(&persisted.run.harness_id)
-        .map_err(|_| {
-            format!(
-                "auto run harness '{}' is no longer configured",
-                persisted.run.harness_id
-            )
-        })?;
-    if harness_config.adapter != persisted.run.adapter_id {
-        return Err(format!(
-            "auto run harness '{}' was recorded with adapter '{}', but it is now configured as '{}'",
-            persisted.run.harness_id, persisted.run.adapter_id, harness_config.adapter
-        ));
-    }
-    let worktree_session_id = persisted
-        .run
-        .worktree_session_id
-        .as_deref()
-        .ok_or_else(|| {
-            "auto run has no Worktree Session identity; legacy runs cannot execute".to_string()
-        })?;
-    let runtime = crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
-        .prepare_server(
-            repo,
-            config,
-            &persisted.run.branch,
-            &persisted.run.worktree_path,
-            worktree_session_id,
-        )?
-        .map(|runtime| runtime.server_url);
-    let executor = crate::auto_flow::AutoExecutorConfig::for_harness(
-        persisted.run.harness_id.clone(),
-        harness_config,
-        runtime,
-        persisted.run.worktree_path.clone(),
-        format!("Auto Flow {}", persisted.run.prompt_summary),
-    );
-    observability::with_writable_db(repo, |conn| {
-        execution::install_claim_guards(conn, claim)?;
-        crate::auto_flow::execute_auto_initial_step(
-            conn,
-            repo,
-            config,
-            &mut persisted,
-            &executor,
-            &mut std::io::sink(),
-        )
-    })
-}
-
-fn execute_plan(repo: &Repository, config: &Config, claim: &ExecutionClaim) -> Result<(), String> {
-    let run_id = &claim.workflow.run_id;
-    let mut persisted =
-        observability::with_writable_db(repo, |conn| crate::plan_run::load_plan_run(conn, run_id))?
-            .ok_or_else(|| format!("plan run not found: {run_id}"))?;
-    let harness_config = config
-        .harness_config(&persisted.run.harness_id)
-        .map_err(|_| {
-            format!(
-                "plan run harness '{}' is no longer configured",
-                persisted.run.harness_id
-            )
-        })?;
-    if harness_config.adapter != persisted.run.adapter_id {
-        return Err(format!(
-            "plan run harness '{}' was recorded with adapter '{}', but it is now configured as '{}'",
-            persisted.run.harness_id, persisted.run.adapter_id, harness_config.adapter
-        ));
-    }
-    let worktree_session_id = persisted
-        .run
-        .worktree_session_id
-        .as_deref()
-        .ok_or_else(|| {
-            "plan run has no Worktree Session identity; legacy runs cannot execute".to_string()
-        })?;
-    let server_url = crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
-        .prepare_server(
-            repo,
-            config,
-            "plan",
-            &persisted.run.scope_path,
-            worktree_session_id,
-        )?
-        .map(|runtime| runtime.server_url);
-    let mut executor = crate::plan_run::PlanExecutorConfig::for_harness(
-        persisted.run.harness_id.clone(),
-        harness_config.clone(),
-        server_url,
-        persisted.run.scope_path.clone(),
-        persisted.run.plan_display.clone(),
-    );
-    if harness_config.adapter == "opencode"
-        && config.opencode_plan_plugin
-        && let Ok(plugin) = crate::plan_run::prepare_plan_plugin_config(&repo.prism_dir())
-    {
-        executor = executor.with_plugin_config(plugin);
-    }
-    observability::with_writable_db(repo, |conn| {
-        execution::install_claim_guards(conn, claim)?;
-        match persisted.run.mode {
-            crate::plan_run::PlanRunMode::Sequential => crate::plan_run::execute_plan_sequential(
-                conn,
-                &mut persisted,
-                &executor,
-                &mut std::io::sink(),
-            ),
-            crate::plan_run::PlanRunMode::Parallel => crate::plan_run::execute_plan_parallel(
-                conn,
-                &mut persisted,
-                &executor,
-                &mut std::io::sink(),
-            ),
-        }
-    })
-}
-
-fn workflow_release_state(
-    repo: &Repository,
-    workflow: &WorkflowIdentity,
-) -> Result<DispatchState, String> {
-    observability::with_writable_db(repo, |conn| {
-        let table = match workflow.kind {
-            WorkflowKind::Auto => "auto_run",
-            WorkflowKind::Plan => "plan_run",
-        };
-        let status = conn
-            .query_row(
-                &format!("select status from {table} where id = ?1"),
-                [&workflow.run_id],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|error| format!("load completed workflow status: {error}"))?;
-        Ok(if status == "paused" {
-            DispatchState::Paused
-        } else {
-            DispatchState::Terminal
-        })
-    })
-}
-
-fn mark_domain_failed(repo: &Repository, claim: &ExecutionClaim, error: &str) {
-    let _ = observability::with_writable_db(repo, |conn| {
-        execution::install_claim_guards(conn, claim)?;
-        match claim.workflow.kind {
-            WorkflowKind::Auto => {
-                if let Some(mut persisted) =
-                    crate::auto_flow::load_auto_run(conn, &claim.workflow.run_id)?
-                {
-                    crate::auto_flow::fail_auto_run(conn, &mut persisted, error.to_string())?;
-                }
-            }
-            WorkflowKind::Plan => {
-                conn.execute(
-                    "update plan_run set status = 'failed', updated_unix_ms = ?1
-                     where id = ?2 and status not in ('aborted', 'done')",
-                    rusqlite::params![execution::now_ms(), claim.workflow.run_id],
-                )
-                .map_err(|db_error| format!("mark plan run failed: {db_error}"))?;
-            }
-        }
-        Ok(())
-    });
 }
 
 fn log_daemon_lifecycle(action: &str, instance_id: &str) {
@@ -1439,35 +1417,19 @@ fn log_daemon_lifecycle(action: &str, instance_id: &str) {
     }
 }
 
-fn log_claim_lifecycle(repo: &Repository, action: &str, claim: &ExecutionClaim, message: &str) {
-    let data = format!(
-        "{{\"workflow_kind\":\"{}\",\"run_id\":{},\"worker_id\":{},\"daemon_instance_id\":{},\"fencing_token\":{}}}",
-        claim.workflow.kind.label(),
-        serde_json::to_string(&claim.workflow.run_id).unwrap_or_else(|_| "null".to_string()),
-        serde_json::to_string(&claim.worker_id).unwrap_or_else(|_| "null".to_string()),
-        serde_json::to_string(&claim.daemon_instance_id).unwrap_or_else(|_| "null".to_string()),
-        claim.fencing_token,
-    );
-    log_worker_event(repo, action, message, Some(&data));
-}
-
 fn log_worker_event(repo: &Repository, action: &str, message: &str, data_json: Option<&str>) {
-    let _ = observability::with_writable_db(repo, |conn| {
-        conn.execute(
-            "insert into event (
-               time_unix_ms, level, target, action, repo, message, data_json
-             ) values (?1, 'info', 'worker', ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                execution::now_ms(),
+    let repo_path = repo.root.display().to_string();
+    let _ = execution::persistence::WorkflowStore::open(&observability::db_path(repo)).and_then(
+        |store| {
+            store.insert_worker_event(execution::persistence::WorkerEvent {
+                time: execution::now_ms(),
                 action,
-                repo.root.display().to_string(),
+                repo: &repo_path,
                 message,
                 data_json,
-            ],
-        )
-        .map(|_| ())
-        .map_err(|error| format!("record worker lifecycle event: {error}"))
-    });
+            })
+        },
+    );
 }
 
 fn acquire_lock(path: &Path) -> Result<File, String> {
@@ -1583,27 +1545,24 @@ mod tests {
     fn transient_opencode_poll_failure_does_not_repeat_a_completion_notification() {
         use crate::agent::AgentState;
         use crate::config::NotificationConfig;
-        use crate::notification::{
-            NotificationCoordinator, NotificationObservation, migrate_schema,
-        };
+        use crate::notification::{NotificationCoordinator, NotificationObservation};
         use crate::session::{WorktreeRepositoryKey, WorktreeSessionKey};
 
+        let temp = crate::compact_runtime::CompactTempDir::new("notification-poll");
+        let coordinator =
+            NotificationCoordinator::open(&temp.runtime_path().join("state.db")).unwrap();
         let session = WorktreeSessionKey {
             repository: WorktreeRepositoryKey::new("/tmp/repo".into()),
-            worktree_session_id: "test-session".to_string(),
             path: "/tmp/repo/feature".into(),
             branch: "feature".to_string(),
             incarnation: "one".to_string(),
         };
-        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
-        migrate_schema(&conn).unwrap();
-        let mut coordinator = NotificationCoordinator::new(&mut conn);
         let config = NotificationConfig {
             enabled: true,
             completed: true,
             ..NotificationConfig::default()
         };
-        let mut observe = |state, at| {
+        let observe = |state, at| {
             coordinator
                 .observe(NotificationObservation {
                     session: &session,
@@ -1634,17 +1593,14 @@ mod tests {
         let subscriber = Arc::new(Mutex::new(Vec::new()));
         client.write_all(b"subscribe-notifications\n").unwrap();
 
-        assert_eq!(
-            respond(
-                &mut server,
-                "daemon-test",
-                "exe",
-                &active,
-                &subscriber,
-                false,
-            ),
-            WorkerControl::Continue
-        );
+        assert!(!respond(
+            &mut server,
+            "daemon-test",
+            &active,
+            &subscriber,
+            None,
+            false,
+        ));
         let mut acknowledgement = [0_u8; 64];
         let size = client.read(&mut acknowledgement).unwrap();
         assert_eq!(
@@ -1871,13 +1827,6 @@ mod tests {
     }
 
     #[test]
-    fn replacement_request_treats_a_removed_worker_socket_as_stopped() {
-        let (_runtime, socket) = test_socket_path();
-
-        assert_eq!(request_if_worker_running(&socket, "replace").unwrap(), None);
-    }
-
-    #[test]
     fn platform_smoke_native_waiting_for_a_live_socket_to_close_times_out() {
         let (_runtime, socket) = test_socket_path();
         let _listener = UnixListener::bind(socket.as_path()).unwrap();
@@ -1889,114 +1838,29 @@ mod tests {
     }
 
     #[test]
-    fn same_version_worker_from_replaced_executable_is_not_reused() {
-        let current =
-            parse_health_response("ok 1 daemon pid=42 state=running active=0 exe=8:100").unwrap();
-        let replaced =
-            parse_health_response("ok 1 daemon pid=42 state=running active=0 exe=8:99").unwrap();
-        let legacy = parse_health_response("ok 1 daemon pid=42 state=running active=0").unwrap();
-
-        assert!(daemon_uses_executable(&current, "8:100"));
-        assert!(!daemon_uses_executable(&replaced, "8:100"));
-        assert!(!daemon_uses_executable(&legacy, "8:100"));
-    }
-
-    #[test]
-    fn draining_daemon_is_waited_through_socket_removal() {
-        let mut probes = [
-            DaemonHealth {
+    fn waiting_for_a_draining_daemon_times_out() {
+        assert_eq!(
+            wait_for_existing_daemon(Duration::ZERO, || Ok(DaemonHealth {
                 state: DaemonState::Draining,
                 protocol_version: Some(PROTOCOL_VERSION),
-                instance_id: Some("old".to_string()),
-                pid: Some(42),
-                executable_identity: Some("8:99".to_string()),
-                active: 0,
+                instance_id: Some("test".to_string()),
+                pid: Some(std::process::id()),
+                active: 2,
                 notifications: false,
-            },
-            DaemonHealth::stopped(),
-        ]
-        .into_iter();
-
-        assert_eq!(
-            wait_for_drain_transition(Duration::from_secs(1), || Ok(probes.next().unwrap()))
-                .unwrap(),
-            DaemonHealth::stopped()
+            })),
+            Err(
+                "timed out waiting for Prism worker daemon to finish draining (2 active)"
+                    .to_string()
+            )
         );
     }
 
     #[test]
-    fn draining_daemon_is_waited_through_concurrent_replacement() {
-        let replacement = DaemonHealth {
-            state: DaemonState::Running,
-            protocol_version: Some(PROTOCOL_VERSION),
-            instance_id: Some("new".to_string()),
-            pid: Some(43),
-            executable_identity: Some("8:100".to_string()),
-            active: 0,
-            notifications: true,
-        };
-        let mut probes = [
-            DaemonHealth {
-                state: DaemonState::Draining,
-                protocol_version: Some(PROTOCOL_VERSION),
-                instance_id: Some("old".to_string()),
-                pid: Some(42),
-                executable_identity: Some("8:99".to_string()),
-                active: 1,
-                notifications: false,
-            },
-            replacement.clone(),
-        ]
-        .into_iter();
-
+    fn daemon_probe_errors_are_not_treated_as_a_stopped_daemon() {
         assert_eq!(
-            wait_for_drain_transition(Duration::from_secs(1), || Ok(probes.next().unwrap()))
-                .unwrap(),
-            replacement
+            wait_for_existing_daemon(Duration::ZERO, || Err("permission denied".to_string())),
+            Err("permission denied".to_string())
         );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn deleted_executable_path_uses_installed_replacement_identity() {
-        let temp = crate::compact_runtime::CompactTempDir::new("worker-deleted-executable");
-        let installed = temp.path.join("prism");
-        fs::write(&installed, "replacement").unwrap();
-        let deleted = PathBuf::from(format!("{} (deleted)", installed.display()));
-
-        assert_eq!(
-            executable_identity(&deleted).unwrap(),
-            executable_identity(&installed).unwrap()
-        );
-    }
-
-    #[test]
-    fn wake_requests_force_running_scheduler_poll_only() {
-        let active = Arc::new(Mutex::new(BTreeSet::new()));
-        let notification_subscriber = Arc::new(Mutex::new(Vec::new()));
-        for (draining, expected) in [
-            (false, WorkerControl::Wake),
-            (true, WorkerControl::Continue),
-        ] {
-            let (mut server, mut client) = UnixStream::pair().unwrap();
-            client.write_all(b"wake\n").unwrap();
-
-            let control = respond(
-                &mut server,
-                "daemon",
-                "exe",
-                &active,
-                &notification_subscriber,
-                draining,
-            );
-            assert_eq!(control, expected);
-            let future = Instant::now() + POLL_INTERVAL;
-            let mut next_poll = future;
-            let mut applied_draining = draining;
-            let mut restart = false;
-            control.apply(&mut next_poll, &mut applied_draining, &mut restart);
-            assert_eq!(next_poll < future, !draining);
-        }
     }
 
     fn runtime_with_socket_path_len(byte_len: usize) -> PathBuf {

@@ -48,7 +48,13 @@ impl<'a> GitHubAdapter<'a> {
         .map_err(|error| github_provider_error(RemoteOperation::ListChangeRequests, error))?;
         summaries
             .into_iter()
-            .map(|summary| normalize_summary(summary, RemoteOperation::ListChangeRequests))
+            .map(|summary| {
+                normalize_summary(
+                    summary,
+                    &self.repository,
+                    RemoteOperation::ListChangeRequests,
+                )
+            })
             .collect()
     }
 
@@ -93,7 +99,7 @@ impl<'a> GitHubAdapter<'a> {
         else {
             return Ok(None);
         };
-        let summary = normalize_summary(summary, operation)?;
+        let summary = normalize_summary(summary, &self.repository, operation)?;
         if summary.change_request.id != *id {
             return Err(github_error(
                 operation,
@@ -229,7 +235,13 @@ impl<'a> GitHubAdapter<'a> {
         .map_err(|error| github_provider_error(RemoteOperation::CreateChangeRequest, error))?;
         let summary = summaries
             .into_iter()
-            .map(|summary| normalize_summary(summary, RemoteOperation::CreateChangeRequest))
+            .map(|summary| {
+                normalize_summary(
+                    summary,
+                    &self.repository,
+                    RemoteOperation::CreateChangeRequest,
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?
             .into_iter()
             .find(|summary| {
@@ -280,20 +292,8 @@ impl<'a> GitHubAdapter<'a> {
             target_project,
         )
         .map_err(|error| github_provider_error(RemoteOperation::MergeChangeRequest, error))?;
-        let summary = match self
-            .observe_change_request_for(&request.id, RemoteOperation::MergeChangeRequest)
-        {
-            Ok(summary) => summary,
-            Err(error) => {
-                return Ok(MergeMutationResult {
-                    outcome: super::super::MergeMutationOutcome::Uncertain,
-                    native_state: format!(
-                        "merge accepted; post-mutation observation failed: {error}"
-                    ),
-                    summary: before,
-                });
-            }
-        };
+        let summary =
+            self.observe_change_request_for(&request.id, RemoteOperation::MergeChangeRequest)?;
         if summary.change_request.head_sha != request.expected_source_sha {
             return Err(github_error(
                 RemoteOperation::MergeChangeRequest,
@@ -503,15 +503,11 @@ struct GithubCreatedReview {
 
 pub(super) fn normalize_summary(
     summary: PrSummary,
+    _expected_repository: &RemoteRepositoryId,
     operation: RemoteOperation,
 ) -> Result<ChangeRequestSummary, RemoteError> {
     let identity = summary.change_request_identity.as_ref().ok_or_else(|| {
-        github_error(
-            operation,
-            RemoteErrorClass::InvalidResponse,
-            Retryability::NotRetryable,
-            "GitHub pull request identity is incomplete",
-        )
+        github_invalid_response(operation, "missing canonical identity".to_string())
     })?;
     let change_request = ChangeRequest {
         id: identity

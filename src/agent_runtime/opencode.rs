@@ -9,8 +9,6 @@ use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{OptionalExtension, params};
-
 use crate::agent::AgentState;
 use crate::config::Config;
 use crate::json::json_escape;
@@ -38,7 +36,6 @@ pub struct OpencodeRuntime {
     pub harness_id: String,
     pub branch: String,
     pub worktree_path: String,
-    pub worktree_session_id: Option<String>,
     pub server_port: u16,
     pub server_url: String,
     pub server_pid: Option<u32>,
@@ -202,28 +199,7 @@ pub fn ensure_opencode_server_with_program(
     program: &str,
 ) -> Result<OpencodeRuntime, String> {
     let _server_lock = lock_repository_server(repo)?;
-    ensure_opencode_server_locked(repo, config, harness_id, branch, worktree, None, program)
-}
-
-pub fn ensure_opencode_server_for_worktree_session_with_program(
-    repo: &Repository,
-    config: &Config,
-    harness_id: &str,
-    branch: &str,
-    worktree: &Path,
-    worktree_session_id: &str,
-    program: &str,
-) -> Result<OpencodeRuntime, String> {
-    let _server_lock = lock_repository_server(repo)?;
-    ensure_opencode_server_locked(
-        repo,
-        config,
-        harness_id,
-        branch,
-        worktree,
-        Some(worktree_session_id),
-        program,
-    )
+    ensure_opencode_server_locked(repo, config, harness_id, branch, worktree, program)
 }
 
 fn ensure_opencode_server_locked(
@@ -232,26 +208,12 @@ fn ensure_opencode_server_locked(
     harness_id: &str,
     branch: &str,
     worktree: &Path,
-    worktree_session_id: Option<&str>,
     program: &str,
 ) -> Result<OpencodeRuntime, String> {
-    let existing = match worktree_session_id {
-        Some(worktree_session_id) => {
-            load_runtime(repo, harness_id, branch, worktree, worktree_session_id)?
-        }
-        None => None,
-    };
+    let existing = load_runtime(repo, harness_id, branch, worktree)?;
     let runtimes = load_runtimes_for_harness(repo, harness_id)?;
     if let Some(shared) = healthy_shared_runtime(&runtimes) {
-        let runtime = runtime_for_worktree(
-            repo,
-            harness_id,
-            branch,
-            worktree,
-            worktree_session_id,
-            &shared,
-            &existing,
-        );
+        let runtime = runtime_for_worktree(repo, harness_id, branch, worktree, &shared, &existing);
         save_shared_server_runtime(repo, &runtime)?;
         return Ok(runtime);
     }
@@ -312,7 +274,6 @@ fn ensure_opencode_server_locked(
         harness_id: harness_id.to_string(),
         branch: branch.to_string(),
         worktree_path: worktree.display().to_string(),
-        worktree_session_id: worktree_session_id.map(str::to_string),
         server_port: port,
         server_url,
         server_pid,
@@ -420,7 +381,6 @@ fn runtime_for_worktree(
     harness_id: &str,
     branch: &str,
     worktree: &Path,
-    worktree_session_id: Option<&str>,
     shared: &OpencodeRuntime,
     existing: &Option<OpencodeRuntime>,
 ) -> OpencodeRuntime {
@@ -434,7 +394,6 @@ fn runtime_for_worktree(
         harness_id: harness_id.to_string(),
         branch: branch.to_string(),
         worktree_path: worktree.display().to_string(),
-        worktree_session_id: worktree_session_id.map(str::to_string),
         server_port: shared.server_port,
         server_url: shared.server_url.clone(),
         server_pid: shared.server_pid,
@@ -458,14 +417,12 @@ fn runtime_for_worktree(
 }
 
 fn server_reference_count(repo: &Repository, runtime: &OpencodeRuntime) -> Result<i64, String> {
-    observability::with_writable_db(repo, |conn| {
-        conn.query_row(
-            "select count(*) from opencode_runtime where repo_root = ?1 and server_url = ?2",
-            params![runtime.repo_root, runtime.server_url],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| format!("count OpenCode server references: {error}"))
-    })
+    crate::persistence::session::count_server_references(
+        &observability::db_path(repo),
+        &runtime.repo_root,
+        &runtime.server_url,
+    )
+    .map_err(|error| format!("count OpenCode server references: {error}"))
 }
 
 pub fn ensure_opencode_session(
@@ -473,7 +430,6 @@ pub fn ensure_opencode_session(
     config: &Config,
     branch: &str,
     worktree: &Path,
-    worktree_session_id: &str,
 ) -> Result<OpencodeRuntime, String> {
     ensure_opencode_session_with_program(
         repo,
@@ -481,7 +437,6 @@ pub fn ensure_opencode_session(
         &config.default_harness,
         branch,
         worktree,
-        worktree_session_id,
         &config.tool("opencode"),
     )
 }
@@ -492,19 +447,11 @@ pub fn ensure_opencode_session_with_program(
     harness_id: &str,
     branch: &str,
     worktree: &Path,
-    worktree_session_id: &str,
     program: &str,
 ) -> Result<OpencodeRuntime, String> {
     let _server_lock = lock_repository_server(repo)?;
-    let mut runtime = ensure_opencode_server_locked(
-        repo,
-        config,
-        harness_id,
-        branch,
-        worktree,
-        Some(worktree_session_id),
-        program,
-    )?;
+    let mut runtime =
+        ensure_opencode_server_locked(repo, config, harness_id, branch, worktree, program)?;
     let session = resolve_session(&runtime, worktree)?;
     save_runtime_session(repo, &mut runtime, session.id)?;
     Ok(runtime)
@@ -516,25 +463,20 @@ pub fn refresh_opencode_session(
     worktree: &Path,
 ) -> Result<OpencodeRuntime, String> {
     let _server_lock = lock_repository_server(repo)?;
-    let worktree_session_id = runtime
-        .worktree_session_id
-        .as_deref()
-        .ok_or_else(|| "OpenCode runtime has no Worktree Session identity".to_string())?;
     let Some(current) = load_runtime(
         repo,
         &runtime.harness_id,
         &runtime.branch,
         Path::new(&runtime.worktree_path),
-        worktree_session_id,
     )?
     else {
-        return Err("OpenCode runtime does not match the current Worktree Session".to_string());
+        return Ok(runtime);
     };
     runtime = current;
-    if runtime.opencode_session_id.is_some() {
+    let Some(session) = newest_listed_session_for_worktree(&runtime, worktree).unwrap_or(None)
+    else {
         return Ok(runtime);
-    }
-    let session = resolve_session(&runtime, worktree)?;
+    };
     save_runtime_session(repo, &mut runtime, session.id)?;
     Ok(runtime)
 }
@@ -1697,12 +1639,27 @@ fn fetch_todos(
 }
 
 fn resolve_session(runtime: &OpencodeRuntime, worktree: &Path) -> Result<OpencodeSession, String> {
-    if let Some(session_id) = runtime.opencode_session_id.as_ref()
+    let worktree_path = worktree.display().to_string();
+    let stored_session = if let Some(session_id) = runtime.opencode_session_id.as_deref()
         && let Some(session) = get_session_for_worktree(&runtime.server_url, session_id, worktree)?
-        && session_matches_worktree(&session, &worktree.display().to_string())
+        && session_matches_worktree(&session, &worktree_path)
     {
+        Some(session)
+    } else {
+        None
+    };
+
+    match newest_listed_session_for_worktree(runtime, worktree) {
+        Ok(Some(session)) => return Ok(session),
+        Ok(None) => {}
+        Err(_) if stored_session.is_some() => return Ok(stored_session.unwrap()),
+        Err(error) => return Err(error),
+    }
+
+    if let Some(session) = stored_session {
         return Ok(session);
     }
+
     create_session(&runtime.server_url, worktree, &runtime.branch)
 }
 
@@ -1752,18 +1709,8 @@ pub fn load_runtime(
     harness_id: &str,
     branch: &str,
     worktree: &Path,
-    worktree_session_id: &str,
 ) -> Result<Option<OpencodeRuntime>, String> {
-    observability::with_writable_db(repo, |conn| {
-        load_runtime_with_conn(
-            conn,
-            repo,
-            harness_id,
-            branch,
-            worktree,
-            worktree_session_id,
-        )
-    })
+    load_runtime_snapshot(repo, harness_id, branch, worktree)
 }
 
 pub fn load_runtime_snapshot(
@@ -1771,47 +1718,16 @@ pub fn load_runtime_snapshot(
     harness_id: &str,
     branch: &str,
     worktree: &Path,
-    worktree_session_id: &str,
-) -> Result<Option<OpencodeRuntime>, String> {
-    observability::with_nonblocking_read_db(repo, |conn| {
-        load_runtime_with_conn(
-            conn,
-            repo,
-            harness_id,
-            branch,
-            worktree,
-            worktree_session_id,
-        )
-    })
-}
-
-fn load_runtime_with_conn(
-    conn: &rusqlite::Connection,
-    repo: &Repository,
-    harness_id: &str,
-    branch: &str,
-    worktree: &Path,
-    worktree_session_id: &str,
 ) -> Result<Option<OpencodeRuntime>, String> {
     let repo_root = repo.root.display().to_string();
     let worktree_path = worktree.display().to_string();
-    conn.query_row(
-        "select repo_root, harness_id, branch, worktree_path, server_port, server_url, server_pid,
-                 opencode_session_id, generation, updated_unix_ms, server_start_time_ticks,
-                 worktree_session_id
-          from opencode_runtime
-          where repo_root = ?1 and harness_id = ?2 and branch = ?3 and worktree_path = ?4
-            and worktree_session_id = ?5",
-        params![
-            repo_root,
-            harness_id,
-            branch,
-            worktree_path,
-            worktree_session_id
-        ],
-        runtime_from_row,
+    crate::persistence::session::load_runtime(
+        &observability::db_path(repo),
+        &repo_root,
+        harness_id,
+        branch,
+        &worktree_path,
     )
-    .optional()
     .map_err(|error| format!("read opencode runtime: {error}"))
 }
 
@@ -1820,22 +1736,12 @@ fn load_runtimes_for_harness(
     harness_id: &str,
 ) -> Result<Vec<OpencodeRuntime>, String> {
     let repo_root = repo.root.display().to_string();
-    observability::with_writable_db(repo, |conn| {
-        let mut statement = conn
-            .prepare(
-                "select repo_root, harness_id, branch, worktree_path, server_port, server_url, server_pid,
-                        opencode_session_id, generation, updated_unix_ms, server_start_time_ticks,
-                        worktree_session_id
-                   from opencode_runtime
-                  where repo_root = ?1 and harness_id = ?2",
-            )
-            .map_err(|error| format!("prepare OpenCode server lookup: {error}"))?;
-        let rows = statement
-            .query_map(params![repo_root, harness_id], runtime_from_row)
-            .map_err(|error| format!("read OpenCode servers: {error}"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("read OpenCode server: {error}"))
-    })
+    crate::persistence::session::list_runtimes_for_harness(
+        &observability::db_path(repo),
+        &repo_root,
+        harness_id,
+    )
+    .map_err(|error| format!("read OpenCode servers: {error}"))
 }
 
 pub(crate) fn load_runtimes_for_worktree_session(
@@ -1845,280 +1751,23 @@ pub(crate) fn load_runtimes_for_worktree_session(
 ) -> Result<Vec<OpencodeRuntime>, String> {
     let repo_root = repo.root.display().to_string();
     let worktree_path = worktree.display().to_string();
-    observability::with_writable_db(repo, |conn| {
-        let mut statement = conn
-            .prepare(
-                "select repo_root, harness_id, branch, worktree_path, server_port, server_url, server_pid,
-                         opencode_session_id, generation, updated_unix_ms, server_start_time_ticks,
-                         worktree_session_id
-                   from opencode_runtime
-                  where repo_root = ?1 and branch = ?2 and worktree_path = ?3",
-            )
-            .map_err(|error| format!("prepare opencode runtime lookup: {error}"))?;
-        let rows = statement
-            .query_map(params![repo_root, branch, worktree_path], runtime_from_row)
-            .map_err(|error| format!("read opencode runtime: {error}"))?;
-
-        let mut runtimes = Vec::new();
-        for row in rows {
-            runtimes.push(row.map_err(|error| format!("read opencode runtime: {error}"))?);
-        }
-        Ok(runtimes)
-    })
-}
-
-fn runtime_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpencodeRuntime> {
-    let server_pid = row
-        .get::<_, Option<i64>>(6)?
-        .and_then(|pid| u32::try_from(pid).ok());
-    Ok(OpencodeRuntime {
-        repo_root: row.get(0)?,
-        harness_id: row.get(1)?,
-        branch: row.get(2)?,
-        worktree_path: row.get(3)?,
-        worktree_session_id: row.get(11)?,
-        server_port: u16::try_from(row.get::<_, i64>(4)?).unwrap_or_default(),
-        server_url: row.get(5)?,
-        server_pid,
-        server_process_identity: row
-            .get::<_, Option<i64>>(10)?
-            .map(|value| value.max(0) as u64),
-        opencode_session_id: row.get(7)?,
-        generation: row
-            .get::<_, i64>(8)
-            .ok()
-            .and_then(|value| u64::try_from(value).ok())
-            .unwrap_or_default(),
-        updated_unix_ms: row
-            .get::<_, i64>(9)
-            .ok()
-            .and_then(|value| u64::try_from(value).ok())
-            .unwrap_or_default(),
-    })
+    crate::persistence::session::list_runtimes_for_worktree(
+        &observability::db_path(repo),
+        &repo_root,
+        branch,
+        &worktree_path,
+    )
+    .map_err(|error| format!("read opencode runtime: {error}"))
 }
 
 pub fn save_runtime(repo: &Repository, runtime: &OpencodeRuntime) -> Result<(), String> {
-    if runtime.worktree_session_id.is_none() {
-        return Err("OpenCode runtime has no Worktree Session identity".to_string());
-    }
-    observability::with_writable_db(repo, |conn| save_runtime_with_conn(conn, runtime))
+    crate::persistence::session::save_runtime(&observability::db_path(repo), runtime)
+        .map_err(|error| format!("write opencode runtime: {error}"))
 }
 
 fn save_shared_server_runtime(repo: &Repository, runtime: &OpencodeRuntime) -> Result<(), String> {
-    observability::with_writable_db(repo, |conn| {
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|error| format!("begin shared OpenCode server update: {error}"))?;
-        tx.execute(
-            "update opencode_runtime
-                set server_port = ?3, server_url = ?4, server_pid = ?5,
-                    server_start_time_ticks = ?6, updated_unix_ms = ?7
-              where repo_root = ?1 and harness_id = ?2
-                and (server_port != ?3 or server_url != ?4 or server_pid is not ?5
-                     or server_start_time_ticks is not ?6)",
-            params![
-                runtime.repo_root.as_str(),
-                runtime.harness_id.as_str(),
-                i64::from(runtime.server_port),
-                runtime.server_url.as_str(),
-                runtime.server_pid.map(i64::from),
-                runtime
-                    .server_process_identity
-                    .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
-                i64::try_from(runtime.updated_unix_ms).unwrap_or(i64::MAX),
-            ],
-        )
-        .map_err(|error| format!("update shared OpenCode server references: {error}"))?;
-        save_runtime_with_conn(&tx, runtime)?;
-        tx.commit()
-            .map_err(|error| format!("commit shared OpenCode server update: {error}"))?;
-        Ok(())
-    })
-}
-
-fn save_runtime_with_conn(
-    conn: &rusqlite::Connection,
-    runtime: &OpencodeRuntime,
-) -> Result<(), String> {
-    let changed = conn
-        .execute(
-            "insert into opencode_runtime (
-                repo_root, harness_id, branch, worktree_path, server_port, server_url, server_pid,
-                 opencode_session_id, generation, updated_unix_ms, server_start_time_ticks,
-                 worktree_session_id
-              ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-              on conflict(repo_root, harness_id, branch, worktree_path) do update set
-                server_port = excluded.server_port,
-                server_url = excluded.server_url,
-                server_pid = excluded.server_pid,
-                opencode_session_id = excluded.opencode_session_id,
-                generation = excluded.generation,
-                updated_unix_ms = excluded.updated_unix_ms,
-                server_start_time_ticks = excluded.server_start_time_ticks,
-                worktree_session_id = excluded.worktree_session_id
-              where opencode_runtime.worktree_session_id = excluded.worktree_session_id
-                 or exists (
-                   select 1 from active_worktree_session a
-                   where a.worktree_session_id = excluded.worktree_session_id
-                     and a.repo_root = excluded.repo_root
-                     and a.branch = excluded.branch
-                     and a.worktree_path = excluded.worktree_path
-                 )
-                 or not exists (
-                   select 1 from active_worktree_session a
-                   where a.repo_root = excluded.repo_root
-                     and a.branch = excluded.branch
-                     and a.worktree_path = excluded.worktree_path
-                 )",
-            params![
-                runtime.repo_root.as_str(),
-                runtime.harness_id.as_str(),
-                runtime.branch.as_str(),
-                runtime.worktree_path.as_str(),
-                i64::from(runtime.server_port),
-                runtime.server_url.as_str(),
-                runtime.server_pid.map(i64::from),
-                runtime.opencode_session_id.as_deref(),
-                i64::try_from(runtime.generation).unwrap_or(i64::MAX),
-                i64::try_from(runtime.updated_unix_ms).unwrap_or(i64::MAX),
-                runtime
-                    .server_process_identity
-                    .map(|value| i64::try_from(value).unwrap_or(i64::MAX)),
-                runtime.worktree_session_id.as_deref(),
-            ],
-        )
-        .map_err(|error| format!("write opencode runtime: {error}"))?;
-    if changed == 1 {
-        Ok(())
-    } else {
-        let stored_worktree_session_id = conn
-            .query_row(
-                "select worktree_session_id from opencode_runtime
-                  where repo_root = ?1 and harness_id = ?2 and branch = ?3 and worktree_path = ?4",
-                params![
-                    runtime.repo_root.as_str(),
-                    runtime.harness_id.as_str(),
-                    runtime.branch.as_str(),
-                    runtime.worktree_path.as_str(),
-                ],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .map_err(|error| format!("verify opencode runtime identity: {error}"))?;
-        if stored_worktree_session_id.as_ref() == Some(&runtime.worktree_session_id) {
-            Ok(())
-        } else {
-            Err("OpenCode runtime belongs to a replaced Worktree Session".to_string())
-        }
-    }
-}
-
-pub(crate) fn migrate_runtime_schema(conn: &rusqlite::Connection) -> Result<(), String> {
-    let has_legacy_table = conn
-        .query_row(
-            "select exists(select 1 from sqlite_master where type = 'table' and name = 'opencode_runtime')",
-            [],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(|error| format!("inspect opencode runtime schema: {error}"))?;
-    if has_legacy_table {
-        let mut statement = conn
-            .prepare("pragma table_info(opencode_runtime)")
-            .map_err(|error| format!("inspect opencode runtime columns: {error}"))?;
-        let columns = statement
-            .query_map([], |row| row.get::<_, String>(1))
-            .map_err(|error| format!("read opencode runtime columns: {error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("read opencode runtime column: {error}"))?;
-        if !columns.iter().any(|column| column == "harness_id") {
-            conn.execute_batch(
-                "alter table opencode_runtime rename to opencode_runtime_legacy;
-                 create table opencode_runtime (
-                   repo_root text not null,
-                   harness_id text not null default 'opencode',
-                   branch text not null,
-                   worktree_path text not null,
-                   server_port integer not null,
-                   server_url text not null,
-                   server_pid integer,
-                   opencode_session_id text,
-                   generation integer not null,
-                   updated_unix_ms integer not null,
-                   server_start_time_ticks integer,
-                   worktree_session_id text,
-                   primary key (repo_root, harness_id, branch, worktree_path)
-                 );
-                 insert into opencode_runtime (
-                   repo_root, harness_id, branch, worktree_path, server_port, server_url,
-                    server_pid, opencode_session_id, generation, updated_unix_ms,
-                    server_start_time_ticks, worktree_session_id
-                  )
-                  select repo_root, 'opencode', branch, worktree_path, server_port, server_url,
-                         server_pid, opencode_session_id, generation, updated_unix_ms, null, null
-                 from opencode_runtime_legacy;
-                 drop table opencode_runtime_legacy;",
-            )
-            .map_err(|error| format!("migrate opencode runtime harness identity: {error}"))?;
-        }
-    }
-    let has_start_time = conn
-        .prepare("pragma table_info(opencode_runtime)")
-        .and_then(|mut statement| {
-            statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .map_err(|error| format!("inspect opencode runtime process identity: {error}"))?
-        .iter()
-        .any(|column| column == "server_start_time_ticks");
-    if has_legacy_table && !has_start_time {
-        conn.execute(
-            "alter table opencode_runtime add column server_start_time_ticks integer",
-            [],
-        )
-        .map_err(|error| format!("migrate opencode runtime process identity: {error}"))?;
-    }
-    let has_worktree_session_id = conn
-        .prepare("pragma table_info(opencode_runtime)")
-        .and_then(|mut statement| {
-            statement
-                .query_map([], |row| row.get::<_, String>(1))?
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .map_err(|error| format!("inspect opencode runtime Worktree Session identity: {error}"))?
-        .iter()
-        .any(|column| column == "worktree_session_id");
-    if has_legacy_table && !has_worktree_session_id {
-        conn.execute(
-            "alter table opencode_runtime add column worktree_session_id text",
-            [],
-        )
-        .map_err(|error| format!("migrate opencode runtime Worktree Session identity: {error}"))?;
-    }
-    conn.execute_batch(
-        "
-        create table if not exists opencode_runtime (
-          repo_root text not null,
-          harness_id text not null default 'opencode',
-          branch text not null,
-          worktree_path text not null,
-          server_port integer not null,
-          server_url text not null,
-          server_pid integer,
-          opencode_session_id text,
-          generation integer not null,
-          updated_unix_ms integer not null,
-          server_start_time_ticks integer,
-          worktree_session_id text,
-          primary key (repo_root, harness_id, branch, worktree_path)
-        );
-
-        create index if not exists opencode_runtime_branch_idx
-          on opencode_runtime(repo_root, harness_id, branch);
-        ",
-    )
-    .map_err(|error| format!("create opencode runtime schema: {error}"))?;
-    Ok(())
+    crate::persistence::session::save_shared_server_runtime(&observability::db_path(repo), runtime)
+        .map_err(|error| format!("write shared OpenCode runtime: {error}"))
 }
 
 pub(crate) fn reconcile_session_refresh(
@@ -2153,23 +1802,9 @@ pub(crate) fn shutdown_worktree_session_runtimes(
             errors.push(error);
             continue;
         }
-        let result = observability::with_writable_db(repo, |conn| {
-            conn.execute(
-                "delete from opencode_runtime
-                 where repo_root = ?1 and harness_id = ?2 and branch = ?3 and worktree_path = ?4
-                   and generation = ?5 and worktree_session_id is ?6",
-                params![
-                    runtime.repo_root,
-                    runtime.harness_id,
-                    runtime.branch,
-                    runtime.worktree_path,
-                    i64::try_from(runtime.generation).unwrap_or(i64::MAX),
-                    runtime.worktree_session_id.as_deref(),
-                ],
-            )
-            .map_err(|error| format!("remove shut down OpenCode runtime: {error}"))?;
-            Ok(())
-        });
+        let result =
+            crate::persistence::session::delete_runtime(&observability::db_path(repo), &runtime)
+                .map_err(|error| format!("remove shut down OpenCode runtime: {error}"));
         if let Err(error) = result {
             errors.push(error);
         }
@@ -2179,28 +1814,6 @@ pub(crate) fn shutdown_worktree_session_runtimes(
     } else {
         Err(errors.join("; "))
     }
-}
-
-pub(crate) fn remove_worktree_session_runtimes_with_conn(
-    conn: &rusqlite::Connection,
-    runtimes: &[OpencodeRuntime],
-) -> Result<(), String> {
-    for runtime in runtimes {
-        conn.execute(
-            "delete from opencode_runtime
-              where repo_root = ?1 and branch = ?2 and worktree_path = ?3 and generation = ?4
-                and worktree_session_id is ?5",
-            params![
-                runtime.repo_root,
-                runtime.branch,
-                runtime.worktree_path,
-                i64::try_from(runtime.generation).unwrap_or(i64::MAX),
-                runtime.worktree_session_id.as_deref(),
-            ],
-        )
-        .map_err(|error| format!("remove opencode runtime state: {error}"))?;
-    }
-    Ok(())
 }
 
 pub(crate) fn shutdown_worktree_session_runtime_processes_with_lock_held(
@@ -3258,7 +2871,6 @@ mod tests {
             harness_id: "opencode".to_string(),
             branch: "feature/test".to_string(),
             worktree_path: "/repo/worktree".to_string(),
-            worktree_session_id: None,
             server_port: 41_234,
             server_url: "http://127.0.0.1:41234".to_string(),
             server_pid: Some(42),
@@ -3363,7 +2975,6 @@ mod tests {
             harness_id: "opencode".to_string(),
             branch: "feature".to_string(),
             worktree_path: worktree.display().to_string(),
-            worktree_session_id: Some("worktree-session-a".to_string()),
             server_port: 41_222,
             server_url: server_url(41_222),
             server_pid: Some(123),
@@ -3374,101 +2985,11 @@ mod tests {
         };
 
         save_runtime(&repo, &runtime).unwrap();
-        save_runtime(&repo, &runtime).unwrap();
-        let loaded = load_runtime(
-            &repo,
-            "opencode",
-            "feature",
-            &worktree,
-            "worktree-session-a",
-        )
-        .unwrap()
-        .unwrap();
+        let loaded = load_runtime(&repo, "opencode", "feature", &worktree)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(loaded, runtime);
-        let _ = fs::remove_dir_all(temp);
-    }
-
-    #[test]
-    fn runtime_lookup_requires_exact_worktree_session_identity() {
-        let temp = unique_temp_dir("prism-opencode-runtime-identity-test");
-        fs::create_dir_all(&temp).unwrap();
-        let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
-        let worktree = temp.join("feature");
-        let mut runtime = OpencodeRuntime {
-            repo_root: temp.display().to_string(),
-            harness_id: "opencode".to_string(),
-            branch: "feature".to_string(),
-            worktree_path: worktree.display().to_string(),
-            worktree_session_id: Some("identity-a".to_string()),
-            server_port: 41_222,
-            server_url: server_url(41_222),
-            server_pid: None,
-            server_process_identity: None,
-            opencode_session_id: Some("ses_a".to_string()),
-            generation: 1,
-            updated_unix_ms: 42,
-        };
-        save_runtime(&repo, &runtime).unwrap();
-        let stale_runtime = runtime.clone();
-
-        assert!(
-            load_runtime(&repo, "opencode", "feature", &worktree, "identity-b")
-                .unwrap()
-                .is_none()
-        );
-
-        runtime.worktree_session_id = Some("identity-b".to_string());
-        runtime.opencode_session_id = Some("ses_b".to_string());
-        observability::with_writable_db(&repo, |conn| {
-            conn.execute(
-                "insert into worktree_session (
-                    id, repo_root, initial_branch, initial_worktree_path, created_unix_ms
-                 ) values ('identity-b', ?1, 'feature', ?2, 1)",
-                params![temp.display().to_string(), worktree.display().to_string()],
-            )
-            .map_err(|error| error.to_string())?;
-            conn.execute(
-                "insert into active_worktree_session (
-                    worktree_session_id, repo_root, branch, worktree_path,
-                    worktree_incarnation, observed_unix_ms
-                 ) values ('identity-b', ?1, 'feature', ?2, 'incarnation-b', 1)",
-                params![temp.display().to_string(), worktree.display().to_string()],
-            )
-            .map_err(|error| error.to_string())?;
-            Ok(())
-        })
-        .unwrap();
-        save_runtime(&repo, &runtime).unwrap();
-        let stale_save_error = save_runtime(&repo, &stale_runtime).unwrap_err();
-        assert!(stale_save_error.contains("replaced Worktree Session"));
-        let error = refresh_opencode_session(&repo, stale_runtime, &worktree).unwrap_err();
-        assert!(error.contains("does not match the current Worktree Session"));
-        assert!(
-            load_runtime(&repo, "opencode", "feature", &worktree, "identity-a")
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            load_runtime(&repo, "opencode", "feature", &worktree, "identity-b")
-                .unwrap()
-                .unwrap()
-                .opencode_session_id
-                .as_deref(),
-            Some("ses_b")
-        );
-
-        observability::with_writable_db(&repo, |conn| {
-            conn.execute("update opencode_runtime set worktree_session_id = null", [])
-                .map_err(|error| error.to_string())?;
-            Ok(())
-        })
-        .unwrap();
-        assert!(
-            load_runtime(&repo, "opencode", "feature", &worktree, "identity-b")
-                .unwrap()
-                .is_none()
-        );
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -3486,7 +3007,6 @@ mod tests {
             harness_id: "opencode".to_string(),
             branch: "feature/first".to_string(),
             worktree_path: first_worktree.display().to_string(),
-            worktree_session_id: Some("worktree-session-first".to_string()),
             server_port,
             server_url: server_url.clone(),
             server_pid: None,
@@ -3530,7 +3050,6 @@ mod tests {
                 harness_id: "opencode".to_string(),
                 branch: branch.to_string(),
                 worktree_path: worktree.display().to_string(),
-                worktree_session_id: Some(format!("worktree-session-{branch}")),
                 server_port: parse_localhost_url(&server_url).unwrap().1,
                 server_url,
                 server_pid: None,
@@ -3585,7 +3104,6 @@ mod tests {
             harness_id: "opencode".to_string(),
             branch: branch.to_string(),
             worktree_path: temp.join(worktree).display().to_string(),
-            worktree_session_id: Some(format!("worktree-session-{branch}")),
             server_port: 41_000,
             server_url: server_url(41_000),
             server_pid: Some(100),
@@ -3650,7 +3168,6 @@ mod tests {
             harness_id: "opencode".to_string(),
             branch: branch.to_string(),
             worktree_path: temp.join(worktree).display().to_string(),
-            worktree_session_id: Some(format!("worktree-session-{branch}")),
             server_port: 41_000,
             server_url: server_url(41_000),
             server_pid: Some(100),
@@ -3663,17 +3180,9 @@ mod tests {
         let second = runtime("feature/second", "second");
         save_runtime(&repo, &first).unwrap();
         save_runtime(&repo, &second).unwrap();
-        observability::with_writable_db(&repo, |conn| {
-            conn.execute_batch(
-                "create trigger fail_runtime_upsert
-                 before update of generation on opencode_runtime
-                 when old.branch = 'feature/first'
-                 begin
-                   select raise(abort, 'forced runtime upsert failure');
-                 end;",
-            )
-            .map_err(|error| error.to_string())?;
-            Ok(())
+        observability::with_writable_db(&repo, |path| {
+            crate::persistence::session::test_install_shared_server_runtime_upsert_failure(path)
+                .map_err(|error| error.to_string())
         })
         .unwrap();
         let replacement = OpencodeRuntime {
@@ -3717,7 +3226,6 @@ mod tests {
                     harness_id: harness_id.to_string(),
                     branch: "feature".to_string(),
                     worktree_path: worktree.display().to_string(),
-                    worktree_session_id: Some("worktree-session-a".to_string()),
                     server_port: port,
                     server_url: server_url(port),
                     server_pid: None,
@@ -3731,98 +3239,22 @@ mod tests {
         }
 
         assert_eq!(
-            load_runtime(
-                &repo,
-                "opencode-a",
-                "feature",
-                &worktree,
-                "worktree-session-a",
-            )
-            .unwrap()
-            .unwrap()
-            .opencode_session_id
-            .as_deref(),
+            load_runtime(&repo, "opencode-a", "feature", &worktree)
+                .unwrap()
+                .unwrap()
+                .opencode_session_id
+                .as_deref(),
             Some("ses_a")
         );
         assert_eq!(
-            load_runtime(
-                &repo,
-                "opencode-b",
-                "feature",
-                &worktree,
-                "worktree-session-a",
-            )
-            .unwrap()
-            .unwrap()
-            .opencode_session_id
-            .as_deref(),
+            load_runtime(&repo, "opencode-b", "feature", &worktree)
+                .unwrap()
+                .unwrap()
+                .opencode_session_id
+                .as_deref(),
             Some("ses_b")
         );
         let _ = fs::remove_dir_all(temp);
-    }
-
-    #[test]
-    fn legacy_runtime_schema_migrates_to_default_opencode_harness() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "create table opencode_runtime (
-               repo_root text not null, branch text not null, worktree_path text not null,
-               server_port integer not null, server_url text not null, server_pid integer,
-               opencode_session_id text, generation integer not null, updated_unix_ms integer not null,
-               primary key (repo_root, branch, worktree_path)
-             );
-             insert into opencode_runtime values
-               ('/repo', 'feature', '/repo/feature', 41222, 'http://127.0.0.1:41222', null, 'ses_old', 2, 42);",
-        )
-        .unwrap();
-
-        migrate_runtime_schema(&conn).unwrap();
-
-        let harness_id = conn
-            .query_row(
-                "select harness_id from opencode_runtime where repo_root = '/repo'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .unwrap();
-        assert_eq!(harness_id, "opencode");
-        let worktree_session_id = conn
-            .query_row(
-                "select worktree_session_id from opencode_runtime where repo_root = '/repo'",
-                [],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .unwrap();
-        assert_eq!(worktree_session_id, None);
-    }
-
-    #[test]
-    fn runtime_schema_migration_keeps_legacy_process_ownership_unknown() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "create table opencode_runtime (
-               repo_root text not null, harness_id text not null, branch text not null,
-               worktree_path text not null, server_port integer not null, server_url text not null,
-               server_pid integer, opencode_session_id text, generation integer not null,
-               updated_unix_ms integer not null, server_start_time_ticks integer,
-               primary key (repo_root, harness_id, branch, worktree_path)
-             );
-             insert into opencode_runtime values
-               ('/repo', 'opencode', 'feature', '/repo/feature', 41222,
-                'http://127.0.0.1:41222', 123, 'ses_old', 2, 42, null);",
-        )
-        .unwrap();
-
-        migrate_runtime_schema(&conn).unwrap();
-
-        let start_time = conn
-            .query_row(
-                "select server_start_time_ticks from opencode_runtime",
-                [],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .unwrap();
-        assert_eq!(start_time, None);
     }
 
     #[test]
@@ -3840,7 +3272,6 @@ mod tests {
             harness_id: "opencode".to_string(),
             branch: "feature".to_string(),
             worktree_path: "/repo/feature".to_string(),
-            worktree_session_id: None,
             server_port: 41_222,
             server_url: server_url(41_222),
             server_pid: Some(child.id()),
@@ -3990,40 +3421,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_session_keeps_stored_native_session_id_stable() {
+    fn resolve_session_prefers_newer_worktree_session_over_stored_session() {
         let worktree = PathBuf::from("/repo/wt");
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let server_url = format!("http://{}", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            loop {
-                let mut buffer = [0_u8; 256];
-                let count = stream.read(&mut buffer).unwrap();
-                if count == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..count]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let request = String::from_utf8_lossy(&request);
-            assert!(request.starts_with("GET /session/old?directory=%2Frepo%2Fwt "));
-            let body = r#"{"id":"old","directory":"/repo/wt"}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-        });
+        let server_url = start_session_resolution_server();
         let runtime = OpencodeRuntime {
             repo_root: "/repo".to_string(),
             harness_id: "opencode".to_string(),
             branch: "feature".to_string(),
             worktree_path: worktree.display().to_string(),
-            worktree_session_id: Some("worktree-session-a".to_string()),
             server_port: 41_234,
             server_url,
             server_pid: None,
@@ -4035,58 +3440,7 @@ mod tests {
 
         let selected = resolve_session(&runtime, &worktree).unwrap();
 
-        assert_eq!(selected.id, "old");
-        server.join().unwrap();
-    }
-
-    #[test]
-    fn resolve_session_does_not_adopt_an_old_session_for_an_unassociated_worktree() {
-        let worktree = PathBuf::from("/repo/wt");
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let server_url = format!("http://{}", listener.local_addr().unwrap());
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            loop {
-                let mut buffer = [0_u8; 256];
-                let count = stream.read(&mut buffer).unwrap();
-                if count == 0 {
-                    break;
-                }
-                request.extend_from_slice(&buffer[..count]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let request = String::from_utf8_lossy(&request);
-            assert!(request.starts_with("POST /session?directory=%2Frepo%2Fwt "));
-            let body = r#"{"id":"fresh","directory":"/repo/wt"}"#;
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            )
-            .unwrap();
-        });
-        let runtime = OpencodeRuntime {
-            repo_root: "/repo".to_string(),
-            harness_id: "opencode".to_string(),
-            branch: "feature".to_string(),
-            worktree_path: worktree.display().to_string(),
-            worktree_session_id: Some("worktree-session-a".to_string()),
-            server_port: 41_234,
-            server_url,
-            server_pid: None,
-            server_process_identity: None,
-            opencode_session_id: None,
-            generation: 0,
-            updated_unix_ms: 0,
-        };
-
-        let selected = resolve_session(&runtime, &worktree).unwrap();
-
-        assert_eq!(selected.id, "fresh");
-        server.join().unwrap();
+        assert_eq!(selected.id, "new");
     }
 
     #[test]
@@ -4103,7 +3457,6 @@ mod tests {
             harness_id: "opencode".to_string(),
             branch: "feature".to_string(),
             worktree_path: worktree.display().to_string(),
-            worktree_session_id: Some("worktree-session-a".to_string()),
             server_port: port,
             server_url: server_url(port),
             server_pid: None,
@@ -4112,7 +3465,6 @@ mod tests {
             generation: 3,
             updated_unix_ms: 42,
         };
-        save_runtime(&repo, &runtime).unwrap();
 
         let refreshed = refresh_opencode_session(&repo, runtime.clone(), &worktree).unwrap();
 
@@ -4528,16 +3880,10 @@ mod tests {
                     created.id
                 ));
             }
-            let resolved = ensure_opencode_session(
-                &repo,
-                &config,
-                "feature/smoke",
-                &worktree,
-                "worktree-session-smoke",
-            )?;
-            if resolved.opencode_session_id.as_deref() == Some(created.id.as_str()) {
+            let resolved = ensure_opencode_session(&repo, &config, "feature/smoke", &worktree)?;
+            if resolved.opencode_session_id.as_deref() != Some(created.id.as_str()) {
                 return Err(format!(
-                    "Prism reused unassociated OpenCode session {} for {}",
+                    "Prism did not select created OpenCode session {} for {}",
                     created.id,
                     worktree.display()
                 ));
@@ -4592,7 +3938,6 @@ mod tests {
             harness_id: "opencode".to_string(),
             branch: branch.to_string(),
             worktree_path: worktree.to_string(),
-            worktree_session_id: Some(format!("worktree-session-{branch}")),
             server_port: 41_000,
             server_url: "http://127.0.0.1:41000".to_string(),
             server_pid: Some(process_id),
@@ -4613,10 +3958,8 @@ mod tests {
         .unwrap();
         assert!(owned_server_process(process_id));
 
-        observability::with_writable_db(&repo, |conn| {
-            remove_worktree_session_runtimes_with_conn(conn, std::slice::from_ref(&first))
-        })
-        .unwrap();
+        crate::persistence::session::delete_runtime(&observability::db_path(&repo), &first)
+            .unwrap();
         shutdown_worktree_session_runtime_processes_with_lock_held(
             &repo,
             std::slice::from_ref(&second),
@@ -4659,7 +4002,6 @@ mod tests {
             harness_id: "opencode".to_string(),
             branch: "feature/test".to_string(),
             worktree_path: "/repo/worktree".to_string(),
-            worktree_session_id: None,
             server_port: 41_000,
             server_url: "http://127.0.0.1:41000".to_string(),
             server_pid: Some(process_id),
@@ -4738,7 +4080,6 @@ mod tests {
             harness_id: "opencode".to_string(),
             branch: "feature/test".to_string(),
             worktree_path: "/repo/worktree".to_string(),
-            worktree_session_id: None,
             server_port: 41_000,
             server_url: "http://127.0.0.1:41000".to_string(),
             server_pid: Some(process_id),
@@ -4852,9 +4193,7 @@ mod tests {
                     }
                 }
                 let request = String::from_utf8_lossy(&request);
-                let body = if request.starts_with("GET /session/old ")
-                    || request.starts_with("GET /session/old?")
-                {
+                let body = if request.starts_with("GET /session/old ") {
                     r#"{"id":"old","directory":"/repo/wt","timeUpdated":"2026-01-01T00:00:00Z"}"#
                 } else if request.starts_with("GET /session ")
                     || request.starts_with("GET /session?")

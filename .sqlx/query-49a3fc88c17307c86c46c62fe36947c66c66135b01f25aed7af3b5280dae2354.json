@@ -1,0 +1,74 @@
+{
+  "db_name": "SQLite",
+  "query": "select\n  attempt.id as \"id!: String\",\n  attempt.step_id as \"step_id!: String\",\n  attempt.status as \"status!: String\",\n  attempt.worker_id as \"worker_id!: String\",\n  attempt.target_id as \"target_id!: String\",\n  attempt.fencing_token as \"fencing_token!: i64\",\n  attempt.process_id,\n  attempt.process_start_time_ticks,\n  attempt.started_unix_ms as \"started_unix_ms!: i64\",\n  attempt.finished_unix_ms\nfrom step_attempt attempt\njoin workflow_step step on step.id = attempt.step_id\nwhere step.run_id = ?\norder by attempt.started_unix_ms, attempt.id\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "step_id!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "status!: String",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "worker_id!: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "target_id!: String",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "fencing_token!: i64",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "process_id",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "process_start_time_ticks",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "started_unix_ms!: i64",
+        "ordinal": 8,
+        "type_info": "Integer"
+      },
+      {
+        "name": "finished_unix_ms",
+        "ordinal": 9,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true
+    ]
+  },
+  "hash": "49a3fc88c17307c86c46c62fe36947c66c66135b01f25aed7af3b5280dae2354"
+}

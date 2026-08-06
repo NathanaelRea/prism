@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "delete from notification_outbox\nwhere delivery_state not in ('pending', 'dispatching') and observed_unix_ms < ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "7d0228791f760682c69e0df888f710bde90bd28b746c7ab14c3d84d7e66d1771"
+}

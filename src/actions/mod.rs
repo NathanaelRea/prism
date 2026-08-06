@@ -6,7 +6,7 @@ use std::time::Duration;
 use crate::agent::AgentState;
 use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey, AgentSessionWarmupResult};
 use crate::auto_flow::{
-    AutoExecutorDecision, AutoImplementationSource, AutoLaunch, AutoLaunchOptions,
+    AutoExecutorDecision, AutoFlowStore, AutoImplementationSource, AutoLaunch, AutoLaunchOptions,
     AutoRunControlIntent, AutoRunMode, AutoStepKey, AutoStepStatus, PersistedAutoRun,
     apply_auto_run_control, archive_auto_run, load_auto_run, prepare_auto_run_for_resume,
 };
@@ -21,9 +21,9 @@ use crate::observability::append_runtime_message;
 use crate::opencode::{self, OpencodeStatus, load_runtime};
 use crate::plan::{PlanExecution, infer_total_phases, open_plan_mode, select_plan_path};
 use crate::plan_run::{
-    DEFAULT_OUTPUT_LINES_PER_STEP, PlanRunMode, PlanStepStatus, abort_plan_step, archive_plan_run,
-    load_plan_run, load_resumable_plan_run, prepare_plan_run_for_resume, retry_failed_steps,
-    retry_from_step, save_plan_run, skip_plan_step,
+    DEFAULT_OUTPUT_LINES_PER_STEP, PlanRunMode, PlanRunStore, PlanStepStatus, abort_plan_step,
+    archive_plan_run, load_plan_run, retry_failed_steps, retry_from_step, save_plan_run,
+    skip_plan_step,
 };
 use crate::process::{
     ProcessPolicy, command_exists, parse_command_words, run_output_allow_failure,
@@ -79,8 +79,8 @@ fn reject_claimed_control(
     control: &str,
 ) -> Result<(), String> {
     let workflow = crate::execution::WorkflowIdentity::new(kind, run_id);
-    let state = crate::observability::with_writable_db(repo, |conn| {
-        crate::execution::dispatch_state(conn, &workflow)
+    let state = crate::observability::with_writable_db(repo, |path| {
+        crate::execution::dispatch_state(path, &workflow)
     })?;
     if state == Some(crate::execution::DispatchState::Claimed) {
         return Err(format!(

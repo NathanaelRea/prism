@@ -562,38 +562,12 @@ impl GitLabAdapter {
         )?;
         let iid = required_iid(&request.id, RemoteOperation::MergeChangeRequest)?;
         let fields = merge_fields(request)?;
-        let accepted: GitLabMergeRequest = match self.api_json(
+        let accepted: GitLabMergeRequest = self.api_json(
             RemoteOperation::MergeChangeRequest,
             &format!("{}/merge", self.merge_request_endpoint(iid)),
             "PUT",
             &fields,
-        ) {
-            Ok(accepted) => accepted,
-            Err(mutation_error) => {
-                let observed = self
-                    .observe_change_request_for(&request.id, RemoteOperation::MergeChangeRequest)
-                    .map_err(|_| mutation_error)?;
-                if observed.change_request.target_repository != request.target_repository
-                    || observed.change_request.target_branch != request.target_branch
-                {
-                    return Err(remote_error(
-                        RemoteOperation::MergeChangeRequest,
-                        RemoteErrorClass::Conflict,
-                        Retryability::NotRetryable,
-                        "merge request target changed during merge reconciliation",
-                    ));
-                }
-                ensure_head(
-                    &observed.change_request.head_sha,
-                    &request.expected_source_sha,
-                    RemoteOperation::MergeChangeRequest,
-                )?;
-                return Ok(MergeMutationResult::from_summary(
-                    observed,
-                    "merge mutation returned an error; provider state was reconciled",
-                ));
-            }
-        };
+        )?;
         if accepted.id.to_string() != request.id.native_id().as_str()
             || accepted.iid != iid
             || accepted.sha != request.expected_source_sha
@@ -603,21 +577,8 @@ impl GitLabAdapter {
                 "GitLab merge response does not match the guarded merge request",
             ));
         }
-        let mut observed = match self
-            .observe_change_request_for(&request.id, RemoteOperation::MergeChangeRequest)
-        {
-            Ok(observed) => observed,
-            Err(error) => {
-                return Ok(MergeMutationResult {
-                    outcome: super::MergeMutationOutcome::Uncertain,
-                    native_state: format!(
-                        "{}; post-mutation observation failed: {error}",
-                        accepted.state
-                    ),
-                    summary: before,
-                });
-            }
-        };
+        let mut observed =
+            self.observe_change_request_for(&request.id, RemoteOperation::MergeChangeRequest)?;
         if observed.change_request.target_repository != request.target_repository
             || observed.change_request.target_branch != request.target_branch
         {
@@ -1954,14 +1915,10 @@ fn merge_fields(request: &GuardedMerge) -> Result<Vec<(&'static str, String)>, R
             ));
         }
     };
-    let mut fields = vec![
+    Ok(vec![
         ("sha", request.expected_source_sha.clone()),
         ("squash", squash.to_string()),
-    ];
-    if request.submission_mode == super::MergeSubmissionMode::NativeQueue {
-        fields.push(("auto_merge", "true".to_string()));
-    }
-    Ok(fields)
+    ])
 }
 
 fn deduplicate_checks(checks: &mut Vec<CheckContext>) {
@@ -2610,7 +2567,9 @@ struct GitLabBranchReference {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{HostIdentity, HostProfile, RemoteBase, RemoteDiscovery, WebScheme};
+    use super::super::{
+        HostIdentity, HostProfile, NativeMergeGuard, RemoteBase, RemoteDiscovery, WebScheme,
+    };
     use super::*;
 
     #[test]
@@ -3386,7 +3345,7 @@ mod tests {
             target_branch: "main".to_string(),
             expected_source_sha: "0123456789abcdef0123456789abcdef01234567".to_string(),
             method: MergeMethod::Squash,
-            submission_mode: super::super::MergeSubmissionMode::NativeQueue,
+            native_guard: Some(NativeMergeGuard::new("guard").unwrap()),
         };
         let fields = merge_fields(&request).unwrap();
         let args = api_args(
@@ -3403,10 +3362,6 @@ mod tests {
                 "sha=0123456789abcdef0123456789abcdef01234567",
             ]
         }));
-        assert!(
-            args.windows(2)
-                .any(|pair| { pair == ["--raw-field", "auto_merge=true"] })
-        );
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--raw-field", "squash=true"])
@@ -3757,7 +3712,7 @@ exit 17
             target_branch: "main".to_string(),
             expected_source_sha: expected_source_sha.to_string(),
             method: MergeMethod::Merge,
-            submission_mode: super::super::MergeSubmissionMode::Immediate,
+            native_guard: None,
         };
         let stale = adapter
             .merge_change_request(&merge_request("0000000000000000000000000000000000000000"))

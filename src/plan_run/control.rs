@@ -33,16 +33,13 @@ pub struct PlanRunControlOutcome {
 }
 
 pub fn apply_plan_run_control(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     run_id: &str,
     intent: PlanRunControlIntent,
 ) -> Result<PlanRunControlOutcome, String> {
     let mut persisted =
         load_plan_run(conn, run_id)?.ok_or_else(|| format!("plan run not found: {run_id}"))?;
     let mut warnings = Vec::new();
-    if intent == PlanRunControlIntent::Resume {
-        require_active_plan_run(conn, &persisted.run)?;
-    }
     let (effect, executor) = match intent {
         PlanRunControlIntent::Pause => {
             request_plan_run_pause(conn, &mut persisted)?;
@@ -97,11 +94,10 @@ pub(super) enum RecordedProcessState {
 }
 
 pub fn prepare_plan_run_for_resume(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     persisted: &mut PersistedPlanRun,
     max_output_lines_per_step: usize,
 ) -> Result<bool, String> {
-    require_active_plan_run(conn, &persisted.run)?;
     let mut changed = false;
     let mut has_live_child = false;
     for step in &mut persisted.steps {
@@ -135,7 +131,7 @@ pub fn prepare_plan_run_for_resume(
             &message,
             max_output_lines_per_step,
         )?;
-        save_step_with_conn(conn, step)?;
+        save_step_with_store(conn, step)?;
         changed = true;
     }
     if has_live_child {
@@ -145,12 +141,12 @@ pub fn prepare_plan_run_for_resume(
         persisted.run.pause_requested = false;
         persisted.run.status = persisted.aggregate_status();
         persisted.run.updated_unix_ms = unix_ms();
-        save_run_with_conn(conn, &persisted.run)?;
+        save_run_with_store(conn, &persisted.run)?;
     }
     Ok(true)
 }
 
-pub fn abort_plan_step(conn: &rusqlite::Connection, step: &mut PlanStepRun) -> Result<(), String> {
+pub fn abort_plan_step(conn: &PlanRunStore, step: &mut PlanStepRun) -> Result<(), String> {
     let mut errors = Vec::new();
     if step.session.id.is_some()
         && let Err(error) = crate::harness::cancel_native_session(&step.session)
@@ -172,7 +168,7 @@ pub fn abort_plan_step(conn: &rusqlite::Connection, step: &mut PlanStepRun) -> R
     } else {
         Some(format!("aborted with errors: {}", errors.join("; ")))
     };
-    save_step_with_conn(conn, step)?;
+    save_step_with_store(conn, step)?;
     if errors.is_empty() {
         Ok(())
     } else {
@@ -180,10 +176,7 @@ pub fn abort_plan_step(conn: &rusqlite::Connection, step: &mut PlanStepRun) -> R
     }
 }
 
-pub fn abort_plan_run(
-    conn: &rusqlite::Connection,
-    persisted: &mut PersistedPlanRun,
-) -> Result<(), String> {
+pub fn abort_plan_run(conn: &PlanRunStore, persisted: &mut PersistedPlanRun) -> Result<(), String> {
     let mut errors = Vec::new();
     for step in &mut persisted.steps {
         match step.status {
@@ -215,11 +208,10 @@ pub fn abort_plan_run(
 }
 
 pub fn reconcile_stale_plan_run(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     persisted: &mut PersistedPlanRun,
     max_output_lines_per_step: usize,
 ) -> Result<bool, String> {
-    require_active_plan_run(conn, &persisted.run)?;
     reconcile_stale_plan_run_with_observer(
         conn,
         persisted,
@@ -229,7 +221,7 @@ pub fn reconcile_stale_plan_run(
 }
 
 pub(super) fn reconcile_stale_plan_run_with_observer(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     persisted: &mut PersistedPlanRun,
     max_output_lines_per_step: usize,
     mut observe: impl FnMut(Option<u32>, Option<u64>) -> Result<RecordedProcessState, String>,
@@ -318,14 +310,14 @@ pub(super) fn reconcile_stale_plan_run_with_observer(
     {
         persisted.run.status = persisted.aggregate_status();
         persisted.run.updated_unix_ms = unix_ms();
-        save_run_with_conn(conn, &persisted.run)?;
+        save_run_with_store(conn, &persisted.run)?;
         changed = true;
     }
     Ok(changed)
 }
 
 pub(super) fn mark_stale_step_failed(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     step: &mut PlanStepRun,
     message: &str,
     max_output_lines_per_step: usize,
@@ -341,7 +333,7 @@ pub(super) fn mark_stale_step_failed(
         message,
         max_output_lines_per_step,
     )?;
-    save_step_with_conn(conn, step)
+    save_step_with_store(conn, step)
 }
 
 pub(super) fn recorded_process_state(
@@ -396,7 +388,7 @@ fn terminate_recorded_process(
 }
 
 pub(super) fn append_unique_system_output(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     step: &PlanStepRun,
     kind: PlanOutputKind,
     text: &str,
@@ -410,23 +402,14 @@ pub(super) fn append_unique_system_output(
 }
 
 pub(super) fn output_line_exists(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     run_id: &str,
     step: usize,
     kind: PlanOutputKind,
     text: &str,
 ) -> Result<bool, String> {
-    let exists: i64 = conn
-        .query_row(
-            "select exists(
-               select 1 from plan_output_line
-               where run_id = ?1 and step = ?2 and kind = ?3 and text = ?4
-             )",
-            params![run_id, usize_to_i64(step), kind.as_str(), text],
-            |row| row.get(0),
-        )
-        .map_err(|error| format!("check plan output line existence: {error}"))?;
-    Ok(exists != 0)
+    crate::persistence::plan_run::output_exists(conn.path(), run_id, step, kind, text)
+        .map_err(|error| format!("check plan output line existence: {error}"))
 }
 
 pub(super) fn append_stale_reconciliation_log(
@@ -455,10 +438,9 @@ pub(super) fn append_stale_reconciliation_log(
 }
 
 pub fn retry_failed_steps(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     persisted: &mut PersistedPlanRun,
 ) -> Result<(), String> {
-    require_active_plan_run(conn, &persisted.run)?;
     let mut first = None;
     for step in &mut persisted.steps {
         if matches!(
@@ -467,7 +449,6 @@ pub fn retry_failed_steps(
         ) {
             reset_step_for_retry(step);
             first.get_or_insert(step.step);
-            save_step_with_conn(conn, step)?;
         }
     }
     if first.is_none() {
@@ -476,15 +457,14 @@ pub fn retry_failed_steps(
     persisted.run.selected_step = first.unwrap_or(persisted.run.selected_step);
     persisted.run.status = persisted.aggregate_status();
     persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)
+    save_plan_run(conn, persisted)
 }
 
 pub fn retry_from_step(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     persisted: &mut PersistedPlanRun,
     selected_step: usize,
 ) -> Result<(), String> {
-    require_active_plan_run(conn, &persisted.run)?;
     let mut found = false;
     for step in &mut persisted.steps {
         if step.step < selected_step {
@@ -492,7 +472,6 @@ pub fn retry_from_step(
         }
         found = true;
         reset_step_for_retry(step);
-        save_step_with_conn(conn, step)?;
     }
     if !found {
         return Err(format!("plan phase not found: {selected_step}"));
@@ -500,11 +479,11 @@ pub fn retry_from_step(
     persisted.run.selected_step = selected_step;
     persisted.run.status = persisted.aggregate_status();
     persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)
+    save_plan_run(conn, persisted)
 }
 
 pub fn skip_plan_step(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     persisted: &mut PersistedPlanRun,
     selected_step: usize,
 ) -> Result<(), String> {
@@ -531,14 +510,14 @@ pub fn skip_plan_step(
         "phase skipped",
         DEFAULT_OUTPUT_LINES_PER_STEP,
     )?;
-    save_step_with_conn(conn, step)?;
+    save_step_with_store(conn, step)?;
     persisted.run.status = persisted.aggregate_status();
     persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)
+    save_run_with_store(conn, &persisted.run)
 }
 
 pub fn request_plan_run_pause(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     persisted: &mut PersistedPlanRun,
 ) -> Result<(), String> {
     if matches!(
@@ -557,38 +536,24 @@ pub fn request_plan_run_pause(
         persisted.run.status = PlanRunStatus::Paused;
     }
     persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)
+    save_run_with_store(conn, &persisted.run)
 }
 
 pub fn resume_paused_plan_run(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     persisted: &mut PersistedPlanRun,
 ) -> Result<(), String> {
-    require_active_plan_run(conn, &persisted.run)?;
     if !persisted.run.pause_requested && persisted.run.status != PlanRunStatus::Paused {
         return Err("plan run is not paused".to_string());
     }
     persisted.run.pause_requested = false;
     persisted.run.status = persisted.aggregate_status();
     persisted.run.updated_unix_ms = unix_ms();
-    save_run_with_conn(conn, &persisted.run)
-}
-
-fn require_active_plan_run(conn: &rusqlite::Connection, run: &PlanRun) -> Result<(), String> {
-    run.worktree_session_id.as_deref().ok_or_else(|| {
-        "plan run has no Worktree Session identity; legacy runs cannot execute".to_string()
-    })?;
-    crate::execution::require_active_worktree_session(
-        conn,
-        &crate::execution::WorkflowIdentity::new(
-            crate::execution::WorkflowKind::Plan,
-            run.id.clone(),
-        ),
-    )
+    save_run_with_store(conn, &persisted.run)
 }
 
 pub fn archive_plan_run(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     persisted: &mut PersistedPlanRun,
 ) -> Result<(), String> {
     if matches!(
@@ -600,34 +565,31 @@ pub fn archive_plan_run(
     let now = unix_ms();
     persisted.run.archived_unix_ms = Some(now);
     persisted.run.updated_unix_ms = now;
-    save_run_with_conn(conn, &persisted.run)
+    save_run_with_store(conn, &persisted.run)
 }
 
 pub fn cleanup_stale_archived_plan_runs(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     retention_ms: u64,
 ) -> Result<usize, String> {
+    conn.validate_claim()?;
     let cutoff = unix_ms().saturating_sub(retention_ms);
-    conn.execute(
-        "delete from plan_run
-         where archived_unix_ms is not null and archived_unix_ms <= ?1",
-        params![u64_to_i64(cutoff)],
-    )
-    .map_err(|error| format!("cleanup archived plan runs: {error}"))
+    crate::persistence::plan_run::cleanup(conn.path(), cutoff)
+        .map_err(|error| format!("cleanup archived plan runs: {error}"))
 }
 
 pub(super) fn reload_pause_request(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     persisted: &mut PersistedPlanRun,
 ) -> Result<bool, String> {
-    let Some(run) = load_run_with_conn(conn, &persisted.run.id)? else {
+    let Some(run) = load_run_with_store(conn, &persisted.run.id)? else {
         return Ok(false);
     };
     persisted.run.pause_requested = run.pause_requested;
     if run.pause_requested || run.status == PlanRunStatus::Paused {
         persisted.run.status = PlanRunStatus::Paused;
         persisted.run.updated_unix_ms = unix_ms();
-        save_run_with_conn(conn, &persisted.run)?;
+        save_run_with_store(conn, &persisted.run)?;
         return Ok(true);
     }
     Ok(false)

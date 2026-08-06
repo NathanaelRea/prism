@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select exists(\n  select 1 from plan_output_line where run_id = ? and step = ? and kind = ? and text = ?\n) as \"exists!: bool\"\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "exists!: bool",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "cec646ae8cdf7521299c1259a001fd3f1a1d7dcceb75db4da72c6d5cde05c353"
+}

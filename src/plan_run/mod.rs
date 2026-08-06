@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -7,7 +8,6 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 
 use crate::opencode::{OpencodeState, OpencodeStatus};
@@ -53,7 +53,7 @@ pub use plugin::{
     DEFAULT_PLAN_AGENT_VARIANT, PlanExecutorConfig, PlanPluginConfig, prepare_plan_plugin_config,
 };
 pub use storage::{
-    load_plan_run, load_recent_plan_runs_for_repo, load_resumable_plan_run, migrate_schema,
+    PlanRunStore, load_plan_run, load_recent_plan_runs_for_repo, load_resumable_plan_run,
     save_plan_run, save_plan_step, submit_plan_run,
 };
 

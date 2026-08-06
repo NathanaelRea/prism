@@ -1,5 +1,8 @@
+pub mod bundled;
 pub(crate) mod ci;
+pub mod engine;
 pub(crate) mod execution;
+pub(crate) mod operations;
 pub(crate) mod plan;
 pub(crate) mod review;
 pub(crate) mod verify;

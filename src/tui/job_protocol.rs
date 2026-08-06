@@ -7,7 +7,7 @@ use crate::agent_session::{AgentSessionSlot, AgentSessionWarmupKey};
 use crate::auto_flow::{AutoOutputLine, PersistedAutoRun};
 use crate::config::Config;
 use crate::opencode::{OpencodeEvent, OpencodeStatus};
-use crate::plan_run::{PersistedPlanRun, PlanOutputLine};
+use crate::plan_run::PlanOutputLine;
 use crate::remote::{PrCache, PrSummary};
 use crate::repo::Repository;
 use crate::session::{Session, WorktreeRepositoryKey, WorktreeSessionKey};
@@ -86,9 +86,6 @@ pub(crate) enum DashboardOutputKey {
 
 pub(crate) struct WorkflowPollSnapshot {
     pub(super) repository: RepositorySnapshot,
-    pub(super) plan_runs: Result<Vec<PersistedPlanRun>, String>,
-    pub(super) auto_runs: Result<Vec<PersistedAutoRun>, String>,
-    pub(super) linked_plan_runs: Result<Vec<PersistedPlanRun>, String>,
     pub(super) worker_health: Result<(), String>,
 }
 

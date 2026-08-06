@@ -2,10 +2,7 @@ use crate::args::{
     self, AgentCommand, Args, AutoCommand, AutoCommandSource, CommandKind, ConfigCommand,
     DaemonCommand, DbCommand, DebugCommand, InspectOptions, StatusOptions, WorkerCommand,
 };
-use crate::auto_flow::{
-    AutoImplementationSource, AutoLaunch, AutoLaunchOptions, AutoRunMode,
-    load_recent_active_runs_for_repo, prepare_auto_run_for_resume, submit_auto_run,
-};
+use crate::auto_flow::{AutoImplementationSource, AutoLaunch, AutoLaunchOptions, AutoRunMode};
 use crate::config::Config;
 use crate::git::{current_branch_name, selected_dirty};
 use crate::observability::{self, LogLevel, ObserverOptions};
@@ -63,8 +60,7 @@ pub fn run() -> Result<(), String> {
         }
         CommandKind::Config(command) => {
             let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
-            run_config_command(command, &repo, &config);
-            Ok(())
+            run_config_command(command, &repo, &config)
         }
         CommandKind::Doctor => {
             let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;
@@ -118,7 +114,11 @@ pub fn run() -> Result<(), String> {
     result
 }
 
-fn run_config_command(command: ConfigCommand, repo: &Repository, config: &Config) {
+fn run_config_command(
+    command: ConfigCommand,
+    repo: &Repository,
+    config: &Config,
+) -> Result<(), String> {
     match command {
         ConfigCommand::Show => config::print_config(repo, config),
         ConfigCommand::Example => print!("{}", config::config_example()),
@@ -129,6 +129,7 @@ fn run_config_command(command: ConfigCommand, repo: &Repository, config: &Config
             println!("schema_url = {}", config::CONFIG_SCHEMA_URL);
         }
     }
+    Ok(())
 }
 
 fn run_agent_command(
@@ -651,14 +652,21 @@ fn load_single_repo_context(
 }
 
 fn warn_pending_recovery(repo: &Repository) {
-    let count = observability::with_writable_db(repo, |conn| {
-        conn.query_row(
-            "select count(*) from workflow_execution where dispatch_state = 'recovery_pending'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| format!("count interrupted workflows: {error}"))
-    });
+    let count = workspace_state(Some(&repo.root))
+        .and_then(|state| {
+            state.inspect(InspectRequest {
+                include_hidden: true,
+                include_terminal: true,
+            })
+        })
+        .map(|snapshot| {
+            snapshot
+                .repositories
+                .iter()
+                .flat_map(|repo| &repo.workflows)
+                .filter(|workflow| workflow.dispatch.state.as_deref() == Some("recovery_pending"))
+                .count()
+        });
     if let Ok(count) = count
         && count > 0
     {
@@ -818,62 +826,6 @@ fn run_auto_command(
     mut command: AutoCommand,
 ) -> Result<(), String> {
     workspace::ensure_repo_entry(&repo.root)?;
-    let existing = observability::with_writable_db(repo, |conn| {
-        load_recent_active_runs_for_repo(conn, &repo.root, 1)
-    })?;
-    if let Some(mut run) = existing.into_iter().next() {
-        let workflow = crate::execution::WorkflowIdentity::new(
-            crate::execution::WorkflowKind::Auto,
-            &run.run.id,
-        );
-        let dispatch = observability::with_writable_db(repo, |conn| {
-            crate::execution::dispatch_state(conn, &workflow)
-        })?;
-        if matches!(
-            dispatch,
-            Some(crate::execution::DispatchState::RecoveryPending)
-        ) {
-            return Err(format!(
-                "Auto Flow run {} was interrupted; open Prism to choose whether to resume it",
-                run.run.id
-            ));
-        }
-        if matches!(
-            dispatch,
-            Some(
-                crate::execution::DispatchState::Queued | crate::execution::DispatchState::Claimed
-            )
-        ) {
-            println!(
-                "auto_run_id = {}\nstatus = {:?}\nworktree = {}",
-                run.run.id,
-                run.run.status,
-                run.run.worktree_path.display()
-            );
-            return Ok(());
-        }
-        let should_execute = observability::with_writable_db(repo, |conn| {
-            prepare_auto_run_for_resume(
-                conn,
-                &mut run,
-                crate::plan_run::DEFAULT_OUTPUT_LINES_PER_STEP,
-            )
-        })?;
-        if should_execute {
-            crate::worker::ensure_running()?;
-            observability::with_writable_db(repo, |conn| {
-                crate::execution::enqueue(conn, &workflow)
-            })?;
-            crate::worker::wake()?;
-        }
-        println!(
-            "auto_run_id = {}\nstatus = {:?}\nworktree = {}",
-            run.run.id,
-            run.run.status,
-            run.run.worktree_path.display()
-        );
-        return Ok(());
-    }
     if !config.selected_harness()?.describe().headless {
         return Err(format!(
             "harness '{}' does not support managed Auto Flow execution; configure headless_command and headless_prompt_transport",
@@ -889,31 +841,25 @@ fn run_auto_command(
     if selected_dirty(&repo.root, config)? {
         return Err("Auto Flow requires a clean worktree at launch".to_string());
     }
-    let launch_options = auto_launch_options_for_command(repo, branch.clone(), command)?;
-    let worktree_session_id =
-        crate::session::ensure_worktree_session_identity(repo, &repo.root, &branch)?;
-    let launch = AutoLaunch::with_options(&repo.root, &repo.root, launch_options)?
-        .with_harness(
-            config.default_harness.clone(),
-            config.harness_adapter(&config.default_harness)?,
-        )
-        .with_worktree_session_id(worktree_session_id);
-    let mut persisted = launch.create_run();
-    if persisted.run.implementation_source == AutoImplementationSource::ExistingPullRequest {
-        crate::auto_flow::stabilization_observe::adopt_existing_pull_request(
-            repo,
-            config,
-            &mut persisted,
-        )?;
-    }
-    crate::worker::ensure_running()?;
-    observability::with_writable_db(repo, |conn| submit_auto_run(conn, &mut persisted))?;
-    crate::worker::wake()?;
+    let launch_options = auto_launch_options_for_command(repo, branch, command)?;
+    let launch = AutoLaunch::with_options(&repo.root, &repo.root, launch_options)?.with_harness(
+        config.default_harness.clone(),
+        config.harness_adapter(&config.default_harness)?,
+    );
+    let run_id =
+        crate::worker::launch_bundled_coding(crate::workflow::bundled::BundledCodingLaunch {
+            repository: launch.repo_root.clone(),
+            worktree_path: launch.worktree_path.clone(),
+            task: launch.initial_prompt.clone(),
+            plan_path: launch.plan_path.clone(),
+            draft_plan: launch.implementation_source
+                == crate::auto_flow::AutoImplementationSource::DraftPlan,
+            harness_id: config.default_harness.clone(),
+            variant: Some(launch.variant.clone()),
+        })?;
     println!(
-        "auto_run_id = {}\nstatus = {:?}\nworktree = {}",
-        persisted.run.id,
-        persisted.run.status,
-        persisted.run.worktree_path.display()
+        "workflow_run_id = {run_id}\nstatus = queued\nworktree = {}",
+        launch.worktree_path.display()
     );
     Ok(())
 }
@@ -1002,16 +948,6 @@ fn auto_launch_options_for_command(
                 initial_prompt: initial_prompt.to_string(),
             })
         }
-        AutoCommandSource::ExistingPullRequest => Ok(AutoLaunchOptions {
-            branch: branch.clone(),
-            mode: AutoRunMode::Standard,
-            implementation_source: AutoImplementationSource::ExistingPullRequest,
-            plan_path: None,
-            plan_run_mode: PlanRunMode::Sequential,
-            variant: "existing-pr".to_string(),
-            agent_profile: None,
-            initial_prompt: format!("Stabilize existing pull request for branch {branch}"),
-        }),
     }
 }
 
@@ -1035,6 +971,18 @@ fn discover_workspace_sessions(repos: &[ManagedRepo]) -> Result<Vec<session::Ses
         all.extend(sessions);
     }
     Ok(all)
+}
+
+fn control_plane_debug_metrics() -> Result<Vec<crate::ControlPlaneMetric>, String> {
+    crate::async_runtime::block_on(async {
+        crate::WorkflowOperations::open_default()
+            .await
+            .map_err(|error| error.to_string())?
+            .control_plane_metrics()
+            .await
+            .map_err(|error| error.to_string())
+    })
+    .map_err(|error| format!("run workflow debug operation: {error}"))?
 }
 
 fn run_debug_command(
@@ -1138,6 +1086,23 @@ fn run_debug_command(
                 }
                 Err(error) => println!("wal_checkpoint_passive_error = {error}"),
             }
+            match control_plane_debug_metrics() {
+                Ok(metrics) => {
+                    println!(
+                        "workflow_database = {}",
+                        crate::util::prism_config_dir()
+                            .join("workflow.db")
+                            .display()
+                    );
+                    for metric in metrics {
+                        println!(
+                            "control_plane.{} = {} time_unix_ms={} labels={}",
+                            metric.name, metric.value, metric.time_unix_ms, metric.labels_json
+                        );
+                    }
+                }
+                Err(error) => println!("control_plane_error = {error}"),
+            }
             Ok(())
         }
         DebugCommand::Logs => {
@@ -1214,6 +1179,9 @@ fn run_db_command(command: DbCommand, repo: &Repository) -> Result<(), String> {
         DbCommand::Path => {
             println!("{}", observability::db_path(repo).display());
             Ok(())
+        }
+        DbCommand::Query(query) if query.trim().is_empty() => {
+            Err("database query must not be empty".to_string())
         }
         DbCommand::Query(query) => observability::run_readonly_query(repo, &query),
     }

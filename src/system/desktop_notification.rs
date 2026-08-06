@@ -402,7 +402,6 @@ mod tests {
     fn key(repo: &str, branch: &str) -> WorktreeSessionKey {
         WorktreeSessionKey {
             repository: WorktreeRepositoryKey::new(format!("/tmp/{repo}").into()),
-            worktree_session_id: format!("test-{repo}-{branch}"),
             path: format!("/tmp/{repo}/{branch}").into(),
             branch: branch.to_string(),
             incarnation: "1".to_string(),

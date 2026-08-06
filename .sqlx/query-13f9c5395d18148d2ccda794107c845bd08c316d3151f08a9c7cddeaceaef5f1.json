@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "select\n  run_id as \"run_id!: String\",\n  id as \"source_event_id!: i64\",\n  time_unix_ms as \"time_unix_ms!: i64\",\n  kind as \"kind!: String\",\n  data_json as \"data_json!: String\"\nfrom auto_event\norder by run_id, id\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "run_id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "source_event_id!: i64",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "time_unix_ms!: i64",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "kind!: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "data_json!: String",
+        "ordinal": 4,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "13f9c5395d18148d2ccda794107c845bd08c316d3151f08a9c7cddeaceaef5f1"
+}

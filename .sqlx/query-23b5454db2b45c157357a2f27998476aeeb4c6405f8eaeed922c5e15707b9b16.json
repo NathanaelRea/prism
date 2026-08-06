@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "select p.status, p.pause_requested, e.dispatch_state\nfrom plan_run p\njoin workflow_execution e on e.run_id = p.id\nwhere p.id = 'plan-control-12345678'\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "status",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "pause_requested",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "dispatch_state",
+        "ordinal": 2,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "23b5454db2b45c157357a2f27998476aeeb4c6405f8eaeed922c5e15707b9b16"
+}

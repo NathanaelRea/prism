@@ -98,11 +98,6 @@ pub(crate) enum DialogModel {
         prompt: String,
         input: String,
     },
-    TextArea {
-        title: String,
-        prompt: String,
-        input: String,
-    },
     Choice {
         choices: ChoiceList,
     },

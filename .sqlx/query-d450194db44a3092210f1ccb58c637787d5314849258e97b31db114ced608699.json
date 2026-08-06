@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into plan_step_run (\n  run_id, step, prompt, status, execution_state, session_endpoint, session_id,\n  agent_variant, execution_process_id, started_unix_ms, finished_unix_ms, exit_code,\n  latest_message, active_tool, todos_json, summary, error, session_adapter_id,\n  execution_process_start_time_ticks\n) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\non conflict(run_id, step) do update set\n  prompt = excluded.prompt,\n  status = excluded.status,\n  execution_state = excluded.execution_state,\n  session_endpoint = excluded.session_endpoint,\n  session_id = excluded.session_id,\n  agent_variant = excluded.agent_variant,\n  execution_process_id = excluded.execution_process_id,\n  started_unix_ms = excluded.started_unix_ms,\n  finished_unix_ms = excluded.finished_unix_ms,\n  exit_code = excluded.exit_code,\n  latest_message = excluded.latest_message,\n  active_tool = excluded.active_tool,\n  todos_json = excluded.todos_json,\n  summary = excluded.summary,\n  error = excluded.error,\n  session_adapter_id = excluded.session_adapter_id,\n  execution_process_start_time_ticks = excluded.execution_process_start_time_ticks\nwhere plan_step_run.status != 'aborted' or excluded.status = 'queued'\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 19
+    },
+    "nullable": []
+  },
+  "hash": "d450194db44a3092210f1ccb58c637787d5314849258e97b31db114ced608699"
+}

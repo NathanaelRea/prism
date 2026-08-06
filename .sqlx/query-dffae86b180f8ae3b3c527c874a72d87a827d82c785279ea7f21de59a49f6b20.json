@@ -1,0 +1,116 @@
+{
+  "db_name": "SQLite",
+  "query": "select id as \"id!\", harness_id, adapter_id, repo_root, scope_path, plan_path, plan_display,\n  step_name, start_step, total_steps, mode, status, pause_requested, selected_step,\n  created_unix_ms, updated_unix_ms, archived_unix_ms\nfrom plan_run\nwhere id = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "harness_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "adapter_id",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "repo_root",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "scope_path",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "plan_path",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "plan_display",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "step_name",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "start_step",
+        "ordinal": 8,
+        "type_info": "Integer"
+      },
+      {
+        "name": "total_steps",
+        "ordinal": 9,
+        "type_info": "Integer"
+      },
+      {
+        "name": "mode",
+        "ordinal": 10,
+        "type_info": "Text"
+      },
+      {
+        "name": "status",
+        "ordinal": 11,
+        "type_info": "Text"
+      },
+      {
+        "name": "pause_requested",
+        "ordinal": 12,
+        "type_info": "Integer"
+      },
+      {
+        "name": "selected_step",
+        "ordinal": 13,
+        "type_info": "Integer"
+      },
+      {
+        "name": "created_unix_ms",
+        "ordinal": 14,
+        "type_info": "Integer"
+      },
+      {
+        "name": "updated_unix_ms",
+        "ordinal": 15,
+        "type_info": "Integer"
+      },
+      {
+        "name": "archived_unix_ms",
+        "ordinal": 16,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "dffae86b180f8ae3b3c527c874a72d87a827d82c785279ea7f21de59a49f6b20"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "delete from notification_session\nwhere worktree_path = ? and branch = ? and incarnation = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "9847d9917216b5da1dad0b1983e91e093b1a656832dc0be2b73cc664f16e7aeb"
+}

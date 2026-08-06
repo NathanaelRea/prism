@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "delete from agent_state where branch = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "9d6e5933fef47f06a978bc3028cd38d3faa1b8c1000bc4263c2b5a615b11ca20"
+}

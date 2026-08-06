@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agent::AgentState;
@@ -56,7 +56,6 @@ pub(super) fn test_auto_run(
             repo_root: "/repo-one".to_string(),
             worktree_path: PathBuf::from(worktree_path),
             worktree_incarnation: None,
-            worktree_session_id: Some(test_worktree_session_id(worktree_path)),
             branch: "feature".to_string(),
             mode: AutoRunMode::Standard,
             implementation_source: AutoImplementationSource::Prompt,
@@ -93,7 +92,6 @@ pub(super) fn test_plan_run(id: &str, scope_path: &str) -> PersistedPlanRun {
             id: id.to_string(),
             repo_root: "/repo-one".to_string(),
             scope_path: PathBuf::from(scope_path),
-            worktree_session_id: Some(test_worktree_session_id(scope_path)),
             plan_path: PathBuf::from("plan.md"),
             plan_display: "plan.md".to_string(),
             step_name: "phase".to_string(),
@@ -109,15 +107,6 @@ pub(super) fn test_plan_run(id: &str, scope_path: &str) -> PersistedPlanRun {
         },
         steps: Vec::new(),
     }
-}
-
-fn test_worktree_session_id(path: &str) -> String {
-    let branch = Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("worktree");
-    let repo_index = usize::from(path.starts_with("/repo-two/"));
-    format!("test-{repo_index}-{branch}")
 }
 
 pub(super) fn test_plan_run_with_steps(
@@ -162,7 +151,6 @@ pub(super) fn test_session(repo_index: usize, root: &str, branch: &str) -> Sessi
         repo_label: format!("repo-{repo_index}"),
         repo_key: None,
         path: path.clone(),
-        worktree_session_id: format!("test-{repo_index}-{branch}"),
         incarnation: String::new(),
         path_display: path.display().to_string(),
         branch: branch.to_string(),

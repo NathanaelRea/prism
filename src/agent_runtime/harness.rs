@@ -664,7 +664,6 @@ impl<'a> Harness<'a> {
         config: &crate::config::Config,
         branch: &str,
         worktree: &Path,
-        worktree_session_id: &str,
     ) -> Result<Option<crate::opencode::OpencodeRuntime>, String> {
         if self.config.adapter != "opencode" {
             return Ok(None);
@@ -674,14 +673,8 @@ impl<'a> Harness<'a> {
             .interactive_command
             .first()
             .ok_or_else(|| format!("harness '{}' has no program", self.id))?;
-        crate::opencode::ensure_opencode_server_for_worktree_session_with_program(
-            repo,
-            config,
-            &self.id,
-            branch,
-            worktree,
-            worktree_session_id,
-            program,
+        crate::opencode::ensure_opencode_server_with_program(
+            repo, config, &self.id, branch, worktree, program,
         )
         .map(Some)
     }
@@ -692,7 +685,6 @@ impl<'a> Harness<'a> {
         config: &crate::config::Config,
         branch: &str,
         worktree: &Path,
-        worktree_session_id: &str,
     ) -> Result<Option<crate::opencode::OpencodeRuntime>, String> {
         if self.config.adapter != "opencode" {
             return Ok(None);
@@ -703,13 +695,7 @@ impl<'a> Harness<'a> {
             .first()
             .ok_or_else(|| format!("harness '{}' has no program", self.id))?;
         crate::opencode::ensure_opencode_session_with_program(
-            repo,
-            config,
-            &self.id,
-            branch,
-            worktree,
-            worktree_session_id,
-            program,
+            repo, config, &self.id, branch, worktree, program,
         )
         .map(Some)
     }

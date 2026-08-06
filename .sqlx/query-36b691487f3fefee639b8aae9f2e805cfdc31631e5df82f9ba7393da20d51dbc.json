@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select dispatch_state as \"dispatch_state!\"\nfrom workflow_execution where workflow_kind = ? and run_id = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "dispatch_state!",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "36b691487f3fefee639b8aae9f2e805cfdc31631e5df82f9ba7393da20d51dbc"
+}

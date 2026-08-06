@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into hidden_session (branch, hidden_unix_ms)\nvalues (?, ?)\non conflict(branch) do update set hidden_unix_ms = excluded.hidden_unix_ms\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "1884ea74050782b7027c17587952b5fbcdd76c536c314b808f0d38198e050986"
+}

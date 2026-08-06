@@ -8,8 +8,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use rusqlite::params;
-
 use crate::repo::Repository;
 
 const MARKER_VERSION: u32 = 1;
@@ -127,7 +125,8 @@ fn begin_new(repo: &Repository, version: &str) -> Result<NewRun, String> {
 
     // Opening here initializes or validates storage before the process marker is
     // published. No normal domain operation can run until begin() returns.
-    let conn = crate::storage::open_writable(&db_path).map_err(|error| error.to_string())?;
+    let store = crate::persistence::observability::ObservabilityStore::open(&db_path)
+        .map_err(|error| error.to_string())?;
     let run_id = new_run_id();
     let marker_path = marker_dir.join(format!("{run_id}.{MARKER_SUFFIX}"));
     let mut marker = create_marker(&marker_path)?;
@@ -143,36 +142,26 @@ fn begin_new(repo: &Repository, version: &str) -> Result<NewRun, String> {
 
     let started = now_ms();
     let transaction = crate::flight_recorder::TransactionTrace::begin("run_marker.begin");
-    let transaction_result = (|| -> rusqlite::Result<()> {
-        conn.execute_batch("begin immediate")?;
-        for stale_marker in &stale {
-            if let Some(record) = &stale_marker.record {
-                conn.execute(
-                    "update startup_run
-                     set time_finished_unix_ms = ?1, status = 'unclean',
-                         error = 'process exited without completing its run marker'
-                     where id = ?2 and status = 'running'",
-                    params![started, record.run_id],
-                )?;
-            }
-        }
-        conn.execute(
-            "insert into startup_run (
-                id, time_started_unix_ms, time_finished_unix_ms, status, repo, version, error
-             ) values (?1, ?2, null, 'running', ?3, ?4, null)",
-            params![run_id, started, repo.root.display().to_string(), version],
-        )?;
-        conn.execute_batch("commit")
-    })();
+    let stale_run_ids = stale
+        .iter()
+        .filter_map(|marker| marker.record.as_ref().map(|record| record.run_id.clone()))
+        .collect::<Vec<_>>();
+    let repo_root = repo.root.display().to_string();
+    let transaction_result = store.begin_run(
+        &crate::persistence::observability::StartupRunRecord {
+            id: &run_id,
+            time_started_unix_ms: started,
+            repo: &repo_root,
+            version,
+        },
+        &stale_run_ids,
+    );
     if let Err(error) = transaction_result {
-        let _ = conn.execute_batch("rollback");
         drop(marker);
         let _ = fs::remove_file(&marker_path);
         return Err(format!("record repository run {run_id}: {error}"));
     }
     transaction.committed();
-    drop(conn);
-
     for existing in markers {
         if existing.state != MarkerState::Live {
             let _ = fs::remove_file(existing.path);
@@ -353,20 +342,14 @@ fn write_marker(
 }
 
 fn finish_database_row(run: &ActiveRun, status: &str, error: Option<&str>) -> Result<(), String> {
-    let conn = crate::storage::open_writable(&run.db_path).map_err(|error| error.to_string())?;
-    conn.execute(
-        "update startup_run
-         set time_finished_unix_ms = ?1, status = ?2, error = ?3
-         where id = ?4 and status = 'running'",
-        params![now_ms(), status, error, run.run_id],
-    )
-    .map_err(|error| {
-        format!(
-            "complete repository run {} for {}: {error}",
-            run.run_id, run.repo_root
-        )
-    })?;
-    Ok(())
+    crate::persistence::observability::ObservabilityStore::open(&run.db_path)
+        .and_then(|store| store.finish_run(&run.run_id, now_ms(), status, error))
+        .map_err(|error| {
+            format!(
+                "complete repository run {} for {}: {error}",
+                run.run_id, run.repo_root
+            )
+        })
 }
 
 fn active_runs() -> &'static Mutex<BTreeMap<PathBuf, ActiveRun>> {
@@ -447,13 +430,13 @@ mod tests {
         fs::create_dir_all(&temp).unwrap();
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let db_path = repo.prism_dir().join("prism.db");
-        let conn = crate::storage::open_writable(&db_path).unwrap();
-        conn.pragma_update(None, "foreign_keys", false).unwrap();
-        conn.execute(
-            "insert into startup_phase (run_id, phase, time_started_unix_ms, status)
-             values ('missing', 'fixture', 1, 'ok')",
-            [],
-        )
+        let mut conn =
+            crate::persistence::database::TestConnection::open_writable(&db_path).unwrap();
+        conn.execute_batch(concat!(
+            include_str!("../../sql/run_marker/test_disable_foreign_keys.sql"),
+            ";",
+            include_str!("../../sql/run_marker/test_insert_orphan_startup_phase.sql"),
+        ))
         .unwrap();
         drop(conn);
         write_unlocked_repo_marker(&repo, "stale-fixture", "running");
@@ -479,13 +462,11 @@ mod tests {
         fs::create_dir_all(&temp).unwrap();
         let repo = Repository::with_config_dir_for_test(temp.clone(), temp.join("config"));
         let db_path = repo.prism_dir().join("prism.db");
-        let conn = crate::storage::open_writable(&db_path).unwrap();
-        conn.execute(
-            "insert into startup_run (
-                id, time_started_unix_ms, status, repo, version
-             ) values ('stale-fixture', 1, 'running', '/repo', 'test')",
-            [],
-        )
+        let mut conn =
+            crate::persistence::database::TestConnection::open_writable(&db_path).unwrap();
+        conn.execute_batch(include_str!(
+            "../../sql/run_marker/test_insert_stale_startup_run.sql"
+        ))
         .unwrap();
         drop(conn);
         write_unlocked_repo_marker(&repo, "stale-fixture", "running");
@@ -493,19 +474,17 @@ mod tests {
         let run = begin_new(&repo, "test").unwrap();
 
         assert_eq!(run.stale_run_ids, ["stale-fixture"]);
-        let conn = crate::storage::open_readonly(&db_path).unwrap();
+        let mut conn =
+            crate::persistence::database::TestConnection::open_readonly(&db_path).unwrap();
         let stale_status = conn
-            .query_row(
-                "select status from startup_run where id = 'stale-fixture'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
+            .scalar_string(include_str!(
+                "../../sql/run_marker/test_load_stale_startup_status.sql"
+            ))
             .unwrap();
         let current_status = conn
-            .query_row(
-                "select status from startup_run where id = ?1",
-                [&run.run_id],
-                |row| row.get::<_, String>(0),
+            .scalar_string_with(
+                include_str!("../../sql/run_marker/test_load_startup_status.sql"),
+                &run.run_id,
             )
             .unwrap();
         assert_eq!(stale_status, "unclean");

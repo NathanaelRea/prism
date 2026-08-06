@@ -83,7 +83,7 @@ impl Tui {
                     .worktree_workflow_snapshot(
                         Path::new(&repo_root),
                         &session.path,
-                        crate::execution::WorkflowKind::Auto,
+                        crate::execution::WorkflowKind::Coding,
                     )
                     .and_then(|workflow| auto_status(workflow.lifecycle));
                 let plan_status = self
@@ -327,8 +327,8 @@ impl Tui {
             .flat_map(|repository| &repository.workflows)
         {
             match (workflow.identity.kind.as_str(), workflow.lifecycle.as_str()) {
-                ("auto", "queued" | "running" | "paused") => active_auto += 1,
-                ("auto", "failed" | "aborted") => failed_auto += 1,
+                ("coding", "queued" | "running" | "paused") => active_auto += 1,
+                ("coding", "failed" | "aborted") => failed_auto += 1,
                 ("plan", "queued" | "running" | "paused") => active_plans += 1,
                 ("plan", "failed" | "aborted") => failed_plans += 1,
                 _ => {}
@@ -503,10 +503,11 @@ impl Tui {
             (Some(LeaderHint::Git), PanelFocus::Worktrees) => Some(view::ChoiceList {
                 title: "Git Actions".to_string(),
                 choices: vec![
+                    view::KeyChoice::new("a", "auto flow"),
                     self.git_choice(GitAction::LazyGit, "g", "lazygit"),
                     self.git_choice(GitAction::Push, "P", "push/create PR"),
                     self.git_choice(GitAction::OpenPr, "o", "open PR"),
-                    self.git_choice(GitAction::MergeIntent, "M", "toggle merge queue"),
+                    self.git_choice(GitAction::Merge, "M", "merge"),
                     self.git_choice(GitAction::CiFix, "c", "CI repair"),
                     self.git_choice(GitAction::ReviewFix, "f", "review repair"),
                     self.git_choice(GitAction::ResolveAllComments, "R", "resolve all comments"),

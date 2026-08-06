@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update startup_run\nset time_finished_unix_ms = ?, status = ?, error = ?\nwhere id = ? and status = 'running'\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "ec476cb64486f73d173f1e8331edf311deb4a511b7624d7ca8a9436b166dec02"
+}

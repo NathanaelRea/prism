@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select count(*) as \"count!\"\nfrom opencode_runtime\nwhere repo_root = ? and server_url = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "count!",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ac1ad5788061b3d07a11a29671af9e5890c51106ff447842f3c8ce95b7e86c69"
+}

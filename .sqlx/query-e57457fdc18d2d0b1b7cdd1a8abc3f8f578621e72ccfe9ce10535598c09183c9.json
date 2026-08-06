@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "create trigger fail_runtime_upsert\nbefore update of generation on opencode_runtime\nwhen old.branch = 'feature/first'\nbegin\n  select raise(abort, 'forced runtime upsert failure');\nend\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "e57457fdc18d2d0b1b7cdd1a8abc3f8f578621e72ccfe9ce10535598c09183c9"
+}

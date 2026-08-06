@@ -121,17 +121,6 @@ impl PrCache {
         self.rebuild_error();
     }
 
-    pub(crate) fn authorize_guarded_refresh(
-        &mut self,
-        identity: Option<&crate::remote::CanonicalChangeRequestIdentity>,
-        head_sha: Option<&str>,
-    ) {
-        let (Some(identity), Some(head_sha)) = (identity, head_sha) else {
-            return;
-        };
-        self.reauthorize_guarded_summary(identity, head_sha);
-    }
-
     #[cfg(test)]
     pub(crate) fn stale_for_test(details: Option<PrDetails>, error: &str) -> Self {
         Self {
@@ -158,22 +147,6 @@ impl PrCache {
         if self.summary.as_ref().is_some_and(|summary| {
             summary.change_request_identity.as_ref() == Some(expected_identity)
                 && summary.head_sha == expected_head_sha
-        }) {
-            self.summary_observed_in_process = true;
-        }
-    }
-
-    pub(crate) fn reauthorize_persisted_run_summary(
-        &mut self,
-        expected_number: u64,
-        expected_url: &str,
-        expected_head_sha: &str,
-    ) {
-        if self.summary.as_ref().is_some_and(|summary| {
-            summary.number == expected_number
-                && summary.url == expected_url
-                && summary.head_sha == expected_head_sha
-                && summary.change_request_identity.is_some()
         }) {
             self.summary_observed_in_process = true;
         }

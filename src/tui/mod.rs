@@ -41,12 +41,12 @@ mod workflow;
 mod tests;
 
 use agent_state::AgentStatePersistenceRequest;
+use dialog::{choice_list, ctrl_key};
 #[cfg(test)]
 use dialog::{
-    TextInputAction, confirmation_result, move_enabled_ordered_item, selectable_choice_key,
-    text_input_action, toggle_item_in_place, toggle_ordered_item,
+    confirmation_result, move_enabled_ordered_item, selectable_choice_key, toggle_item_in_place,
+    toggle_ordered_item,
 };
-use dialog::{choice_list, ctrl_key};
 pub(crate) use git_actions::GitAction;
 use job_orchestration::ShutdownReason;
 pub(crate) use job_orchestration::{TuiJobKey, TuiJobKind, TuiJobPayload};
@@ -912,13 +912,13 @@ impl Tui {
                         self.show_error("push failed", &error)?;
                     }
                 }
-                Key::ToggleMergeQueue => {
+                Key::Merge => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.git_action_enabled(GitAction::MergeIntent)
-                        && let Err(error) = self.toggle_selected_merge_intent()
+                    if self.git_action_enabled(GitAction::Merge)
+                        && let Err(error) = self.merge_selected_pr(runtime)
                     {
-                        self.show_error("merge queue update failed", &error)?;
+                        self.show_error("merge failed", &error)?;
                     }
                 }
                 Key::PullDefault => {
@@ -992,20 +992,15 @@ impl Tui {
                 Key::Delete => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    match self.dismiss_selected_workflow() {
-                        Ok(true) => {}
-                        Err(error) => self.show_error("dismiss failed", &error)?,
-                        Ok(false) if self.focused_panel == PanelFocus::Status => {
-                            self.show_message("focus worktrees to delete a worktree/session")?
-                        }
-                        Ok(false) if self.focused_panel == PanelFocus::Repos => {
-                            self.show_message("repository removal is available from r")?
-                        }
-                        Ok(false) => {
-                            if let Err(error) = self.archive_session(runtime) {
-                                self.show_error("archive failed", &error)?;
-                            }
-                        }
+                    let handled =
+                        self.dismiss_selected_auto_run()? || self.dismiss_selected_plan_run()?;
+                    if handled {
+                    } else if self.focused_panel == PanelFocus::Status {
+                        self.show_message("focus worktrees to delete a worktree/session")?;
+                    } else if self.focused_panel == PanelFocus::Repos {
+                        self.show_message("repository removal is available from r")?;
+                    } else if let Err(error) = self.archive_session(runtime) {
+                        self.show_error("archive failed", &error)?;
                     }
                 }
                 Key::Unarchive => {
@@ -1020,18 +1015,15 @@ impl Tui {
                 Key::DeletePermanent => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.permanent_delete_targets_worktree() {
-                        if let Err(error) = self.delete_session(runtime) {
-                            self.show_error("delete failed", &error)?;
-                        }
-                    } else {
-                        match self.dismiss_selected_workflow() {
-                            Ok(true) => {}
-                            Ok(false) => self.show_message(
-                                "focus worktrees to permanently delete a worktree/session",
-                            )?,
-                            Err(error) => self.show_error("dismiss failed", &error)?,
-                        }
+                    let handled =
+                        self.dismiss_selected_auto_run()? || self.dismiss_selected_plan_run()?;
+                    if handled {
+                    } else if self.focused_panel != PanelFocus::Worktrees {
+                        self.show_message(
+                            "focus worktrees to permanently delete a worktree/session",
+                        )?;
+                    } else if let Err(error) = self.delete_session(runtime) {
+                        self.show_error("delete failed", &error)?;
                     }
                 }
                 Key::EditWorktreeColumns => {
@@ -1055,11 +1047,11 @@ impl Tui {
                         self.show_error("edit user config failed", &error)?;
                     }
                 }
-                Key::EditWorktrunkUserConfig => {
+                Key::EditWorktrunkConfig => {
                     self.clear_leader_hint();
                     pending_g = false;
                     if let Err(error) = self.edit_worktrunk_user_config(runtime) {
-                        self.show_error("edit Worktrunk user config failed", &error)?;
+                        self.show_error("edit Worktrunk config failed", &error)?;
                     }
                 }
                 Key::SelectHarness => {

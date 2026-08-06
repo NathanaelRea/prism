@@ -995,85 +995,6 @@ fn prompt_dialog_sets_cursor_at_end_of_input() {
 }
 
 #[test]
-fn text_area_renders_input_on_new_lines_with_updated_controls() {
-    let config = test_config();
-    let sessions = vec![test_session("feature", AgentState::Idle)];
-    let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
-    model.dialog = Some(DialogModel::TextArea {
-        title: "Create Pull Request".to_string(),
-        prompt: "Description:\n".to_string(),
-        input: "First line\nSecond line".to_string(),
-    });
-
-    let backend = render_to_backend(&model, 100, 24);
-    let buffer = backend.buffer();
-
-    assert_ne!(
-        find_line(buffer, "Description:"),
-        find_line(buffer, "First line")
-    );
-    assert_ne!(
-        find_line(buffer, "First line"),
-        find_line(buffer, "Second line")
-    );
-    assert!(
-        buffer_to_string(buffer)
-            .contains("Enter for new line, Ctrl+Enter to submit, Esc to cancel")
-    );
-    assert_eq!(
-        backend.cursor_position().y,
-        find_line(buffer, "Second line")
-    );
-}
-
-#[test]
-fn text_area_cursor_uses_full_width_after_first_input_line() {
-    let config = test_config();
-    let sessions = vec![test_session("feature", AgentState::Idle)];
-    let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
-    let last_line = "abcdefghijklmnopqrstuvwxyz1234";
-    model.dialog = Some(DialogModel::TextArea {
-        title: "Create Pull Request".to_string(),
-        prompt: "Description: ".to_string(),
-        input: format!("First line\n{last_line}"),
-    });
-
-    let backend = render_to_backend(&model, 40, 20);
-    let buffer = backend.buffer();
-    let y = find_line(buffer, last_line);
-    let line_start = line_text(buffer, y)
-        .chars()
-        .position(|character| character == 'a')
-        .expect("last input line");
-
-    assert_eq!(
-        backend.cursor_position(),
-        Position::new(line_start as u16 + last_line.len() as u16, y)
-    );
-}
-
-#[test]
-fn text_area_scrolls_to_keep_long_input_and_controls_visible() {
-    let config = test_config();
-    let sessions = vec![test_session("feature", AgentState::Idle)];
-    let mut model = test_model(&config, &sessions, PanelFocus::Status, None, None);
-    model.dialog = Some(DialogModel::TextArea {
-        title: "Create Pull Request".to_string(),
-        prompt: "Description:\n".to_string(),
-        input: (1..=10)
-            .map(|line| format!("Line {line}"))
-            .collect::<Vec<_>>()
-            .join("\n"),
-    });
-
-    let backend = render_to_backend(&model, 100, 10);
-    let buffer = backend.buffer();
-
-    assert!(buffer_to_string(buffer).contains("Ctrl+Enter to submit"));
-    assert_eq!(backend.cursor_position().y, find_line(buffer, "Line 10"));
-}
-
-#[test]
 fn prompt_dialog_geometry_is_stable_and_tail_truncates_input() {
     let area = Rect::new(0, 0, 80, 20);
     let short = DialogModel::Prompt {
@@ -1450,7 +1371,7 @@ fn renders_stabilization_pending_push_in_worktree_main_panel() {
 }
 
 #[test]
-fn worktree_main_panel_uses_stabilization_review_blocker() {
+fn worktree_main_panel_renders_review_gate() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
     session.pr = PrCache::observed(
@@ -1467,16 +1388,15 @@ fn worktree_main_panel_uses_stabilization_review_blocker() {
     let sessions = vec![session];
     let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
     model.auto_dashboard = Some(stabilization_dashboard(
-        StabilizationBlocker::ReviewFeedbackMissing,
-        StabilizationWorkKind::WaitForReview,
+        StabilizationBlocker::ReadyForManualMerge,
+        StabilizationWorkKind::MarkReadyForManualMerge,
         None,
     ));
 
     let buffer = render_to_string(&model, 120, 40);
 
     assert!(buffer.contains("review"));
-    assert!(buffer.contains("missing"));
-    assert!(!buffer.contains("pending"));
+    assert!(buffer.contains("needs review"));
 }
 
 #[test]
@@ -1512,93 +1432,8 @@ fn worktree_main_panel_passes_review_gate_without_actionable_feedback() {
 }
 
 #[test]
-fn worktree_main_panel_marks_resolved_review_without_comments_missing() {
+fn worktree_main_panel_ignores_provider_review_state_without_unresolved_comments() {
     let config = test_config();
-    let mut session = test_session("feature", AgentState::Idle);
-    session.pr = PrCache::observed(test_pr_summary(), Some(PrDetails::default()));
-    let sessions = vec![session];
-    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    model.auto_dashboard = Some(stabilization_dashboard(
-        StabilizationBlocker::ReviewFeedbackMissing,
-        StabilizationWorkKind::WaitForReview,
-        None,
-    ));
-
-    let buffer = render_to_string(&model, 120, 40);
-
-    assert!(buffer.contains("ReviewFeedbackMissing"));
-    assert!(buffer.contains("missing"));
-}
-
-#[test]
-fn worktree_main_panel_ignores_local_review_activity_when_review_is_none() {
-    let mut config = test_config();
-    config.auto.review_requirement = crate::config::ReviewRequirement::None;
-    let mut session = test_session("feature", AgentState::Idle);
-    let mut summary = test_pr_summary();
-    summary.review_decision = "UNKNOWN".to_string();
-    summary.requested_reviewers = vec!["reviewer".to_string()];
-    session.pr = PrCache::observed(
-        summary,
-        Some(PrDetails {
-            review_comments: vec![PrReviewComment {
-                body: "optional feedback".to_string(),
-                resolved: false,
-                ..PrReviewComment::default()
-            }],
-            ..PrDetails::default()
-        }),
-    );
-    let sessions = vec![session];
-    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    model.auto_dashboard = Some(stabilization_dashboard(
-        StabilizationBlocker::ReadyForManualMerge,
-        StabilizationWorkKind::MarkReadyForManualMerge,
-        None,
-    ));
-
-    let buffer = render_to_string(&model, 120, 40);
-
-    assert!(buffer.contains("passed"));
-    assert!(!buffer.contains("pending"));
-}
-
-#[test]
-fn worktree_main_panel_does_not_claim_review_passed_when_an_earlier_blocker_masks_it() {
-    let mut config = test_config();
-    config.auto.review_requirement = crate::config::ReviewRequirement::Approved;
-    let mut session = test_session("feature", AgentState::Idle);
-    let mut summary = test_pr_summary();
-    summary.review_decision = "APPROVED".to_string();
-    session.pr = PrCache::observed(
-        summary,
-        Some(PrDetails {
-            review_comments: vec![PrReviewComment {
-                body: "unresolved feedback".to_string(),
-                resolved: false,
-                ..PrReviewComment::default()
-            }],
-            ..PrDetails::default()
-        }),
-    );
-    let sessions = vec![session];
-    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
-    model.auto_dashboard = Some(stabilization_dashboard(
-        StabilizationBlocker::DirtyWorktree,
-        StabilizationWorkKind::Escalate,
-        None,
-    ));
-
-    let buffer = render_to_string(&model, 120, 40);
-
-    assert!(buffer.contains("unknown"));
-    assert!(!buffer.contains("approved"));
-}
-
-#[test]
-fn worktree_main_panel_ignores_provider_review_state_when_review_is_none() {
-    let mut config = test_config();
-    config.auto.review_requirement = crate::config::ReviewRequirement::None;
     let mut session = test_session("feature", AgentState::Idle);
     let mut summary = test_pr_summary();
     summary.review_decision = "REVIEW_REQUIRED".to_string();
@@ -1898,7 +1733,6 @@ fn test_session(branch: &str, agent_state: AgentState) -> Session {
         repo_label: "repo".to_string(),
         repo_key: Some('1'),
         path: PathBuf::from(format!("/repo/{branch}")),
-        worktree_session_id: format!("test-{branch}"),
         incarnation: String::new(),
         path_display: format!("/repo/{branch}"),
         branch: branch.to_string(),
@@ -2033,7 +1867,6 @@ fn test_plan_dashboard(expanded: bool) -> PlanDashboard {
                 id: "plan-run".to_string(),
                 repo_root: "/repo".to_string(),
                 scope_path: PathBuf::from("/repo"),
-                worktree_session_id: None,
                 plan_path: PathBuf::from("plan.md"),
                 plan_display: "plan.md".to_string(),
                 step_name: "phase".to_string(),
@@ -2147,7 +1980,6 @@ fn test_auto_dashboard() -> AutoDashboard {
                 repo_root: "/repo".to_string(),
                 worktree_path: PathBuf::from("/repo/feature"),
                 worktree_incarnation: None,
-                worktree_session_id: None,
                 branch: "feature".to_string(),
                 mode: AutoRunMode::Standard,
                 implementation_source: AutoImplementationSource::Prompt,

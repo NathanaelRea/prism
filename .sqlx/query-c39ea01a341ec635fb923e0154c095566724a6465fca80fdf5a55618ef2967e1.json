@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select run.id as \"id!\"\nfrom workflow_run run\nwhere (? is null or run.repository = ?)\norder by run.updated_unix_ms desc, run.id\nlimit ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "c39ea01a341ec635fb923e0154c095566724a6465fca80fdf5a55618ef2967e1"
+}

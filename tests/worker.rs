@@ -1,36 +1,20 @@
 mod common;
-
 use std::fs;
-use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::UnixListener;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use common::CompactTempDir as TempDir;
 
 fn prism(runtime: &Path, home: &Path) -> Command {
-    prism_at(Path::new(env!("CARGO_BIN_EXE_prism")), runtime, home)
-}
-
-fn prism_at(executable: &Path, runtime: &Path, home: &Path) -> Command {
-    let mut command = Command::new(executable);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_prism"));
     command
         .env("PRISM_RUNTIME_DIR", runtime)
         .env("XDG_CONFIG_HOME", home)
         .env("HOME", home);
     command
-}
-
-fn health_pid(output: &Output) -> u32 {
-    String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .find_map(|field| field.strip_prefix("pid="))
-        .and_then(|pid| pid.parse().ok())
-        .expect("worker health PID")
 }
 
 fn run(runtime: &Path, home: &Path, args: &[&str]) -> Output {
@@ -45,6 +29,292 @@ fn serial_worker_test() -> MutexGuard<'static, ()> {
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn worker_request(runtime: &Path, request: serde_json::Value) -> serde_json::Value {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let mut stream = UnixStream::connect(runtime.join("worker.sock")).unwrap();
+    writeln!(stream, "{request}").unwrap();
+    stream.shutdown(std::net::Shutdown::Write).unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    serde_json::from_str(response.trim()).unwrap()
+}
+
+#[test]
+fn worker_socket_owns_generalized_workflow_mutations_and_inspection() {
+    let _serial = serial_worker_test();
+    let temp = TempDir::new("worker-workflow-operations");
+    let runtime = temp.runtime_path().to_path_buf();
+    let home = temp.path.join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    assert!(run(&runtime, &home, &["worker", "ensure"]).status.success());
+    let registered = worker_request(
+        &runtime,
+        serde_json::json!({
+            "type": "workflow_register_definition",
+            "definition": {
+                "id": "definition",
+                "name": "socket-tracer",
+                "revision": "1",
+                "source": "test",
+                "trusted": true,
+                "body_json": "{}",
+                "digest": "digest",
+                "now_unix_ms": 1
+            }
+        }),
+    );
+    assert_eq!(registered, serde_json::json!({"ok": true}));
+
+    let launched = worker_request(
+        &runtime,
+        serde_json::json!({
+            "type": "workflow_launch",
+            "run": {
+                "run_id": "run",
+                "definition_snapshot_id": "definition",
+                "repository": null,
+                "idempotency_key": "socket-run",
+                "now_unix_ms": 2
+            },
+            "steps": [{
+                "id": "step",
+                "key": "approval",
+                "implementation": "not-installed",
+                "target_id": "local",
+                "input_json": "{}",
+                "dependencies": [],
+                "resources": []
+            }]
+        }),
+    );
+    assert_eq!(launched, serde_json::json!({"ok": true, "run_id": "run"}));
+
+    let inspected = worker_request(
+        &runtime,
+        serde_json::json!({"type": "workflow_inspect", "run_id": "run"}),
+    );
+    assert_eq!(inspected["ok"], true);
+    assert_eq!(inspected["run"]["id"], "run");
+    assert_eq!(inspected["run"]["definition_name"], "socket-tracer");
+    assert_eq!(inspected["run"]["status"], "runnable");
+    assert_eq!(inspected["run"]["steps"][0]["input_json"], "{}");
+    assert_eq!(inspected["run"]["artifacts"], serde_json::json!([]));
+    let listed = worker_request(
+        &runtime,
+        serde_json::json!({"type": "workflow_list", "repository": null, "limit": 8}),
+    );
+    assert_eq!(listed["ok"], true);
+    assert_eq!(listed["runs"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["runs"][0]["id"], "run");
+
+    assert_eq!(
+        worker_request(
+            &runtime,
+            serde_json::json!({
+                "type": "workflow_request_approval",
+                "id": "approval",
+                "run_id": "run",
+                "step_id": "step",
+                "now_unix_ms": 3
+            }),
+        ),
+        serde_json::json!({"ok": true})
+    );
+    let waiting = worker_request(
+        &runtime,
+        serde_json::json!({"type": "workflow_inspect", "run_id": "run"}),
+    );
+    assert_eq!(waiting["run"]["status"], "waiting");
+    assert_eq!(waiting["run"]["approvals"][0]["status"], "pending");
+    assert_eq!(
+        worker_request(
+            &runtime,
+            serde_json::json!({
+                "type": "workflow_decide_approval",
+                "id": "approval",
+                "decision": "approve",
+                "decided_by": "user",
+                "note": null,
+                "now_unix_ms": 4
+            }),
+        ),
+        serde_json::json!({"ok": true})
+    );
+
+    assert!(
+        run(&runtime, &home, &["worker", "shutdown"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn production_worker_executes_a_bundled_command_step() {
+    let _serial = serial_worker_test();
+    let temp = TempDir::new("worker-command-step");
+    let runtime = temp.runtime_path().to_path_buf();
+    let home = temp.path.join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    assert!(run(&runtime, &home, &["worker", "ensure"]).status.success());
+    assert_eq!(
+        worker_request(
+            &runtime,
+            serde_json::json!({
+                "type": "workflow_register_definition",
+                "definition": {
+                    "id": "command-definition",
+                    "name": "command",
+                    "revision": "1",
+                    "source": "test",
+                    "trusted": true,
+                    "body_json": "{}",
+                    "digest": "command-digest",
+                    "now_unix_ms": 1
+                }
+            }),
+        ),
+        serde_json::json!({"ok": true})
+    );
+    assert_eq!(
+        worker_request(
+            &runtime,
+            serde_json::json!({
+                "type": "workflow_launch",
+                "run": {
+                    "run_id": "command-run",
+                    "definition_snapshot_id": "command-definition",
+                    "repository": null,
+                    "idempotency_key": "command-run",
+                    "now_unix_ms": 2
+                },
+                "steps": [{
+                    "id": "command-step",
+                    "key": "command",
+                    "implementation": "command",
+                    "target_id": "local",
+                    "input_json": serde_json::json!({
+                        "program": "/bin/sh",
+                        "args": ["-c", "printf 'command output\\n'"]
+                    }).to_string(),
+                    "dependencies": [],
+                    "resources": []
+                }]
+            }),
+        ),
+        serde_json::json!({"ok": true, "run_id": "command-run"})
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let response = worker_request(
+            &runtime,
+            serde_json::json!({"type": "workflow_inspect", "run_id": "command-run"}),
+        );
+        if response["run"]["status"] == "succeeded" {
+            assert!(
+                response["run"]["attempts"][0]["process_id"]
+                    .as_i64()
+                    .unwrap()
+                    > 0
+            );
+            assert!(
+                response["run"]["events"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["kind"] == "process_recorded")
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "command workflow did not finish: {response}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(
+        run(&runtime, &home, &["worker", "shutdown"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn bundled_coding_workflow_executes_through_the_generic_harness() {
+    let _serial = serial_worker_test();
+    let temp = TempDir::new("worker-bundled-coding");
+    let runtime = temp.runtime_path().to_path_buf();
+    let home = temp.path.join("home");
+    let repo = temp.path.join("repo");
+    fs::create_dir_all(home.join("prism")).unwrap();
+    fs::create_dir_all(&repo).unwrap();
+    let harness = temp.path.join("harness.sh");
+    fs::write(
+        &harness,
+        "#!/bin/sh\nprintf '%s' \"$1\" > bundled-prompt.txt\n",
+    )
+    .unwrap();
+    fs::set_permissions(&harness, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        home.join("prism/config.toml"),
+        format!(
+            "default_harness = \"test\"\n\n[harnesses.test]\nadapter = \"generic\"\ninteractive_command = [\"{}\"]\nheadless_command = [\"{}\", \"{{prompt}}\"]\nheadless_prompt_transport = \"argument\"\noutput_format = \"text\"\n",
+            harness.display(),
+            harness.display(),
+        ),
+    )
+    .unwrap();
+
+    assert!(run(&runtime, &home, &["worker", "ensure"]).status.success());
+    let launched = worker_request(
+        &runtime,
+        serde_json::json!({
+            "type": "bundled_coding_launch",
+            "launch": {
+                "repository": repo,
+                "worktree_path": repo,
+                "task": "implement bundled coding",
+                "plan_path": null,
+                "draft_plan": false,
+                "harness_id": "test",
+                "variant": null
+            }
+        }),
+    );
+    assert_eq!(launched["ok"], true, "{launched}");
+    let run_id = launched["run_id"].as_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let inspected = worker_request(
+            &runtime,
+            serde_json::json!({"type": "workflow_inspect", "run_id": run_id}),
+        );
+        if inspected["run"]["status"] == "succeeded" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bundled coding did not finish: {inspected}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        fs::read_to_string(repo.join("bundled-prompt.txt"))
+            .unwrap()
+            .contains("implement bundled coding")
+    );
+    assert!(
+        run(&runtime, &home, &["worker", "shutdown"])
+            .status
+            .success()
+    );
 }
 
 #[test]
@@ -84,276 +354,6 @@ fn platform_smoke_native_worker_starts_once_reports_health_and_shuts_down() {
         String::from_utf8_lossy(&shutdown.stderr)
     );
     assert!(!runtime.join("worker.sock").exists());
-}
-
-#[test]
-fn worker_ensure_restarts_a_same_version_replaced_executable() {
-    let _serial = serial_worker_test();
-    let temp = TempDir::new("worker-replaced-executable");
-    let runtime = temp.runtime_path().to_path_buf();
-    let home = temp.path.join("home");
-    let installed = temp.path.join("prism");
-    let replacement = temp.path.join("prism.new");
-    fs::create_dir_all(&home).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_prism"), &installed).unwrap();
-
-    let first = prism_at(&installed, &runtime, &home)
-        .args(["worker", "ensure"])
-        .output()
-        .unwrap();
-    assert!(first.status.success());
-    let first_health = prism_at(&installed, &runtime, &home)
-        .args(["worker", "health"])
-        .output()
-        .unwrap();
-    let first_pid = health_pid(&first_health);
-
-    fs::copy(env!("CARGO_BIN_EXE_prism"), &replacement).unwrap();
-    fs::rename(&replacement, &installed).unwrap();
-    let ensure = prism_at(&installed, &runtime, &home)
-        .args(["worker", "ensure"])
-        .output()
-        .unwrap();
-    assert!(
-        ensure.status.success(),
-        "replacement ensure failed: {}",
-        String::from_utf8_lossy(&ensure.stderr)
-    );
-    let second_health = prism_at(&installed, &runtime, &home)
-        .args(["worker", "health"])
-        .output()
-        .unwrap();
-    assert_ne!(health_pid(&second_health), first_pid);
-    assert!(String::from_utf8_lossy(&second_health.stdout).contains(" exe="));
-
-    assert!(
-        prism_at(&installed, &runtime, &home)
-            .args(["worker", "shutdown"])
-            .status()
-            .unwrap()
-            .success()
-    );
-}
-
-#[test]
-fn worker_ensure_allows_active_work_to_drain_before_replacement() {
-    let _serial = serial_worker_test();
-    let temp = TempDir::new("worker-active-replacement");
-    let runtime = temp.runtime_path().to_path_buf();
-    let home = temp.path.join("home");
-    let repo = temp.path.join("repo");
-    let installed = temp.path.join("prism");
-    let replacement = temp.path.join("prism.new");
-    let release = temp.path.join("release");
-    fs::create_dir_all(home.join("prism")).unwrap();
-    fs::create_dir_all(&repo).unwrap();
-    fs::copy(env!("CARGO_BIN_EXE_prism"), &installed).unwrap();
-    assert!(
-        Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(&repo)
-            .status()
-            .unwrap()
-            .success()
-    );
-
-    let harness = temp.path.join("harness.sh");
-    fs::write(
-        &harness,
-        format!(
-            "#!/bin/sh\nwhile [ ! -e '{}' ]; do sleep 0.1; done\n",
-            release.display()
-        ),
-    )
-    .unwrap();
-    fs::set_permissions(&harness, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(
-        home.join("prism/config.toml"),
-        format!(
-            "default_harness = \"test\"\n[harnesses.test]\nadapter = \"generic\"\ninteractive_command = [\"{}\"]\nheadless_command = [\"{}\", \"{{prompt}}\"]\nheadless_prompt_transport = \"argument\"\noutput_format = \"text\"\n",
-            harness.display(), harness.display()
-        ),
-    )
-    .unwrap();
-    fs::write(
-        home.join("prism/repos.toml"),
-        format!("[[repos]]\npath = \"{}\"\n", repo.display()),
-    )
-    .unwrap();
-    let db = prism_at(&installed, &runtime, &home)
-        .args(["--repo", repo.to_str().unwrap(), "db", "path"])
-        .output()
-        .unwrap();
-    assert!(db.status.success());
-    let db = PathBuf::from(String::from_utf8_lossy(&db.stdout).trim());
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    insert_active_worktree_session(&conn, "00000000000000000000000000000003", &repo);
-    conn.execute(
-        "insert into plan_run (id, harness_id, adapter_id, repo_root, scope_path, worktree_session_id, plan_path,
-           plan_display, step_name, start_step, total_steps, mode, status, pause_requested,
-           selected_step, created_unix_ms, updated_unix_ms)
-         values ('replacement-plan', 'test', 'generic', ?1, ?1, '00000000000000000000000000000003', ?2, 'plan.md', 'Phase', 1, 1,
-                  'sequential', 'queued', 0, 1, 1, 1)",
-        rusqlite::params![
-            repo.display().to_string(),
-            repo.join("plan.md").display().to_string()
-        ],
-    )
-    .unwrap();
-    conn.execute(
-        "insert into plan_step_run (run_id, step, prompt, status)
-         values ('replacement-plan', 1, 'wait for release', 'queued')",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "insert into workflow_execution (workflow_kind, run_id, dispatch_state, fencing_token,
-           interruption_generation, created_unix_ms, updated_unix_ms)
-         values ('plan', 'replacement-plan', 'queued', 0, 0, 1, 1)",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-
-    assert!(
-        prism_at(&installed, &runtime, &home)
-            .args(["worker", "ensure"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let first_pid = loop {
-        let health = prism_at(&installed, &runtime, &home)
-            .args(["worker", "health"])
-            .output()
-            .unwrap();
-        if health.status.success() && String::from_utf8_lossy(&health.stdout).contains("active=1") {
-            break health_pid(&health);
-        }
-        assert!(Instant::now() < deadline, "workflow did not become active");
-        std::thread::sleep(Duration::from_millis(25));
-    };
-
-    fs::copy(env!("CARGO_BIN_EXE_prism"), &replacement).unwrap();
-    fs::rename(&replacement, &installed).unwrap();
-    let ensure = prism_at(&installed, &runtime, &home)
-        .args(["worker", "ensure"])
-        .output()
-        .unwrap();
-    let ensure_while_draining = prism_at(&installed, &runtime, &home)
-        .args(["worker", "ensure"])
-        .output()
-        .unwrap();
-    fs::write(&release, "release").unwrap();
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let health = prism_at(&installed, &runtime, &home)
-            .args(["worker", "health"])
-            .output()
-            .unwrap();
-        if health.status.success()
-            && String::from_utf8_lossy(&health.stdout).contains("state=running active=0")
-            && health_pid(&health) != first_pid
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "replacement daemon did not start"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    assert!(
-        prism_at(&installed, &runtime, &home)
-            .args(["worker", "shutdown"])
-            .status()
-            .unwrap()
-            .success()
-    );
-    assert!(
-        ensure.status.success(),
-        "replacement ensure failed: {}",
-        String::from_utf8_lossy(&ensure.stderr)
-    );
-    assert!(
-        ensure_while_draining.status.success(),
-        "ensure while draining failed: {}",
-        String::from_utf8_lossy(&ensure_while_draining.stderr)
-    );
-}
-
-#[test]
-fn worker_ensure_schedules_replacement_for_active_legacy_draining_daemon() {
-    let _serial = serial_worker_test();
-    let temp = TempDir::new("worker-legacy-draining");
-    let runtime = temp.runtime_path().to_path_buf();
-    let home = temp.path.join("home");
-    fs::create_dir_all(&runtime).unwrap();
-    fs::create_dir_all(&home).unwrap();
-
-    let socket = runtime.join("worker.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let stop = Arc::new(AtomicBool::new(false));
-    let server_stop = Arc::clone(&stop);
-    let server = std::thread::spawn(move || {
-        loop {
-            let (mut stream, _) = match listener.accept() {
-                Ok(connection) => connection,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                Err(error) => panic!("accept legacy worker request: {error}"),
-            };
-            let mut request = [0_u8; 64];
-            let size = stream.read(&mut request).unwrap();
-            let request = std::str::from_utf8(&request[..size]).unwrap().trim();
-            if server_stop.load(Ordering::Acquire) && request == "health" {
-                return;
-            }
-            match request {
-                "health" => stream
-                    .write_all(b"ok 1 legacy pid=42 state=draining active=1 exe=legacy\n")
-                    .unwrap(),
-                "replace" => stream.write_all(b"error unknown-command\n").unwrap(),
-                request => panic!("unexpected legacy worker request: {request}"),
-            }
-        }
-    });
-
-    let ensure = run(&runtime, &home, &["worker", "ensure"]);
-    stop.store(true, Ordering::Release);
-    server.join().unwrap();
-    fs::remove_file(&socket).unwrap();
-
-    assert!(
-        ensure.status.success(),
-        "ensure against legacy draining worker failed: {}",
-        String::from_utf8_lossy(&ensure.stderr)
-    );
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let health = run(&runtime, &home, &["worker", "health"]);
-        if health.status.success()
-            && String::from_utf8_lossy(&health.stdout).contains("state=running active=0")
-        {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "replacement daemon did not start"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    assert!(
-        run(&runtime, &home, &["worker", "shutdown"])
-            .status
-            .success()
-    );
 }
 
 #[test]
@@ -399,323 +399,4 @@ fn worker_ensure_rejects_an_invalid_socket_path_before_startup_side_effects() {
     assert!(error.contains("103 bytes"), "{error}");
     assert!(error.contains("PRISM_RUNTIME_DIR"), "{error}");
     assert!(!runtime.exists());
-}
-
-#[test]
-fn real_worker_executes_a_queued_plan_and_persists_lifecycle() {
-    let _serial = serial_worker_test();
-    let temp = TempDir::new("worker-plan");
-    let runtime = temp.runtime_path().to_path_buf();
-    let home = temp.path.join("home");
-    let repo = temp.path.join("repo");
-    fs::create_dir_all(home.join("prism")).unwrap();
-    fs::create_dir_all(&repo).unwrap();
-    let git = Command::new("git")
-        .args(["init", "-b", "main"])
-        .current_dir(&repo)
-        .output()
-        .unwrap();
-    assert!(git.status.success());
-
-    let harness = temp.path.join("harness.sh");
-    fs::write(&harness, "#!/bin/sh\nprintf 'worker output\\n'\n").unwrap();
-    fs::set_permissions(&harness, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(
-        home.join("prism/config.toml"),
-        format!(
-            "default_harness = \"test\"\n\n[harnesses.test]\nadapter = \"generic\"\ninteractive_command = [\"{}\"]\nheadless_command = [\"{}\", \"{{prompt}}\"]\nheadless_prompt_transport = \"argument\"\noutput_format = \"text\"\n",
-            harness.display(),
-            harness.display(),
-        ),
-    )
-    .unwrap();
-    fs::write(
-        home.join("prism/repos.toml"),
-        format!("[[repos]]\npath = \"{}\"\n", repo.display()),
-    )
-    .unwrap();
-
-    let db_path = run(
-        &runtime,
-        &home,
-        &["--repo", repo.to_str().unwrap(), "db", "path"],
-    );
-    assert!(db_path.status.success());
-    let db_path = PathBuf::from(String::from_utf8_lossy(&db_path.stdout).trim());
-    let conn = rusqlite::Connection::open(&db_path).unwrap();
-    insert_active_worktree_session(&conn, "00000000000000000000000000000001", &repo);
-    conn.execute(
-        "insert into plan_run (
-           id, harness_id, adapter_id, repo_root, scope_path, worktree_session_id, plan_path, plan_display,
-           step_name, start_step, total_steps, mode, status, pause_requested,
-           selected_step, created_unix_ms, updated_unix_ms
-         ) values ('worker-plan', 'test', 'generic', ?1, ?1, '00000000000000000000000000000001', ?2, 'plan.md',
-                   'Phase', 1, 1, 'sequential', 'queued', 0, 1, 1, 1)",
-        rusqlite::params![
-            repo.display().to_string(),
-            repo.join("plan.md").display().to_string()
-        ],
-    )
-    .unwrap();
-    conn.execute(
-        "insert into plan_step_run (run_id, step, prompt, status)
-         values ('worker-plan', 1, 'execute the deterministic test', 'queued')",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "insert into workflow_execution (
-           workflow_kind, run_id, dispatch_state, fencing_token,
-           interruption_generation, created_unix_ms, updated_unix_ms
-         ) values ('plan', 'worker-plan', 'queued', 0, 0, 1, 1)",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-
-    assert!(run(&runtime, &home, &["worker", "ensure"]).status.success());
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let conn = rusqlite::Connection::open(&db_path).unwrap();
-        let state: String = conn
-            .query_row(
-                "select dispatch_state from workflow_execution
-                 where workflow_kind = 'plan' and run_id = 'worker-plan'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        if state == "terminal" {
-            let status: String = conn
-                .query_row(
-                    "select status from plan_run where id = 'worker-plan'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            if status != "done" {
-                let step: (String, Option<String>) = conn
-                    .query_row(
-                        "select status, error from plan_step_run where run_id = 'worker-plan'",
-                        [],
-                        |row| Ok((row.get(0)?, row.get(1)?)),
-                    )
-                    .unwrap();
-                let active = conn
-                    .prepare("select worktree_session_id, repo_root, worktree_path from active_worktree_session")
-                    .unwrap()
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
-                    })
-                    .unwrap()
-                    .collect::<Result<Vec<_>, _>>()
-                    .unwrap();
-                let failure: Option<String> = conn
-                    .query_row(
-                        "select message from event where action = 'executor_failed' order by id desc limit 1",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .ok();
-                panic!(
-                    "worker plan ended as {status}; step={step:?}; active={active:?}; failure={failure:?}"
-                );
-            }
-            let output: String = conn
-                .query_row(
-                    "select text from plan_output_line
-                     where run_id = 'worker-plan' order by line_number desc limit 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(output, "worker output");
-            let events: i64 = conn
-                .query_row(
-                    "select count(*) from event where target = 'worker'
-                     and action in ('claim', 'executor_start', 'release', 'executor_stop')",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            if events >= 4 {
-                break;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "worker did not finish queued plan"
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(
-        run(&runtime, &home, &["worker", "shutdown"])
-            .status
-            .success()
-    );
-}
-
-#[test]
-fn daemon_crash_leaves_claimed_work_recovery_pending() {
-    let _serial = serial_worker_test();
-    let temp = TempDir::new("worker-crash");
-    let runtime = temp.runtime_path().to_path_buf();
-    let home = temp.path.join("home");
-    let repo = temp.path.join("repo");
-    fs::create_dir_all(home.join("prism")).unwrap();
-    fs::create_dir_all(&repo).unwrap();
-    assert!(
-        Command::new("git")
-            .args(["init", "-b", "main"])
-            .current_dir(&repo)
-            .status()
-            .unwrap()
-            .success()
-    );
-    let harness = temp.path.join("sleep.sh");
-    fs::write(&harness, "#!/bin/sh\nsleep 30\n").unwrap();
-    fs::set_permissions(&harness, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(
-        home.join("prism/config.toml"),
-        format!(
-            "default_harness = \"test\"\n[harnesses.test]\nadapter = \"generic\"\ninteractive_command = [\"{}\"]\nheadless_command = [\"{}\", \"{{prompt}}\"]\nheadless_prompt_transport = \"argument\"\noutput_format = \"text\"\n",
-            harness.display(), harness.display()
-        ),
-    )
-    .unwrap();
-    fs::write(
-        home.join("prism/repos.toml"),
-        format!("[[repos]]\npath = \"{}\"\n", repo.display()),
-    )
-    .unwrap();
-    let db = run(
-        &runtime,
-        &home,
-        &["--repo", repo.to_str().unwrap(), "db", "path"],
-    );
-    assert!(db.status.success());
-    let db = PathBuf::from(String::from_utf8_lossy(&db.stdout).trim());
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    insert_active_worktree_session(&conn, "00000000000000000000000000000002", &repo);
-    conn.execute(
-        "insert into plan_run (id, harness_id, adapter_id, repo_root, scope_path, plan_path,
-           plan_display, step_name, start_step, total_steps, mode, status, pause_requested,
-           selected_step, created_unix_ms, updated_unix_ms, worktree_session_id)
-         values ('crash-plan', 'test', 'generic', ?1, ?1, ?2, 'plan.md', 'Phase', 1, 1,
-                   'sequential', 'queued', 0, 1, 1, 1, '00000000000000000000000000000002')",
-        rusqlite::params![
-            repo.display().to_string(),
-            repo.join("plan.md").display().to_string()
-        ],
-    )
-    .unwrap();
-    conn.execute(
-        "insert into plan_step_run (run_id, step, prompt, status)
-         values ('crash-plan', 1, 'sleep', 'queued')",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "insert into workflow_execution (workflow_kind, run_id, dispatch_state, fencing_token,
-           interruption_generation, created_unix_ms, updated_unix_ms)
-         values ('plan', 'crash-plan', 'queued', 0, 0, 1, 1)",
-        [],
-    )
-    .unwrap();
-    drop(conn);
-    assert!(run(&runtime, &home, &["worker", "ensure"]).status.success());
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let harness_pid = loop {
-        let conn = rusqlite::Connection::open(&db).unwrap();
-        let pid = conn
-            .query_row(
-                "select execution_process_id from plan_step_run where run_id = 'crash-plan'",
-                [],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .unwrap();
-        if let Some(pid) = pid {
-            break pid;
-        }
-        assert!(Instant::now() < deadline, "harness did not start");
-        std::thread::sleep(Duration::from_millis(25));
-    };
-    let health = run(&runtime, &home, &["worker", "health"]);
-    let health = String::from_utf8_lossy(&health.stdout);
-    let daemon_pid: i32 = health
-        .split_whitespace()
-        .find_map(|field| field.strip_prefix("pid="))
-        .unwrap()
-        .parse()
-        .unwrap();
-    assert_eq!(unsafe { libc::kill(daemon_pid, libc::SIGKILL) }, 0);
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let ensure = run(&runtime, &home, &["worker", "ensure"]);
-        if ensure.status.success() {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "replacement daemon did not start"
-        );
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    let conn = rusqlite::Connection::open(&db).unwrap();
-    let state: String = conn
-        .query_row(
-            "select dispatch_state from workflow_execution
-             where workflow_kind = 'plan' and run_id = 'crash-plan'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(state, "recovery_pending");
-    std::thread::sleep(Duration::from_millis(1200));
-    let state: String = conn
-        .query_row(
-            "select dispatch_state from workflow_execution
-             where workflow_kind = 'plan' and run_id = 'crash-plan'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(state, "recovery_pending");
-    drop(conn);
-    let _ = unsafe { libc::kill(-(harness_pid as i32), libc::SIGTERM) };
-    assert!(
-        run(&runtime, &home, &["worker", "shutdown"])
-            .status
-            .success()
-    );
-}
-
-fn insert_active_worktree_session(conn: &rusqlite::Connection, id: &str, repo: &Path) {
-    let path = repo.display().to_string();
-    let mut repo_hash = 0xcbf29ce484222325_u64;
-    for byte in path.as_bytes() {
-        repo_hash ^= u64::from(*byte);
-        repo_hash = repo_hash.wrapping_mul(0x100000001b3);
-    }
-    fs::write(
-        repo.join(".git/prism-worktree-session-id"),
-        format!("{repo_hash:016x}:{id}\n"),
-    )
-    .unwrap();
-    conn.execute(
-        "insert into worktree_session
-         (id, repo_root, initial_branch, initial_worktree_path, created_unix_ms)
-         values (?1, ?2, 'main', ?2, 1)",
-        rusqlite::params![id, path],
-    )
-    .unwrap();
-    conn.execute(
-        "insert into active_worktree_session
-         (worktree_session_id, repo_root, branch, worktree_path, worktree_incarnation, observed_unix_ms)
-         values (?1, ?2, 'main', ?2, 'test', 1)",
-        rusqlite::params![id, path],
-    )
-    .unwrap();
 }

@@ -78,7 +78,7 @@ impl KeyInput {
             KeyCode::Char('R') if plain_char(event) => Key::ManageRepos,
             KeyCode::Char('e') if plain_char(event) => Key::EditConfig,
             KeyCode::Char('E') if plain_char(event) => Key::EditUserConfig,
-            KeyCode::Char('w') if plain_char(event) => Key::EditWorktrunkUserConfig,
+            KeyCode::Char('w') if plain_char(event) => Key::EditWorktrunkConfig,
             KeyCode::Char('H') if plain_char(event) => Key::SelectHarness,
             KeyCode::Char('D') if plain_char(event) => Key::Delete,
             KeyCode::Char('U') if plain_char(event) => Key::Unarchive,
@@ -126,7 +126,7 @@ impl KeyInput {
             KeyCode::Char('o') if plain_char(event) => Key::OpenPr,
             KeyCode::Char('v') if plain_char(event) => Key::SubmitReview,
             KeyCode::Char('P') if plain_char(event) => Key::Push,
-            KeyCode::Char('M') if plain_char(event) => Key::ToggleMergeQueue,
+            KeyCode::Char('M') if plain_char(event) => Key::Merge,
             KeyCode::Char('c') if plain_char(event) => Key::CiFix,
             KeyCode::Char('f') if plain_char(event) => Key::ReviewFix,
             KeyCode::Char('R') if plain_char(event) => Key::ResolveAllComments,
@@ -194,7 +194,7 @@ pub enum Key {
     ReviewFix,
     ResolveAllComments,
     Push,
-    ToggleMergeQueue,
+    Merge,
     PullDefault,
     PlanMode,
     Create,
@@ -205,7 +205,7 @@ pub enum Key {
     DeletePermanent,
     EditConfig,
     EditUserConfig,
-    EditWorktrunkUserConfig,
+    EditWorktrunkConfig,
     SelectHarness,
     Search,
     Quit,
@@ -378,14 +378,11 @@ mod tests {
     }
 
     #[test]
-    fn key_input_handles_merge_queue_toggle() {
+    fn key_input_handles_merge() {
         let mut input = KeyInput::default();
         assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
         assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
-        assert_eq!(
-            map(&mut input, shift_key(KeyCode::Char('M'))),
-            Key::ToggleMergeQueue
-        );
+        assert_eq!(map(&mut input, shift_key(KeyCode::Char('M'))), Key::Merge);
     }
 
     #[test]
@@ -433,7 +430,7 @@ mod tests {
         assert_eq!(map(&mut input, key(KeyCode::Char('e'))), Key::EditConfig);
         assert_eq!(
             map(&mut input, key(KeyCode::Char('w'))),
-            Key::EditWorktrunkUserConfig
+            Key::EditWorktrunkConfig
         );
         assert_eq!(
             map(&mut input, shift_key(KeyCode::Char('E'))),

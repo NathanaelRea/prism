@@ -80,6 +80,106 @@ fn provider_implementations_stay_behind_remote_boundary() {
     );
 }
 
+#[test]
+fn remote_domain_boundary_contains_no_database_driver_calls() {
+    fn scan(path: &std::path::Path, violations: &mut Vec<String>) {
+        for entry in std::fs::read_dir(path).expect("read remote source directory") {
+            let path = entry.expect("read remote source entry").path();
+            if path.is_dir() {
+                scan(&path, violations);
+                continue;
+            }
+            if path.file_name().and_then(std::ffi::OsStr::to_str) == Some("tests.rs")
+                || path.extension().and_then(std::ffi::OsStr::to_str) != Some("rs")
+            {
+                continue;
+            }
+            let production = std::fs::read_to_string(&path).expect("read remote source");
+            let production = production
+                .split_once("#[cfg(test)]")
+                .map_or(production.as_str(), |(production, _)| production);
+            let legacy_driver = ["rusi", "qlite"].concat();
+            for driver in [legacy_driver.as_str(), "sqlx::", "SqliteConnection"] {
+                if production.contains(driver) {
+                    violations.push(format!("{}: {driver}", path.display()));
+                }
+            }
+        }
+    }
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/remote");
+    let mut violations = Vec::new();
+    scan(&source, &mut violations);
+    assert!(
+        violations.is_empty(),
+        "remote database boundary violations:\n{}",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn temporary_file_cache_interface_rejects_malformed_json() {
+    let root = std::env::temp_dir().join(format!(
+        "prism-remote-strict-json-{}-{}",
+        std::process::id(),
+        crate::util::stable_hash(std::path::Path::new(&format!(
+            "{:?}",
+            std::time::SystemTime::now()
+        )))
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let repo = crate::repo::Repository::with_config_dir_for_test(root.clone(), root.join("config"));
+    let identity = test_change_request_identity();
+    let summary = PrSummary {
+        number: 42,
+        change_request_identity: Some(identity),
+        native_state_evidence: NativeStateEvidence::default(),
+        title: "Strict persistence".to_string(),
+        author: "author".to_string(),
+        body: String::new(),
+        url: "https://github.com/example/repo/pull/42".to_string(),
+        state: "OPEN".to_string(),
+        review_decision: String::new(),
+        requested_reviewers: Vec::new(),
+        head_ref: "topic".to_string(),
+        base_ref: "main".to_string(),
+        head_sha: "abc123".to_string(),
+        updated_at: String::new(),
+        check_status: String::new(),
+        merge_state_status: String::new(),
+        queue_state: String::new(),
+        comment_count: 0,
+        merged: false,
+        draft: false,
+    };
+    let cache = PrCache::observed(summary, Some(PrDetails::default()));
+    super::store::persist_pr_cache_snapshot(&repo, "topic", &cache).unwrap();
+
+    let path = crate::observability::db_path(&repo);
+    let (_, details) = crate::persistence::remote::load_snapshot(&path, "topic").unwrap();
+    let mut details = details.unwrap();
+    details.comments = "not-json".to_string();
+    crate::persistence::remote::save_details(&path, &details, 1).unwrap();
+
+    let loaded = super::store::load_pr_cache(&repo, "topic");
+    assert!(loaded.summary().is_none());
+    assert!(
+        loaded
+            .display_error()
+            .is_some_and(|error| error.contains("decode pr_details_cache.comments"))
+    );
+
+    details.comments = "[]".to_string();
+    details.pr_number = -1;
+    crate::persistence::remote::save_details(&path, &details, 2).unwrap();
+    let loaded = super::store::load_pr_cache(&repo, "topic");
+    assert!(
+        loaded
+            .display_error()
+            .is_some_and(|error| error.contains("pr_details_cache.pr_number: -1"))
+    );
+    let _ = std::fs::remove_dir_all(root);
+}
+
 fn repository(provider: ProviderKind, host: &str, path: &str) -> RemoteRepositoryId {
     RemoteRepositoryId::new(
         provider,
@@ -381,7 +481,7 @@ fn guarded_merge_requires_exact_identity_head_target_and_open_lifecycle() {
         target_branch: "release/next".to_string(),
         expected_source_sha: "abc123".to_string(),
         method: MergeMethod::Squash,
-        submission_mode: MergeSubmissionMode::Immediate,
+        native_guard: None,
     };
     let mut summary = ChangeRequestSummary {
         change_request: ChangeRequest {

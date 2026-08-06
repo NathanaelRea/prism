@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select state as \"state!\" from notification_session\nwhere worktree_path = ? and branch = ? and incarnation = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "state!",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "c0e04aa6138ce431f96d92ae2d248610e34718c37e993d995ab585177a0cbea3"
+}

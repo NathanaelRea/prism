@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "create trigger reject_policy_refresh before update on repo_policy_cache\nbegin\n  select raise(abort, 'policy refresh rejected');\nend\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "4eb3e9791127bcf6e9dd29dde273e28d4376a8da496784a460a358deb7b423b4"
+}

@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "select branch as \"branch!\", worktree_path, classification\nfrom archived_worktree\norder by archived_unix_ms desc, branch asc\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "branch!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "worktree_path",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "classification",
+        "ordinal": 2,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "a0a937abfee0fec41a59dfbe0f056e0f2922c4f5be740dd0e84515c91986fbd2"
+}

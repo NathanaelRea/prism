@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into event (\n  time_unix_ms, level, target, action, operation_id, parent_operation_id,\n  repo, branch, session, message, data_json\n) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 11
+    },
+    "nullable": []
+  },
+  "hash": "79613cf0e583bf14824a524511364924d35e2f73fc94748ea54149765442e29f"
+}

@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select exists(select 1 from hidden_session where branch = ?) as \"exists!\"\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "exists!",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a65510a2868e8120bf9e30681504b33fc9c5c679b6f4e7210f55fe21065f730c"
+}
