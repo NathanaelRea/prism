@@ -148,19 +148,42 @@ typed inputs through Steps to declared outcomes. It defines dependencies,
 conditions, policies, and required capabilities. An ordered list is shorthand
 for a dependency chain; explicit dependencies can form an acyclic graph.
 
-Bundled planning and end-to-end coding workflows are ordinary Workflow
-Definitions. They use the same execution and history model as user-authored
-definitions.
+Starter planning and end-to-end coding workflows are ordinary Workflow
+Definitions copied from the Standard Pack. They are user-owned after setup and
+use the same execution and history model as any other definition.
 
-### Workflow Component
+A Workflow Definition declares whether it can be launched manually, called as a
+child, used by a Trigger, or some combination. Reusable orchestration is a child
+Workflow Definition with explicit typed input and output bindings; Prism has no
+separate Workflow Component concept. The generalized source contract begins at
+Workflow Definition schema version 2; source migration is explicit and never
+imports Plan Mode or Auto Flow state.
 
-A Workflow Component is a reusable, versioned portion of a Workflow Definition.
-It exposes typed parameters, inputs, and outputs and is included through explicit
-composition rather than positional inheritance.
+### Step Implementation
 
-A Step Implementation is the reusable behavior selected by one Step. Agent
-prompts, commands, provider operations, Gates, and notifications can all have
-built-in or user-defined implementations within their primitive class.
+A Step Implementation is the reusable behavior selected by one Step within its
+kernel-owned primitive class. Implementations can provide Agent, command, Git,
+provider, Gate, input/rendering, Trigger-adapter, and notification behavior.
+
+Step Implementations run as versioned extension executables. Extensions have the
+user's full OS authority; capability declarations disclose and audit expected
+behavior but are not a sandbox. Standard Implementations use Prism's brokered
+host operations for protected effects. A third-party extension can bypass those
+operations, so its direct effects are explicitly unbrokered and do not receive
+Prism's intent, fencing, or reconciliation guarantees.
+
+### Prism Package
+
+A Prism Package is an installable, versioned collection of Workflow Definitions,
+extensions, Artifact schemas, skills, and templates. Packages can be installed
+globally or for a trusted repository from a local path, URL, Git source, or
+GitHub source. Installed files are editable user-owned working copies, while
+Workflow Runs retain immutable content-addressed package and executable revisions.
+
+Package updates compare the previous upstream revision, the local working copy,
+and the incoming revision. They never silently overwrite or resurrect user
+customizations. Package manifests and scope lockfiles begin at schema version 1;
+locks contain only exact sources, revisions, and digests.
 
 ### Trigger
 
@@ -175,8 +198,10 @@ A Workflow Run is one durable execution of a fully resolved Workflow Definition.
 It owns its initial inputs, Definition Snapshot, Steps, attempts, Artifacts,
 decisions, child-run lineage, and aggregate outcome.
 
-A Definition Snapshot is the immutable resolved definition used by one run.
-Changing the source definition does not reinterpret the run or its history.
+A Definition Snapshot is the immutable resolved definition used by one run. It
+pins the complete package, dependency, schema, prompt/template, and extension
+executable closure. Changing or deleting editable source does not reinterpret the
+run or its history.
 
 ### Workflow Step
 
@@ -280,7 +305,7 @@ requeue intent so runnable work cannot be stranded by the release race.
 Change Request Stabilization is the composition of observation, Gate, repair,
 and guarded Action Steps used to move a Change Request toward a declared goal.
 Review, CI, policy, mergeability, and merge-relation evidence remain independent,
-even when a bundled component presents one most useful current blocker.
+even when a Starter child workflow presents one most useful current blocker.
 
 Actionable review feedback means feedback submitted through provider review
 mechanisms, such as review bodies and inline review-thread comments. Top-level

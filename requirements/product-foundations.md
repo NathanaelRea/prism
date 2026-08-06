@@ -68,8 +68,9 @@
   worktree, and deleting a Worktree Session remove those identities from active
   use without silently deleting historical Workflow Runs, attempts, Artifacts,
   or decisions. Worktree deletion is not itself history deletion; independent
-  retention cleanup applies only to eligible archived records, and database
-  migrations preserve retained history.
+  retention cleanup applies only to eligible archived records. Ordinary database
+  migrations preserve retained generalized history; the alpha cutover explicitly
+  deletes Plan Mode and Auto Flow state without importing or converting it.
 
 ## Technology Boundaries
 

@@ -7,9 +7,10 @@
   verification, human decisions, change-request stabilization, merge, and
   cleanup.
 - **Behavior**: Users can define and run multiple named Workflow Definitions for
-  a repository. Plan-oriented and end-to-end coding flows are bundled Workflow
-  Definitions and components, not separate execution engines or run kinds.
-- **Invariant**: A Workflow Definition is declarative, namespaced, typed, and
+  a repository. Plan-oriented and end-to-end coding flows are ordinary,
+  user-owned Workflow Definitions in the Standard Pack, not separate modes,
+  execution engines, or run kinds.
+- **Invariant**: A Workflow Definition is declarative, qualified, typed, and
   versioned. It declares inputs, outputs, Steps, dependencies, conditions,
   policies, and required capabilities without embedding mutable run state.
 - **Invariant**: Every Workflow Run has an identity independent of its trigger,
@@ -20,8 +21,8 @@
   Change Request, review report, or gate observation, without changing the
   identity of the original input.
 - **Customization**: Users can select, parameterize, compose, copy, and replace
-  bundled definitions and components. No built-in workflow order or prompt is a
-  mandatory engine behavior.
+  Standard Pack definitions and Step Implementations. No Standard Pack workflow
+  order or prompt is mandatory engine behavior.
 
 ## Definitions And Composition
 
@@ -55,12 +56,13 @@
   references, input and output types, conditions, bounds, implementation
   availability, target requirements, capability policy, and reachable terminal
   outcomes. Validation errors identify the definition and Step responsible.
-- **Behavior**: Reusable Workflow Components and Step Implementations have
-  versioned typed interfaces. Composition and parameter binding are explicit;
-  Prism does not merge definitions through positional or deep configuration
-  inheritance.
+- **Behavior**: Reusable orchestration is a child Workflow Definition; reusable
+  behavior is a Step Implementation. Both have versioned typed interfaces.
+  Composition and parameter binding are explicit; Prism does not merge
+  definitions through positional or deep configuration inheritance.
 - **Invariant**: Starting a run persists a fully resolved Definition Snapshot,
-  including component and implementation revisions, prompt templates, bound
+  including child-definition, package, implementation executable, schema, and
+  prompt-template revisions, bound
   parameters, conditions, retry and timeout policies, harness and model choices,
   declared capabilities, Admission Policy, execution-target requirements, and
   every reachable Workflow Call target revision and bound call policy.
@@ -76,8 +78,9 @@
   implementations rather than new orchestration semantics.
 - **Behavior**: An Action Step performs bounded work and emits typed Artifacts or
   Step outcomes. Normalized facts are payloads in immutable Artifacts rather than
-  a separate mutable data channel. Built-in and custom Action implementations
-  use the same attempt, capability, cancellation, timeout, and audit contract.
+  a separate mutable data channel. Standard and third-party Action implementations
+  use the same public extension protocol and the same attempt, capability,
+  cancellation, timeout, and audit contract.
 - **Behavior**: An Agent Action invokes one recorded harness, model, prompt
   template, and tool policy with explicit Artifact inputs. Each attempt is
   isolated by default; a definition may explicitly resume a recorded compatible
@@ -91,11 +94,12 @@
 - **Behavior**: A Command Action receives structured arguments, input, working
   scope, environment references, timeout, and expected outputs. Untrusted values
   are not interpolated into shell syntax implicitly.
-- **Invariant**: On a confined Execution Target, Agent and Command Actions can
-  modify only their granted workspace scope directly. Provider writes, push,
-  merge, Git-ref mutation, Worktrunk lifecycle effects, secret delegation, and
-  child-run creation use brokered implementations that persist intent,
-  preconditions, reconciliation identity, and resource claims before dispatch.
+- **Invariant**: Standard protected provider, Git, Worktrunk, secret-delegation,
+  and child-run effects use host operations that persist intent, preconditions,
+  reconciliation identity, and resource claims before dispatch. Extension
+  processes run with the user's full OS authority and can bypass host operations;
+  such direct effects are labeled unbrokered and receive no Prism fencing,
+  intent-first, or reconciliation guarantee.
 - **Invariant**: A Gate Step observes or evaluates evidence and has no mutating
   repair or merge authority. Repair, push, label, merge, and cleanup effects are
   separate Action Steps whose dependencies make the authorization visible.
@@ -122,10 +126,11 @@
   pause and cancel controls apply only to the parent, to its non-detached child
   lineage, or not at all; the default stops new scheduling throughout the
   non-detached lineage.
-- **Customization**: Users can define custom implementations within a primitive
-  class through typed agent templates, commands, or supported extension
-  adapters. An unknown implementation or undeclared required capability fails
-  closed.
+- **Customization**: Users can define implementations within a primitive class
+  through executable extensions using Prism's language-neutral, versioned JSON
+  Lines protocol. Rust is the initial supported SDK; TypeScript and Wasm
+  transports are deferred. An unknown implementation or undeclared required
+  capability fails closed.
 
 ## Runs, Attempts, And Artifacts
 
@@ -202,12 +207,13 @@
 - **Invariant**: A review configured as blocking has a policy Gate bound to the
   exact report revision in merge-readiness dependencies. Action completion means
   only that a report was produced, not that its findings passed.
-- **Behavior**: A bundled second-model review uses an isolated attempt and a
-  model identity distinct from implementation and self-review. If a user chooses
-  the same model, Prism describes it as an additional same-model review rather
-  than claiming independent second-model evidence.
-- **Customization**: Bundled Gate implementations provide default observation
-  and prompt templates, policies, polling, deadlines, and evidence renderers.
+- **Behavior**: The Standard Pack's second-model review uses an isolated attempt
+  and a model identity distinct from implementation and self-review. If a user
+  chooses the same model, Prism describes it as an additional same-model review
+  rather than claiming independent second-model evidence.
+- **Customization**: Standard Pack Gate implementations provide default
+  observation and prompt templates, policies, polling, deadlines, and evidence
+  renderers.
   Users can change settings, replace templates, or define compatible custom
   implementations.
 
@@ -324,8 +330,9 @@
 - **Constraint**: Once an admitted Agent Action is allowed, its Harness remains
   the command- and tool-level sandbox and approval authority inside the granted
   workspace. Prism records the selected Harness policy but does not treat prompt
-  text, agent output, or a Gate result as permission to bypass it or invoke a
-  protected brokered effect.
+  text, agent output, or a Gate result as authority for a Standard brokered
+  effect. Prism does not claim that capability declarations sandbox an arbitrary
+  full-trust extension.
 - **Behavior**: A target that cannot technically confine an Agent or Command to
   its declared grant is visibly unconfined. Its capability grant is disclosure,
   not technical enforcement, and trusting it admits the exact implementation's
@@ -422,19 +429,19 @@
   multi-user authorization, and server deployment are not required by the local
   product contract.
 
-## Bundled Workflows
+## Standard Pack Workflows
 
-- **Behavior**: Prism ships versioned components for planning, plan approval,
-  implementation, local verification, self-review, second-model review,
-  change-request creation, review and CI observation, bounded repair, merge
-  readiness, merge, and cleanup.
-- **Behavior**: The bundled plan-oriented workflow can select or create a Plan
-  Artifact, optionally request evidence-bound approval, and implement its phases
-  sequentially or through explicit dependency-safe parallel child runs.
-- **Behavior**: The bundled end-to-end coding workflow composes the same public
-  components. Users can reorder independent Gates, insert security or human
-  review, change models and prompts, remove optional Steps, alter policies, or
-  replace the definition entirely.
+- **Behavior**: Prism ships ordinary, editable Workflow Definitions and extension
+  implementations for planning, plan approval, implementation, local
+  verification, self-review, second-model review, change-request creation,
+  review and CI observation, bounded repair, merge readiness, merge, and cleanup.
+- **Behavior**: The Standard Pack plan-oriented workflow can select or create a
+  Plan Artifact, optionally request evidence-bound approval, and implement its
+  phases sequentially or through explicit dependency-safe parallel child runs.
+- **Behavior**: The Standard Pack end-to-end coding workflow composes child
+  Workflow Definitions and public Step Implementations. Users can reorder
+  independent Gates, insert security or human review, change models and prompts,
+  remove optional Steps, alter policies, or replace the definition entirely.
 - **Invariant**: A Plan is an Artifact consumed by Steps, not a nested execution
   engine. Its validated phase manifest has stable phase identities,
   dependencies, inputs, and bounds. Dynamic phase fan-out creates child runs
@@ -450,11 +457,12 @@
 
 ## Authoring And Operations
 
-- **Customization**: Workflow, component, Step Implementation, Trigger, and
-  Admission Policy definitions can live in the user's Prism configuration or in
-  an explicitly trusted repository-owned Prism configuration location.
-- **Invariant**: Built-in, global, and repository definitions have explicit
-  namespaces and revisions. Name collisions never silently replace a referenced
+- **Customization**: Workflow Definitions, Step Implementations, Triggers,
+  packages, skills, templates, and Admission Policies can live globally or in an
+  explicitly trusted repository-owned Prism configuration location.
+- **Invariant**: Standard Pack, global, and repository resources have explicit
+  qualified identities and revisions. Scope does not shadow identity; collisions
+  are errors and never silently replace a referenced
   definition or rewrite a Trigger selector; an explicitly floating selector may
   resolve a newer revision only according to its recorded policy.
 - **Behavior**: Prism publishes a schema and generates useful commented examples

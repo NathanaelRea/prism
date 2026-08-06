@@ -2,19 +2,21 @@
 
 ## Configuration Experience
 
-- **Behavior**: `E` edits and reloads global settings, distinct from `e` editing
-  the selected repository's settings.
-- **Behavior**: `w` discovers the Worktrunk user configuration through
-  machine-readable Worktrunk output, offers to create a missing file through
-  Worktrunk, and opens it in the user's editor after explaining that changes
-  affect Prism and standalone `wt`. Prism does not parse or write this file.
+- **Behavior**: `Space c` opens one configuration tree containing global Prism
+  settings, selected-repository settings, tracked repositories and keybindings,
+  Worktrunk configuration, worktree columns, and Harness selection. Direct `e`,
+  `E`, `R`, `w`, and `H` configuration bindings are not supported.
+- **Behavior**: The Worktrunk configuration destination is discovered through
+  machine-readable Worktrunk output, offers creation through Worktrunk when
+  missing, and explains that changes affect Prism and standalone `wt`. Prism
+  does not parse or write this file.
 - **Invariant**: Effective repository configuration applies built-in defaults,
   then global settings, then repository settings. Unspecified repository values
   inherit their effective global values.
-- **Invariant**: Workflow Definitions, Components, Step Implementations,
-  Triggers, and Admission Policies use explicit namespaced references and
-  composition. The ordinary settings precedence above never deep-merges or
-  silently replaces one of those definitions.
+- **Invariant**: Workflow Definitions, Step Implementations, packages, Triggers,
+  and Admission Policies use explicit qualified references and composition. The
+  ordinary settings precedence above never deep-merges, shadows, or silently
+  replaces one of those resources.
 - **Behavior**: Initial terminal presentation setup explains and offers Nerd Font
   icons or a Unicode fallback. It does not claim to detect font support
   automatically.
@@ -88,9 +90,9 @@
   compose them into Action and Gate implementations. Commands run in the
   declared repository or worktree scope, stop according to explicit policy, and
   emit typed verification Artifacts.
-- **Behavior**: Bundled workflows provide useful local-verification and
-  merge-conflict components, but no command-set name such as pre-push, pre-PR, or
-  review-fix has hard-coded orchestration meaning.
+- **Behavior**: Standard Pack workflows provide useful local-verification and
+  merge-conflict Step Implementations, but no command-set name such as pre-push,
+  pre-PR, or review-fix has hard-coded orchestration meaning.
 - **Behavior**: An empty verification implementation is reported explicitly and
   follows the resolved Gate policy; absence is not silently represented as a
   passing check.

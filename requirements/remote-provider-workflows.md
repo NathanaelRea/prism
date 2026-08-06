@@ -67,9 +67,9 @@
   Definition. Manual merge is refused for a dirty worktree and runs its
   configured safety Gates.
 - **Behavior**: Board commands for push, change-request creation, and manual merge
-  launch named bundled Workflow Definitions that compose the corresponding
-  components, so their safety Gates, attempts, effects, and recovery use the same
-  history and control model as triggered work.
+  launch named Standard Pack Workflow Definitions that compose child definitions
+  and public Step Implementations, so their safety Gates, attempts, effects, and
+  recovery use the same history and control model as triggered work.
 - **Invariant**: Automatic merge uses a provider-enforced exact-head precondition
   and authoritative repository policy when available. If the provider cannot
   close the race between observation and mutation, the merge fails closed or
