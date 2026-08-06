@@ -20,8 +20,8 @@ use super::super::{
     PrSummarySessionResult, TmuxPortalCapture, TmuxPortalResult, TmuxPortalSnapshot, Tui,
 };
 use super::support::{
-    test_auto_run, test_config, test_plan_run_with_steps, test_pr_summary, test_session,
-    unique_temp_dir,
+    test_auto_run, test_change_request_identity, test_config, test_plan_run_with_steps,
+    test_pr_summary, test_session, unique_temp_dir,
 };
 
 #[test]
@@ -139,7 +139,9 @@ fn remote_review_update_replans_auto_flow_and_refreshes_worktree_status() {
         .insert("git".to_string(), git.display().to_string());
     let mut session = test_session(0, &temp.display().to_string(), "feature");
     session.status_label = "clean".to_string();
+    let identity = test_change_request_identity(crate::remote::ProviderKind::GitHub);
     let mut requested_changes = test_pr_summary(false);
+    requested_changes.change_request_identity = Some(identity.clone());
     requested_changes.review_decision = "CHANGES_REQUESTED".to_string();
     requested_changes.check_status = "passed".to_string();
     session.pr = PrCache::observed(
@@ -160,8 +162,9 @@ fn remote_review_update_replans_auto_flow_and_refreshes_worktree_status() {
     run.run.repo_root = temp.display().to_string();
     run.run.branch = "feature".to_string();
     run.run.stabilization_blocker = Some(StabilizationBlocker::ReviewFeedbackFound);
-    crate::observability::with_writable_db(&repo, |conn| {
-        crate::auto_flow::save_auto_run(conn, &mut run)
+    crate::observability::with_writable_db(&repo, |path| {
+        let store = crate::auto_flow::AutoFlowStore::open(path);
+        crate::auto_flow::save_auto_run(&store, &mut run)
     })
     .unwrap();
     tui.remember_auto_run(run);
@@ -171,6 +174,7 @@ fn remote_review_update_replans_auto_flow_and_refreshes_worktree_status() {
     let poll_started_at = Instant::now();
     tui.sessions[0].pr.begin_summary_poll(poll_started_at);
     let mut approved = test_pr_summary(false);
+    approved.change_request_identity = Some(identity);
     approved.review_decision = "APPROVED".to_string();
     approved.check_status = "passed".to_string();
     tui.pr_poll_tx
@@ -284,10 +288,11 @@ fn repeated_dashboard_rendering_uses_only_cached_output() {
     let scope_path = session.path.clone();
     let mut run = test_plan_run_with_steps("plan", &scope_path.display().to_string(), 1);
     run.run.repo_root = temp.display().to_string();
-    crate::observability::with_writable_db(&repo, |conn| {
-        crate::plan_run::save_plan_run(conn, &run)?;
+    crate::observability::with_writable_db(&repo, |path| {
+        let store = crate::plan_run::PlanRunStore::open(path);
+        crate::plan_run::save_plan_run(&store, &run)?;
         crate::plan_run::append_output_line(
-            conn,
+            &store,
             &PlanOutputLine {
                 run_id: "plan".to_string(),
                 step: 1,
@@ -336,14 +341,8 @@ fn repeated_dashboard_rendering_uses_only_cached_output() {
 fn returning_from_tmux_does_not_wait_for_worktree_refresh() {
     let temp = unique_temp_dir("prism-tmux-return-refresh-test");
     let worktree = temp.join("feature");
-    let git_dir = temp.join("gitdir");
     fs::create_dir_all(&worktree).unwrap();
-    fs::create_dir_all(&git_dir).unwrap();
-    fs::write(
-        worktree.join(".git"),
-        format!("gitdir: {}\n", git_dir.display()),
-    )
-    .unwrap();
+    fs::write(worktree.join(".git"), "gitdir: /tmp/gitdir\n").unwrap();
     let git = temp.join("git");
     let refresh_gate = temp.join("allow-refresh");
     fs::write(
@@ -497,10 +496,12 @@ fn workflow_database_writer_does_not_block_tmux_portal_polling() {
     tui.refresh_worktree_harness_configs();
     let slot = AgentSessionSlot::for_repository_session(&tui.repos[0].identity, &tui.sessions[0]);
     tui.tmux_generations.insert(slot, 0);
-    let blocker = rusqlite::Connection::open(crate::observability::db_path(&repo)).unwrap();
-    blocker
-        .execute_batch("begin exclusive transaction")
-        .unwrap();
+    let mut blocker = crate::persistence::database::TestConnection::open_writable(
+        &crate::observability::db_path(&repo),
+    )
+    .unwrap();
+    // Transaction mechanics belong to the test harness rather than a domain SQL file.
+    blocker.execute_batch("begin exclusive").unwrap();
 
     let started = Instant::now();
     tui.tick_tui_action_jobs();

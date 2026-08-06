@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into startup_phase (\n  run_id, phase, time_started_unix_ms, time_finished_unix_ms, status, error\n) values (?, ?, ?, ?, ?, ?)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "f73752374546c8c2232f429e1dffd210bf648155804452b77d67c7b293f814a5"
+}

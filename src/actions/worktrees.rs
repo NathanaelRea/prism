@@ -354,7 +354,7 @@ impl Tui {
             return Ok(false);
         }
         let Some(initial_prompt) =
-            self.text_area_dialog(raw, "Create Session", "Initial prompt (optional):\n", "")?
+            self.prompt_line_dialog(raw, "Create Session", "Initial prompt (optional): ", "")?
         else {
             return Ok(false);
         };

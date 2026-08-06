@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "select prompt_summary, classification, visibility\nfrom task_metadata\nwhere branch = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "prompt_summary",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "classification",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "visibility",
+        "ordinal": 2,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "b79fdec53ce3a6d17b862d106a3578908214721179dbfaf0b6789f78896ee8ed"
+}

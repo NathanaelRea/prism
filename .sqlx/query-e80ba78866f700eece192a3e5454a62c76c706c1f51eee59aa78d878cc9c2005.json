@@ -1,0 +1,80 @@
+{
+  "db_name": "SQLite",
+  "query": "select repo_root, harness_id, branch, worktree_path, server_port, server_url,\n       server_pid, opencode_session_id, generation, updated_unix_ms,\n       server_start_time_ticks\nfrom opencode_runtime\nwhere repo_root = ? and harness_id = ? and branch = ? and worktree_path = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "repo_root",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "harness_id",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "branch",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "worktree_path",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "server_port",
+        "ordinal": 4,
+        "type_info": "Integer"
+      },
+      {
+        "name": "server_url",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "server_pid",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "opencode_session_id",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "generation",
+        "ordinal": 8,
+        "type_info": "Integer"
+      },
+      {
+        "name": "updated_unix_ms",
+        "ordinal": 9,
+        "type_info": "Integer"
+      },
+      {
+        "name": "server_start_time_ticks",
+        "ordinal": 10,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "e80ba78866f700eece192a3e5454a62c76c706c1f51eee59aa78d878cc9c2005"
+}

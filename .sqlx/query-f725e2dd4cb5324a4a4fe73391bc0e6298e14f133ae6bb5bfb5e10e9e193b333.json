@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "select\n  version as \"version!: i64\",\n  description as \"description!: String\",\n  success as \"success!: bool\",\n  hex(checksum) as \"checksum!: String\"\nfrom _sqlx_migrations\norder by version\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "version!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "description!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "success!: bool",
+        "ordinal": 2,
+        "type_info": "Bool"
+      },
+      {
+        "name": "checksum!: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "f725e2dd4cb5324a4a4fe73391bc0e6298e14f133ae6bb5bfb5e10e9e193b333"
+}

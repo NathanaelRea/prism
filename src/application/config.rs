@@ -69,13 +69,38 @@ fzf = "fzf"
 # provider = "forgejo"
 # credential_env = "FORGEJO_TOKEN" # variable name only; never put a token here
 
-# Workflow orchestration belongs in definitions under ~/.config/prism/workflows
-# or .prism/workflows. Run `prism config migrate-workflows` before upgrading
-# configurations that still contain [auto] or checks.pre_pr/pre_push/review_fix.
-# This legacy prompt key remains shown so older files have an actionable,
-# representable migration source; bundled Workflows do not read it after cutover.
+[checks]
+pre_pr = []
+pre_push = []
+review_fix = []
+
+[auto]
+merge = false
+cleanup_after_merge = false
+require_review_approval = false
+push_initial = true
+push_repairs = false
+review_wait_enabled = true
+review_reviewer_identities = ["Copilot", "github-copilot"]
+review_max_wait_seconds = 300
+review_poll_interval_seconds = 30
+review_continue_on_timeout = true
+ci_wait_enabled = true
+ci_max_wait_seconds = 1800
+ci_poll_interval_seconds = 30
+
 [prompt_templates]
+auto_create_plan = "Create an implementation plan at `{{plan_path}}`. Do not implement or commit. Include phases, tests, verification, risks, observability, and architecture fit.\n\nTask:\n{{task}}\n\nMode: {{mode}}\nVariant: {{variant}}\nAgent profile: {{agent_profile}}"
+auto_review_plan = "Review `{{plan_path}}` and edit it in place. Do not implement or commit. Check phases, risks, tests, observability, restartability, safety, and architecture fit.\n\nTask:\n{{task}}"
 auto_implement = "Implement this task in the current worktree. Stop after implementation; do not commit, push, create a pull request, or merge.\n\nTask:\n{{task}}"
+auto_fix_local_verify = "Fix the local verification failures, then stop without committing.\n\nOriginal task:\n{{task}}\n\nFailure context:\n{{context}}"
+auto_fix_review = "Resolve the review feedback, then stop without committing.\n\nOriginal task:\n{{task}}\n\nReview context:\n{{context}}"
+auto_fix_ci = "Fix the CI failure, then stop without committing.\n\nOriginal task:\n{{task}}\n\nCI context:\n{{context}}"
+review_fix = "Here are review comments on PR {pr_number}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n{comments}"
+ci_failure = "Here are CI failures on PR {pr_number}.\n\nFix the failing checks. Use the log tails below as the primary clues.\n\nPR: {url}\nBranch: {branch}\nHead SHA: {head_sha}\n\n---\n\n{failures}"
+repair_commit_review = "fix: cr"
+repair_commit_ci = "fix: ci"
+repair_commit_merge = "fix: merge"
 "#
 }
 
@@ -104,7 +129,7 @@ pub struct Checks {
 pub struct AutoConfig {
     pub merge: bool,
     pub cleanup_after_merge: bool,
-    pub review_requirement: ReviewRequirement,
+    pub require_review_approval: bool,
     pub push_initial: bool,
     pub push_repairs: bool,
     pub review_wait_enabled: bool,
@@ -115,33 +140,6 @@ pub struct AutoConfig {
     pub ci_wait_enabled: bool,
     pub ci_max_wait_seconds: u64,
     pub ci_poll_interval_seconds: u64,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum ReviewRequirement {
-    None,
-    #[default]
-    Resolved,
-    Approved,
-}
-
-impl ReviewRequirement {
-    pub fn parse(value: &str) -> Option<Self> {
-        match value.trim() {
-            "none" => Some(Self::None),
-            "resolved" => Some(Self::Resolved),
-            "approved" => Some(Self::Approved),
-            _ => None,
-        }
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::None => "none",
-            Self::Resolved => "resolved",
-            Self::Approved => "approved",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -195,8 +193,8 @@ impl Default for AutoConfig {
     fn default() -> Self {
         Self {
             merge: false,
-            cleanup_after_merge: true,
-            review_requirement: ReviewRequirement::Resolved,
+            cleanup_after_merge: false,
+            require_review_approval: false,
             push_initial: true,
             push_repairs: false,
             review_wait_enabled: true,
@@ -362,8 +360,6 @@ struct RawChecks {
 struct RawAutoConfig {
     merge: Option<bool>,
     cleanup_after_merge: Option<bool>,
-    review_requirement: Option<String>,
-    // Accepted while shipped configurations migrate to review_requirement.
     require_review_approval: Option<bool>,
     push_initial: Option<bool>,
     push_repairs: Option<bool>,
@@ -535,21 +531,6 @@ fn validate_config_values(raw: &RawConfig, is_user_config: bool) -> Result<(), S
     {
         return Err(format!("ui.icon_style has unsupported value '{value}'"));
     }
-    if let Some(auto) = &raw.auto {
-        if auto.review_requirement.is_some() && auto.require_review_approval.is_some() {
-            return Err(
-                "auto.review_requirement and auto.require_review_approval cannot both be set"
-                    .to_string(),
-            );
-        }
-        if let Some(value) = auto.review_requirement.as_deref()
-            && ReviewRequirement::parse(value).is_none()
-        {
-            return Err(format!(
-                "auto.review_requirement has unsupported value '{value}'"
-            ));
-        }
-    }
     if let Some(harnesses) = &raw.harnesses {
         for (id, harness) in harnesses {
             harness_config_from_raw(id, harness.clone())?;
@@ -630,25 +611,6 @@ pub(crate) fn update_config_file(
         Ok(((), replacement))
     })
     .map_err(|error| error.to_string())
-}
-
-fn workflow_cutover_complete() -> bool {
-    let path = prism_config_dir().join("workflow.db");
-    if !path.exists() {
-        return false;
-    }
-    rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .and_then(|conn| {
-        conn.query_row(
-            "select exists(select 1 from sqlite_master where type='table' and name='workflow_cutover' and exists(select 1 from workflow_cutover where id=1))",
-            [],
-            |row| row.get::<_, bool>(0),
-        )
-    })
-    .unwrap_or(false)
 }
 
 impl Config {
@@ -751,20 +713,6 @@ impl Config {
                 return;
             }
         };
-        if workflow_cutover_complete()
-            && (raw.auto.is_some()
-                || raw.checks.as_ref().is_some_and(|checks| {
-                    checks.pre_pr.is_some()
-                        || checks.pre_push.is_some()
-                        || checks.review_fix.is_some()
-                }))
-        {
-            self.config_errors.push(format!(
-                "{} uses legacy [auto] or checks.pre_pr/pre_push/review_fix orchestration after Workflow cutover; run `prism config migrate-workflows` and move the settings into explicit Workflow definitions",
-                path.display()
-            ));
-            return;
-        }
         if raw.default_agent.is_some() || raw.agents.is_some() {
             self.config_errors.push(format!(
                 "{} uses obsolete default_agent/[agents.*] settings; replace them with default_harness/[harnesses.*]",
@@ -867,15 +815,8 @@ impl Config {
             if let Some(enabled) = auto.cleanup_after_merge {
                 self.auto.cleanup_after_merge = enabled;
             }
-            if let Some(value) = auto.review_requirement {
-                self.auto.review_requirement = ReviewRequirement::parse(&value)
-                    .expect("review requirement was validated before applying config");
-            } else if let Some(enabled) = auto.require_review_approval {
-                self.auto.review_requirement = if enabled {
-                    ReviewRequirement::Approved
-                } else {
-                    ReviewRequirement::Resolved
-                };
+            if let Some(enabled) = auto.require_review_approval {
+                self.auto.require_review_approval = enabled;
             }
             if let Some(enabled) = auto.push_initial {
                 self.auto.push_initial = enabled;
@@ -1415,8 +1356,8 @@ pub fn print_config(repo: &Repository, config: &Config) {
         config.auto.cleanup_after_merge
     );
     println!(
-        "auto.review_requirement = {}",
-        config.auto.review_requirement.label()
+        "auto.require_review_approval = {}",
+        config.auto.require_review_approval
     );
     println!("auto.push_initial = {}", config.auto.push_initial);
     println!("auto.push_repairs = {}", config.auto.push_repairs);
@@ -1615,55 +1556,6 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
             }
         }
         Err(error) => println!("worktrees: {error}"),
-    }
-
-    println!();
-    let definitions = crate::definition::DefinitionCatalog::discover(Some(&repo.root)).list();
-    match definitions {
-        Ok(definitions) => {
-            println!(
-                "workflow definitions: {} (invalid={} trust_required={})",
-                definitions.len(),
-                definitions
-                    .iter()
-                    .filter(|definition| !definition.valid)
-                    .count(),
-                definitions
-                    .iter()
-                    .filter(|definition| definition.trust_required)
-                    .count(),
-            );
-        }
-        Err(error) => println!("workflow definitions: unavailable: {error}"),
-    }
-    match crate::run::RunLedger::user().and_then(|ledger| ledger.health()) {
-        Ok(health) => {
-            println!(
-                "workflow database: {} active_leases={} dangling_claims={} quarantined={} overdue_waits={} recovery_required={} unresolved_effects={} enabled_triggers={}",
-                if health.integrity_ok {
-                    "ok"
-                } else {
-                    "problems"
-                },
-                health.active_leases,
-                health.dangling_claims,
-                health.quarantined_workspaces,
-                health.overdue_waits,
-                health.recovery_required_attempts,
-                health.unresolved_effects,
-                health.enabled_triggers,
-            );
-            for target in health.target_descriptors {
-                println!(
-                    "execution target: {} local={} confined={} continuation={}",
-                    target.id, target.local, target.confined, target.supports_continuation
-                );
-            }
-            for problem in health.problems {
-                println!("workflow problem: {problem}");
-            }
-        }
-        Err(error) => println!("workflow database: unavailable: {error}"),
     }
 
     Ok(())
@@ -2124,63 +2016,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_review_requirement() {
-        for (value, expected) in [
-            ("none", ReviewRequirement::None),
-            ("resolved", ReviewRequirement::Resolved),
-            ("approved", ReviewRequirement::Approved),
-        ] {
-            let raw = parse_and_validate_config(
-                &format!("[auto]\nreview_requirement = \"{value}\"\n"),
-                true,
-            )
-            .unwrap();
-            let mut config = Config::defaults(
-                PathBuf::from("/tmp/user.toml"),
-                PathBuf::from("/tmp/repo.toml"),
-            );
-
-            config.apply_raw_config(raw, true);
-
-            assert_eq!(config.auto.review_requirement, expected);
-        }
-    }
-
-    #[test]
-    fn rejects_unknown_review_requirement() {
-        let error = parse_and_validate_config("[auto]\nreview_requirement = \"comments\"\n", true)
-            .unwrap_err();
-
-        assert!(
-            error
-                .to_string()
-                .contains("auto.review_requirement has unsupported value 'comments'")
-        );
-    }
-
-    #[test]
-    fn legacy_review_approval_setting_maps_to_review_requirement() {
-        for (value, expected) in [
-            (false, ReviewRequirement::Resolved),
-            (true, ReviewRequirement::Approved),
-        ] {
-            let raw = parse_and_validate_config(
-                &format!("[auto]\nrequire_review_approval = {value}\n"),
-                true,
-            )
-            .unwrap();
-            let mut config = Config::defaults(
-                PathBuf::from("/tmp/user.toml"),
-                PathBuf::from("/tmp/repo.toml"),
-            );
-
-            config.apply_raw_config(raw, true);
-
-            assert_eq!(config.auto.review_requirement, expected);
-        }
-    }
-
-    #[test]
     fn defaults_to_opencode_json_run_backend() {
         let config = Config::defaults(
             PathBuf::from("/tmp/user.toml"),
@@ -2208,7 +2043,6 @@ mod tests {
         assert_eq!(config.opencode_port_span, 1_000);
         assert!(!config.opencode_shutdown_owned_servers);
         assert!(!config.opencode_plan_plugin);
-        assert!(config.auto.cleanup_after_merge);
         assert!(config.is_default_branch("main"));
         assert_eq!(
             config.agent_command("opencode"),

@@ -117,8 +117,6 @@ struct GithubPullRequest {
         deserialize_with = "deserialize_merge_queue_entry"
     )]
     merge_queue_entry: GithubMergeQueueObservation,
-    #[serde(default, rename = "autoMergeRequest")]
-    auto_merge_request: Option<GithubAutoMergeRequest>,
     #[serde(default)]
     merged: Option<bool>,
     #[serde(default, rename = "mergedAt")]
@@ -131,12 +129,6 @@ struct GithubPullRequest {
 struct GithubMergeQueueEntry {
     #[serde(default)]
     state: String,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct GithubAutoMergeRequest {
-    #[serde(default, rename = "enabledAt")]
-    _enabled_at: String,
 }
 
 #[derive(Debug, Default)]
@@ -960,7 +952,7 @@ pub(crate) fn refresh_repo_policy_cache_for_repository(
                     canonical_host: Some(repository.host().to_string()),
                     project_path: Some(repository.project_path().to_string()),
                     target_branch: Some(target_branch.to_string()),
-                    identity_complete: false,
+                    identity_complete: true,
                     refreshed_unix_ms: unix_seconds().max(0) as u64,
                     error: Some(error),
                     ..RepoPolicyCache::default()
@@ -1109,11 +1101,11 @@ fn fetch_repo_policy(
 
     Ok(RepoPolicyCache {
         repo_remote: repository.project_path().to_string(),
-        provider: None,
-        canonical_host: None,
-        project_path: None,
+        provider: Some(repository.provider()),
+        canonical_host: Some(repository.host().to_string()),
+        project_path: Some(repository.project_path().to_string()),
         target_branch: Some(target_branch.to_string()),
-        identity_complete: false,
+        identity_complete: true,
         default_branch: Some(target_branch.to_string()),
         required_approvals: facts.required_approvals,
         require_conversation_resolution: facts.require_conversation_resolution,
@@ -1494,9 +1486,6 @@ query($owner: String!, $name: String!, $headRefName: String, $endCursor: String)
         mergeQueueEntry {
           state
         }
-        autoMergeRequest {
-          enabledAt
-        }
         merged
         isDraft
         comments {
@@ -1577,9 +1566,6 @@ query($owner: String!, $name: String!, $number: Int!) {
       mergeStateStatus
       mergeQueueEntry {
         state
-      }
-      autoMergeRequest {
-        enabledAt
       }
       merged
       isDraft
@@ -1821,16 +1807,10 @@ fn pr_summary_from_node(
     repository: Option<&crate::remote::RemoteRepositoryId>,
 ) -> Option<PrSummary> {
     let number = node.number?;
-    let queue_evidence = match (&node.merge_queue_entry, node.auto_merge_request.is_some()) {
-        (GithubMergeQueueObservation::NotObserved, false) => Vec::new(),
-        (GithubMergeQueueObservation::NotQueued, false) => vec!["null".to_string()],
-        (
-            GithubMergeQueueObservation::NotObserved | GithubMergeQueueObservation::NotQueued,
-            true,
-        ) => {
-            vec!["auto_merge".to_string()]
-        }
-        (GithubMergeQueueObservation::Entry(entry), _) => vec![entry.state.clone()],
+    let queue_evidence = match &node.merge_queue_entry {
+        GithubMergeQueueObservation::NotObserved => Vec::new(),
+        GithubMergeQueueObservation::NotQueued => vec!["null".to_string()],
+        GithubMergeQueueObservation::Entry(entry) => vec![entry.state.clone()],
     };
     Some(PrSummary {
         number,
@@ -1871,17 +1851,13 @@ fn pr_summary_from_node(
         updated_at: node.updated_at.clone(),
         check_status: check_status_for_pr(node),
         merge_state_status: node.merge_state_status.clone(),
-        queue_state: match (&node.merge_queue_entry, node.auto_merge_request.is_some()) {
-            (GithubMergeQueueObservation::NotObserved, false) => "unknown".to_string(),
-            (GithubMergeQueueObservation::NotQueued, false) => "not_queued".to_string(),
-            (
-                GithubMergeQueueObservation::NotObserved | GithubMergeQueueObservation::NotQueued,
-                true,
-            ) => "queued".to_string(),
-            (GithubMergeQueueObservation::Entry(entry), _) if !entry.state.trim().is_empty() => {
+        queue_state: match &node.merge_queue_entry {
+            GithubMergeQueueObservation::NotObserved => "unknown".to_string(),
+            GithubMergeQueueObservation::NotQueued => "not_queued".to_string(),
+            GithubMergeQueueObservation::Entry(entry) if !entry.state.trim().is_empty() => {
                 entry.state.clone()
             }
-            (GithubMergeQueueObservation::Entry(_), _) => "unknown".to_string(),
+            GithubMergeQueueObservation::Entry(_) => "unknown".to_string(),
         },
         comment_count: node.comments.total_count + node.review_threads.total_count,
         merged: merged_status_from_node(node),

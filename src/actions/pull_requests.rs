@@ -66,14 +66,12 @@ fn remote_pr_choice_label(summary: &crate::remote::PrSummary) -> String {
     )
 }
 
-#[allow(dead_code)]
 fn session_for_remote_action(session: &crate::session::Session) -> crate::session::Session {
     crate::session::Session {
         repo_index: session.repo_index,
         repo_label: session.repo_label.clone(),
         repo_key: session.repo_key,
         path: session.path.clone(),
-        worktree_session_id: session.worktree_session_id.clone(),
         incarnation: session.incarnation.clone(),
         path_display: session.path_display.clone(),
         branch: session.branch.clone(),
@@ -779,87 +777,106 @@ impl Tui {
         repair: crate::auto_flow::stabilization_execute::StandaloneRepair,
     ) -> Result<bool, String> {
         let session_path = self.sessions[selected].path.clone();
-        let session_branch = self.sessions[selected].branch.clone();
-        let mut persisted = if let Some(run_id) = self.active_auto_runs.get(&session_path).cloned()
+        #[cfg(not(test))]
         {
-            crate::observability::with_writable_db(repo, |conn| load_auto_run(conn, &run_id))?
-                .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?
-        } else {
-            let initial_prompt = crate::session::load_task_initial_prompt(repo, &session_branch)?
-                .filter(|prompt| !prompt.trim().is_empty())
-                .or_else(|| {
-                    let summary = self.sessions[selected].prompt_summary.trim();
-                    (!summary.is_empty()).then(|| summary.to_string())
-                })
-                .unwrap_or_else(|| format!("Repair PR branch {session_branch}"));
-            let launch = AutoLaunch::with_options(
-                &repo.root,
-                &session_path,
-                AutoLaunchOptions {
-                    branch: session_branch.clone(),
-                    mode: AutoRunMode::Standard,
-                    implementation_source: AutoImplementationSource::Prompt,
-                    plan_path: None,
-                    plan_run_mode: PlanRunMode::Sequential,
-                    variant: "repair".to_string(),
-                    agent_profile: None,
-                    initial_prompt,
-                },
-            )?
-            .with_worktree_session_id(self.sessions[selected].worktree_session_id.clone())
-            .with_harness(
-                config.default_harness.clone(),
-                config.harness_adapter(&config.default_harness)?,
-            );
-            let mut run = launch.create_run();
-            run.steps.clear();
-            run.run.pr_number = self.sessions[selected]
-                .pr
-                .summary()
-                .map(|summary| summary.number);
-            run.run.pr_url = self.sessions[selected]
-                .pr
-                .summary()
-                .map(|summary| summary.url.clone());
-            run.run.current_head_sha = crate::git::current_head_sha(&session_path, config).ok();
-            run
-        };
-
-        let queue = crate::observability::with_writable_db(repo, |conn| {
-            crate::auto_flow::stabilization_execute::queue_standalone_repair(
-                conn,
-                &mut persisted,
-                repair,
-            )
-        })?;
-        let selected_step = match queue {
-            crate::auto_flow::stabilization_execute::StandaloneRepairQueue::Queued(step_id)
-            | crate::auto_flow::stabilization_execute::StandaloneRepairQueue::AlreadyPending(
-                step_id,
-            ) => step_id,
-        };
-        self.remember_auto_run(persisted.clone());
-        self.selected_auto_step_by_run
-            .insert(persisted.run.id.clone(), selected_step);
-        self.selected_auto_run = Some(persisted.run.id.clone());
+            crate::worker::launch_bundled_coding(crate::workflow::bundled::BundledCodingLaunch {
+                repository: repo.root.display().to_string(),
+                worktree_path: session_path,
+                task: repair.prompt().to_string(),
+                plan_path: None,
+                draft_plan: false,
+                harness_id: config.default_harness.clone(),
+                variant: Some("repair".into()),
+            })?;
+            Ok(true)
+        }
         #[cfg(test)]
-        if self.prompt_submissions.is_some() {
-            return Ok(matches!(
+        {
+            let session_branch = self.sessions[selected].branch.clone();
+            let mut persisted = if let Some(run_id) =
+                self.active_auto_runs.get(&session_path).cloned()
+            {
+                crate::observability::with_writable_db(repo, |path| {
+                    load_auto_run(&AutoFlowStore::open(path), &run_id)
+                })?
+                .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?
+            } else {
+                let initial_prompt =
+                    crate::session::load_task_initial_prompt(repo, &session_branch)?
+                        .filter(|prompt| !prompt.trim().is_empty())
+                        .or_else(|| {
+                            let summary = self.sessions[selected].prompt_summary.trim();
+                            (!summary.is_empty()).then(|| summary.to_string())
+                        })
+                        .unwrap_or_else(|| format!("Repair PR branch {session_branch}"));
+                let launch = AutoLaunch::with_options(
+                    &repo.root,
+                    &session_path,
+                    AutoLaunchOptions {
+                        branch: session_branch.clone(),
+                        mode: AutoRunMode::Standard,
+                        implementation_source: AutoImplementationSource::Prompt,
+                        plan_path: None,
+                        plan_run_mode: PlanRunMode::Sequential,
+                        variant: "repair".to_string(),
+                        agent_profile: None,
+                        initial_prompt,
+                    },
+                )?
+                .with_harness(
+                    config.default_harness.clone(),
+                    config.harness_adapter(&config.default_harness)?,
+                );
+                let mut run = launch.create_run();
+                run.steps.clear();
+                run.run.pr_number = self.sessions[selected]
+                    .pr
+                    .summary()
+                    .map(|summary| summary.number);
+                run.run.pr_url = self.sessions[selected]
+                    .pr
+                    .summary()
+                    .map(|summary| summary.url.clone());
+                run.run.current_head_sha = crate::git::current_head_sha(&session_path, config).ok();
+                run
+            };
+
+            let queue = crate::observability::with_writable_db(repo, |path| {
+                crate::auto_flow::stabilization_execute::queue_standalone_repair(
+                    &AutoFlowStore::open(path),
+                    &mut persisted,
+                    repair,
+                )
+            })?;
+            let selected_step = match queue {
+                crate::auto_flow::stabilization_execute::StandaloneRepairQueue::Queued(step_id)
+                | crate::auto_flow::stabilization_execute::StandaloneRepairQueue::AlreadyPending(
+                    step_id,
+                ) => step_id,
+            };
+            self.remember_auto_run(persisted.clone());
+            self.selected_auto_step_by_run
+                .insert(persisted.run.id.clone(), selected_step);
+            self.selected_auto_run = Some(persisted.run.id.clone());
+            #[cfg(test)]
+            if self.prompt_submissions.is_some() {
+                return Ok(matches!(
+                    queue,
+                    crate::auto_flow::stabilization_execute::StandaloneRepairQueue::Queued(_)
+                ));
+            }
+            let queued = matches!(
                 queue,
                 crate::auto_flow::stabilization_execute::StandaloneRepairQueue::Queued(_)
-            ));
+            );
+            if queued {
+                self.spawn_auto_run_executor(repo.clone(), config.clone(), persisted)?;
+            } else {
+                crate::worker::ensure_running()?;
+                crate::worker::wake()?;
+            }
+            Ok(queued)
         }
-        let queued = matches!(
-            queue,
-            crate::auto_flow::stabilization_execute::StandaloneRepairQueue::Queued(_)
-        );
-        if queued {
-            self.spawn_auto_run_executor(repo.clone(), config.clone(), persisted)?;
-        } else {
-            crate::worker::ensure_running()?;
-            crate::worker::wake()?;
-        }
-        Ok(queued)
     }
 
     #[cfg(test)]
@@ -1231,14 +1248,14 @@ impl Tui {
                 )),
             },
             move || {
-                let mut persisted = crate::observability::with_writable_db(&repo, |conn| {
-                    load_auto_run(conn, &run_id)
+                let mut persisted = crate::observability::with_writable_db(&repo, |path| {
+                    load_auto_run(&AutoFlowStore::open(path), &run_id)
                 })?
                 .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?;
                 let progress = if persisted.run.pending_push.is_some() {
-                    Some(crate::observability::with_writable_db(&repo, |conn| {
+                    Some(crate::observability::with_writable_db(&repo, |path| {
                         crate::auto_flow::stabilization_execute::progress_pending_push(
-                            conn,
+                            &AutoFlowStore::open(path),
                             &repo,
                             &config,
                             &mut persisted,
@@ -1323,8 +1340,8 @@ impl Tui {
                 let branch = branch.clone();
                 move || {
                     let mut persisted =
-                        crate::observability::with_writable_db(&repo, |conn| {
-                            load_auto_run(conn, &run_id)
+                        crate::observability::with_writable_db(&repo, |path| {
+                            load_auto_run(&AutoFlowStore::open(path), &run_id)
                         })?
                         .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?;
                     if persisted.run.stabilization_blocker
@@ -1353,9 +1370,9 @@ impl Tui {
                         ensure_review_resolution_head(&summary, expected_head_sha)?;
                     }
                     if thread_ids.is_empty() {
-                        crate::observability::with_writable_db(&repo, |conn| {
+                        crate::observability::with_writable_db(&repo, |path| {
                             crate::auto_flow::stabilization_execute::observe_plan_and_save(
-                                conn,
+                                &AutoFlowStore::open(path),
                                 &repo,
                                 &config,
                                 &mut persisted,
@@ -1441,9 +1458,9 @@ impl Tui {
                     )
                 })?;
                 refresh_pr_cache(&repo, &branch, &mut cache, &path, &config, true)?;
-                crate::observability::with_writable_db(&repo, |conn| {
+                crate::observability::with_writable_db(&repo, |path| {
                     crate::auto_flow::stabilization_execute::observe_plan_and_save(
-                        conn,
+                        &AutoFlowStore::open(path),
                         &repo,
                         &config,
                         &mut persisted,
@@ -1471,10 +1488,9 @@ impl Tui {
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,
     ) -> Result<Option<String>, String> {
-        self.text_area_dialog(raw, "Create Pull Request", "Description:\n", "")
+        self.prompt_line_dialog(raw, "Create Pull Request", "Description: ", "")
     }
 
-    #[allow(dead_code)]
     pub(crate) fn merge_selected_pr(
         &mut self,
         raw: &mut crate::tui_runtime::TerminalRuntime,

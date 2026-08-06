@@ -1,21 +1,9 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
 use crate::view::{ChoiceList, KeyChoice, OrderedToggleItem};
 
 use super::super::{
-    TextInputAction, confirmation_result, move_enabled_ordered_item, selectable_choice_key,
-    text_input_action, toggle_item_in_place, toggle_ordered_item,
+    confirmation_result, move_enabled_ordered_item, selectable_choice_key, toggle_item_in_place,
+    toggle_ordered_item,
 };
-
-#[test]
-fn text_area_enter_adds_a_line_and_ctrl_enter_submits() {
-    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-    let ctrl_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL);
-
-    assert_eq!(text_input_action(enter, true), TextInputAction::Newline);
-    assert_eq!(text_input_action(ctrl_enter, true), TextInputAction::Submit);
-    assert_eq!(text_input_action(enter, false), TextInputAction::Submit);
-}
 
 #[test]
 fn confirmation_empty_answer_uses_the_passed_default() {

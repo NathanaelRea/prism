@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update pr_cache set observation_error = ? where branch = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "549fb100c16abea1d35df7a2f2c03ca6cfcea56f830af78aff0cad9594b30509"
+}

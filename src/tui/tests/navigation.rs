@@ -332,17 +332,6 @@ fn historical_auto_run_does_not_replace_active_worktree_owner() {
 }
 
 #[test]
-fn permanent_delete_targets_worktree_even_with_active_auto_dashboard() {
-    let mut tui = test_tui();
-    tui.focused_panel = PanelFocus::Worktrees;
-    tui.select_worktree(1);
-    tui.remember_auto_run(test_auto_run("active", "/repo-one/feature-one", 20));
-
-    assert!(tui.current_auto_dashboard().is_some());
-    assert!(tui.permanent_delete_targets_worktree());
-}
-
-#[test]
 fn open_tmux_session_target_opens_repo_default_from_repos() {
     let mut tui = test_tui();
     tui.focused_panel = PanelFocus::Repos;

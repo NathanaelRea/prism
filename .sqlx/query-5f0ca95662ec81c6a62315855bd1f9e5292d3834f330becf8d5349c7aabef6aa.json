@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update startup_run\nset time_finished_unix_ms = ?, status = 'unclean',\n    error = 'process exited without completing its run marker'\nwhere id = ? and status = 'running'\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "5f0ca95662ec81c6a62315855bd1f9e5292d3834f330becf8d5349c7aabef6aa"
+}

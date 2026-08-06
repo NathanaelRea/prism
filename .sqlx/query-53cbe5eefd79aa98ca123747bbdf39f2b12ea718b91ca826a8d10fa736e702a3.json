@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update notification_session\nset state = ?, transition_sequence = ?, observed_unix_ms = ?\nwhere worktree_path = ? and branch = ? and incarnation = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "53cbe5eefd79aa98ca123747bbdf39f2b12ea718b91ca826a8d10fa736e702a3"
+}

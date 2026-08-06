@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update auto_step_run\nset status = ?, execution_process_id = null,\n    execution_process_start_time_ticks = null, finished_unix_ms = ?, error = ?\nwhere id = ? and status != 'aborted'\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "0dafc2d1c865f10716b4d7c0faf1f149adc1f7157a869568b957c6e79b8260ef"
+}

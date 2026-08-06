@@ -1,4 +1,6 @@
+#[cfg(test)]
 use std::collections::hash_map::DefaultHasher;
+#[cfg(test)]
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -7,7 +9,6 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -30,6 +31,7 @@ mod control;
 mod model;
 mod non_agent;
 mod output;
+use crate::persistence::auto_flow as persistence;
 mod prompts;
 mod runner;
 pub(crate) mod stabilization_execute;
@@ -58,9 +60,9 @@ pub use output::{
 };
 pub use runner::execute_auto_initial_step;
 pub use storage::{
-    load_auto_run, load_auto_run_snapshot, load_recent_active_run_snapshots_for_repo,
-    load_recent_active_runs_for_repo, load_terminal_repair_run_snapshots_for_repo, migrate_schema,
-    save_auto_run, submit_auto_run, submit_auto_run_with_merge_intent,
+    AutoFlowStore, load_auto_run, load_auto_run_snapshot,
+    load_recent_active_run_snapshots_for_repo, load_recent_active_runs_for_repo,
+    load_terminal_repair_run_snapshots_for_repo, save_auto_run, submit_auto_run,
 };
 
 pub(crate) use support::unix_ms;

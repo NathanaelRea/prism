@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "delete from archived_worktree where branch = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "770cb1e0a15491a77833097755650e4736c9c6e8c5b9bc7618da05896df0c91d"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into repo_policy_cache (\n  provider, canonical_host, project_path, project_path_key, target_branch, default_branch,\n  required_approvals, require_conversation_resolution, require_branch_up_to_date,\n  required_checks, merge_queue_required, refreshed_unix_ms, error\n) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)\non conflict(provider, canonical_host, project_path_key, target_branch) do update set\n  project_path = excluded.project_path, default_branch = excluded.default_branch,\n  required_approvals = excluded.required_approvals,\n  require_conversation_resolution = excluded.require_conversation_resolution,\n  require_branch_up_to_date = excluded.require_branch_up_to_date,\n  required_checks = excluded.required_checks,\n  merge_queue_required = excluded.merge_queue_required,\n  refreshed_unix_ms = excluded.refreshed_unix_ms, error = excluded.error\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 13
+    },
+    "nullable": []
+  },
+  "hash": "7c16ac8d1b3ad537bc4afd28297d4e13db1629277bb733395b2f561bea9e2f00"
+}

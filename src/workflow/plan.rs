@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::json::json_string_field;
 use crate::plan_run::{PlanLaunch, PlanRunMode};
 use crate::process::command_exists;
+use crate::repo::Repository;
 use crate::util::stable_hash;
 
 const DEFAULT_STEP_NAME: &str = "phase";
@@ -102,14 +103,6 @@ impl PlanExecution {
         )
     }
 
-    pub(crate) fn artifact(&self, max_parallel: u32) -> Result<crate::run::ArtifactInput, String> {
-        crate::plan_artifact::PlanManifest::launch_task_from_file(
-            &self.plan_path,
-            Some(self.start..=self.total),
-            max_parallel,
-        )
-    }
-
     #[cfg(test)]
     fn tasks(&self) -> Vec<String> {
         (self.start..=self.total)
@@ -194,6 +187,48 @@ pub fn infer_total_phases(path: &Path) -> Result<usize, String> {
         }
     }
     Ok(max_phase)
+}
+
+pub fn run_plan_mode(cwd: &Path, config: &Config, path: Option<&Path>) -> Result<(), String> {
+    let selected_harness = config.harness_config(&config.default_harness)?;
+    if !crate::harness::Harness::new(&config.default_harness, &selected_harness)
+        .describe()
+        .headless
+    {
+        return Err(format!(
+            "harness '{}' does not support managed Plan execution; configure headless_command and headless_prompt_transport",
+            config.default_harness
+        ));
+    }
+    let execution = PlanExecution::prepare(cwd, config, path)?;
+    let repo = Repository {
+        root: execution.cwd.clone(),
+    };
+    let launch = PlanLaunch::new(
+        &repo.root,
+        &execution.cwd,
+        &execution.plan_path,
+        &execution.step_name,
+        execution.start,
+        execution.total,
+        PlanRunMode::Sequential,
+    )?
+    .with_harness(
+        config.default_harness.clone(),
+        selected_harness.adapter.clone(),
+    );
+    let run_id = crate::worker::launch_bundled_plan(crate::workflow::bundled::BundledPlanLaunch {
+        repository: launch.repo_root,
+        scope_path: launch.scope_path,
+        plan_path: launch.plan_path,
+        step_name: launch.step_name,
+        start_step: launch.start_step,
+        total_steps: launch.total_steps,
+        parallel: false,
+        harness_id: launch.harness_id,
+    })?;
+    println!("workflow_run_id = {run_id}\nstatus = queued");
+    Ok(())
 }
 
 #[allow(dead_code)]

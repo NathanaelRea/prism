@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select status from plan_step_run where run_id = ? and step = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "status",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fb7545de1a1cbc8bee8c3ff8c4e22b0e66cd7ef453fb3f9b4f140a2401c401b5"
+}

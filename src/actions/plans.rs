@@ -18,7 +18,6 @@ fn action_choice(key: &str, label: &str, enabled: bool) -> crate::view::KeyChoic
     }
 }
 
-#[cfg(test)]
 pub(super) fn plan_run_mode_from_parallel_confirmation(parallel: bool) -> PlanRunMode {
     if parallel {
         PlanRunMode::Parallel
@@ -36,10 +35,7 @@ impl Tui {
             return Ok(());
         };
         let path = self.sessions[context.session_index].path.clone();
-        let worktree_session_id = self.sessions[context.session_index]
-            .worktree_session_id
-            .clone();
-        self.start_plan_run_for_scope(raw, context.repo, context.config, path, worktree_session_id)
+        self.start_plan_run_for_scope(raw, context.repo, context.config, path)
     }
 
     pub(super) fn start_plan_run_for_scope(
@@ -48,7 +44,6 @@ impl Tui {
         repo: crate::repo::Repository,
         config: crate::config::Config,
         scope_path: PathBuf,
-        worktree_session_id: String,
     ) -> Result<(), String> {
         if !config.selected_harness()?.describe().headless {
             return Err(format!(
@@ -63,18 +58,25 @@ impl Tui {
             "Run steps in parallel?",
             false,
         )?;
-        let artifact = execution.artifact(if parallel { 8 } else { 1 })?;
-        let run_id = crate::operations::WorkflowOperations::launch_named(
-            &repo.root,
-            "builtin:plan",
-            vec![artifact],
-            "local:tui".to_string(),
-        )?;
-        let _ = worktree_session_id;
-        crate::worker::ensure_running()?;
-        crate::worker::wake()?;
+        let mode = plan_run_mode_from_parallel_confirmation(parallel);
+        let launch = execution.launch(&repo.root, mode)?.with_harness(
+            config.default_harness.clone(),
+            config.harness_adapter(&config.default_harness)?,
+        );
+        let run_id =
+            crate::worker::launch_bundled_plan(crate::workflow::bundled::BundledPlanLaunch {
+                repository: launch.repo_root.clone(),
+                scope_path: launch.scope_path.clone(),
+                plan_path: launch.plan_path.clone(),
+                step_name: launch.step_name.clone(),
+                start_step: launch.start_step,
+                total_steps: launch.total_steps,
+                parallel: launch.mode == PlanRunMode::Parallel,
+                harness_id: launch.harness_id.clone(),
+            })?;
         self.invalidate_workflow_snapshots();
-        self.show_message(&format!("started Workflow {}", run_id.as_str()))?;
+        self.start_workflow_polls(true);
+        self.show_message(&format!("Plan workflow {run_id} queued"))?;
         Ok(())
     }
 
@@ -84,9 +86,9 @@ impl Tui {
         _config: crate::config::Config,
         persisted: crate::plan_run::PersistedPlanRun,
     ) -> Result<(), String> {
-        crate::observability::with_writable_db(&repo, |conn| {
+        crate::observability::with_writable_db(&repo, |path| {
             crate::execution::enqueue(
-                conn,
+                path,
                 &crate::execution::WorkflowIdentity::new(
                     crate::execution::WorkflowKind::Plan,
                     &persisted.run.id,
@@ -174,29 +176,22 @@ impl Tui {
         };
         let (_, server_port) = crate::opencode::parse_localhost_url(&server_url)?;
         let session = self.sessions[session_index].background_job_snapshot();
-        let plan_runtime = crate::opencode::load_runtime(
-            &repo,
-            &plan_run.run.harness_id,
-            "plan",
-            &session.path,
-            &session.worktree_session_id,
-        )
-        .ok()
-        .flatten()
-        .filter(|runtime| runtime.server_url == server_url);
+        let plan_runtime =
+            crate::opencode::load_runtime(&repo, &plan_run.run.harness_id, "plan", &session.path)
+                .ok()
+                .flatten()
+                .filter(|runtime| runtime.server_url == server_url);
         let mut runtime = crate::opencode::load_runtime(
             &repo,
             &plan_run.run.harness_id,
             &session.branch,
             &session.path,
-            &session.worktree_session_id,
         )?
         .unwrap_or_else(|| crate::opencode::OpencodeRuntime {
             repo_root: repo.root.display().to_string(),
             harness_id: plan_run.run.harness_id.clone(),
             branch: session.branch.clone(),
             worktree_path: session.path.display().to_string(),
-            worktree_session_id: Some(session.worktree_session_id.clone()),
             server_port,
             server_url: server_url.clone(),
             server_pid: plan_runtime.as_ref().and_then(|runtime| runtime.server_pid),
@@ -563,8 +558,9 @@ impl Tui {
             }
             return Ok(true);
         }
-        crate::observability::with_writable_db(&repo, |conn| {
-            let mut run = load_plan_run(conn, &run_id)?
+        crate::observability::with_writable_db(&repo, |path| {
+            let store = PlanRunStore::open(path);
+            let mut run = load_plan_run(&store, &run_id)?
                 .ok_or_else(|| format!("plan run not found: {run_id}"))?;
             let step = run
                 .steps
@@ -577,9 +573,9 @@ impl Tui {
             ) {
                 return Err(format!("plan phase {selected_step} is not running"));
             }
-            abort_plan_step(conn, step)?;
+            abort_plan_step(&store, step)?;
             run.run.status = run.aggregate_status();
-            save_plan_run(conn, &run)
+            save_plan_run(&store, &run)
         })?;
         self.load_plan_run_snapshot(&repo.root, &run_id);
         self.show_message("abort requested for selected plan phase")?;
@@ -601,10 +597,11 @@ impl Tui {
             &run_id,
             "retry",
         )?;
-        let persisted = crate::observability::with_writable_db(&repo, |conn| {
-            let mut run = load_plan_run(conn, &run_id)?
+        let persisted = crate::observability::with_writable_db(&repo, |path| {
+            let store = PlanRunStore::open(path);
+            let mut run = load_plan_run(&store, &run_id)?
                 .ok_or_else(|| format!("plan run not found: {run_id}"))?;
-            retry_failed_steps(conn, &mut run)?;
+            retry_failed_steps(&store, &mut run)?;
             Ok(run)
         })?;
         self.remember_plan_run(persisted.clone());
@@ -641,10 +638,11 @@ impl Tui {
             &run_id,
             "retry",
         )?;
-        let persisted = crate::observability::with_writable_db(&repo, |conn| {
-            let mut run = load_plan_run(conn, &run_id)?
+        let persisted = crate::observability::with_writable_db(&repo, |path| {
+            let store = PlanRunStore::open(path);
+            let mut run = load_plan_run(&store, &run_id)?
                 .ok_or_else(|| format!("plan run not found: {run_id}"))?;
-            retry_from_step(conn, &mut run, selected_step)?;
+            retry_from_step(&store, &mut run, selected_step)?;
             Ok(run)
         })?;
         self.remember_plan_run(persisted.clone());
@@ -662,10 +660,11 @@ impl Tui {
         };
         let run_id = dashboard.run.run.id.clone();
         let selected_step = dashboard.run.run.selected_step;
-        crate::observability::with_writable_db(&repo, |conn| {
-            let mut run = load_plan_run(conn, &run_id)?
+        crate::observability::with_writable_db(&repo, |path| {
+            let store = PlanRunStore::open(path);
+            let mut run = load_plan_run(&store, &run_id)?
                 .ok_or_else(|| format!("plan run not found: {run_id}"))?;
-            skip_plan_step(conn, &mut run, selected_step)
+            skip_plan_step(&store, &mut run, selected_step)
         })?;
         self.load_plan_run_snapshot(&repo.root, &run_id);
         self.show_message("skipped selected plan phase")?;
@@ -687,14 +686,18 @@ impl Tui {
         let plan_run_id = plan_dashboard.run.run.id.clone();
         let selected_step = plan_dashboard.run.run.selected_step;
         let mut should_execute = false;
-        let (auto_run, plan_run) = crate::observability::with_writable_db(&repo, |conn| {
-            let mut plan_run = load_plan_run(conn, &plan_run_id)?
+        let (auto_run, plan_run) = crate::observability::with_writable_db(&repo, |path| {
+            let auto_store = AutoFlowStore::open(path);
+            let mut plan_run = load_plan_run(&auto_store, &plan_run_id)?
                 .ok_or_else(|| format!("plan run not found: {plan_run_id}"))?;
-            skip_plan_step(conn, &mut plan_run, selected_step)?;
-            let mut auto_run = load_auto_run(conn, &auto_run_id)?
+            skip_plan_step(&auto_store, &mut plan_run, selected_step)?;
+            let mut auto_run = load_auto_run(&auto_store, &auto_run_id)?
                 .ok_or_else(|| format!("auto flow run not found: {auto_run_id}"))?;
-            should_execute =
-                prepare_auto_run_for_resume(conn, &mut auto_run, DEFAULT_OUTPUT_LINES_PER_STEP)?;
+            should_execute = prepare_auto_run_for_resume(
+                &auto_store,
+                &mut auto_run,
+                DEFAULT_OUTPUT_LINES_PER_STEP,
+            )?;
             Ok((auto_run, plan_run))
         })?;
         self.remember_plan_run(plan_run);
@@ -753,12 +756,13 @@ impl Tui {
             root: PathBuf::from(&dashboard.run.run.repo_root),
         };
         let run_id = dashboard.run.run.id.clone();
-        crate::observability::with_writable_db(&repo, |conn| {
-            let mut run = load_plan_run(conn, &run_id)?
+        crate::observability::with_writable_db(&repo, |path| {
+            let store = PlanRunStore::open(path);
+            let mut run = load_plan_run(&store, &run_id)?
                 .ok_or_else(|| format!("plan run not found: {run_id}"))?;
-            archive_plan_run(conn, &mut run)?;
+            archive_plan_run(&store, &mut run)?;
             let _ = crate::plan_run::cleanup_stale_archived_plan_runs(
-                conn,
+                &store,
                 crate::plan_run::ARCHIVED_PLAN_RETENTION_MS,
             );
             Ok(())

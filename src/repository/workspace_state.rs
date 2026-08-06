@@ -1,22 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 
 use crate::agent::AgentState;
-use crate::auto_flow::{
-    AutoExecutorDecision, AutoRunControlEffect, AutoRunControlIntent, apply_auto_run_control,
-};
 use crate::config::Config;
-use crate::execution::{self, WorkflowIdentity as ExecutionIdentity, WorkflowKind};
+use crate::execution::{self, WorkflowKind};
 use crate::git::{self, GitStatus};
 use crate::lifecycle;
-use crate::plan_run::{
-    PlanExecutorDecision, PlanRunControlEffect, PlanRunControlIntent, apply_plan_run_control,
-};
+use crate::persistence::workspace as workspace_persistence;
 use crate::repo::Repository;
-use crate::{storage, worker, workspace};
+use crate::{worker, workspace};
 
 const RECENT_TERMINAL_WORKFLOWS: usize = 10;
 
@@ -203,7 +197,6 @@ pub struct StepSummary {
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowLifecycle {
-    Draft,
     Queued,
     Running,
     Paused,
@@ -213,9 +206,9 @@ pub enum WorkflowLifecycle {
 }
 
 impl WorkflowLifecycle {
+    #[cfg(test)]
     fn parse(value: &str) -> Result<Self, String> {
         match value {
-            "draft" => Ok(Self::Draft),
             "queued" => Ok(Self::Queued),
             "running" => Ok(Self::Running),
             "paused" => Ok(Self::Paused),
@@ -228,7 +221,6 @@ impl WorkflowLifecycle {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Draft => "draft",
             Self::Queued => "queued",
             Self::Running => "running",
             Self::Paused => "paused",
@@ -284,13 +276,13 @@ pub enum StepState {
 impl StepState {
     fn parse(value: Option<String>) -> Self {
         match value.as_deref() {
-            Some("queued") => Self::Queued,
+            Some("queued" | "runnable") => Self::Queued,
             Some("starting") => Self::Starting,
-            Some("running") => Self::Running,
+            Some("running" | "claimed") => Self::Running,
             Some("waiting") => Self::Waiting,
-            Some("done") => Self::Done,
+            Some("done" | "succeeded") => Self::Done,
             Some("failed") => Self::Failed,
-            Some("aborted") => Self::Aborted,
+            Some("aborted" | "cancelled") => Self::Aborted,
             Some("skipped") => Self::Skipped,
             _ => Self::Unknown,
         }
@@ -401,7 +393,6 @@ pub struct ControlReceipt {
 #[derive(Clone, Debug)]
 pub struct RecoveryDecision {
     pub workflow: WorkflowIdentity,
-    pub interruption_generation: i64,
     pub restart: bool,
 }
 
@@ -484,9 +475,23 @@ impl WorkspaceState {
                 worker::DaemonHealth::stopped()
             }
         };
+        let ledger_runs = match list_ledger_workflows(&self.sources) {
+            Ok(runs) => runs,
+            Err(error) => {
+                warnings.push(Diagnostic {
+                    code: DiagnosticCode::ProjectionRead,
+                    severity: DiagnosticSeverity::Warning,
+                    scope: "workflow ledger".to_string(),
+                    operation: Some("list_workflows"),
+                    provenance: None,
+                    message: error,
+                });
+                Vec::new()
+            }
+        };
         let mut repositories = Vec::new();
         for source in &self.sources {
-            match inspect_repository(source, request, observed) {
+            match inspect_repository(source, request, observed, &ledger_runs) {
                 Ok((repository, mut repository_warnings)) => {
                     repositories.push(repository);
                     warnings.append(&mut repository_warnings);
@@ -589,38 +594,27 @@ impl WorkspaceState {
                 target.identity.display_id, owner.display_id, owner.display_id
             ));
         }
-        if request.action == ControlAction::Recover {
-            if target.dispatch.state != Some(execution::DispatchState::RecoveryPending) {
-                return Err("workflow does not require recovery".to_string());
-            }
-            let batch = self.recover_batch(&[RecoveryDecision {
-                workflow: target.identity.clone(),
-                interruption_generation: target.dispatch.interruption_generation,
-                restart: true,
-            }])?;
-            return Ok(ControlReceipt {
-                workflow: target.identity.clone(),
-                state: "queued".to_string(),
-                warnings: batch.warnings,
-            });
+        if request.action == ControlAction::Recover
+            && target.dispatch.state != Some(execution::DispatchState::RecoveryPending)
+        {
+            return Err("workflow does not require recovery".to_string());
         }
-        let source = self
-            .sources
-            .iter()
-            .find(|source| source.repo.root == target.identity.repository)
-            .ok_or_else(|| "workflow repository is no longer available".to_string())?;
-        let path = source.repo.prism_dir().join("prism.db");
-        let mut conn = storage::open_writable(&path).map_err(|error| error.to_string())?;
-        let (state, mut warnings) = apply_control_transaction(&mut conn, target, request.action)?;
-        if request.action == ControlAction::Resume {
-            notify_daemon_after_commit(true, "control", &mut warnings);
-        } else if request.action == ControlAction::Pause {
-            notify_daemon_after_commit(false, "control", &mut warnings);
-        }
+        let command = match request.action {
+            ControlAction::Pause => crate::WorkflowCommand::Pause,
+            ControlAction::Resume => crate::WorkflowCommand::Resume,
+            ControlAction::Stop => crate::WorkflowCommand::Cancel,
+            ControlAction::Recover => crate::WorkflowCommand::Retry,
+        };
+        worker::command_workflow(&target.identity.run_id, command)?;
         Ok(ControlReceipt {
             workflow: target.identity.clone(),
-            state,
-            warnings,
+            state: match request.action {
+                ControlAction::Pause => "paused",
+                ControlAction::Resume | ControlAction::Recover => "runnable",
+                ControlAction::Stop => "cancelled",
+            }
+            .to_string(),
+            warnings: Vec::new(),
         })
     }
 
@@ -630,46 +624,16 @@ impl WorkspaceState {
     ) -> Result<RecoveryBatchReceipt, String> {
         for decision in decisions {
             self.source_for_identity(&decision.workflow)?;
-        }
-        for decision in decisions.iter().filter(|decision| decision.restart) {
-            let source = self.source_for_identity(&decision.workflow)?;
-            let config = Config::load(&source.repo);
-            if worker::legacy_worker_running(
-                &source.repo,
-                &config,
-                &execution_identity(&decision.workflow)?,
-            )? {
-                return Err(format!(
-                    "legacy {} worker for run {} is still active; try recovery after it exits",
-                    decision.workflow.kind, decision.workflow.run_id
-                ));
+            if decision.restart {
+                worker::command_workflow(&decision.workflow.run_id, crate::WorkflowCommand::Retry)?;
+            } else {
+                worker::command_workflow(
+                    &decision.workflow.run_id,
+                    crate::WorkflowCommand::Cancel,
+                )?;
             }
         }
-
-        let mut receipt = RecoveryBatchReceipt::default();
-        for source in &self.sources {
-            let repository_decisions = decisions
-                .iter()
-                .filter(|decision| paths_equal(&decision.workflow.repository, &source.repo.root))
-                .map(|decision| {
-                    Ok((
-                        execution_identity(&decision.workflow)?,
-                        decision.interruption_generation,
-                        decision.restart,
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()?;
-            if repository_decisions.is_empty() {
-                continue;
-            }
-            let path = source.repo.prism_dir().join("prism.db");
-            let mut conn = storage::open_writable(&path).map_err(|error| error.to_string())?;
-            execution::apply_recovery_decision(&mut conn, &repository_decisions)?;
-            if repository_decisions.iter().any(|(_, _, restart)| *restart) {
-                notify_daemon_after_commit(true, "recovery", &mut receipt.warnings);
-            }
-        }
-        Ok(receipt)
+        Ok(RecoveryBatchReceipt::default())
     }
 
     fn source_for_identity(&self, identity: &WorkflowIdentity) -> Result<&RepoSource, String> {
@@ -734,20 +698,6 @@ impl WorkspaceState {
     }
 }
 
-fn notify_daemon_after_commit(ensure: bool, operation: &str, warnings: &mut Vec<String>) {
-    if ensure && let Err(error) = worker::ensure_running() {
-        warnings.push(format!(
-            "{operation} committed, but daemon is unavailable: {error}"
-        ));
-        return;
-    }
-    if let Err(error) = worker::wake() {
-        warnings.push(format!(
-            "{operation} committed, but daemon wake failed: {error}"
-        ));
-    }
-}
-
 pub(crate) fn control_repository_workflow(
     repo: &Repository,
     action: ControlAction,
@@ -764,6 +714,33 @@ pub(crate) fn control_repository_workflow(
     })
 }
 
+fn list_ledger_workflows(sources: &[RepoSource]) -> Result<Vec<crate::WorkflowProjection>, String> {
+    let repositories = sources
+        .iter()
+        .map(|source| source.repo.root.display().to_string())
+        .collect::<Vec<_>>();
+    let from_worker = repositories
+        .iter()
+        .try_fold(Vec::new(), |mut runs, repository| {
+            runs.extend(worker::list_workflows(Some(Path::new(repository)), 256)?);
+            Ok::<_, String>(runs)
+        });
+    match from_worker {
+        Ok(runs) => Ok(runs),
+        Err(_) if !crate::util::prism_config_dir().join("workflow.db").exists() => Ok(Vec::new()),
+        Err(socket_error) => crate::async_runtime::block_on(async {
+            let operations = crate::WorkflowOperations::open_default().await?;
+            let mut runs = Vec::new();
+            for repository in repositories {
+                runs.extend(operations.list(Some(&repository), 256).await?);
+            }
+            Ok::<_, crate::WorkflowOperationError>(runs)
+        })
+        .map_err(|error| format!("access workflow ledger runtime: {error}"))?
+        .map_err(|error| format!("{socket_error}; direct workflow ledger read failed: {error}")),
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Subject {
     Repository(usize),
@@ -775,13 +752,14 @@ fn inspect_repository(
     source: &RepoSource,
     request: InspectRequest,
     observed: i64,
+    ledger_runs: &[crate::WorkflowProjection],
 ) -> Result<(RepositorySnapshot, Vec<Diagnostic>), String> {
     let config = Config::load(&source.repo);
     let inventory = lifecycle::list_worktrees(&source.repo, &config)?;
     let db_path = source.repo.prism_dir().join("prism.db");
     let mut warnings = Vec::new();
-    let conn = if db_path.exists() {
-        match storage::open_readonly(&db_path) {
+    let reader = if db_path.exists() {
+        match workspace_persistence::WorkspaceReader::open(&db_path) {
             Ok(conn) => Some(conn),
             Err(error) => {
                 warnings.push(repository_diagnostic(
@@ -795,12 +773,12 @@ fn inspect_repository(
     } else {
         None
     };
-    let hidden = read_projection(&conn, source, &mut warnings, "load_hidden", load_hidden)
+    let hidden = read_projection(&reader, source, &mut warnings, "load_hidden", load_hidden)
         .unwrap_or_default();
-    let mut workflows = read_projection(&conn, source, &mut warnings, "load_workflows", |conn| {
-        load_workflows(conn, &source.repo.root, request.include_terminal)
-    })
-    .unwrap_or_default();
+    let mut workflows = load_ledger_workflows(ledger_runs, &source.repo.root)?;
+    if !request.include_terminal {
+        workflows.retain(|workflow| !workflow.lifecycle.terminal());
+    }
     workflows.sort_by(|left, right| {
         right
             .updated_unix_ms
@@ -835,16 +813,19 @@ fn inspect_repository(
         } else {
             BranchState::Named(entry.branch.clone())
         };
-        let agent = read_projection(&conn, source, &mut warnings, "load_agent", |conn| {
-            load_agent(conn, &entry.branch)
+        let agent = read_projection(&reader, source, &mut warnings, "load_agent", |reader| {
+            load_agent(reader, &entry.branch)
         })
         .flatten()
         .unwrap_or_default();
-        let pull_request =
-            read_projection(&conn, source, &mut warnings, "load_pull_request", |conn| {
-                load_pr(conn, &entry.branch, observed)
-            })
-            .flatten();
+        let pull_request = read_projection(
+            &reader,
+            source,
+            &mut warnings,
+            "load_pull_request",
+            |reader| load_pr(reader, &entry.branch, observed),
+        )
+        .flatten();
         if let Some(error) = pull_request
             .as_ref()
             .and_then(|pull_request| pull_request.error.as_ref())
@@ -932,14 +913,14 @@ fn retain_recent_terminal_workflows(workflows: &mut Vec<WorkflowSnapshot>, limit
 }
 
 fn read_projection<T>(
-    conn: &Option<Connection>,
+    reader: &Option<workspace_persistence::WorkspaceReader>,
     source: &RepoSource,
     warnings: &mut Vec<Diagnostic>,
     operation: &'static str,
-    read: impl FnOnce(&Connection) -> Result<T, String>,
+    read: impl FnOnce(&workspace_persistence::WorkspaceReader) -> Result<T, String>,
 ) -> Option<T> {
-    let conn = conn.as_ref()?;
-    match read(conn) {
+    let reader = reader.as_ref()?;
+    match read(reader) {
         Ok(value) => Some(value),
         Err(error) => {
             warnings.push(repository_diagnostic(source, operation, error));
@@ -963,93 +944,66 @@ fn repository_diagnostic(
     }
 }
 
-fn load_hidden(conn: &Connection) -> Result<BTreeSet<String>, String> {
-    if !table_exists(conn, "hidden_session")? {
-        return Ok(BTreeSet::new());
-    }
-    let mut statement = conn
-        .prepare("select branch from hidden_session")
-        .map_err(|error| error.to_string())?;
-    statement
-        .query_map([], |row| row.get(0))
-        .map_err(|error| error.to_string())?
-        .collect::<Result<_, _>>()
-        .map_err(|error| error.to_string())
+fn load_hidden(
+    reader: &workspace_persistence::WorkspaceReader,
+) -> Result<BTreeSet<String>, String> {
+    await_cache(reader.hidden()).map(|branches| branches.into_iter().collect())
 }
 
-fn load_agent(conn: &Connection, branch: &str) -> Result<Option<AgentStatus>, String> {
-    if !table_exists(conn, "agent_state")? {
-        return Ok(None);
-    }
-    conn.query_row(
-        "select state, updated_unix_ms from agent_state where branch = ?1",
-        [branch],
-        |row| {
-            let state = row
-                .get::<_, Option<String>>(0)?
-                .map(|value| {
-                    AgentState::parse(&value)
-                        .ok_or_else(|| sql_value_error(0, format!("unknown agent state: {value}")))
-                })
-                .transpose()?;
-            Ok(AgentStatus {
-                state,
-                updated_unix_ms: row.get(1)?,
-            })
-        },
-    )
-    .optional()
-    .map_err(|error| error.to_string())
+fn load_agent(
+    reader: &workspace_persistence::WorkspaceReader,
+    branch: &str,
+) -> Result<Option<AgentStatus>, String> {
+    await_cache(reader.agent(branch))?.map_or(Ok(None), |row| {
+        let state = AgentState::parse(&row.state)
+            .ok_or_else(|| format!("unknown agent state: {}", row.state))?;
+        Ok(Some(AgentStatus {
+            state: Some(state),
+            updated_unix_ms: Some(row.updated_unix_ms),
+        }))
+    })
 }
 
 fn load_pr(
-    conn: &Connection,
+    reader: &workspace_persistence::WorkspaceReader,
     branch: &str,
     observed: i64,
 ) -> Result<Option<CachedPullRequest>, String> {
-    if !table_exists(conn, "pr_cache")? {
-        return Ok(None);
-    }
-    conn.query_row(
-        "select number, title, url, state, merge_state_status, check_status,
-                refreshed_unix_ms, merged, draft, observation_error
-         from pr_cache where branch = ?1",
-        [branch],
-        |row| {
-            let refreshed = row.get::<_, i64>(6)?.saturating_mul(1_000);
-            let age_ms = observed.saturating_sub(refreshed).max(0);
-            let error = row.get::<_, Option<String>>(9)?;
-            let state = pull_request_state(
-                &row.get::<_, String>(3)?,
-                row.get::<_, i64>(7)? != 0,
-                row.get::<_, i64>(8)? != 0,
-            );
-            Ok(CachedPullRequest {
-                number: row.get(0)?,
-                title: row.get(1)?,
-                url: row.get(2)?,
-                state,
-                mergeability: row
-                    .get::<_, Option<String>>(4)?
-                    .filter(|value| !value.is_empty())
-                    .map(|value| mergeability_state(&value)),
-                ci: row
-                    .get::<_, Option<String>>(5)?
-                    .filter(|value| !value.is_empty())
-                    .map(|value| ci_state(&value)),
-                observed_unix_ms: refreshed,
-                age_ms,
-                stale: error.is_some()
-                    || age_ms
-                        > i64::try_from(crate::remote::PR_SUMMARY_POLL_INTERVAL.as_millis() * 2)
-                            .unwrap_or(i64::MAX),
-                error,
-                provenance: ObservationProvenance::SqliteCache,
-            })
-        },
-    )
-    .optional()
-    .map_err(|error| error.to_string())
+    await_cache(reader.pull_request(branch))?.map_or(Ok(None), |row| {
+        let refreshed = row.refreshed_unix_ms.saturating_mul(1_000);
+        let age_ms = observed.saturating_sub(refreshed).max(0);
+        let error = row.observation_error;
+        let state = pull_request_state(&row.state, row.merged != 0, row.draft != 0);
+        Ok(Some(CachedPullRequest {
+            number: row.number,
+            title: row.title,
+            url: row.url,
+            state,
+            mergeability: row
+                .merge_state_status
+                .filter(|value| !value.is_empty())
+                .map(|value| mergeability_state(&value)),
+            ci: row
+                .check_status
+                .filter(|value| !value.is_empty())
+                .map(|value| ci_state(&value)),
+            observed_unix_ms: refreshed,
+            age_ms,
+            stale: error.is_some()
+                || age_ms
+                    > i64::try_from(crate::remote::PR_SUMMARY_POLL_INTERVAL.as_millis() * 2)
+                        .unwrap_or(i64::MAX),
+            error,
+            provenance: ObservationProvenance::SqliteCache,
+        }))
+    })
+}
+
+fn await_cache<T>(
+    future: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    crate::async_runtime::block_on(future)
+        .map_err(|error| format!("access repository cache runtime: {error}"))?
 }
 
 fn pull_request_state(value: &str, merged: bool, draft: bool) -> PullRequestState {
@@ -1089,164 +1043,104 @@ fn ci_state(value: &str) -> CiState {
     }
 }
 
-fn load_workflows(
-    conn: &Connection,
+fn load_ledger_workflows(
+    runs: &[crate::WorkflowProjection],
     repo_root: &Path,
-    include_terminal: bool,
 ) -> Result<Vec<WorkflowSnapshot>, String> {
-    if !table_exists(conn, "workflow_execution")? {
-        return Ok(Vec::new());
-    }
-    let terminal_filter = if include_terminal {
-        ""
-    } else {
-        "and (r.status in ('queued','running','paused','failed') or e.dispatch_state in ('queued','claimed','recovery_pending','paused'))"
-    };
-    let active_identity = if table_exists(conn, "active_worktree_session")?
-        && table_has_column(conn, "auto_run", "worktree_session_id")?
-        && table_has_column(conn, "plan_run", "worktree_session_id")?
-    {
-        "exists(select 1 from active_worktree_session a where a.worktree_session_id = r.worktree_session_id)"
-    } else {
-        "0"
-    };
-    let query = format!(
-        "select 'auto', r.id, r.worktree_path, r.status, r.pause_requested, r.updated_unix_ms,
-                e.dispatch_state, e.daemon_instance_id, e.worker_id, e.lease_expires_unix_ms,
-                e.heartbeat_unix_ms, e.interruption_generation, e.updated_unix_ms,
-                (select s.step_key from auto_step_run s where s.run_id = r.id order by s.sequence desc limit 1),
-                (select s.status from auto_step_run s where s.run_id = r.id order by s.sequence desc limit 1),
-                (select count(*) from auto_step_run s where s.run_id = r.id and s.status = 'done'),
-                (select count(*) from auto_step_run s where s.run_id = r.id),
-                {active_identity}
-         from auto_run r left join workflow_execution e on e.workflow_kind = 'auto' and e.run_id = r.id
-         where r.repo_root = ?1 and r.archived_unix_ms is null {terminal_filter}
-         union all
-         select 'plan', r.id, r.scope_path, r.status, r.pause_requested, r.updated_unix_ms,
-                e.dispatch_state, e.daemon_instance_id, e.worker_id, e.lease_expires_unix_ms,
-                e.heartbeat_unix_ms, e.interruption_generation, e.updated_unix_ms,
-                (select r.step_name || ' ' || s.step || '/' || r.total_steps from plan_step_run s where s.run_id = r.id order by case s.status when 'running' then 0 when 'starting' then 1 when 'queued' then 2 else 3 end, s.step limit 1),
-                (select s.status from plan_step_run s where s.run_id = r.id order by case s.status when 'running' then 0 when 'starting' then 1 when 'queued' then 2 else 3 end, s.step limit 1),
-                (select count(*) from plan_step_run s where s.run_id = r.id and s.status in ('done','skipped')),
-                r.total_steps,
-                {active_identity}
-         from plan_run r left join workflow_execution e on e.workflow_kind = 'plan' and e.run_id = r.id
-         where r.repo_root = ?1 and r.archived_unix_ms is null {terminal_filter}"
-    );
-    let mut statement = conn
-        .prepare(&query)
-        .map_err(|error| format!("prepare workflow projection: {error}"))?;
-    let rows = statement
-        .query_map([repo_root.display().to_string()], |row| {
-            let kind: String = row.get(0)?;
-            let lifecycle = WorkflowLifecycle::parse(&row.get::<_, String>(3)?)
-                .map_err(|error| sql_value_error(3, error))?;
-            let pause_requested = row.get::<_, i64>(4)? != 0;
-            let dispatch_state = row
-                .get::<_, Option<String>>(6)?
-                .map(|state| execution::DispatchState::parse(&state))
-                .transpose()
-                .map_err(|error| sql_value_error(6, error))?;
-            let ownerless = true;
-            let execution_eligible = row.get::<_, i64>(17)? != 0;
-            let mut available_controls =
-                controls_for(lifecycle, pause_requested, dispatch_state, ownerless);
-            if !execution_eligible {
-                available_controls.pause = false;
-                available_controls.resume = false;
-                available_controls.recover = false;
-            }
+    runs.iter()
+        .filter(|run| {
+            run.repository
+                .as_deref()
+                .is_some_and(|repository| paths_equal(Path::new(repository), repo_root))
+        })
+        .map(|run| {
+            let lifecycle = ledger_lifecycle(&run.status)?;
+            let dispatch_state = match run.status.as_str() {
+                "waiting" | "runnable" => Some(execution::DispatchState::Queued),
+                "running" => Some(execution::DispatchState::Claimed),
+                "paused" => Some(execution::DispatchState::Paused),
+                "recovery_required" => Some(execution::DispatchState::RecoveryPending),
+                "succeeded" | "failed" | "cancelled" => Some(execution::DispatchState::Terminal),
+                _ => None,
+            };
+            let current_step = run
+                .steps
+                .iter()
+                .find(|step| matches!(step.status.as_str(), "claimed" | "runnable" | "waiting"))
+                .or_else(|| run.steps.last());
+            let worktree = run
+                .steps
+                .iter()
+                .find_map(|step| {
+                    serde_json::from_str::<serde_json::Value>(&step.input_json)
+                        .ok()?
+                        .get("cwd")?
+                        .as_str()
+                        .map(PathBuf::from)
+                })
+                .unwrap_or_else(|| repo_root.to_path_buf());
+            let worker_id = run
+                .attempts
+                .iter()
+                .find(|attempt| attempt.status == "claimed")
+                .map(|attempt| attempt.worker_id.clone());
+            let completed = run
+                .steps
+                .iter()
+                .filter(|step| step.status == "succeeded")
+                .count();
             Ok(WorkflowSnapshot {
                 identity: WorkflowIdentity {
                     repository: absolute_path(repo_root),
-                    kind: if kind == "auto" {
-                        WorkflowKind::Auto
-                    } else {
+                    kind: if run.definition_name.contains("plan") {
                         WorkflowKind::Plan
+                    } else {
+                        WorkflowKind::Coding
                     },
-                    run_id: row.get(1)?,
+                    run_id: run.id.clone(),
                     display_id: String::new(),
                 },
                 owner: None,
                 worktree: WorktreeIdentity {
-                    path: absolute_path(Path::new(&row.get::<_, String>(2)?)),
+                    path: absolute_path(&worktree),
                     display: String::new(),
                 },
                 lifecycle,
-                pause_requested,
+                pause_requested: false,
                 dispatch: DispatchSnapshot {
                     state: dispatch_state,
-                    daemon_instance_id: row.get(7)?,
-                    worker_id: row.get(8)?,
-                    lease_expires_unix_ms: row.get(9)?,
-                    heartbeat_unix_ms: row.get(10)?,
-                    interruption_generation: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
-                    updated_unix_ms: row.get(12)?,
+                    daemon_instance_id: None,
+                    worker_id,
+                    lease_expires_unix_ms: None,
+                    heartbeat_unix_ms: None,
+                    interruption_generation: 0,
+                    updated_unix_ms: Some(run.updated_unix_ms),
                 },
-                current_step: row.get::<_, Option<String>>(13)?.map(|label| StepSummary {
-                    label,
-                    state: StepState::parse(row.get::<_, Option<String>>(14).ok().flatten()),
+                current_step: current_step.map(|step| StepSummary {
+                    label: step.key.clone(),
+                    state: StepState::parse(Some(step.status.clone())),
                 }),
                 progress: Progress {
-                    completed: row.get::<_, i64>(15)?.max(0) as usize,
-                    total: row.get::<_, i64>(16)?.max(0) as usize,
+                    completed,
+                    total: run.steps.len(),
                 },
-                available_controls,
-                updated_unix_ms: row.get(5)?,
+                available_controls: controls_for(lifecycle, false, dispatch_state, true),
+                updated_unix_ms: run.updated_unix_ms,
             })
         })
-        .map_err(|error| format!("query workflow projection: {error}"))?;
-    let mut workflows = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("read workflow projection: {error}"))?;
-    drop(statement);
-    let owners = linked_plan_owners(conn, repo_root)?;
-    let identities = workflows
-        .iter()
-        .map(|workflow| {
-            (
-                (workflow.identity.kind, workflow.identity.run_id.clone()),
-                workflow.identity.clone(),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    for workflow in &mut workflows {
-        if workflow.identity.kind == WorkflowKind::Plan
-            && let Some(owner) = owners.get(&workflow.identity.run_id)
-        {
-            workflow.owner = Some(
-                identities
-                    .get(&(WorkflowKind::Auto, owner.run_id.clone()))
-                    .cloned()
-                    .unwrap_or_else(|| owner.clone()),
-            );
-            workflow.available_controls = AvailableControls::default();
-        }
-    }
-    Ok(workflows)
+        .collect()
 }
 
-fn linked_plan_owners(
-    conn: &Connection,
-    repo_root: &Path,
-) -> Result<BTreeMap<String, WorkflowIdentity>, String> {
-    let mut statement = conn.prepare("select distinct s.plan_run_id, s.run_id from auto_step_run s join auto_run r on r.id = s.run_id where s.plan_run_id is not null and r.archived_unix_ms is null order by s.plan_run_id, s.run_id").map_err(|error| format!("prepare linked plan ownership: {error}"))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })
-        .map_err(|error| format!("query linked plan ownership: {error}"))?;
-    let mut owners = BTreeMap::new();
-    for row in rows {
-        let (plan, auto) = row.map_err(|error| format!("read linked plan ownership: {error}"))?;
-        owners.entry(plan).or_insert_with(|| WorkflowIdentity {
-            repository: absolute_path(repo_root),
-            kind: WorkflowKind::Auto,
-            display_id: short_id(WorkflowKind::Auto, &auto),
-            run_id: auto,
-        });
+fn ledger_lifecycle(status: &str) -> Result<WorkflowLifecycle, String> {
+    match status {
+        "waiting" | "runnable" => Ok(WorkflowLifecycle::Queued),
+        "running" => Ok(WorkflowLifecycle::Running),
+        "paused" => Ok(WorkflowLifecycle::Paused),
+        "succeeded" => Ok(WorkflowLifecycle::Done),
+        "failed" | "recovery_required" => Ok(WorkflowLifecycle::Failed),
+        "cancelled" => Ok(WorkflowLifecycle::Aborted),
+        other => Err(format!("unknown global workflow lifecycle: {other}")),
     }
-    Ok(owners)
 }
 
 fn controls_for(
@@ -1256,7 +1150,6 @@ fn controls_for(
     ownerless: bool,
 ) -> AvailableControls {
     let terminal = lifecycle.terminal();
-    let stranded = !terminal && dispatch == Some(execution::DispatchState::Terminal);
     AvailableControls {
         pause: ownerless
             && !terminal
@@ -1269,8 +1162,7 @@ fn controls_for(
             && !terminal
             && (pause_requested
                 || lifecycle == WorkflowLifecycle::Paused
-                || dispatch == Some(execution::DispatchState::Paused)
-                || stranded)
+                || dispatch == Some(execution::DispatchState::Paused))
             && dispatch != Some(execution::DispatchState::RecoveryPending),
         stop: ownerless && !terminal,
         recover: ownerless && dispatch == Some(execution::DispatchState::RecoveryPending),
@@ -1335,212 +1227,6 @@ fn assign_display_ids(repositories: &mut [RepositorySnapshot]) {
     }
 }
 
-fn apply_control_transaction(
-    conn: &mut Connection,
-    workflow: &WorkflowSnapshot,
-    action: ControlAction,
-) -> Result<(String, Vec<String>), String> {
-    if workflow.dispatch.state == Some(execution::DispatchState::RecoveryPending) {
-        return Err("workflow was interrupted; use recover instead".to_string());
-    }
-    let tx = conn
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(|error| format!("begin workflow control: {error}"))?;
-    let now = execution::now_ms();
-    validate_control_snapshot(&tx, workflow)?;
-    let (run_table, step_table) = if workflow.identity.kind == WorkflowKind::Auto {
-        ("auto_run", "auto_step_run")
-    } else {
-        ("plan_run", "plan_step_run")
-    };
-    let mut warnings = Vec::new();
-    let state = match action {
-        ControlAction::Pause => {
-            let paused = if workflow.identity.kind == WorkflowKind::Auto {
-                let outcome = apply_auto_run_control(
-                    &tx,
-                    &workflow.identity.run_id,
-                    AutoRunControlIntent::Pause,
-                )?;
-                warnings.extend(outcome.warnings);
-                outcome.effect == AutoRunControlEffect::Paused
-            } else {
-                let outcome = apply_plan_run_control(
-                    &tx,
-                    &workflow.identity.run_id,
-                    PlanRunControlIntent::Pause,
-                )?;
-                warnings.extend(outcome.warnings);
-                outcome.effect == PlanRunControlEffect::Paused
-            };
-            if paused {
-                set_dispatch(&tx, workflow, "paused", now)?;
-            }
-            if paused {
-                "paused".to_string()
-            } else {
-                "pause_requested".to_string()
-            }
-        }
-        ControlAction::Resume => {
-            let stranded = !workflow.lifecycle.terminal()
-                && workflow.dispatch.state == Some(execution::DispatchState::Terminal);
-            if !stranded
-                && !workflow.pause_requested
-                && workflow.lifecycle != WorkflowLifecycle::Paused
-                && workflow.dispatch.state != Some(execution::DispatchState::Paused)
-            {
-                return Err("workflow is not paused".to_string());
-            }
-            if !workflow.pause_requested && workflow.lifecycle != WorkflowLifecycle::Paused {
-                tx.execute(
-                    &format!("update {run_table} set pause_requested = 1 where id = ?1"),
-                    [&workflow.identity.run_id],
-                )
-                .map_err(|error| format!("adapt paused dispatch for resume: {error}"))?;
-            }
-            let claimed = workflow.dispatch.state == Some(execution::DispatchState::Claimed);
-            let resumed_state = if claimed {
-                resume_claimed_workflow(&tx, workflow, now)?;
-                "running"
-            } else if workflow.identity.kind == WorkflowKind::Auto {
-                let outcome = apply_auto_run_control(
-                    &tx,
-                    &workflow.identity.run_id,
-                    AutoRunControlIntent::Resume,
-                )?;
-                warnings.extend(outcome.warnings);
-                match outcome.executor {
-                    AutoExecutorDecision::Start => "queued",
-                    AutoExecutorDecision::AlreadyRunning => "running",
-                    AutoExecutorDecision::DoNotStart => "paused",
-                }
-            } else {
-                let outcome = apply_plan_run_control(
-                    &tx,
-                    &workflow.identity.run_id,
-                    PlanRunControlIntent::Resume,
-                )?;
-                warnings.extend(outcome.warnings);
-                match outcome.executor {
-                    PlanExecutorDecision::Start => "queued",
-                    PlanExecutorDecision::AlreadyRunning => "running",
-                    PlanExecutorDecision::DoNotStart => "paused",
-                }
-            };
-            if resumed_state == "queued" {
-                enqueue_dispatch(&tx, workflow)?;
-            }
-            resumed_state.to_string()
-        }
-        ControlAction::Stop => {
-            let cancellation = recorded_cancellation(&tx, workflow)?;
-            if workflow.identity.kind == WorkflowKind::Auto {
-                crate::integration::withdraw_merge_intent_in_transaction(
-                    &tx,
-                    &workflow.identity.run_id,
-                )?;
-            }
-            tx.execute(&format!("update {step_table} set status = 'aborted', finished_unix_ms = ?1, error = coalesce(error, 'aborted'), execution_process_id = null, execution_process_start_time_ticks = null, process_id = null where run_id = ?2 and status in ('queued','starting','running','waiting')"), params![now, workflow.identity.run_id]).map_err(|error| format!("abort workflow steps: {error}"))?;
-            let changed = tx.execute(&format!("update {run_table} set pause_requested = 0, status = 'aborted', updated_unix_ms = ?1 where id = ?2 and status not in ('done','aborted')"), params![now, workflow.identity.run_id]).map_err(|error| format!("stop workflow: {error}"))?;
-            if changed != 1 {
-                return Err("workflow cannot be stopped from its current state".to_string());
-            }
-            if workflow.identity.kind == WorkflowKind::Auto {
-                tx.execute(
-                    "update plan_step_run set status = 'aborted', finished_unix_ms = ?1,
-                       error = coalesce(error, 'aborted'), execution_process_id = null,
-                       execution_process_start_time_ticks = null, process_id = null
-                     where run_id in (select plan_run_id from auto_step_run
-                       where run_id = ?2 and plan_run_id is not null)
-                       and status in ('queued','starting','running')",
-                    params![now, workflow.identity.run_id],
-                )
-                .map_err(|error| format!("abort linked plan steps: {error}"))?;
-                tx.execute(
-                    "update plan_run set pause_requested = 0, status = 'aborted',
-                       updated_unix_ms = ?1
-                     where id in (select plan_run_id from auto_step_run
-                       where run_id = ?2 and plan_run_id is not null)
-                       and status not in ('done','failed','aborted')",
-                    params![now, workflow.identity.run_id],
-                )
-                .map_err(|error| format!("abort linked plan: {error}"))?;
-            }
-            set_dispatch(&tx, workflow, "terminal", now)?;
-            tx.commit()
-                .map_err(|error| format!("commit workflow control: {error}"))?;
-            cancel_recorded_work(cancellation, &mut warnings);
-            return Ok(("aborted".to_string(), warnings));
-        }
-        ControlAction::Recover => unreachable!(),
-    };
-    tx.commit()
-        .map_err(|error| format!("commit workflow control: {error}"))?;
-    Ok((state, warnings))
-}
-
-fn resume_claimed_workflow(
-    conn: &Connection,
-    workflow: &WorkflowSnapshot,
-    now: i64,
-) -> Result<(), String> {
-    let run_table = if workflow.identity.kind == WorkflowKind::Auto {
-        "auto_run"
-    } else {
-        "plan_run"
-    };
-    let changed = conn
-        .execute(
-            &format!(
-                "update {run_table} set pause_requested = 0, status = 'running',
-                   updated_unix_ms = ?1 where id = ?2 and pause_requested = 1"
-            ),
-            params![now, workflow.identity.run_id],
-        )
-        .map_err(|error| format!("resume claimed workflow: {error}"))?;
-    if changed != 1 {
-        return Err("workflow changed while applying resume".to_string());
-    }
-    if workflow.identity.kind == WorkflowKind::Auto {
-        conn.execute(
-            "update plan_run set pause_requested = 0,
-               status = case when exists(
-                 select 1 from plan_step_run s where s.run_id = plan_run.id
-                   and s.status in ('starting','running')
-               ) then 'running' else 'queued' end,
-               updated_unix_ms = ?1
-             where id in (select plan_run_id from auto_step_run
-               where run_id = ?2 and plan_run_id is not null)
-               and (pause_requested = 1 or status = 'paused')",
-            params![now, workflow.identity.run_id],
-        )
-        .map_err(|error| format!("resume claimed linked plan: {error}"))?;
-    }
-    Ok(())
-}
-
-fn set_dispatch(
-    conn: &Connection,
-    workflow: &WorkflowSnapshot,
-    state: &str,
-    now: i64,
-) -> Result<(), String> {
-    conn.execute("update workflow_execution set dispatch_state = ?1, worker_id = null, daemon_instance_id = null, lease_expires_unix_ms = null, heartbeat_unix_ms = null, executor_pid = null, executor_process_identity = null, requeue_requested = 0, not_before_unix_ms = null, wake_reason = null, fencing_token = fencing_token + 1, workflow_revision = workflow_revision + 1, updated_unix_ms = ?2 where workflow_kind = ?3 and run_id = ?4", params![state, now, workflow.identity.kind.label(), workflow.identity.run_id]).map_err(|error| format!("update workflow dispatch: {error}"))?;
-    Ok(())
-}
-
-fn enqueue_dispatch(conn: &Connection, workflow: &WorkflowSnapshot) -> Result<(), String> {
-    crate::execution::enqueue(
-        conn,
-        &crate::execution::WorkflowIdentity::new(
-            workflow.identity.kind,
-            workflow.identity.run_id.clone(),
-        ),
-    )?;
-    Ok(())
-}
-
 fn eligible_owner(
     workflows: &[WorkflowSnapshot],
     action: ControlAction,
@@ -1570,146 +1256,6 @@ fn validate_explicit_control(
             control_action_label(action),
             workflow.identity.display_id
         ))
-    }
-}
-
-fn validate_control_snapshot(conn: &Connection, workflow: &WorkflowSnapshot) -> Result<(), String> {
-    let run_table = if workflow.identity.kind == WorkflowKind::Auto {
-        "auto_run"
-    } else {
-        "plan_run"
-    };
-    let current = conn
-        .query_row(
-            &format!(
-                "select r.status, r.pause_requested, r.updated_unix_ms,
-                        e.dispatch_state, coalesce(e.interruption_generation, 0)
-                 from {run_table} r left join workflow_execution e
-                   on e.workflow_kind = ?1 and e.run_id = r.id
-                 where r.id = ?2"
-            ),
-            params![workflow.identity.kind.label(), workflow.identity.run_id],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)? != 0,
-                    row.get::<_, i64>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            },
-        )
-        .optional()
-        .map_err(|error| format!("validate workflow control: {error}"))?;
-    let expected = (
-        workflow.lifecycle.label().to_string(),
-        workflow.pause_requested,
-        workflow.updated_unix_ms,
-        workflow
-            .dispatch
-            .state
-            .map(|state| state.label().to_string()),
-        workflow.dispatch.interruption_generation,
-    );
-    if current.as_ref() != Some(&expected) {
-        return Err("workflow changed while applying control; inspect it again".to_string());
-    }
-    Ok(())
-}
-
-struct RecordedCancellation {
-    processes: Vec<(u32, Option<u64>)>,
-    sessions: Vec<crate::harness::SessionRef>,
-}
-
-fn recorded_cancellation(
-    conn: &Connection,
-    workflow: &WorkflowSnapshot,
-) -> Result<RecordedCancellation, String> {
-    let query = if workflow.identity.kind == WorkflowKind::Auto {
-        "select execution_process_id, execution_process_start_time_ticks
-         from auto_step_run where run_id = ?1 and execution_process_id is not null
-         union
-         select execution_process_id, execution_process_start_time_ticks
-         from plan_step_run where run_id in (
-           select plan_run_id from auto_step_run where run_id = ?1 and plan_run_id is not null
-         ) and execution_process_id is not null"
-    } else {
-        "select execution_process_id, execution_process_start_time_ticks
-         from plan_step_run where run_id = ?1 and execution_process_id is not null"
-    };
-    let mut statement = conn
-        .prepare(query)
-        .map_err(|error| format!("prepare workflow process cancellation: {error}"))?;
-    let rows = statement
-        .query_map([&workflow.identity.run_id], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
-        })
-        .map_err(|error| format!("query workflow process cancellation: {error}"))?;
-    let mut processes = Vec::new();
-    for row in rows {
-        let (pid, start) = row.map_err(|error| format!("read workflow process: {error}"))?;
-        if let Ok(pid) = u32::try_from(pid) {
-            processes.push((pid, start.and_then(|value| u64::try_from(value).ok())));
-        }
-    }
-    let query = if workflow.identity.kind == WorkflowKind::Auto {
-        "select session_adapter_id, session_endpoint, session_id
-         from auto_step_run where run_id = ?1 and session_id is not null
-         union
-         select session_adapter_id, session_endpoint, session_id
-         from plan_step_run where run_id in (
-           select plan_run_id from auto_step_run where run_id = ?1 and plan_run_id is not null
-         ) and session_id is not null"
-    } else {
-        "select session_adapter_id, session_endpoint, session_id
-         from plan_step_run where run_id = ?1 and session_id is not null"
-    };
-    let mut statement = conn
-        .prepare(query)
-        .map_err(|error| format!("prepare workflow session cancellation: {error}"))?;
-    let rows = statement
-        .query_map([&workflow.identity.run_id], |row| {
-            Ok(crate::harness::SessionRef {
-                adapter_id: row.get(0)?,
-                endpoint: row.get(1)?,
-                id: row.get(2)?,
-            })
-        })
-        .map_err(|error| format!("query workflow session cancellation: {error}"))?;
-    let sessions = rows
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("read workflow session: {error}"))?;
-    Ok(RecordedCancellation {
-        processes,
-        sessions,
-    })
-}
-
-fn cancel_recorded_work(cancellation: RecordedCancellation, warnings: &mut Vec<String>) {
-    for session in cancellation.sessions {
-        if let Err(error) = crate::harness::cancel_native_session(&session) {
-            warnings.push(format!(
-                "workflow stopped, but native session cancellation failed: {error}"
-            ));
-        }
-    }
-    for (pid, identity) in cancellation.processes {
-        let recorded = crate::process::RecordedProcess::from_stored(pid, identity);
-        match crate::process::terminate_recorded_process(
-            recorded,
-            std::time::Duration::from_secs(1),
-        ) {
-            Ok(crate::process::TerminationOutcome::Terminated)
-            | Ok(crate::process::TerminationOutcome::AlreadyExited)
-            | Ok(crate::process::TerminationOutcome::IdentityReused) => {}
-            Ok(crate::process::TerminationOutcome::Unverifiable) => warnings.push(format!(
-                "workflow stopped, but external process {pid} has no reusable process identity"
-            )),
-            Err(error) => warnings.push(format!(
-                "workflow stopped, but external process {pid} cancellation failed: {error}"
-            )),
-        }
     }
 }
 
@@ -1750,48 +1296,18 @@ fn eligible_refs<'a>(
     }
 }
 
-fn execution_identity(identity: &WorkflowIdentity) -> Result<ExecutionIdentity, String> {
-    Ok(ExecutionIdentity::new(identity.kind, &identity.run_id))
-}
-
-fn sql_value_error(index: usize, error: String) -> rusqlite::Error {
-    rusqlite::Error::FromSqlConversionFailure(
-        index,
-        rusqlite::types::Type::Text,
-        Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, error)),
-    )
-}
-
-fn table_exists(conn: &Connection, table: &str) -> Result<bool, String> {
-    conn.query_row(
-        "select exists(select 1 from sqlite_master where type = 'table' and name = ?1)",
-        [table],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|value| value != 0)
-    .map_err(|error| error.to_string())
-}
-
-fn table_has_column(conn: &Connection, table: &str, column: &str) -> Result<bool, String> {
-    conn.query_row(
-        &format!("select exists(select 1 from pragma_table_info('{table}') where name = ?1)"),
-        [column],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|value| value != 0)
-    .map_err(|error| error.to_string())
-}
-
 fn workflow_selector_matches(selector: &str, identity: &WorkflowIdentity) -> bool {
     selector == identity.display_id
         || selector
-            .strip_prefix("auto:")
-            .is_some_and(|id| identity.kind == WorkflowKind::Auto && id == identity.run_id)
+            .strip_prefix("coding:")
+            .is_some_and(|id| identity.kind == WorkflowKind::Coding && id == identity.run_id)
         || selector
             .strip_prefix("plan:")
             .is_some_and(|id| identity.kind == WorkflowKind::Plan && id == identity.run_id)
-        || selector.strip_prefix("a:").is_some_and(|id| {
-            identity.kind == WorkflowKind::Auto && id.len() == 8 && identity.run_id.starts_with(id)
+        || selector.strip_prefix("c:").is_some_and(|id| {
+            identity.kind == WorkflowKind::Coding
+                && id.len() == 8
+                && identity.run_id.starts_with(id)
         })
         || selector.strip_prefix("p:").is_some_and(|id| {
             identity.kind == WorkflowKind::Plan && id.len() == 8 && identity.run_id.starts_with(id)
@@ -1826,7 +1342,11 @@ fn short_id(kind: WorkflowKind, run_id: &str) -> String {
 }
 
 fn kind_prefix(kind: WorkflowKind) -> &'static str {
-    if kind == WorkflowKind::Auto { "a" } else { "p" }
+    match kind {
+        WorkflowKind::Coding => "c",
+        WorkflowKind::Plan => "p",
+        WorkflowKind::Auto => "a",
+    }
 }
 fn branch_label(branch: &BranchState) -> &str {
     match branch {
@@ -1853,26 +1373,22 @@ fn path_contains(root: &Path, selected: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::database::TestDatabase;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn connection() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::plan_run::migrate_schema(&conn).unwrap();
-        conn.execute_batch(
-            "create table workflow_execution (
-               workflow_kind text not null, run_id text not null, dispatch_state text not null,
-               worker_id text, daemon_instance_id text, lease_expires_unix_ms integer,
-               heartbeat_unix_ms integer, fencing_token integer not null,
-                executor_pid integer, executor_process_identity text,
-                requeue_requested integer not null default 0, interruption_generation integer not null,
-                recovery_decided_unix_ms integer, execution_version integer not null default 1,
-                not_before_unix_ms integer, wake_reason text,
-                workflow_revision integer not null default 0,
-                created_unix_ms integer not null, updated_unix_ms integer not null,
-               primary key (workflow_kind, run_id)
-             );",
-        )
-        .unwrap();
-        conn
+    static DATABASE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+    fn connection() -> TestDatabase {
+        let path = std::env::temp_dir().join(format!(
+            "prism-workspace-interface-{}-{}.db",
+            std::process::id(),
+            DATABASE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        TestDatabase::open(&path).unwrap()
+    }
+
+    fn reader(conn: &TestDatabase) -> workspace_persistence::WorkspaceReader {
+        workspace_persistence::WorkspaceReader::open(conn.path()).unwrap()
     }
 
     fn workflow(status: &str, paused: bool, dispatch: &str) -> WorkflowSnapshot {
@@ -1915,27 +1431,43 @@ mod tests {
         }
     }
 
-    fn insert_run(conn: &Connection, status: &str, paused: bool, dispatch: &str) {
-        conn.execute(
-            "insert into plan_run (
-               id, repo_root, scope_path, worktree_session_id, plan_path, plan_display, step_name,
-               start_step, total_steps, mode, status, pause_requested, selected_step,
-               created_unix_ms, updated_unix_ms
-              ) values (
-               'plan-1', '/repo', '/repo', 'test-worktree-session', '/repo/plan.md', 'plan.md', 'phase',
-               1, 1, 'sequential', ?1, ?2, 1, 10, 20
-              )",
-            params![status, paused],
-        )
+    #[test]
+    fn global_ledger_projection_drives_coding_workflow_state_and_controls() {
+        let run: crate::WorkflowProjection = serde_json::from_value(serde_json::json!({
+            "id": "coding-run-12345678",
+            "definition_name": "coding",
+            "status": "running",
+            "repository": "/repo",
+            "created_unix_ms": 10,
+            "updated_unix_ms": 20,
+            "completed_unix_ms": null,
+            "steps": [{
+                "id": "step", "key": "implement", "implementation": "harness",
+                "target_id": "local", "status": "claimed",
+                "input_json": "{\"cwd\":\"/repo/worktree\"}"
+            }],
+            "attempts": [{
+                "id": "attempt", "step_id": "step", "status": "claimed",
+                "worker_id": "worker", "target_id": "local", "fencing_token": 1,
+                "process_id": null, "process_start_time_ticks": null,
+                "started_unix_ms": 20, "finished_unix_ms": null, "output": []
+            }],
+            "artifacts": [], "approvals": [], "effects": [], "gates": [], "events": []
+        }))
         .unwrap();
-        conn.execute(
-            "insert into workflow_execution (
-               workflow_kind, run_id, dispatch_state, fencing_token, requeue_requested,
-               interruption_generation, created_unix_ms, updated_unix_ms
-             ) values ('plan', 'plan-1', ?1, 1, 0, 0, 10, 20)",
-            [dispatch],
-        )
-        .unwrap();
+
+        let workflows = load_ledger_workflows(&[run], Path::new("/repo")).unwrap();
+        let workflow = &workflows[0];
+        assert_eq!(workflow.identity.kind, WorkflowKind::Coding);
+        assert_eq!(workflow.worktree.path, PathBuf::from("/repo/worktree"));
+        assert_eq!(workflow.lifecycle, WorkflowLifecycle::Running);
+        assert_eq!(
+            workflow.current_step.as_ref().unwrap().state,
+            StepState::Running
+        );
+        assert_eq!(workflow.dispatch.worker_id.as_deref(), Some("worker"));
+        assert!(workflow.available_controls.pause);
+        assert!(workflow.available_controls.stop);
     }
 
     #[test]
@@ -1958,16 +1490,14 @@ mod tests {
 
     #[test]
     fn persisted_agent_labels_project_as_stable_typed_states() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "create table agent_state (
-               branch text primary key, state text, updated_unix_ms integer
-             );
-             insert into agent_state values ('feature', 'needs input', 42);",
+        let conn = connection();
+        conn.execute(
+            "insert into agent_state values ('feature', 'needs input', 42)",
+            [],
         )
         .unwrap();
 
-        let agent = load_agent(&conn, "feature").unwrap().unwrap();
+        let agent = load_agent(&reader(&conn), "feature").unwrap().unwrap();
 
         assert_eq!(agent.state, Some(AgentState::NeedsInput));
         assert_eq!(agent.updated_unix_ms, Some(42));
@@ -1976,22 +1506,27 @@ mod tests {
 
     #[test]
     fn cached_pull_request_preserves_mergeability_staleness_and_error_provenance() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "create table pr_cache (
-               branch text primary key, number integer, title text, url text, state text,
-               review_decision text, merge_state_status text, check_status text,
-               refreshed_unix_ms integer, merged integer, draft integer,
-               observation_error text
-             );
-             insert into pr_cache values (
-               'feature', 42, 'PR', 'https://example.test/42', 'OPEN',
-               'APPROVED', 'DIRTY', 'passed', 10, 0, 0, 'gh unavailable'
-             );",
+        let conn = connection();
+        conn.execute(
+            "insert into pr_cache (
+            branch, number, provider, canonical_host, project_path, native_cr_id,
+            display_number, source_provider, source_canonical_host, source_project_path,
+            target_provider, target_canonical_host, target_project_path,
+            title, url, state, review_decision, head_ref, base_ref,
+            head_sha, updated_at, merge_state_status, check_status, merged, draft,
+            last_refreshed, refreshed_unix_ms, observation_error
+          ) values ('feature', 42, 'github', 'github.com', 'org/repo', '42', 42,
+            'github', 'github.com', 'org/repo', 'github', 'github.com', 'org/repo',
+            'PR', 'https://example.test/42', 'OPEN',
+            'APPROVED', 'feature', 'main', 'abc', '', 'DIRTY', 'passed', 0, 0, '', 10,
+            'gh unavailable')",
+            [],
         )
         .unwrap();
 
-        let pull_request = load_pr(&conn, "feature", 100_000).unwrap().unwrap();
+        let pull_request = load_pr(&reader(&conn), "feature", 100_000)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(pull_request.state, PullRequestState::Open);
         assert_eq!(pull_request.mergeability, Some(MergeabilityState::Dirty));
@@ -2036,176 +1571,6 @@ mod tests {
     }
 
     #[test]
-    fn active_resume_does_not_request_a_second_execution() {
-        let mut conn = connection();
-        insert_run(&conn, "running", true, "claimed");
-        conn.execute(
-            "insert into plan_step_run (run_id, step, prompt, status, execution_process_id)
-             values ('plan-1', 1, 'phase', 'running', ?1)",
-            [i64::from(std::process::id())],
-        )
-        .unwrap();
-
-        let (state, _) = apply_control_transaction(
-            &mut conn,
-            &workflow("running", true, "claimed"),
-            ControlAction::Resume,
-        )
-        .unwrap();
-
-        assert_eq!(state, "running");
-        let dispatch: (String, i64) = conn
-            .query_row(
-                "select dispatch_state, requeue_requested from workflow_execution",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(dispatch, ("claimed".to_string(), 0));
-    }
-
-    #[test]
-    fn nonterminal_workflow_with_terminal_dispatch_can_be_resumed() {
-        let mut conn = connection();
-        insert_run(&conn, "queued", false, "terminal");
-        conn.execute(
-            "insert into plan_step_run (run_id, step, prompt, status)
-             values ('plan-1', 1, 'phase', 'queued')",
-            [],
-        )
-        .unwrap();
-        let workflow = workflow("queued", false, "terminal");
-
-        assert!(
-            controls_for(
-                workflow.lifecycle,
-                workflow.pause_requested,
-                workflow.dispatch.state,
-                true,
-            )
-            .resume
-        );
-        let (state, _) =
-            apply_control_transaction(&mut conn, &workflow, ControlAction::Resume).unwrap();
-
-        assert_eq!(state, "queued");
-        let persisted: (String, i64, String) = conn
-            .query_row(
-                "select p.status, p.pause_requested, e.dispatch_state
-                 from plan_run p join workflow_execution e on e.run_id = p.id",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(persisted, ("queued".to_string(), 0, "queued".to_string()));
-    }
-
-    #[test]
-    fn claimed_resume_does_not_reconcile_a_starting_step_without_a_pid() {
-        let mut conn = connection();
-        insert_run(&conn, "running", true, "claimed");
-        conn.execute(
-            "insert into plan_step_run (run_id, step, prompt, status)
-             values ('plan-1', 1, 'phase', 'starting')",
-            [],
-        )
-        .unwrap();
-
-        let (state, _) = apply_control_transaction(
-            &mut conn,
-            &workflow("running", true, "claimed"),
-            ControlAction::Resume,
-        )
-        .unwrap();
-
-        assert_eq!(state, "running");
-        let persisted: (String, String, i64) = conn
-            .query_row(
-                "select p.status, e.dispatch_state, e.requeue_requested
-                 from plan_run p join workflow_execution e on e.run_id = p.id",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(persisted, ("running".to_string(), "claimed".to_string(), 0));
-        let step: String = conn
-            .query_row("select status from plan_step_run", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(step, "starting");
-    }
-
-    #[test]
-    fn stale_control_cannot_overwrite_recovery_pending() {
-        let mut conn = connection();
-        insert_run(&conn, "queued", false, "recovery_pending");
-        conn.execute(
-            "update workflow_execution set interruption_generation = 1, updated_unix_ms = 21",
-            [],
-        )
-        .unwrap();
-
-        let error = apply_control_transaction(
-            &mut conn,
-            &workflow("queued", false, "queued"),
-            ControlAction::Pause,
-        )
-        .unwrap_err();
-
-        assert!(error.contains("changed while applying control"));
-        let state: String = conn
-            .query_row("select dispatch_state from workflow_execution", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(state, "recovery_pending");
-    }
-
-    #[test]
-    fn stop_commits_then_cancels_a_recorded_process() {
-        let mut conn = connection();
-        insert_run(&conn, "running", false, "claimed");
-        let mut command = std::process::Command::new("sleep");
-        command.arg("30");
-        let mut child = crate::process::SupervisedChild::spawn(&mut command, None, None).unwrap();
-        let pid = child.id();
-        let recorded = crate::process::record_process(pid).unwrap();
-        let start = recorded.identity.map(|identity| identity.stored_value());
-        let reaper = std::thread::spawn(move || child.wait().unwrap());
-        conn.execute(
-            "insert into plan_step_run (
-               run_id, step, prompt, status, execution_process_id,
-               execution_process_start_time_ticks
-             ) values ('plan-1', 1, 'phase', 'running', ?1, ?2)",
-            params![pid, start.map(|value| i64::try_from(value).unwrap())],
-        )
-        .unwrap();
-
-        let (state, warnings) = apply_control_transaction(
-            &mut conn,
-            &workflow("running", false, "claimed"),
-            ControlAction::Stop,
-        )
-        .unwrap();
-
-        assert_eq!(state, "aborted");
-        assert!(warnings.is_empty(), "{warnings:?}");
-        let process: (Option<i64>, Option<i64>) = conn
-            .query_row(
-                "select execution_process_id, execution_process_start_time_ticks
-                 from plan_step_run where run_id = 'plan-1'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(process, (None, None));
-        reaper.join().unwrap();
-        assert_eq!(
-            crate::process::observe_process(recorded).unwrap(),
-            crate::process::ProcessObservation::Missing
-        );
-    }
-
-    #[test]
     fn dispatch_only_pause_advertises_and_accepts_resume() {
         let controls = controls_for(
             WorkflowLifecycle::Running,
@@ -2215,49 +1580,5 @@ mod tests {
         );
         assert!(controls.resume);
         assert!(!controls.pause);
-
-        let mut conn = connection();
-        insert_run(&conn, "running", false, "paused");
-        let (state, _) = apply_control_transaction(
-            &mut conn,
-            &workflow("running", false, "paused"),
-            ControlAction::Resume,
-        )
-        .unwrap();
-        assert_eq!(state, "queued");
-    }
-
-    #[test]
-    fn linked_plan_owner_is_available_when_owner_is_not_projected() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "create table auto_run (id text primary key, archived_unix_ms integer);
-             create table auto_step_run (run_id text, plan_run_id text);
-             insert into auto_run values ('auto-owner-12345678', null);
-             insert into auto_step_run values ('auto-owner-12345678', 'plan-child');",
-        )
-        .unwrap();
-
-        let owners = linked_plan_owners(&conn, Path::new("/repo")).unwrap();
-        let owner = owners.get("plan-child").unwrap();
-        assert_eq!(owner.kind, WorkflowKind::Auto);
-        assert_eq!(owner.run_id, "auto-owner-12345678");
-        assert_eq!(owner.display_id, "a:auto-own");
-    }
-
-    #[test]
-    fn archived_auto_link_does_not_make_a_plan_uncontrollable() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "create table auto_run (id text primary key, archived_unix_ms integer);
-             create table auto_step_run (run_id text, plan_run_id text);
-             insert into auto_run values ('archived-owner', 42);
-             insert into auto_step_run values ('archived-owner', 'active-plan');",
-        )
-        .unwrap();
-
-        let owners = linked_plan_owners(&conn, Path::new("/repo")).unwrap();
-
-        assert!(!owners.contains_key("active-plan"));
     }
 }

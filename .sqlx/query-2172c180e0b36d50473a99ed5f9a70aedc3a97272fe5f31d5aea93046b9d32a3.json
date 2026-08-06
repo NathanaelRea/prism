@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select branch as \"branch!\" from hidden_session\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "branch!",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "2172c180e0b36d50473a99ed5f9a70aedc3a97272fe5f31d5aea93046b9d32a3"
+}

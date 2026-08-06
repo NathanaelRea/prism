@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into metadata (key, value)\nvalues (?1, ?2)\non conflict(key) do update set value = excluded.value\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "a5f6c2c4a53ab48b9e856d393f5eb6a4d4bf29247fa346c463e323d8eb858431"
+}

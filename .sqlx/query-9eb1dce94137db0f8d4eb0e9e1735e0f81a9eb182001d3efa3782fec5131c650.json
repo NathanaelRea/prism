@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update notification_outbox\nset delivery_state = 'superseded', superseded_unix_ms = ?\nwhere worktree_path = ? and branch = ? and incarnation = ?\n  and kind = ? and delivery_state = 'pending'\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "9eb1dce94137db0f8d4eb0e9e1735e0f81a9eb182001d3efa3782fec5131c650"
+}

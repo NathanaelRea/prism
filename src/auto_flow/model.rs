@@ -12,7 +12,6 @@ pub struct AutoRun {
     pub repo_root: String,
     pub worktree_path: PathBuf,
     pub worktree_incarnation: Option<String>,
-    pub worktree_session_id: Option<String>,
     pub branch: String,
     pub mode: AutoRunMode,
     pub implementation_source: AutoImplementationSource,
@@ -85,7 +84,6 @@ pub struct AutoLaunch {
     pub repo_root: String,
     pub worktree_path: PathBuf,
     worktree_incarnation: Option<String>,
-    worktree_session_id: Option<String>,
     pub branch: String,
     pub mode: AutoRunMode,
     pub implementation_source: AutoImplementationSource,
@@ -138,7 +136,6 @@ pub enum AutoImplementationSource {
     Prompt,
     ExistingPlan,
     DraftPlan,
-    ExistingPullRequest,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,7 +168,6 @@ pub enum AutoStepKey {
     FixCi,
     VerifyCiFix,
     CommitCiFix,
-    UpdateBranch,
     Merge,
     Cleanup,
     Custom(String),
@@ -214,14 +210,14 @@ pub struct AutoStatusCounts {
 }
 
 impl AutoRunMode {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Standard => "standard",
             Self::PlanFirst => "plan_first",
         }
     }
 
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "standard" => Ok(Self::Standard),
             "plan_first" => Ok(Self::PlanFirst),
@@ -231,28 +227,26 @@ impl AutoRunMode {
 }
 
 impl AutoImplementationSource {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Prompt => "prompt",
             Self::ExistingPlan => "existing_plan",
             Self::DraftPlan => "draft_plan",
-            Self::ExistingPullRequest => "existing_pull_request",
         }
     }
 
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "prompt" => Ok(Self::Prompt),
             "existing_plan" => Ok(Self::ExistingPlan),
             "draft_plan" => Ok(Self::DraftPlan),
-            "existing_pull_request" => Ok(Self::ExistingPullRequest),
             _ => Err(format!("unknown auto implementation source: {value}")),
         }
     }
 }
 
 impl AutoRunStatus {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Running => "running",
@@ -263,7 +257,7 @@ impl AutoRunStatus {
         }
     }
 
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "queued" => Ok(Self::Queued),
             "running" => Ok(Self::Running),
@@ -297,14 +291,13 @@ impl AutoStepKey {
             Self::FixCi => "fix_ci",
             Self::VerifyCiFix => "verify_ci_fix",
             Self::CommitCiFix => "commit_ci_fix",
-            Self::UpdateBranch => "update_branch",
             Self::Merge => "merge",
             Self::Cleanup => "cleanup",
             Self::Custom(value) => value.as_str(),
         }
     }
 
-    pub(super) fn parse(value: &str) -> Self {
+    pub(crate) fn parse(value: &str) -> Self {
         match value {
             "prepare" => Self::Prepare,
             "create_plan" => Self::CreatePlan,
@@ -324,7 +317,6 @@ impl AutoStepKey {
             "fix_ci" => Self::FixCi,
             "verify_ci_fix" => Self::VerifyCiFix,
             "commit_ci_fix" => Self::CommitCiFix,
-            "update_branch" => Self::UpdateBranch,
             "merge" => Self::Merge,
             "cleanup" => Self::Cleanup,
             other => Self::Custom(other.to_string()),
@@ -333,7 +325,7 @@ impl AutoStepKey {
 }
 
 impl AutoStepStatus {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
             Self::Starting => "starting",
@@ -346,7 +338,7 @@ impl AutoStepStatus {
         }
     }
 
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "queued" => Ok(Self::Queued),
             "starting" => Ok(Self::Starting),
@@ -362,7 +354,7 @@ impl AutoStepStatus {
 }
 
 impl AutoOutputKind {
-    pub(super) fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Assistant => "assistant",
             Self::Tool => "tool",
@@ -375,7 +367,7 @@ impl AutoOutputKind {
         }
     }
 
-    pub(super) fn parse(value: &str) -> Result<Self, String> {
+    pub(crate) fn parse(value: &str) -> Result<Self, String> {
         match value {
             "assistant" => Ok(Self::Assistant),
             "tool" => Ok(Self::Tool),
@@ -437,12 +429,8 @@ impl AutoLaunch {
         if implementation_source == AutoImplementationSource::ExistingPlan && plan_path.is_none() {
             return Err("existing-plan auto flow requires a plan path".to_string());
         }
-        if matches!(
-            implementation_source,
-            AutoImplementationSource::Prompt | AutoImplementationSource::ExistingPullRequest
-        ) && plan_path.is_some()
-        {
-            return Err("prompt and existing-PR auto flow cannot have a plan path".to_string());
+        if implementation_source == AutoImplementationSource::Prompt && plan_path.is_some() {
+            return Err("prompt auto flow cannot have a plan path".to_string());
         }
         if variant.trim().is_empty() {
             return Err("auto flow variant cannot be empty".to_string());
@@ -453,11 +441,6 @@ impl AutoLaunch {
             worktree_incarnation: nonempty_incarnation(crate::session::worktree_incarnation(
                 worktree_path,
             )),
-            worktree_session_id: if cfg!(test) {
-                Some("test-worktree-session".to_string())
-            } else {
-                None
-            },
             branch,
             mode,
             implementation_source,
@@ -482,11 +465,12 @@ impl AutoLaunch {
         self
     }
 
-    pub(crate) fn with_worktree_session_id(mut self, id: impl Into<String>) -> Self {
-        self.worktree_session_id = Some(id.into());
+    pub(crate) fn with_worktree_incarnation(mut self, incarnation: String) -> Self {
+        self.worktree_incarnation = nonempty_incarnation(incarnation);
         self
     }
 
+    #[cfg(test)]
     pub fn create_run(&self) -> PersistedAutoRun {
         let now = unix_ms();
         let id = self.default_run_id(now);
@@ -497,7 +481,6 @@ impl AutoLaunch {
             repo_root: self.repo_root.clone(),
             worktree_path: self.worktree_path.clone(),
             worktree_incarnation: self.worktree_incarnation.clone(),
-            worktree_session_id: self.worktree_session_id.clone(),
             branch: self.branch.clone(),
             mode: self.mode,
             implementation_source: self.implementation_source,
@@ -532,6 +515,7 @@ impl AutoLaunch {
         PersistedAutoRun { run, steps }
     }
 
+    #[cfg(test)]
     pub(super) fn default_run_id(&self, now: u64) -> String {
         format!(
             "auto-{:016x}-{now}",

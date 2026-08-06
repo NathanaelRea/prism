@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update workflow_execution set dispatch_state = 'recovery_pending', worker_id = null,\n daemon_instance_id = null, lease_expires_unix_ms = null, executor_pid = null,\n executor_process_identity = null, requeue_requested = 0,\n interruption_generation = interruption_generation + 1, fencing_token = fencing_token + 1,\n updated_unix_ms = ?\nwhere dispatch_state = 'claimed' and (daemon_instance_id != ? or lease_expires_unix_ms <= ?)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "33d48d49baf89a23b708cecbefb77e646c1d158e8211b4a4c1b4842a09744560"
+}

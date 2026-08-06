@@ -1,0 +1,74 @@
+{
+  "db_name": "SQLite",
+  "query": "select number, title, url, state, merge_state_status, check_status,\n       refreshed_unix_ms, merged, draft, observation_error\nfrom pr_cache where branch = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "number",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "title",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "url",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "state",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "merge_state_status",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "check_status",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "refreshed_unix_ms",
+        "ordinal": 6,
+        "type_info": "Integer"
+      },
+      {
+        "name": "merged",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "draft",
+        "ordinal": 8,
+        "type_info": "Integer"
+      },
+      {
+        "name": "observation_error",
+        "ordinal": 9,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "933c1862dfae00fd834fee68a23598fb416e3489ea9f2209d9d984b09073d13d"
+}

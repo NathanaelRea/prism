@@ -1,270 +1,22 @@
 use super::*;
 use crate::config::Config;
-use crate::observability;
 use crate::remote::coordinator::{
     PrCacheEligibility, PrCacheRepository, load_pr_cache_for_branch, pr_cache_pollable_for_session,
     pr_summary_matches_worktree, refresh_pr_summary_index_for_sessions,
     resolve_pr_summary_for_session,
 };
-use crate::remote::migrations::{migrate_pr_cache_schema, table_has_column};
 use crate::remote::store::{
-    load_pr_cache, load_pr_details_cache, load_repo_policy_cache,
-    load_repo_policy_cache_for_identity, load_repo_policy_cache_for_repository,
-    persist_pr_cache_snapshot, persist_pr_summary_mutation, record_pr_summary, save_pr_cache,
-    save_pr_details_cache, save_pr_details_cache_for_association, save_repo_policy_cache,
+    load_pr_cache, load_pr_details_cache, load_repo_policy_cache_for_identity,
+    persist_pr_cache_snapshot, record_pr_summary, save_pr_cache, save_pr_details_cache,
+    save_pr_details_cache_for_association, save_repo_policy_cache,
 };
 use crate::session::Session;
 use crate::test_support::write_executable;
-use rusqlite::params;
 use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-#[test]
-fn migrates_existing_pr_cache_schema_additively_without_losing_rows() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-        "
-            create table pr_cache (
-              branch text primary key, number integer not null, title text not null,
-              url text not null, state text not null, review_decision text not null,
-              head_ref text not null, base_ref text not null, head_sha text not null,
-              updated_at text not null, check_status text not null, merged integer not null,
-              draft integer not null, last_refreshed text not null,
-              refreshed_unix_ms integer not null
-            );
-            create table pr_details_cache (
-              branch text primary key, comments text not null, reviews text not null,
-              review_comments text not null, files text not null,
-              failing_checks text not null, refreshed_unix_ms integer not null
-            );
-            create table repo_policy_cache (
-              repo_remote text primary key, default_branch text,
-              required_approvals integer not null default 0,
-              require_conversation_resolution integer not null default 0,
-              require_branch_up_to_date integer not null default 0,
-              required_checks text not null default '[]',
-              merge_queue_required integer not null default 0,
-              refreshed_unix_ms integer not null, error text
-            );
-            insert into pr_cache values (
-              'feature', 42, 'Old row', 'https://example.test/42', 'OPEN', '',
-              'feature', 'main', 'head-a', '2026-01-01', 'pending', 0, 0,
-              'before migration', 123
-            );
-            insert into pr_details_cache values (
-              'feature', '[]', '[]', '[]', '[\"src/lib.rs\"]', '[]', 123
-            );
-            insert into pr_cache values (
-              'github-feature', 43, 'GitHub row', 'https://github.com/acme/widgets/pull/43',
-              'OPEN', '', 'github-feature', 'main', 'head-b', '2026-01-02', 'pending',
-              0, 0, 'before migration', 124
-            );
-            insert into pr_details_cache values (
-              'github-feature', '[]', '[]', '[]', '[\"src/main.rs\"]', '[]', 124
-            );
-            insert into repo_policy_cache values (
-              'acme/widgets', 'main', 1, 1, 1, '[\"ci\"]', 0, 125, null
-            );
-            ",
-    )
-    .unwrap();
-
-    migrate_pr_cache_schema(&conn).unwrap();
-    migrate_pr_cache_schema(&conn).unwrap();
-
-    assert!(table_has_column(&conn, "pr_cache", "body").unwrap());
-    assert!(table_has_column(&conn, "pr_cache", "observation_error").unwrap());
-    assert!(table_has_column(&conn, "pr_details_cache", "pr_number").unwrap());
-    assert!(table_has_column(&conn, "pr_details_cache", "head_sha").unwrap());
-    assert!(table_has_column(&conn, "pr_cache", "native_cr_id").unwrap());
-    assert!(table_has_column(&conn, "pr_cache", "identity_complete").unwrap());
-    assert!(table_has_column(&conn, "pr_cache", "native_state_evidence").unwrap());
-    assert!(table_has_column(&conn, "pr_details_cache", "target_project_path").unwrap());
-    assert!(table_has_column(&conn, "repo_policy_cache", "target_branch").unwrap());
-    let old_row = conn
-        .query_row(
-            "select title, body, comment_count from pr_cache where branch = 'feature'",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(old_row, ("Old row".to_string(), String::new(), 0));
-    assert_eq!(
-        conn.query_row(
-            "select native_state_evidence from pr_cache where branch = 'feature'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .unwrap(),
-        "{}"
-    );
-    let association = conn
-        .query_row(
-            "select pr_number, head_sha from pr_details_cache where branch = 'feature'",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, Option<i64>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(association, (None, None));
-    let github_identity = conn
-        .query_row(
-            "select provider, canonical_host, project_path, native_cr_id, display_number,
-                        source_project_path, target_project_path, identity_complete
-                   from pr_cache where branch = 'github-feature'",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, Option<i64>>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                    row.get::<_, Option<String>>(6)?,
-                    row.get::<_, i64>(7)?,
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        github_identity,
-        (
-            Some("github".to_string()),
-            Some("github.com".to_string()),
-            Some("acme/widgets".to_string()),
-            None,
-            Some(43),
-            None,
-            Some("acme/widgets".to_string()),
-            0,
-        )
-    );
-    let details_identity = conn
-        .query_row(
-            "select provider, target_project_path, identity_complete
-                   from pr_details_cache where branch = 'github-feature'",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        details_identity,
-        (
-            Some("github".to_string()),
-            Some("acme/widgets".to_string()),
-            0,
-        )
-    );
-    let policy_identity = conn
-        .query_row(
-            "select provider, canonical_host, project_path, target_branch, identity_complete
-                   from repo_policy_cache where repo_remote = 'acme/widgets'",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, Option<String>>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        policy_identity,
-        (
-            Some("github".to_string()),
-            Some("github.com".to_string()),
-            Some("acme/widgets".to_string()),
-            Some("main".to_string()),
-            1,
-        )
-    );
-}
-
-#[test]
-fn migration_normalizes_and_deduplicates_github_policy_identity_keys_only() {
-    let conn = rusqlite::Connection::open_in_memory().unwrap();
-    conn.execute_batch(
-            "
-            create table repo_policy_cache_v2 (
-              provider text not null,
-              canonical_host text not null,
-              project_path text not null,
-              target_branch text not null,
-              repo_remote text not null,
-              default_branch text,
-              required_approvals integer not null default 0,
-              require_conversation_resolution integer not null default 0,
-              require_branch_up_to_date integer not null default 0,
-              required_checks text not null default '[]',
-              merge_queue_required integer not null default 0,
-              refreshed_unix_ms integer not null,
-              error text,
-              primary key (provider, canonical_host, project_path, target_branch)
-            );
-            insert into repo_policy_cache_v2 values
-              ('github', 'github.com', 'acme/widget', 'main', 'acme/widget', 'main', 1, 0, 0, '[]', 0, 10, null),
-              ('github', 'github.com', 'Acme/Widget', 'main', 'Acme/Widget', 'main', 2, 0, 0, '[]', 0, 20, null),
-              ('gitlab', 'gitlab.com', 'acme/widget', 'main', 'acme/widget', 'main', 3, 0, 0, '[]', 0, 30, null),
-              ('gitlab', 'gitlab.com', 'Acme/Widget', 'main', 'Acme/Widget', 'main', 4, 0, 0, '[]', 0, 40, null);
-            ",
-        )
-        .unwrap();
-
-    migrate_pr_cache_schema(&conn).unwrap();
-    migrate_pr_cache_schema(&conn).unwrap();
-
-    let github = conn
-        .query_row(
-            "select count(*), project_path, project_path_key, required_approvals
-                   from repo_policy_cache_v2 where provider = 'github'",
-            [],
-            |row| {
-                Ok((
-                    row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            },
-        )
-        .unwrap();
-    assert_eq!(
-        github,
-        (1, "Acme/Widget".to_string(), "acme/widget".to_string(), 2)
-    );
-    assert_eq!(
-        conn.query_row(
-            "select count(*) from repo_policy_cache_v2 where provider = 'gitlab'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap(),
-        2
-    );
-}
 
 #[test]
 fn direct_and_index_summary_paths_produce_equivalent_cache_facts() {
@@ -1040,27 +792,6 @@ fn restart_accepts_only_details_associated_with_persisted_pr_and_head() {
     assert!(stale.details().is_none());
 
     save_pr_cache(&repo, "feature", &cache).unwrap();
-    observability::with_writable_db(&repo, |conn| {
-        conn.execute(
-            "update pr_details_cache set pr_number = null, head_sha = null where branch = ?1",
-            params!["feature"],
-        )
-        .map_err(|error| error.to_string())?;
-        Ok(())
-    })
-    .unwrap();
-    let mut legacy = load_pr_cache(&repo, "feature");
-    assert!(legacy.details().is_some());
-    assert_eq!(
-        legacy.details_observation_quality(),
-        PrObservationQuality::PreservedStale
-    );
-    assert!(legacy.trusted_details().is_err());
-    let mutation =
-        legacy.record_summary_observation(Some(summary.clone()), "refreshed".to_string());
-    persist_pr_summary_mutation(&repo, "feature", &mut legacy, mutation);
-    assert!(load_pr_cache(&repo, "feature").details.is_none());
-
     save_pr_details_cache_for_association(
         &repo,
         "feature",
@@ -2008,9 +1739,13 @@ fn github_preserves_merge_state_status_separately_from_mergeability() {
         "example/repo",
         "117",
     ));
-    let normalized =
-        adapter::normalize_summary(summary, crate::remote::RemoteOperation::ListChangeRequests)
-            .unwrap();
+    let repository = adapter_change_request().id.repository().clone();
+    let normalized = adapter::normalize_summary(
+        summary,
+        &repository,
+        crate::remote::RemoteOperation::ListChangeRequests,
+    )
+    .unwrap();
 
     assert_eq!(
         normalized.mergeability,
@@ -2025,9 +1760,12 @@ fn github_preserves_merge_state_status_separately_from_mergeability() {
         "example/repo",
         "117",
     ));
-    let normalized =
-        adapter::normalize_summary(behind, crate::remote::RemoteOperation::ListChangeRequests)
-            .unwrap();
+    let normalized = adapter::normalize_summary(
+        behind,
+        &repository,
+        crate::remote::RemoteOperation::ListChangeRequests,
+    )
+    .unwrap();
 
     assert_eq!(
         normalized.mergeability,
@@ -2045,19 +1783,30 @@ fn graphql_queue_state_distinguishes_native_entry_absence_and_unobserved() {
             r#"{"data":{"repository":{"pullRequests":{"nodes":[{"number":42,"mergeQueueEntry":null}],"pageInfo":{"hasNextPage":false}}}}}"#,
         )
         .unwrap();
-    let auto_merge = try_parse_pr_summary_index(
-            r#"{"data":{"repository":{"pullRequests":{"nodes":[{"number":42,"mergeQueueEntry":null,"autoMergeRequest":{"enabledAt":"2026-08-02T00:00:00Z"}}],"pageInfo":{"hasNextPage":false}}}}}"#,
-        )
-        .unwrap();
     let direct: GithubPullRequest = serde_json::from_str(r#"{"number":42}"#).unwrap();
 
     assert_eq!(queued[0].queue_state, "AWAITING_CHECKS");
     assert_eq!(not_queued[0].queue_state, "not_queued");
-    assert_eq!(auto_merge[0].queue_state, "queued");
     assert_eq!(
         pr_summary_from_node(&direct, None).unwrap().queue_state,
         "unknown"
     );
+}
+
+#[test]
+fn github_adapter_rejects_identity_less_summary() {
+    let repository = adapter_change_request().id.repository().clone();
+    let mut summary = test_summary("feature", "head", 0);
+    summary.change_request_identity = None;
+
+    let error = adapter::normalize_summary(
+        summary,
+        &repository,
+        crate::remote::RemoteOperation::ListChangeRequests,
+    )
+    .unwrap_err();
+
+    assert!(error.to_string().contains("missing canonical identity"));
 }
 
 #[test]
@@ -2430,7 +2179,16 @@ fn failed_policy_refresh_preserves_identity_matched_stale_facts() {
             .as_deref()
             .is_some_and(|error| error.contains("policy unavailable"))
     );
-    assert_eq!(load_repo_policy_cache(&repo, "owner/repo"), Some(refreshed));
+    let repository = crate::remote::RemoteRepositoryId::new(
+        crate::remote::ProviderKind::GitHub,
+        crate::remote::HostIdentity::new("github.com", None).unwrap(),
+        "owner/repo",
+    )
+    .unwrap();
+    assert_eq!(
+        load_repo_policy_cache_for_identity(&repo, &repository, "main"),
+        Some(refreshed)
+    );
 
     let _ = fs::remove_dir_all(repo.prism_dir());
     let _ = fs::remove_dir_all(temp);
@@ -2459,37 +2217,31 @@ fn repo_policy_cache_round_trips_success_and_error() {
     };
 
     save_repo_policy_cache(&repo, &policy).unwrap();
-    let loaded = load_repo_policy_cache(&repo, "owner/repo").unwrap();
-
-    assert_eq!(loaded, policy);
     let github_repository = crate::remote::RemoteRepositoryId::new(
         crate::remote::ProviderKind::GitHub,
         crate::remote::HostIdentity::new("github.com", None).unwrap(),
         "owner/repo",
     )
     .unwrap();
-    assert_eq!(
-        load_repo_policy_cache_for_repository(&repo, &github_repository),
-        Some(policy.clone())
-    );
+    let loaded = load_repo_policy_cache_for_identity(&repo, &github_repository, "main").unwrap();
+    assert_eq!(loaded, policy);
     let enterprise_repository = crate::remote::RemoteRepositoryId::new(
         crate::remote::ProviderKind::GitHub,
         crate::remote::HostIdentity::new("github.example.com", None).unwrap(),
         "owner/repo",
     )
     .unwrap();
-    assert!(load_repo_policy_cache_for_repository(&repo, &enterprise_repository).is_none());
+    assert!(load_repo_policy_cache_for_identity(&repo, &enterprise_repository, "main").is_none());
 
-    let error_policy = RepoPolicyCache {
+    let incomplete_policy = RepoPolicyCache {
         repo_remote: "owner/repo".to_string(),
         refreshed_unix_ms: 456,
         error: Some("gh auth failed".to_string()),
         ..RepoPolicyCache::default()
     };
-    save_repo_policy_cache(&repo, &error_policy).unwrap();
     assert_eq!(
-        load_repo_policy_cache(&repo, "owner/repo"),
-        Some(error_policy)
+        save_repo_policy_cache(&repo, &incomplete_policy).unwrap_err(),
+        "repository policy has no provider identity"
     );
 
     let _ = fs::remove_dir_all(repo.prism_dir());
@@ -2567,19 +2319,8 @@ fn github_policy_identity_queries_and_upserts_use_normalized_path_keys() {
     .unwrap();
 
     let loaded = load_repo_policy_cache_for_identity(&repo, &lowercase, "main").unwrap();
-    let count = observability::with_writable_db(&repo, |conn| {
-        conn.query_row(
-            "select count(*) from repo_policy_cache_v2 where provider = 'github'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| error.to_string())
-    })
-    .unwrap();
-
     assert_eq!(loaded.required_approvals, 2);
     assert_eq!(loaded.project_path.as_deref(), Some("acme/widget"));
-    assert_eq!(count, 1);
     let _ = fs::remove_dir_all(repo.prism_dir());
     let _ = fs::remove_dir_all(temp);
 }
@@ -3679,7 +3420,12 @@ fn resolve_request(change_request: &ChangeRequest) -> ResolveReviewThread {
 fn test_summary(head_ref: &str, head_sha: &str, comment_count: u64) -> PrSummary {
     PrSummary {
         number: 42,
-        change_request_identity: None,
+        change_request_identity: Some(test_identity(
+            crate::remote::ProviderKind::GitHub,
+            "github.com",
+            "example/repo",
+            "PR_test_42",
+        )),
         native_state_evidence: crate::remote::NativeStateEvidence::default(),
         title: "Fix review".to_string(),
         author: "author".to_string(),
@@ -3727,7 +3473,6 @@ fn test_session(branch: &str, pr: PrCache) -> Session {
         repo_label: "repo".to_string(),
         repo_key: None,
         path: PathBuf::from("/tmp").join(branch),
-        worktree_session_id: format!("test-{branch}"),
         incarnation: String::new(),
         path_display: format!("/tmp/{branch}"),
         branch: branch.to_string(),

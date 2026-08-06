@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into workflow_execution (\n  workflow_kind, run_id, dispatch_state, fencing_token,\n  interruption_generation, created_unix_ms, updated_unix_ms\n) values ('auto', ?, 'queued', 0, 0, ?, ?)\non conflict(workflow_kind, run_id) do update set\n  dispatch_state = 'queued', worker_id = null, daemon_instance_id = null,\n  lease_expires_unix_ms = null, heartbeat_unix_ms = null, executor_pid = null,\n  executor_process_identity = null, requeue_requested = 0,\n  recovery_decided_unix_ms = null,\n  fencing_token = workflow_execution.fencing_token + 1,\n  updated_unix_ms = excluded.updated_unix_ms\nwhere workflow_execution.dispatch_state != 'claimed'\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "f4c7ca4b4d27c3993edb3a016687c9cf4af28e9a846ae060c89632b708138e4d"
+}

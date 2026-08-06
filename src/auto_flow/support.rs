@@ -100,6 +100,7 @@ pub(super) fn summarize_prompt(prompt: &str) -> String {
     summary
 }
 
+#[cfg(test)]
 pub(super) fn stable_string_hash(value: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);

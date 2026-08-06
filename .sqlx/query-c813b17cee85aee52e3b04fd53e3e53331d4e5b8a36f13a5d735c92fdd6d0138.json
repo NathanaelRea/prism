@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "create trigger fail_selected_step_update\nbefore update of selected_step_run_id on auto_run\nwhen new.selected_step_run_id is not null\nbegin\n  select raise(fail, 'injected late write failure');\nend\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "c813b17cee85aee52e3b04fd53e3e53331d4e5b8a36f13a5d735c92fdd6d0138"
+}

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into pending_worktree_deletion (\n  branch, worktree_path, worktree_incarnation, branch_oid,\n  worktree_removed, branch_deleted, updated_unix_ms\n) values (?, ?, ?, 'branch-oid', 0, 0, 0)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "1504a13d69ced8d53c73a6c5878752cfc5c85eb36baa8490672b31013ccd6aed"
+}

@@ -8,14 +8,15 @@ mod application;
 pub use application::cli;
 pub(crate) use application::{args, config, setup};
 pub mod auto_flow;
-mod integration;
+mod persistence;
 pub mod plan_run;
 mod remote;
 mod repository;
 pub(crate) use repository::{git, lifecycle, repo, session, workspace, workspace_state, worktrunk};
 mod system;
 pub(crate) use system::{
-    desktop_notification, durability, json, notification, platform, process, terminal, util,
+    async_runtime, desktop_notification, durability, json, notification, platform, process,
+    terminal, util,
 };
 pub use system::{file_persistence, storage};
 mod telemetry;
@@ -30,8 +31,16 @@ pub(crate) use tui::{
 };
 mod view;
 mod workflow;
-#[allow(unused_imports)]
-pub(crate) use workflow::{
-    ci, coding, coordinator, definition, effect, execution, gate, implementation, migration,
-    operations, plan, plan_artifact, review, run, runtime, target, trigger, verify, worker,
+pub use workflow::engine::{
+    ArtifactContent, ArtifactPublication, EffectIntent, EffectReconciler, EffectReconciliation,
+    ExecutionClass, ExecutionContext, ReconciliationFuture, ReconciliationResult, StepFuture,
+    StepImplementation, WorkerConfig, WorkerError, WorkflowWorker,
 };
+pub use workflow::operations::{
+    ApprovalDecision, ControlPlaneMetric, DefinitionSnapshot, LaunchWorkflow, LegacyImportSummary,
+    WorkflowApprovalProjection, WorkflowArtifactProjection, WorkflowAttemptProjection,
+    WorkflowAuditEvent, WorkflowCommand, WorkflowEffectProjection, WorkflowGateProjection,
+    WorkflowOperationError, WorkflowOperations, WorkflowOutputProjection, WorkflowProjection,
+    WorkflowStep, WorkflowStepProjection,
+};
+pub(crate) use workflow::{ci, execution, plan, review, verify, worker};

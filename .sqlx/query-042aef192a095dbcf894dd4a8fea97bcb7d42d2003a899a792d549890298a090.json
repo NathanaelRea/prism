@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into worktree_harness (\n  branch, worktree_path, worktree_incarnation, harness_id, migration_policy, updated_unix_ms\n) values (?, ?, ?, ?, ?, ?)\non conflict(branch) do update set\n  worktree_path = excluded.worktree_path,\n  worktree_incarnation = excluded.worktree_incarnation,\n  harness_id = excluded.harness_id,\n  migration_policy = excluded.migration_policy,\n  updated_unix_ms = excluded.updated_unix_ms\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 6
+    },
+    "nullable": []
+  },
+  "hash": "042aef192a095dbcf894dd4a8fea97bcb7d42d2003a899a792d549890298a090"
+}

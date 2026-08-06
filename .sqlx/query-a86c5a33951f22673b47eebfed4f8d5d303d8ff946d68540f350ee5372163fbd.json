@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select initial_prompt\nfrom task_metadata\nwhere branch = ?\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "initial_prompt",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a86c5a33951f22673b47eebfed4f8d5d303d8ff946d68540f350ee5372163fbd"
+}

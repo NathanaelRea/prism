@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update task_metadata\nset worktree = ?\nwhere branch = ? and worktree = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "e62294bfb1687c023a50efbadc5fa53270886851abde3b6f0a38a837a8585853"
+}

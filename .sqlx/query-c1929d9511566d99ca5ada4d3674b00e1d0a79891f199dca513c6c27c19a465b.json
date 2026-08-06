@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into archived_worktree (\n  branch, repo_root, worktree_path, archived_unix_ms, classification\n) values (?, ?, ?, ?, ?)\non conflict(branch) do update set\n  repo_root = excluded.repo_root,\n  worktree_path = excluded.worktree_path,\n  archived_unix_ms = excluded.archived_unix_ms,\n  classification = excluded.classification\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "c1929d9511566d99ca5ada4d3674b00e1d0a79891f199dca513c6c27c19a465b"
+}

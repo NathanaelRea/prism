@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into plan_step_run (run_id, step, prompt, status, todos_json)\nvalues ('plan-control-12345678', ?1, 'prompt', 'queued', '[]')\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "430a8c1f69ab362c343d8afe0faa42186c1c2aa2413c741ff6704ddfb335fdd1"
+}

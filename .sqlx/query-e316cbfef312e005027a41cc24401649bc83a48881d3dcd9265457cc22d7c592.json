@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into auto_event (run_id, step_run_id, time_unix_ms, kind, data_json)\nvalues (?, ?, ?, ?, ?)\nreturning id as \"id!\"\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "e316cbfef312e005027a41cc24401649bc83a48881d3dcd9265457cc22d7c592"
+}

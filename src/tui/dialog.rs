@@ -20,45 +20,6 @@ pub(super) fn ctrl_key(event: KeyEvent) -> bool {
     event.modifiers.contains(KeyModifiers::CONTROL)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TextInputAction {
-    Submit,
-    Cancel,
-    Backspace,
-    Insert(char),
-    Newline,
-    Ignore,
-}
-
-pub(super) fn text_input_action(event: KeyEvent, multiline: bool) -> TextInputAction {
-    match event.code {
-        KeyCode::Enter if !multiline || ctrl_key(event) => TextInputAction::Submit,
-        KeyCode::Enter if plain_key(event) => TextInputAction::Newline,
-        KeyCode::Esc | KeyCode::Char('c') if event.code == KeyCode::Esc || ctrl_key(event) => {
-            TextInputAction::Cancel
-        }
-        KeyCode::Backspace => TextInputAction::Backspace,
-        KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => TextInputAction::Insert(ch),
-        _ => TextInputAction::Ignore,
-    }
-}
-
-fn text_input_model(title: &str, prompt: &str, input: &str, multiline: bool) -> view::DialogModel {
-    if multiline {
-        view::DialogModel::TextArea {
-            title: title.to_string(),
-            prompt: prompt.to_string(),
-            input: input.to_string(),
-        }
-    } else {
-        view::DialogModel::Prompt {
-            title: title.to_string(),
-            prompt: prompt.to_string(),
-            input: input.to_string(),
-        }
-    }
-}
-
 pub(super) fn confirmation_result(input: &str, default: bool) -> Option<bool> {
     match input.trim().to_ascii_lowercase().as_str() {
         "" => Some(default),
@@ -331,29 +292,12 @@ impl Tui {
         prompt: &str,
         initial: &str,
     ) -> Result<Option<String>, String> {
-        self.text_input_dialog(runtime, title, prompt, initial, false)
-    }
-
-    pub(crate) fn text_area_dialog(
-        &mut self,
-        runtime: &mut TerminalRuntime,
-        title: &str,
-        prompt: &str,
-        initial: &str,
-    ) -> Result<Option<String>, String> {
-        self.text_input_dialog(runtime, title, prompt, initial, true)
-    }
-
-    fn text_input_dialog(
-        &mut self,
-        runtime: &mut TerminalRuntime,
-        title: &str,
-        prompt: &str,
-        initial: &str,
-        multiline: bool,
-    ) -> Result<Option<String>, String> {
         let mut input = initial.to_string();
-        self.dialog = Some(text_input_model(title, prompt, &input, multiline));
+        self.dialog = Some(view::DialogModel::Prompt {
+            title: title.to_string(),
+            prompt: prompt.to_string(),
+            input: input.clone(),
+        });
         self.draw(runtime)?;
         loop {
             if self.tick_tui_action_jobs().any() {
@@ -369,27 +313,32 @@ impl Tui {
             if event.kind != KeyEventKind::Press {
                 continue;
             }
-            match text_input_action(event, multiline) {
-                TextInputAction::Submit => {
+            match event.code {
+                KeyCode::Enter => {
                     self.dialog = None;
                     self.draw(runtime)?;
                     return Ok(Some(input));
                 }
-                TextInputAction::Cancel => {
+                KeyCode::Esc | KeyCode::Char('c')
+                    if event.code == KeyCode::Esc || ctrl_key(event) =>
+                {
                     self.dialog = None;
                     self.draw(runtime)?;
                     return Ok(None);
                 }
-                TextInputAction::Backspace => {
+                KeyCode::Backspace => {
                     input.pop();
                 }
-                TextInputAction::Insert(ch) => {
+                KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => {
                     input.push(ch);
                 }
-                TextInputAction::Newline => input.push('\n'),
-                TextInputAction::Ignore => {}
+                _ => {}
             }
-            self.dialog = Some(text_input_model(title, prompt, &input, multiline));
+            self.dialog = Some(view::DialogModel::Prompt {
+                title: title.to_string(),
+                prompt: prompt.to_string(),
+                input: input.clone(),
+            });
             self.draw(runtime)?;
         }
     }
@@ -637,7 +586,6 @@ impl Tui {
             .map(
                 |(index, (_, workflow))| crate::workspace_state::RecoveryDecision {
                     workflow: workflow.identity.clone(),
-                    interruption_generation: workflow.dispatch.interruption_generation,
                     restart: selected.contains(&index.to_string()),
                 },
             )

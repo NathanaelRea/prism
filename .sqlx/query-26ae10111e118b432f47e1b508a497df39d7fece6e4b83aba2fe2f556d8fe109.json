@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "select count(*) as \"count!: i64\" from pending_worktree_deletion\nwhere branch = ? and worktree_removed = 0\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "count!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "26ae10111e118b432f47e1b508a497df39d7fece6e4b83aba2fe2f556d8fe109"
+}

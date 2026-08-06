@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update plan_step_run\nset status = 'running', execution_process_id = ?, execution_process_start_time_ticks = ?\nwhere run_id = ? and step = ? and status = 'starting'\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "c59cc366c2a8f9018d220840c12387bea7a03749fccd911fe5b04ebd63fcbfc3"
+}

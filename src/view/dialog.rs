@@ -46,23 +46,14 @@ pub(super) fn render_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &crate::v
     let mut paragraph = Paragraph::new(lines)
         .block(block)
         .wrap(Wrap { trim: false });
-    let vertical_scroll = match dialog {
-        crate::view::DialogModel::Help { scroll, .. }
-        | crate::view::DialogModel::Notice { scroll, .. } => {
-            (*scroll).min(u16::MAX as usize) as u16
-        }
-        crate::view::DialogModel::TextArea { .. } => dialog_lines(dialog)
-            .len()
-            .saturating_sub(geometry.inner.height as usize)
-            .min(u16::MAX as usize) as u16,
-        _ => 0,
-    };
-    paragraph = paragraph.scroll((vertical_scroll, 0));
-    frame.render_widget(paragraph, geometry.popup);
-    if let crate::view::DialogModel::Prompt { prompt, input, .. }
-    | crate::view::DialogModel::TextArea { prompt, input, .. } = dialog
+    if let crate::view::DialogModel::Help { scroll, .. }
+    | crate::view::DialogModel::Notice { scroll, .. } = dialog
     {
-        set_prompt_cursor(frame, geometry.inner, prompt, input, vertical_scroll);
+        paragraph = paragraph.scroll(((*scroll).min(u16::MAX as usize) as u16, 0));
+    }
+    frame.render_widget(paragraph, geometry.popup);
+    if let crate::view::DialogModel::Prompt { prompt, input, .. } = dialog {
+        set_prompt_cursor(frame, geometry.inner, prompt, input);
     } else if let crate::view::DialogModel::Confirm {
         prompt,
         input,
@@ -85,13 +76,8 @@ pub(super) fn dialog_geometry(area: Rect, dialog: &crate::view::DialogModel) -> 
     let raw_lines = dialog_lines(dialog);
     let content_width = match dialog {
         crate::view::DialogModel::Prompt { prompt, .. } => {
-            prompt_dialog_content_width(prompt, title_width, "Enter to continue, Esc to cancel")
+            prompt_dialog_content_width(prompt, title_width)
         }
-        crate::view::DialogModel::TextArea { prompt, .. } => prompt_dialog_content_width(
-            prompt,
-            title_width,
-            "Enter for new line, Ctrl+Enter to submit, Esc to cancel",
-        ),
         crate::view::DialogModel::Help {
             items, info_lines, ..
         } => help_dialog_content_width(items, info_lines, title_width).max(
@@ -126,7 +112,7 @@ pub(super) fn dialog_geometry(area: Rect, dialog: &crate::view::DialogModel) -> 
     DialogGeometry { popup, inner }
 }
 
-pub(super) fn prompt_dialog_content_width(prompt: &str, title_width: u16, help: &str) -> u16 {
+pub(super) fn prompt_dialog_content_width(prompt: &str, title_width: u16) -> u16 {
     let prompt_lines = prompt.split('\n').collect::<Vec<_>>();
     let last_prefix_width = prompt_lines
         .last()
@@ -140,7 +126,7 @@ pub(super) fn prompt_dialog_content_width(prompt: &str, title_width: u16, help: 
         .max()
         .unwrap_or(0)
         .max(last_prefix_width.saturating_add(PROMPT_INPUT_DISPLAY_WIDTH))
-        .max(help.chars().count() as u16)
+        .max("Enter to continue, Esc to cancel".chars().count() as u16)
         .max(title_width)
 }
 
@@ -162,46 +148,22 @@ pub(super) fn pad_line(mut line: Line<'static>, width: usize) -> Line<'static> {
     line
 }
 
-pub(super) fn set_prompt_cursor(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    prompt: &str,
-    input: &str,
-    vertical_scroll: u16,
-) {
+pub(super) fn set_prompt_cursor(frame: &mut Frame<'_>, area: Rect, prompt: &str, input: &str) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let prompt_prefix_lines = prompt.split('\n').collect::<Vec<_>>();
     let prompt_prefix = prompt_prefix_lines.last().copied().unwrap_or(prompt);
     let prompt_width = prompt_prefix.chars().count() as u16;
-    let input_lines = input.split('\n').collect::<Vec<_>>();
-    let prefix_width = if input_lines.len() == 1 {
-        prompt_width
-    } else {
-        0
-    };
-    let input_width = visible_prompt_input_width(area.width, prefix_width);
-    let input_cursor = input_lines
-        .last()
-        .copied()
-        .unwrap_or(input)
-        .chars()
-        .count()
-        .min(input_width as usize) as u16;
-    let x_offset = prefix_width
+    let input_width = visible_prompt_input_width(area.width, prompt_width);
+    let input_cursor = input.chars().count().min(input_width as usize) as u16;
+    let x_offset = prompt_width
         .saturating_add(input_cursor)
         .min(area.width.saturating_sub(1));
-    let prompt_y = prompt_prefix_lines
-        .len()
-        .saturating_add(input_lines.len())
-        .saturating_sub(2) as u16;
+    let prompt_y = prompt_prefix_lines.len().saturating_sub(1) as u16;
     frame.set_cursor_position((
         area.x + x_offset,
-        area.y
-            + prompt_y
-                .saturating_sub(vertical_scroll)
-                .min(area.height.saturating_sub(1)),
+        area.y + prompt_y.min(area.height.saturating_sub(1)),
     ));
 }
 
@@ -218,7 +180,6 @@ pub(super) fn dialog_title(dialog: &crate::view::DialogModel) -> String {
         crate::view::DialogModel::Confirm { title, .. }
         | crate::view::DialogModel::Notice { title, .. }
         | crate::view::DialogModel::Prompt { title, .. }
-        | crate::view::DialogModel::TextArea { title, .. }
         | crate::view::DialogModel::OrderedToggle { title, .. }
         | crate::view::DialogModel::Choice {
             choices: crate::view::ChoiceList { title, .. },
@@ -333,15 +294,6 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled(
                 "Enter to continue, Esc to cancel",
-                muted_style(),
-            )));
-            lines
-        }
-        crate::view::DialogModel::TextArea { prompt, input, .. } => {
-            let mut lines = prompt_dialog_lines(prompt, input);
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "Enter for new line, Ctrl+Enter to submit, Esc to cancel",
                 muted_style(),
             )));
             lines
@@ -473,24 +425,17 @@ pub(super) fn ordered_toggle_lines(
 
 pub(super) fn prompt_dialog_lines(prompt: &str, input: &str) -> Vec<Line<'static>> {
     let prompt_lines = prompt.split('\n').collect::<Vec<_>>();
-    let input_lines = input.split('\n').collect::<Vec<_>>();
     let mut lines = Vec::new();
     for (index, line) in prompt_lines.iter().enumerate() {
         let mut spans = styled_prompt_spans(line);
         if index + 1 == prompt_lines.len() {
             spans.push(Span::raw(visible_prompt_input(
-                input_lines.first().copied().unwrap_or(input),
+                input,
                 PROMPT_INPUT_DISPLAY_WIDTH,
             )));
         }
         lines.push(Line::from(spans));
     }
-    lines.extend(input_lines.iter().skip(1).map(|line| {
-        Line::from(Span::raw(visible_prompt_input(
-            line,
-            PROMPT_INPUT_DISPLAY_WIDTH,
-        )))
-    }));
     lines
 }
 

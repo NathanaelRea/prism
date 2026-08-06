@@ -4,8 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use rusqlite::{OptionalExtension, params};
-
 use crate::agent::AgentState;
 use crate::config::Config;
 use crate::git::git_status_label;
@@ -73,7 +71,6 @@ pub struct Session {
     pub repo_label: String,
     pub repo_key: Option<char>,
     pub path: PathBuf,
-    pub(crate) worktree_session_id: String,
     pub(crate) incarnation: String,
     pub path_display: String,
     pub branch: String,
@@ -113,7 +110,6 @@ impl Session {
     pub(crate) fn identity_key(&self, repository: &WorktreeRepositoryKey) -> WorktreeSessionKey {
         WorktreeSessionKey {
             repository: repository.clone(),
-            worktree_session_id: self.worktree_session_id.clone(),
             path: self.path.clone(),
             branch: self.branch.clone(),
             incarnation: self.incarnation.clone(),
@@ -191,7 +187,6 @@ impl Session {
             repo_label: self.repo_label.clone(),
             repo_key: self.repo_key,
             path: self.path.clone(),
-            worktree_session_id: self.worktree_session_id.clone(),
             incarnation: self.incarnation.clone(),
             path_display: self.path_display.clone(),
             branch: self.branch.clone(),
@@ -365,54 +360,38 @@ fn load_pending_worktree_deletion(
     repo: &Repository,
     branch: &str,
 ) -> Result<Option<PendingWorktreeDeletion>, String> {
-    observability::with_writable_db(repo, |conn| {
-        conn.query_row(
-            "select worktree_path, worktree_incarnation, branch_oid, worktree_removed, branch_deleted
-             from pending_worktree_deletion where branch = ?1",
-            params![branch],
-            |row| {
-                Ok(PendingWorktreeDeletion {
-                    worktree_path: row.get(0)?,
-                    worktree_incarnation: row.get(1)?,
-                    branch_oid: row.get(2)?,
-                    worktree_removed: row.get(3)?,
-                    branch_deleted: row.get(4)?,
-                })
-            },
-        )
-        .optional()
+    session_store(repo)?
+        .load_pending_deletion(branch)
+        .map(|pending| pending.map(pending_deletion_from_record))
         .map_err(|error| format!("load pending worktree deletion: {error}"))
-    })
 }
 
 fn load_pending_worktree_deletions(
     repo: &Repository,
 ) -> Result<Vec<(String, PendingWorktreeDeletion)>, String> {
-    observability::with_writable_db(repo, |conn| {
-        let mut statement = conn
-            .prepare(
-                "select branch, worktree_path, worktree_incarnation, branch_oid,
-                        worktree_removed, branch_deleted
-                 from pending_worktree_deletion",
-            )
-            .map_err(|error| format!("prepare pending worktree deletions: {error}"))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    PendingWorktreeDeletion {
-                        worktree_path: row.get(1)?,
-                        worktree_incarnation: row.get(2)?,
-                        branch_oid: row.get(3)?,
-                        worktree_removed: row.get(4)?,
-                        branch_deleted: row.get(5)?,
-                    },
-                ))
-            })
-            .map_err(|error| format!("query pending worktree deletions: {error}"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("read pending worktree deletions: {error}"))
-    })
+    session_store(repo)?
+        .list_pending_deletions()
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| {
+                    let branch = row.branch.clone();
+                    (branch, pending_deletion_from_record(row))
+                })
+                .collect()
+        })
+        .map_err(|error| format!("load pending worktree deletions: {error}"))
+}
+
+fn pending_deletion_from_record(
+    row: crate::persistence::session::PendingDeletion,
+) -> PendingWorktreeDeletion {
+    PendingWorktreeDeletion {
+        worktree_path: row.worktree_path,
+        worktree_incarnation: row.worktree_incarnation,
+        branch_oid: row.branch_oid,
+        worktree_removed: row.worktree_removed,
+        branch_deleted: row.branch_deleted,
+    }
 }
 
 fn save_pending_worktree_deletion(
@@ -422,23 +401,15 @@ fn save_pending_worktree_deletion(
     incarnation: &str,
     branch_oid: Option<&str>,
 ) -> Result<(), String> {
-    observability::with_writable_db(repo, |conn| {
-        conn.execute(
-            "insert into pending_worktree_deletion (
-                branch, worktree_path, worktree_incarnation, branch_oid,
-                worktree_removed, branch_deleted, updated_unix_ms
-             ) values (?1, ?2, ?3, ?4, 0, 0, ?5)",
-            params![
-                branch,
-                path.display().to_string(),
-                incarnation,
-                branch_oid,
-                unix_seconds(),
-            ],
+    session_store(repo)?
+        .save_pending_deletion(
+            branch,
+            &path.display().to_string(),
+            incarnation,
+            branch_oid,
+            unix_seconds(),
         )
-        .map_err(|error| format!("save pending worktree deletion: {error}"))?;
-        Ok(())
-    })
+        .map_err(|error| format!("save pending worktree deletion: {error}"))
 }
 
 fn mark_pending_deletion_phase(
@@ -446,17 +417,14 @@ fn mark_pending_deletion_phase(
     branch: &str,
     column: &str,
 ) -> Result<(), String> {
-    observability::with_writable_db(repo, |conn| {
-        conn.execute(
-            &format!(
-                "update pending_worktree_deletion
-                 set {column} = 1, updated_unix_ms = ?1 where branch = ?2"
-            ),
-            params![unix_seconds(), branch],
-        )
-        .map_err(|error| format!("record pending worktree deletion phase: {error}"))?;
-        Ok(())
-    })
+    let worktree_removed = match column {
+        "worktree_removed" => true,
+        "branch_deleted" => false,
+        _ => return Err(format!("unknown pending deletion phase: {column}")),
+    };
+    session_store(repo)?
+        .mark_pending_phase(branch, worktree_removed, unix_seconds())
+        .map_err(|error| format!("record pending worktree deletion phase: {error}"))
 }
 
 pub(crate) fn worktree_deletion_is_pending(
@@ -496,16 +464,6 @@ pub(crate) fn delete_worktree_session_if_current(
     expected_incarnation: Option<&str>,
 ) -> Result<DeleteWorktreeOutcome, String> {
     let path_display = path.display().to_string();
-    let worktree_session_id = observability::with_writable_db(repo, |conn| {
-        conn.query_row(
-            "select worktree_session_id from active_worktree_session
-             where branch = ?1 and worktree_path = ?2",
-            params![branch, path_display.as_str()],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .map_err(|error| format!("load deletion Worktree Session identity: {error}"))
-    })?;
     let pending = load_pending_worktree_deletion(repo, branch)?;
     if let Some(pending) = &pending
         && (pending.worktree_path != path_display
@@ -664,14 +622,7 @@ pub(crate) fn delete_worktree_session_if_current(
     if !branch_deleted {
         errors.extend(mark_pending_deletion_phase(repo, branch, "branch_deleted").err());
     }
-    let cleanup_error = remove_deleted_worktree_owned_state(
-        repo,
-        config,
-        path,
-        branch,
-        worktree_session_id.as_deref(),
-    )
-    .err();
+    let cleanup_error = remove_deleted_worktree_owned_state(repo, config, path, branch).err();
     let owned_state_removed = cleanup_error.is_none();
     errors.extend(cleanup_error);
     if errors.is_empty() {
@@ -688,15 +639,10 @@ fn shutdown_worktree_session_resources(
     repo: &Repository,
     config: &Config,
     branch: &str,
-    worktree_session_id: Option<&str>,
     runtimes: &[crate::opencode::OpencodeRuntime],
 ) -> Result<(), String> {
     let mut errors = Vec::new();
-    let shutdown = match worktree_session_id {
-        Some(id) => crate::agent_session::shutdown_worktree_session(repo, config, branch, id),
-        None => crate::agent_session::shutdown(repo, config, branch),
-    };
-    if let Err(error) = shutdown {
+    if let Err(error) = crate::agent_session::shutdown(repo, config, branch) {
         errors.push(error);
     }
     if let Err(error) =
@@ -717,7 +663,6 @@ fn shutdown_worktree_session_resources(
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct WorktreeSessionKey {
     pub repository: WorktreeRepositoryKey,
-    pub worktree_session_id: String,
     pub path: PathBuf,
     pub branch: String,
     pub incarnation: String,
@@ -847,22 +792,6 @@ pub(crate) fn discover_sessions(
             repo_label: String::new(),
             repo_key: None,
             path: path.clone(),
-            worktree_session_id: observability::with_writable_db(repo, |conn| {
-                conn.query_row(
-                    "select worktree_session_id from active_worktree_session
-                     where branch = ?1 and worktree_path = ?2",
-                    params![branch.as_str(), pending.worktree_path.as_str()],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(|error| format!("load pending Worktree Session identity: {error}"))
-            })?
-            .unwrap_or_else(|| {
-                format!(
-                    "legacy-pending-{:016x}",
-                    crate::util::stable_hash(Path::new(&pending.worktree_path))
-                )
-            }),
             incarnation: pending.worktree_incarnation,
             path_display: pending.worktree_path,
             branch: branch.clone(),
@@ -896,25 +825,12 @@ pub(crate) fn discover_sessions(
 pub(crate) fn reconcile_worktree_state(repo: &Repository, config: &Config) -> Result<(), String> {
     crate::lifecycle::prune_worktrees(repo, config)?;
     let live = crate::lifecycle::list_worktrees(repo, config)?;
-    let persisted = observability::with_writable_db(repo, |conn| {
-        let mut statement = conn
-            .prepare(
-                "select branch, worktree
-                 from task_metadata
-                 where branch not in (select branch from archived_worktree)",
-            )
-            .map_err(|error| format!("prepare worktree state inventory: {error}"))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    PathBuf::from(row.get::<_, String>(1)?),
-                ))
-            })
-            .map_err(|error| format!("query worktree state inventory: {error}"))?;
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("read worktree state inventory: {error}"))
-    })?;
+    let persisted = session_store(repo)?
+        .persisted_worktrees()
+        .map_err(|error| format!("read worktree state inventory: {error}"))?
+        .into_iter()
+        .map(|(branch, path)| (branch, PathBuf::from(path)))
+        .collect::<Vec<_>>();
 
     let mut persisted_by_branch = BTreeMap::<String, Vec<PathBuf>>::new();
     for (branch, path) in persisted {
@@ -937,28 +853,15 @@ pub(crate) fn reconcile_worktree_state(repo: &Repository, config: &Config) -> Re
             let old_path = paths[0].display().to_string();
             let replacement_path = replacement.path.display().to_string();
             let replacement_incarnation = worktree_incarnation(&replacement.path);
-            observability::with_writable_db(repo, |conn| {
-                conn.execute(
-                    "update task_metadata set worktree = ?1
-                      where branch = ?2 and worktree = ?3",
-                    params![replacement_path, branch, old_path],
+            session_store(repo)?
+                .repoint_worktree(
+                    &branch,
+                    &old_path,
+                    &replacement_path,
+                    &replacement_incarnation,
+                    unix_seconds(),
                 )
-                .map_err(|error| format!("repoint moved worktree metadata: {error}"))?;
-                conn.execute(
-                    "update worktree_harness
-                     set worktree_path = ?1, worktree_incarnation = ?2, updated_unix_ms = ?3
-                     where branch = ?4 and worktree_path = ?5",
-                    params![
-                        replacement_path,
-                        replacement_incarnation,
-                        unix_seconds(),
-                        branch,
-                        old_path,
-                    ],
-                )
-                .map_err(|error| format!("repoint moved worktree harness: {error}"))?;
-                Ok(())
-            })?;
+                .map_err(|error| format!("repoint moved worktree state: {error}"))?;
         } else {
             let path = &paths[0];
             remove_worktree_session_owned_state(repo, config, path, &branch)?;
@@ -976,38 +879,13 @@ pub(crate) fn reconcile_worktree_state(repo: &Repository, config: &Config) -> Re
         }
     }
 
-    let (runtime_sessions, agent_branches) = observability::with_writable_db(repo, |conn| {
-        let mut runtime_statement = conn
-            .prepare(
-                "select branch, worktree_path from opencode_runtime
-                 where branch not in (select branch from task_metadata)
-                   and branch not in (select branch from archived_worktree)",
-            )
-            .map_err(|error| format!("prepare non-adopted runtime inventory: {error}"))?;
-        let runtime_sessions = runtime_statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    PathBuf::from(row.get::<_, String>(1)?),
-                ))
-            })
-            .map_err(|error| format!("query non-adopted runtime inventory: {error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("read non-adopted runtime inventory: {error}"))?;
-        let mut agent_statement = conn
-            .prepare(
-                "select branch from agent_state
-                 where branch not in (select branch from task_metadata)
-                   and branch not in (select branch from archived_worktree)",
-            )
-            .map_err(|error| format!("prepare non-adopted Agent Session inventory: {error}"))?;
-        let agent_branches = agent_statement
-            .query_map([], |row| row.get::<_, String>(0))
-            .map_err(|error| format!("query non-adopted Agent Session inventory: {error}"))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("read non-adopted Agent Session inventory: {error}"))?;
-        Ok((runtime_sessions, agent_branches))
-    })?;
+    let (runtime_sessions, agent_branches) = session_store(repo)?
+        .unadopted_state()
+        .map_err(|error| format!("read non-adopted session state: {error}"))?;
+    let runtime_sessions = runtime_sessions
+        .into_iter()
+        .map(|(branch, path)| (branch, PathBuf::from(path)))
+        .collect::<Vec<_>>();
     let mut cleaned_branches = BTreeSet::new();
     for (branch, path) in runtime_sessions {
         if live
@@ -1029,9 +907,7 @@ pub(crate) fn reconcile_worktree_state(repo: &Repository, config: &Config) -> Re
         }
         crate::agent_session::shutdown(repo, config, &branch)?;
         crate::agent_session::remove_owned_log(repo, &branch)?;
-        observability::with_writable_db(repo, |conn| {
-            crate::agent_session::remove_state_with_conn(conn, &branch)
-        })?;
+        crate::agent_session::remove_state(repo, &branch)?;
     }
     Ok(())
 }
@@ -1042,7 +918,7 @@ fn remove_worktree_session_owned_state(
     path: &Path,
     branch: &str,
 ) -> Result<(), String> {
-    remove_worktree_owned_state(repo, config, path, branch, None)
+    remove_worktree_owned_state(repo, config, path, branch)
 }
 
 fn remove_deleted_worktree_owned_state(
@@ -1050,9 +926,8 @@ fn remove_deleted_worktree_owned_state(
     config: &Config,
     path: &Path,
     branch: &str,
-    worktree_session_id: Option<&str>,
 ) -> Result<(), String> {
-    remove_worktree_owned_state(repo, config, path, branch, worktree_session_id)
+    remove_worktree_owned_state(repo, config, path, branch)
 }
 
 fn remove_worktree_owned_state(
@@ -1060,116 +935,27 @@ fn remove_worktree_owned_state(
     config: &Config,
     path: &Path,
     branch: &str,
-    worktree_session_id: Option<&str>,
 ) -> Result<(), String> {
-    if worktree_session_id.is_none() && !worktree_incarnation(path).is_empty() {
-        return Err(format!(
-            "retained state for {branch}: a live worktree now exists at {}",
-            path.display()
-        ));
-    }
     let worktree_path = path.display().to_string();
-    observability::with_writable_db(repo, |conn| {
-        ensure_cleanup_ownership(conn, branch, &worktree_path, worktree_session_id)
-    })?;
+    ensure_cleanup_ownership(repo, branch, &worktree_path)?;
     let _server_lock = crate::opencode::lock_repository_server(repo)?;
-    let mut runtimes = crate::opencode::load_runtimes_for_worktree_session(repo, branch, path)?;
-    if let Some(worktree_session_id) = worktree_session_id {
-        runtimes
-            .retain(|runtime| runtime.worktree_session_id.as_deref() == Some(worktree_session_id));
-    }
-    shutdown_worktree_session_resources(repo, config, branch, worktree_session_id, &runtimes)?;
-    observability::with_writable_db(repo, |conn| {
-        let transaction =
-            crate::flight_recorder::TransactionTrace::begin("session.remove_owned_state");
-        conn.execute_batch("begin immediate transaction")
-            .map_err(|error| format!("begin worktree session cleanup transaction: {error}"))?;
-        let result = (|| {
-            ensure_cleanup_ownership(conn, branch, &worktree_path, worktree_session_id)?;
-            crate::remote::remove_pr_cache_with_conn(conn, branch)?;
-            crate::agent_session::remove_state_with_conn(conn, branch)?;
-            crate::opencode::remove_worktree_session_runtimes_with_conn(conn, &runtimes)?;
-            conn.execute(
-                "delete from task_metadata where branch = ?1 and worktree = ?2",
-                params![branch, worktree_path],
-            )
-            .map_err(|error| format!("remove Worktree Session metadata: {error}"))?;
-            conn.execute(
-                "delete from worktree_harness where branch = ?1 and worktree_path = ?2",
-                params![branch, worktree_path],
-            )
-            .map_err(|error| format!("remove worktree harness association: {error}"))?;
-            clear_hidden_session_marker_with_conn(conn, branch)?;
-            conn.execute(
-                "delete from archived_worktree where branch = ?1 and worktree_path = ?2",
-                params![branch, worktree_path],
-            )
-            .map_err(|error| format!("remove archived worktree metadata: {error}"))?;
-            conn.execute(
-                "delete from pending_worktree_deletion where branch = ?1 and worktree_path = ?2",
-                params![branch, worktree_path],
-            )
-            .map_err(|error| format!("complete pending worktree deletion: {error}"))?;
-            if let Some(worktree_session_id) = worktree_session_id {
-                let removed = conn
-                    .execute(
-                        "delete from active_worktree_session where worktree_session_id = ?1",
-                        params![worktree_session_id],
-                    )
-                    .map_err(|error| format!("retire deleted Worktree Session: {error}"))?;
-                if removed != 1 {
-                    return Err(
-                        "deleted Worktree Session identity changed before cleanup".to_string()
-                    );
-                }
-            }
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                conn.execute_batch("commit").map_err(|error| {
-                    format!("commit worktree session cleanup transaction: {error}")
-                })?;
-                transaction.committed();
-                Ok(())
-            }
-            Err(error) => {
-                let _ = conn.execute_batch("rollback");
-                Err(error)
-            }
-        }
-    })
+    let runtimes = crate::opencode::load_runtimes_for_worktree_session(repo, branch, path)?;
+    shutdown_worktree_session_resources(repo, config, branch, &runtimes)?;
+    let transaction = crate::flight_recorder::TransactionTrace::begin("session.remove_owned_state");
+    session_store(repo)?
+        .remove_owned_state(branch, &worktree_path, &runtimes)
+        .map_err(|error| format!("remove worktree session state: {error}"))?;
+    transaction.committed();
+    Ok(())
 }
 
 fn ensure_cleanup_ownership(
-    conn: &rusqlite::Connection,
+    repo: &Repository,
     branch: &str,
     worktree_path: &str,
-    worktree_session_id: Option<&str>,
 ) -> Result<(), String> {
-    if let Some(worktree_session_id) = worktree_session_id {
-        require_active_worktree_session_owner(conn, worktree_session_id, branch)?;
-        let current_path = conn
-            .query_row(
-                "select worktree_path from active_worktree_session
-                 where worktree_session_id = ?1",
-                params![worktree_session_id],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|error| format!("inspect Worktree Session cleanup path: {error}"))?;
-        if current_path != worktree_path {
-            return Err(format!(
-                "retained state for {branch}: Worktree Session moved to {current_path:?}"
-            ));
-        }
-    }
-    let current_path = conn
-        .query_row(
-            "select worktree from task_metadata where branch = ?1",
-            params![branch],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
+    let current_path = session_store(repo)?
+        .cleanup_owner(branch)
         .map_err(|error| format!("inspect Worktree Session cleanup ownership: {error}"))?;
     if current_path
         .as_deref()
@@ -1208,10 +994,6 @@ fn build_session(
     let legacy_metadata_path = path
         .join(".agent/tasks")
         .join(format!("{}.json", safe_branch_filename(&branch)));
-    let path_display = path.display().to_string();
-    let incarnation = worktree_incarnation(&path);
-    let worktree_session_id =
-        resolve_worktree_session_identity(repo, &path, &branch, &incarnation)?;
     let metadata = load_task_metadata(repo, &branch)?;
     let prompt_summary = metadata
         .as_ref()
@@ -1228,6 +1010,8 @@ fn build_session(
         .unwrap_or_default();
     let adopted = metadata.is_some() || legacy_metadata_path.exists();
     let status_label = git_status_label(&path, config);
+    let path_display = path.display().to_string();
+    let incarnation = worktree_incarnation(&path);
     let agent_state = load_agent_state(repo, &branch).unwrap_or(AgentState::Idle);
     let pr = load_pr_cache_for_branch(repo, config, &branch, &path);
     Ok(Session {
@@ -1235,7 +1019,6 @@ fn build_session(
         repo_label: String::new(),
         repo_key: None,
         path,
-        worktree_session_id,
         incarnation,
         path_display,
         branch,
@@ -1251,405 +1034,6 @@ fn build_session(
         wt_columns: BTreeMap::new(),
         unseen_comments: false,
     })
-}
-
-fn worktree_session_marker_path(worktree: &Path) -> Result<PathBuf, String> {
-    let git = worktree.join(".git");
-    if git.is_dir() {
-        return Ok(git.join("prism-worktree-session-id"));
-    }
-    let contents = match fs::read_to_string(&git) {
-        Ok(contents) => contents,
-        #[cfg(test)]
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(worktree
-                .join(".prism-test-git")
-                .join("prism-worktree-session-id"));
-        }
-        Err(error) => {
-            return Err(format!("read worktree Git link {}: {error}", git.display()));
-        }
-    };
-    let target = contents
-        .trim()
-        .strip_prefix("gitdir:")
-        .map(str::trim)
-        .filter(|target| !target.is_empty())
-        .ok_or_else(|| format!("invalid worktree Git link {}", git.display()))?;
-    let target = PathBuf::from(target);
-    let git_dir = if target.is_absolute() {
-        target
-    } else {
-        worktree.join(target)
-    };
-    Ok(git_dir.join("prism-worktree-session-id"))
-}
-
-fn resolve_worktree_session_identity(
-    repo: &Repository,
-    worktree: &Path,
-    branch: &str,
-    incarnation: &str,
-) -> Result<String, String> {
-    if incarnation.is_empty() && !cfg!(test) {
-        return Err(format!(
-            "cannot identify Worktree Session at {} without Git administrative metadata",
-            worktree.display()
-        ));
-    }
-    let test_incarnation;
-    let incarnation = if incarnation.is_empty() {
-        test_incarnation = format!("test:{:016x}", crate::util::stable_hash(worktree));
-        test_incarnation.as_str()
-    } else {
-        incarnation
-    };
-    let marker = worktree_session_marker_path(worktree)?;
-    let marker_prefix = format!("{:016x}:", crate::util::stable_hash(&repo.root));
-    observability::with_writable_db(repo, |conn| {
-        conn.execute_batch("begin immediate transaction")
-            .map_err(|error| format!("begin Worktree Session identity transaction: {error}"))?;
-        let result = (|| {
-            let existing = match fs::read_to_string(&marker) {
-                Ok(value) => Some(value.trim().to_string()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => {
-                    return Err(format!(
-                        "read Worktree Session marker {}: {error}",
-                        marker.display()
-                    ));
-                }
-            };
-            let id = match existing {
-                Some(marker_value) => {
-                    let Some(id) = marker_value.strip_prefix(&marker_prefix) else {
-                        return Err(
-                            "Worktree Session marker belongs to another repository".to_string()
-                        );
-                    };
-                    if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                        return Err(format!(
-                            "invalid Worktree Session marker {}",
-                            marker.display()
-                        ));
-                    }
-                    id.to_string()
-                }
-                None => {
-                    let id = conn
-                        .query_row("select lower(hex(randomblob(16)))", [], |row| {
-                            row.get::<_, String>(0)
-                        })
-                        .map_err(|error| format!("allocate Worktree Session identity: {error}"))?;
-                    crate::file_persistence::update(
-                        &marker,
-                        crate::file_persistence::UpdateOptions::important_toml(),
-                        |_| Ok(((), Some(format!("{marker_prefix}{id}\n").into_bytes()))),
-                    )
-                    .map_err(|error| format!("write Worktree Session marker: {error}"))?;
-                    id
-                }
-            };
-            let repo_root = repo.root.display().to_string();
-            let path = worktree.display().to_string();
-            let owner = conn
-                .query_row(
-                    "select repo_root from worktree_session where id = ?1",
-                    params![id.as_str()],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(|error| format!("read Worktree Session identity: {error}"))?;
-            if owner.as_deref().is_some_and(|owner| owner != repo_root) {
-                return Err("Worktree Session marker belongs to another repository".to_string());
-            }
-            conn.execute(
-                "insert or ignore into worktree_session (
-                    id, repo_root, initial_branch, initial_worktree_path, created_unix_ms
-                 ) values (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    id.as_str(),
-                    repo_root.as_str(),
-                    branch,
-                    path.as_str(),
-                    unix_seconds()
-                ],
-            )
-            .map_err(|error| format!("record Worktree Session identity: {error}"))?;
-            let previous_location = conn
-                .query_row(
-                    "select branch, worktree_path from active_worktree_session
-                     where worktree_session_id = ?1",
-                    params![id.as_str()],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()
-                .map_err(|error| format!("inspect existing Worktree Session location: {error}"))?;
-            let displaced_branches = {
-                let mut statement = conn
-                    .prepare(
-                        "select branch from active_worktree_session
-                         where repo_root = ?1 and worktree_session_id != ?2
-                           and (branch = ?3 or worktree_path = ?4)",
-                    )
-                    .map_err(|error| format!("prepare replaced Worktree Session query: {error}"))?;
-                statement
-                    .query_map(
-                        params![repo_root.as_str(), id.as_str(), branch, path.as_str()],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .map_err(|error| format!("query replaced Worktree Sessions: {error}"))?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| format!("read replaced Worktree Sessions: {error}"))?
-            };
-            for displaced_branch in displaced_branches {
-                retire_branch_owned_active_state(conn, &displaced_branch)?;
-            }
-            if let Some((previous_branch, previous_path)) = previous_location.as_ref()
-                && (previous_branch != branch || previous_path != &path)
-            {
-                migrate_worktree_session_location(
-                    conn,
-                    previous_branch,
-                    previous_path,
-                    branch,
-                    &path,
-                    &repo_root,
-                    &id,
-                )?;
-            }
-            conn.execute(
-                "delete from active_worktree_session
-                 where repo_root = ?1 and worktree_session_id != ?2
-                   and (branch = ?3 or worktree_path = ?4)",
-                params![repo_root.as_str(), id.as_str(), branch, path.as_str()],
-            )
-            .map_err(|error| format!("retire replaced Worktree Session: {error}"))?;
-            conn.execute(
-                "insert into active_worktree_session (
-                    worktree_session_id, repo_root, branch, worktree_path,
-                    worktree_incarnation, observed_unix_ms
-                 ) values (?1, ?2, ?3, ?4, ?5, ?6)
-                 on conflict(worktree_session_id) do update set
-                    repo_root = excluded.repo_root,
-                    branch = excluded.branch,
-                    worktree_path = excluded.worktree_path,
-                    worktree_incarnation = excluded.worktree_incarnation,
-                    observed_unix_ms = excluded.observed_unix_ms",
-                params![
-                    id.as_str(),
-                    repo_root,
-                    branch,
-                    path,
-                    incarnation,
-                    unix_seconds()
-                ],
-            )
-            .map_err(|error| format!("activate Worktree Session identity: {error}"))?;
-            Ok(id)
-        })();
-        match result {
-            Ok(id) => {
-                conn.execute_batch("commit")
-                    .map_err(|error| format!("commit Worktree Session identity: {error}"))?;
-                Ok(id)
-            }
-            Err(error) => {
-                let _ = conn.execute_batch("rollback");
-                Err(error)
-            }
-        }
-    })
-}
-
-#[cfg(test)]
-fn ensure_worktree_session_identity(
-    repo: &Repository,
-    worktree: &Path,
-    branch: &str,
-) -> Result<String, String> {
-    let incarnation = worktree_incarnation(worktree);
-    resolve_worktree_session_identity(repo, worktree, branch, &incarnation)
-}
-
-fn retire_branch_owned_active_state(
-    conn: &rusqlite::Connection,
-    branch: &str,
-) -> Result<(), String> {
-    crate::remote::remove_pr_cache_with_conn(conn, branch)?;
-    crate::agent_session::remove_state_with_conn(conn, branch)?;
-    for (table, context) in [
-        ("task_metadata", "retire task metadata"),
-        ("hidden_session", "retire hidden marker"),
-        ("archived_worktree", "retire archived worktree marker"),
-        ("worktree_harness", "retire harness association"),
-    ] {
-        conn.execute(
-            &format!("delete from {table} where branch = ?1"),
-            params![branch],
-        )
-        .map_err(|error| format!("{context}: {error}"))?;
-    }
-    Ok(())
-}
-
-fn migrate_worktree_session_location(
-    conn: &rusqlite::Connection,
-    previous_branch: &str,
-    previous_path: &str,
-    branch: &str,
-    worktree_path: &str,
-    repo_root: &str,
-    worktree_session_id: &str,
-) -> Result<(), String> {
-    for (table, context) in [
-        ("task_metadata", "migrate task metadata"),
-        ("hidden_session", "migrate hidden marker"),
-        ("archived_worktree", "migrate archived worktree marker"),
-        ("agent_state", "migrate agent state"),
-        ("worktree_harness", "migrate harness association"),
-        ("pr_cache", "migrate pull request cache"),
-        ("pr_details_cache", "migrate pull request details cache"),
-    ] {
-        conn.execute(
-            &format!("update {table} set branch = ?1 where branch = ?2"),
-            params![branch, previous_branch],
-        )
-        .map_err(|error| format!("{context}: {error}"))?;
-    }
-    conn.execute(
-        "update task_metadata set worktree = ?1 where branch = ?2",
-        params![worktree_path, branch],
-    )
-    .map_err(|error| format!("migrate task metadata path: {error}"))?;
-    conn.execute(
-        "update worktree_harness set worktree_path = ?1 where branch = ?2",
-        params![worktree_path, branch],
-    )
-    .map_err(|error| format!("migrate harness association path: {error}"))?;
-    conn.execute(
-        "delete from opencode_runtime
-         where repo_root = ?1 and branch = ?2 and worktree_path = ?3
-           and worktree_session_id is not ?4",
-        params![repo_root, branch, worktree_path, worktree_session_id],
-    )
-    .map_err(|error| format!("retire displaced OpenCode runtime association: {error}"))?;
-    conn.execute(
-        "update opencode_runtime set branch = ?1, worktree_path = ?2
-         where branch = ?3 and worktree_path = ?4 and worktree_session_id = ?5",
-        params![
-            branch,
-            worktree_path,
-            previous_branch,
-            previous_path,
-            worktree_session_id
-        ],
-    )
-    .map_err(|error| format!("migrate OpenCode runtime association: {error}"))?;
-    for (kind, table) in [("auto", "auto_run"), ("plan", "plan_run")] {
-        conn.execute(
-            &format!(
-                "update workflow_execution set
-                   dispatch_state = 'recovery_pending',
-                   worker_id = null,
-                   daemon_instance_id = null,
-                   lease_expires_unix_ms = null,
-                   heartbeat_unix_ms = null,
-                   executor_pid = null,
-                   executor_process_identity = null,
-                   requeue_requested = 0,
-                   interruption_generation = interruption_generation + 1,
-                   fencing_token = fencing_token + 1,
-                   updated_unix_ms = ?1
-                 where workflow_kind = ?2 and dispatch_state = 'claimed'
-                   and run_id in (
-                     select id from {table} where worktree_session_id = ?3
-                   )"
-            ),
-            params![
-                unix_seconds().saturating_mul(1000),
-                kind,
-                worktree_session_id
-            ],
-        )
-        .map_err(|error| format!("interrupt {kind} execution for location migration: {error}"))?;
-    }
-    conn.execute(
-        "update auto_run set
-           branch = ?1,
-           worktree_path = ?2,
-           plan_path = case
-             when plan_path = ?3 then ?2
-             when substr(plan_path, 1, length(?3) + 1) = ?3 || '/'
-               then ?2 || substr(plan_path, length(?3) + 1)
-             else plan_path
-           end
-         where worktree_session_id = ?4 and status not in ('done', 'aborted')",
-        params![branch, worktree_path, previous_path, worktree_session_id],
-    )
-    .map_err(|error| format!("migrate active Auto Flow location: {error}"))?;
-    conn.execute(
-        "update plan_run set
-           scope_path = ?1,
-           plan_path = case
-             when plan_path = ?2 then ?1
-             when substr(plan_path, 1, length(?2) + 1) = ?2 || '/'
-               then ?1 || substr(plan_path, length(?2) + 1)
-             else plan_path
-           end
-         where worktree_session_id = ?3 and status not in ('done', 'aborted')",
-        params![worktree_path, previous_path, worktree_session_id],
-    )
-    .map_err(|error| format!("migrate active Plan location: {error}"))?;
-    Ok(())
-}
-
-pub(crate) fn worktree_session_is_active(
-    conn: &rusqlite::Connection,
-    worktree_session_id: &str,
-) -> Result<bool, String> {
-    #[cfg(test)]
-    if !table_exists_for_identity(conn, "active_worktree_session")? {
-        return Ok(true);
-    }
-    conn.query_row(
-        "select exists(select 1 from active_worktree_session where worktree_session_id = ?1)",
-        params![worktree_session_id],
-        |row| row.get(0),
-    )
-    .map_err(|error| format!("validate active Worktree Session: {error}"))
-}
-
-#[cfg(test)]
-fn table_exists_for_identity(conn: &rusqlite::Connection, table: &str) -> Result<bool, String> {
-    conn.query_row(
-        "select exists(select 1 from sqlite_master where type = 'table' and name = ?1)",
-        params![table],
-        |row| row.get(0),
-    )
-    .map_err(|error| format!("inspect Worktree Session identity schema: {error}"))
-}
-
-pub(crate) fn require_active_worktree_session_owner(
-    conn: &rusqlite::Connection,
-    worktree_session_id: &str,
-    branch: &str,
-) -> Result<(), String> {
-    let owned = conn
-        .query_row(
-            "select exists(
-               select 1 from active_worktree_session
-               where worktree_session_id = ?1 and branch = ?2
-             )",
-            params![worktree_session_id, branch],
-            |row| row.get::<_, bool>(0),
-        )
-        .map_err(|error| format!("validate Worktree Session ownership: {error}"))?;
-    if owned {
-        Ok(())
-    } else {
-        Err("Worktree Session is no longer active for this branch".to_string())
-    }
 }
 
 pub(crate) fn worktree_incarnation(path: &Path) -> String {
@@ -1681,31 +1065,17 @@ fn write_task_metadata(
     initial_prompt: &str,
 ) -> Result<(), String> {
     let summary = prompt_summary_from_text(initial_prompt);
-    observability::with_writable_db(repo, |conn| {
-        conn.execute(
-            "insert into task_metadata (
-                branch, prompt_summary, initial_prompt, worktree, classification, visibility, updated_unix_ms
-             ) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-             on conflict(branch) do update set
-                prompt_summary = excluded.prompt_summary,
-                initial_prompt = excluded.initial_prompt,
-                worktree = excluded.worktree,
-                classification = excluded.classification,
-                visibility = excluded.visibility,
-                updated_unix_ms = excluded.updated_unix_ms",
-            params![
-                session.branch.as_str(),
-                summary.as_str(),
-                initial_prompt,
-                session.path_display.as_str(),
-                session.classification.label(),
-                session.visibility,
-                unix_seconds(),
-            ],
-        )
-        .map_err(|error| format!("write task metadata: {error}"))?;
-        Ok(())
-    })
+    session_store(repo)?
+        .write_task_metadata(&crate::persistence::session::TaskMetadataInput {
+            branch: &session.branch,
+            prompt_summary: &summary,
+            initial_prompt,
+            worktree: &session.path_display,
+            classification: session.classification.label(),
+            visibility: i64::from(session.visibility),
+            updated_unix_ms: unix_seconds(),
+        })
+        .map_err(|error| format!("write task metadata: {error}"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1733,123 +1103,17 @@ pub(crate) fn set_worktree_visibility(
     session: &Session,
     visibility: i16,
 ) -> Result<(), String> {
-    observability::with_writable_db(repo, |conn| {
-        conn.execute(
-            "insert into task_metadata (
-                branch, prompt_summary, initial_prompt, worktree, classification, visibility, updated_unix_ms
-             ) values (?1, ?2, '', ?3, ?4, ?5, ?6)
-             on conflict(branch) do update set
-                worktree = excluded.worktree,
-                classification = excluded.classification,
-                visibility = excluded.visibility,
-                updated_unix_ms = excluded.updated_unix_ms",
-            params![
-                session.branch.as_str(),
-                session.prompt_summary.as_str(),
-                session.path_display.as_str(),
-                session.classification.label(),
-                visibility,
-                unix_seconds(),
-            ],
-        )
-        .map_err(|error| format!("write worktree visibility: {error}"))?;
-        Ok(())
-    })
-}
-
-pub(crate) fn migrate_worktree_session_schema(conn: &rusqlite::Connection) -> Result<(), String> {
-    conn.execute_batch(
-        "
-        create table if not exists task_metadata (
-          branch text primary key,
-          prompt_summary text not null,
-          initial_prompt text not null,
-          worktree text not null,
-          classification text not null default 'work',
-          visibility integer not null default 0,
-          updated_unix_ms integer not null
-        );
-
-        create table if not exists worktree_session (
-          id text primary key,
-          repo_root text not null,
-          initial_branch text not null,
-          initial_worktree_path text not null,
-          created_unix_ms integer not null
-        ) without rowid;
-
-        create table if not exists active_worktree_session (
-          worktree_session_id text primary key references worktree_session(id),
-          repo_root text not null,
-          branch text not null,
-          worktree_path text not null,
-          worktree_incarnation text not null,
-          observed_unix_ms integer not null,
-          unique(repo_root, branch),
-          unique(repo_root, worktree_path)
-        ) without rowid;
-        create index if not exists active_worktree_session_location_idx
-          on active_worktree_session(repo_root, branch, worktree_path);
-
-        create table if not exists hidden_session (
-          branch text primary key,
-          hidden_unix_ms integer not null
-        );
-
-        create table if not exists archived_worktree (
-          branch text primary key,
-          repo_root text not null,
-          worktree_path text not null,
-          archived_unix_ms integer not null,
-          classification text not null default 'work'
-        );
-
-        create table if not exists agent_state (
-          branch text primary key,
-          state text not null,
-          updated_unix_ms integer not null
-        );
-
-        create table if not exists worktree_harness (
-          branch text primary key,
-          worktree_path text not null,
-          worktree_incarnation text not null,
-          harness_id text not null,
-          migration_policy text not null default 'ask',
-          updated_unix_ms integer not null
-        );
-
-        create table if not exists pending_worktree_deletion (
-          branch text primary key,
-          worktree_path text not null,
-          worktree_incarnation text not null,
-          branch_oid text,
-          worktree_removed integer not null default 0,
-          branch_deleted integer not null default 0,
-          updated_unix_ms integer not null
-        );
-        ",
-    )
-    .map_err(|error| format!("create worktree session schema: {error}"))?;
-    add_column_if_missing(
-        conn,
-        "task_metadata",
-        "classification",
-        "alter table task_metadata add column classification text not null default 'work'",
-    )?;
-    add_column_if_missing(
-        conn,
-        "task_metadata",
-        "visibility",
-        "alter table task_metadata add column visibility integer not null default 0",
-    )?;
-    add_column_if_missing(
-        conn,
-        "pending_worktree_deletion",
-        "branch_deleted",
-        "alter table pending_worktree_deletion add column branch_deleted integer not null default 0",
-    )?;
-    Ok(())
+    session_store(repo)?
+        .set_visibility(&crate::persistence::session::TaskMetadataInput {
+            branch: &session.branch,
+            prompt_summary: &session.prompt_summary,
+            initial_prompt: "",
+            worktree: &session.path_display,
+            classification: session.classification.label(),
+            visibility: i64::from(visibility),
+            updated_unix_ms: unix_seconds(),
+        })
+        .map_err(|error| format!("write worktree visibility: {error}"))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1862,62 +1126,24 @@ pub(crate) fn worktree_harness(
     repo: &Repository,
     session: &Session,
 ) -> Result<WorktreeHarnessAssociation, String> {
-    observability::with_writable_db(repo, |conn| {
-        let stored = conn
-            .query_row(
-                "select worktree_path, worktree_incarnation, harness_id, migration_policy
-                 from worktree_harness where branch = ?1",
-                params![session.branch.as_str()],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                },
-            )
-            .optional()
-            .map_err(|error| format!("load worktree harness: {error}"))?;
-        if let Some((path, incarnation, harness_id, policy)) = stored
-            && path == session.path_display
-            && worktree_incarnations_match(&incarnation, &session.incarnation)
-        {
-            let keep = policy == "keep";
-            if incarnation != session.incarnation {
-                set_worktree_harness_with_conn(conn, session, &harness_id, keep)?;
-            }
-            return Ok(WorktreeHarnessAssociation { harness_id, keep });
-        }
-        // Before multi-harness support every existing Agent Session was OpenCode.
-        set_worktree_harness_with_conn(conn, session, "opencode", false)?;
-        Ok(WorktreeHarnessAssociation {
-            harness_id: "opencode".to_string(),
-            keep: false,
-        })
-    })
-}
-
-fn worktree_incarnations_match(stored: &str, current: &str) -> bool {
-    if stored == current {
-        return true;
+    let store = session_store(repo)?;
+    let stored = store
+        .load_harness(&session.branch)
+        .map_err(|error| format!("load worktree harness: {error}"))?;
+    if let Some(stored) = stored
+        && stored.worktree_path == session.path_display
+        && stored.worktree_incarnation == session.incarnation
+    {
+        return Ok(WorktreeHarnessAssociation {
+            harness_id: stored.harness_id,
+            keep: stored.migration_policy == "keep",
+        });
     }
-    let Some(current_inode) = current
-        .strip_prefix("directory:")
-        .and_then(|identity| identity.rsplit(':').next())
-    else {
-        return false;
-    };
-    let mut legacy = stored.splitn(4, ':');
-    let (Some(legacy_inode), Some(modified), Some(length), Some(target)) =
-        (legacy.next(), legacy.next(), legacy.next(), legacy.next())
-    else {
-        return false;
-    };
-    legacy_inode == current_inode
-        && modified.parse::<u128>().is_ok()
-        && length.parse::<u64>().is_ok()
-        && target.is_empty()
+    set_worktree_harness(repo, session, "opencode", false)?;
+    Ok(WorktreeHarnessAssociation {
+        harness_id: "opencode".to_string(),
+        keep: false,
+    })
 }
 
 pub(crate) fn set_worktree_harness(
@@ -1926,246 +1152,77 @@ pub(crate) fn set_worktree_harness(
     harness_id: &str,
     keep: bool,
 ) -> Result<(), String> {
-    observability::with_writable_db(repo, |conn| {
-        set_worktree_harness_with_conn(conn, session, harness_id, keep)
-    })
-}
-
-fn set_worktree_harness_with_conn(
-    conn: &rusqlite::Connection,
-    session: &Session,
-    harness_id: &str,
-    keep: bool,
-) -> Result<(), String> {
-    conn.execute(
-        "insert into worktree_harness (
-           branch, worktree_path, worktree_incarnation, harness_id, migration_policy, updated_unix_ms
-         ) values (?1, ?2, ?3, ?4, ?5, ?6)
-         on conflict(branch) do update set
-           worktree_path = excluded.worktree_path,
-           worktree_incarnation = excluded.worktree_incarnation,
-           harness_id = excluded.harness_id,
-           migration_policy = excluded.migration_policy,
-           updated_unix_ms = excluded.updated_unix_ms",
-        params![
-            session.branch.as_str(),
-            session.path_display.as_str(),
-            session.incarnation.as_str(),
+    session_store(repo)?
+        .set_harness(&crate::persistence::session::WorktreeHarnessInput {
+            branch: &session.branch,
+            worktree_path: &session.path_display,
+            worktree_incarnation: &session.incarnation,
             harness_id,
-            if keep { "keep" } else { "ask" },
-            unix_seconds(),
-        ],
-    )
-    .map_err(|error| format!("write worktree harness: {error}"))?;
-    Ok(())
+            migration_policy: if keep { "keep" } else { "ask" },
+            updated_unix_ms: unix_seconds(),
+        })
+        .map_err(|error| format!("write worktree harness: {error}"))
 }
 
 pub(crate) fn archive_worktree_session(repo: &Repository, session: &Session) -> Result<(), String> {
-    observability::with_writable_db(repo, |conn| {
-        let transaction = crate::flight_recorder::TransactionTrace::begin("session.archive");
-        conn.execute_batch("begin transaction")
-            .map_err(|error| format!("begin archive transaction: {error}"))?;
-        let result = (|| -> Result<(), String> {
-            conn.execute(
-                "insert into hidden_session (branch, hidden_unix_ms)
-                 values (?1, ?2)
-                 on conflict(branch) do update set hidden_unix_ms = excluded.hidden_unix_ms",
-                params![session.branch.as_str(), unix_seconds()],
-            )
-            .map_err(|error| format!("write hidden marker: {error}"))?;
-            conn.execute(
-                "insert into archived_worktree (
-                    branch, repo_root, worktree_path, archived_unix_ms, classification
-                 ) values (?1, ?2, ?3, ?4, ?5)
-                 on conflict(branch) do update set
-                    repo_root = excluded.repo_root,
-                    worktree_path = excluded.worktree_path,
-                    archived_unix_ms = excluded.archived_unix_ms,
-                    classification = excluded.classification",
-                params![
-                    session.branch.as_str(),
-                    repo.root.display().to_string(),
-                    session.path_display.as_str(),
-                    unix_seconds(),
-                    session.classification.label(),
-                ],
-            )
-            .map_err(|error| format!("write archived worktree metadata: {error}"))?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                conn.execute_batch("commit")
-                    .map_err(|error| format!("commit archive transaction: {error}"))?;
-                transaction.committed();
-                Ok(())
-            }
-            Err(error) => {
-                let _ = conn.execute_batch("rollback");
-                Err(error)
-            }
-        }
-    })
-}
-
-fn clear_hidden_session_marker_with_conn(
-    conn: &rusqlite::Connection,
-    branch: &str,
-) -> Result<(), String> {
-    conn.execute(
-        "delete from hidden_session where branch = ?1",
-        params![branch],
-    )
-    .map_err(|error| format!("remove hidden marker: {error}"))?;
+    let transaction = crate::flight_recorder::TransactionTrace::begin("session.archive");
+    let archived_unix_ms = unix_seconds();
+    let repo_root = repo.root.display().to_string();
+    session_store(repo)?
+        .archive(&crate::persistence::session::ArchiveInput {
+            branch: &session.branch,
+            repo_root: &repo_root,
+            worktree_path: &session.path_display,
+            archived_unix_ms,
+            classification: session.classification.label(),
+        })
+        .map_err(|error| format!("archive worktree session: {error}"))?;
+    transaction.committed();
     Ok(())
 }
 
 fn unarchive_worktree_session(repo: &Repository, branch: &str) -> Result<(), String> {
-    observability::with_writable_db(repo, |conn| {
-        let transaction = crate::flight_recorder::TransactionTrace::begin("session.unarchive");
-        conn.execute_batch("begin transaction")
-            .map_err(|error| format!("begin unarchive transaction: {error}"))?;
-        let result = (|| -> Result<(), String> {
-            clear_hidden_session_marker_with_conn(conn, branch)?;
-            conn.execute(
-                "delete from archived_worktree where branch = ?1",
-                params![branch],
-            )
-            .map_err(|error| format!("remove archived worktree metadata: {error}"))?;
-            Ok(())
-        })();
-        match result {
-            Ok(()) => {
-                conn.execute_batch("commit")
-                    .map_err(|error| format!("commit unarchive transaction: {error}"))?;
-                transaction.committed();
-                Ok(())
-            }
-            Err(error) => {
-                let _ = conn.execute_batch("rollback");
-                Err(error)
-            }
-        }
-    })
+    let transaction = crate::flight_recorder::TransactionTrace::begin("session.unarchive");
+    session_store(repo)?
+        .unarchive(branch)
+        .map_err(|error| format!("unarchive worktree session: {error}"))?;
+    transaction.committed();
+    Ok(())
 }
 
 pub(crate) fn list_archived_worktrees(repo: &Repository) -> Result<Vec<ArchivedWorktree>, String> {
-    let path = observability::db_path(repo);
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let conn = crate::storage::open_readonly(&path).map_err(|error| error.to_string())?;
-    let table_count = conn
-        .query_row(
-            "select count(*) from sqlite_master where type = 'table' and name = 'archived_worktree'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| format!("inspect archived worktree table: {error}"))?;
-    if table_count == 0 {
-        return Ok(Vec::new());
-    }
-    let mut statement = conn
-        .prepare(
-            "select branch, worktree_path, classification
-             from archived_worktree
-             order by archived_unix_ms desc, branch asc",
-        )
-        .map_err(|error| format!("prepare archived worktree query: {error}"))?;
-    let rows = statement
-        .query_map([], |row| {
-            Ok(ArchivedWorktree {
-                branch: row.get(0)?,
-                worktree_path: row.get(1)?,
-                classification: SessionClassification::parse(&row.get::<_, String>(2)?),
-            })
+    session_store(repo)?
+        .list_archived()
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| ArchivedWorktree {
+                    branch: row.branch,
+                    worktree_path: row.worktree_path,
+                    classification: SessionClassification::parse(&row.classification),
+                })
+                .collect()
         })
-        .map_err(|error| format!("read archived worktrees: {error}"))?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("read archived worktree row: {error}"))
+        .map_err(|error| format!("read archived worktrees: {error}"))
 }
 
 fn hidden_session_exists(repo: &Repository, branch: &str) -> Result<bool, String> {
-    let path = observability::db_path(repo);
-    if !path.exists() {
-        return Ok(false);
-    }
-    let conn = crate::storage::open_readonly(&path).map_err(|error| error.to_string())?;
-    let table_count = conn
-        .query_row(
-            "select count(*) from sqlite_master where type = 'table' and name = 'hidden_session'",
-            [],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| format!("inspect hidden marker table: {error}"))?;
-    if table_count == 0 {
-        return Ok(false);
-    }
-    let count = conn
-        .query_row(
-            "select count(*) from hidden_session where branch = ?1",
-            params![branch],
-            |row| row.get::<_, i64>(0),
-        )
-        .map_err(|error| format!("read hidden marker: {error}"))?;
-    Ok(count > 0)
+    session_store(repo)?
+        .hidden_exists(branch)
+        .map_err(|error| format!("read hidden marker: {error}"))
 }
 
 pub(crate) fn save_agent_state(
     repo: &Repository,
-    worktree_session_id: &str,
     branch: &str,
     state: AgentState,
 ) -> Result<(), String> {
-    observability::with_writable_db(repo, |conn| {
-        require_active_worktree_session_owner(conn, worktree_session_id, branch)?;
-        conn.execute(
-            "insert into agent_state (branch, state, updated_unix_ms)
-             values (?1, ?2, ?3)
-             on conflict(branch) do update set
-                state = excluded.state,
-                updated_unix_ms = excluded.updated_unix_ms",
-            params![branch, state.label(), unix_seconds()],
-        )
-        .map_err(|error| format!("write process state: {error}"))?;
-        Ok(())
-    })
-}
-
-pub(crate) fn remove_agent_state(
-    repo: &Repository,
-    worktree_session_id: &str,
-    branch: &str,
-) -> Result<(), String> {
-    observability::with_writable_db(repo, |conn| {
-        let current = conn
-            .query_row(
-                "select worktree_session_id from active_worktree_session where branch = ?1",
-                params![branch],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(|error| format!("inspect Agent Session state owner: {error}"))?;
-        if current
-            .as_deref()
-            .is_some_and(|current| current != worktree_session_id)
-        {
-            return Ok(());
-        }
-        crate::agent_session::remove_state_with_conn(conn, branch)
-    })
+    session_store(repo)?
+        .save_agent_state(branch, state.label(), unix_seconds())
+        .map_err(|error| format!("write process state: {error}"))
 }
 
 fn load_agent_state(repo: &Repository, branch: &str) -> Option<AgentState> {
-    let state = observability::with_writable_db(repo, |conn| {
-        conn.query_row(
-            "select state from agent_state where branch = ?1",
-            params![branch],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|error| format!("read process state: {error}"))
-    })
-    .ok()?;
+    let state = session_store(repo).ok()?.load_agent_state(branch).ok()??;
     AgentState::parse(&state)
 }
 
@@ -2176,77 +1233,38 @@ struct TaskMetadata {
 }
 
 fn load_task_metadata(repo: &Repository, branch: &str) -> Result<Option<TaskMetadata>, String> {
-    observability::with_writable_db(repo, |conn| {
-        conn.query_row(
-            "select prompt_summary, classification, visibility from task_metadata where branch = ?1",
-            params![branch],
-            |row| {
-                Ok(TaskMetadata {
-                    prompt_summary: row.get(0)?,
-                    classification: SessionClassification::parse(&row.get::<_, String>(1)?),
-                    visibility: row.get(2)?,
-                })
-            },
-        )
-        .optional()
+    session_store(repo)?
+        .load_task_metadata(branch)
+        .map(|row| {
+            row.map(|row| TaskMetadata {
+                prompt_summary: row.prompt_summary,
+                classification: SessionClassification::parse(&row.classification),
+                visibility: i16::try_from(row.visibility).unwrap_or_default(),
+            })
+        })
         .map_err(|error| format!("read task metadata: {error}"))
-    })
 }
 
+#[cfg(test)]
 pub(crate) fn load_task_initial_prompt(
     repo: &Repository,
     branch: &str,
 ) -> Result<Option<String>, String> {
-    observability::with_writable_db(repo, |conn| {
-        conn.query_row(
-            "select initial_prompt from task_metadata where branch = ?1",
-            params![branch],
-            |row| row.get(0),
-        )
-        .optional()
+    session_store(repo)?
+        .load_initial_prompt(branch)
         .map_err(|error| format!("read task initial prompt: {error}"))
-    })
 }
 
 fn load_hidden_sessions(repo: &Repository) -> Result<BTreeMap<String, i64>, String> {
-    observability::with_writable_db(repo, |conn| {
-        let mut statement = conn
-            .prepare("select branch, hidden_unix_ms from hidden_session")
-            .map_err(|error| format!("read hidden sessions: {error}"))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-            })
-            .map_err(|error| format!("read hidden sessions: {error}"))?;
-        let mut hidden = BTreeMap::new();
-        for row in rows {
-            let (branch, hidden_unix_ms) =
-                row.map_err(|error| format!("read hidden session: {error}"))?;
-            hidden.insert(branch, hidden_unix_ms);
-        }
-        Ok(hidden)
-    })
+    session_store(repo)?
+        .hidden_sessions()
+        .map(|rows| rows.into_iter().collect())
+        .map_err(|error| format!("read hidden sessions: {error}"))
 }
 
-fn add_column_if_missing(
-    conn: &rusqlite::Connection,
-    table: &str,
-    column: &str,
-    sql: &str,
-) -> Result<(), String> {
-    let mut statement = conn
-        .prepare(&format!("pragma table_info({table})"))
-        .map_err(|error| format!("inspect {table} schema: {error}"))?;
-    let columns = statement
-        .query_map([], |row| row.get::<_, String>(1))
-        .map_err(|error| format!("inspect {table} schema: {error}"))?;
-    for value in columns {
-        if value.map_err(|error| format!("inspect {table} schema: {error}"))? == column {
-            return Ok(());
-        }
-    }
-    conn.execute_batch(sql)
-        .map_err(|error| format!("migrate {table}.{column}: {error}"))
+fn session_store(repo: &Repository) -> Result<crate::persistence::session::SessionStore, String> {
+    crate::persistence::session::SessionStore::open(&observability::db_path(repo))
+        .map_err(|error| format!("open session persistence: {error}"))
 }
 
 fn read_prompt_summary(path: &Path) -> Option<String> {
@@ -2274,112 +1292,14 @@ fn unix_seconds() -> i64 {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::persistence::database::TestDatabase;
+    use crate::sqlx_test_params as params;
     use crate::test_support::write_executable;
 
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn recreated_same_branch_and_path_gets_new_durable_identity_and_no_active_state() {
-        let temp = unique_temp_dir("prism-worktree-session-identity-test");
-        let worktree = temp.join("worktree");
-        fs::create_dir_all(worktree.join(".git")).unwrap();
-        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        let first_incarnation = worktree_incarnation(&worktree);
-        let first =
-            resolve_worktree_session_identity(&repo, &worktree, "feature", &first_incarnation)
-                .unwrap();
-        let repeated =
-            resolve_worktree_session_identity(&repo, &worktree, "feature", &first_incarnation)
-                .unwrap();
-        assert_eq!(repeated, first);
-        observability::with_writable_db(&repo, |conn| {
-            conn.execute(
-                "insert into task_metadata (
-                    branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
-                 ) values ('feature', 'old prompt', 'old prompt', ?1, 0)",
-                params![worktree.display().to_string()],
-            )
-            .map_err(|error| error.to_string())?;
-            conn.execute(
-                "insert into agent_state (branch, state, updated_unix_ms)
-                 values ('feature', 'running', 0)",
-                [],
-            )
-            .map_err(|error| error.to_string())?;
-            Ok(())
-        })
-        .unwrap();
-
-        fs::remove_dir_all(&worktree).unwrap();
-        fs::create_dir_all(worktree.join(".git")).unwrap();
-        let replacement_incarnation = worktree_incarnation(&worktree);
-        let replacement = resolve_worktree_session_identity(
-            &repo,
-            &worktree,
-            "feature",
-            &replacement_incarnation,
-        )
-        .unwrap();
-
-        assert_ne!(replacement, first);
-        observability::with_writable_db(&repo, |conn| {
-            assert!(!worktree_session_is_active(conn, &first)?);
-            assert!(worktree_session_is_active(conn, &replacement)?);
-            let metadata: i64 = conn
-                .query_row("select count(*) from task_metadata", [], |row| row.get(0))
-                .map_err(|error| error.to_string())?;
-            let agent_state: i64 = conn
-                .query_row("select count(*) from agent_state", [], |row| row.get(0))
-                .map_err(|error| error.to_string())?;
-            assert_eq!(metadata, 0);
-            assert_eq!(agent_state, 0);
-            Ok(())
-        })
-        .unwrap();
-        let _ = fs::remove_dir_all(temp);
-    }
-
-    #[test]
-    fn stale_agent_state_removal_cannot_delete_replacement_state() {
-        let temp = unique_temp_dir("prism-stale-agent-state-removal-test");
-        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        observability::with_writable_db(&repo, |conn| {
-            conn.execute(
-                "insert into worktree_session (
-                    id, repo_root, initial_branch, initial_worktree_path, created_unix_ms
-                 ) values ('replacement', ?1, 'feature', '/repo/feature', 1)",
-                params![repo.root.display().to_string()],
-            )
-            .map_err(|error| error.to_string())?;
-            conn.execute(
-                "insert into active_worktree_session (
-                    worktree_session_id, repo_root, branch, worktree_path,
-                    worktree_incarnation, observed_unix_ms
-                 ) values ('replacement', ?1, 'feature', '/repo/feature', 'new', 1)",
-                params![repo.root.display().to_string()],
-            )
-            .map_err(|error| error.to_string())?;
-            conn.execute(
-                "insert into agent_state (branch, state, updated_unix_ms)
-                 values ('feature', 'running', 1)",
-                [],
-            )
-            .map_err(|error| error.to_string())?;
-            Ok(())
-        })
-        .unwrap();
-
-        remove_agent_state(&repo, "retired", "feature").unwrap();
-
-        assert_eq!(
-            load_agent_state(&repo, "feature"),
-            Some(AgentState::Running)
-        );
-        let _ = fs::remove_dir_all(temp);
-    }
 
     #[test]
     fn owned_state_cleanup_rolls_back_all_branch_rows_on_late_failure() {
@@ -2394,7 +1314,7 @@ mod tests {
         config
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
                     branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
@@ -2410,10 +1330,15 @@ mod tests {
             .map_err(|error| error.to_string())?;
             conn.execute(
                 "insert into pr_cache (
-                    branch, number, title, url, state, review_decision, head_ref, base_ref,
+                    branch, number, provider, canonical_host, project_path, native_cr_id,
+                    display_number, source_provider, source_canonical_host, source_project_path,
+                    target_provider, target_canonical_host, target_project_path,
+                    title, url, state, review_decision, head_ref, base_ref,
                     head_sha, updated_at, check_status, merged, draft, last_refreshed,
                     refreshed_unix_ms
-                 ) values (?1, 42, '', '', 'OPEN', '', ?1, 'main', 'head', '', '', 0, 0, '', 0)",
+                 ) values (?1, 42, 'github', 'github.com', 'org/repo', '42', 42,
+                    'github', 'github.com', 'org/repo', 'github', 'github.com', 'org/repo',
+                    '', '', 'OPEN', '', ?1, 'main', 'head', '', '', 0, 0, '', 0)",
                 params![branch],
             )
             .map_err(|error| error.to_string())?;
@@ -2440,10 +1365,10 @@ mod tests {
         })
         .unwrap();
 
-        let error = remove_worktree_owned_state(&repo, &config, &path, branch, None).unwrap_err();
+        let error = remove_worktree_owned_state(&repo, &config, &path, branch).unwrap_err();
 
-        assert!(error.contains("archived worktree metadata"));
-        observability::with_writable_db(&repo, |conn| {
+        assert!(error.contains("injected archived worktree delete failure"));
+        with_test_database(&repo, |conn| {
             for table in ["task_metadata", "agent_state", "pr_cache"] {
                 let count = conn
                     .query_row(
@@ -2544,7 +1469,7 @@ exit 0
             .insert("git".to_string(), git.display().to_string());
         crate::test_support::install_tool(&mut config, &temp, "tmux", "#!/bin/sh\nexit 0\n");
         let repo = Repository::with_config_dir_for_test(repo_path, temp.join("config"));
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             for (branch, path) in [
                 ("live", &live_path),
                 ("stale", &stale_path),
@@ -2571,7 +1496,7 @@ exit 0
 
         reconcile_worktree_state(&repo, &config).unwrap();
 
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             let live: i64 = conn
                 .query_row(
                     "select count(*) from task_metadata where branch = 'live'",
@@ -2634,7 +1559,7 @@ exit 0
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
                     branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
@@ -2676,101 +1601,6 @@ exit 0
     }
 
     #[test]
-    fn durable_identity_migrates_branch_owned_state_across_rename() {
-        let temp = unique_temp_dir("prism-durable-identity-branch-rename-test");
-        let worktree = temp.join("worktree");
-        fs::create_dir_all(&worktree).unwrap();
-        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        let id = ensure_worktree_session_identity(&repo, &worktree, "old-name").unwrap();
-        let mut auto = crate::auto_flow::AutoLaunch::new(
-            &repo.root,
-            &worktree,
-            "old-name",
-            "continue after rename",
-        )
-        .unwrap()
-        .with_worktree_session_id(id.clone())
-        .create_run();
-        observability::with_writable_db(&repo, |conn| {
-            crate::auto_flow::submit_auto_run(conn, &mut auto)?;
-            conn.execute(
-                "update workflow_execution set
-                   dispatch_state = 'claimed', worker_id = 'worker', daemon_instance_id = 'daemon',
-                   lease_expires_unix_ms = 9999999999999, fencing_token = 1
-                 where workflow_kind = 'auto' and run_id = ?1",
-                params![auto.run.id],
-            )
-            .map_err(|error| error.to_string())?;
-            conn.execute(
-                "insert into task_metadata (
-                    branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
-                 ) values ('old-name', 'summary', 'prompt', ?1, 0)",
-                params![worktree.display().to_string()],
-            )
-            .map_err(|error| error.to_string())?;
-            conn.execute(
-                "insert into agent_state (branch, state, updated_unix_ms)
-                 values ('old-name', 'running', 0)",
-                [],
-            )
-            .map_err(|error| error.to_string())?;
-            conn.execute(
-                "insert into opencode_runtime (
-                    repo_root, branch, worktree_path, server_port, server_url,
-                    generation, updated_unix_ms, worktree_session_id
-                 ) values (?1, 'old-name', ?2, 41000, 'http://127.0.0.1:41000', 1, 0, ?3)",
-                params![
-                    repo.root.display().to_string(),
-                    worktree.display().to_string(),
-                    id
-                ],
-            )
-            .map_err(|error| error.to_string())?;
-            Ok(())
-        })
-        .unwrap();
-
-        let renamed_id = ensure_worktree_session_identity(&repo, &worktree, "new-name").unwrap();
-
-        assert_eq!(renamed_id, id);
-        assert_eq!(count_rows(&repo, "task_metadata", "old-name"), 0);
-        assert_eq!(count_rows(&repo, "task_metadata", "new-name"), 1);
-        assert_eq!(count_rows(&repo, "agent_state", "new-name"), 1);
-        assert_eq!(count_rows(&repo, "opencode_runtime", "new-name"), 1);
-        observability::with_writable_db(&repo, |conn| {
-            let active_branch: String = conn
-                .query_row(
-                    "select branch from active_worktree_session where worktree_session_id = ?1",
-                    params![id],
-                    |row| row.get(0),
-                )
-                .map_err(|error| error.to_string())?;
-            assert_eq!(active_branch, "new-name");
-            let migrated: (String, String, String) = conn
-                .query_row(
-                    "select r.branch, r.worktree_path, e.dispatch_state
-                     from auto_run r join workflow_execution e
-                       on e.workflow_kind = 'auto' and e.run_id = r.id
-                     where r.id = ?1",
-                    params![auto.run.id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )
-                .map_err(|error| error.to_string())?;
-            assert_eq!(
-                migrated,
-                (
-                    "new-name".to_string(),
-                    worktree.display().to_string(),
-                    "recovery_pending".to_string()
-                )
-            );
-            Ok(())
-        })
-        .unwrap();
-        let _ = fs::remove_dir_all(temp);
-    }
-
-    #[test]
     fn reconcile_removes_stale_non_adopted_agent_and_runtime_state() {
         let temp = unique_temp_dir("prism-reconcile-non-adopted-test");
         let live = temp.join("live");
@@ -2794,7 +1624,7 @@ exit 0
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into agent_state (branch, state, updated_unix_ms)
                  values ('stale', 'running', 0)",
@@ -2851,7 +1681,7 @@ exit 0
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
                     branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
@@ -2882,7 +1712,7 @@ exit 0
         reconcile_worktree_state(&repo, &config).unwrap();
 
         let (metadata_path, old_runtime, new_runtime, agent_state) =
-            observability::with_writable_db(&repo, |conn| {
+            with_test_database(&repo, |conn| {
                 let metadata_path = conn
                     .query_row(
                         "select worktree from task_metadata where branch = 'feature'",
@@ -2949,7 +1779,7 @@ exit 0
             .tools
             .insert("tmux".to_string(), tmux.display().to_string());
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into agent_state (branch, state, updated_unix_ms)
                  values ('feature', 'running', 0)",
@@ -3026,7 +1856,7 @@ exit 0
         config
             .tools
             .insert("wt".to_string(), wt.display().to_string());
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
                     branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
@@ -3132,7 +1962,7 @@ exit 0
         config
             .tools
             .insert("wt".to_string(), wt.display().to_string());
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute(
                 "insert into task_metadata (
                     branch, prompt_summary, initial_prompt, worktree, updated_unix_ms
@@ -3246,7 +2076,7 @@ exit 0
 
         archive_worktree_session(&repo, &session).unwrap();
 
-        let row = observability::with_writable_db(&repo, |conn| {
+        let row = with_test_database(&repo, |conn| {
             conn.query_row(
                 "select repo_root, worktree_path, classification from archived_worktree where branch = ?1",
                 params!["feature"],
@@ -3303,48 +2133,6 @@ exit 0
     }
 
     #[test]
-    fn worktree_harness_migrates_legacy_directory_incarnation() {
-        let temp = unique_temp_dir("prism-worktree-harness-incarnation-migration-test");
-        let worktree = temp.join("worktree");
-        fs::create_dir_all(worktree.join(".git")).unwrap();
-        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        let mut session = test_session("main", &worktree.display().to_string());
-        session.incarnation = worktree_incarnation(&worktree);
-        set_worktree_harness(&repo, &session, "codex", true).unwrap();
-        let inode = session.incarnation.rsplit(':').next().unwrap();
-        let legacy_incarnation = format!("{inode}:123:40:");
-        observability::with_writable_db(&repo, |conn| {
-            conn.execute(
-                "update worktree_harness set worktree_incarnation = ?1 where branch = ?2",
-                params![legacy_incarnation, session.branch.as_str()],
-            )
-            .map_err(|error| error.to_string())?;
-            Ok(())
-        })
-        .unwrap();
-
-        assert_eq!(
-            worktree_harness(&repo, &session).unwrap(),
-            WorktreeHarnessAssociation {
-                harness_id: "codex".to_string(),
-                keep: true,
-            }
-        );
-        let migrated = observability::with_writable_db(&repo, |conn| {
-            conn.query_row(
-                "select worktree_incarnation from worktree_harness where branch = ?1",
-                params![session.branch.as_str()],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|error| error.to_string())
-        })
-        .unwrap();
-        assert_eq!(migrated, session.incarnation);
-
-        let _ = fs::remove_dir_all(temp);
-    }
-
-    #[test]
     fn unarchive_worktree_session_clears_hidden_and_archived_markers() {
         let temp = unique_temp_dir("prism-unarchive-worktree-test");
         let repo_path = temp.join("repo");
@@ -3368,7 +2156,7 @@ exit 0
         let temp = unique_temp_dir("prism-archive-atomic-failure-test");
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
         let session = test_session("feature", "/repo/feature");
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute_batch(
                 "create trigger reject_archive before insert on archived_worktree
                  begin select raise(abort, 'archive rejected'); end;",
@@ -3391,7 +2179,7 @@ exit 0
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
         let session = test_session("feature", "/repo/feature");
         archive_worktree_session(&repo, &session).unwrap();
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute_batch(
                 "create trigger reject_unarchive before delete on archived_worktree
                  begin select raise(abort, 'unarchive rejected'); end;",
@@ -3405,34 +2193,6 @@ exit 0
         assert!(error.contains("unarchive rejected"));
         assert!(hidden_session_exists(&repo, "feature").unwrap());
         assert_eq!(list_archived_worktrees(&repo).unwrap().len(), 1);
-        let _ = fs::remove_dir_all(temp);
-    }
-
-    #[test]
-    fn hidden_session_exists_missing_db_is_false_without_creating_db() {
-        let temp = unique_temp_dir("prism-hidden-session-missing-db-test");
-        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        let db = observability::db_path(&repo);
-
-        assert!(!hidden_session_exists(&repo, "feature").unwrap());
-        assert!(!db.exists());
-
-        let _ = fs::remove_dir_all(temp);
-    }
-
-    #[test]
-    fn hidden_session_exists_missing_table_is_false() {
-        let temp = unique_temp_dir("prism-hidden-session-missing-table-test");
-        let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        let db = observability::db_path(&repo);
-        fs::create_dir_all(db.parent().unwrap()).unwrap();
-        rusqlite::Connection::open(&db)
-            .unwrap()
-            .execute_batch("create table unrelated (id integer primary key)")
-            .unwrap();
-
-        assert!(!hidden_session_exists(&repo, "feature").unwrap());
-
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -3535,13 +2295,6 @@ exit 0
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
         let repository = WorktreeRepositoryKey::new(repo.root.clone());
         let mut previous = test_session("(detached)", &worktree.display().to_string());
-        previous.worktree_session_id = resolve_worktree_session_identity(
-            &repo,
-            &worktree,
-            "(detached)",
-            &worktree_incarnation(&worktree),
-        )
-        .unwrap();
         previous.agent_state = AgentState::Running;
         let mut sessions = vec![previous];
         let repositories = [WorktreeSessionRepository {
@@ -3568,7 +2321,7 @@ exit 0
     }
 
     #[test]
-    fn refresh_rejects_one_worktree_marker_claimed_by_different_repositories() {
+    fn refresh_uses_repository_root_when_different_repositories_report_same_session_identity() {
         let temp = unique_temp_dir("prism-session-repository-identity-test");
         let shared_path = temp.join("shared-worktree");
         fs::create_dir_all(&shared_path).unwrap();
@@ -3616,14 +2369,17 @@ exit 0
             },
         ];
 
-        let error = refresh_worktree_sessions(
+        refresh_worktree_sessions(
             &repositories,
             &BTreeMap::from([(0, identity_a.clone()), (1, identity_b.clone())]),
             &mut sessions,
         )
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.contains("belongs to another repository"), "{error}");
+        assert_eq!(sessions[0].repo_label, "b");
+        assert_eq!(sessions[0].agent_state, AgentState::NeedsInput);
+        assert_eq!(sessions[1].repo_label, "a");
+        assert_eq!(sessions[1].agent_state, AgentState::Running);
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -3694,7 +2450,7 @@ exit 0
             .tools
             .insert("git".to_string(), git.display().to_string());
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute_batch(
                 "drop table task_metadata; create table task_metadata (branch text primary key);",
             )
@@ -3730,7 +2486,7 @@ exit 0
     fn archived_worktree_read_failure_is_not_reported_as_an_empty_archive() {
         let temp = unique_temp_dir("prism-archive-read-failure-test");
         let repo = Repository::with_config_dir_for_test(temp.join("repo"), temp.join("config"));
-        observability::with_writable_db(&repo, |conn| {
+        with_test_database(&repo, |conn| {
             conn.execute_batch(
                 "drop table archived_worktree; create table archived_worktree (branch text primary key);",
             )
@@ -3787,7 +2543,8 @@ exit 0
         write_executable(
             &wt,
             &format!(
-                "#!/bin/sh\nmkdir -p '{}'\nprintf '%s' '{{\"action\":\"created\",\"branch\":\"feature\",\"path\":\"/repo/worktree\",\"created_branch\":true}}'\n",
+                "#!/bin/sh\nrm -f '{}'\nmkdir -p '{}'\nprintf '%s' '{{\"action\":\"created\",\"branch\":\"feature\",\"path\":\"/repo/worktree\",\"created_branch\":true}}'\n",
+                db.display(),
                 db.display()
             ),
         );
@@ -3869,7 +2626,6 @@ exit 0
             repo_label: "repo".to_string(),
             repo_key: None,
             path: PathBuf::from(path),
-            worktree_session_id: format!("test-{branch}"),
             incarnation: String::new(),
             path_display: path.to_string(),
             branch: branch.to_string(),
@@ -3900,20 +2656,22 @@ exit 0
     }
 
     fn count_rows(repo: &Repository, table: &str, branch: &str) -> i64 {
-        observability::with_writable_db(repo, |conn| count_rows_with_conn(conn, table, branch))
-            .unwrap()
+        with_test_database(repo, |conn| count_rows_with_conn(conn, table, branch)).unwrap()
     }
 
-    fn count_rows_with_conn(
-        conn: &rusqlite::Connection,
-        table: &str,
-        branch: &str,
-    ) -> Result<i64, String> {
+    fn count_rows_with_conn(conn: &TestDatabase, table: &str, branch: &str) -> Result<i64, String> {
         conn.query_row(
             &format!("select count(*) from {table} where branch = ?1"),
             params![branch],
             |row| row.get::<_, i64>(0),
         )
         .map_err(|error| error.to_string())
+    }
+
+    fn with_test_database<T>(
+        repo: &Repository,
+        run: impl FnOnce(&TestDatabase) -> Result<T, String>,
+    ) -> Result<T, String> {
+        observability::with_writable_db(repo, |path| run(&TestDatabase::open(path)?))
     }
 }

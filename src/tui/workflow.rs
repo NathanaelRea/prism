@@ -3,13 +3,12 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::auto_flow::{
-    AutoOutputLine, AutoRunStatus, PersistedAutoRun, load_auto_run_snapshot,
-    load_output_lines as load_auto_output_lines, load_recent_active_run_snapshots_for_repo,
-    load_terminal_repair_run_snapshots_for_repo,
+    AutoFlowStore, AutoOutputLine, AutoRunStatus, PersistedAutoRun, load_auto_run_snapshot,
+    load_output_lines as load_auto_output_lines,
 };
 use crate::plan_run::{
-    PersistedPlanRun, PlanOutputLine, PlanRunStatus, PlanStepStatus, load_output_lines,
-    load_plan_run, load_recent_plan_runs_for_repo,
+    PersistedPlanRun, PlanOutputLine, PlanRunStatus, PlanRunStore, PlanStepStatus,
+    load_output_lines, load_plan_run,
 };
 use crate::repo::Repository;
 use crate::session::WorktreeRepositoryKey;
@@ -92,7 +91,6 @@ pub(super) fn auto_status(status: WorkflowLifecycle) -> Option<AutoRunStatus> {
         WorkflowLifecycle::Failed => Some(AutoRunStatus::Failed),
         WorkflowLifecycle::Done => Some(AutoRunStatus::Done),
         WorkflowLifecycle::Aborted => Some(AutoRunStatus::Aborted),
-        WorkflowLifecycle::Draft => None,
     }
 }
 
@@ -109,7 +107,6 @@ fn auto_run_priority(status: AutoRunStatus) -> u8 {
 
 pub(super) fn plan_status(status: WorkflowLifecycle) -> Option<PlanRunStatus> {
     match status {
-        WorkflowLifecycle::Draft => Some(PlanRunStatus::Draft),
         WorkflowLifecycle::Queued => Some(PlanRunStatus::Queued),
         WorkflowLifecycle::Running => Some(PlanRunStatus::Running),
         WorkflowLifecycle::Paused => Some(PlanRunStatus::Paused),
@@ -134,44 +131,6 @@ impl Tui {
                 .insert(result.repository.clone(), snapshot.repository);
             changed |= self.worker_health.as_ref() != Some(&snapshot.worker_health);
             self.worker_health = Some(snapshot.worker_health.clone());
-            if let Ok(runs) = snapshot.generalized_runs {
-                changed |= self.generalized_runs.get(&result.repository) != Some(&runs);
-                self.generalized_runs
-                    .insert(result.repository.clone(), runs);
-            }
-            if let Ok(detail) = snapshot.generalized_detail {
-                match detail {
-                    Some(detail) => {
-                        changed |= self.generalized_run_detail.get(&result.repository)
-                            != Some(detail.as_ref());
-                        self.generalized_run_detail
-                            .insert(result.repository.clone(), *detail);
-                    }
-                    None => {
-                        changed |= self
-                            .generalized_run_detail
-                            .remove(&result.repository)
-                            .is_some();
-                    }
-                }
-            }
-            if let Ok(runs) = snapshot.plan_runs {
-                for run in runs {
-                    changed |= self.remember_plan_run_snapshot(run);
-                }
-            }
-            if let Ok(runs) = snapshot.auto_runs {
-                for run in runs {
-                    changed |= self.remember_auto_run_snapshot(run);
-                }
-            }
-            if let Ok(runs) = snapshot.linked_plan_runs {
-                for run in runs {
-                    let run_id = run.run.id.clone();
-                    changed |= self.linked_plan_runs.get(&run_id) != Some(&run);
-                    self.linked_plan_runs.insert(run_id, run);
-                }
-            }
         }
         let repositories = self
             .repos
@@ -180,10 +139,6 @@ impl Tui {
             .collect::<BTreeSet<_>>();
         let previous = self.workspace_repositories.len();
         self.workspace_repositories
-            .retain(|repository, _| repositories.contains(repository));
-        self.generalized_runs
-            .retain(|repository, _| repositories.contains(repository));
-        self.generalized_run_detail
             .retain(|repository, _| repositories.contains(repository));
         changed |= previous != self.workspace_repositories.len();
         self.start_workflow_polls(false);
@@ -240,80 +195,10 @@ impl Tui {
                     .into_iter()
                     .next()
                     .ok_or_else(|| "workspace inspection returned no repository".to_string())?;
-                    // Global Workflow summaries are paged first. Only the
-                    // selected (most recent) Run detail, including bounded
-                    // output, is loaded afterward in this supervised job.
-                    let generalized = crate::run::RunLedger::user().and_then(|ledger| {
-                        let runs = ledger.list_for_repository(&repo.root, 32)?;
-                        let detail = runs
-                            .first()
-                            .map(|run| ledger.inspect(&run.id).map(Box::new))
-                            .transpose()?;
-                        let cutover = ledger.cutover_complete()?;
-                        Ok((runs, detail, cutover))
+                    let snapshot = Ok(WorkflowPollSnapshot {
+                        repository: repository_snapshot,
+                        worker_health,
                     });
-                    let cutover = generalized.as_ref().is_ok_and(|(_, _, cutover)| *cutover);
-                    let snapshot = crate::observability::with_nonblocking_read_db_named(
-                        &repo,
-                        "tui.workflow.refresh",
-                        |conn| {
-                            let plan_runs = if cutover {
-                                Ok(Vec::new())
-                            } else {
-                                load_recent_plan_runs_for_repo(conn, &repo.root, 8)
-                            };
-                            let auto_runs = if cutover {
-                                Ok(Vec::new())
-                            } else {
-                                (|| {
-                                    let mut runs = load_recent_active_run_snapshots_for_repo(
-                                        conn, &repo.root, 8,
-                                    )?;
-                                    let active_ids = runs
-                                        .iter()
-                                        .map(|run| run.run.id.clone())
-                                        .collect::<BTreeSet<_>>();
-                                    runs.extend(
-                                        load_terminal_repair_run_snapshots_for_repo(
-                                            conn, &repo.root,
-                                        )?
-                                        .into_iter()
-                                        .filter(|run| !active_ids.contains(&run.run.id)),
-                                    );
-                                    Ok(runs)
-                                })()
-                            };
-                            let linked_plan_runs = match &auto_runs {
-                                Ok(runs) => {
-                                    let plan_ids = runs
-                                        .iter()
-                                        .flat_map(|run| &run.steps)
-                                        .filter_map(|step| step.plan_run_id.as_ref())
-                                        .collect::<BTreeSet<_>>();
-                                    plan_ids
-                                        .into_iter()
-                                        .filter_map(|run_id| {
-                                            load_plan_run(conn, run_id).transpose()
-                                        })
-                                        .collect::<Result<Vec<_>, _>>()
-                                }
-                                Err(_) => Ok(Vec::new()),
-                            };
-                            let (generalized_runs, generalized_detail) = match generalized {
-                                Ok((runs, detail, _)) => (Ok(runs), Ok(detail)),
-                                Err(error) => (Err(error.clone()), Err(error)),
-                            };
-                            Ok(WorkflowPollSnapshot {
-                                repository: repository_snapshot,
-                                generalized_runs,
-                                generalized_detail,
-                                plan_runs,
-                                auto_runs,
-                                linked_plan_runs,
-                                worker_health,
-                            })
-                        },
-                    );
                     Ok(Some(TuiJobPayload::WorkflowPoll(WorkflowPollResult {
                         repository: job_repository,
                         revision,
@@ -331,7 +216,7 @@ impl Tui {
         if let Ok(Some(run)) = crate::observability::with_nonblocking_read_db_named(
             &repo,
             "tui.plan_run.snapshot",
-            |conn| load_plan_run(conn, run_id),
+            |path| load_plan_run(&PlanRunStore::open(path), run_id),
         ) {
             self.remember_plan_run(run);
         }
@@ -352,11 +237,6 @@ impl Tui {
     pub(super) fn remember_plan_run_snapshot(&mut self, run: PersistedPlanRun) -> bool {
         let run_id = run.run.id.clone();
         let scope_path = run.run.scope_path.clone();
-        let belongs_to_live_session = run.run.worktree_session_id.as_deref().is_some_and(|id| {
-            self.sessions
-                .iter()
-                .any(|session| session.path == scope_path && session.worktree_session_id == id)
-        });
         let selected_step = self.resolved_plan_step_selection(&run);
         self.selected_plan_step_by_run
             .insert(run_id.clone(), selected_step);
@@ -364,7 +244,7 @@ impl Tui {
             .active_plan_runs
             .get(&scope_path)
             .is_some_and(|selected| selected == &run_id || self.plan_runs.contains_key(selected));
-        if belongs_to_live_session && !selected_run_is_known {
+        if !selected_run_is_known {
             self.active_plan_runs.insert(scope_path, run_id.clone());
         }
         let changed = self.plan_runs.get(&run_id) != Some(&run);
@@ -503,7 +383,7 @@ impl Tui {
         if let Ok(Some(run)) = crate::observability::with_nonblocking_read_db_named(
             &repo,
             "tui.auto_run.snapshot",
-            |conn| load_auto_run_snapshot(conn, run_id),
+            |path| load_auto_run_snapshot(&AutoFlowStore::open(path), run_id),
         ) {
             self.remember_auto_run(run);
         }
@@ -532,11 +412,7 @@ impl Tui {
         let is_active = matches!(
             run.run.status,
             AutoRunStatus::Queued | AutoRunStatus::Running | AutoRunStatus::Paused
-        ) && run.run.worktree_session_id.as_deref().is_some_and(|id| {
-            self.sessions.iter().any(|session| {
-                session.path == run.run.worktree_path && session.worktree_session_id == id
-            })
-        });
+        );
         if is_active {
             let replace_active = self
                 .active_auto_runs
@@ -621,13 +497,13 @@ impl Tui {
                     let lines = crate::observability::with_nonblocking_read_db_named(
                         &repo,
                         "tui.dashboard_output.refresh",
-                        |conn| match &job_key {
+                        |path| match &job_key {
                             DashboardOutputKey::Plan { run_id, step, .. } => {
-                                load_output_lines(conn, run_id, *step)
+                                load_output_lines(&PlanRunStore::open(path), run_id, *step)
                                     .map(DashboardOutputLines::Plan)
                             }
                             DashboardOutputKey::Auto { step_run_id, .. } => {
-                                load_auto_output_lines(conn, *step_run_id)
+                                load_auto_output_lines(&AutoFlowStore::open(path), *step_run_id)
                                     .map(DashboardOutputLines::Auto)
                             }
                         },
@@ -753,28 +629,7 @@ impl Tui {
         })
     }
 
-    pub(super) fn permanent_delete_targets_worktree(&self) -> bool {
-        self.focused_panel == PanelFocus::Worktrees
-    }
-
-    pub(super) fn dismiss_selected_workflow(&mut self) -> Result<bool, String> {
-        if self.dismiss_selected_auto_run()? {
-            Ok(true)
-        } else {
-            self.dismiss_selected_plan_run()
-        }
-    }
-
     pub(super) fn auto_run_id_for_worktree(&self, worktree_path: &Path) -> Option<&String> {
-        if self.focused_panel == PanelFocus::Status
-            && let Some(run_id) = self.selected_auto_run.as_ref()
-            && self
-                .auto_runs
-                .get(run_id)
-                .is_some_and(|run| run.run.worktree_path == worktree_path)
-        {
-            return Some(run_id);
-        }
         if let Some(run_id) = self.active_auto_runs.get(worktree_path) {
             return Some(run_id);
         }
@@ -914,6 +769,10 @@ impl Tui {
     pub(super) fn selected_status_auto_run_id(&self) -> Option<&str> {
         if let Some(run_id) = self.selected_auto_run.as_deref()
             && self.auto_runs.contains_key(run_id)
+            && self
+                .active_auto_runs
+                .values()
+                .any(|active| active == run_id)
         {
             return Some(run_id);
         }
@@ -1028,7 +887,7 @@ impl Tui {
             .find(|workflow| workflow.identity.kind == kind && workflow.identity.run_id == run_id)
     }
 
-    pub(super) fn worktree_workflow_snapshot(
+    pub(crate) fn worktree_workflow_snapshot(
         &self,
         repository: &Path,
         path: &Path,

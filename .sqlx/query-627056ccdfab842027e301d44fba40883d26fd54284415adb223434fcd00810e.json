@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into workflow_execution (\n  workflow_kind, run_id, dispatch_state, fencing_token,\n  interruption_generation, created_unix_ms, updated_unix_ms\n) values ('plan', 'plan-history-87654321', 'terminal', 0, 0, 1, 5)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "627056ccdfab842027e301d44fba40883d26fd54284415adb223434fcd00810e"
+}

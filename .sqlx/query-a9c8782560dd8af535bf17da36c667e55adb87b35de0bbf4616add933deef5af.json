@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into notification_session (\n  worktree_path, branch, incarnation, state, transition_sequence, observed_unix_ms\n) values (?, ?, ?, ?, 0, ?)\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "a9c8782560dd8af535bf17da36c667e55adb87b35de0bbf4616add933deef5af"
+}

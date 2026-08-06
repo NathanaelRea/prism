@@ -5,7 +5,7 @@ use crate::repo::Repository;
 
 use super::stabilization_model::{PendingPushGuard, StabilizationWorkItem, WorkGuard};
 use super::{
-    AutoEvent, AutoStepKey, AutoStepStatus, PersistedAutoRun, append_auto_event,
+    AutoEvent, AutoFlowStore, AutoStepKey, AutoStepStatus, PersistedAutoRun, append_auto_event,
     save_run_with_conn, stabilization_observe, stabilization_plan, unix_ms,
 };
 
@@ -41,6 +41,12 @@ pub(crate) struct StandaloneRepair {
     kind: super::stabilization_model::RepairKind,
     prompt: String,
     guard: WorkGuard,
+}
+
+impl StandaloneRepair {
+    pub(crate) fn prompt(&self) -> &str {
+        &self.prompt
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,20 +268,6 @@ pub(crate) fn execute_merge_authorization(
     path: &std::path::Path,
     authorization: MergeAuthorization,
 ) -> Result<ManualMergeExecution, String> {
-    execute_merge_authorization_with_mode(
-        config,
-        path,
-        authorization,
-        crate::remote::MergeSubmissionMode::Immediate,
-    )
-}
-
-pub(crate) fn execute_merge_authorization_with_mode(
-    config: &Config,
-    path: &std::path::Path,
-    authorization: MergeAuthorization,
-    submission_mode: crate::remote::MergeSubmissionMode,
-) -> Result<ManualMergeExecution, String> {
     match authorization {
         MergeAuthorization::Authorized(AuthorizedMerge {
             display_number,
@@ -293,7 +285,6 @@ pub(crate) fn execute_merge_authorization_with_mode(
                 identity,
                 display_number,
                 expected_head_sha,
-                submission_mode,
             )?;
             match result.outcome {
                 crate::remote::MergeMutationOutcome::Merged => Ok(ManualMergeExecution::Merged {
@@ -505,43 +496,17 @@ pub(crate) fn next_repair_continuation(persisted: &PersistedAutoRun) -> Option<R
 }
 
 pub(crate) fn observe_and_plan(
-    conn: &rusqlite::Connection,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
-) -> Result<StabilizationWorkItem, String> {
-    let merge_intent_armed = crate::integration::ensure_default_merge_intent(
-        conn,
-        &persisted.run.id,
-        config.auto.merge,
-    )?;
-    let mut effective_config = config.clone();
-    effective_config.auto.merge = merge_intent_armed;
-    let snapshot = stabilization_observe::build_auto_run_stabilization_snapshot(
-        repo,
-        &persisted.run,
-        &effective_config,
-    );
-    if merge_intent_armed
-        && let Some(pull_request) = snapshot.pull_request.as_ref()
-        && let Some(identity) = pull_request.change_request_identity.clone()
-    {
-        crate::integration::synchronize_generation(
-            conn,
-            &persisted.run.id,
-            &crate::integration::CandidateGeneration {
-                change_request_identity: identity,
-                target_branch: pull_request.base_ref.clone(),
-                pr_number: pull_request.number,
-                head_sha: pull_request.head_sha.clone(),
-            },
-        )?;
-    }
+) -> StabilizationWorkItem {
+    let snapshot =
+        stabilization_observe::build_auto_run_stabilization_snapshot(repo, &persisted.run, config);
     let work = stabilization_plan::plan(&snapshot);
     apply_state(persisted, &work.state());
     persisted.run.status = persisted.authoritative_status();
     persisted.run.updated_unix_ms = unix_ms();
-    Ok(work)
+    work
 }
 
 fn apply_state(
@@ -666,7 +631,7 @@ pub(crate) fn decide_work_guard(
 }
 
 pub(crate) fn queue_standalone_repair(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     repair: StandaloneRepair,
 ) -> Result<StandaloneRepairQueue, String> {
@@ -690,12 +655,7 @@ pub(crate) fn queue_standalone_repair(
         super::stabilization_model::RepairKind::Merge => unreachable!(),
     };
     let result = (|| {
-        let transaction =
-            crate::flight_recorder::TransactionTrace::begin("auto_run.queue_standalone_repair");
-        let tx =
-            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-                .map_err(|error| format!("begin standalone repair transaction: {error}"))?;
-        if let Some(latest) = super::load_auto_run(&tx, &persisted.run.id)? {
+        if let Some(latest) = super::load_auto_run(conn, &persisted.run.id)? {
             *persisted = latest;
         }
         let queue = if let Some(step_id) = persisted.steps.iter().find_map(|step| {
@@ -711,7 +671,7 @@ pub(crate) fn queue_standalone_repair(
             .flatten()
         }) {
             persisted.run.selected_step_run_id = Some(step_id);
-            super::save_run_with_conn(&tx, &persisted.run)?;
+            super::save_auto_run(conn, persisted)?;
             StandaloneRepairQueue::AlreadyPending(step_id)
         } else {
             apply_state(
@@ -726,7 +686,7 @@ pub(crate) fn queue_standalone_repair(
             );
             persisted.run.pause_requested = false;
             let step_id = super::append_step_run_with_work_guard_in_transaction(
-                &tx,
+                conn,
                 persisted,
                 step_key,
                 Some(repair.prompt),
@@ -735,9 +695,7 @@ pub(crate) fn queue_standalone_repair(
             )?;
             StandaloneRepairQueue::Queued(step_id)
         };
-        tx.commit()
-            .map_err(|error| format!("commit standalone repair transaction: {error}"))?;
-        transaction.committed();
+        super::save_auto_run(conn, persisted)?;
         Ok(queue)
     })();
     if result.is_err() {
@@ -747,7 +705,7 @@ pub(crate) fn queue_standalone_repair(
 }
 
 pub(crate) fn append_repair_continuation(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
 ) -> Result<bool, String> {
     let Some(continuation) = next_repair_continuation(persisted) else {
@@ -765,7 +723,7 @@ pub(crate) fn append_repair_continuation(
 }
 
 pub(crate) fn append_planned_work(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     work: StabilizationWorkItem,
 ) -> Result<bool, String> {
@@ -774,47 +732,11 @@ pub(crate) fn append_planned_work(
         &persisted.run.id,
         work.guard.change_request_identity.as_ref(),
     )?;
-    if work.kind == super::stabilization_model::StabilizationWorkKind::Escalate {
-        super::fail_auto_run(conn, persisted, work.reason)?;
-        return Ok(false);
-    }
-    if matches!(
-        work.kind,
-        super::stabilization_model::StabilizationWorkKind::Merge
-            | super::stabilization_model::StabilizationWorkKind::UpdateBranch
-    ) && crate::integration::active_merge_intent(conn, &persisted.run.id)?.is_some()
-    {
-        let expected_head_sha = work
-            .guard
-            .pr_head_sha
-            .as_deref()
-            .ok_or_else(|| "ready integration work has no pull request head".to_string())?;
-        if crate::integration::publish_ready(conn, &persisted.run.id, expected_head_sha)?
-            == crate::integration::IntegrationPlacement::Backlogged
-        {
-            apply_state(
-                persisted,
-                &super::stabilization_model::StabilizationState {
-                    status: super::stabilization_model::StabilizationStatus::Waiting,
-                    blocker:
-                        super::stabilization_model::StabilizationBlocker::IntegrationBacklogged,
-                    next_work:
-                        super::stabilization_model::StabilizationWorkKind::WaitForIntegration,
-                    reason: "pull request is ready and waiting for the repository integration lane"
-                        .to_string(),
-                },
-            );
-            persisted.run.status = persisted.authoritative_status();
-            persisted.run.updated_unix_ms = unix_ms();
-            save_run_with_conn(conn, &persisted.run)?;
-            return Ok(false);
-        }
-    }
     let Some(step_key) = step_for_work(&work.kind) else {
         save_run_with_conn(conn, &persisted.run)?;
         return Ok(false);
     };
-    if has_active_or_completed_step_after_latest_pr(persisted, &step_key, &work.guard) {
+    if has_active_or_completed_step_after_latest_pr(persisted, &step_key) {
         save_run_with_conn(conn, &persisted.run)?;
         return Ok(false);
     }
@@ -854,7 +776,7 @@ pub(crate) fn ci_wait_decision(work: &StabilizationWorkItem) -> WaitDecision {
 }
 
 pub(crate) fn advance_review_wait(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
     work: StabilizationWorkItem,
@@ -892,7 +814,7 @@ pub(crate) fn advance_review_wait(
 }
 
 pub(crate) fn advance_ci_wait(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
     work: StabilizationWorkItem,
@@ -931,7 +853,7 @@ pub(crate) fn advance_ci_wait(
 
 #[allow(clippy::too_many_arguments)]
 fn queue_wait_repair(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     step_index: usize,
     step_key: AutoStepKey,
@@ -946,29 +868,19 @@ fn queue_wait_repair(
     }
     let original = persisted.clone();
     let result = (|| {
-        let transaction =
-            crate::flight_recorder::TransactionTrace::begin("auto_run.queue_wait_repair");
-        let tx =
-            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-                .map_err(|error| format!("begin wait repair transaction: {error}"))?;
-        super::finish_non_agent_step(
-            &tx,
-            &mut persisted.steps[step_index],
-            AutoStepStatus::Done,
-            Some(summary),
-            None,
-        )?;
+        let waiting_step = &mut persisted.steps[step_index];
+        waiting_step.status = AutoStepStatus::Done;
+        waiting_step.finished_unix_ms = Some(super::unix_ms());
+        waiting_step.summary = Some(summary);
+        waiting_step.error = None;
         super::append_step_run_with_work_guard_in_transaction(
-            &tx,
+            conn,
             persisted,
             step_key,
             Some(prompt),
             guard,
             None,
         )?;
-        tx.commit()
-            .map_err(|error| format!("commit wait repair transaction: {error}"))?;
-        transaction.committed();
         Ok(WaitProgress::RepairQueued)
     })();
     if result.is_err() {
@@ -991,14 +903,12 @@ fn step_for_work(kind: &super::stabilization_model::StabilizationWorkKind) -> Op
         StabilizationWorkKind::FixCi => Some(AutoStepKey::FixCi),
         StabilizationWorkKind::VerifyCiFix => Some(AutoStepKey::VerifyCiFix),
         StabilizationWorkKind::CommitCiFix => Some(AutoStepKey::CommitCiFix),
-        StabilizationWorkKind::UpdateBranch => Some(AutoStepKey::UpdateBranch),
         StabilizationWorkKind::WaitForCi => Some(AutoStepKey::WaitCi),
         StabilizationWorkKind::WaitForReview => Some(AutoStepKey::WaitReview),
         StabilizationWorkKind::MarkReadyForManualMerge | StabilizationWorkKind::Merge => {
             Some(AutoStepKey::Merge)
         }
         StabilizationWorkKind::PushPendingRepair
-        | StabilizationWorkKind::WaitForIntegration
         | StabilizationWorkKind::Done
         | StabilizationWorkKind::Escalate => None,
     }
@@ -1007,7 +917,6 @@ fn step_for_work(kind: &super::stabilization_model::StabilizationWorkKind) -> Op
 fn has_active_or_completed_step_after_latest_pr(
     persisted: &PersistedAutoRun,
     key: &AutoStepKey,
-    expected_guard: &WorkGuard,
 ) -> bool {
     let pr_sequence = persisted
         .steps
@@ -1019,30 +928,25 @@ fn has_active_or_completed_step_after_latest_pr(
     persisted.steps.iter().any(|step| {
         step.sequence > pr_sequence
             && step.step_key.as_str() == key.as_str()
-            && step.work_guard.as_ref().is_some_and(|guard| {
-                guard.change_request_identity == expected_guard.change_request_identity
-                    && guard.authorized_target_branch == expected_guard.authorized_target_branch
-                    && guard.pr_head_sha == expected_guard.pr_head_sha
-            })
-            && (matches!(
+            && matches!(
                 step.status,
                 AutoStepStatus::Queued
                     | AutoStepStatus::Starting
                     | AutoStepStatus::Running
                     | AutoStepStatus::Waiting
                     | AutoStepStatus::Done
-            ) && !(key == &AutoStepKey::UpdateBranch && step.status == AutoStepStatus::Done)
-                || (step.status == AutoStepStatus::Skipped && key != &AutoStepKey::Merge))
+                    | AutoStepStatus::Skipped
+            )
     })
 }
 
 pub(crate) fn observe_plan_and_save(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
 ) -> Result<StabilizationWorkItem, String> {
-    let work = observe_and_plan(conn, repo, config, persisted)?;
+    let work = observe_and_plan(repo, config, persisted);
     save_run_with_conn(conn, &persisted.run)?;
     super::save_observed_change_request_identity(
         conn,
@@ -1053,7 +957,7 @@ pub(crate) fn observe_plan_and_save(
 }
 
 pub(crate) fn observe_cached_plan_and_save(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     session: &crate::session::Session,
@@ -1096,7 +1000,7 @@ pub(crate) fn repair_commit_message(
 }
 
 pub(crate) fn validate_and_begin_repair_commit(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -1113,13 +1017,9 @@ pub(crate) fn validate_and_begin_repair_commit(
                 repair_label(&kind)
             )
         })?;
-    if let WorkGuardDecision::Invalidated { reason } = decide_repair_commit_guard(
-        config,
-        &persisted.run.worktree_path,
-        &kind,
-        &original_guard,
-        &observation.guard,
-    )? {
+    if let WorkGuardDecision::Invalidated { reason } =
+        decide_work_guard(&kind, &original_guard, &observation.guard)
+    {
         let summary = format!("repair guard invalidated before commit: {reason}");
         super::finish_non_agent_step(
             conn,
@@ -1165,66 +1065,9 @@ pub(crate) fn validate_and_begin_repair_commit(
     Ok(RepairCommitGate::Ready)
 }
 
-fn decide_repair_commit_guard(
-    config: &Config,
-    path: &std::path::Path,
-    kind: &super::stabilization_model::RepairKind,
-    original: &WorkGuard,
-    current: &WorkGuard,
-) -> Result<WorkGuardDecision, String> {
-    if original.local_head_sha == current.local_head_sha {
-        return Ok(decide_work_guard(kind, original, current));
-    }
-
-    let mut expected = original.clone();
-    expected.local_head_sha = current.local_head_sha.clone();
-    if let invalid @ WorkGuardDecision::Invalidated { .. } =
-        decide_work_guard(kind, &expected, current)
-    {
-        return Ok(invalid);
-    }
-
-    let Some(original_head) = original.local_head_sha.as_deref() else {
-        return Ok(WorkGuardDecision::Invalidated {
-            reason: "local HEAD changed from an unknown repair baseline".to_string(),
-        });
-    };
-    let Some(current_head) = current.local_head_sha.as_deref() else {
-        return Ok(WorkGuardDecision::Invalidated {
-            reason: "local HEAD disappeared while the repair was in progress".to_string(),
-        });
-    };
-    if !crate::git::is_ancestor(path, config, original_head, current_head)? {
-        return Ok(WorkGuardDecision::Invalidated {
-            reason: "local HEAD was rewritten while the repair was in progress".to_string(),
-        });
-    }
-
-    Ok(WorkGuardDecision::Valid)
-}
-
-pub(crate) fn commit_repair_changes(
-    path: &std::path::Path,
-    config: &Config,
-    guarded_head: Option<&str>,
-    message: &str,
-) -> Result<crate::git::GitCommitResult, String> {
-    let current_head = crate::git::current_head_sha(path, config)?;
-    if guarded_head.is_some_and(|head| head != current_head)
-        && !crate::git::selected_dirty(path, config)?
-    {
-        return Ok(crate::git::GitCommitResult {
-            committed: true,
-            commit_sha: Some(current_head),
-            message: "agent committed changes".to_string(),
-        });
-    }
-    crate::git::commit_if_dirty(path, config, message)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn complete_repair_commit(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -1291,11 +1134,7 @@ pub(crate) fn complete_repair_commit(
     guard.commit_sha = commit_sha.clone();
     guard.expected_local_head_sha = local_head_sha.clone().unwrap_or_else(|| commit_sha.clone());
     save_run_with_conn(conn, &persisted.run)?;
-    let push_repair = config.auto.push_repairs
-        || crate::integration::active_merge_intent(conn, &persisted.run.id)?.is_some_and(
-            |intent| intent.placement == crate::integration::IntegrationPlacement::Reserved,
-        );
-    if push_repair {
+    if config.auto.push_repairs {
         progress_pending_push(conn, repo, config, persisted, cache, || Ok(()))?;
     }
 
@@ -1307,7 +1146,7 @@ pub(crate) fn complete_repair_commit(
         super::stabilization_model::RepairKind::Ci => "CI",
         super::stabilization_model::RepairKind::Merge => "merge",
     };
-    let summary = if push_repair {
+    let summary = if config.auto.push_repairs {
         format!("committed {label} fixes as {commit_sha} and pushed")
     } else {
         format!("committed {label} fixes as {commit_sha}; pending guarded push")
@@ -1422,7 +1261,7 @@ pub(crate) fn decide_guarded_push(
 }
 
 pub(crate) fn progress_pending_push(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -1460,7 +1299,7 @@ pub(crate) fn progress_pending_push(
             )?;
             crate::lifecycle::run_pre_push_checks(config, &persisted.run.worktree_path)?;
             before_push()?;
-            crate::execution::validate_installed_claim(conn)?;
+            conn.validate_claim()?;
             match observe_guarded_push_decision(conn, repo, config, persisted, cache, &guard)? {
                 GuardedPushDecision::Invalidated { reason } => {
                     invalidate_pending_push(conn, repo, config, persisted, &reason)?;
@@ -1521,18 +1360,6 @@ pub(crate) fn progress_pending_push(
                 .to_string(),
         );
     }
-    if let Some(identity) = summary.change_request_identity.clone() {
-        crate::integration::synchronize_managed_generation(
-            conn,
-            &persisted.run.id,
-            &crate::integration::CandidateGeneration {
-                change_request_identity: identity,
-                target_branch: summary.base_ref.clone(),
-                pr_number: summary.number,
-                head_sha: summary.head_sha.clone(),
-            },
-        )?;
-    }
 
     while let Some(thread_id) = persisted
         .run
@@ -1580,7 +1407,7 @@ pub(crate) fn progress_pending_push(
                 .any(|comment| comment.thread_id == thread_id && !comment.resolved)
         });
         if unresolved {
-            crate::execution::validate_installed_claim(conn)?;
+            conn.validate_claim()?;
             crate::remote::dispatcher::resolve_review_thread(
                 &persisted.run.worktree_path,
                 config,
@@ -1623,7 +1450,7 @@ fn guarded_replan_is_terminal(work: &StabilizationWorkItem) -> bool {
 }
 
 fn observe_guarded_push_decision(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &PersistedAutoRun,
@@ -1693,7 +1520,7 @@ fn refresh_after_guarded_effect(
 }
 
 fn invalidate_pending_push(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -1722,8 +1549,9 @@ fn short_sha(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auto_flow::tests::TestDatabase;
     use crate::auto_flow::{
-        AutoLaunch, AutoRunStatus, AutoStepRun,
+        AutoLaunch, AutoStepRun,
         stabilization_model::{
             ActionableReviewItem, CiFacts, MergeabilityFacts, PolicyBlocker, PolicyFacts,
             PullRequestFacts, PullRequestState, RepairKind, RepositoryFacts, ReviewFacts,
@@ -1736,48 +1564,6 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[test]
-    fn completed_wait_from_old_head_does_not_suppress_new_generation() {
-        let mut persisted = AutoLaunch::new(
-            Path::new("/repo"),
-            Path::new("/repo/feature"),
-            "feature",
-            "stabilize",
-        )
-        .unwrap()
-        .create_run();
-        persisted.steps.clear();
-        let mut push = AutoStepRun::running(&persisted.run.id, 1, AutoStepKey::PushPr, 1);
-        push.status = AutoStepStatus::Done;
-        persisted.steps.push(push);
-        let mut wait = AutoStepRun::running(&persisted.run.id, 2, AutoStepKey::WaitCi, 1);
-        wait.status = AutoStepStatus::Done;
-        wait.work_guard = Some(WorkGuard {
-            pr_head_sha: Some("old-head".to_string()),
-            ..WorkGuard::default()
-        });
-        persisted.steps.push(wait);
-
-        let old_guard = WorkGuard {
-            pr_head_sha: Some("old-head".to_string()),
-            ..WorkGuard::default()
-        };
-        let new_guard = WorkGuard {
-            pr_head_sha: Some("new-head".to_string()),
-            ..WorkGuard::default()
-        };
-        assert!(has_active_or_completed_step_after_latest_pr(
-            &persisted,
-            &AutoStepKey::WaitCi,
-            &old_guard
-        ));
-        assert!(!has_active_or_completed_step_after_latest_pr(
-            &persisted,
-            &AutoStepKey::WaitCi,
-            &new_guard
-        ));
-    }
 
     #[test]
     fn blocked_manual_merge_cases_never_invoke_gh_merge() {
@@ -1811,9 +1597,13 @@ mod tests {
             },
             {
                 let mut snapshot = ready_manual_merge_snapshot();
-                let review = &mut snapshot.pull_request.as_mut().unwrap().review;
-                review.feedback_required = true;
-                review.unresolved_threads.push(unresolved_review_thread());
+                snapshot
+                    .pull_request
+                    .as_mut()
+                    .unwrap()
+                    .review
+                    .unresolved_threads
+                    .push(unresolved_review_thread());
                 snapshot
             },
             {
@@ -2102,82 +1892,6 @@ mod tests {
         assert!(!guarded_replan_is_terminal(&work(
             StabilizationBlocker::PolicyUnknown
         )));
-    }
-
-    #[test]
-    fn escalation_fails_reserved_run_and_releases_next_candidate() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        super::super::migrate_schema(&conn).unwrap();
-        crate::plan_run::migrate_schema(&conn).unwrap();
-        crate::execution::migrate_schema(&conn).unwrap();
-        let mut first = AutoLaunch::new(
-            Path::new("/repo"),
-            Path::new("/repo/first"),
-            "first",
-            "stabilize",
-        )
-        .unwrap()
-        .create_run();
-        let mut second = AutoLaunch::new(
-            Path::new("/repo"),
-            Path::new("/repo/second"),
-            "second",
-            "stabilize",
-        )
-        .unwrap()
-        .create_run();
-        super::super::save_auto_run(&conn, &mut first).unwrap();
-        super::super::save_auto_run(&conn, &mut second).unwrap();
-        for (run, head) in [(&first, "first-head"), (&second, "second-head")] {
-            crate::integration::arm_merge_intent(&conn, &run.run.id).unwrap();
-            crate::integration::synchronize_generation(
-                &conn,
-                &run.run.id,
-                &crate::integration::CandidateGeneration {
-                    change_request_identity: crate::remote::test_change_request_identity(),
-                    target_branch: "main".to_string(),
-                    pr_number: 42,
-                    head_sha: head.to_string(),
-                },
-            )
-            .unwrap();
-            crate::integration::publish_ready(&conn, &run.run.id, head).unwrap();
-        }
-
-        assert!(
-            !append_planned_work(
-                &conn,
-                &mut first,
-                StabilizationWorkItem {
-                    kind: StabilizationWorkKind::Escalate,
-                    blocker: StabilizationBlocker::ObservationFailed,
-                    reason: "repository policy refresh failed".to_string(),
-                    guard: WorkGuard::default(),
-                },
-            )
-            .unwrap()
-        );
-
-        assert_eq!(
-            super::super::load_auto_run(&conn, &first.run.id)
-                .unwrap()
-                .unwrap()
-                .run
-                .status,
-            AutoRunStatus::Failed
-        );
-        assert!(
-            crate::integration::active_merge_intent(&conn, &first.run.id)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            crate::integration::active_merge_intent(&conn, &second.run.id)
-                .unwrap()
-                .unwrap()
-                .placement,
-            crate::integration::IntegrationPlacement::Reserved
-        );
     }
 
     #[test]
@@ -2499,8 +2213,7 @@ mod tests {
                 super::super::stabilization_model::StabilizationWorkKind::FixCi,
             ),
         ] {
-            let conn = rusqlite::Connection::open_in_memory().unwrap();
-            super::super::migrate_schema(&conn).unwrap();
+            let conn = TestDatabase::new("standalone-repair");
             let mut persisted = AutoLaunch::new(
                 Path::new("/repo"),
                 Path::new("/repo/feature"),
@@ -2560,8 +2273,7 @@ mod tests {
 
     #[test]
     fn standalone_repair_late_write_failure_rolls_back_run_step_and_guard() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        super::super::migrate_schema(&conn).unwrap();
+        let conn = TestDatabase::new("standalone-deduplication");
         let mut persisted = AutoLaunch::new(
             Path::new("/repo"),
             Path::new("/repo/feature"),
@@ -2573,15 +2285,8 @@ mod tests {
         persisted.run.variant = "repair".to_string();
         persisted.steps.clear();
         super::super::save_auto_run(&conn, &mut persisted).unwrap();
-        conn.execute_batch(
-            "create trigger fail_guarded_queue_late
-             before update of selected_step_run_id on auto_run
-             when new.selected_step_run_id is not null
-             begin
-               select raise(fail, 'injected late write failure');
-             end;",
-        )
-        .unwrap();
+        crate::persistence::auto_flow::test_install_selected_step_failure(conn.path(), false)
+            .unwrap();
 
         let error = queue_standalone_repair(
             &conn,
@@ -2609,8 +2314,7 @@ mod tests {
 
     #[test]
     fn wait_repair_late_failure_restores_wait_step_and_does_not_enqueue() {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        super::super::migrate_schema(&conn).unwrap();
+        let conn = TestDatabase::new("standalone-rollback");
         let mut persisted = AutoLaunch::new(
             Path::new("/repo"),
             Path::new("/repo/feature"),
@@ -2631,15 +2335,8 @@ mod tests {
         persisted.steps.push(wait);
         super::super::save_auto_run(&conn, &mut persisted).unwrap();
         let original = persisted.clone();
-        conn.execute_batch(
-            "create trigger fail_wait_repair_late
-             before update of selected_step_run_id on auto_run
-             when new.selected_step_run_id is not old.selected_step_run_id
-             begin
-               select raise(fail, 'injected wait repair failure');
-             end;",
-        )
-        .unwrap();
+        crate::persistence::auto_flow::test_install_selected_step_failure(conn.path(), true)
+            .unwrap();
 
         let error = queue_wait_repair(
             &conn,
@@ -2712,9 +2409,11 @@ mod tests {
         };
         cases.push(policy);
         let mut review = ready.clone();
-        let review_facts = &mut review.pull_request.as_mut().unwrap().review;
-        review_facts.feedback_required = true;
-        review_facts
+        review
+            .pull_request
+            .as_mut()
+            .unwrap()
+            .review
             .unresolved_threads
             .push(unresolved_review_thread());
         cases.push(review);
@@ -2750,7 +2449,6 @@ mod tests {
             repo_label: "repo".to_string(),
             repo_key: None,
             path: temp.clone(),
-            worktree_session_id: "test-feature".to_string(),
             incarnation: String::new(),
             path_display: temp.display().to_string(),
             branch: "feature".to_string(),
@@ -2787,7 +2485,6 @@ mod tests {
                 remote_project: Some("owner/repo".to_string()),
                 policy_refreshed_unix_ms: Some(1),
                 policy_error: None,
-                merge_queue_required: false,
             },
             worktree: WorktreeFacts {
                 path: PathBuf::from("/repo/feature"),
@@ -2816,9 +2513,6 @@ mod tests {
                 },
                 review: ReviewFacts {
                     decision: "APPROVED".to_string(),
-                    feedback_required: false,
-                    resolved_comments_required: false,
-                    review_feedback_count: 0,
                     approval_required: false,
                     approval_count: 0,
                     required_approvals: 0,

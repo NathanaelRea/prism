@@ -17,7 +17,6 @@ pub(super) enum AgentObservationMode {
 pub(super) struct AgentStatePersistenceRequest {
     generation: u64,
     repo: Repository,
-    worktree_session_id: String,
     branch: String,
     state: Option<AgentState>,
 }
@@ -165,7 +164,6 @@ impl Tui {
             AgentStatePersistenceRequest {
                 generation,
                 repo: managed.repo.clone(),
-                worktree_session_id: session.worktree_session_id.clone(),
                 branch: session.branch.clone(),
                 state: Some(session.agent_state),
             },
@@ -191,7 +189,6 @@ impl Tui {
             AgentStatePersistenceRequest {
                 generation,
                 repo: managed.repo.clone(),
-                worktree_session_id: session.worktree_session_id.clone(),
                 branch: session.branch.clone(),
                 state: None,
             },
@@ -227,17 +224,10 @@ impl Tui {
                 "prism-agent-state-persistence".to_string(),
                 move |_| {
                     match request.state {
-                        Some(state) => crate::session::save_agent_state(
-                            &request.repo,
-                            &request.worktree_session_id,
-                            &request.branch,
-                            state,
-                        )?,
-                        None => crate::session::remove_agent_state(
-                            &request.repo,
-                            &request.worktree_session_id,
-                            &request.branch,
-                        )?,
+                        Some(state) => {
+                            crate::session::save_agent_state(&request.repo, &request.branch, state)?
+                        }
+                        None => crate::agent_session::remove_state(&request.repo, &request.branch)?,
                     }
                     Ok(None)
                 },

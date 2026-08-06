@@ -1,0 +1,1 @@
+pragma foreign_key_check

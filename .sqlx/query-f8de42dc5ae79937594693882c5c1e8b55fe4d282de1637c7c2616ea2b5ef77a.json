@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "insert into plan_output_line (\n  run_id, step, line_number, time_unix_ms, kind, text, block_id\n)\nselect ?, ?, coalesce(max(line_number), 0) + 1, ?, ?, ?, ?\nfrom plan_output_line\nwhere run_id = ? and step = ?\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 8
+    },
+    "nullable": []
+  },
+  "hash": "f8de42dc5ae79937594693882c5c1e8b55fe4d282de1637c7c2616ea2b5ef77a"
+}

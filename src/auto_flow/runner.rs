@@ -1,7 +1,7 @@
 use super::*;
 
 pub fn execute_auto_initial_step(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     repo: &Repository,
     config: &Config,
     persisted: &mut PersistedAutoRun,
@@ -11,14 +11,6 @@ pub fn execute_auto_initial_step(
     let run_id = persisted.run.id.clone();
     *persisted = load_auto_run(conn, &run_id)?
         .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
-    if persisted.run.status == AutoRunStatus::Paused
-        && !persisted.run.pause_requested
-        && crate::integration::active_merge_intent(conn, &run_id)?.is_some_and(|intent| {
-            intent.placement == crate::integration::IntegrationPlacement::Reserved
-        })
-    {
-        persisted.run.status = AutoRunStatus::Queued;
-    }
     if auto_run_execution_blocked(persisted) {
         return Ok(());
     }
@@ -28,20 +20,18 @@ pub fn execute_auto_initial_step(
     save_run_with_conn(conn, &persisted.run)?;
 
     complete_queued_prepare(conn, persisted, executor.max_output_lines_per_step)?;
-    if persisted.run.implementation_source != AutoImplementationSource::ExistingPullRequest
-        && !persisted.steps.iter().any(|step| {
-            matches!(
-                step.step_key,
-                AutoStepKey::CreatePlan
-                    | AutoStepKey::ReviewPlan
-                    | AutoStepKey::RunPlan
-                    | AutoStepKey::Implement
-                    | AutoStepKey::FixLocalVerify
-                    | AutoStepKey::FixReview
-                    | AutoStepKey::FixCi
-            )
-        })
-    {
+    if !persisted.steps.iter().any(|step| {
+        matches!(
+            step.step_key,
+            AutoStepKey::CreatePlan
+                | AutoStepKey::ReviewPlan
+                | AutoStepKey::RunPlan
+                | AutoStepKey::Implement
+                | AutoStepKey::FixLocalVerify
+                | AutoStepKey::FixReview
+                | AutoStepKey::FixCi
+        )
+    }) {
         let (step_key, reason) = initial_agent_step(persisted);
         append_step_run(conn, persisted, step_key, Some(reason.to_string()))?;
     }
@@ -55,13 +45,7 @@ pub fn execute_auto_initial_step(
             return Ok(());
         }
 
-        let reserved_integration = crate::integration::active_merge_intent(conn, &run_id)?
-            .is_some_and(|intent| {
-                intent.placement == crate::integration::IntegrationPlacement::Reserved
-            });
-        if persisted.run.pending_push.is_some()
-            && (config.auto.push_repairs || reserved_integration)
-        {
+        if persisted.run.pending_push.is_some() && config.auto.push_repairs {
             let mut cache = crate::remote::load_pr_cache(repo, &persisted.run.branch);
             stabilization_execute::progress_pending_push(
                 conn,
@@ -150,7 +134,7 @@ pub(super) fn auto_run_execution_blocked(persisted: &PersistedAutoRun) -> bool {
 }
 
 pub(super) fn complete_queued_prepare(
-    conn: &rusqlite::Connection,
+    conn: &AutoFlowStore,
     persisted: &mut PersistedAutoRun,
     max_output_lines_per_step: usize,
 ) -> Result<(), String> {
@@ -179,10 +163,10 @@ pub(super) fn complete_queued_prepare(
 }
 
 pub(super) fn queued_prepare_needs_initial_agent_step(persisted: &PersistedAutoRun) -> bool {
-    persisted.run.implementation_source != AutoImplementationSource::ExistingPullRequest
-        && persisted.steps.iter().any(|step| {
-            step.step_key == AutoStepKey::Prepare && step.status == AutoStepStatus::Queued
-        })
+    persisted
+        .steps
+        .iter()
+        .any(|step| step.step_key == AutoStepKey::Prepare && step.status == AutoStepStatus::Queued)
         && !persisted.steps.iter().any(|step| {
             matches!(
                 step.step_key,

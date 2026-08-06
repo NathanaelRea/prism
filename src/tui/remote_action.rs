@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
-use rusqlite::OptionalExtension;
 
 use crate::auto_flow::PersistedAutoRun;
 use crate::remote::{PrCache, PrSummary};
@@ -19,7 +18,7 @@ use super::{
 fn merge_is_authoritatively_pending(queue_state: &str) -> bool {
     matches!(
         queue_state.trim().to_ascii_lowercase().as_str(),
-        "queued" | "running" | "blocked" | "awaiting_checks" | "locked" | "mergeable"
+        "queued" | "running" | "blocked"
     )
 }
 
@@ -138,7 +137,6 @@ pub(crate) enum RemoteActionValue {
         cache: Box<PrCache>,
         resolved: usize,
     },
-    #[allow(dead_code)]
     MergeAuthorization {
         session: Box<Session>,
         authorization: Box<crate::auto_flow::stabilization_execute::MergeAuthorization>,
@@ -300,17 +298,14 @@ impl Tui {
             .repos
             .iter()
             .filter_map(|managed| {
-                let markers = crate::observability::with_writable_db(&managed.repo, |conn| {
-                    let value = conn
-                        .query_row(
-                            "select value from metadata where key = ?1",
-                            [REMOTE_MUTATION_RECONCILIATION_KEY],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .optional()
-                        .map_err(|error| {
-                            format!("read remote mutation reconciliation marker: {error}")
-                        })?;
+                let markers = (|| {
+                    let value = crate::persistence::database::load_metadata(
+                        &crate::observability::db_path(&managed.repo),
+                        REMOTE_MUTATION_RECONCILIATION_KEY,
+                    )
+                    .map_err(|error| {
+                        format!("read remote mutation reconciliation marker: {error}")
+                    })?;
                     value
                         .map(|value| {
                             serde_json::from_str::<Vec<RemoteMutationReconciliationMarker>>(&value)
@@ -320,7 +315,7 @@ impl Tui {
                         })
                         .transpose()
                         .map(|markers| markers.unwrap_or_default())
-                })
+                })()
                 .unwrap_or_else(|error| {
                     vec![RemoteMutationReconciliationMarker {
                         target: RemoteMutationTarget::Unknown {
@@ -403,14 +398,12 @@ impl Tui {
                 );
             }
         }
-        crate::observability::with_writable_db(&repo, |conn| {
-            conn.execute(
-                "insert into metadata (key, value) values (?1, ?2)\n                 on conflict(key) do update set value = excluded.value",
-                rusqlite::params![REMOTE_MUTATION_RECONCILIATION_KEY, value],
-            )
-            .map_err(|error| format!("write remote mutation reconciliation marker: {error}"))?;
-            Ok(())
-        })?;
+        crate::persistence::database::upsert_metadata(
+            &crate::observability::db_path(&repo),
+            REMOTE_MUTATION_RECONCILIATION_KEY,
+            &value,
+        )
+        .map_err(|error| format!("write remote mutation reconciliation marker: {error}"))?;
         Ok(())
     }
 
@@ -430,27 +423,24 @@ impl Tui {
             .get(&repository.root)
             .cloned()
             .unwrap_or_default();
-        crate::observability::with_writable_db(&managed.repo, |conn| {
-            if markers.is_empty() {
-                conn.execute(
-                    "delete from metadata where key = ?1",
-                    [REMOTE_MUTATION_RECONCILIATION_KEY],
-                )
-                .map_err(|error| format!("clear remote mutation reconciliation marker: {error}"))?;
-            } else {
-                let value = serde_json::to_string(&markers).map_err(|error| {
-                    format!("encode remote mutation reconciliation marker: {error}")
-                })?;
-                conn.execute(
-                    "insert into metadata (key, value) values (?1, ?2)\n                     on conflict(key) do update set value = excluded.value",
-                    rusqlite::params![REMOTE_MUTATION_RECONCILIATION_KEY, value],
-                )
-                .map_err(|error| {
-                    format!("write remote mutation reconciliation marker: {error}")
-                })?;
-            }
-            Ok(())
-        })?;
+        let path = crate::observability::db_path(&managed.repo);
+        if markers.is_empty() {
+            crate::persistence::database::delete_metadata(
+                &path,
+                REMOTE_MUTATION_RECONCILIATION_KEY,
+            )
+            .map_err(|error| format!("clear remote mutation reconciliation marker: {error}"))?;
+        } else {
+            let value = serde_json::to_string(&markers).map_err(|error| {
+                format!("encode remote mutation reconciliation marker: {error}")
+            })?;
+            crate::persistence::database::upsert_metadata(
+                &path,
+                REMOTE_MUTATION_RECONCILIATION_KEY,
+                &value,
+            )
+            .map_err(|error| format!("write remote mutation reconciliation marker: {error}"))?;
+        }
         if markers.is_empty() {
             self.remote_mutations_requiring_reconciliation
                 .remove(&repository.root);

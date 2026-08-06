@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "select\n  type as \"kind!: String\",\n  name as \"name!: String\",\n  tbl_name as \"table_name!: String\",\n  coalesce(sql, '') as \"sql!: String\"\nfrom sqlite_schema\nwhere name not like 'sqlite_%' and name != '_sqlx_migrations'\norder by type, name, tbl_name\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "kind!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "name!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "table_name!: String",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "sql!: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "a4fba81fadd214c9046831ee7f5aecc620cff13985562c11fa9722661aad4e16"
+}

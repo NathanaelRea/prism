@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "select worktree_path as \"worktree_path!\", branch as \"branch!\", incarnation as \"incarnation!\"\nfrom notification_session\n",
+  "describe": {
+    "columns": [
+      {
+        "name": "worktree_path!",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "branch!",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "incarnation!",
+        "ordinal": 2,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "17f88068cf2a5380c5589bc0ccd0db01e50f4ab639a4a3f65a990324f8d2dcd8"
+}

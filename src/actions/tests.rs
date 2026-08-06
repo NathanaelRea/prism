@@ -4,7 +4,7 @@ use crate::auto_flow::stabilization_execute::{GuardedPushProgress, progress_pend
 use crate::auto_flow::stabilization_model::{
     PendingPushGuard, RepairKind, StabilizationBlocker, StabilizationWorkKind,
 };
-use crate::auto_flow::{AutoLaunch, AutoStepKey, load_auto_run, save_auto_run};
+use crate::auto_flow::{AutoFlowStore, AutoLaunch, AutoStepKey, load_auto_run, save_auto_run};
 use crate::config::Config;
 use crate::opencode::{OpencodeState, OpencodeStatus, parse_event_payload};
 use crate::plan_run::PlanRunMode;
@@ -26,18 +26,6 @@ use super::{
     remote_pr_worktree_branch, run_browser_opener, status_label_with_behind,
     unresolved_review_thread_ids, validate_push_target_after_checks, worktree_column_choices,
 };
-
-#[test]
-fn auto_startup_choices_only_allow_disable_for_active_runs() {
-    let active = super::auto::auto_startup_choices(true);
-    assert_eq!(active.choices[0].key, "x");
-    assert!(!active.choices[0].disabled);
-    assert!(active.choices[1..].iter().all(|choice| choice.disabled));
-
-    let inactive = super::auto::auto_startup_choices(false);
-    assert!(inactive.choices[0].disabled);
-    assert!(inactive.choices[1..].iter().all(|choice| !choice.disabled));
-}
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -435,10 +423,11 @@ esac
         .get(&tui.sessions[0].path)
         .unwrap()
         .clone();
-    let persisted =
-        crate::observability::with_writable_db(&tui.repo, |conn| load_auto_run(conn, &run_id))
-            .unwrap()
-            .unwrap();
+    let persisted = crate::observability::with_writable_db(&tui.repo, |path| {
+        load_auto_run(&AutoFlowStore::open(path), &run_id)
+    })
+    .unwrap()
+    .unwrap();
     assert_eq!(persisted.steps.len(), 1);
     assert_eq!(persisted.steps[0].step_key, AutoStepKey::FixReview);
     assert_eq!(persisted.run.initial_prompt, original_task);
@@ -551,7 +540,6 @@ esac
 
     let mut config = test_config();
     config.default_base = Some("main".to_string());
-    config.auto.review_requirement = crate::config::ReviewRequirement::Approved;
     config
         .tools
         .insert("gh".to_string(), gh.display().to_string());
@@ -574,8 +562,10 @@ esac
         expected_base_sha: Some("base-sha".to_string()),
         guarded_review_thread_ids: vec!["PRRT_guarded_1".to_string(), "PRRT_guarded_2".to_string()],
     });
-    crate::observability::with_writable_db(&repo, |conn| save_auto_run(conn, &mut persisted))
-        .unwrap();
+    crate::observability::with_writable_db(&repo, |path| {
+        save_auto_run(&AutoFlowStore::open(path), &mut persisted)
+    })
+    .unwrap();
 
     let mut session = test_session(worktree.clone(), "feature");
     session.pr = PrCache::observed(
@@ -615,9 +605,9 @@ esac
     tui.active_auto_runs
         .insert(worktree, persisted.run.id.clone());
 
-    let progress = crate::observability::with_writable_db(&repo, |conn| {
+    let progress = crate::observability::with_writable_db(&repo, |path| {
         progress_pending_push(
-            conn,
+            &AutoFlowStore::open(path),
             &repo,
             &config,
             &mut persisted,
@@ -646,8 +636,8 @@ esac
             .iter()
             .any(|review| review.state == "APPROVED")
     );
-    let reloaded = crate::observability::with_writable_db(&repo, |conn| {
-        load_auto_run(conn, &persisted.run.id)
+    let reloaded = crate::observability::with_writable_db(&repo, |path| {
+        load_auto_run(&AutoFlowStore::open(path), &persisted.run.id)
     })
     .unwrap()
     .unwrap();
@@ -785,17 +775,26 @@ esac
         expected_base_sha: Some("base-sha".to_string()),
         guarded_review_thread_ids: vec!["PRRT_1".to_string(), "PRRT_2".to_string()],
     });
-    crate::observability::with_writable_db(&repo, |conn| save_auto_run(conn, &mut persisted))
-        .unwrap();
+    crate::observability::with_writable_db(&repo, |path| {
+        save_auto_run(&AutoFlowStore::open(path), &mut persisted)
+    })
+    .unwrap();
 
     let mut cache = PrCache::default();
-    let first = crate::observability::with_writable_db(&repo, |conn| {
-        progress_pending_push(conn, &repo, &config, &mut persisted, &mut cache, || Ok(()))
+    let first = crate::observability::with_writable_db(&repo, |path| {
+        progress_pending_push(
+            &AutoFlowStore::open(path),
+            &repo,
+            &config,
+            &mut persisted,
+            &mut cache,
+            || Ok(()),
+        )
     });
     assert!(first.is_err());
 
-    let mut reopened = crate::observability::with_writable_db(&repo, |conn| {
-        load_auto_run(conn, &persisted.run.id)
+    let mut reopened = crate::observability::with_writable_db(&repo, |path| {
+        load_auto_run(&AutoFlowStore::open(path), &persisted.run.id)
     })
     .unwrap()
     .unwrap();
@@ -810,14 +809,22 @@ esac
     );
     fs::write(&allow_second, "retry").unwrap();
     let mut cache = PrCache::default();
-    let refresh_failure = crate::observability::with_writable_db(&repo, |conn| {
-        progress_pending_push(conn, &repo, &config, &mut reopened, &mut cache, || Ok(()))
+    let refresh_failure = crate::observability::with_writable_db(&repo, |path| {
+        progress_pending_push(
+            &AutoFlowStore::open(path),
+            &repo,
+            &config,
+            &mut reopened,
+            &mut cache,
+            || Ok(()),
+        )
     });
     assert!(refresh_failure.is_err(), "{refresh_failure:?}");
-    let mut reopened =
-        crate::observability::with_writable_db(&repo, |conn| load_auto_run(conn, &reopened.run.id))
-            .unwrap()
-            .unwrap();
+    let mut reopened = crate::observability::with_writable_db(&repo, |path| {
+        load_auto_run(&AutoFlowStore::open(path), &reopened.run.id)
+    })
+    .unwrap()
+    .unwrap();
     assert!(
         reopened
             .run
@@ -829,14 +836,22 @@ esac
     );
     fs::write(&allow_refresh, "retry").unwrap();
     let mut cache = PrCache::default();
-    crate::observability::with_writable_db(&repo, |conn| {
-        progress_pending_push(conn, &repo, &config, &mut reopened, &mut cache, || Ok(()))
+    crate::observability::with_writable_db(&repo, |path| {
+        progress_pending_push(
+            &AutoFlowStore::open(path),
+            &repo,
+            &config,
+            &mut reopened,
+            &mut cache,
+            || Ok(()),
+        )
     })
     .unwrap();
-    let final_run =
-        crate::observability::with_writable_db(&repo, |conn| load_auto_run(conn, &reopened.run.id))
-            .unwrap()
-            .unwrap();
+    let final_run = crate::observability::with_writable_db(&repo, |path| {
+        load_auto_run(&AutoFlowStore::open(path), &reopened.run.id)
+    })
+    .unwrap()
+    .unwrap();
     assert!(final_run.run.pending_push.is_none());
     let commands = fs::read_to_string(&gh_log).unwrap();
     assert_eq!(commands.matches("thread=PRRT_1").count(), 1);
@@ -985,10 +1000,11 @@ esac
         .get(&tui.sessions[0].path)
         .unwrap()
         .clone();
-    let persisted =
-        crate::observability::with_writable_db(&tui.repo, |conn| load_auto_run(conn, &run_id))
-            .unwrap()
-            .unwrap();
+    let persisted = crate::observability::with_writable_db(&tui.repo, |path| {
+        load_auto_run(&AutoFlowStore::open(path), &run_id)
+    })
+    .unwrap()
+    .unwrap();
     assert_eq!(persisted.steps.len(), 1);
     assert_eq!(
         tui.selected_auto_step_by_run.get(&first_run_id),
@@ -2563,7 +2579,6 @@ fn test_session(path: PathBuf, branch: &str) -> Session {
         repo_label: "repo".to_string(),
         repo_key: None,
         path: path.clone(),
-        worktree_session_id: "test-worktree-session".to_string(),
         incarnation: String::new(),
         path_display: path.display().to_string(),
         branch: branch.to_string(),
@@ -2624,9 +2639,20 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
 }
 
 fn phase_1_pr_summary(head_sha: &str) -> PrSummary {
+    let repository = crate::remote::RemoteRepositoryId::new(
+        crate::remote::ProviderKind::GitHub,
+        crate::remote::HostIdentity::new("github.com", None).unwrap(),
+        "example/repo",
+    )
+    .unwrap();
     PrSummary {
         number: 42,
-        change_request_identity: None,
+        change_request_identity: Some(crate::remote::CanonicalChangeRequestIdentity::new(
+            &repository,
+            &crate::remote::NativeChangeRequestId::new("PR_42").unwrap(),
+            &repository,
+            &repository,
+        )),
         native_state_evidence: crate::remote::NativeStateEvidence::default(),
         title: "Phase 1 safety".to_string(),
         author: "author".to_string(),

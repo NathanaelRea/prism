@@ -132,7 +132,7 @@ pub fn parse_plan_agent_events(raw: &str) -> Vec<PlanAgentEvent> {
 }
 
 pub fn ingest_plan_sse_payload(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     step: &mut PlanStepRun,
     raw: &str,
     max_output_lines_per_step: usize,
@@ -149,7 +149,7 @@ pub fn ingest_plan_sse_payload(
 }
 
 pub fn reconcile_plan_step_from_server(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     step: &mut PlanStepRun,
     max_output_lines_per_step: usize,
 ) -> Result<bool, String> {
@@ -163,7 +163,7 @@ pub fn reconcile_plan_step_from_server(
 }
 
 pub fn reconcile_plan_step_from_opencode_status(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     step: &mut PlanStepRun,
     status: &OpencodeStatus,
     max_output_lines_per_step: usize,
@@ -235,7 +235,7 @@ pub fn reconcile_plan_step_from_opencode_status(
 }
 
 pub(super) fn ingest_plan_agent_events(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     step: &mut PlanStepRun,
     events: Vec<PlanAgentEvent>,
     max_output_lines_per_step: usize,
@@ -243,11 +243,11 @@ pub(super) fn ingest_plan_agent_events(
     for event in events {
         ingest_single_plan_agent_event(conn, step, event, max_output_lines_per_step)?;
     }
-    save_step_with_conn(conn, step)
+    save_step_with_store(conn, step)
 }
 
 pub(super) fn ingest_single_plan_agent_event(
-    conn: &rusqlite::Connection,
+    conn: &PlanRunStore,
     step: &mut PlanStepRun,
     event: PlanAgentEvent,
     max_output_lines_per_step: usize,

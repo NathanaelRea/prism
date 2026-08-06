@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "update workflow_execution\nset dispatch_state = 'recovery_pending', interruption_generation = 3, updated_unix_ms = 30\nwhere run_id = 'plan-control-12345678'\n",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": []
+  },
+  "hash": "ab409c605dd2ae13a6b5ddab59bb87e962518c1cf44ff1d1b03bd87f201311de"
+}
