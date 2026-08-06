@@ -59,6 +59,13 @@ pub(crate) fn connect_writable(path: &Path) -> Result<SqliteConnection, Database
 }
 
 pub(crate) fn open_readonly(path: &Path) -> Result<SqliteConnection, DatabaseError> {
+    open_readonly_with_timeout(path, Duration::ZERO)
+}
+
+fn open_readonly_with_timeout(
+    path: &Path,
+    busy_timeout: Duration,
+) -> Result<SqliteConnection, DatabaseError> {
     if !path.exists() {
         return Err(DatabaseError::Connect {
             path: path.to_path_buf(),
@@ -75,7 +82,7 @@ pub(crate) fn open_readonly(path: &Path) -> Result<SqliteConnection, DatabaseErr
         .read_only(true)
         .create_if_missing(false)
         .foreign_keys(true)
-        .busy_timeout(Duration::ZERO);
+        .busy_timeout(busy_timeout);
     let mut connection = connect(path, options)?;
     // SQLX_RUNTIME_SQL: SQLite connection policy PRAGMAs are runtime-only statements.
     block_on(sqlx::query("pragma query_only = on").execute(&mut connection))?;
@@ -121,7 +128,8 @@ pub(crate) fn delete_metadata(path: &Path, key: &str) -> Result<(), DatabaseErro
 }
 
 pub(crate) fn run_operator_query(path: &Path, query: &str) -> Result<Vec<Vec<String>>, String> {
-    let mut connection = open_readonly(path).map_err(|error| error.to_string())?;
+    let mut connection = open_readonly_with_timeout(path, super::pools::WRITER_BUSY_TIMEOUT)
+        .map_err(|error| error.to_string())?;
     block_on(async {
         // SQLX_RUNTIME_SQL: `prism db` intentionally executes operator-supplied read-only SQL.
         let rows = sqlx::query(query).fetch_all(&mut connection).await?;
@@ -492,6 +500,17 @@ mod tests {
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        remove_database(&path);
+    }
+
+    #[test]
+    fn operator_queries_wait_for_transient_database_locks() {
+        let path = test_path("operator-query-timeout");
+        initialize(&path).unwrap();
+
+        let values = run_operator_query(&path, "pragma busy_timeout").unwrap();
+
+        assert_eq!(values, vec![vec!["5000".to_string()]]);
         remove_database(&path);
     }
 
