@@ -1818,6 +1818,7 @@ mod tests {
                     .await
                     .unwrap();
                 worker.register_builtins().unwrap();
+                let first_database = worker.database.clone();
                 let (_shutdown, receiver) = watch::channel(false);
                 let first = tokio::spawn(worker.run(receiver));
                 tokio::time::timeout(Duration::from_secs(5), async {
@@ -1840,6 +1841,7 @@ mod tests {
                 .expect("command process should be recorded before simulating a crash");
                 first.abort();
                 let _ = first.await;
+                first_database.close().await;
                 tokio::time::sleep(Duration::from_millis(120)).await;
 
                 let mut replacement = WorkflowWorker::open(&path, "replacement", config)

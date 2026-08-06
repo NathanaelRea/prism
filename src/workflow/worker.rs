@@ -107,7 +107,21 @@ fn probe_health_at(path: &WorkerSocketPath) -> Result<DaemonHealth, String> {
         }
         Err(error) => return Err(format!("connect to Prism worker: {error}")),
     };
-    parse_health_response(&request_on_stream(stream, "health")?)
+    let response = match request_on_stream_raw(stream, "health") {
+        Ok(response) => response,
+        Err((_, error))
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotConnected
+            ) =>
+        {
+            return Ok(DaemonHealth::stopped());
+        }
+        Err(error) => return Err(format_request_error(error)),
+    };
+    parse_health_response(&response)
 }
 
 fn parse_health_response(response: &str) -> Result<DaemonHealth, String> {
@@ -475,18 +489,29 @@ fn request_at(path: &WorkerSocketPath, command: &str) -> Result<String, String> 
     request_on_stream(stream, command)
 }
 
-fn request_on_stream(mut stream: UnixStream, command: &str) -> Result<String, String> {
+fn request_on_stream(stream: UnixStream, command: &str) -> Result<String, String> {
+    request_on_stream_raw(stream, command).map_err(format_request_error)
+}
+
+fn request_on_stream_raw(
+    mut stream: UnixStream,
+    command: &str,
+) -> Result<String, (&'static str, std::io::Error)> {
     stream
         .set_read_timeout(Some(Duration::from_secs(1)))
-        .map_err(|error| format!("configure Prism worker socket: {error}"))?;
+        .map_err(|error| ("configure Prism worker socket", error))?;
     stream
         .write_all(format!("{command}\n").as_bytes())
-        .map_err(|error| format!("write Prism worker request: {error}"))?;
+        .map_err(|error| ("write Prism worker request", error))?;
     let mut response = String::new();
     stream
         .read_to_string(&mut response)
-        .map_err(|error| format!("read Prism worker response: {error}"))?;
+        .map_err(|error| ("read Prism worker response", error))?;
     Ok(response.trim().to_string())
+}
+
+fn format_request_error((action, error): (&str, std::io::Error)) -> String {
+    format!("{action}: {error}")
 }
 
 pub fn serve() -> Result<(), String> {
