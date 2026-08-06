@@ -147,6 +147,7 @@ struct StateRow {
     state: String,
 }
 
+#[cfg(test)]
 #[derive(FromRow)]
 struct InitialPromptRow {
     initial_prompt: String,
@@ -707,6 +708,7 @@ impl SessionStore {
         }))
     }
 
+    #[cfg(test)]
     pub(crate) fn load_initial_prompt(
         &self,
         branch: &str,

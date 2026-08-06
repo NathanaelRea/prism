@@ -1245,6 +1245,7 @@ fn load_task_metadata(repo: &Repository, branch: &str) -> Result<Option<TaskMeta
         .map_err(|error| format!("read task metadata: {error}"))
 }
 
+#[cfg(test)]
 pub(crate) fn load_task_initial_prompt(
     repo: &Repository,
     branch: &str,

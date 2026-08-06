@@ -9,8 +9,13 @@ static ID_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowKind {
-    Auto,
+    Coding,
     Plan,
+    #[allow(
+        dead_code,
+        reason = "recognized only while importing legacy repository history"
+    )]
+    Auto,
 }
 
 impl WorkflowKind {
@@ -20,16 +25,9 @@ impl WorkflowKind {
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::Auto => "auto",
+            Self::Coding => "coding",
             Self::Plan => "plan",
-        }
-    }
-
-    pub(crate) fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "auto" => Ok(Self::Auto),
-            "plan" => Ok(Self::Plan),
-            other => Err(format!("unknown workflow kind: {other}")),
+            Self::Auto => "auto",
         }
     }
 }

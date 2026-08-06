@@ -67,7 +67,7 @@ pub struct LaunchWorkflow<'a> {
     pub now_unix_ms: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct WorkflowProjection {
     pub id: String,
     pub definition_name: String,
@@ -85,7 +85,7 @@ pub struct WorkflowProjection {
     pub events: Vec<WorkflowAuditEvent>,
 }
 
-#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct WorkflowStepProjection {
     pub id: String,
     pub key: String,
@@ -95,7 +95,7 @@ pub struct WorkflowStepProjection {
     pub input_json: String,
 }
 
-#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct WorkflowAttemptProjection {
     pub id: String,
     pub step_id: String,
@@ -110,7 +110,7 @@ pub struct WorkflowAttemptProjection {
     pub output: Vec<WorkflowOutputProjection>,
 }
 
-#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct WorkflowOutputProjection {
     pub sequence: i64,
     pub stream: String,
@@ -118,7 +118,7 @@ pub struct WorkflowOutputProjection {
     pub time_unix_ms: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct WorkflowArtifactProjection {
     pub id: String,
     pub producing_attempt_id: Option<String>,
@@ -131,7 +131,7 @@ pub struct WorkflowArtifactProjection {
     pub created_unix_ms: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct WorkflowApprovalProjection {
     pub id: String,
     pub step_id: Option<String>,
@@ -142,7 +142,7 @@ pub struct WorkflowApprovalProjection {
     pub decision_note: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct WorkflowEffectProjection {
     pub id: String,
     pub attempt_id: String,
@@ -155,7 +155,7 @@ pub struct WorkflowEffectProjection {
     pub updated_unix_ms: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct WorkflowGateProjection {
     pub step_id: String,
     pub gate_kind: String,
@@ -164,7 +164,7 @@ pub struct WorkflowGateProjection {
     pub poll_count: i64,
 }
 
-#[derive(Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct WorkflowAuditEvent {
     pub sequence: i64,
     pub step_id: Option<String>,
@@ -411,6 +411,11 @@ impl WorkflowOperations {
         importer_revision: &str,
         now_unix_ms: i64,
     ) -> Result<LegacyImportSummary, WorkflowOperationError> {
+        // Adopt and validate the repository database before opening the importer's read-only
+        // snapshot. This preserves released pre-SQLx databases instead of rejecting them merely
+        // because they do not yet carry SQLx's migration journal.
+        let source = crate::persistence::pools::RepositoryDatabase::open(source_path).await?;
+        source.close().await;
         import_legacy_repository(&self.database, source_path, importer_revision, now_unix_ms)
             .await
             .map(|summary| LegacyImportSummary {
@@ -715,6 +720,7 @@ mod tests {
     fn legacy_import_is_resumable_and_preserves_provenance() {
         let source_path = path("legacy-source");
         let workflow_path = path("legacy-target");
+        std::fs::copy("tests/fixtures/database/repository-v1.db", &source_path).unwrap();
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
@@ -739,7 +745,8 @@ mod tests {
                     })
                     .await
                     .unwrap();
-                drop(source);
+                source.close().await;
+                assert!(source_path.with_extension("db.pre-sqlx-backup").exists());
 
                 let operations = WorkflowOperations::open(&workflow_path).await.unwrap();
                 assert_eq!(
@@ -778,6 +785,7 @@ mod tests {
                 assert_eq!(imported.steps[0].status, "succeeded");
                 assert_eq!(imported.steps[0].implementation, "legacy-history");
             });
+        let _ = std::fs::remove_file(source_path.with_extension("db.pre-sqlx-backup"));
         let _ = std::fs::remove_file(source_path);
         let _ = std::fs::remove_file(workflow_path);
     }

@@ -60,6 +60,11 @@ impl RepositoryDatabase {
         &self.readers
     }
 
+    pub(crate) async fn close(&self) {
+        self.readers.close().await;
+        self.writer.close().await;
+    }
+
     pub(crate) async fn write_immediate<T>(
         &self,
         operation: impl for<'c> FnOnce(&'c mut SqliteConnection) -> WriteFuture<'c, T>,

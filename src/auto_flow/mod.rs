@@ -1,4 +1,6 @@
+#[cfg(test)]
 use std::collections::hash_map::DefaultHasher;
+#[cfg(test)]
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};

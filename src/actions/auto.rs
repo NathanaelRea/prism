@@ -42,6 +42,21 @@ impl Tui {
         let session_path = self.sessions[context.session_index].path.clone();
         let session_branch = self.sessions[context.session_index].branch.clone();
         let session_incarnation = self.sessions[context.session_index].incarnation.clone();
+        if let Some(workflow) = self
+            .worktree_workflow_snapshot(
+                &context.repo.root,
+                &session_path,
+                crate::execution::WorkflowKind::Coding,
+            )
+            .filter(|workflow| !workflow.lifecycle.terminal())
+        {
+            self.show_message(&format!(
+                "coding workflow {} is {}",
+                workflow.identity.display_id,
+                workflow.lifecycle.label()
+            ))?;
+            return Ok(());
+        }
         if let Some(run_id) = self.active_auto_runs.get(&session_path).cloned() {
             self.load_auto_run_snapshot(&context.repo.root, &run_id);
             self.selected_auto_run = Some(run_id);
@@ -175,6 +190,8 @@ impl Tui {
                 harness_id: context.config.default_harness.clone(),
                 variant: Some(launch.variant.clone()),
             })?;
+        self.invalidate_workflow_snapshots();
+        self.start_workflow_polls(true);
         self.show_message(&format!(
             "Coding workflow {run_id} queued on headless worker"
         ))?;

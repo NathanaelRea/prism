@@ -1,5 +1,7 @@
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
@@ -9,6 +11,7 @@ use super::error::DatabaseError;
 
 const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/repository");
+static INITIALIZED_DATABASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 type TransactionQuery =
     sqlx::query::Query<'static, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'static>>;
@@ -26,7 +29,25 @@ pub(crate) fn rollback_query() -> TransactionQuery {
 }
 
 pub(crate) fn initialize(path: &Path) -> Result<(), DatabaseError> {
-    crate::async_runtime::block_on(initialize_async(path)).map_err(DatabaseError::Runtime)?
+    let key = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
+    };
+    let initialized = INITIALIZED_DATABASES.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut initialized = initialized.lock().map_err(|_| {
+        DatabaseError::Runtime(std::io::Error::other(
+            "repository database initialization state is poisoned",
+        ))
+    })?;
+    if initialized.contains(&key) && path.exists() {
+        return Ok(());
+    }
+    crate::async_runtime::block_on(initialize_async(path)).map_err(DatabaseError::Runtime)??;
+    initialized.insert(key);
+    Ok(())
 }
 
 pub(crate) fn open_writable(path: &Path) -> Result<SqliteConnection, DatabaseError> {
@@ -703,15 +724,10 @@ mod tests {
     #[test]
     fn released_pre_sqlx_database_is_backed_up_and_adopted() {
         let path = test_path("adopt");
-        let options = writable_options(&path, true).unwrap();
+        std::fs::copy("tests/fixtures/database/repository-v1.db", &path).unwrap();
+        let options = writable_options(&path, false).unwrap();
         let mut connection = connect(&path, options).unwrap();
         block_on(async {
-            sqlx::raw_sql(include_str!("../../migrations/repository/0001_initial.sql"))
-                .execute(&mut connection)
-                .await?;
-            sqlx::query("pragma user_version = 1")
-                .execute(&mut connection)
-                .await?;
             sqlx::query("insert into metadata (key, value) values ('preserved', 'yes')")
                 .execute(&mut connection)
                 .await?;

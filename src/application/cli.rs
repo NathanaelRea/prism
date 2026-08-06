@@ -2,10 +2,7 @@ use crate::args::{
     self, AgentCommand, Args, AutoCommand, AutoCommandSource, CommandKind, ConfigCommand,
     DaemonCommand, DbCommand, DebugCommand, InspectOptions, StatusOptions, WorkerCommand,
 };
-use crate::auto_flow::{
-    AutoFlowStore, AutoImplementationSource, AutoLaunch, AutoLaunchOptions, AutoRunMode,
-    load_recent_active_runs_for_repo, prepare_auto_run_for_resume,
-};
+use crate::auto_flow::{AutoImplementationSource, AutoLaunch, AutoLaunchOptions, AutoRunMode};
 use crate::config::Config;
 use crate::git::{current_branch_name, selected_dirty};
 use crate::observability::{self, LogLevel, ObserverOptions};
@@ -829,62 +826,6 @@ fn run_auto_command(
     mut command: AutoCommand,
 ) -> Result<(), String> {
     workspace::ensure_repo_entry(&repo.root)?;
-    let existing = observability::with_writable_db(repo, |path| {
-        load_recent_active_runs_for_repo(&AutoFlowStore::open(path), &repo.root, 1)
-    })?;
-    if let Some(mut run) = existing.into_iter().next() {
-        let workflow = crate::execution::WorkflowIdentity::new(
-            crate::execution::WorkflowKind::Auto,
-            &run.run.id,
-        );
-        let dispatch = observability::with_writable_db(repo, |path| {
-            crate::execution::dispatch_state(path, &workflow)
-        })?;
-        if matches!(
-            dispatch,
-            Some(crate::execution::DispatchState::RecoveryPending)
-        ) {
-            return Err(format!(
-                "Auto Flow run {} was interrupted; open Prism to choose whether to resume it",
-                run.run.id
-            ));
-        }
-        if matches!(
-            dispatch,
-            Some(
-                crate::execution::DispatchState::Queued | crate::execution::DispatchState::Claimed
-            )
-        ) {
-            println!(
-                "auto_run_id = {}\nstatus = {:?}\nworktree = {}",
-                run.run.id,
-                run.run.status,
-                run.run.worktree_path.display()
-            );
-            return Ok(());
-        }
-        let should_execute = observability::with_writable_db(repo, |path| {
-            prepare_auto_run_for_resume(
-                &AutoFlowStore::open(path),
-                &mut run,
-                crate::plan_run::DEFAULT_OUTPUT_LINES_PER_STEP,
-            )
-        })?;
-        if should_execute {
-            observability::with_writable_db(repo, |path| {
-                crate::execution::enqueue(path, &workflow)
-            })?;
-            crate::worker::ensure_running()?;
-            crate::worker::wake()?;
-        }
-        println!(
-            "auto_run_id = {}\nstatus = {:?}\nworktree = {}",
-            run.run.id,
-            run.run.status,
-            run.run.worktree_path.display()
-        );
-        return Ok(());
-    }
     if !config.selected_harness()?.describe().headless {
         return Err(format!(
             "harness '{}' does not support managed Auto Flow execution; configure headless_command and headless_prompt_transport",

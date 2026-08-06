@@ -777,9 +777,8 @@ impl Tui {
         repair: crate::auto_flow::stabilization_execute::StandaloneRepair,
     ) -> Result<bool, String> {
         let session_path = self.sessions[selected].path.clone();
-        let session_branch = self.sessions[selected].branch.clone();
         #[cfg(not(test))]
-        if !self.active_auto_runs.contains_key(&session_path) {
+        {
             crate::worker::launch_bundled_coding(crate::workflow::bundled::BundledCodingLaunch {
                 repository: repo.root.display().to_string(),
                 worktree_path: session_path,
@@ -789,89 +788,95 @@ impl Tui {
                 harness_id: config.default_harness.clone(),
                 variant: Some("repair".into()),
             })?;
-            return Ok(true);
+            Ok(true)
         }
-        let mut persisted = if let Some(run_id) = self.active_auto_runs.get(&session_path).cloned()
-        {
-            crate::observability::with_writable_db(repo, |path| {
-                load_auto_run(&AutoFlowStore::open(path), &run_id)
-            })?
-            .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?
-        } else {
-            let initial_prompt = crate::session::load_task_initial_prompt(repo, &session_branch)?
-                .filter(|prompt| !prompt.trim().is_empty())
-                .or_else(|| {
-                    let summary = self.sessions[selected].prompt_summary.trim();
-                    (!summary.is_empty()).then(|| summary.to_string())
-                })
-                .unwrap_or_else(|| format!("Repair PR branch {session_branch}"));
-            let launch = AutoLaunch::with_options(
-                &repo.root,
-                &session_path,
-                AutoLaunchOptions {
-                    branch: session_branch.clone(),
-                    mode: AutoRunMode::Standard,
-                    implementation_source: AutoImplementationSource::Prompt,
-                    plan_path: None,
-                    plan_run_mode: PlanRunMode::Sequential,
-                    variant: "repair".to_string(),
-                    agent_profile: None,
-                    initial_prompt,
-                },
-            )?
-            .with_harness(
-                config.default_harness.clone(),
-                config.harness_adapter(&config.default_harness)?,
-            );
-            let mut run = launch.create_run();
-            run.steps.clear();
-            run.run.pr_number = self.sessions[selected]
-                .pr
-                .summary()
-                .map(|summary| summary.number);
-            run.run.pr_url = self.sessions[selected]
-                .pr
-                .summary()
-                .map(|summary| summary.url.clone());
-            run.run.current_head_sha = crate::git::current_head_sha(&session_path, config).ok();
-            run
-        };
-
-        let queue = crate::observability::with_writable_db(repo, |path| {
-            crate::auto_flow::stabilization_execute::queue_standalone_repair(
-                &AutoFlowStore::open(path),
-                &mut persisted,
-                repair,
-            )
-        })?;
-        let selected_step = match queue {
-            crate::auto_flow::stabilization_execute::StandaloneRepairQueue::Queued(step_id)
-            | crate::auto_flow::stabilization_execute::StandaloneRepairQueue::AlreadyPending(
-                step_id,
-            ) => step_id,
-        };
-        self.remember_auto_run(persisted.clone());
-        self.selected_auto_step_by_run
-            .insert(persisted.run.id.clone(), selected_step);
-        self.selected_auto_run = Some(persisted.run.id.clone());
         #[cfg(test)]
-        if self.prompt_submissions.is_some() {
-            return Ok(matches!(
+        {
+            let session_branch = self.sessions[selected].branch.clone();
+            let mut persisted = if let Some(run_id) =
+                self.active_auto_runs.get(&session_path).cloned()
+            {
+                crate::observability::with_writable_db(repo, |path| {
+                    load_auto_run(&AutoFlowStore::open(path), &run_id)
+                })?
+                .ok_or_else(|| format!("active Auto Flow run not found: {run_id}"))?
+            } else {
+                let initial_prompt =
+                    crate::session::load_task_initial_prompt(repo, &session_branch)?
+                        .filter(|prompt| !prompt.trim().is_empty())
+                        .or_else(|| {
+                            let summary = self.sessions[selected].prompt_summary.trim();
+                            (!summary.is_empty()).then(|| summary.to_string())
+                        })
+                        .unwrap_or_else(|| format!("Repair PR branch {session_branch}"));
+                let launch = AutoLaunch::with_options(
+                    &repo.root,
+                    &session_path,
+                    AutoLaunchOptions {
+                        branch: session_branch.clone(),
+                        mode: AutoRunMode::Standard,
+                        implementation_source: AutoImplementationSource::Prompt,
+                        plan_path: None,
+                        plan_run_mode: PlanRunMode::Sequential,
+                        variant: "repair".to_string(),
+                        agent_profile: None,
+                        initial_prompt,
+                    },
+                )?
+                .with_harness(
+                    config.default_harness.clone(),
+                    config.harness_adapter(&config.default_harness)?,
+                );
+                let mut run = launch.create_run();
+                run.steps.clear();
+                run.run.pr_number = self.sessions[selected]
+                    .pr
+                    .summary()
+                    .map(|summary| summary.number);
+                run.run.pr_url = self.sessions[selected]
+                    .pr
+                    .summary()
+                    .map(|summary| summary.url.clone());
+                run.run.current_head_sha = crate::git::current_head_sha(&session_path, config).ok();
+                run
+            };
+
+            let queue = crate::observability::with_writable_db(repo, |path| {
+                crate::auto_flow::stabilization_execute::queue_standalone_repair(
+                    &AutoFlowStore::open(path),
+                    &mut persisted,
+                    repair,
+                )
+            })?;
+            let selected_step = match queue {
+                crate::auto_flow::stabilization_execute::StandaloneRepairQueue::Queued(step_id)
+                | crate::auto_flow::stabilization_execute::StandaloneRepairQueue::AlreadyPending(
+                    step_id,
+                ) => step_id,
+            };
+            self.remember_auto_run(persisted.clone());
+            self.selected_auto_step_by_run
+                .insert(persisted.run.id.clone(), selected_step);
+            self.selected_auto_run = Some(persisted.run.id.clone());
+            #[cfg(test)]
+            if self.prompt_submissions.is_some() {
+                return Ok(matches!(
+                    queue,
+                    crate::auto_flow::stabilization_execute::StandaloneRepairQueue::Queued(_)
+                ));
+            }
+            let queued = matches!(
                 queue,
                 crate::auto_flow::stabilization_execute::StandaloneRepairQueue::Queued(_)
-            ));
+            );
+            if queued {
+                self.spawn_auto_run_executor(repo.clone(), config.clone(), persisted)?;
+            } else {
+                crate::worker::ensure_running()?;
+                crate::worker::wake()?;
+            }
+            Ok(queued)
         }
-        let queued = matches!(
-            queue,
-            crate::auto_flow::stabilization_execute::StandaloneRepairQueue::Queued(_)
-        );
-        if queued {
-            self.spawn_auto_run_executor(repo.clone(), config.clone(), persisted)?;
-        } else {
-            crate::worker::ensure_running()?;
-            crate::worker::wake()?;
-        }
-        Ok(queued)
     }
 
     #[cfg(test)]

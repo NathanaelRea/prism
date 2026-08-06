@@ -103,10 +103,6 @@ impl PlanExecution {
         )
     }
 
-    pub(crate) fn cwd(&self) -> &Path {
-        &self.cwd
-    }
-
     #[cfg(test)]
     fn tasks(&self) -> Vec<String> {
         (self.start..=self.total)

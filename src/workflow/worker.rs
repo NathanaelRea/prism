@@ -14,12 +14,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::execution::{self, WorkflowIdentity};
+use crate::execution;
 use crate::notification::{NotificationCoordinator, NotificationObservation, PendingNotification};
 use crate::platform::SupportedOs;
 use crate::process::DetachedProcessPolicy;
 use crate::repo::Repository;
-use crate::util::stable_hash;
 use crate::{observability, workspace};
 
 const PROTOCOL_VERSION: u32 = 1;
@@ -444,6 +443,32 @@ fn launch_bundled<T: serde::Serialize>(kind: &str, launch: T) -> Result<String, 
         .ok_or_else(|| "workflow worker omitted run id".to_string())
 }
 
+/// Read the authoritative global run ledger through the worker projection API.
+pub fn list_workflows(
+    repository: Option<&Path>,
+    limit: usize,
+) -> Result<Vec<crate::WorkflowProjection>, String> {
+    let repository = repository.map(|path| path.display().to_string());
+    let response = workflow_request(serde_json::json!({
+        "type": "workflow_list",
+        "repository": repository,
+        "limit": limit,
+    }))?;
+    serde_json::from_value(response["runs"].clone())
+        .map_err(|error| format!("decode workflow list projection: {error}"))
+}
+
+pub fn command_workflow(run_id: &str, command: crate::WorkflowCommand) -> Result<(), String> {
+    ensure_running()?;
+    workflow_request(serde_json::json!({
+        "type": "workflow_command",
+        "run_id": run_id,
+        "command": command,
+        "now_unix_ms": execution::now_ms(),
+    }))?;
+    Ok(())
+}
+
 fn request_at(path: &WorkerSocketPath, command: &str) -> Result<String, String> {
     let stream = UnixStream::connect(path.as_path())
         .map_err(|error| format!("connect to Prism worker: {error}"))?;
@@ -487,6 +512,7 @@ pub fn serve() -> Result<(), String> {
         crate::workflow::bundled::install(&operations)
             .await
             .map_err(|error| format!("install bundled workflow definitions: {error}"))?;
+        import_legacy_repositories(&operations).await?;
         let (shutdown, shutdown_receiver) = tokio::sync::watch::channel(false);
         let control_plane_failure = Arc::new(Mutex::new(None::<String>));
         let failure = Arc::clone(&control_plane_failure);
@@ -510,6 +536,32 @@ pub fn serve() -> Result<(), String> {
             .map_err(|error| format!("join workflow control plane: {error}"))?;
         socket_result
     })
+}
+
+async fn import_legacy_repositories(operations: &crate::WorkflowOperations) -> Result<(), String> {
+    const IMPORTER_REVISION: &str = "workflow-ledger-v1";
+    let now_unix_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or(0);
+    for entry in crate::workspace::load_entries()? {
+        let repository = crate::repo::Repository { root: entry.root };
+        let source = repository.prism_dir().join("prism.db");
+        if !source.exists() {
+            continue;
+        }
+        operations
+            .import_legacy_repository(&source, IMPORTER_REVISION, now_unix_ms)
+            .await
+            .map_err(|error| {
+                format!(
+                    "import legacy workflow history from {} before worker startup: {error}",
+                    source.display()
+                )
+            })?;
+    }
+    Ok(())
 }
 
 fn serve_socket(
@@ -1312,21 +1364,6 @@ fn classify_abandoned(instance_id: &str) -> Result<(), String> {
         execution::mark_abandoned(&observability::db_path(&entry.repo), instance_id).map(|_| ())?;
     }
     Ok(())
-}
-
-pub fn legacy_worker_running(
-    repo: &Repository,
-    config: &Config,
-    workflow: &WorkflowIdentity,
-) -> Result<bool, String> {
-    let expected = format!(
-        "prism-{:016x}-worker-{}-{:016x}",
-        stable_hash(&repo.root),
-        workflow.kind.label(),
-        stable_hash(Path::new(&workflow.run_id))
-    );
-    crate::tmux::named_session_exists(config, &expected)
-        .map_err(|error| format!("inspect legacy tmux workers: {error}"))
 }
 
 fn log_daemon_lifecycle(action: &str, instance_id: &str) {

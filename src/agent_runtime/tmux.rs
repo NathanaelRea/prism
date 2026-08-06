@@ -411,31 +411,6 @@ pub fn latest_agent_session_generation_result(
     sessions.map(|_| generation)
 }
 
-pub(crate) fn named_session_exists(config: &Config, expected: &str) -> Result<bool, String> {
-    let output = run_tmux_output_allow_failure(
-        Command::new(config.tool("tmux")).env_remove("TMUX").args([
-            "list-sessions",
-            "-F",
-            "#{session_name}",
-        ]),
-        ProcessPolicy::TmuxPoll,
-    )?;
-    if output.status.success() {
-        return Ok(output.stdout.lines().any(|name| name == expected));
-    }
-    let error = output.stderr.trim();
-    if tmux_missing_session_error(error)
-        || error.contains("no sessions")
-        || error.contains("error connecting to")
-    {
-        Ok(false)
-    } else if error.is_empty() {
-        Err(format!("tmux exited with {}", output.status))
-    } else {
-        Err(error.to_string())
-    }
-}
-
 fn agent_session_names_with_prefix(config: &Config, prefix: &str) -> Result<Vec<String>, String> {
     Ok(tmux_session_names(config)?
         .into_iter()

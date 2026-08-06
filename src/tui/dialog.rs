@@ -586,7 +586,6 @@ impl Tui {
             .map(
                 |(index, (_, workflow))| crate::workspace_state::RecoveryDecision {
                     workflow: workflow.identity.clone(),
-                    interruption_generation: workflow.dispatch.interruption_generation,
                     restart: selected.contains(&index.to_string()),
                 },
             )

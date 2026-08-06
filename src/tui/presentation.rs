@@ -83,7 +83,7 @@ impl Tui {
                     .worktree_workflow_snapshot(
                         Path::new(&repo_root),
                         &session.path,
-                        crate::execution::WorkflowKind::Auto,
+                        crate::execution::WorkflowKind::Coding,
                     )
                     .and_then(|workflow| auto_status(workflow.lifecycle));
                 let plan_status = self
@@ -327,8 +327,8 @@ impl Tui {
             .flat_map(|repository| &repository.workflows)
         {
             match (workflow.identity.kind.as_str(), workflow.lifecycle.as_str()) {
-                ("auto", "queued" | "running" | "paused") => active_auto += 1,
-                ("auto", "failed" | "aborted") => failed_auto += 1,
+                ("coding", "queued" | "running" | "paused") => active_auto += 1,
+                ("coding", "failed" | "aborted") => failed_auto += 1,
                 ("plan", "queued" | "running" | "paused") => active_plans += 1,
                 ("plan", "failed" | "aborted") => failed_plans += 1,
                 _ => {}

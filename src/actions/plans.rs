@@ -63,56 +63,20 @@ impl Tui {
             config.default_harness.clone(),
             config.harness_adapter(&config.default_harness)?,
         );
-        let resumable = crate::observability::with_writable_db(&repo, |path| {
-            load_resumable_plan_run(&PlanRunStore::open(path), &launch)
-        })?;
-        let Some(mut resumable) = resumable else {
-            let run_id =
-                crate::worker::launch_bundled_plan(crate::workflow::bundled::BundledPlanLaunch {
-                    repository: launch.repo_root.clone(),
-                    scope_path: launch.scope_path.clone(),
-                    plan_path: launch.plan_path.clone(),
-                    step_name: launch.step_name.clone(),
-                    start_step: launch.start_step,
-                    total_steps: launch.total_steps,
-                    parallel: launch.mode == PlanRunMode::Parallel,
-                    harness_id: launch.harness_id.clone(),
-                })?;
-            if self.focused_panel == crate::tui::PanelFocus::Worktrees {
-                self.worktree_main_view = crate::view::WorktreeMainView::Plan;
-                self.main_focused = false;
-            }
-            self.show_message(&format!("Plan workflow {run_id} queued"))?;
-            return Ok(());
-        };
-        let mut should_execute = true;
-        let persisted = crate::observability::with_writable_db(&repo, |path| {
-            let store = PlanRunStore::open(path);
-            should_execute =
-                prepare_plan_run_for_resume(&store, &mut resumable, DEFAULT_OUTPUT_LINES_PER_STEP)?;
-            Ok(resumable)
-        })?;
-        let run_id = persisted.run.id.clone();
-        let scope_path = execution.cwd().to_path_buf();
-        self.plan_runs.insert(run_id.clone(), persisted.clone());
-        self.active_plan_runs
-            .insert(scope_path.clone(), run_id.clone());
-        self.selected_plan_step_by_run
-            .insert(run_id.clone(), persisted.run.selected_step);
-        self.manual_plan_step_selection_by_run.remove(&run_id);
-
-        if should_execute {
-            self.spawn_plan_run_executor(repo, config, persisted)?;
-        }
-        if self.focused_panel == crate::tui::PanelFocus::Worktrees {
-            self.worktree_main_view = crate::view::WorktreeMainView::Plan;
-            self.main_focused = false;
-        }
-        if should_execute {
-            self.show_message("started plan run")?;
-        } else {
-            self.show_message("plan run is already running")?;
-        }
+        let run_id =
+            crate::worker::launch_bundled_plan(crate::workflow::bundled::BundledPlanLaunch {
+                repository: launch.repo_root.clone(),
+                scope_path: launch.scope_path.clone(),
+                plan_path: launch.plan_path.clone(),
+                step_name: launch.step_name.clone(),
+                start_step: launch.start_step,
+                total_steps: launch.total_steps,
+                parallel: launch.mode == PlanRunMode::Parallel,
+                harness_id: launch.harness_id.clone(),
+            })?;
+        self.invalidate_workflow_snapshots();
+        self.start_workflow_polls(true);
+        self.show_message(&format!("Plan workflow {run_id} queued"))?;
         Ok(())
     }
 

@@ -70,6 +70,7 @@ mod architecture_tests {
             "pools.rs",
             "run_ledger.rs",
             "wakeups.rs",
+            "workspace.rs",
         ] {
             let path = Path::new("src/persistence").join(file);
             let production = production_source(&path);
@@ -132,6 +133,22 @@ mod architecture_tests {
             !worker.contains(&["schedule", "_queued"].concat()),
             "legacy repository scheduler remains in the worker"
         );
+    }
+
+    #[test]
+    fn repository_workspace_persistence_has_no_legacy_workflow_authority() {
+        let production = production_source(Path::new("src/persistence/workspace.rs"));
+        for forbidden in [
+            "WorkflowRow",
+            "ControlInput",
+            "apply_control",
+            "linked_plan_owners",
+        ] {
+            assert!(
+                !production.contains(forbidden),
+                "repository workspace persistence still exposes legacy workflow state: {forbidden}"
+            );
+        }
     }
 
     #[test]

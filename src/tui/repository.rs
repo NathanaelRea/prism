@@ -83,17 +83,10 @@ pub(crate) fn load_worktree_harness_configs(
         .collect()
 }
 
-pub(crate) fn maintain_workflow_storage(repo: &Repository) -> Result<(), String> {
-    crate::observability::with_writable_db_named(repo, "workflow.maintenance", |path| {
-        let plan_store = crate::plan_run::PlanRunStore::open(path);
-        crate::plan_run::cleanup_stale_archived_plan_runs(
-            &plan_store,
-            crate::plan_run::ARCHIVED_PLAN_RETENTION_MS,
-        )?;
-        let auto_store = crate::auto_flow::AutoFlowStore::open(path);
-        crate::auto_flow::load_recent_active_runs_for_repo(&auto_store, &repo.root, usize::MAX)?;
-        Ok(())
-    })
+pub(crate) fn maintain_workflow_storage(_repo: &Repository) -> Result<(), String> {
+    // Workflow history and retention are owned by the global ledger/worker. Repository databases
+    // retain only repository-local caches and Worktree Session state.
+    Ok(())
 }
 
 impl ManagedRepo {

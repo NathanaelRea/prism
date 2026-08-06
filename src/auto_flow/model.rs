@@ -470,6 +470,7 @@ impl AutoLaunch {
         self
     }
 
+    #[cfg(test)]
     pub fn create_run(&self) -> PersistedAutoRun {
         let now = unix_ms();
         let id = self.default_run_id(now);
@@ -514,6 +515,7 @@ impl AutoLaunch {
         PersistedAutoRun { run, steps }
     }
 
+    #[cfg(test)]
     pub(super) fn default_run_id(&self, now: u64) -> String {
         format!(
             "auto-{:016x}-{now}",

@@ -347,7 +347,7 @@ fn daemon_status_with_long_tmpdir_uses_the_explicit_compact_runtime() {
 }
 
 #[test]
-fn list_and_control_project_and_mutate_managed_plan_state() {
+fn list_does_not_project_or_control_legacy_repository_runs() {
     let temp = TempDir::new("managed-plan-control");
     let repo = temp.path().join("repo");
     let config_home = temp.path().join("xdg");
@@ -361,52 +361,14 @@ fn list_and_control_project_and_mutate_managed_plan_state() {
     let listed = run(["list", "--all", "--json"], &repo, &config_home);
     assert!(listed.status.success(), "{}", stderr(&listed));
     let value: serde_json::Value = serde_json::from_str(&stdout(&listed)).unwrap();
-    assert_eq!(
-        value["repositories"][0]["workflows"][0]["identity"]["run_id"],
-        "plan-control-12345678"
-    );
-    assert_eq!(
-        value["repositories"][0]["workflows"][0]["dispatch"]["state"],
-        "queued"
-    );
-    assert_eq!(
-        value["repositories"][0]["workflows"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
-    assert_eq!(
-        value["repositories"][0]["worktrees"][0]["workflows"]
-            .as_array()
-            .unwrap()
-            .len(),
-        2
-    );
+    assert_eq!(value["repositories"][0]["workflows"], serde_json::json!([]));
 
     let paused = run(["pause", "plan:plan-control-12345678"], &repo, &config_home);
-    assert!(paused.status.success(), "{}", stderr(&paused));
-    assert!(stdout(&paused).contains("state = paused"));
-    assert!(stderr(&paused).contains("control committed, but daemon wake failed"));
-    let state = persistence_test_support::plan_control_state(&db_path).unwrap();
-    assert_eq!(state, ("paused".to_string(), 1, "paused".to_string()));
-    persistence_test_support::prepare_plan_recovery(&db_path).unwrap();
-    fs::write(config_home.join("runtime"), "block daemon startup").unwrap();
-
-    let recovered = run(
-        ["recover", "plan:plan-control-12345678"],
-        &repo,
-        &config_home,
+    assert!(!paused.status.success());
+    assert_eq!(
+        persistence_test_support::plan_control_state(&db_path).unwrap(),
+        ("queued".to_string(), 0, "queued".to_string())
     );
-    assert!(recovered.status.success(), "{}", stderr(&recovered));
-    assert!(stderr(&recovered).contains("recovery committed, but daemon is unavailable"));
-    let recovery = persistence_test_support::plan_recovery_state(&db_path).unwrap();
-    assert_eq!(recovery.0, "queued");
-    assert_eq!(recovery.1, 4);
-
-    let stopped = run(["stop", "p:plan-con"], &repo, &config_home);
-    assert!(stopped.status.success(), "{}", stderr(&stopped));
-    assert!(stdout(&stopped).contains("state = aborted"));
 }
 
 #[test]

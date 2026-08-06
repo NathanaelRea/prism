@@ -756,14 +756,6 @@ pub fn with_writable_db<T>(
     writable_db(repo).run_observed(&format!("{}:{}", caller.file(), caller.line()), run)
 }
 
-pub fn with_writable_db_named<T>(
-    repo: &Repository,
-    operation: &'static str,
-    run: impl FnOnce(&Path) -> Result<T, String>,
-) -> Result<T, String> {
-    writable_db(repo).run_observed(operation, run)
-}
-
 #[track_caller]
 #[cfg(test)]
 pub fn with_nonblocking_read_db<T>(
