@@ -611,7 +611,17 @@ fn db_query_rejects_writes_after_shell_initializes_database() {
 
     assert!(!output.status.success());
     assert!(stdout(&output).is_empty());
-    assert!(stderr(&output).contains("readonly database"));
+
+    let output = run(
+        [
+            "db",
+            "select count(*) from metadata where key = 'not-allowed'",
+        ],
+        &repo,
+        &config_home,
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), "0\n");
 }
 
 #[test]

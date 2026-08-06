@@ -178,6 +178,7 @@ pub(super) async fn adopt_historical_repository_database(
             .map_err(DatabaseError::Query),
         Err(error) => {
             let _ = sqlx::query("rollback").execute(&mut connection).await;
+            let _ = connection.close().await;
             Err(error)
         }
     }
