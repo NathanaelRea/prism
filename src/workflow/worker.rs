@@ -1201,16 +1201,23 @@ fn observe_interactive_agent(
             &session.path,
         )?
     {
-        return match crate::opencode::poll_status_authoritative(&runtime) {
-            Ok(status) => Ok(Some(normalize_interactive_state(
-                running,
-                Some(status.state.agent_state()),
-            ))),
-            Err(_) if running => Ok(Some(crate::agent::AgentState::Running)),
-            Err(error) => Err(error),
-        };
+        return normalize_opencode_observation(
+            running,
+            crate::opencode::poll_status_authoritative(&runtime)
+                .map(|status| status.state.agent_state()),
+        );
     }
     Ok(generation.map(|_| normalize_interactive_state(running, None)))
+}
+
+fn normalize_opencode_observation(
+    running: bool,
+    observed: Result<crate::agent::AgentState, String>,
+) -> Result<Option<crate::agent::AgentState>, String> {
+    match observed {
+        Ok(state) => Ok(Some(normalize_interactive_state(running, Some(state)))),
+        Err(error) => Err(error),
+    }
 }
 
 fn normalize_interactive_state(
@@ -1507,6 +1514,51 @@ mod tests {
             Some(AgentState::ExitedOk)
         );
         assert_eq!(resolve_observed_state(None, None), None);
+    }
+
+    #[test]
+    fn transient_opencode_poll_failure_does_not_repeat_a_completion_notification() {
+        use crate::agent::AgentState;
+        use crate::config::NotificationConfig;
+        use crate::notification::{NotificationCoordinator, NotificationObservation};
+        use crate::session::{WorktreeRepositoryKey, WorktreeSessionKey};
+
+        let temp = crate::compact_runtime::CompactTempDir::new("notification-poll");
+        let coordinator =
+            NotificationCoordinator::open(&temp.runtime_path().join("state.db")).unwrap();
+        let session = WorktreeSessionKey {
+            repository: WorktreeRepositoryKey::new("/tmp/repo".into()),
+            path: "/tmp/repo/feature".into(),
+            branch: "feature".to_string(),
+            incarnation: "one".to_string(),
+        };
+        let config = NotificationConfig {
+            enabled: true,
+            completed: true,
+            ..NotificationConfig::default()
+        };
+        let observe = |state, at| {
+            coordinator
+                .observe(NotificationObservation {
+                    session: &session,
+                    repo_label: "repo",
+                    state,
+                    config,
+                    observed_unix_ms: at,
+                })
+                .unwrap()
+                .event_id
+        };
+
+        assert_eq!(observe(AgentState::Running, 1_000), None);
+        assert!(observe(AgentState::ExitedOk, 2_000).is_some());
+        let transient = normalize_opencode_observation(true, Err("timeout".to_string()));
+        if let Ok(Some(state)) = transient.as_ref() {
+            observe(*state, 3_000);
+        }
+        assert!(transient.is_err());
+        assert_eq!(observe(AgentState::ExitedOk, 4_000), None);
+        assert_eq!(coordinator.pending().unwrap().len(), 1);
     }
 
     #[test]

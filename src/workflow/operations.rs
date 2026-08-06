@@ -747,11 +747,11 @@ mod tests {
                 source
                     .write_immediate(|connection| {
                         Box::pin(async move {
-                            sqlx::query("insert into plan_run (id, repo_root, scope_path, plan_path, plan_display, step_name, start_step, total_steps, mode, status, selected_step, created_unix_ms, updated_unix_ms) values ('plan-1', '/repo', '/repo', '/repo/plan.md', 'plan.md', 'phase', 1, 1, 'execute', 'completed', 1, 10, 20)")
+                            sqlx::query("insert into plan_run (id, repo_root, scope_path, plan_path, plan_display, step_name, start_step, total_steps, mode, status, selected_step, created_unix_ms, updated_unix_ms) values ('plan-1', '/repo', '/repo', '/repo/plan.md', 'plan.md', 'phase', 1, 1, 'execute', 'done', 1, 10, 20)")
                                 .execute(&mut *connection)
                                 .await
                                 .map_err(DatabaseError::Query)?;
-                            sqlx::query("insert into plan_step_run (run_id, step, prompt, status, started_unix_ms, finished_unix_ms, summary) values ('plan-1', 1, 'implement phase one', 'completed', 11, 19, 'done')")
+                            sqlx::query("insert into plan_step_run (run_id, step, prompt, status, started_unix_ms, finished_unix_ms, summary) values ('plan-1', 1, 'implement phase one', 'done', 11, 19, 'done')")
                                 .execute(connection)
                                 .await
                                 .map_err(DatabaseError::Query)?;

@@ -1,3 +1,5 @@
+mod adoption;
+
 pub(crate) mod approvals;
 pub(crate) mod artifacts;
 pub(crate) mod auto_flow;
@@ -62,6 +64,7 @@ mod architecture_tests {
     #[test]
     fn generalized_persistence_has_no_synchronous_runtime_wrapper() {
         for file in [
+            "adoption.rs",
             "approvals.rs",
             "artifacts.rs",
             "control_plane.rs",

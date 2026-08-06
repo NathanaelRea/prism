@@ -424,6 +424,7 @@ impl TestConnection {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -487,6 +488,10 @@ mod tests {
         .len();
         assert_eq!(foreign_key_violations, 0);
         drop(connection);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         remove_database(&path);
     }
 
@@ -564,6 +569,16 @@ mod tests {
             sqlx::query("insert into metadata (key, value) values ('preserved', 'yes')")
                 .execute(&mut connection)
                 .await?;
+            sqlx::raw_sql(
+                "insert into plan_run (id, repo_root, scope_path, plan_path, plan_display, step_name, start_step, total_steps, mode, status, selected_step, created_unix_ms, updated_unix_ms)
+                 values ('v1-plan', '/repo', '/worktree', '/worktree/plan.md', 'plan.md', 'phase', 1, 1, 'sequential', 'done', 1, 1, 2);
+                 insert into plan_step_run (run_id, step, prompt, status)
+                 values ('v1-plan', 1, 'preserve v1 history', 'done');
+                 insert into plan_output_line (run_id, step, line_number, time_unix_ms, kind, text)
+                 values ('v1-plan', 1, 1, 3, 'stdout', 'v1 plan output');",
+            )
+            .execute(&mut connection)
+            .await?;
             Ok(())
         })
         .unwrap();
@@ -586,7 +601,295 @@ mod tests {
         .unwrap();
         assert_eq!(preserved, "yes");
         drop(backup_connection);
+        let mut connection = open_readonly(&path).unwrap();
+        let preserved_output: String = block_on(async {
+            sqlx::query_scalar("select text from plan_output_line where run_id = 'v1-plan'")
+                .fetch_one(&mut connection)
+                .await
+        })
+        .unwrap();
+        assert_eq!(preserved_output, "v1 plan output");
+        let v2_tables: i64 = block_on(async {
+            sqlx::query_scalar("select count(*) from sqlite_master where type = 'table' and name in ('worktree_session','active_worktree_session','merge_intent','integration_lane')")
+                .fetch_one(&mut connection)
+                .await
+        })
+        .unwrap();
+        assert_eq!(v2_tables, 4);
+        drop(connection);
         remove_database(&backup);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn released_schema_v2_database_is_migrated_and_adopted() {
+        let path = test_path("adopt-v2");
+        let options = writable_options(&path, true).unwrap();
+        let mut connection = connect(&path, options).unwrap();
+        block_on(async {
+            sqlx::raw_sql(include_str!(
+                "../../migrations/historical/repository_v2.sql"
+            ))
+            .execute(&mut connection)
+            .await?;
+            sqlx::query("insert into metadata (key, value) values ('preserved', 'v2')")
+                .execute(&mut connection)
+                .await?;
+            sqlx::query("insert into task_metadata (branch, prompt_summary, initial_prompt, worktree, updated_unix_ms, classification, visibility) values ('feat/v2', 'summary', 'prompt', '/tmp/v2', 42, 'work', 1)")
+                .execute(&mut connection)
+                .await?;
+            sqlx::query("insert into repo_policy_cache_v2 (provider, canonical_host, project_path, project_path_key, target_branch, repo_remote, refreshed_unix_ms) values ('git_hub', 'github.com', 'Owner/Repo', 'owner/repo', 'main', 'origin', 42)")
+                .execute(&mut connection)
+                .await?;
+            Ok(())
+        })
+        .unwrap();
+        block_on(connection.close()).unwrap();
+
+        initialize(&path).unwrap();
+
+        assert_eq!(
+            load_metadata(&path, "preserved").unwrap().as_deref(),
+            Some("v2")
+        );
+        let mut connection = open_readonly(&path).unwrap();
+        let visibility: i64 = block_on(async {
+            sqlx::query_scalar("select visibility from task_metadata where branch = 'feat/v2'")
+                .fetch_one(&mut connection)
+                .await
+        })
+        .unwrap();
+        assert_eq!(visibility, 1);
+        let project_path_key: String = block_on(async {
+            sqlx::query_scalar(
+                "select project_path_key from repo_policy_cache where provider = 'git_hub'",
+            )
+            .fetch_one(&mut connection)
+            .await
+        })
+        .unwrap();
+        assert_eq!(project_path_key, "owner/repo");
+        drop(connection);
+        assert!(path.with_extension("db.pre-sqlx-backup").is_file());
+        remove_database(&path.with_extension("db.pre-sqlx-backup"));
+        remove_database(&path);
+    }
+
+    #[test]
+    fn progressively_migrated_schema_v2_database_is_adopted() {
+        let path = test_path("adopt-progressive-v2");
+        let options = writable_options(&path, true).unwrap();
+        let mut connection = connect(&path, options).unwrap();
+        block_on(async {
+            sqlx::raw_sql(include_str!(
+                "../../tests/fixtures/sql/repository-v2-progressive.sql"
+            ))
+            .execute(&mut connection)
+            .await?;
+            sqlx::query("insert into metadata (key, value) values ('preserved', 'progressive-v2')")
+                .execute(&mut connection)
+                .await?;
+            Ok(())
+        })
+        .unwrap();
+        block_on(connection.close()).unwrap();
+
+        initialize(&path).unwrap();
+
+        assert_eq!(
+            load_metadata(&path, "preserved").unwrap().as_deref(),
+            Some("progressive-v2")
+        );
+        let backup = path.with_extension("db.pre-sqlx-backup");
+        assert!(backup.is_file());
+        remove_database(&backup);
+        remove_database(&path);
+    }
+
+    #[test]
+    fn released_schema_v2_preserves_durable_repository_state() {
+        let path = test_path("adopt-v2-durable-state");
+        let options = writable_options(&path, true).unwrap();
+        let mut connection = connect(&path, options).unwrap();
+        block_on(async {
+            sqlx::raw_sql(include_str!(
+                "../../migrations/historical/repository_v2.sql"
+            ))
+            .execute(&mut connection)
+            .await?;
+            sqlx::raw_sql(
+                "insert into worktree_session (id, repo_root, initial_branch, initial_worktree_path, created_unix_ms)
+                 values ('session-1', '/repo', 'feat/durable', '/repo.wt/durable', 1);
+                 insert into active_worktree_session (worktree_session_id, repo_root, branch, worktree_path, worktree_incarnation, observed_unix_ms)
+                 values ('session-1', '/repo', 'feat/durable', '/repo.wt/durable', 'incarnation-1', 2);
+                 insert into plan_run (id, repo_root, scope_path, plan_path, plan_display, step_name, start_step, total_steps, mode, status, selected_step, created_unix_ms, updated_unix_ms, worktree_session_id)
+                 values ('plan-1', '/repo', '/repo.wt/durable', '/repo.wt/durable/plan.md', 'plan.md', 'phase', 1, 1, 'sequential', 'done', 1, 3, 4, 'session-1');
+                 insert into plan_step_run (run_id, step, prompt, status)
+                 values ('plan-1', 1, 'preserve plan', 'done');
+                 insert into plan_output_line (run_id, step, line_number, time_unix_ms, kind, text)
+                 values ('plan-1', 1, 1, 5, 'stdout', 'plan output');
+                 insert into auto_run (id, repo_root, worktree_path, branch, mode, variant, prompt_summary, initial_prompt, status, created_unix_ms, updated_unix_ms, worktree_session_id)
+                 values ('auto-1', '/repo', '/repo.wt/durable', 'feat/durable', 'prompt', 'medium', 'durable', 'preserve auto', 'done', 6, 7, 'session-1');
+                 insert into auto_step_run (id, run_id, sequence, step_key, status, attempt)
+                 values (101, 'auto-1', 1, 'implement', 'done', 1);
+                 insert into auto_output_line (step_run_id, line_number, time_unix_ms, kind, text)
+                 values (101, 1, 8, 'stdout', 'auto output');
+                 insert into auto_event (run_id, step_run_id, time_unix_ms, kind, data_json)
+                 values ('auto-1', 101, 9, 'completed', '{}');
+                 insert into workflow_execution (workflow_kind, run_id, dispatch_state, created_unix_ms, updated_unix_ms)
+                 values ('auto', 'auto-1', 'terminal', 10, 11);
+                 insert into merge_intent (id, run_id, generation, state, placement, created_unix_ms, updated_unix_ms)
+                 values (201, 'auto-1', 1, 'merged', 'direct', 12, 13);
+                 insert into integration_lane (lane_key, next_ready_sequence, reserved_intent_id, updated_unix_ms)
+                 values ('github.com/org/repo:main', 2, 201, 14);
+                 insert into notification_outbox (worktree_path, branch, incarnation, transition_sequence, kind, title, body, observed_unix_ms, expires_unix_ms, delivery_state, available_unix_ms)
+                 values ('/repo.wt/durable', 'feat/durable', 'incarnation-1', 1, 'completed', 'done', 'body', 15, 16, 'pending', 15);",
+            )
+            .execute(&mut connection)
+            .await?;
+            Ok(())
+        })
+        .unwrap();
+        block_on(connection.close()).unwrap();
+
+        initialize(&path).unwrap();
+
+        let mut connection = open_readonly(&path).unwrap();
+        let facts: (i64, i64, i64, i64, i64, i64, i64, i64) = block_on(async {
+            sqlx::query_as(
+                "select
+                   (select count(*) from active_worktree_session where worktree_session_id = 'session-1'),
+                   (select count(*) from plan_output_line where text = 'plan output'),
+                   (select count(*) from auto_output_line where text = 'auto output'),
+                   (select count(*) from auto_event where run_id = 'auto-1'),
+                   (select count(*) from workflow_execution where run_id = 'auto-1' and execution_version = 1),
+                   (select count(*) from merge_intent where id = 201 and state = 'merged'),
+                   (select count(*) from integration_lane where reserved_intent_id = 201),
+                   (select count(*) from notification_outbox where branch = 'feat/durable')",
+            )
+            .fetch_one(&mut connection)
+            .await
+        })
+        .unwrap();
+        assert_eq!(facts, (1, 1, 1, 1, 1, 1, 1, 1));
+        let user_version: i64 = block_on(async {
+            sqlx::query_scalar("pragma user_version")
+                .fetch_one(&mut connection)
+                .await
+        })
+        .unwrap();
+        assert_eq!(
+            user_version,
+            super::super::adoption::SQLX_OWNED_USER_VERSION
+        );
+        drop(connection);
+        remove_database(&path.with_extension("db.pre-sqlx-backup"));
+        remove_database(&path);
+    }
+
+    #[test]
+    fn protected_legacy_execution_blocks_adoption_without_modification() {
+        let path = test_path("adopt-v2-protected");
+        let options = writable_options(&path, true).unwrap();
+        let mut connection = connect(&path, options).unwrap();
+        block_on(async {
+            sqlx::raw_sql(include_str!(
+                "../../migrations/historical/repository_v2.sql"
+            ))
+            .execute(&mut connection)
+            .await?;
+            sqlx::query("insert into auto_run (id, repo_root, worktree_path, branch, mode, variant, prompt_summary, initial_prompt, status, created_unix_ms, updated_unix_ms) values ('auto-protected', '/repo', '/worktree', 'feat/protected', 'prompt', 'medium', 'protected', 'protected', 'queued', 1, 1)")
+                .execute(&mut connection)
+                .await?;
+            sqlx::query(include_str!("../../sql/database/test_checkpoint.sql"))
+                .fetch_one(&mut connection)
+                .await?;
+            Ok(())
+        })
+        .unwrap();
+        block_on(connection.close()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+
+        let error = initialize(&path).unwrap_err();
+
+        assert!(matches!(
+            error,
+            DatabaseError::ProtectedLegacyExecution { count: 1, .. }
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(!path.with_extension("db.pre-sqlx-backup").exists());
+        remove_database(&path);
+    }
+
+    #[test]
+    fn failed_legacy_conversion_rolls_back_and_keeps_recovery_backup() {
+        let path = test_path("adopt-v2-rollback");
+        let options = writable_options(&path, true).unwrap();
+        let mut connection = connect(&path, options).unwrap();
+        block_on(async {
+            sqlx::raw_sql(include_str!(
+                "../../migrations/historical/repository_v2.sql"
+            ))
+            .execute(&mut connection)
+            .await?;
+            // `identity_complete` claims a canonical identity while one required field is null.
+            // Adoption must fail rather than silently retain or partially rewrite this cache row.
+            sqlx::query("insert into pr_cache (branch, number, title, url, state, review_decision, head_ref, base_ref, head_sha, updated_at, check_status, merged, draft, last_refreshed, refreshed_unix_ms, identity_complete) values ('feat/invalid-cache', 1, 'title', 'url', 'open', '', 'feat/invalid-cache', 'main', 'head', '', '', 0, 0, '', 1, 1)")
+                .execute(&mut connection)
+                .await?;
+            Ok(())
+        })
+        .unwrap();
+        block_on(connection.close()).unwrap();
+
+        assert!(initialize(&path).is_err());
+
+        let mut connection = open_readonly(&path).unwrap();
+        let facts: (i64, i64, i64) = block_on(async {
+            sqlx::query_as(
+                "select
+                   (select count(*) from pr_cache where branch = 'feat/invalid-cache' and provider is null),
+                   (select count(*) from pragma_table_info('pr_cache') where name = 'identity_complete'),
+                   (select count(*) from sqlite_master where name = '_sqlx_migrations')",
+            )
+            .fetch_one(&mut connection)
+            .await
+        })
+        .unwrap();
+        assert_eq!(facts, (1, 1, 0));
+        drop(connection);
+        assert!(path.with_extension("db.pre-sqlx-backup").is_file());
+        remove_database(&path.with_extension("db.pre-sqlx-backup"));
+        remove_database(&path);
+    }
+
+    #[test]
+    fn sqlx_ownership_fence_rejects_legacy_migration_control() {
+        let path = test_path("sqlx-ownership-fence");
+        initialize(&path).unwrap();
+        let mut connection = connect_writable(&path).unwrap();
+        block_on(async {
+            sqlx::query("pragma user_version = 2")
+                .execute(&mut connection)
+                .await?;
+            // Simulate an unreleased development build that wrote a different baseline before
+            // the SQLx ownership fence existed.
+            sqlx::query("update _sqlx_migrations set checksum = x'00' where version = 1")
+                .execute(&mut connection)
+                .await?;
+            Ok(())
+        })
+        .unwrap();
+        block_on(connection.close()).unwrap();
+
+        let error = crate::async_runtime::block_on(initialize_async(&path))
+            .unwrap()
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            DatabaseError::NonCanonicalRepositorySchema { .. }
+        ));
         remove_database(&path);
     }
 

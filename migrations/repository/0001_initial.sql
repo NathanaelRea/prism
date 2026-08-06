@@ -103,6 +103,7 @@ create table opencode_runtime (
   generation integer not null,
   updated_unix_ms integer not null,
   server_start_time_ticks integer,
+  worktree_session_id text,
   primary key (repo_root, harness_id, branch, worktree_path)
 );
 create index opencode_runtime_branch_idx
@@ -125,7 +126,8 @@ create table plan_run (
   selected_step integer not null,
   created_unix_ms integer not null,
   updated_unix_ms integer not null,
-  archived_unix_ms integer
+  archived_unix_ms integer,
+  worktree_session_id text
 );
 
 create table plan_step_run (
@@ -202,6 +204,7 @@ create table auto_run (
   created_unix_ms integer not null,
   updated_unix_ms integer not null,
   archived_unix_ms integer,
+  worktree_session_id text,
   foreign key (selected_step_run_id) references auto_step_run(id) on delete set null
 );
 
@@ -260,6 +263,36 @@ create index auto_step_run_key_idx on auto_step_run(run_id, step_key, attempt);
 create index auto_output_line_step_idx on auto_output_line(step_run_id, line_number);
 create index auto_event_run_idx on auto_event(run_id, time_unix_ms);
 
+-- Retained repository-local integration state from the released v2 schema. New workflow
+-- execution does not write these tables, but adoption must not erase an unfinished cutover.
+create table merge_intent (
+  id integer primary key autoincrement,
+  run_id text not null references auto_run(id) on delete cascade,
+  generation integer not null,
+  state text not null,
+  placement text not null,
+  change_request_identity_json text,
+  lane_key text,
+  target_branch text,
+  pr_number integer,
+  head_sha text,
+  ready_sequence integer,
+  created_unix_ms integer not null,
+  updated_unix_ms integer not null,
+  unique(run_id, generation)
+);
+create unique index merge_intent_active_run_idx
+  on merge_intent(run_id) where state = 'armed';
+create index merge_intent_lane_ready_idx
+  on merge_intent(lane_key, state, ready_sequence);
+
+create table integration_lane (
+  lane_key text primary key,
+  next_ready_sequence integer not null default 1,
+  reserved_intent_id integer references merge_intent(id) on delete set null,
+  updated_unix_ms integer not null
+);
+
 create table workflow_execution (
   workflow_kind text not null,
   run_id text not null,
@@ -276,12 +309,16 @@ create table workflow_execution (
   recovery_decided_unix_ms integer,
   created_unix_ms integer not null,
   updated_unix_ms integer not null,
+  execution_version integer not null default 1,
+  not_before_unix_ms integer,
+  wake_reason text,
+  workflow_revision integer not null default 0,
   primary key (workflow_kind, run_id),
   check (workflow_kind in ('auto', 'plan')),
   check (dispatch_state in ('queued', 'claimed', 'recovery_pending', 'paused', 'terminal'))
 );
 create index workflow_execution_dispatch_idx
-  on workflow_execution(dispatch_state, updated_unix_ms);
+  on workflow_execution(dispatch_state, not_before_unix_ms, created_unix_ms);
 create index workflow_execution_lease_idx
   on workflow_execution(dispatch_state, lease_expires_unix_ms);
 create index workflow_execution_daemon_idx
@@ -400,3 +437,28 @@ create table notification_outbox (
 );
 create index notification_outbox_delivery_idx
   on notification_outbox(delivery_state, expires_unix_ms, id);
+
+-- Worktree Session identity remains repository-local and survives branch/path reuse.
+create table worktree_session (
+  id text primary key,
+  repo_root text not null,
+  initial_branch text not null,
+  initial_worktree_path text not null,
+  created_unix_ms integer not null
+) without rowid;
+
+create table active_worktree_session (
+  worktree_session_id text primary key references worktree_session(id),
+  repo_root text not null,
+  branch text not null,
+  worktree_path text not null,
+  worktree_incarnation text not null,
+  observed_unix_ms integer not null,
+  unique(repo_root, branch),
+  unique(repo_root, worktree_path)
+) without rowid;
+create index active_worktree_session_location_idx
+  on active_worktree_session(repo_root, branch, worktree_path);
+
+-- Fence pre-SQLx Prism binaries out after migration ownership transfers to SQLx.
+pragma user_version = 2147483647;

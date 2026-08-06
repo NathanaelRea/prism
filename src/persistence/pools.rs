@@ -73,8 +73,10 @@ impl RepositoryDatabase {
 
 pub(super) async fn initialize_repository_database(path: &Path) -> Result<(), DatabaseError> {
     prepare_parent(path)?;
-    adopt_historical_repository_database(path).await?;
-    migrate(path, &REPOSITORY_MIGRATOR).await
+    super::adoption::adopt_historical_repository_database(path, &REPOSITORY_MIGRATOR).await?;
+    migrate(path, &REPOSITORY_MIGRATOR).await?;
+    super::adoption::validate_canonical_repository_database(path, &REPOSITORY_MIGRATOR).await?;
+    set_owner_only(path)
 }
 
 impl WorkflowDatabase {
@@ -279,7 +281,7 @@ fn prepare_parent(path: &Path) -> Result<(), DatabaseError> {
     Ok(())
 }
 
-fn set_owner_only(path: &Path) -> Result<(), DatabaseError> {
+pub(super) fn set_owner_only(path: &Path) -> Result<(), DatabaseError> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|source| {
         DatabaseError::SetPermissions {
             path: path.into(),
@@ -315,143 +317,6 @@ async fn reject_wrong_workflow_database(path: &Path) -> Result<(), DatabaseError
         });
     }
     Ok(())
-}
-
-pub(super) async fn adopt_historical_repository_database(path: &Path) -> Result<(), DatabaseError> {
-    if !path.exists()
-        || std::fs::metadata(path)
-            .map(|m| m.len() == 0)
-            .unwrap_or(false)
-    {
-        return Ok(());
-    }
-    // Classification is deliberately read-only. A database that is unknown, corrupt, or from a
-    // future Prism version must not gain a WAL, migration table, or any other side effect merely
-    // because Prism inspected it.
-    let mut connection = SqliteConnection::connect_with(&options(path, false, true)?)
-        .await
-        .map_err(|source| DatabaseError::Connect {
-            path: path.into(),
-            source,
-        })?;
-    let owned: i64 = sqlx::query_scalar(
-        "select count(*) from sqlite_master where type = 'table' and name = '_sqlx_migrations'",
-    )
-    .fetch_one(&mut connection)
-    .await
-    .map_err(DatabaseError::Query)?;
-    if owned == 1 {
-        return Ok(());
-    }
-
-    // Released pre-SQLx databases used user_version=1 and these canonical anchor tables.
-    let user_version: i64 = sqlx::query_scalar("pragma user_version")
-        .fetch_one(&mut connection)
-        .await
-        .map_err(DatabaseError::Query)?;
-    let anchors: i64 = sqlx::query_scalar(
-        "select count(*) from sqlite_master where type = 'table' and name in ('metadata','plan_run','auto_run','workflow_execution','notification_outbox')",
-    ).fetch_one(&mut connection).await.map_err(DatabaseError::Query)?;
-    if user_version != 1 || anchors != 5 {
-        return Err(DatabaseError::UnknownHistoricalSchema {
-            path: path.into(),
-            user_version,
-        });
-    }
-    validate_integrity(&mut connection).await?;
-    if schema_contract(&mut connection).await? != canonical_repository_schema_contract().await? {
-        return Err(DatabaseError::UnknownHistoricalSchema {
-            path: path.into(),
-            user_version,
-        });
-    }
-
-    let backup = path.with_extension("db.pre-sqlx-backup");
-    if !backup.exists() {
-        // `VACUUM INTO` uses SQLite's own consistent snapshot machinery, so committed WAL pages
-        // are included. Copying only the main file can silently produce an incomplete recovery
-        // artifact when the historical database is in WAL mode.
-        let backup_name = backup.to_string_lossy().into_owned();
-        sqlx::query("vacuum into ?")
-            .bind(backup_name)
-            .execute(&mut connection)
-            .await
-            .map_err(|source| DatabaseError::Backup {
-                path: path.into(),
-                backup: backup.clone(),
-                source: std::io::Error::other(source.to_string()),
-            })?;
-        set_owner_only(&backup)?;
-    }
-    connection.close().await.map_err(DatabaseError::Query)?;
-
-    let mut connection = SqliteConnection::connect_with(&options(path, false, false)?)
-        .await
-        .map_err(|source| DatabaseError::Connect {
-            path: path.into(),
-            source,
-        })?;
-    let baseline = REPOSITORY_MIGRATOR
-        .iter()
-        .next()
-        .ok_or(DatabaseError::MissingMigrationBaseline)?;
-    sqlx::query("begin immediate")
-        .execute(&mut connection)
-        .await
-        .map_err(DatabaseError::Query)?;
-    let adoption = async {
-        sqlx::query("create table _sqlx_migrations (version bigint primary key, description text not null, installed_on timestamp not null default current_timestamp, success boolean not null, checksum blob not null, execution_time bigint not null)")
-            .execute(&mut connection).await?;
-        sqlx::query("insert into _sqlx_migrations (version, description, success, checksum, execution_time) values (?, ?, 1, ?, 0)")
-            .bind(baseline.version).bind(baseline.description.as_ref()).bind(baseline.checksum.as_ref())
-            .execute(&mut connection).await?;
-        Ok::<_, sqlx::Error>(())
-    }.await;
-    match adoption {
-        Ok(()) => sqlx::query("commit")
-            .execute(&mut connection)
-            .await
-            .map(|_| ())
-            .map_err(DatabaseError::Query),
-        Err(source) => {
-            let _ = sqlx::query("rollback").execute(&mut connection).await;
-            Err(DatabaseError::Query(source))
-        }
-    }
-}
-
-async fn canonical_repository_schema_contract()
--> Result<Vec<(String, String, String, String)>, DatabaseError> {
-    let mut canonical = SqliteConnection::connect("sqlite::memory:")
-        .await
-        .map_err(DatabaseError::Query)?;
-    REPOSITORY_MIGRATOR
-        .run(&mut canonical)
-        .await
-        .map_err(DatabaseError::Migrate)?;
-    schema_contract(&mut canonical).await
-}
-
-async fn schema_contract(
-    connection: &mut SqliteConnection,
-) -> Result<Vec<(String, String, String, String)>, DatabaseError> {
-    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
-        "select type, name, tbl_name, coalesce(sql, '') from sqlite_master where name not like 'sqlite_%' and name <> '_sqlx_migrations' order by type, name",
-    )
-    .fetch_all(connection)
-    .await
-    .map_err(DatabaseError::Query)?;
-    Ok(rows
-        .into_iter()
-        .map(|(kind, name, table, sql)| {
-            let normalized = sql
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .to_ascii_lowercase();
-            (kind, name, table, normalized)
-        })
-        .collect())
 }
 
 pub(super) async fn validate_integrity(

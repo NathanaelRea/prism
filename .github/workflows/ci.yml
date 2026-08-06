@@ -21,6 +21,7 @@ jobs:
           targets: aarch64-apple-darwin
       - name: Install SQLx CLI 0.8.6
         run: cargo install sqlx-cli --version 0.8.6 --locked --no-default-features --features sqlite,rustls
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
       - uses: actions/setup-node@v4
         with:
           node-version: 22

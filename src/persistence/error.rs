@@ -12,6 +12,13 @@ pub(crate) enum DatabaseError {
         path: PathBuf,
         user_version: i64,
     },
+    NonCanonicalRepositorySchema {
+        path: PathBuf,
+    },
+    ProtectedLegacyExecution {
+        path: PathBuf,
+        count: i64,
+    },
     MissingMigrationBaseline,
     Backup {
         path: PathBuf,
@@ -62,6 +69,16 @@ impl fmt::Display for DatabaseError {
             Self::UnknownHistoricalSchema { path, user_version } => write!(
                 formatter,
                 "database {} has an unknown historical schema (user_version={user_version}); the original was not modified",
+                path.display()
+            ),
+            Self::NonCanonicalRepositorySchema { path } => write!(
+                formatter,
+                "SQLx-owned repository database {} does not match the canonical migration schema",
+                path.display()
+            ),
+            Self::ProtectedLegacyExecution { path, count } => write!(
+                formatter,
+                "database {} has {count} protected queued, claimed, recovery-pending, running, waiting, or paused legacy execution record(s); resolve them with the previous Prism version before migration",
                 path.display()
             ),
             Self::MissingMigrationBaseline => {
@@ -128,6 +145,8 @@ impl Error for DatabaseError {
             Self::Query(source) => Some(source),
             Self::WrongDatabase { .. }
             | Self::UnknownHistoricalSchema { .. }
+            | Self::NonCanonicalRepositorySchema { .. }
+            | Self::ProtectedLegacyExecution { .. }
             | Self::MissingMigrationBaseline
             | Self::StaleClaim
             | Self::Conflict { .. }

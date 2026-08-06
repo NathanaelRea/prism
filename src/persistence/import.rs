@@ -310,7 +310,7 @@ fn imported_step_status(status: &str) -> &'static str {
 
 fn imported_status(status: &str, updated_unix_ms: i64) -> (&'static str, Option<i64>) {
     match status {
-        "completed" | "succeeded" | "merged" => ("succeeded", Some(updated_unix_ms)),
+        "completed" | "succeeded" | "done" | "merged" => ("succeeded", Some(updated_unix_ms)),
         "failed" | "error" => ("failed", Some(updated_unix_ms)),
         "cancelled" | "canceled" | "aborted" => ("cancelled", Some(updated_unix_ms)),
         "paused" => ("paused", None),
