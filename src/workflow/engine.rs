@@ -189,6 +189,9 @@ impl StepImplementation for CommandImplementation {
         Box::pin(async move {
             let input: CommandInput = serde_json::from_str(context.input_json())
                 .map_err(|error| format!("invalid command step input: {error}"))?;
+            if context.is_cancelled() {
+                return Err("command cancelled".into());
+            }
             if input.program.trim().is_empty() {
                 return Err("command program must not be empty".into());
             }
@@ -515,6 +518,7 @@ pub struct WorkflowWorker {
     implementations: HashMap<String, RegisteredImplementation>,
     targets: HashMap<String, Arc<dyn ExecutionTarget>>,
     reconcilers: HashMap<String, Arc<dyn EffectReconciler>>,
+    execution: ExecutionControl,
 }
 
 impl WorkflowWorker {
@@ -531,6 +535,7 @@ impl WorkflowWorker {
             implementations: HashMap::new(),
             targets: default_targets(),
             reconcilers: HashMap::new(),
+            execution: ExecutionControl::new(),
         })
     }
 
@@ -546,11 +551,15 @@ impl WorkflowWorker {
             implementations: HashMap::new(),
             targets: default_targets(),
             reconcilers: HashMap::new(),
+            execution: ExecutionControl::new(),
         })
     }
 
     pub(crate) fn operations(&self) -> crate::workflow::operations::WorkflowOperations {
-        crate::workflow::operations::WorkflowOperations::from_database(self.database.clone())
+        crate::workflow::operations::WorkflowOperations::from_database_with_execution(
+            self.database.clone(),
+            Some(self.execution.clone()),
+        )
     }
 
     pub(crate) fn register_builtins(&mut self) -> Result<(), WorkerError> {
@@ -637,7 +646,7 @@ impl WorkflowWorker {
         let effect_broker = EffectBroker::new(self.database.clone());
         let artifact_store = ArtifactStore::new(self.database.clone());
         let wakeups = WakeupStore::new(self.database.clone());
-        let active = Arc::new(Mutex::new(HashMap::<String, ActiveAttempt>::new()));
+        let active = self.execution.active.clone();
         let registry = ExecutionRegistry {
             implementations: Arc::new(self.implementations),
             targets: Arc::new(self.targets),
@@ -725,13 +734,36 @@ impl WorkflowWorker {
 #[derive(Clone)]
 struct Dispatch {
     lease: AttemptLease,
+    run_id: String,
     implementation: String,
     input_json: String,
 }
 
 struct ActiveAttempt {
     lease: AttemptLease,
+    run_id: String,
     cancel: watch::Sender<bool>,
+}
+
+#[derive(Clone)]
+pub(crate) struct ExecutionControl {
+    active: Arc<Mutex<HashMap<String, ActiveAttempt>>>,
+}
+
+impl ExecutionControl {
+    fn new() -> Self {
+        Self {
+            active: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub(crate) fn cancel_run(&self, run_id: &str) {
+        if let Ok(active) = self.active.lock() {
+            for attempt in active.values().filter(|attempt| attempt.run_id == run_id) {
+                let _ = attempt.cancel.send(true);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -816,6 +848,7 @@ async fn scheduler_task(
                     }).await? else { continue };
                     if let Err(error) = dispatch.send(Dispatch {
                         lease,
+                        run_id: step.run_id,
                         implementation: step.implementation,
                         input_json: step.input_json,
                     }).await {
@@ -853,7 +886,17 @@ async fn execution_task(
                 Some(item) => {
                     let (cancel, cancellation) = watch::channel(false);
                     active.lock().map_err(|_| WorkerError::Stopped("active attempt registry poisoned".into()))?
-                        .insert(item.lease.attempt_id.clone(), ActiveAttempt { lease: item.lease.clone(), cancel });
+                        .insert(item.lease.attempt_id.clone(), ActiveAttempt {
+                            lease: item.lease.clone(),
+                            run_id: item.run_id.clone(),
+                            cancel,
+                        });
+                    if coordinator.run_is_cancelled(&item.run_id).await?
+                        && let Ok(active) = active.lock()
+                        && let Some(attempt) = active.get(&item.lease.attempt_id)
+                    {
+                        let _ = attempt.cancel.send(true);
+                    }
                     let implementation = registry.implementations
                         .get(&item.implementation)
                         .map(|registration| registration.implementation.clone());
@@ -864,20 +907,24 @@ async fn execution_task(
                     let stores = stores.clone();
                     executions.spawn(async move {
                         let completion_cancellation = cancellation.clone();
-                        let result = match (implementation, target) {
-                            (Some(implementation), Some(target)) => target.execute(implementation, ExecutionContext {
-                                run_attempt_id: item.lease.attempt_id.clone(),
-                                step_id: item.lease.step_id.clone(),
-                                input_json: item.input_json,
-                                output: output.clone(),
-                                cancellation,
-                                control: stores.control,
-                                effects: stores.effects,
-                                artifacts: stores.artifacts,
-                                lease: item.lease.clone(),
-                            }).await,
-                            (None, _) => Err(format!("unregistered step implementation '{}'", item.implementation)),
-                            (_, None) => Err(format!("unregistered execution target '{}'", item.lease.target_id)),
+                        let result = if *completion_cancellation.borrow() {
+                            Err("attempt cancelled".into())
+                        } else {
+                            match (implementation, target) {
+                                (Some(implementation), Some(target)) => target.execute(implementation, ExecutionContext {
+                                    run_attempt_id: item.lease.attempt_id.clone(),
+                                    step_id: item.lease.step_id.clone(),
+                                    input_json: item.input_json,
+                                    output: output.clone(),
+                                    cancellation,
+                                    control: stores.control,
+                                    effects: stores.effects,
+                                    artifacts: stores.artifacts,
+                                    lease: item.lease.clone(),
+                                }).await,
+                                (None, _) => Err(format!("unregistered step implementation '{}'", item.implementation)),
+                                (_, None) => Err(format!("unregistered execution target '{}'", item.lease.target_id)),
+                            }
                         };
                         let (status, result_json) = if *completion_cancellation.borrow() {
                             ("cancelled", serde_json::json!({"error": "attempt cancelled"}).to_string())
@@ -1319,6 +1366,30 @@ mod tests {
         release: watch::Receiver<bool>,
     }
 
+    struct CancellationImplementation {
+        started: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl StepImplementation for CancellationImplementation {
+        fn execute<'a>(&'a self, context: ExecutionContext) -> StepFuture<'a> {
+            let started = self.started.clone();
+            let cancelled = self.cancelled.clone();
+            Box::pin(async move {
+                started.store(true, Ordering::Release);
+                let mut cancellation = context.cancellation();
+                while !*cancellation.borrow() {
+                    cancellation
+                        .changed()
+                        .await
+                        .map_err(|_| "cancellation dropped".to_string())?;
+                }
+                cancelled.store(true, Ordering::Release);
+                Err("cancelled".into())
+            })
+        }
+    }
+
     impl StepImplementation for BlockingImplementation {
         fn execute<'a>(&'a self, _context: ExecutionContext) -> StepFuture<'a> {
             let started = self.started.clone();
@@ -1574,6 +1645,113 @@ mod tests {
                 }
                 shutdown.send(true).unwrap();
                 worker_task.await.unwrap().unwrap();
+            });
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cancelling_a_run_signals_its_active_attempt() {
+        let path = std::env::temp_dir().join(format!(
+            "prism-worker-run-cancellation-{}-{}.db",
+            std::process::id(),
+            SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let started = Arc::new(AtomicBool::new(false));
+                let cancelled = Arc::new(AtomicBool::new(false));
+                let mut worker = WorkflowWorker::open(
+                    &path,
+                    "worker",
+                    WorkerConfig {
+                        scheduler_interval: Duration::from_millis(5),
+                        output_flush_interval: Duration::from_millis(5),
+                        ..WorkerConfig::default()
+                    },
+                )
+                .await
+                .unwrap();
+                worker
+                    .register(
+                        "cancellable",
+                        CancellationImplementation {
+                            started: started.clone(),
+                            cancelled: cancelled.clone(),
+                        },
+                    )
+                    .unwrap();
+                let operations = worker.operations();
+                operations
+                    .register_definition(crate::DefinitionSnapshot {
+                        id: "definition",
+                        name: "cancellation",
+                        revision: "1",
+                        source: "test",
+                        trusted: true,
+                        body_json: "{}",
+                        digest: "digest",
+                        now_unix_ms: 1,
+                    })
+                    .await
+                    .unwrap();
+                operations
+                    .launch_materialized(
+                        crate::LaunchWorkflow {
+                            run_id: "run",
+                            definition_snapshot_id: "definition",
+                            repository: None,
+                            idempotency_key: "run",
+                            now_unix_ms: 2,
+                        },
+                        vec![crate::WorkflowStep {
+                            id: "step".into(),
+                            key: "step".into(),
+                            implementation: "cancellable".into(),
+                            target_id: "local".into(),
+                            input_json: "{}".into(),
+                            dependencies: vec![],
+                            resources: vec![],
+                        }],
+                    )
+                    .await
+                    .unwrap();
+                let (shutdown, shutdown_receiver) = watch::channel(false);
+                let task = tokio::spawn(worker.run(shutdown_receiver));
+                for _ in 0..100 {
+                    if started.load(Ordering::Acquire) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert!(started.load(Ordering::Acquire));
+
+                operations
+                    .command("run", crate::WorkflowCommand::Cancel, 3)
+                    .await
+                    .unwrap();
+                for _ in 0..100 {
+                    if cancelled.load(Ordering::Acquire) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert!(cancelled.load(Ordering::Acquire));
+                for _ in 0..100 {
+                    if operations.inspect("run").await.unwrap().unwrap().attempts[0].status
+                        == "cancelled"
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let projection = operations.inspect("run").await.unwrap().unwrap();
+                assert_eq!(projection.status, "cancelled");
+                assert_eq!(projection.attempts[0].status, "cancelled");
+                shutdown.send(true).unwrap();
+                task.await.unwrap().unwrap();
             });
         let _ = std::fs::remove_file(path);
     }

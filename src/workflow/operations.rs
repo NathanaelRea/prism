@@ -20,6 +20,7 @@ pub struct WorkflowOperations {
     approvals: ApprovalStore,
     effects: EffectBroker,
     wakeups: WakeupStore,
+    execution: Option<super::engine::ExecutionControl>,
 }
 
 pub struct DefinitionSnapshot<'a> {
@@ -200,11 +201,19 @@ impl WorkflowOperations {
     }
 
     pub(crate) fn from_database(database: WorkflowDatabase) -> Self {
+        Self::from_database_with_execution(database, None)
+    }
+
+    pub(crate) fn from_database_with_execution(
+        database: WorkflowDatabase,
+        execution: Option<super::engine::ExecutionControl>,
+    ) -> Self {
         Self {
             ledger: RunLedger::new(database.clone()),
             approvals: ApprovalStore::new(database.clone()),
             effects: EffectBroker::new(database.clone()),
             wakeups: WakeupStore::new(database.clone()),
+            execution,
             database,
         }
     }
@@ -285,7 +294,13 @@ impl WorkflowOperations {
                 now_unix_ms,
             )
             .await
-            .map_err(Into::into)
+            .map_err(WorkflowOperationError::from)?;
+        if command == WorkflowCommand::Cancel
+            && let Some(execution) = &self.execution
+        {
+            execution.cancel_run(run_id);
+        }
+        Ok(())
     }
 
     pub async fn request_approval(

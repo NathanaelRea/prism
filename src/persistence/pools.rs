@@ -10,7 +10,7 @@ use sqlx::{Connection, SqliteConnection, SqlitePool};
 
 use super::error::DatabaseError;
 
-const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 static REPOSITORY_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/repository");
 static WORKFLOW_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/workflow");
 
@@ -42,9 +42,7 @@ pub(crate) struct WorkflowDatabase {
 )]
 impl RepositoryDatabase {
     pub(crate) async fn open(path: &Path) -> Result<Self, DatabaseError> {
-        prepare_parent(path)?;
-        adopt_historical_repository_database(path).await?;
-        migrate(path, &REPOSITORY_MIGRATOR).await?;
+        initialize_repository_database(path).await?;
         let (writer, readers) = open_pools(path).await?;
         Ok(Self {
             path: path.into(),
@@ -71,6 +69,12 @@ impl RepositoryDatabase {
     ) -> Result<T, DatabaseError> {
         write_immediate(&self.writer, false, operation).await
     }
+}
+
+pub(super) async fn initialize_repository_database(path: &Path) -> Result<(), DatabaseError> {
+    prepare_parent(path)?;
+    adopt_historical_repository_database(path).await?;
+    migrate(path, &REPOSITORY_MIGRATOR).await
 }
 
 impl WorkflowDatabase {
@@ -450,7 +454,9 @@ async fn schema_contract(
         .collect())
 }
 
-async fn validate_integrity(connection: &mut SqliteConnection) -> Result<(), DatabaseError> {
+pub(super) async fn validate_integrity(
+    connection: &mut SqliteConnection,
+) -> Result<(), DatabaseError> {
     let quick: Vec<String> = sqlx::query_scalar("pragma quick_check")
         .fetch_all(&mut *connection)
         .await

@@ -710,14 +710,14 @@ impl Coordinator {
                     let run_id: String = sqlx::query_scalar("select run_id from workflow_step where id = ?")
                         .bind(&lease.step_id).fetch_one(&mut *connection).await.map_err(DatabaseError::Query)?;
                     if status == "failed" || status == "cancelled" {
-                        sqlx::query("update workflow_run set status = ?, updated_unix_ms = ?, completed_unix_ms = ? where id = ? and status in ('runnable','running')")
+                        sqlx::query("update workflow_run set status = ?, updated_unix_ms = ?, completed_unix_ms = ? where id = ? and status in ('runnable','running','paused')")
                             .bind(&status).bind(finished_unix_ms).bind(finished_unix_ms).bind(&run_id)
                             .execute(&mut *connection).await.map_err(DatabaseError::Query)?;
                     } else {
                         let unfinished: i64 = sqlx::query_scalar("select count(*) from workflow_step where run_id = ? and status <> 'succeeded'")
                             .bind(&run_id).fetch_one(&mut *connection).await.map_err(DatabaseError::Query)?;
                         if unfinished == 0 {
-                            sqlx::query("update workflow_run set status = 'succeeded', updated_unix_ms = ?, completed_unix_ms = ? where id = ? and status in ('runnable','running')")
+                            sqlx::query("update workflow_run set status = 'succeeded', updated_unix_ms = ?, completed_unix_ms = ? where id = ? and status in ('runnable','running','paused')")
                                 .bind(finished_unix_ms).bind(finished_unix_ms).bind(&run_id)
                                 .execute(&mut *connection).await.map_err(DatabaseError::Query)?;
                         } else {
@@ -729,6 +729,14 @@ impl Coordinator {
                 })
             })
             .await
+    }
+
+    pub(crate) async fn run_is_cancelled(&self, run_id: &str) -> Result<bool, DatabaseError> {
+        sqlx::query_scalar("select status = 'cancelled' from workflow_run where id = ?")
+            .bind(run_id)
+            .fetch_one(self.database.readers())
+            .await
+            .map_err(DatabaseError::Query)
     }
 }
 
@@ -897,6 +905,47 @@ mod tests {
                     .await,
                 Err(DatabaseError::StaleClaim)
             ));
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn final_attempt_terminalizes_a_paused_run() {
+        let path = path();
+        runtime().block_on(async {
+            let database = WorkflowDatabase::open(&path).await.unwrap();
+            fixture(&database).await;
+            let ledger = RunLedger::new(database.clone());
+            let coordinator = Coordinator::new(database);
+            let lease = coordinator
+                .claim(ClaimRequest {
+                    attempt_id: "attempt-1",
+                    step_id: "step-1",
+                    worker_id: "worker-1",
+                    now_unix_ms: 2,
+                    lease_expires_unix_ms: 10,
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            ledger.command("run-1", RunCommand::Pause, 3).await.unwrap();
+
+            coordinator
+                .finish(
+                    &lease,
+                    AttemptResult {
+                        status: "succeeded",
+                        result_json: "{}",
+                        finished_unix_ms: 4,
+                    },
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                ledger.inspect("run-1").await.unwrap().unwrap().status,
+                "succeeded"
+            );
         });
         let _ = std::fs::remove_file(&path);
     }

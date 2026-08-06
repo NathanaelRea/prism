@@ -4,9 +4,6 @@ use std::path::PathBuf;
 
 #[derive(Debug)]
 pub(crate) enum DatabaseError {
-    IncompatibleFormat {
-        path: PathBuf,
-    },
     WrongDatabase {
         path: PathBuf,
         expected: &'static str,
@@ -33,15 +30,6 @@ pub(crate) enum DatabaseError {
         path: PathBuf,
         source: sqlx::Error,
     },
-    InspectOwnership {
-        path: PathBuf,
-        source: sqlx::Error,
-    },
-    Configure {
-        setting: &'static str,
-        expected: String,
-        actual: String,
-    },
     Migrate(sqlx::migrate::MigrateError),
     Query(sqlx::Error),
     StaleClaim,
@@ -66,11 +54,6 @@ pub(crate) enum DatabaseError {
 impl fmt::Display for DatabaseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::IncompatibleFormat { path } => write!(
-                formatter,
-                "database {} has an incompatible or unknown format; the original was not modified",
-                path.display()
-            ),
             Self::WrongDatabase { path, expected } => write!(
                 formatter,
                 "database {} is not a {expected} database",
@@ -109,19 +92,6 @@ impl fmt::Display for DatabaseError {
             Self::Connect { path, source } => {
                 write!(formatter, "open database {}: {source}", path.display())
             }
-            Self::InspectOwnership { path, source } => write!(
-                formatter,
-                "inspect SQLx ownership of database {}: {source}",
-                path.display()
-            ),
-            Self::Configure {
-                setting,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "SQLite policy mismatch for {setting}: expected {expected}, got {actual}"
-            ),
             Self::Migrate(source) => write!(formatter, "apply database migrations: {source}"),
             Self::Query(source) => write!(formatter, "database operation: {source}"),
             Self::StaleClaim => formatter.write_str("execution claim is stale"),
@@ -153,17 +123,15 @@ impl Error for DatabaseError {
             | Self::Backup { source, .. }
             | Self::SetPermissions { source, .. }
             | Self::Runtime(source) => Some(source),
-            Self::Connect { source, .. } | Self::InspectOwnership { source, .. } => Some(source),
+            Self::Connect { source, .. } => Some(source),
             Self::Migrate(source) => Some(source),
             Self::Query(source) => Some(source),
-            Self::IncompatibleFormat { .. }
-            | Self::WrongDatabase { .. }
+            Self::WrongDatabase { .. }
             | Self::UnknownHistoricalSchema { .. }
             | Self::MissingMigrationBaseline
             | Self::StaleClaim
             | Self::Conflict { .. }
             | Self::OutputBudgetExceeded { .. }
-            | Self::Configure { .. }
             | Self::Integrity { .. }
             | Self::InvalidValue { .. } => None,
         }

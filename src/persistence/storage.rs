@@ -223,7 +223,6 @@ fn sqlite_error_code(error: &sqlx::Error) -> Option<i32> {
 fn database_error_code(error: &crate::persistence::error::DatabaseError) -> Option<i32> {
     let source = match error {
         crate::persistence::error::DatabaseError::Connect { source, .. }
-        | crate::persistence::error::DatabaseError::InspectOwnership { source, .. }
         | crate::persistence::error::DatabaseError::Query(source) => source,
         _ => return None,
     };

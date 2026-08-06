@@ -1,4 +1,4 @@
-select step.id, step.implementation, step.target_id, step.input_json, run.repository
+select step.id, step.run_id, step.implementation, step.target_id, step.input_json, run.repository
 from workflow_step step
 join workflow_run run on run.id = step.run_id
 where step.status = 'runnable' and step.available_unix_ms <= ?

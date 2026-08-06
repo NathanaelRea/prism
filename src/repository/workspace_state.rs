@@ -475,7 +475,7 @@ impl WorkspaceState {
                 worker::DaemonHealth::stopped()
             }
         };
-        let ledger_runs = match list_ledger_workflows() {
+        let ledger_runs = match list_ledger_workflows(&self.sources) {
             Ok(runs) => runs,
             Err(error) => {
                 warnings.push(Diagnostic {
@@ -714,13 +714,27 @@ pub(crate) fn control_repository_workflow(
     })
 }
 
-fn list_ledger_workflows() -> Result<Vec<crate::WorkflowProjection>, String> {
-    match worker::list_workflows(None, 256) {
+fn list_ledger_workflows(sources: &[RepoSource]) -> Result<Vec<crate::WorkflowProjection>, String> {
+    let repositories = sources
+        .iter()
+        .map(|source| source.repo.root.display().to_string())
+        .collect::<Vec<_>>();
+    let from_worker = repositories
+        .iter()
+        .try_fold(Vec::new(), |mut runs, repository| {
+            runs.extend(worker::list_workflows(Some(Path::new(repository)), 256)?);
+            Ok::<_, String>(runs)
+        });
+    match from_worker {
         Ok(runs) => Ok(runs),
         Err(_) if !crate::util::prism_config_dir().join("workflow.db").exists() => Ok(Vec::new()),
         Err(socket_error) => crate::async_runtime::block_on(async {
             let operations = crate::WorkflowOperations::open_default().await?;
-            operations.list(None, 256).await
+            let mut runs = Vec::new();
+            for repository in repositories {
+                runs.extend(operations.list(Some(&repository), 256).await?);
+            }
+            Ok::<_, crate::WorkflowOperationError>(runs)
         })
         .map_err(|error| format!("access workflow ledger runtime: {error}"))?
         .map_err(|error| format!("{socket_error}; direct workflow ledger read failed: {error}")),

@@ -14,6 +14,7 @@ pub(crate) struct AsyncCoordinator {
 #[derive(Debug, Clone, PartialEq, Eq, FromRow)]
 pub(crate) struct RunnableStep {
     pub id: String,
+    pub run_id: String,
     pub implementation: String,
     pub target_id: String,
     pub input_json: String,

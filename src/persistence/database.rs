@@ -4,13 +4,11 @@ use std::str::FromStr;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
+use sqlx::sqlite::SqliteConnectOptions;
 use sqlx::{Connection, Row, SqliteConnection, TypeInfo, ValueRef};
 
 use super::error::DatabaseError;
 
-const WRITER_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations/repository");
 static INITIALIZED_DATABASES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 
 type TransactionQuery =
@@ -164,81 +162,14 @@ fn sqlite_value_to_string(
 }
 
 async fn initialize_async(path: &Path) -> Result<(), DatabaseError> {
-    let existed = path.exists();
-    if existed {
-        super::pools::adopt_historical_repository_database(path).await?;
-        reject_unowned_database(path).await?;
-    } else if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| DatabaseError::CreateDirectory {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
-
-    let options = writable_options(path, !existed)?;
-    let mut connection = SqliteConnection::connect_with(&options)
-        .await
-        .map_err(|source| DatabaseError::Connect {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    verify_policy(&mut connection).await?;
-    MIGRATOR
-        .run(&mut connection)
-        .await
-        .map_err(DatabaseError::Migrate)?;
-    validate_database(&mut connection).await?;
-    connection.close().await.map_err(DatabaseError::Query)
-}
-
-async fn reject_unowned_database(path: &Path) -> Result<(), DatabaseError> {
-    let options = SqliteConnectOptions::from_str(&path.to_string_lossy())
-        .map_err(|source| DatabaseError::Connect {
-            path: path.to_path_buf(),
-            source,
-        })?
-        .read_only(true)
-        .create_if_missing(false);
-    let mut connection = SqliteConnection::connect_with(&options)
-        .await
-        .map_err(|source| DatabaseError::Connect {
-            path: path.to_path_buf(),
-            source,
-        })?;
-    // SQLX_RUNTIME_SQL: ownership inspection must also work before a checked schema exists.
-    let owned =
-        sqlx::query_scalar::<_, i64>(include_str!("../../sql/database/owns_migration_table.sql"))
-            .fetch_one(&mut connection)
-            .await
-            .map_err(|source| DatabaseError::InspectOwnership {
-                path: path.to_path_buf(),
-                source,
-            })?;
-    if owned != 1 {
-        return Err(DatabaseError::IncompatibleFormat {
-            path: path.to_path_buf(),
-        });
-    }
-    Ok(())
+    super::pools::initialize_repository_database(path).await
 }
 
 pub(super) fn writable_options(
     path: &Path,
     create: bool,
 ) -> Result<SqliteConnectOptions, DatabaseError> {
-    SqliteConnectOptions::from_str(&path.to_string_lossy())
-        .map_err(|source| DatabaseError::Connect {
-            path: path.to_path_buf(),
-            source,
-        })
-        .map(|options| {
-            options
-                .create_if_missing(create)
-                .foreign_keys(true)
-                .journal_mode(SqliteJournalMode::Wal)
-                .synchronous(SqliteSynchronous::Full)
-                .busy_timeout(WRITER_BUSY_TIMEOUT)
-        })
+    super::pools::options(path, create, false)
 }
 
 pub(super) fn block_on<T>(
@@ -489,104 +420,6 @@ impl TestConnection {
         })
         .map_err(|error| error.to_string())
     }
-}
-
-async fn verify_policy(connection: &mut SqliteConnection) -> Result<(), DatabaseError> {
-    verify_integer_pragma(connection, "foreign_keys", 1).await?;
-    verify_text_pragma(connection, "journal_mode", "wal").await?;
-    verify_integer_pragma(connection, "synchronous", 2).await?;
-    verify_integer_pragma(
-        connection,
-        "busy_timeout",
-        WRITER_BUSY_TIMEOUT.as_millis() as i64,
-    )
-    .await
-}
-
-// PRAGMA identifiers cannot be bound, so each caller supplies a fixed allowlisted name.
-async fn verify_integer_pragma(
-    connection: &mut SqliteConnection,
-    setting: &'static str,
-    expected: i64,
-) -> Result<(), DatabaseError> {
-    // SQLX_RUNTIME_SQL: the PRAGMA identifier is selected from fixed call-site constants.
-    let actual: i64 = sqlx::query_scalar::<_, i64>(&format!("pragma {setting}"))
-        .fetch_one(connection)
-        .await
-        .map_err(|source| DatabaseError::Connect {
-            path: Path::new("<configured connection>").to_path_buf(),
-            source,
-        })?;
-    if actual != expected {
-        return Err(DatabaseError::Configure {
-            setting,
-            expected: expected.to_string(),
-            actual: actual.to_string(),
-        });
-    }
-    Ok(())
-}
-
-async fn verify_text_pragma(
-    connection: &mut SqliteConnection,
-    setting: &'static str,
-    expected: &'static str,
-) -> Result<(), DatabaseError> {
-    // SQLX_RUNTIME_SQL: the PRAGMA identifier is selected from fixed call-site constants.
-    let actual: String = sqlx::query_scalar::<_, String>(&format!("pragma {setting}"))
-        .fetch_one(connection)
-        .await
-        .map_err(|source| DatabaseError::Connect {
-            path: Path::new("<configured connection>").to_path_buf(),
-            source,
-        })?;
-    if !actual.eq_ignore_ascii_case(expected) {
-        return Err(DatabaseError::Configure {
-            setting,
-            expected: expected.to_string(),
-            actual,
-        });
-    }
-    Ok(())
-}
-
-async fn validate_database(connection: &mut SqliteConnection) -> Result<(), DatabaseError> {
-    // SQLX_RUNTIME_SQL: integrity PRAGMAs expose dynamic result schemas unsupported by macros.
-    let quick_check: Vec<String> = sqlx::query_scalar::<_, String>("pragma quick_check")
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|source| DatabaseError::Connect {
-            path: Path::new("<configured connection>").to_path_buf(),
-            source,
-        })?;
-    if quick_check.as_slice() != ["ok"] {
-        return Err(DatabaseError::Integrity {
-            check: "quick_check",
-            details: quick_check.join("; "),
-        });
-    }
-
-    // SQLX_RUNTIME_SQL: integrity PRAGMAs expose dynamic result schemas unsupported by macros.
-    let violations = sqlx::query("pragma foreign_key_check")
-        .fetch_all(connection)
-        .await
-        .map_err(|source| DatabaseError::Connect {
-            path: Path::new("<configured connection>").to_path_buf(),
-            source,
-        })?;
-    if let Some(row) = violations.first() {
-        return Err(DatabaseError::Integrity {
-            check: "foreign_key_check",
-            details: format!(
-                "table={} rowid={:?} parent={} fk_index={}",
-                row.get::<String, _>(0),
-                row.get::<Option<i64>, _>(1),
-                row.get::<String, _>(2),
-                row.get::<i64, _>(3)
-            ),
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]
