@@ -312,7 +312,15 @@ impl Tui {
                 unreachable!();
             };
             processed += 1;
-            self.clear_tui_job_in_flight(&metadata);
+            // A completed portal job's payload records the successful resize. Keep the poll slot
+            // owned until that payload is applied: under a spent routing budget the terminal can
+            // be observed one tick before the coalesced payload.
+            let tmux_portal_payload_pending = metadata.kind == TuiJobKind::TmuxPortal
+                && matches!(&outcome, JobOutcome::Completed)
+                && self.job_generation_is_current(&metadata);
+            if !tmux_portal_payload_pending {
+                self.clear_tui_job_in_flight(&metadata);
+            }
             self.record_tui_job_terminal(&metadata, &outcome);
             let delete_needs_recovery_refresh = metadata.kind == TuiJobKind::DeleteSession
                 && !matches!(outcome, JobOutcome::Completed);
@@ -430,6 +438,8 @@ impl Tui {
                     .contains(&metadata.id)
             {
                 self.route_tui_job_payload_for_metadata(&metadata, payload);
+            } else {
+                self.clear_tui_job_in_flight(&metadata);
             }
         }
 
@@ -461,6 +471,8 @@ impl Tui {
                     .contains(&metadata.id)
             {
                 self.route_tui_job_payload_for_metadata(&metadata, payload);
+            } else {
+                self.clear_tui_job_in_flight(&metadata);
             }
         }
 
