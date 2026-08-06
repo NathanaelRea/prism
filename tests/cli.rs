@@ -80,6 +80,106 @@ fn help_prints_usage_without_repo() {
 }
 
 #[test]
+fn legacy_launch_commands_require_workflow_migration() {
+    let temp = TempDir::new("legacy-launch-requires-migration");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+
+    let auto = run(["auto", "implement this"], &repo, &config_home);
+    assert!(!auto.status.success());
+    assert!(
+        stderr(&auto).contains("prism config migrate-workflows"),
+        "{}",
+        stderr(&auto)
+    );
+
+    let plan = repo.join("plan.md");
+    fs::write(&plan, "# Phase 1\n\nImplement it.\n").unwrap();
+    let plan = run(["run-plan", "plan.md"], &repo, &config_home);
+    assert!(!plan.status.success());
+    assert!(
+        stderr(&plan).contains("prism config migrate-workflows"),
+        "{}",
+        stderr(&plan)
+    );
+}
+
+#[test]
+fn workflow_list_and_preview_are_versioned_and_read_only() {
+    let temp = TempDir::new("workflow-preview-readonly");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+
+    let list = run(["workflow", "list", "--json"], &repo, &config_home);
+    assert!(list.status.success(), "{}", stderr(&list));
+    let list: serde_json::Value = serde_json::from_str(&stdout(&list)).unwrap();
+    assert_eq!(list["schema_version"], 1);
+    assert_eq!(list["definitions"][0]["source"]["namespace"], "builtin");
+
+    let preview = run(
+        ["workflow", "preview", "builtin:approval", "--json"],
+        &repo,
+        &config_home,
+    );
+    assert!(preview.status.success(), "{}", stderr(&preview));
+    let preview: serde_json::Value = serde_json::from_str(&stdout(&preview)).unwrap();
+    assert_eq!(preview["schema_version"], 1);
+    assert_eq!(preview["trust_required"], false);
+    assert_eq!(preview["snapshot"]["content"]["steps"][0]["id"], "approve");
+    assert!(!contains_file_named(&config_home, "workflow.db"));
+    assert!(!contains_file_named(&config_home, "prism.db"));
+    assert!(!config_home.join("runtime/worker.sock").exists());
+}
+
+#[test]
+fn workflow_sources_keep_namespaces_and_repository_trust() {
+    let temp = TempDir::new("workflow-source-namespaces");
+    let repo = temp.path().join("repo");
+    let config_home = temp.path().join("xdg");
+    init_repo(&repo);
+    let global = config_home.join("prism/workflows");
+    let repository = repo.join(".prism/workflows");
+    fs::create_dir_all(&global).unwrap();
+    fs::create_dir_all(&repository).unwrap();
+    let source = "schema_version = 1\nname = \"custom\"\ndescription = \"test\"\ncapabilities = []\n[budgets]\nmax_attempts = 1\nmax_fan_out = 1\nmax_child_depth = 0\nmax_mutations = 0\n[[steps]]\nid = \"wait\"\nclass = \"wait\"\nimplementation = \"builtin:wait@1\"\n";
+    fs::write(global.join("custom.toml"), source).unwrap();
+    fs::write(repository.join("custom.toml"), source).unwrap();
+
+    let list = run(["workflow", "list", "--json"], &repo, &config_home);
+    assert!(list.status.success(), "{}", stderr(&list));
+    let list: serde_json::Value = serde_json::from_str(&stdout(&list)).unwrap();
+    let custom = list["definitions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|definition| definition["source"]["name"] == "custom")
+        .collect::<Vec<_>>();
+    assert_eq!(custom.len(), 2);
+    assert!(
+        custom
+            .iter()
+            .any(|definition| definition["source"]["namespace"] == "global")
+    );
+    assert!(custom.iter().any(|definition| {
+        definition["source"]["namespace"] == "repository" && definition["trust_required"] == true
+    }));
+
+    let ambiguous = run(["workflow", "preview", "custom"], &repo, &config_home);
+    assert!(!ambiguous.status.success());
+    assert!(stderr(&ambiguous).contains("ambiguous"));
+    let qualified = run(
+        ["workflow", "preview", "repository:custom", "--json"],
+        &repo,
+        &config_home,
+    );
+    assert!(qualified.status.success(), "{}", stderr(&qualified));
+    let qualified: serde_json::Value = serde_json::from_str(&stdout(&qualified)).unwrap();
+    assert_eq!(qualified["trust_required"], true);
+}
+
+#[test]
 fn debug_help_prints_without_repo() {
     let temp = TempDir::new("debug-help");
     let output = run(["debug", "--help"], temp.path(), temp.path());
@@ -882,21 +982,6 @@ fn auto_run_plan_without_path_fails_before_repo_discovery() {
     assert!(!output.status.success());
     assert!(stdout(&output).is_empty());
     assert!(stderr(&output).contains("prism: auto run-plan requires a plan path"));
-}
-
-#[test]
-fn auto_run_plan_without_phase_headings_fails_before_launch_gates() {
-    let temp = TempDir::new("auto-run-plan-no-phases");
-    let repo = temp.path().join("repo");
-    let config_home = temp.path().join("xdg");
-    init_repo(&repo);
-    fs::write(repo.join("plan.md"), "# Notes\n\nNo phases yet.\n").expect("write plan");
-
-    let output = run(["auto", "run-plan", "plan.md"], &repo, &config_home);
-
-    assert!(!output.status.success());
-    assert!(stdout(&output).is_empty());
-    assert!(stderr(&output).contains("could not infer phases"));
 }
 
 #[test]

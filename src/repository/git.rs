@@ -372,6 +372,27 @@ pub(crate) fn stage_all(path: &std::path::Path, config: &Config) -> Result<(), S
 }
 
 #[allow(dead_code)]
+pub(crate) fn commit_parent_and_message(
+    path: &std::path::Path,
+    config: &Config,
+) -> Result<(Option<String>, String), String> {
+    let output = run_capture(
+        Command::new(config.tool("git"))
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .arg("-C")
+            .arg(path)
+            .args(["show", "-s", "--format=%P%x00%B", "HEAD"]),
+        ProcessPolicy::Metadata,
+    )?;
+    let (parents, message) = output
+        .split_once('\0')
+        .ok_or_else(|| "Git commit observation omitted its delimiter".to_string())?;
+    Ok((
+        parents.split_whitespace().next().map(str::to_string),
+        message.trim_end().to_string(),
+    ))
+}
+
 pub(crate) fn commit_if_dirty(
     path: &std::path::Path,
     config: &Config,

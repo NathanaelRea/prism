@@ -86,6 +86,8 @@ pub(crate) enum DashboardOutputKey {
 
 pub(crate) struct WorkflowPollSnapshot {
     pub(super) repository: RepositorySnapshot,
+    pub(super) generalized_runs: Result<Vec<crate::run::RunSummary>, String>,
+    pub(super) generalized_detail: Result<Option<Box<crate::run::RunProjection>>, String>,
     pub(super) plan_runs: Result<Vec<PersistedPlanRun>, String>,
     pub(super) auto_runs: Result<Vec<PersistedAutoRun>, String>,
     pub(super) linked_plan_runs: Result<Vec<PersistedPlanRun>, String>,

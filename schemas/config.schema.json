@@ -5,6 +5,12 @@
   "description": "Configuration for Prism user and repository config.toml files.",
   "type": "object",
   "additionalProperties": false,
+  "not": {
+    "anyOf": [
+      { "required": ["auto"] },
+      { "required": ["checks"] }
+    ]
+  },
   "$defs": {
     "harness": {
       "type": "object",
@@ -186,6 +192,8 @@
       }
     },
     "checks": {
+      "deprecated": true,
+      "description": "Legacy orchestration; rejected after Workflow cutover. Run prism config migrate-workflows.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -207,6 +215,8 @@
       }
     },
     "auto": {
+      "deprecated": true,
+      "description": "Legacy Auto orchestration; rejected after Workflow cutover. Run prism config migrate-workflows.",
       "type": "object",
       "additionalProperties": false,
       "properties": {

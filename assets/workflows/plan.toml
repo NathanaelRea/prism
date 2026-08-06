@@ -1,0 +1,64 @@
+schema_version = 1
+name = "plan"
+description = "Create or select an immutable Plan Artifact, approve its exact revision, and fan phases out as bounded child runs."
+capabilities = ["repository_read", "workspace_write", "process_execute", "git_commit", "child_workflow_create"]
+
+[inputs.task]
+artifact_type = "builtin:task@1"
+
+[budgets]
+max_attempts = 12
+max_fan_out = 8
+max_child_depth = 2
+max_mutations = 8
+
+[[steps]]
+id = "create-plan"
+class = "action"
+implementation = "builtin:create-plan@1"
+capabilities = ["repository_read", "process_execute"]
+[steps.inputs.task]
+from = "run.task"
+artifact_type = "builtin:task@1"
+[steps.outputs.plan]
+artifact_type = "builtin:plan@1"
+
+[[steps]]
+id = "review-plan"
+class = "action"
+implementation = "builtin:review-plan@1"
+depends_on = ["create-plan"]
+capabilities = ["repository_read", "process_execute"]
+[steps.inputs.plan]
+from = "create-plan.plan"
+artifact_type = "builtin:plan@1"
+[steps.outputs.plan]
+artifact_type = "builtin:plan@1"
+
+[[steps]]
+id = "approve-plan"
+class = "approval"
+implementation = "builtin:approve-plan@1"
+depends_on = ["review-plan"]
+[steps.inputs.plan]
+from = "review-plan.plan"
+artifact_type = "builtin:plan@1"
+[steps.outputs.decision]
+artifact_type = "builtin:human-attestation@1"
+
+[[steps]]
+id = "implement-phases"
+class = "workflow_call"
+implementation = "builtin:workflow-call@1"
+depends_on = ["approve-plan"]
+capabilities = ["child_workflow_create"]
+[steps.inputs.plan]
+from = "review-plan.plan"
+artifact_type = "builtin:plan@1"
+[steps.outputs.commit]
+artifact_type = "builtin:commit@1"
+[steps.child_workflow]
+qualified_name = "builtin:plan-phase"
+revision = "1"
+digest = "1f78377d85daca687e1867f2fdd50072058deb70e9d08bed515f0868aff11e21"
+capabilities = ["repository_read", "workspace_write", "process_execute", "git_commit"]

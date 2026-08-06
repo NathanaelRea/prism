@@ -728,6 +728,10 @@ impl<R: Read> Read for CountingReader<R> {
 }
 
 impl SupervisedChild {
+    pub fn id(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn spawn(
         command: &mut Command,
         policy: Option<ProcessPolicy>,

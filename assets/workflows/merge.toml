@@ -1,0 +1,80 @@
+schema_version = 1
+name = "merge"
+description = "Evidence-bound guarded merge for an existing Change Request."
+capabilities = ["provider_read", "merge"]
+
+[inputs.change_request]
+artifact_type = "builtin:change-request-observation@1"
+
+[budgets]
+max_attempts = 8
+max_fan_out = 4
+max_child_depth = 0
+max_mutations = 1
+
+[[steps]]
+id = "ci"
+class = "gate"
+implementation = "builtin:ci@1"
+capabilities = ["provider_read"]
+[steps.inputs.change_request]
+from = "run.change_request"
+artifact_type = "builtin:change-request-observation@1"
+[steps.outputs.evidence]
+artifact_type = "builtin:gate-evidence@1"
+
+[[steps]]
+id = "provider-review"
+class = "gate"
+implementation = "builtin:provider-review@1"
+capabilities = ["provider_read"]
+[steps.inputs.change_request]
+from = "run.change_request"
+artifact_type = "builtin:change-request-observation@1"
+[steps.outputs.evidence]
+artifact_type = "builtin:gate-evidence@1"
+
+[[steps]]
+id = "policy"
+class = "gate"
+implementation = "builtin:policy@1"
+capabilities = ["provider_read"]
+[steps.inputs.change_request]
+from = "run.change_request"
+artifact_type = "builtin:change-request-observation@1"
+[steps.outputs.evidence]
+artifact_type = "builtin:gate-evidence@1"
+
+[[steps]]
+id = "mergeability"
+class = "gate"
+implementation = "builtin:mergeability@1"
+capabilities = ["provider_read"]
+[steps.inputs.change_request]
+from = "run.change_request"
+artifact_type = "builtin:change-request-observation@1"
+[steps.outputs.evidence]
+artifact_type = "builtin:gate-evidence@1"
+
+[[steps]]
+id = "approve-merge"
+class = "approval"
+implementation = "builtin:exact-mutation-approval@1"
+depends_on = ["ci", "provider-review", "policy", "mergeability"]
+[steps.inputs.commit]
+from = "run.change_request"
+artifact_type = "builtin:change-request-observation@1"
+[steps.outputs.decision]
+artifact_type = "builtin:human-attestation@1"
+
+[[steps]]
+id = "merge"
+class = "action"
+implementation = "builtin:merge@1"
+depends_on = ["ci", "provider-review", "policy", "mergeability", "approve-merge"]
+capabilities = ["merge"]
+[steps.inputs.change_request]
+from = "run.change_request"
+artifact_type = "builtin:change-request-observation@1"
+[steps.outputs.result]
+artifact_type = "builtin:change-request-observation@1"

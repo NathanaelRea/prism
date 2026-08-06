@@ -25,7 +25,14 @@ pub(super) fn render_main(frame: &mut Frame<'_>, area: Rect, model: &crate::view
         PanelFocus::Repos => repo_overview_lines(model, width, content_area),
         PanelFocus::Worktrees => worktree_detail_lines(model),
     };
-    if model.focus == PanelFocus::Worktrees {
+    if matches!(model.focus, PanelFocus::Repos | PanelFocus::Worktrees)
+        && let Some(dashboard) = &model.workflow_dashboard
+    {
+        lines.push(Line::from(""));
+        lines.extend(workflow_dashboard_lines(dashboard, width));
+    } else if model.focus == PanelFocus::Worktrees {
+        // Pre-cutover history remains visible until imported, but generalized
+        // Runs always use the single graph/history renderer above.
         if let Some(dashboard) = &model.auto_dashboard {
             lines.push(Line::from(""));
             lines.extend(auto_dashboard_lines(dashboard, width, content_area));

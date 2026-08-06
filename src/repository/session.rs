@@ -1462,7 +1462,8 @@ fn resolve_worktree_session_identity(
     })
 }
 
-pub(crate) fn ensure_worktree_session_identity(
+#[cfg(test)]
+fn ensure_worktree_session_identity(
     repo: &Repository,
     worktree: &Path,
     branch: &str,

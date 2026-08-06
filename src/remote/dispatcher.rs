@@ -20,8 +20,9 @@ use super::{
     CanonicalChangeRequestIdentity, Capabilities, ChangeRequest, ChangeRequestDetails,
     ChangeRequestId, ChangeRequestSummary, CheckState, CreateChangeRequest, DiscoveredRemote,
     GuardedMerge, LifecycleState, MergeMethod, MergeMutationResult, MergeabilityState,
-    NativeReviewThreadId, Observation, ProviderKind, QueueState, RemoteError, RemoteRepositoryId,
-    RemoteUrlKind, RepositoryPolicy, ResolveReviewThread, ReviewDecision, ReviewSubmissionKind,
+    NativeReviewThreadId, Observation, ProviderItemObservation, ProviderKind, QueueState,
+    RemoteError, RemoteErrorClass, RemoteOperation, RemoteRepositoryId, RemoteUrlKind,
+    RepositoryPolicy, ResolveReviewThread, Retryability, ReviewDecision, ReviewSubmissionKind,
     SubmitReview, discover_git_remote,
 };
 
@@ -93,6 +94,127 @@ impl<'a> Adapter<'a> {
                     .map(|adapter| Self::Forgejo(Box::new(adapter)))
                     .map_err(|error| error.to_string())
             }
+        }
+    }
+
+    fn discover_issues(&self) -> Result<Vec<ProviderItemObservation>, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.discover_issues("open"),
+            Self::GitLab(_) => Err(RemoteError::new(
+                ProviderKind::GitLab,
+                RemoteOperation::DiscoverIssues,
+                RemoteErrorClass::Unsupported,
+                Retryability::NotRetryable,
+                "GitLab issue discovery is not implemented",
+            )),
+            Self::Forgejo(_) => Err(RemoteError::new(
+                ProviderKind::Forgejo,
+                RemoteOperation::DiscoverIssues,
+                RemoteErrorClass::Unsupported,
+                Retryability::NotRetryable,
+                "Forgejo issue discovery is not implemented",
+            )),
+        }
+    }
+
+    fn observe_issue(&self, native_id: &str) -> Result<ProviderItemObservation, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.observe_issue(native_id),
+            Self::GitLab(_) => Err(unsupported_issue_operation(
+                ProviderKind::GitLab,
+                RemoteOperation::DiscoverIssues,
+            )),
+            Self::Forgejo(_) => Err(unsupported_issue_operation(
+                ProviderKind::Forgejo,
+                RemoteOperation::DiscoverIssues,
+            )),
+        }
+    }
+
+    fn set_issue_labels(
+        &self,
+        native_id: &str,
+        labels: &[String],
+    ) -> Result<ProviderItemObservation, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.set_issue_labels(native_id, labels),
+            Self::GitLab(_) => Err(unsupported_issue_operation(
+                ProviderKind::GitLab,
+                RemoteOperation::MutateLabels,
+            )),
+            Self::Forgejo(_) => Err(unsupported_issue_operation(
+                ProviderKind::Forgejo,
+                RemoteOperation::MutateLabels,
+            )),
+        }
+    }
+
+    fn set_issue_assignees(
+        &self,
+        native_id: &str,
+        assignees: &[String],
+    ) -> Result<ProviderItemObservation, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.set_issue_assignees(native_id, assignees),
+            Self::GitLab(_) => Err(unsupported_issue_operation(
+                ProviderKind::GitLab,
+                RemoteOperation::MutateAssignment,
+            )),
+            Self::Forgejo(_) => Err(unsupported_issue_operation(
+                ProviderKind::Forgejo,
+                RemoteOperation::MutateAssignment,
+            )),
+        }
+    }
+
+    fn set_issue_lifecycle(
+        &self,
+        native_id: &str,
+        lifecycle: &str,
+    ) -> Result<ProviderItemObservation, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.set_issue_lifecycle(native_id, lifecycle),
+            Self::GitLab(_) => Err(unsupported_issue_operation(
+                ProviderKind::GitLab,
+                RemoteOperation::MutateIssueLifecycle,
+            )),
+            Self::Forgejo(_) => Err(unsupported_issue_operation(
+                ProviderKind::Forgejo,
+                RemoteOperation::MutateIssueLifecycle,
+            )),
+        }
+    }
+
+    fn issue_has_comment_marker(&self, native_id: &str, marker: &str) -> Result<bool, RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.issue_has_comment_marker(native_id, marker),
+            Self::GitLab(_) => Err(unsupported_issue_operation(
+                ProviderKind::GitLab,
+                RemoteOperation::CreateIssueComment,
+            )),
+            Self::Forgejo(_) => Err(unsupported_issue_operation(
+                ProviderKind::Forgejo,
+                RemoteOperation::CreateIssueComment,
+            )),
+        }
+    }
+
+    fn create_issue_comment(
+        &self,
+        native_id: &str,
+        body: &str,
+        marker: &str,
+    ) -> Result<(), RemoteError> {
+        match self {
+            Self::GitHub(adapter) => adapter.create_issue_comment(native_id, body, marker),
+            Self::GitLab(_) => Err(unsupported_issue_operation(
+                ProviderKind::GitLab,
+                RemoteOperation::CreateIssueComment,
+            )),
+            Self::Forgejo(_) => Err(unsupported_issue_operation(
+                ProviderKind::Forgejo,
+                RemoteOperation::CreateIssueComment,
+            )),
         }
     }
 
@@ -194,6 +316,106 @@ impl<'a> Adapter<'a> {
 
 pub(crate) fn configured(path: &Path, config: &Config) -> bool {
     Adapter::resolve(path, config).is_ok()
+}
+
+/// Discovers authoritative open Issues through the provider seam. Unsupported
+/// providers return an explicit capability error, never an empty collection.
+fn unsupported_issue_operation(provider: ProviderKind, operation: RemoteOperation) -> RemoteError {
+    RemoteError::new(
+        provider,
+        operation,
+        RemoteErrorClass::Unsupported,
+        Retryability::NotRetryable,
+        "provider Issue operation is not implemented",
+    )
+}
+
+pub(crate) fn discover_issues(
+    path: &Path,
+    config: &Config,
+) -> Result<Vec<ProviderItemObservation>, RemoteError> {
+    let (adapter, _) = Adapter::resolve(path, config).map_err(|message| {
+        RemoteError::new(
+            ProviderKind::GitHub,
+            RemoteOperation::DiscoverIssues,
+            RemoteErrorClass::Configuration,
+            Retryability::NotRetryable,
+            message,
+        )
+    })?;
+    adapter.discover_issues()
+}
+
+pub(crate) fn observe_issue(
+    path: &Path,
+    config: &Config,
+    repository: &RemoteRepositoryId,
+    native_id: &str,
+) -> Result<ProviderItemObservation, String> {
+    Adapter::for_repository(path, config, repository)?
+        .observe_issue(native_id)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn set_issue_labels(
+    path: &Path,
+    config: &Config,
+    repository: &RemoteRepositoryId,
+    native_id: &str,
+    labels: &[String],
+) -> Result<ProviderItemObservation, String> {
+    Adapter::for_repository(path, config, repository)?
+        .set_issue_labels(native_id, labels)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn set_issue_assignees(
+    path: &Path,
+    config: &Config,
+    repository: &RemoteRepositoryId,
+    native_id: &str,
+    assignees: &[String],
+) -> Result<ProviderItemObservation, String> {
+    Adapter::for_repository(path, config, repository)?
+        .set_issue_assignees(native_id, assignees)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn set_issue_lifecycle(
+    path: &Path,
+    config: &Config,
+    repository: &RemoteRepositoryId,
+    native_id: &str,
+    lifecycle: &str,
+) -> Result<ProviderItemObservation, String> {
+    Adapter::for_repository(path, config, repository)?
+        .set_issue_lifecycle(native_id, lifecycle)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn issue_has_comment_marker(
+    path: &Path,
+    config: &Config,
+    repository: &RemoteRepositoryId,
+    native_id: &str,
+    marker: &str,
+) -> Result<bool, String> {
+    Adapter::for_repository(path, config, repository)?
+        .issue_has_comment_marker(native_id, marker)
+        .map_err(|error| error.to_string())
+}
+
+pub(crate) fn create_issue_comment(
+    path: &Path,
+    config: &Config,
+    repository: &RemoteRepositoryId,
+    native_id: &str,
+    body: &str,
+    marker: &str,
+) -> Result<(), String> {
+    Adapter::for_repository(path, config, repository)?
+        .create_issue_comment(native_id, body, marker)
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn provider(path: &Path, config: &Config) -> Result<ProviderKind, String> {
@@ -1294,6 +1516,106 @@ fn observe_exact_change_request(
         return Err("change request head changed during merge verification".to_string());
     }
     Ok(observed)
+}
+
+pub(crate) fn observe_change_request_identity(
+    path: &Path,
+    config: &Config,
+    identity: &CanonicalChangeRequestIdentity,
+    display_number: u64,
+) -> Result<ChangeRequestSummary, String> {
+    let id = identity
+        .change_request_id(Some(display_number))
+        .map_err(|error| error.to_string())?;
+    let target = identity
+        .target_repository()
+        .map_err(|error| error.to_string())?;
+    configured_remote_repositories(path, config)?
+        .validate_target_repository(&target)
+        .map_err(|_| "change request repository changed since authorization".to_string())?;
+    let observed = Adapter::for_repository(path, config, &target)?
+        .observe_change_request(&id)
+        .map_err(|error| error.to_string())?;
+    if observed.change_request.id != id {
+        return Err("provider returned a different change request identity".to_string());
+    }
+    Ok(observed)
+}
+
+pub(crate) fn observe_change_request_for_source(
+    path: &Path,
+    config: &Config,
+    target: &RemoteRepositoryId,
+    source_branch: &str,
+    expected_head: &str,
+) -> Result<Option<ChangeRequestSummary>, String> {
+    configured_remote_repositories(path, config)?
+        .validate_target_repository(target)
+        .map_err(|_| "change request target repository is not configured".to_string())?;
+    let matches = Adapter::for_repository(path, config, target)?
+        .list_change_requests(target, Some(source_branch))
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|summary| {
+            summary.change_request.source_branch == source_branch
+                && summary.change_request.head_sha == expected_head
+        })
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(matches.into_iter().next()),
+        _ => Err("multiple change requests match the exact source branch and head".to_string()),
+    }
+}
+
+pub(crate) fn review_thread_resolution_state(
+    path: &Path,
+    config: &Config,
+    identity: &CanonicalChangeRequestIdentity,
+    display_number: u64,
+    expected_head: &str,
+    thread_id: &str,
+) -> Result<Option<bool>, String> {
+    let summary = observe_change_request_identity(path, config, identity, display_number)?;
+    if summary.change_request.head_sha != expected_head {
+        return Err("change request head changed before review-thread observation".to_string());
+    }
+    let native_id =
+        NativeReviewThreadId::new(thread_id.to_string()).map_err(|error| error.to_string())?;
+    let details = Adapter::for_repository(path, config, summary.change_request.id.repository())?
+        .change_request_details(&summary.change_request)
+        .map_err(|error| error.to_string())?;
+    match details.review_threads {
+        Observation::Known(threads) => Ok(threads
+            .into_iter()
+            .find(|thread| thread.native_id == native_id)
+            .map(|thread| thread.resolved)),
+        Observation::EmptyKnown | Observation::AuthoritativelyAbsent => Ok(None),
+        other => known(other, "review threads").map(|_: Vec<super::ReviewThread>| None),
+    }
+}
+
+pub(crate) fn resolve_review_thread_identity(
+    path: &Path,
+    config: &Config,
+    identity: &CanonicalChangeRequestIdentity,
+    display_number: u64,
+    expected_head: &str,
+    thread_id: &str,
+) -> Result<(), String> {
+    let summary = observe_change_request_identity(path, config, identity, display_number)?;
+    if summary.change_request.head_sha != expected_head {
+        return Err("change request head changed before review-thread resolution".to_string());
+    }
+    let request = ResolveReviewThread {
+        id: summary.change_request.id.clone(),
+        thread_id: NativeReviewThreadId::new(thread_id.to_string())
+            .map_err(|error| error.to_string())?,
+        expected_head_sha: expected_head.to_string(),
+    };
+    Adapter::for_repository(path, config, request.id.repository())?
+        .resolve_review_thread(&request)
+        .map_err(|error| error.to_string())
 }
 
 fn known<T>(observation: Observation<T>, label: &str) -> Result<T, String> {

@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Legacy ledger support is retained only for history import tests.
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 

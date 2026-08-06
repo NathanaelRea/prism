@@ -1,4 +1,38 @@
-# Remote Change-Request Workflows
+# Remote Provider Workflows
+
+## Issue Intake And Triage
+
+- **Behavior**: Provider Adapters can expose canonical Provider Item identity,
+  title, body, lifecycle, author and repository relationship, labels and their
+  provenance, assignees, timestamps, native revisions, and event checkpoints
+  when the provider supports those facts. Prism derives a stable Observation
+  Revision digest over every externally controlled field available to Trigger
+  selection, admission, conditions, prompts, or effects unless a native revision
+  is proven to change for that complete field set.
+- **Invariant**: Pull or merge requests returned by an issue-shaped provider API
+  retain their Change Request identity and are never admitted as Issues merely
+  because they share an endpoint or response shape.
+- **Behavior**: Provider capabilities independently declare issue discovery,
+  event observation, labels, assignment, comments, and lifecycle mutation.
+  Missing capability is visible to Workflow validation and Gate evaluation and
+  is not treated as an empty result.
+- **Invariant**: Issue observations distinguish never loaded, current, stale,
+  partial, failed, confirmed absent, and present. Refresh failure preserves the
+  prior observation and cannot create a false Trigger occurrence or authorize a
+  mutation.
+- **Behavior**: Scheduled or event-backed Triggers can select Issues through
+  deterministic provider facts and start provider-neutral triage workflows.
+  Each run records canonical Issue identity and exact Observation Revision;
+  mutation and implementation additionally record its Admission Decision.
+- **Invariant**: Issue classification and security analysis receive externally
+  authored content as delimited untrusted data. Their output is an Artifact and
+  retains that provenance; it never expands the run's Admission Policy, provider
+  token scope, or execution capabilities.
+- **Behavior**: Label, assignment, comment, and close Actions show their intended
+  mutation, use exact provider identity, and reconcile an uncertain result
+  before retry. A child workflow starts through a Workflow Call rather than a
+  provider mutation Action. Bulk triage remains bounded and auditable per
+  affected Issue.
 
 ## Change-Request State
 
@@ -7,8 +41,8 @@
   externally and caches their summary, review, check, comment, merge, and refresh
   state for responsive rendering after startup.
 - **Behavior**: A repository without a known or explicitly configured hosting
-  adapter does not trigger change-request, CI, or review queries. Unknown hosts
-  are never probed and cached display state is retained as stale.
+  adapter does not trigger issue, change-request, CI, or review queries. Unknown
+  hosts are never probed and cached display state is retained as stale.
 - **Behavior**: The main panel hides the entire change-request section when none
   exists. When present, display number and title precede state, next action, merge, review, CI, and
   related gate facts.
@@ -28,9 +62,18 @@
 - **Invariant**: Push and merge actions revalidate the selected repository,
   branch, remote, expected head, target branch, and required gates immediately
   before mutation. Unknown or stale policy blocks automatic merge.
-- **Behavior**: Configured pre-push checks run before ordinary and repair pushes.
-  Pull-request creation additionally runs pre-PR checks, while manual merge is
-  refused for a dirty worktree and runs its configured safety checks.
+- **Behavior**: Push, change-request creation, repair, and merge Actions depend on
+  the named verification and policy Gates declared by their resolved Workflow
+  Definition. Manual merge is refused for a dirty worktree and runs its
+  configured safety Gates.
+- **Behavior**: Board commands for push, change-request creation, and manual merge
+  launch named bundled Workflow Definitions that compose the corresponding
+  components, so their safety Gates, attempts, effects, and recovery use the same
+  history and control model as triggered work.
+- **Invariant**: Automatic merge uses a provider-enforced exact-head precondition
+  and authoritative repository policy when available. If the provider cannot
+  close the race between observation and mutation, the merge fails closed or
+  requires an Approval Request that describes the residual risk.
 - **Behavior**: Users can open the selected change request in a browser.
 - **Default**: Merge uses squash unless configured otherwise.
 - **Customization**: Merge strategy and whether repository policy requires an
@@ -43,8 +86,9 @@
 ## Repair And Stabilization
 
 - **Behavior**: Change-request stabilization observes local Git state, cached provider state,
-  repository policy, and the requested goal, then identifies one safe next
-  blocker/action across review, CI, mergeability, waiting, and readiness.
+  repository policy, and the requested goal. Its independent review, CI,
+  mergeability, merge-relation, and policy Gates can identify one most useful
+  current blocker without converting those facts into one ordered checklist.
 - **Behavior**: Actionable review feedback consists of provider review bodies and
   inline review threads. Generic top-level summaries are context, not requested
   changes, by default.
@@ -54,8 +98,9 @@
 - **Behavior**: Review-repair prompts include actionable inline feedback with
   file/line context; CI-repair prompts include change-request identity, failing action facts,
   and a useful bounded failure-log tail.
-- **Invariant**: Starting a review or CI repair creates exactly one new harness
-  session for the selected worktree and delivers the prompt only there.
+- **Invariant**: Starting a review or CI repair creates exactly one Agent Action
+  attempt through its recorded Harness and delivers the prompt only to that
+  attempt or its explicitly selected continuation session.
 - **Behavior**: Prism records exactly which review threads informed a managed
   repair. After the guarded repair commit is pushed, it may resolve only those
   threads.
@@ -70,18 +115,29 @@
 
 ## Provider Exceptions
 
-- **GitHub**: `gh` remains the credential and transport broker. Merge uses
+### GitHub
+
+- **Constraint**: `gh` remains the credential and transport broker. Merge uses
   `--match-head-commit`. Summary and policy pagination limitations are reported
   as incomplete or unknown evidence rather than false facts.
-- **GitLab**: `glab` is required only for GitLab repositories. Global merge-request
+
+### GitLab
+
+- **Constraint**: `glab` is required only for GitLab repositories. Global merge-request
   IDs remain mutation identity while project-local IIDs remain display labels.
   Pipeline evidence is selected for the exact source SHA; hidden tier or policy
   evidence remains unknown and blocks automatic merge.
-- **Forgejo and Codeberg**: HTTPS uses certificate-validating platform TLS transport.
+
+### Forgejo And Codeberg
+
+- **Constraint**: HTTPS uses certificate-validating platform TLS transport.
   Tokens come only from a configured environment-variable name. Guarded merge
   sends `head_commit_id`. Conversation resolution and merge queues are unsupported
   and unavailable in the UI and managed repair paths.
-- **Codeberg**: Codeberg is a built-in Forgejo host profile, not a separate
+
+### Codeberg
+
+- **Invariant**: Codeberg is a built-in Forgejo host profile, not a separate
   protocol. Version, paging limits, Actions, and log availability are runtime
   observations.
 

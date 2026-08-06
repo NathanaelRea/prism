@@ -235,31 +235,8 @@ pub fn open_writable(path: &Path) -> Result<Connection, StorageError> {
 }
 
 fn open_writable_inner(path: &Path) -> Result<Connection, StorageError> {
-    let existed = path.exists();
-    if existed {
-        reject_empty_database(path)?;
-    } else if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|error| StorageError::from_io("create database directory", error))?;
-    }
-
+    let conn = open_writable_connection(path)?;
     let started = Instant::now();
-    let conn = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE
-            | OpenFlags::SQLITE_OPEN_CREATE
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|error| {
-        StorageError::from_sqlite(format!("open {}", path.display()), error, started.elapsed())
-    })?;
-    install_flight_recorder_trace(&conn);
-    configure_writer(&conn)?;
-
-    if !journal_mode(&conn)?.eq_ignore_ascii_case("wal") {
-        request_and_verify_wal(&conn, path)?;
-    }
-
     let version = user_version(&conn)?;
     if version > CURRENT_SCHEMA_VERSION {
         return Err(future_version_error(path, version));
@@ -294,6 +271,37 @@ fn open_writable_inner(path: &Path) -> Result<Connection, StorageError> {
     }
 
     migrate(&conn, path, |_| Ok(()))?;
+    Ok(conn)
+}
+
+/// Opens SQLite with Prism's durability and concurrency policy but without
+/// applying any schema. Domain stores own their independent migration policy.
+pub(crate) fn open_writable_connection(path: &Path) -> Result<Connection, StorageError> {
+    let existed = path.exists();
+    if existed {
+        reject_empty_database(path)?;
+    } else if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| StorageError::from_io("create database directory", error))?;
+    }
+
+    let started = Instant::now();
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE
+            | OpenFlags::SQLITE_OPEN_CREATE
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| {
+        StorageError::from_sqlite(format!("open {}", path.display()), error, started.elapsed())
+    })?;
+    install_flight_recorder_trace(&conn);
+    configure_writer(&conn)?;
+
+    if !journal_mode(&conn)?.eq_ignore_ascii_case("wal") {
+        request_and_verify_wal(&conn, path)?;
+    }
+
     Ok(conn)
 }
 
@@ -399,6 +407,13 @@ fn token_after<'a>(tokens: &'a [String], needle: &str) -> Option<&'a str> {
 }
 
 fn open_readonly_inner(path: &Path, observed: bool) -> Result<Connection, StorageError> {
+    open_readonly_connection(path, observed)
+}
+
+pub(crate) fn open_readonly_connection(
+    path: &Path,
+    observed: bool,
+) -> Result<Connection, StorageError> {
     if !path.exists() {
         return Err(StorageError::policy(
             format!("database {} does not exist", path.display()),

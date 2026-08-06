@@ -32,6 +32,236 @@ impl<'a> GitHubAdapter<'a> {
         Capabilities::for_provider(ProviderKind::GitHub)
     }
 
+    /// Lists issue-shaped records but deliberately excludes pull requests.
+    /// `--slurp` preserves page boundaries so a truncated or malformed page
+    /// fails the whole observation instead of looking like an empty result.
+    pub(in crate::remote) fn discover_issues(
+        &self,
+        state: &str,
+    ) -> Result<Vec<ProviderItemObservation>, RemoteError> {
+        let operation = RemoteOperation::DiscoverIssues;
+        if !matches!(state, "open" | "closed" | "all") {
+            return Err(github_error(
+                operation,
+                RemoteErrorClass::Validation,
+                Retryability::NotRetryable,
+                "GitHub issue state must be open, closed, or all",
+            ));
+        }
+        let endpoint = github_repository_api_endpoint(
+            &self.repository,
+            &format!("issues?state={state}&per_page=100"),
+        )
+        .map_err(|error| github_invalid_response(operation, error))?;
+        let endpoint = github_api_endpoint(self.config, self.repository.host(), &endpoint);
+        let mut command = std::process::Command::new(self.config.tool("gh"));
+        command
+            .arg("api")
+            .arg(endpoint)
+            .arg("--hostname")
+            .arg(self.repository.host().to_string())
+            .arg("--paginate")
+            .arg("--slurp")
+            .args(["-H", "Accept: application/vnd.github+json"])
+            .current_dir(self.path);
+        let output = crate::process::run_output_allow_failure_named(
+            &mut command,
+            crate::process::ProcessPolicy::NetworkQuery,
+            crate::process::ProcessDescriptor::new("gh.api.issue.list"),
+        )
+        .map_err(|error| github_provider_error(operation, error))?;
+        if !output.status.success() {
+            return Err(github_provider_error(operation, output.stderr)
+                .with_exit_code(output.status.code().unwrap_or(-1)));
+        }
+        if output.stdout_truncated {
+            return Err(github_invalid_response(
+                operation,
+                "GitHub issue discovery response was truncated".to_string(),
+            ));
+        }
+        let pages: Vec<Vec<GithubIssue>> =
+            serde_json::from_str(&output.stdout).map_err(|error| {
+                github_invalid_response(operation, format!("parse GitHub issues: {error}"))
+            })?;
+        pages
+            .into_iter()
+            .flatten()
+            .filter(|issue| issue.pull_request.is_none())
+            .map(|issue| issue.normalize(self.repository.clone(), operation))
+            .collect()
+    }
+
+    pub(in crate::remote) fn observe_issue(
+        &self,
+        native_id: &str,
+    ) -> Result<ProviderItemObservation, RemoteError> {
+        let operation = RemoteOperation::DiscoverIssues;
+        let number = native_id.parse::<u64>().map_err(|_| {
+            github_error(
+                operation,
+                RemoteErrorClass::Validation,
+                Retryability::NotRetryable,
+                "GitHub Issue identity must be numeric",
+            )
+        })?;
+        let endpoint =
+            github_repository_api_endpoint(&self.repository, &format!("issues/{number}"))
+                .map_err(|error| github_invalid_response(operation, error))?;
+        let issue: GithubIssue = self.issue_api_json(operation, &endpoint, "GET", &[])?;
+        if issue.pull_request.is_some() {
+            return Err(github_error(
+                operation,
+                RemoteErrorClass::Validation,
+                Retryability::NotRetryable,
+                "provider item is a pull request, not an Issue",
+            ));
+        }
+        issue.normalize(self.repository.clone(), operation)
+    }
+
+    pub(in crate::remote) fn set_issue_labels(
+        &self,
+        native_id: &str,
+        labels: &[String],
+    ) -> Result<ProviderItemObservation, RemoteError> {
+        let before = self.observe_issue(native_id)?;
+        let operation = RemoteOperation::MutateLabels;
+        let endpoint =
+            github_repository_api_endpoint(&self.repository, &format!("issues/{native_id}"))
+                .map_err(|error| github_invalid_response(operation, error))?;
+        let fields = labels
+            .iter()
+            .map(|label| format!("labels[]={label}"))
+            .collect::<Vec<_>>();
+        let _: serde_json::Value = self.issue_api_json(operation, &endpoint, "PATCH", &fields)?;
+        let after = self.observe_issue(native_id)?;
+        if after.id != before.id {
+            return Err(github_invalid_response(
+                operation,
+                "GitHub Issue identity changed during label mutation".into(),
+            ));
+        }
+        Ok(after)
+    }
+
+    pub(in crate::remote) fn set_issue_assignees(
+        &self,
+        native_id: &str,
+        assignees: &[String],
+    ) -> Result<ProviderItemObservation, RemoteError> {
+        let operation = RemoteOperation::MutateAssignment;
+        let endpoint =
+            github_repository_api_endpoint(&self.repository, &format!("issues/{native_id}"))
+                .map_err(|error| github_invalid_response(operation, error))?;
+        let fields = assignees
+            .iter()
+            .map(|value| format!("assignees[]={value}"))
+            .collect::<Vec<_>>();
+        let _: serde_json::Value = self.issue_api_json(operation, &endpoint, "PATCH", &fields)?;
+        self.observe_issue(native_id)
+    }
+
+    pub(in crate::remote) fn set_issue_lifecycle(
+        &self,
+        native_id: &str,
+        lifecycle: &str,
+    ) -> Result<ProviderItemObservation, RemoteError> {
+        if !matches!(lifecycle, "open" | "closed") {
+            return Err(github_error(
+                RemoteOperation::MutateIssueLifecycle,
+                RemoteErrorClass::Validation,
+                Retryability::NotRetryable,
+                "GitHub Issue lifecycle must be open or closed",
+            ));
+        }
+        let operation = RemoteOperation::MutateIssueLifecycle;
+        let endpoint =
+            github_repository_api_endpoint(&self.repository, &format!("issues/{native_id}"))
+                .map_err(|error| github_invalid_response(operation, error))?;
+        let _: serde_json::Value = self.issue_api_json(
+            operation,
+            &endpoint,
+            "PATCH",
+            &[format!("state={lifecycle}")],
+        )?;
+        self.observe_issue(native_id)
+    }
+
+    pub(in crate::remote) fn issue_has_comment_marker(
+        &self,
+        native_id: &str,
+        marker: &str,
+    ) -> Result<bool, RemoteError> {
+        let operation = RemoteOperation::CreateIssueComment;
+        let endpoint = github_repository_api_endpoint(
+            &self.repository,
+            &format!("issues/{native_id}/comments?per_page=100"),
+        )
+        .map_err(|error| github_invalid_response(operation, error))?;
+        let comments: Vec<GithubIssueComment> =
+            self.issue_api_json(operation, &endpoint, "GET", &[])?;
+        Ok(comments.iter().any(|comment| comment.body.contains(marker)))
+    }
+
+    pub(in crate::remote) fn create_issue_comment(
+        &self,
+        native_id: &str,
+        body: &str,
+        marker: &str,
+    ) -> Result<(), RemoteError> {
+        let operation = RemoteOperation::CreateIssueComment;
+        let endpoint = github_repository_api_endpoint(
+            &self.repository,
+            &format!("issues/{native_id}/comments"),
+        )
+        .map_err(|error| github_invalid_response(operation, error))?;
+        let value = format!("body={}\n\n<!-- prism:{marker} -->", body.trim());
+        let _: serde_json::Value = self.issue_api_json(operation, &endpoint, "POST", &[value])?;
+        Ok(())
+    }
+
+    fn issue_api_json<T: serde::de::DeserializeOwned>(
+        &self,
+        operation: RemoteOperation,
+        endpoint: &str,
+        method: &str,
+        fields: &[String],
+    ) -> Result<T, RemoteError> {
+        let endpoint = github_api_endpoint(self.config, self.repository.host(), endpoint);
+        let mut command = std::process::Command::new(self.config.tool("gh"));
+        command
+            .arg("api")
+            .arg(endpoint)
+            .arg("--hostname")
+            .arg(self.repository.host().to_string())
+            .args(["--method", method])
+            .args(["-H", "Accept: application/vnd.github+json"])
+            .current_dir(self.path);
+        for field in fields {
+            command.arg("-f").arg(field);
+        }
+        let output = crate::process::run_output_allow_failure_named(
+            &mut command,
+            crate::process::ProcessPolicy::NetworkQuery,
+            crate::process::ProcessDescriptor::new("gh.api.issue"),
+        )
+        .map_err(|error| github_provider_error(operation, error))?;
+        if !output.status.success() {
+            return Err(github_provider_error(operation, output.stderr)
+                .with_exit_code(output.status.code().unwrap_or(-1)));
+        }
+        if output.stdout_truncated {
+            return Err(github_invalid_response(
+                operation,
+                "GitHub Issue response was truncated".into(),
+            ));
+        }
+        serde_json::from_str(&output.stdout).map_err(|error| {
+            github_invalid_response(operation, format!("parse GitHub Issue response: {error}"))
+        })
+    }
+
     pub(in crate::remote) fn list_change_requests(
         &self,
         head_ref: Option<&str>,
@@ -499,6 +729,81 @@ impl<'a> GitHubAdapter<'a> {
 #[derive(serde::Deserialize)]
 struct GithubCreatedReview {
     commit_id: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GithubIssueComment {
+    body: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GithubIssue {
+    number: u64,
+    title: String,
+    body: Option<String>,
+    state: String,
+    user: Option<GithubLogin>,
+    author_association: Option<String>,
+    #[serde(default)]
+    labels: Vec<GithubLabel>,
+    #[serde(default)]
+    assignees: Vec<GithubLogin>,
+    updated_at: Option<String>,
+    pull_request: Option<serde_json::Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct GithubLogin {
+    login: String,
+}
+
+#[derive(serde::Deserialize)]
+struct GithubLabel {
+    id: serde_json::Value,
+    name: String,
+}
+
+impl GithubIssue {
+    fn normalize(
+        self,
+        repository: RemoteRepositoryId,
+        operation: RemoteOperation,
+    ) -> Result<ProviderItemObservation, RemoteError> {
+        let id = ProviderItemId::new(repository, self.number.to_string(), ProviderItemKind::Issue)
+            .map_err(|error| github_invalid_response(operation, error.to_string()))?;
+        let labels = self
+            .labels
+            .into_iter()
+            .map(|label| {
+                let id = match label.id {
+                    serde_json::Value::String(value) => value,
+                    serde_json::Value::Number(value) => value.to_string(),
+                    _ => String::new(),
+                };
+                if id.is_empty() {
+                    Err(github_invalid_response(
+                        operation,
+                        "GitHub issue label has no authenticated identity".to_string(),
+                    ))
+                } else {
+                    Ok((id, label.name))
+                }
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(ProviderItemObservation {
+            id,
+            title: self.title,
+            body: self.body.unwrap_or_default(),
+            lifecycle: self.state,
+            author: self
+                .user
+                .map_or_else(|| "ghost".to_string(), |user| user.login),
+            author_relationship: self.author_association,
+            labels,
+            assignees: self.assignees.into_iter().map(|user| user.login).collect(),
+            updated_at: self.updated_at,
+        })
+    }
 }
 
 pub(super) fn normalize_summary(

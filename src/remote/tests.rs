@@ -215,6 +215,57 @@ fn unknown_native_states_are_retained_verbatim() {
 }
 
 #[test]
+fn issue_shaped_change_requests_are_not_issue_identities() {
+    let repository = repository(ProviderKind::GitHub, "github.com", "owner/repo");
+    let issue = ProviderItemId::new(repository.clone(), "1", ProviderItemKind::Issue).unwrap();
+    let change_request =
+        ProviderItemId::new(repository, "2", ProviderItemKind::ChangeRequest).unwrap();
+    assert!(issue.as_issue().is_some());
+    assert!(change_request.as_issue().is_none());
+}
+
+#[test]
+fn provider_item_revision_covers_all_consumed_external_fields() {
+    let id = ProviderItemId::new(
+        repository(ProviderKind::GitHub, "github.com", "owner/repo"),
+        "1",
+        ProviderItemKind::Issue,
+    )
+    .unwrap();
+    let observation = ProviderItemObservation {
+        id,
+        title: "title".into(),
+        body: "body".into(),
+        lifecycle: "open".into(),
+        author: "user".into(),
+        author_relationship: Some("member".into()),
+        labels: std::collections::BTreeMap::new(),
+        assignees: Vec::new(),
+        updated_at: None,
+    };
+    let original = observation.revision();
+    let mut changed = observation;
+    changed.body = "changed".into();
+    assert_ne!(original, changed.revision());
+}
+
+#[test]
+fn provider_issue_capability_gaps_are_explicit() {
+    assert_eq!(
+        Capabilities::for_provider(ProviderKind::GitHub).issue_discovery,
+        SupportLevel::Supported
+    );
+    assert_eq!(
+        Capabilities::for_provider(ProviderKind::GitLab).issue_discovery,
+        SupportLevel::Unsupported
+    );
+    assert_eq!(
+        Capabilities::for_provider(ProviderKind::Forgejo).issue_labels,
+        SupportLevel::Unsupported
+    );
+}
+
+#[test]
 fn capability_support_is_independent_from_observation_quality() {
     let capabilities = Capabilities {
         ci_logs: SupportLevel::Supported,

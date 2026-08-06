@@ -52,6 +52,7 @@ pub(crate) struct FrameModel<'a> {
     pub repo_filter: &'a str,
     pub worktree_filter: &'a str,
     pub leader_hint: Option<LeaderHintModel>,
+    pub workflow_dashboard: Option<WorkflowDashboard>,
     pub auto_dashboard: Option<AutoDashboard>,
     pub plan_dashboard: Option<PlanDashboard>,
     pub tmux_portal: Option<TmuxPortalModel<'a>>,
@@ -351,6 +352,7 @@ mod repo_panel;
 mod shell;
 mod sidebar;
 mod style;
+mod workflow_dashboard;
 mod worktree_panel;
 
 #[cfg(test)]
@@ -358,6 +360,8 @@ mod tests;
 
 pub(crate) use layout::{sidebar_areas, tmux_portal_size};
 pub(crate) use shell::render;
+#[allow(unused_imports)]
+pub(crate) use workflow_dashboard::{WorkflowDashboard, workflow_dashboard_lines};
 
 pub(crate) fn sidebar_width_for(cols: u16, configured_width: Option<u16>) -> u16 {
     layout::sidebar_width(cols, configured_width)

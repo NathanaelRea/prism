@@ -20,8 +20,9 @@
   startup may offer to restore the Default Branch there and move the active
   branch into a Worktrunk worktree. It does not make this offer non-interactively
   and refuses to move a dirty checkout.
-- **Default**: GitHub polling for an inactive repository is reduced to no more
-  often than once every 60 seconds.
+- **Default**: Presentation-driven provider polling for an inactive repository
+  is reduced to no more often than once every 60 seconds. Enabled Triggers use
+  their own visible schedules and rate-limit policy.
 - **Behavior**: Users can pull the selected repository's configured Default
   Branch. Before creating a Worktree Session, Prism detects when that branch is
   behind its remote and offers to update it; declining does not block creation.
@@ -29,6 +30,30 @@
   open it as a Worktree Session. Prism reuses an existing matching worktree or
   fetches the pull request into a deterministic local branch, then retains the
   selected pull request summary on the focused session.
+
+## Workflow And Intake Views
+
+- **Behavior**: Repository context exposes available Workflow Definitions,
+  enabled Triggers, quarantined Provider Items, pending Approval Requests,
+  active runs, and recent outcomes without requiring each item to have a
+  Worktree Session.
+- **Behavior**: Users can inspect a discovered Issue, its exact Observation
+  Revision, classification Artifacts, Admission Policy result, and proposed
+  mutations before admitting capabilities within its intake run or starting a
+  child implementation run.
+- **Behavior**: Intake can be filtered by repository, provider, workflow,
+  admission state, labels, actor relationship, age, and current run state.
+  Refresh and filtering preserve stable provider-item and run selections.
+- **Behavior**: Workflow Run detail renders the resolved dependency graph,
+  current blockers, Gate evidence, attempts, child runs, Artifacts, and pending
+  decisions. Parallel branches remain distinguishable from retries and ordered
+  chains.
+- **Behavior**: A global input-required view makes pending Approval Requests,
+  quarantined items, failed runs, and recovery-required attempts discoverable
+  across tracked repositories.
+- **Invariant**: Provider Items, Workflow Runs, Worktree Sessions, and Change
+  Requests retain separate identities in navigation. Opening or admitting one
+  can create or link another, but does not collapse their histories.
 
 ## Navigation
 
@@ -72,7 +97,7 @@
   review comments, merge conflicts, and Worktrunk data. Success indicators are
   green and merge conflicts have a distinct recognizable indicator.
 - **Behavior**: The Default Branch sorts first when present in `[3]`, suppresses
-  task-only activity and GitHub indicators, and is not an attach target from that
+  task-only activity and worktree-scoped provider indicators, and is not an attach target from that
   panel. Suppressed indicators retain their column width so other rows remain
   aligned.
 - **Behavior**: Contextual help for repository and worktree views explains their

@@ -69,38 +69,13 @@ fzf = "fzf"
 # provider = "forgejo"
 # credential_env = "FORGEJO_TOKEN" # variable name only; never put a token here
 
-[checks]
-pre_pr = []
-pre_push = []
-review_fix = []
-
-[auto]
-merge = false
-cleanup_after_merge = true
-review_requirement = "resolved" # none, resolved, or approved
-push_initial = true
-push_repairs = false
-review_wait_enabled = true
-review_reviewer_identities = ["Copilot", "github-copilot"]
-review_max_wait_seconds = 300
-review_poll_interval_seconds = 30
-review_continue_on_timeout = true
-ci_wait_enabled = true
-ci_max_wait_seconds = 1800
-ci_poll_interval_seconds = 30
-
+# Workflow orchestration belongs in definitions under ~/.config/prism/workflows
+# or .prism/workflows. Run `prism config migrate-workflows` before upgrading
+# configurations that still contain [auto] or checks.pre_pr/pre_push/review_fix.
+# This legacy prompt key remains shown so older files have an actionable,
+# representable migration source; bundled Workflows do not read it after cutover.
 [prompt_templates]
-auto_create_plan = "Create an implementation plan at `{{plan_path}}`. Do not implement or commit. Include phases, tests, verification, risks, observability, and architecture fit.\n\nTask:\n{{task}}\n\nMode: {{mode}}\nVariant: {{variant}}\nAgent profile: {{agent_profile}}"
-auto_review_plan = "Review `{{plan_path}}` and edit it in place. Do not implement or commit. Check phases, risks, tests, observability, restartability, safety, and architecture fit.\n\nTask:\n{{task}}"
 auto_implement = "Implement this task in the current worktree. Stop after implementation; do not commit, push, create a pull request, or merge.\n\nTask:\n{{task}}"
-auto_fix_local_verify = "Fix the local verification failures, then stop without committing.\n\nOriginal task:\n{{task}}\n\nFailure context:\n{{context}}"
-auto_fix_review = "Resolve the review feedback and commit your changes, but do not push.\n\nOriginal task:\n{{task}}\n\nReview context:\n{{context}}"
-auto_fix_ci = "Fix the CI failure and commit your changes, but do not push.\n\nOriginal task:\n{{task}}\n\nCI context:\n{{context}}"
-review_fix = "Here are review comments on PR {pr_number}.\n\nIf they are applicable, fix them. Otherwise, say why not.\n\n---\n\n{comments}"
-ci_failure = "Here are CI failures on PR {pr_number}.\n\nFix the failing checks. Use the log tails below as the primary clues.\n\nPR: {url}\nBranch: {branch}\nHead SHA: {head_sha}\n\n---\n\n{failures}"
-repair_commit_review = "fix: cr"
-repair_commit_ci = "fix: ci"
-repair_commit_merge = "fix: merge"
 "#
 }
 
@@ -657,6 +632,25 @@ pub(crate) fn update_config_file(
     .map_err(|error| error.to_string())
 }
 
+fn workflow_cutover_complete() -> bool {
+    let path = prism_config_dir().join("workflow.db");
+    if !path.exists() {
+        return false;
+    }
+    rusqlite::Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .and_then(|conn| {
+        conn.query_row(
+            "select exists(select 1 from sqlite_master where type='table' and name='workflow_cutover' and exists(select 1 from workflow_cutover where id=1))",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+    })
+    .unwrap_or(false)
+}
+
 impl Config {
     pub fn load(repo: &Repository) -> Self {
         let user_path = prism_config_dir().join("config.toml");
@@ -757,6 +751,20 @@ impl Config {
                 return;
             }
         };
+        if workflow_cutover_complete()
+            && (raw.auto.is_some()
+                || raw.checks.as_ref().is_some_and(|checks| {
+                    checks.pre_pr.is_some()
+                        || checks.pre_push.is_some()
+                        || checks.review_fix.is_some()
+                }))
+        {
+            self.config_errors.push(format!(
+                "{} uses legacy [auto] or checks.pre_pr/pre_push/review_fix orchestration after Workflow cutover; run `prism config migrate-workflows` and move the settings into explicit Workflow definitions",
+                path.display()
+            ));
+            return;
+        }
         if raw.default_agent.is_some() || raw.agents.is_some() {
             self.config_errors.push(format!(
                 "{} uses obsolete default_agent/[agents.*] settings; replace them with default_harness/[harnesses.*]",
@@ -1607,6 +1615,55 @@ pub fn doctor(repo: &Repository, config: &mut Config) -> Result<(), String> {
             }
         }
         Err(error) => println!("worktrees: {error}"),
+    }
+
+    println!();
+    let definitions = crate::definition::DefinitionCatalog::discover(Some(&repo.root)).list();
+    match definitions {
+        Ok(definitions) => {
+            println!(
+                "workflow definitions: {} (invalid={} trust_required={})",
+                definitions.len(),
+                definitions
+                    .iter()
+                    .filter(|definition| !definition.valid)
+                    .count(),
+                definitions
+                    .iter()
+                    .filter(|definition| definition.trust_required)
+                    .count(),
+            );
+        }
+        Err(error) => println!("workflow definitions: unavailable: {error}"),
+    }
+    match crate::run::RunLedger::user().and_then(|ledger| ledger.health()) {
+        Ok(health) => {
+            println!(
+                "workflow database: {} active_leases={} dangling_claims={} quarantined={} overdue_waits={} recovery_required={} unresolved_effects={} enabled_triggers={}",
+                if health.integrity_ok {
+                    "ok"
+                } else {
+                    "problems"
+                },
+                health.active_leases,
+                health.dangling_claims,
+                health.quarantined_workspaces,
+                health.overdue_waits,
+                health.recovery_required_attempts,
+                health.unresolved_effects,
+                health.enabled_triggers,
+            );
+            for target in health.target_descriptors {
+                println!(
+                    "execution target: {} local={} confined={} continuation={}",
+                    target.id, target.local, target.confined, target.supports_continuation
+                );
+            }
+            for problem in health.problems {
+                println!("workflow problem: {problem}");
+            }
+        }
+        Err(error) => println!("workflow database: unavailable: {error}"),
     }
 
     Ok(())

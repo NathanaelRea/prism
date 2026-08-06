@@ -120,6 +120,22 @@ See [Remote Hosting](remote-hosting.md) for the full capability matrix,
 qualified server versions, authentication commands, Codeberg CI limitations,
 and doctor/debug troubleshooting.
 
+## Workflow health and retention
+
+`prism workflow doctor` reports Definition Snapshot and Artifact digest checks,
+lineage and child-link integrity, orphaned blobs, dangling resource claims,
+quarantined workspaces, overdue waits, enabled Triggers, unresolved effects, and
+local Execution Target confinement. The same summary is included in `prism
+doctor`; machine-readable output is available with `prism workflow doctor
+--json`. `prism debug info` prints the corresponding passive coordinator facts
+and `prism debug paths` prints the global workflow database location.
+
+At worker startup Prism conservatively removes expired bounded Attempt output,
+noisy duplicate events, terminal notification deliveries, and unreferenced
+provider observations. Immutable snapshots, Artifacts, lineage, approvals,
+effects, Trigger-to-Run links, and imported history are retained. Only blob
+files with no ledger reference are garbage-collected.
+
 ## Desktop notifications
 
 Desktop notifications are enabled by default for sessions waiting for input and for failures; `failed` also covers sessions that need to be restarted. Successful completion notifications default to off. The global switch and category switches may be overridden globally or in a repository config. Reloading config with `E` or `e` changes subsequent notifications without reporting sessions that are already blocked or finished.

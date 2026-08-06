@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::execution::{self, DispatchState, ExecutionClaim, WorkflowIdentity, WorkflowKind};
+use crate::execution::{self, WorkflowIdentity};
 use crate::notification::{NotificationCoordinator, NotificationObservation, PendingNotification};
 use crate::platform::SupportedOs;
 use crate::process::DetachedProcessPolicy;
@@ -28,7 +28,6 @@ const PROTOCOL_VERSION: u32 = 1;
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 const NOTIFICATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const NOTIFICATION_RETRY_INTERVAL: Duration = Duration::from_secs(10);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const DAEMON_TRANSITION_TIMEOUT: Duration = Duration::from_secs(3);
 const GLOBAL_CONCURRENCY: usize = 4;
 const SOCKET_PATH_BUDGET: usize = 103;
@@ -586,6 +585,25 @@ pub fn serve() -> Result<(), String> {
     let executable = installed_executable_path(&executable);
     let started_executable_identity = executable_identity(&executable)?;
     classify_abandoned(&instance_id)?;
+    if let Ok(ledger) = crate::run::RunLedger::user() {
+        let started = Instant::now();
+        match ledger.apply_retention(crate::run::RetentionPolicy::default()) {
+            Ok(report) => crate::flight_recorder::record(
+                "workflow_retention",
+                "apply",
+                Some(started.elapsed()),
+                vec![
+                    crate::flight_recorder::unsigned("events_deleted", report.events_deleted),
+                    crate::flight_recorder::unsigned(
+                        "output_rows_deleted",
+                        report.output_rows_deleted,
+                    ),
+                    crate::flight_recorder::unsigned("blobs_deleted", report.blobs_deleted),
+                ],
+            ),
+            Err(error) => eprintln!("Prism workflow retention failed: {error}"),
+        }
+    }
     log_daemon_lifecycle("daemon_start", &instance_id);
     let listener = UnixListener::bind(socket.as_path()).map_err(|error| {
         format!(
@@ -599,7 +617,7 @@ pub fn serve() -> Result<(), String> {
         .set_nonblocking(true)
         .map_err(|error| format!("configure Prism worker listener: {error}"))?;
 
-    let active = Arc::new(Mutex::new(BTreeSet::<PathBuf>::new()));
+    let active = Arc::new(Mutex::new(BTreeSet::<String>::new()));
     let notification_subscriber = Arc::new(Mutex::new(Vec::<UnixStream>::new()));
     let notification_stop = Arc::new(AtomicBool::new(false));
     let observer_stop = Arc::clone(&notification_stop);
@@ -646,7 +664,14 @@ pub fn serve() -> Result<(), String> {
                 restart_after_drain = true;
                 continue;
             }
-            schedule_queued(&instance_id, Arc::clone(&active));
+            // The Step-Attempt coordinator is the sole production scheduler.
+            // Legacy rows are migration inputs and history only; the worker
+            // never claims them, including before the cutover marker exists.
+            // Trigger evaluation is durable orchestration work, not a leased
+            // Step, and remains gated by the cutover marker internally.
+            let _ = evaluate_scheduled_triggers();
+            let _ = evaluate_provider_triggers();
+            schedule_generalized(&instance_id, Arc::clone(&active));
             next_poll = Instant::now() + POLL_INTERVAL;
         }
         thread::sleep(Duration::from_millis(50));
@@ -660,6 +685,283 @@ pub fn serve() -> Result<(), String> {
         start_worker(executable)?;
     }
     Ok(())
+}
+
+fn evaluate_scheduled_triggers() -> Result<(), String> {
+    let ledger = crate::run::RunLedger::user()?;
+    if !ledger.cutover_complete()? {
+        return Ok(());
+    }
+    let engine = crate::trigger::TriggerEngine::new(ledger.clone())?;
+    sync_definition_triggers(&ledger, &engine)?;
+    let now = crate::run::now_ms();
+    for (trigger, enabled) in engine.list()? {
+        if !enabled || !matches!(trigger.kind, crate::trigger::TriggerKind::Schedule { .. }) {
+            continue;
+        }
+        let after = engine
+            .checkpoint_value(&trigger.id)?
+            .and_then(|value| value.parse::<i64>().ok())
+            // Enabling a schedule starts from now and does not accidentally
+            // replay its entire calendar history.
+            .unwrap_or_else(|| now.saturating_sub(POLL_INTERVAL.as_millis() as i64));
+        let due = engine.evaluate_due(&trigger.id, after, now)?;
+        let catalog = crate::definition::DefinitionCatalog::discover(None);
+        let preview = catalog
+            .preview(&trigger.definition_selector)
+            .map_err(|diagnostics| {
+                diagnostics
+                    .into_iter()
+                    .map(|value| value.message)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })?;
+        if preview
+            .snapshot
+            .content
+            .inputs
+            .values()
+            .any(|port| port.required)
+        {
+            return Err(format!(
+                "scheduled Trigger '{}' resolves to a Workflow with required inputs",
+                trigger.id
+            ));
+        }
+        let input_digest = crate::run::sha256(b"{}");
+        let mut persisted = Vec::new();
+        for due in due {
+            let occurrence = engine.record_occurrence(
+                &trigger.id,
+                crate::trigger::OccurrenceIdentity {
+                    native_occurrence: &due.native_occurrence,
+                    provider_item: None,
+                    observation_revision: None,
+                    definition_digest: &preview.snapshot.digest,
+                    input_digest: &input_digest,
+                },
+            )?;
+            persisted.push(occurrence.id.clone());
+            if occurrence.run_id.is_some() {
+                continue;
+            }
+            match engine.launch_disposition(&occurrence.id)? {
+                crate::trigger::LaunchDisposition::Coalesced(run_id) => {
+                    engine.attach_run(&occurrence.id, &run_id)?;
+                }
+                crate::trigger::LaunchDisposition::Queued => {}
+                crate::trigger::LaunchDisposition::Supersede(runs) => {
+                    for run in runs {
+                        let _ = ledger.set_control(&run, "cancel_requested");
+                    }
+                    launch_trigger_occurrence(
+                        &ledger,
+                        &engine,
+                        &trigger,
+                        &preview.snapshot,
+                        &occurrence,
+                    )?;
+                }
+                crate::trigger::LaunchDisposition::Launch => {
+                    launch_trigger_occurrence(
+                        &ledger,
+                        &engine,
+                        &trigger,
+                        &preview.snapshot,
+                        &occurrence,
+                    )?;
+                }
+            }
+        }
+        // Schedule polling has no provider page, but still commits its cursor
+        // only after every due occurrence is durable.
+        engine.checkpoint(&trigger.id, &now.to_string(), &persisted)?;
+    }
+    Ok(())
+}
+
+fn sync_definition_triggers(
+    ledger: &crate::run::RunLedger,
+    engine: &crate::trigger::TriggerEngine,
+) -> Result<(), String> {
+    let mut repositories = vec![None];
+    repositories.extend(ledger.tracked_repository_paths()?.into_iter().map(Some));
+    let mut discovered = std::collections::BTreeMap::new();
+    for repository in repositories {
+        let catalog = crate::definition::DefinitionCatalog::discover(repository.as_deref());
+        for summary in catalog.list()? {
+            if !summary.valid || summary.trust_required {
+                continue;
+            }
+            let selector = summary.source.qualified_name();
+            let preview = catalog.preview(&selector).map_err(|diagnostics| {
+                diagnostics
+                    .into_iter()
+                    .map(|value| value.message)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })?;
+            for trigger in preview.snapshot.content.triggers {
+                if let Some(existing) = discovered.insert(trigger.id.clone(), trigger.clone())
+                    && existing != trigger
+                {
+                    return Err(format!(
+                        "Trigger '{}' is declared inconsistently by discovered Workflow sources",
+                        trigger.id
+                    ));
+                }
+            }
+        }
+    }
+    for trigger in discovered.into_values() {
+        engine.register(&trigger, trigger.enabled)?;
+    }
+    Ok(())
+}
+
+fn evaluate_provider_triggers() -> Result<(), String> {
+    let ledger = crate::run::RunLedger::user()?;
+    if !ledger.cutover_complete()? {
+        return Ok(());
+    }
+    let engine = crate::trigger::TriggerEngine::new(ledger.clone())?;
+    sync_definition_triggers(&ledger, &engine)?;
+    let now = crate::run::now_ms();
+    for (trigger, enabled) in engine.list()? {
+        let crate::trigger::TriggerKind::ProviderEvent { repository, event } = &trigger.kind else {
+            continue;
+        };
+        if !enabled || event != "issue" {
+            continue;
+        }
+        if engine
+            .checkpoint_value(&trigger.id)?
+            .and_then(|value| value.parse::<i64>().ok())
+            .is_some_and(|last| now.saturating_sub(last) < 60_000)
+        {
+            continue;
+        }
+        let mut matched = false;
+        for path in ledger.tracked_repository_paths()? {
+            let repo = Repository { root: path.clone() };
+            let config = Config::load(&repo);
+            let provider = match crate::remote::dispatcher::provider(&path, &config) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            let project =
+                match crate::remote::dispatcher::repository_project(&path, &config, "origin") {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+            let identity = format!("{}:{}", provider.config_label(), project);
+            if &identity != repository {
+                continue;
+            }
+            matched = true;
+            let preview = crate::definition::DefinitionCatalog::discover(Some(&path))
+                .preview(&trigger.definition_selector)
+                .map_err(|diagnostics| {
+                    diagnostics
+                        .into_iter()
+                        .map(|value| value.message)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })?;
+            let observations = crate::remote::dispatcher::discover_issues(&path, &config)
+                .map_err(|error| error.to_string())?;
+            if observations.len() > trigger.max_fan_out as usize {
+                return Err(format!(
+                    "provider Trigger '{}' exceeded its bounded fan-out",
+                    trigger.id
+                ));
+            }
+            let mut persisted = Vec::new();
+            for observation in observations {
+                let item_key = observation.id.canonical_key();
+                let revision = observation.revision();
+                engine.record_provider_observation(
+                    &crate::remote::ProviderItemObservationState::Current(observation.clone()),
+                )?;
+                let inputs = vec![crate::run::ArtifactInput {
+                    name: "item".into(),
+                    artifact_type: "builtin:provider-item-observation@1".into(),
+                    payload: serde_json::to_value(&observation)
+                        .map_err(|error| error.to_string())?,
+                    trust: crate::run::TrustClass::Untrusted,
+                    sensitivity: crate::run::Sensitivity::Internal,
+                }];
+                let input_digest = crate::run::input_digest(&inputs)?;
+                let occurrence = engine.record_occurrence(
+                    &trigger.id,
+                    crate::trigger::OccurrenceIdentity {
+                        native_occurrence: &now.to_string(),
+                        provider_item: Some(&item_key),
+                        observation_revision: Some(&revision),
+                        definition_digest: &preview.snapshot.digest,
+                        input_digest: &input_digest,
+                    },
+                )?;
+                persisted.push(occurrence.id.clone());
+                if occurrence.run_id.is_some() {
+                    continue;
+                }
+                let launch = |engine: &crate::trigger::TriggerEngine| -> Result<(), String> {
+                    let started = ledger.start_intake(crate::run::StartRun {
+                        snapshot: preview.snapshot.clone(),
+                        repository_id: None,
+                        inputs: inputs.clone(),
+                        idempotency_key: Some(format!("trigger:{}", occurrence.occurrence_key)),
+                        actor: format!("provider-trigger:{}", trigger.id),
+                        actor_capabilities: preview
+                            .snapshot
+                            .content
+                            .transitive_capabilities
+                            .clone(),
+                    })?;
+                    engine.attach_run(&occurrence.id, &started.run_id)
+                };
+                match engine.launch_disposition(&occurrence.id)? {
+                    crate::trigger::LaunchDisposition::Launch => launch(&engine)?,
+                    crate::trigger::LaunchDisposition::Coalesced(run) => {
+                        engine.attach_run(&occurrence.id, &run)?
+                    }
+                    crate::trigger::LaunchDisposition::Queued => {}
+                    crate::trigger::LaunchDisposition::Supersede(runs) => {
+                        for run in runs {
+                            let _ = ledger.set_control(&run, "cancel_requested");
+                        }
+                        launch(&engine)?;
+                    }
+                }
+            }
+            engine.checkpoint(&trigger.id, &now.to_string(), &persisted)?;
+        }
+        if !matched {
+            // Unsupported or untracked repositories remain visible through the
+            // unchanged checkpoint instead of being rendered as an empty poll.
+            continue;
+        }
+    }
+    Ok(())
+}
+
+fn launch_trigger_occurrence(
+    ledger: &crate::run::RunLedger,
+    engine: &crate::trigger::TriggerEngine,
+    trigger: &crate::trigger::TriggerDefinition,
+    snapshot: &crate::definition::DefinitionSnapshot,
+    occurrence: &crate::trigger::TriggerOccurrence,
+) -> Result<(), String> {
+    let started = ledger.start(crate::run::StartRun {
+        snapshot: snapshot.clone(),
+        repository_id: None,
+        inputs: Vec::new(),
+        idempotency_key: Some(format!("trigger:{}", occurrence.occurrence_key)),
+        actor: format!("trigger:{}", trigger.id),
+        actor_capabilities: snapshot.content.transitive_capabilities.clone(),
+    })?;
+    engine.attach_run(&occurrence.id, &started.run_id)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -688,7 +990,7 @@ fn respond(
     stream: &mut UnixStream,
     instance_id: &str,
     executable_identity: &str,
-    active: &Arc<Mutex<BTreeSet<PathBuf>>>,
+    active: &Arc<Mutex<BTreeSet<String>>>,
     notification_subscriber: &Arc<Mutex<Vec<UnixStream>>>,
     draining: bool,
 ) -> WorkerControl {
@@ -1061,81 +1363,50 @@ fn classify_abandoned(instance_id: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn schedule_queued(instance_id: &str, active: Arc<Mutex<BTreeSet<PathBuf>>>) {
-    let active_count = active
+fn schedule_generalized(instance_id: &str, active: Arc<Mutex<BTreeSet<String>>>) {
+    if active
         .lock()
         .map(|active| active.len())
-        .unwrap_or(usize::MAX);
-    if active_count >= GLOBAL_CONCURRENCY {
+        .unwrap_or(usize::MAX)
+        >= GLOBAL_CONCURRENCY
+    {
         return;
     }
-    let entries = match workspace::load_entries() {
-        Ok(entries) => entries,
+    let runtime = match crate::runtime::WorkflowRuntime::user() {
+        Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("Prism worker cannot load repositories: {error}");
+            eprintln!("Prism worker cannot open the Workflow Run Ledger: {error}");
             return;
         }
     };
-    for entry in workspace::discover_valid_entries(entries) {
-        let repo = entry.repo;
-        if let Err(error) = observability::attach_run_repo(&repo) {
-            eprintln!(
-                "Prism worker cannot attach repository {}: {error}",
-                repo.root.display()
-            );
-            continue;
+    let worker_id = format!(
+        "{instance_id}:attempt:{}",
+        execution::new_instance_id("worker")
+    );
+    let claim = match runtime.claim_next(&worker_id) {
+        Ok(Some(claim)) => claim,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("Prism generalized scheduler failed: {error}");
+            return;
         }
-        let _ = observability::with_writable_db(&repo, |conn| {
-            execution::mark_abandoned(conn, instance_id).map(|_| ())
-        });
-        let queued = observability::with_writable_db(&repo, |conn| execution::queued(conn, 16));
-        let Ok(queued) = queued else {
-            continue;
-        };
-        for workflow in queued {
-            if active
-                .lock()
-                .map(|active| active.len())
-                .unwrap_or(usize::MAX)
-                >= GLOBAL_CONCURRENCY
-            {
-                return;
-            }
-            let Ok(worktree) = workflow_worktree(&repo, &workflow) else {
-                continue;
-            };
-            let config = Config::load(&repo);
-            if !matches!(legacy_worker_running(&repo, &config, &workflow), Ok(false)) {
-                continue;
-            }
-            let inserted = active
-                .lock()
-                .map(|mut active| active.insert(worktree.clone()))
-                .unwrap_or(false);
-            if !inserted {
-                continue;
-            }
-            let worker_id = execution::new_instance_id("executor");
-            let claim = observability::with_writable_db_mut(&repo, |conn| {
-                execution::claim(conn, &workflow, instance_id, &worker_id)
-            });
-            let Ok(Some(claim)) = claim else {
-                if let Ok(mut active) = active.lock() {
-                    active.remove(&worktree);
-                }
-                continue;
-            };
-            log_claim_lifecycle(&repo, "claim", &claim, "workflow claimed");
-            let active = Arc::clone(&active);
-            let executor_repo = repo.clone();
-            thread::spawn(move || {
-                execute_claim(&executor_repo, &claim);
-                if let Ok(mut active) = active.lock() {
-                    active.remove(&worktree);
-                }
-            });
-        }
+    };
+    let key = format!("attempt:{}", claim.lease.attempt_id.as_str());
+    if !active
+        .lock()
+        .map(|mut active| active.insert(key.clone()))
+        .unwrap_or(false)
+    {
+        return;
     }
+    thread::spawn(move || {
+        if let Err(error) = runtime.execute(claim) {
+            eprintln!("Prism generalized Attempt failed: {error}");
+        }
+        if let Ok(mut active) = active.lock() {
+            active.remove(&key);
+        }
+    });
 }
 
 pub fn legacy_worker_running(
@@ -1151,273 +1422,6 @@ pub fn legacy_worker_running(
     );
     crate::tmux::named_session_exists(config, &expected)
         .map_err(|error| format!("inspect legacy tmux workers: {error}"))
-}
-
-fn workflow_worktree(repo: &Repository, workflow: &WorkflowIdentity) -> Result<PathBuf, String> {
-    observability::with_writable_db(repo, |conn| {
-        let (table, column) = match workflow.kind {
-            WorkflowKind::Auto => ("auto_run", "worktree_path"),
-            WorkflowKind::Plan => ("plan_run", "scope_path"),
-        };
-        conn.query_row(
-            &format!("select {column} from {table} where id = ?1"),
-            [&workflow.run_id],
-            |row| row.get::<_, String>(0),
-        )
-        .map(PathBuf::from)
-        .map_err(|error| format!("load workflow worktree: {error}"))
-    })
-}
-
-fn execute_claim(repo: &Repository, claim: &ExecutionClaim) {
-    log_claim_lifecycle(repo, "executor_start", claim, "workflow executor started");
-    let heartbeat_stop = Arc::new(AtomicBool::new(false));
-    let ownership_lost = Arc::new(AtomicBool::new(false));
-    let heartbeat = spawn_heartbeat(
-        repo.clone(),
-        claim.clone(),
-        Arc::clone(&heartbeat_stop),
-        Arc::clone(&ownership_lost),
-    );
-    let config = Config::load(repo);
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        observability::with_writable_db(repo, |conn| execution::validate_claim(conn, claim))
-            .and_then(|()| match claim.workflow.kind {
-                WorkflowKind::Auto => execute_auto(repo, &config, claim),
-                WorkflowKind::Plan => execute_plan(repo, &config, claim),
-            })
-    }))
-    .unwrap_or_else(|_| Err("workflow executor panicked".to_string()));
-    heartbeat_stop.store(true, Ordering::Release);
-    let _ = heartbeat.join();
-
-    let state = match result {
-        Ok(()) => workflow_release_state(repo, &claim.workflow).unwrap_or(DispatchState::Terminal),
-        Err(error) => {
-            log_claim_lifecycle(repo, "executor_failed", claim, &error);
-            if !ownership_lost.load(Ordering::Acquire) {
-                mark_domain_failed(repo, claim, &error);
-            }
-            DispatchState::Terminal
-        }
-    };
-    match observability::with_writable_db(repo, |conn| execution::release(conn, claim, state)) {
-        Ok(()) => log_claim_lifecycle(repo, "release", claim, state.label()),
-        Err(error) => log_claim_lifecycle(repo, "release_failed", claim, &error),
-    }
-    log_claim_lifecycle(repo, "executor_stop", claim, "workflow executor stopped");
-}
-
-fn spawn_heartbeat(
-    repo: Repository,
-    claim: ExecutionClaim,
-    stop: Arc<AtomicBool>,
-    ownership_lost: Arc<AtomicBool>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        let mut next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
-        while !stop.load(Ordering::Acquire) {
-            thread::sleep(Duration::from_millis(100));
-            if stop.load(Ordering::Acquire) {
-                break;
-            }
-            if Instant::now() < next_heartbeat {
-                continue;
-            }
-            if observability::with_writable_db(&repo, |conn| execution::heartbeat(conn, &claim))
-                .is_err()
-            {
-                let validation = observability::with_writable_db(&repo, |conn| {
-                    execution::validate_claim(conn, &claim)
-                });
-                if matches!(
-                    validation,
-                    Err(ref error) if execution::is_stale_claim_error(error)
-                ) {
-                    ownership_lost.store(true, Ordering::Release);
-                    log_claim_lifecycle(
-                        &repo,
-                        "heartbeat_lost",
-                        &claim,
-                        "execution ownership lost",
-                    );
-                    break;
-                }
-            }
-            next_heartbeat = Instant::now() + HEARTBEAT_INTERVAL;
-        }
-    })
-}
-
-fn execute_auto(repo: &Repository, config: &Config, claim: &ExecutionClaim) -> Result<(), String> {
-    let run_id = &claim.workflow.run_id;
-    let mut persisted = observability::with_writable_db(repo, |conn| {
-        crate::auto_flow::load_auto_run(conn, run_id)
-    })?
-    .ok_or_else(|| format!("auto flow run not found: {run_id}"))?;
-    let harness_config = config
-        .harness_config(&persisted.run.harness_id)
-        .map_err(|_| {
-            format!(
-                "auto run harness '{}' is no longer configured",
-                persisted.run.harness_id
-            )
-        })?;
-    if harness_config.adapter != persisted.run.adapter_id {
-        return Err(format!(
-            "auto run harness '{}' was recorded with adapter '{}', but it is now configured as '{}'",
-            persisted.run.harness_id, persisted.run.adapter_id, harness_config.adapter
-        ));
-    }
-    let worktree_session_id = persisted
-        .run
-        .worktree_session_id
-        .as_deref()
-        .ok_or_else(|| {
-            "auto run has no Worktree Session identity; legacy runs cannot execute".to_string()
-        })?;
-    let runtime = crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
-        .prepare_server(
-            repo,
-            config,
-            &persisted.run.branch,
-            &persisted.run.worktree_path,
-            worktree_session_id,
-        )?
-        .map(|runtime| runtime.server_url);
-    let executor = crate::auto_flow::AutoExecutorConfig::for_harness(
-        persisted.run.harness_id.clone(),
-        harness_config,
-        runtime,
-        persisted.run.worktree_path.clone(),
-        format!("Auto Flow {}", persisted.run.prompt_summary),
-    );
-    observability::with_writable_db(repo, |conn| {
-        execution::install_claim_guards(conn, claim)?;
-        crate::auto_flow::execute_auto_initial_step(
-            conn,
-            repo,
-            config,
-            &mut persisted,
-            &executor,
-            &mut std::io::sink(),
-        )
-    })
-}
-
-fn execute_plan(repo: &Repository, config: &Config, claim: &ExecutionClaim) -> Result<(), String> {
-    let run_id = &claim.workflow.run_id;
-    let mut persisted =
-        observability::with_writable_db(repo, |conn| crate::plan_run::load_plan_run(conn, run_id))?
-            .ok_or_else(|| format!("plan run not found: {run_id}"))?;
-    let harness_config = config
-        .harness_config(&persisted.run.harness_id)
-        .map_err(|_| {
-            format!(
-                "plan run harness '{}' is no longer configured",
-                persisted.run.harness_id
-            )
-        })?;
-    if harness_config.adapter != persisted.run.adapter_id {
-        return Err(format!(
-            "plan run harness '{}' was recorded with adapter '{}', but it is now configured as '{}'",
-            persisted.run.harness_id, persisted.run.adapter_id, harness_config.adapter
-        ));
-    }
-    let worktree_session_id = persisted
-        .run
-        .worktree_session_id
-        .as_deref()
-        .ok_or_else(|| {
-            "plan run has no Worktree Session identity; legacy runs cannot execute".to_string()
-        })?;
-    let server_url = crate::harness::Harness::new(&persisted.run.harness_id, &harness_config)
-        .prepare_server(
-            repo,
-            config,
-            "plan",
-            &persisted.run.scope_path,
-            worktree_session_id,
-        )?
-        .map(|runtime| runtime.server_url);
-    let mut executor = crate::plan_run::PlanExecutorConfig::for_harness(
-        persisted.run.harness_id.clone(),
-        harness_config.clone(),
-        server_url,
-        persisted.run.scope_path.clone(),
-        persisted.run.plan_display.clone(),
-    );
-    if harness_config.adapter == "opencode"
-        && config.opencode_plan_plugin
-        && let Ok(plugin) = crate::plan_run::prepare_plan_plugin_config(&repo.prism_dir())
-    {
-        executor = executor.with_plugin_config(plugin);
-    }
-    observability::with_writable_db(repo, |conn| {
-        execution::install_claim_guards(conn, claim)?;
-        match persisted.run.mode {
-            crate::plan_run::PlanRunMode::Sequential => crate::plan_run::execute_plan_sequential(
-                conn,
-                &mut persisted,
-                &executor,
-                &mut std::io::sink(),
-            ),
-            crate::plan_run::PlanRunMode::Parallel => crate::plan_run::execute_plan_parallel(
-                conn,
-                &mut persisted,
-                &executor,
-                &mut std::io::sink(),
-            ),
-        }
-    })
-}
-
-fn workflow_release_state(
-    repo: &Repository,
-    workflow: &WorkflowIdentity,
-) -> Result<DispatchState, String> {
-    observability::with_writable_db(repo, |conn| {
-        let table = match workflow.kind {
-            WorkflowKind::Auto => "auto_run",
-            WorkflowKind::Plan => "plan_run",
-        };
-        let status = conn
-            .query_row(
-                &format!("select status from {table} where id = ?1"),
-                [&workflow.run_id],
-                |row| row.get::<_, String>(0),
-            )
-            .map_err(|error| format!("load completed workflow status: {error}"))?;
-        Ok(if status == "paused" {
-            DispatchState::Paused
-        } else {
-            DispatchState::Terminal
-        })
-    })
-}
-
-fn mark_domain_failed(repo: &Repository, claim: &ExecutionClaim, error: &str) {
-    let _ = observability::with_writable_db(repo, |conn| {
-        execution::install_claim_guards(conn, claim)?;
-        match claim.workflow.kind {
-            WorkflowKind::Auto => {
-                if let Some(mut persisted) =
-                    crate::auto_flow::load_auto_run(conn, &claim.workflow.run_id)?
-                {
-                    crate::auto_flow::fail_auto_run(conn, &mut persisted, error.to_string())?;
-                }
-            }
-            WorkflowKind::Plan => {
-                conn.execute(
-                    "update plan_run set status = 'failed', updated_unix_ms = ?1
-                     where id = ?2 and status not in ('aborted', 'done')",
-                    rusqlite::params![execution::now_ms(), claim.workflow.run_id],
-                )
-                .map_err(|db_error| format!("mark plan run failed: {db_error}"))?;
-            }
-        }
-        Ok(())
-    });
 }
 
 fn log_daemon_lifecycle(action: &str, instance_id: &str) {
@@ -1437,18 +1441,6 @@ fn log_daemon_lifecycle(action: &str, instance_id: &str) {
             Some(&data),
         );
     }
-}
-
-fn log_claim_lifecycle(repo: &Repository, action: &str, claim: &ExecutionClaim, message: &str) {
-    let data = format!(
-        "{{\"workflow_kind\":\"{}\",\"run_id\":{},\"worker_id\":{},\"daemon_instance_id\":{},\"fencing_token\":{}}}",
-        claim.workflow.kind.label(),
-        serde_json::to_string(&claim.workflow.run_id).unwrap_or_else(|_| "null".to_string()),
-        serde_json::to_string(&claim.worker_id).unwrap_or_else(|_| "null".to_string()),
-        serde_json::to_string(&claim.daemon_instance_id).unwrap_or_else(|_| "null".to_string()),
-        claim.fencing_token,
-    );
-    log_worker_event(repo, action, message, Some(&data));
 }
 
 fn log_worker_event(repo: &Repository, action: &str, message: &str, data_json: Option<&str>) {

@@ -209,6 +209,15 @@ impl Tui {
             repo_filter: &self.repo_filter,
             worktree_filter: &self.worktree_filter,
             leader_hint: self.leader_hint_model(),
+            workflow_dashboard: self
+                .repos
+                .get(self.current_repo)
+                .and_then(|managed| self.generalized_run_detail.get(&managed.identity))
+                .cloned()
+                .map(|projection| view::WorkflowDashboard {
+                    selected_attempt: projection.attempts.last().map(|attempt| attempt.id.clone()),
+                    projection,
+                }),
             auto_dashboard: self.current_auto_dashboard(),
             plan_dashboard: self.current_plan_dashboard(),
             tmux_portal: self.tmux_portal_model(),

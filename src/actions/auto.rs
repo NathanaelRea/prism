@@ -81,65 +81,30 @@ impl Tui {
             });
         }
 
-        let session = &self.sessions[context.session_index];
-        let summary = session.pr.trusted_summary()?.cloned().ok_or_else(|| {
-            "merge queue requires an active Auto Flow or open pull request".to_string()
-        })?;
-        let branch = session.branch.clone();
-        let incarnation = session.incarnation.clone();
-        let detached = session.is_detached();
+        let summary = self.sessions[context.session_index]
+            .pr
+            .trusted_summary()?
+            .cloned()
+            .ok_or_else(|| {
+                "guarded merge requires a current Change Request observation".to_string()
+            })?;
         if summary.merged || !summary.state.eq_ignore_ascii_case("OPEN") {
-            return Err("merge queue requires an open pull request".to_string());
+            return Err("guarded merge requires an open Change Request".to_string());
         }
-        if context.config.is_default_branch(&branch) || detached {
-            return Err("merge queue requires a non-default attached worktree".to_string());
-        }
-        if selected_dirty(&session_path, &context.config)? {
-            return Err("merge queue requires a clean worktree at launch".to_string());
-        }
-        if !context.config.selected_harness()?.describe().headless {
-            return Err(format!(
-                "harness '{}' does not support managed Auto Flow execution; configure headless_command and headless_prompt_transport",
-                context.config.default_harness
-            ));
-        }
-        let launch = AutoLaunch::with_options(
+        let artifact = crate::coding::cached_change_request_artifact(&summary)?;
+        let run_id = crate::operations::WorkflowOperations::launch_named(
             &context.repo.root,
-            &session_path,
-            AutoLaunchOptions {
-                branch: branch.clone(),
-                mode: AutoRunMode::Standard,
-                implementation_source: AutoImplementationSource::ExistingPullRequest,
-                plan_path: None,
-                plan_run_mode: PlanRunMode::Sequential,
-                variant: "existing-pr".to_string(),
-                agent_profile: None,
-                initial_prompt: format!("Stabilize existing pull request for branch {}", branch),
-            },
-        )?
-        .with_harness(
-            context.config.default_harness.clone(),
-            context
-                .config
-                .harness_adapter(&context.config.default_harness)?,
-        )
-        .with_worktree_incarnation(incarnation)
-        .with_worktree_session_id(session.worktree_session_id.clone());
-        let mut persisted = launch.create_run();
-        crate::auto_flow::stabilization_observe::adopt_existing_pull_request(
-            &context.repo,
-            &context.config,
-            &mut persisted,
+            "builtin:merge",
+            vec![artifact],
+            "local:tui".to_string(),
         )?;
-        crate::observability::with_writable_db(&context.repo, |conn| {
-            crate::auto_flow::submit_auto_run_with_merge_intent(conn, &mut persisted)
-        })?;
-        let run_id = persisted.run.id.clone();
-        self.remember_auto_run(persisted);
-        self.selected_auto_run = Some(run_id);
         crate::worker::ensure_running()?;
         crate::worker::wake()?;
-        self.show_message("added pull request to the merge queue")
+        self.invalidate_workflow_snapshots();
+        self.show_message(&format!(
+            "guarded merge Workflow {} is awaiting evidence and Approval",
+            run_id.as_str()
+        ))
     }
 
     pub(crate) fn start_or_focus_selected_auto_run(
@@ -269,45 +234,48 @@ impl Tui {
             ),
             AutoStartupSource::Disable => unreachable!("disable is handled before launch"),
         };
-        let launch = AutoLaunch::with_options(
-            &context.repo.root,
-            &session_path,
-            AutoLaunchOptions {
-                branch: session_branch,
-                mode,
-                implementation_source,
-                plan_path,
-                plan_run_mode,
-                variant,
-                agent_profile: None,
-                initial_prompt: prompt,
-            },
-        )?
-        .with_harness(
-            context.config.default_harness.clone(),
-            context
-                .config
-                .harness_adapter(&context.config.default_harness)?,
-        )
-        .with_worktree_incarnation(session_incarnation);
-        let launch = launch.with_worktree_session_id(worktree_session_id);
-        let mut persisted = launch.create_run();
-        if persisted.run.implementation_source == AutoImplementationSource::ExistingPullRequest {
-            crate::auto_flow::stabilization_observe::adopt_existing_pull_request(
-                &context.repo,
-                &context.config,
-                &mut persisted,
-            )?;
+        let source = match implementation_source {
+            AutoImplementationSource::Prompt => "prompt",
+            AutoImplementationSource::ExistingPlan => "existing_plan",
+            AutoImplementationSource::DraftPlan => "draft_plan",
+            AutoImplementationSource::ExistingPullRequest => "existing_change_request",
+        };
+        let mut task = serde_json::json!({
+            "implementation_source": source,
+            "task": prompt,
+            "branch": session_branch,
+            "variant": variant,
+            "plan_run_mode": format!("{plan_run_mode:?}").to_lowercase(),
+            "worktree_session_id": worktree_session_id,
+            "worktree_incarnation": session_incarnation,
+            "mode": format!("{mode:?}").to_lowercase(),
+        });
+        if let Some(path) = plan_path {
+            let content = std::fs::read_to_string(&path).map_err(|error| {
+                format!("read immutable Plan input {}: {error}", path.display())
+            })?;
+            task["plan"] = serde_json::Value::String(content);
+            task["plan_display"] = serde_json::Value::String(path.display().to_string());
         }
-        crate::observability::with_writable_db(&context.repo, |conn| {
-            crate::auto_flow::submit_auto_run(conn, &mut persisted)
-        })?;
-        let run_id = persisted.run.id.clone();
-        self.remember_auto_run(persisted.clone());
-        self.selected_auto_run = Some(run_id);
+        let run_id = crate::operations::WorkflowOperations::launch_named(
+            &context.repo.root,
+            "builtin:coding",
+            vec![crate::run::ArtifactInput {
+                name: "task".to_string(),
+                artifact_type: "builtin:task@1".to_string(),
+                payload: task,
+                trust: crate::run::TrustClass::Trusted,
+                sensitivity: crate::run::Sensitivity::Internal,
+            }],
+            "local:tui".to_string(),
+        )?;
         crate::worker::ensure_running()?;
         crate::worker::wake()?;
-        self.show_message("Auto Flow queued on headless worker")?;
+        self.invalidate_workflow_snapshots();
+        self.show_message(&format!(
+            "Workflow {} queued on headless worker",
+            run_id.as_str()
+        ))?;
         Ok(())
     }
 

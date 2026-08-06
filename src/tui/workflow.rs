@@ -134,6 +134,27 @@ impl Tui {
                 .insert(result.repository.clone(), snapshot.repository);
             changed |= self.worker_health.as_ref() != Some(&snapshot.worker_health);
             self.worker_health = Some(snapshot.worker_health.clone());
+            if let Ok(runs) = snapshot.generalized_runs {
+                changed |= self.generalized_runs.get(&result.repository) != Some(&runs);
+                self.generalized_runs
+                    .insert(result.repository.clone(), runs);
+            }
+            if let Ok(detail) = snapshot.generalized_detail {
+                match detail {
+                    Some(detail) => {
+                        changed |= self.generalized_run_detail.get(&result.repository)
+                            != Some(detail.as_ref());
+                        self.generalized_run_detail
+                            .insert(result.repository.clone(), *detail);
+                    }
+                    None => {
+                        changed |= self
+                            .generalized_run_detail
+                            .remove(&result.repository)
+                            .is_some();
+                    }
+                }
+            }
             if let Ok(runs) = snapshot.plan_runs {
                 for run in runs {
                     changed |= self.remember_plan_run_snapshot(run);
@@ -159,6 +180,10 @@ impl Tui {
             .collect::<BTreeSet<_>>();
         let previous = self.workspace_repositories.len();
         self.workspace_repositories
+            .retain(|repository, _| repositories.contains(repository));
+        self.generalized_runs
+            .retain(|repository, _| repositories.contains(repository));
+        self.generalized_run_detail
             .retain(|repository, _| repositories.contains(repository));
         changed |= previous != self.workspace_repositories.len();
         self.start_workflow_polls(false);
@@ -215,25 +240,49 @@ impl Tui {
                     .into_iter()
                     .next()
                     .ok_or_else(|| "workspace inspection returned no repository".to_string())?;
+                    // Global Workflow summaries are paged first. Only the
+                    // selected (most recent) Run detail, including bounded
+                    // output, is loaded afterward in this supervised job.
+                    let generalized = crate::run::RunLedger::user().and_then(|ledger| {
+                        let runs = ledger.list_for_repository(&repo.root, 32)?;
+                        let detail = runs
+                            .first()
+                            .map(|run| ledger.inspect(&run.id).map(Box::new))
+                            .transpose()?;
+                        let cutover = ledger.cutover_complete()?;
+                        Ok((runs, detail, cutover))
+                    });
+                    let cutover = generalized.as_ref().is_ok_and(|(_, _, cutover)| *cutover);
                     let snapshot = crate::observability::with_nonblocking_read_db_named(
                         &repo,
                         "tui.workflow.refresh",
                         |conn| {
-                            let plan_runs = load_recent_plan_runs_for_repo(conn, &repo.root, 8);
-                            let auto_runs = (|| {
-                                let mut runs =
-                                    load_recent_active_run_snapshots_for_repo(conn, &repo.root, 8)?;
-                                let active_ids = runs
-                                    .iter()
-                                    .map(|run| run.run.id.clone())
-                                    .collect::<BTreeSet<_>>();
-                                runs.extend(
-                                    load_terminal_repair_run_snapshots_for_repo(conn, &repo.root)?
+                            let plan_runs = if cutover {
+                                Ok(Vec::new())
+                            } else {
+                                load_recent_plan_runs_for_repo(conn, &repo.root, 8)
+                            };
+                            let auto_runs = if cutover {
+                                Ok(Vec::new())
+                            } else {
+                                (|| {
+                                    let mut runs = load_recent_active_run_snapshots_for_repo(
+                                        conn, &repo.root, 8,
+                                    )?;
+                                    let active_ids = runs
+                                        .iter()
+                                        .map(|run| run.run.id.clone())
+                                        .collect::<BTreeSet<_>>();
+                                    runs.extend(
+                                        load_terminal_repair_run_snapshots_for_repo(
+                                            conn, &repo.root,
+                                        )?
                                         .into_iter()
                                         .filter(|run| !active_ids.contains(&run.run.id)),
-                                );
-                                Ok(runs)
-                            })();
+                                    );
+                                    Ok(runs)
+                                })()
+                            };
                             let linked_plan_runs = match &auto_runs {
                                 Ok(runs) => {
                                     let plan_ids = runs
@@ -250,8 +299,14 @@ impl Tui {
                                 }
                                 Err(_) => Ok(Vec::new()),
                             };
+                            let (generalized_runs, generalized_detail) = match generalized {
+                                Ok((runs, detail, _)) => (Ok(runs), Ok(detail)),
+                                Err(error) => (Err(error.clone()), Err(error)),
+                            };
                             Ok(WorkflowPollSnapshot {
                                 repository: repository_snapshot,
+                                generalized_runs,
+                                generalized_detail,
                                 plan_runs,
                                 auto_runs,
                                 linked_plan_runs,

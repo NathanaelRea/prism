@@ -22,8 +22,7 @@ use crate::opencode::{self, OpencodeStatus, load_runtime};
 use crate::plan::{PlanExecution, infer_total_phases, open_plan_mode, select_plan_path};
 use crate::plan_run::{
     DEFAULT_OUTPUT_LINES_PER_STEP, PlanRunMode, PlanStepStatus, abort_plan_step, archive_plan_run,
-    load_plan_run, load_resumable_plan_run, prepare_plan_run_for_resume, retry_failed_steps,
-    retry_from_step, save_plan_run, skip_plan_step,
+    load_plan_run, retry_failed_steps, retry_from_step, save_plan_run, skip_plan_step,
 };
 use crate::process::{
     ProcessPolicy, command_exists, parse_command_words, run_output_allow_failure,

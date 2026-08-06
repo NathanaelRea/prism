@@ -35,12 +35,14 @@ pub(crate) use error::{RemoteError, RemoteErrorClass, RemoteOperation, RetryHint
 pub(crate) use migrations::migrate_pr_cache_schema;
 #[cfg(test)]
 pub(crate) use model::HeadAssociation;
+#[allow(unused_imports)]
 pub(crate) use model::{
     CanonicalChangeRequestIdentity, ChangeRequest, ChangeRequestDetails, ChangeRequestId,
     ChangeRequestSummary, CheckContext, CheckState, CiFailure, Comment, CreateChangeRequest,
-    FetchChangeRequest, GuardedMerge, HostIdentity, IdentityError, LifecycleState, MergeMethod,
-    MergeMutationOutcome, MergeMutationResult, MergeSubmissionMode, MergeabilityState,
+    FetchChangeRequest, GuardedMerge, HostIdentity, IdentityError, IssueId, LifecycleState,
+    MergeMethod, MergeMutationOutcome, MergeMutationResult, MergeSubmissionMode, MergeabilityState,
     NativeChangeRequestId, NativeReviewThreadId, NativeStateEvidence, Observation, PolicyFacts,
+    ProviderItemId, ProviderItemKind, ProviderItemObservation, ProviderItemObservationState,
     ProviderKind, QueueState, RemoteBase, RemoteRepository, RemoteRepositoryId, RepositoryPolicy,
     ResolveReviewThread, Review, ReviewDecision, ReviewSubmissionKind, ReviewThread, SubmitReview,
     WebScheme,

@@ -482,11 +482,6 @@ impl AutoLaunch {
         self
     }
 
-    pub(crate) fn with_worktree_incarnation(mut self, incarnation: String) -> Self {
-        self.worktree_incarnation = nonempty_incarnation(incarnation);
-        self
-    }
-
     pub(crate) fn with_worktree_session_id(mut self, id: impl Into<String>) -> Self {
         self.worktree_session_id = Some(id.into());
         self

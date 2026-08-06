@@ -1,22 +1,17 @@
 use crate::args::{
     self, AgentCommand, Args, AutoCommand, AutoCommandSource, CommandKind, ConfigCommand,
     DaemonCommand, DbCommand, DebugCommand, InspectOptions, StatusOptions, WorkerCommand,
-};
-use crate::auto_flow::{
-    AutoImplementationSource, AutoLaunch, AutoLaunchOptions, AutoRunMode,
-    load_recent_active_runs_for_repo, prepare_auto_run_for_resume, submit_auto_run,
+    WorkflowCommand,
 };
 use crate::config::Config;
-use crate::git::{current_branch_name, selected_dirty};
 use crate::observability::{self, LogLevel, ObserverOptions};
-use crate::plan_run::PlanRunMode;
 use crate::repo::Repository;
 use crate::tui::ManagedRepo;
 use crate::workspace_state::{
     ControlAction, ControlRequest, InspectRequest, Subject, WorkspaceContext, WorkspaceSnapshot,
     WorkspaceState,
 };
-use crate::{agent_session, config, plan, session, setup, tui, ui_state, workspace};
+use crate::{agent_session, config, session, setup, tui, ui_state, workspace};
 use std::process::Command as ProcessCommand;
 
 pub fn run() -> Result<(), String> {
@@ -61,6 +56,9 @@ pub fn run() -> Result<(), String> {
         CommandKind::Help | CommandKind::Version | CommandKind::DebugHelp | CommandKind::DbHelp => {
             run_static_command(args.command)
         }
+        CommandKind::Config(ConfigCommand::MigrateWorkflows { json }) => {
+            run_workflow_migration(args.repo.as_deref(), json)
+        }
         CommandKind::Config(command) => {
             let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
             run_config_command(command, &repo, &config);
@@ -70,6 +68,7 @@ pub fn run() -> Result<(), String> {
             let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;
             config::doctor(&repo, &mut config)
         }
+        CommandKind::Workflow(command) => run_workflow_command(command, args.repo.as_deref()),
         CommandKind::Agent(command) => {
             let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;
             config::ensure_default_agent_noninteractive(&mut config)?;
@@ -77,12 +76,20 @@ pub fn run() -> Result<(), String> {
             run_agent_command(command, &repo, &config)
         }
         CommandKind::RunPlan(path) => {
-            let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
-            plan::run_plan_mode(&repo.root, &config, path.as_deref())
+            let (repo, _) = load_single_repo_context(args.repo.as_deref())?;
+            let ledger = crate::run::RunLedger::user()?;
+            if !ledger.cutover_complete()? {
+                return Err("legacy Plan execution is disabled; run `prism config migrate-workflows` before launching bundled Workflows".to_string());
+            }
+            launch_bundled_plan(&repo, path.as_deref(), ledger)
         }
         CommandKind::Auto(command) => {
-            let (repo, config) = load_single_repo_context(args.repo.as_deref())?;
-            run_auto_command(&repo, &config, command)
+            let (repo, _) = load_single_repo_context(args.repo.as_deref())?;
+            let ledger = crate::run::RunLedger::user()?;
+            if !ledger.cutover_complete()? {
+                return Err("legacy Auto Flow execution is disabled; run `prism config migrate-workflows` before launching bundled Workflows".to_string());
+            }
+            launch_bundled_coding(&repo, command, ledger)
         }
         CommandKind::Debug(command) => {
             let (repo, mut config) = load_single_repo_context(args.repo.as_deref())?;
@@ -118,6 +125,648 @@ pub fn run() -> Result<(), String> {
     result
 }
 
+#[derive(serde::Serialize)]
+struct WorkflowListOutput {
+    schema_version: u32,
+    definitions: Vec<crate::definition::DefinitionSummary>,
+}
+
+fn run_workflow_command(
+    command: WorkflowCommand,
+    repository: Option<&std::path::Path>,
+) -> Result<(), String> {
+    if matches!(command, WorkflowCommand::Schema) {
+        print!("{}", crate::definition::WORKFLOW_SCHEMA_JSON);
+        return Ok(());
+    }
+    if matches!(command, WorkflowCommand::Example) {
+        print!("{}", crate::definition::WORKFLOW_EXAMPLE);
+        return Ok(());
+    }
+    let repository = workflow_repository_root(repository)?;
+    let catalog = crate::definition::DefinitionCatalog::discover(repository.as_deref());
+    match command {
+        WorkflowCommand::List { json } => {
+            let definitions = catalog.list()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&WorkflowListOutput {
+                        schema_version: 1,
+                        definitions
+                    })
+                    .map_err(|error| error.to_string())?
+                );
+            } else {
+                for definition in definitions {
+                    println!(
+                        "{}@{}  {}{}",
+                        definition.source.qualified_name(),
+                        definition.source.revision,
+                        if definition.valid { "valid" } else { "invalid" },
+                        if definition.trust_required {
+                            "  trust required"
+                        } else {
+                            ""
+                        }
+                    );
+                    for diagnostic in definition.diagnostics {
+                        println!("  {}: {}", diagnostic.code, diagnostic.message);
+                    }
+                }
+            }
+            Ok(())
+        }
+        WorkflowCommand::Validate {
+            selector,
+            all,
+            json,
+        } => {
+            let definitions = if all {
+                catalog.list()?
+            } else {
+                let selector = selector.expect("parser requires selector");
+                match catalog.preview(&selector) {
+                    Ok(preview) => vec![crate::definition::DefinitionSummary {
+                        source: preview.source,
+                        valid: true,
+                        trust_required: preview.trust_required,
+                        requested_capabilities: preview.snapshot.content.capabilities,
+                        diagnostics: Vec::new(),
+                    }],
+                    Err(diagnostics) => {
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "schema_version": 1, "valid": false, "diagnostics": diagnostics })).map_err(|error| error.to_string())?);
+                        }
+                        return Err(diagnostics
+                            .into_iter()
+                            .map(|diagnostic| diagnostic.message)
+                            .collect::<Vec<_>>()
+                            .join("; "));
+                    }
+                }
+            };
+            let valid = definitions.iter().all(|definition| definition.valid);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&serde_json::json!({ "schema_version": 1, "valid": valid, "definitions": definitions })).map_err(|error| error.to_string())?);
+            } else {
+                for definition in &definitions {
+                    println!(
+                        "{}: {}",
+                        definition.source.qualified_name(),
+                        if definition.valid { "valid" } else { "invalid" }
+                    );
+                    for diagnostic in &definition.diagnostics {
+                        println!("  {}: {}", diagnostic.code, diagnostic.message);
+                    }
+                }
+            }
+            if valid {
+                Ok(())
+            } else {
+                Err("one or more workflow definitions are invalid".to_string())
+            }
+        }
+        WorkflowCommand::Preview { selector, json } => {
+            let preview = catalog.preview(&selector).map_err(|diagnostics| {
+                diagnostics
+                    .into_iter()
+                    .map(|diagnostic| diagnostic.message)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&preview).map_err(|error| error.to_string())?
+                );
+            } else {
+                println!("definition = {}", preview.source.qualified_name());
+                println!("snapshot_digest = {}", preview.snapshot.digest);
+                println!("trust_required = {}", preview.trust_required);
+                println!(
+                    "source_revision = {}",
+                    preview.snapshot.content.source_revision
+                );
+                println!("description = {}", preview.snapshot.content.description);
+                println!("inputs = {:#?}", preview.snapshot.content.inputs);
+                println!("outputs = {:#?}", preview.snapshot.content.outputs);
+                println!("budgets = {:#?}", preview.snapshot.content.budgets);
+                println!(
+                    "capabilities = {:#?}",
+                    preview.snapshot.content.capabilities
+                );
+                println!(
+                    "transitive_capabilities = {:#?}",
+                    preview.snapshot.content.transitive_capabilities
+                );
+                println!(
+                    "admission_policy = {:#?}",
+                    preview.snapshot.content.admission_policy
+                );
+                println!(
+                    "pinned_workflows = {:#?}",
+                    preview.snapshot.content.pinned_workflows
+                );
+                println!(
+                    "implementations = {:#?}",
+                    preview.snapshot.content.implementations
+                );
+                for step in &preview.snapshot.content.steps {
+                    println!("step.{} = {step:#?}", step.id);
+                }
+            }
+            Ok(())
+        }
+        WorkflowCommand::Trust { selector } => {
+            let preview = catalog
+                .preview(&selector)
+                .map_err(format_workflow_diagnostics)?;
+            let ledger = crate::run::RunLedger::user()?;
+            ledger.trust_definition(&preview.snapshot)?;
+            println!(
+                "trusted {}@{}",
+                preview.source.qualified_name(),
+                preview.source.digest
+            );
+            Ok(())
+        }
+        WorkflowCommand::Launch {
+            selector,
+            inputs,
+            idempotency_key,
+            actor,
+            json,
+        } => {
+            let preview = catalog
+                .preview(&selector)
+                .map_err(format_workflow_diagnostics)?;
+            let inputs = parse_workflow_inputs(&preview.snapshot, &inputs)?;
+            let ledger = crate::run::RunLedger::user()?;
+            if !ledger.cutover_complete()? {
+                return Err(
+                    "workflow execution is not cut over; run `prism config migrate-workflows` to stop legacy scheduling and import history first"
+                        .to_string(),
+                );
+            }
+            let repository_id = repository
+                .as_deref()
+                .map(|path| ledger.repository_id(path))
+                .transpose()?;
+            let actor = actor.unwrap_or_else(current_workflow_actor);
+            let receipt = crate::operations::WorkflowOperations::new(ledger).execute(
+                crate::operations::WorkflowCommand::Launch(Box::new(crate::run::StartRun {
+                    actor_capabilities: preview.snapshot.content.transitive_capabilities.clone(),
+                    snapshot: preview.snapshot,
+                    repository_id,
+                    inputs,
+                    idempotency_key,
+                    actor,
+                })),
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&receipt).map_err(|error| error.to_string())?
+                );
+            } else if let crate::operations::WorkflowCommandReceipt::Launched(result) = receipt {
+                println!(
+                    "{}  {}",
+                    result.run_id.as_str(),
+                    if result.created {
+                        "created"
+                    } else {
+                        "existing"
+                    }
+                );
+            }
+            crate::worker::ensure_running()?;
+            crate::worker::wake()
+        }
+        WorkflowCommand::Runs { json } => {
+            let runs = crate::run::RunLedger::user()?.list(200)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"schema_version":1,"runs":runs})
+                    )
+                    .map_err(|error| error.to_string())?
+                );
+            } else {
+                for run in runs {
+                    println!(
+                        "{}  {}  {}",
+                        run.id.as_str(),
+                        run.state.label(),
+                        run.definition
+                    );
+                }
+            }
+            Ok(())
+        }
+        WorkflowCommand::Attention { json } => {
+            let attention = crate::run::RunLedger::user()?.attention(200)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"schema_version":1,"attention":attention})
+                    )
+                    .map_err(|error| error.to_string())?
+                );
+            } else {
+                println!("pending approvals: {}", attention.pending_approvals);
+                println!(
+                    "recovery-required attempts: {}",
+                    attention.recovery_required_attempts
+                );
+                println!(
+                    "quarantined workspaces: {}",
+                    attention.quarantined_workspaces
+                );
+                for run in attention.runs {
+                    println!(
+                        "{}  {}  {}",
+                        run.id.as_str(),
+                        run.state.label(),
+                        run.definition
+                    );
+                }
+            }
+            Ok(())
+        }
+        WorkflowCommand::Status { run_id, json } => {
+            let projection = crate::run::RunLedger::user()?.inspect(&crate::run::RunId(run_id))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&projection).map_err(|error| error.to_string())?
+                );
+            } else {
+                println!(
+                    "{}  {}  {}",
+                    projection.run.id.as_str(),
+                    projection.run.state.label(),
+                    projection.run.definition
+                );
+                for step in projection.steps {
+                    println!(
+                        "  {}  {}  {}",
+                        step.definition_step_id,
+                        step.state.label(),
+                        step.blocker.unwrap_or_default()
+                    );
+                }
+            }
+            Ok(())
+        }
+        WorkflowCommand::History {
+            run_id,
+            after,
+            limit,
+            json,
+        } => {
+            let events =
+                crate::run::RunLedger::user()?.history(&crate::run::RunId(run_id), after, limit)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"schema_version":1,"events":events})
+                    )
+                    .map_err(|error| error.to_string())?
+                );
+            } else {
+                for event in events {
+                    println!("{}  {}  {}", event.id, event.kind, event.data_json);
+                }
+            }
+            Ok(())
+        }
+        WorkflowCommand::Pause { run_id } => control_workflow_run(run_id, "pause_requested"),
+        WorkflowCommand::Resume { run_id } => control_workflow_run(run_id, "running"),
+        WorkflowCommand::Cancel { run_id } => control_workflow_run(run_id, "cancel_requested"),
+        WorkflowCommand::Retry { attempt_id } => {
+            let receipt =
+                crate::operations::WorkflowOperations::new(crate::run::RunLedger::user()?)
+                    .retry_attempt(crate::run::AttemptId(attempt_id))?;
+            println!(
+                "{}",
+                serde_json::to_string(&receipt).map_err(|error| error.to_string())?
+            );
+            crate::worker::ensure_running()?;
+            crate::worker::wake()
+        }
+        WorkflowCommand::RecoverAttempt { attempt_id, retry } => {
+            let receipt =
+                crate::operations::WorkflowOperations::new(crate::run::RunLedger::user()?)
+                    .execute(crate::operations::WorkflowCommand::Recover {
+                        attempt_id: crate::run::AttemptId(attempt_id),
+                        retry,
+                    })?;
+            println!(
+                "{}",
+                serde_json::to_string(&receipt).map_err(|error| error.to_string())?
+            );
+            crate::worker::ensure_running()?;
+            crate::worker::wake()
+        }
+        WorkflowCommand::Decide {
+            request_id,
+            approved,
+            actor,
+            reason,
+            json,
+        } => {
+            let receipt =
+                crate::operations::WorkflowOperations::new(crate::run::RunLedger::user()?)
+                    .decide_pending(
+                        crate::run::ApprovalRequestId(request_id),
+                        approved,
+                        actor.unwrap_or_else(current_workflow_actor),
+                        reason,
+                    )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&receipt).map_err(|error| error.to_string())?
+                );
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string(&receipt).map_err(|error| error.to_string())?
+                );
+            }
+            crate::worker::ensure_running()?;
+            crate::worker::wake()
+        }
+        WorkflowCommand::Doctor { json } => {
+            let health = crate::run::RunLedger::user()?.health()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&health).map_err(|error| error.to_string())?
+                );
+            } else {
+                println!(
+                    "workflow database: {}",
+                    if health.integrity_ok {
+                        "ok"
+                    } else {
+                        "problems found"
+                    }
+                );
+                println!("active leases: {}", health.active_leases);
+                println!("dangling claims: {}", health.dangling_claims);
+                println!("quarantined workspaces: {}", health.quarantined_workspaces);
+                println!("overdue waits: {}", health.overdue_waits);
+                println!(
+                    "recovery-required attempts: {}",
+                    health.recovery_required_attempts
+                );
+                println!("unresolved effects: {}", health.unresolved_effects);
+                println!("enabled triggers: {}", health.enabled_triggers);
+                println!("orphaned blobs: {}", health.orphaned_blobs);
+                for target in &health.target_descriptors {
+                    println!(
+                        "target {}: local={} confined={} continuation={}",
+                        target.id, target.local, target.confined, target.supports_continuation
+                    );
+                }
+                for problem in health.problems {
+                    println!("  problem: {problem}");
+                }
+            }
+            Ok(())
+        }
+        WorkflowCommand::TriggerList { json } => {
+            let triggers =
+                crate::trigger::TriggerEngine::new(crate::run::RunLedger::user()?)?.list()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"schema_version":1,"triggers":triggers})
+                    )
+                    .map_err(|error| error.to_string())?
+                );
+            } else {
+                for (trigger, enabled) in triggers {
+                    println!(
+                        "{}  {}  {}",
+                        trigger.id,
+                        if enabled { "enabled" } else { "disabled" },
+                        trigger.definition_selector
+                    );
+                }
+            }
+            Ok(())
+        }
+        WorkflowCommand::TriggerEnable { id, enabled } => {
+            crate::trigger::TriggerEngine::new(crate::run::RunLedger::user()?)?
+                .set_enabled(&id, enabled)?;
+            println!("{}  {}", id, if enabled { "enabled" } else { "disabled" });
+            Ok(())
+        }
+        WorkflowCommand::TriggerStatus { id, json } => {
+            let engine = crate::trigger::TriggerEngine::new(crate::run::RunLedger::user()?)?;
+            let mut statuses = engine.statuses(crate::run::now_ms(), 20)?;
+            if let Some(id) = id {
+                statuses.retain(|status| status.definition.id == id);
+                if statuses.is_empty() {
+                    return Err(format!("Trigger '{id}' was not found"));
+                }
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(
+                        &serde_json::json!({"schema_version":1,"triggers":statuses})
+                    )
+                    .map_err(|error| error.to_string())?
+                );
+            } else {
+                for status in statuses {
+                    println!(
+                        "{}  {}  next={}  checkpoint={}",
+                        status.definition.id,
+                        if status.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        status
+                            .next_run_unix_ms
+                            .map_or_else(|| "-".into(), |value| value.to_string()),
+                        status.checkpoint.as_deref().unwrap_or("-")
+                    );
+                    for occurrence in status.recent_occurrences {
+                        println!(
+                            "  {}  {}  run={}",
+                            occurrence.id,
+                            occurrence.state,
+                            occurrence
+                                .run_id
+                                .as_ref()
+                                .map_or("-", crate::run::RunId::as_str)
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        WorkflowCommand::TriggerRunNow { id, json } => {
+            let ledger = crate::run::RunLedger::user()?;
+            if !ledger.cutover_complete()? {
+                return Err("workflow execution is not cut over; run `prism config migrate-workflows` first".to_string());
+            }
+            let engine = crate::trigger::TriggerEngine::new(ledger.clone())?;
+            let trigger = engine.get(&id)?;
+            let preview = catalog
+                .preview(&trigger.definition_selector)
+                .map_err(format_workflow_diagnostics)?;
+            if preview
+                .snapshot
+                .content
+                .inputs
+                .values()
+                .any(|port| port.required)
+            {
+                return Err("trigger run-now requires a definition with no required inputs; provider intake supplies item inputs through polling".to_string());
+            }
+            let native = format!("manual:{}", crate::run::now_ms());
+            let occurrence = engine.record_occurrence(
+                &id,
+                crate::trigger::OccurrenceIdentity {
+                    native_occurrence: &native,
+                    provider_item: None,
+                    observation_revision: None,
+                    definition_digest: &preview.snapshot.digest,
+                    input_digest: &crate::run::sha256(b"{}"),
+                },
+            )?;
+            let repository_id = repository
+                .as_deref()
+                .map(|path| ledger.repository_id(path))
+                .transpose()?;
+            let started = ledger.start(crate::run::StartRun {
+                actor_capabilities: preview.snapshot.content.transitive_capabilities.clone(),
+                snapshot: preview.snapshot,
+                repository_id,
+                inputs: Vec::new(),
+                idempotency_key: Some(format!("trigger:{}", occurrence.occurrence_key)),
+                actor: current_workflow_actor(),
+            })?;
+            engine.attach_run(&occurrence.id, &started.run_id)?;
+            if json {
+                println!("{}",serde_json::to_string_pretty(&serde_json::json!({"schema_version":1,"occurrence":occurrence,"run":started})).map_err(|error|error.to_string())?);
+            } else {
+                println!("{}  run={}", occurrence.id, started.run_id.as_str());
+            }
+            crate::worker::ensure_running()?;
+            crate::worker::wake()
+        }
+        WorkflowCommand::Schema | WorkflowCommand::Example => {
+            unreachable!("handled before discovery")
+        }
+    }
+}
+
+fn format_workflow_diagnostics(diagnostics: Vec<crate::definition::Diagnostic>) -> String {
+    diagnostics
+        .into_iter()
+        .map(|diagnostic| diagnostic.message)
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn parse_workflow_inputs(
+    snapshot: &crate::definition::DefinitionSnapshot,
+    values: &[String],
+) -> Result<Vec<crate::run::ArtifactInput>, String> {
+    let mut parsed = std::collections::BTreeMap::new();
+    for value in values {
+        let (name, json) = value
+            .split_once('=')
+            .ok_or_else(|| format!("workflow input '{value}' must use name=<json>"))?;
+        if name.is_empty() {
+            return Err("workflow input name cannot be empty".to_string());
+        }
+        let payload = serde_json::from_str(json)
+            .map_err(|error| format!("parse workflow input '{name}': {error}"))?;
+        if parsed.insert(name.to_string(), payload).is_some() {
+            return Err(format!(
+                "workflow input '{name}' was supplied more than once"
+            ));
+        }
+    }
+    let unexpected = parsed
+        .keys()
+        .filter(|name| !snapshot.content.inputs.contains_key(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    if !unexpected.is_empty() {
+        return Err(format!(
+            "workflow has no input port(s): {}",
+            unexpected.join(", ")
+        ));
+    }
+    snapshot
+        .content
+        .inputs
+        .iter()
+        .filter_map(|(name, port)| match parsed.remove(name) {
+            Some(payload) => Some(Ok(crate::run::ArtifactInput {
+                name: name.clone(),
+                artifact_type: port.artifact_type.clone(),
+                payload,
+                trust: crate::run::TrustClass::Trusted,
+                sensitivity: crate::run::Sensitivity::Internal,
+            })),
+            None if port.required => {
+                Some(Err(format!("required workflow input '{name}' is missing")))
+            }
+            None => None,
+        })
+        .collect()
+}
+
+fn current_workflow_actor() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "local-user".to_string())
+}
+
+fn control_workflow_run(run_id: String, control: &str) -> Result<(), String> {
+    let run = crate::run::RunId(run_id.clone());
+    let command = match control {
+        "pause_requested" => crate::operations::WorkflowCommand::Pause(run),
+        "running" => crate::operations::WorkflowCommand::Resume(run),
+        "cancel_requested" => crate::operations::WorkflowCommand::Cancel(run),
+        _ => return Err(format!("unsupported workflow control '{control}'")),
+    };
+    crate::operations::WorkflowOperations::new(crate::run::RunLedger::user()?).execute(command)?;
+    println!("{run_id}  {control}");
+    crate::worker::ensure_running()?;
+    crate::worker::wake()
+}
+
+fn workflow_repository_root(
+    repository: Option<&std::path::Path>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let start = match repository {
+        Some(path) => path
+            .canonicalize()
+            .map_err(|error| format!("resolve repository path {}: {error}", path.display()))?,
+        None => std::env::current_dir().map_err(|error| format!("current directory: {error}"))?,
+    };
+    Ok(start
+        .ancestors()
+        .find(|path| path.join(".git").exists())
+        .map(std::path::Path::to_path_buf))
+}
+
 fn run_config_command(command: ConfigCommand, repo: &Repository, config: &Config) {
     match command {
         ConfigCommand::Show => config::print_config(repo, config),
@@ -128,7 +777,179 @@ fn run_config_command(command: ConfigCommand, repo: &Repository, config: &Config
             println!("repo_config = {}", config.repo_config_path.display());
             println!("schema_url = {}", config::CONFIG_SCHEMA_URL);
         }
+        ConfigCommand::MigrateWorkflows { .. } => unreachable!("handled before repository loading"),
     }
+}
+
+fn run_workflow_migration(
+    selected_repository: Option<&std::path::Path>,
+    json: bool,
+) -> Result<(), String> {
+    let health = crate::worker::probe_health()?;
+    if health.state != crate::worker::DaemonState::Stopped {
+        crate::worker::shutdown()?;
+    }
+
+    let mut repositories = if let Some(path) = selected_repository {
+        vec![Repository {
+            root: workflow_repository_root(Some(path))?
+                .ok_or_else(|| format!("not inside a Git repository: {}", path.display()))?,
+        }]
+    } else {
+        workspace::discover_valid_entries(workspace::load_entries()?)
+            .into_iter()
+            .map(|entry| entry.repo)
+            .collect::<Vec<_>>()
+    };
+    repositories.sort_by(|left, right| left.root.cmp(&right.root));
+    repositories.dedup_by(|left, right| left.root == right.root);
+
+    let database_paths = repositories
+        .iter()
+        .map(observability::db_path)
+        .collect::<Vec<_>>();
+    let ledger = crate::run::RunLedger::user()?;
+    let report = crate::migration::import_repositories(&ledger, database_paths)?;
+    emit_migrated_check_definition(&repositories)?;
+    ledger.complete_cutover()?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+        );
+    } else {
+        println!(
+            "workflow cutover complete: {} imported, {} already imported across {} source database(s)",
+            report.imported_runs,
+            report.already_imported_runs,
+            report.sources.len()
+        );
+        println!(
+            "legacy runs are historical only; active runs must be restarted as new bundled workflows"
+        );
+    }
+    Ok(())
+}
+
+fn emit_migrated_check_definition(repositories: &[Repository]) -> Result<(), String> {
+    let Some(repository) = repositories.first() else {
+        return Ok(());
+    };
+    let config = Config::load(repository);
+    if !config.config_errors.is_empty() {
+        return Err(format!(
+            "legacy configuration cannot be migrated until these errors are fixed: {}",
+            config.config_errors.join("; ")
+        ));
+    }
+    let mut commands = Vec::new();
+    for (group, values) in [
+        ("pre-pr", &config.checks.pre_pr),
+        ("pre-push", &config.checks.pre_push),
+        ("review-fix", &config.checks.review_fix),
+    ] {
+        for (index, command) in values.iter().enumerate() {
+            let argv = crate::process::parse_command_words(command).map_err(|error| {
+                format!("legacy checks.{group}[{index}] is not representable as structured argv: {error}; rewrite it as a Workflow command Step")
+            })?;
+            if argv.is_empty() {
+                return Err(format!(
+                    "legacy checks.{group}[{index}] is empty and cannot be migrated"
+                ));
+            }
+            commands.push((format!("{group}-{}", index + 1), argv));
+        }
+    }
+    if commands.is_empty() {
+        let mut paths = repositories
+            .iter()
+            .map(|repository| repository.prism_dir().join("config.toml"))
+            .collect::<Vec<_>>();
+        paths.push(config.user_path.clone());
+        paths.sort();
+        paths.dedup();
+        for path in paths {
+            migrate_legacy_config_file(&path)?;
+        }
+        return Ok(());
+    }
+
+    let mut output = String::from(
+        "schema_version = 1\nname = \"migrated-checks\"\ndescription = \"Explicit structured command Steps migrated from legacy check settings.\"\nordered = true\ncapabilities = [\"repository_read\", \"process_execute\"]\n\n[inputs.task]\nartifact_type = \"builtin:task@1\"\n\n[budgets]\nmax_attempts = 32\nmax_fan_out = 1\nmax_child_depth = 0\nmax_mutations = 0\n",
+    );
+    for (id, argv) in commands {
+        output.push_str("\n[[steps]]\n");
+        output.push_str(&format!("id = {}\n", toml::Value::String(id)));
+        output.push_str("class = \"action\"\nimplementation = \"builtin:command@1\"\ncapabilities = [\"repository_read\", \"process_execute\"]\n[steps.inputs.task]\nfrom = \"run.task\"\nartifact_type = \"builtin:task@1\"\n[steps.outputs.result]\nartifact_type = \"builtin:task@1\"\n[steps.settings]\ncommand = ");
+        output.push_str(
+            &toml::Value::Array(argv.into_iter().map(toml::Value::String).collect()).to_string(),
+        );
+        output.push('\n');
+    }
+    let directory = crate::util::prism_config_dir().join("workflows");
+    std::fs::create_dir_all(&directory)
+        .map_err(|error| format!("create migrated Workflow directory: {error}"))?;
+    crate::file_persistence::update(
+        &directory.join("migrated-checks.toml"),
+        crate::file_persistence::UpdateOptions::important_toml(),
+        |_| Ok(((), Some(output.clone().into_bytes()))),
+    )
+    .map_err(|error| format!("write migrated Workflow definition: {error}"))?;
+
+    let mut paths = repositories
+        .iter()
+        .map(|repository| repository.prism_dir().join("config.toml"))
+        .collect::<Vec<_>>();
+    paths.push(config.user_path.clone());
+    paths.sort();
+    paths.dedup();
+    for path in paths {
+        migrate_legacy_config_file(&path)?;
+    }
+    Ok(())
+}
+
+fn migrate_legacy_config_file(path: &std::path::Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    crate::file_persistence::update(
+        path,
+        crate::file_persistence::UpdateOptions::important_toml(),
+        |contents| {
+            let bytes = contents.as_bytes().unwrap_or_default();
+            let text = std::str::from_utf8(bytes)
+                .map_err(|error| Box::new(error) as crate::file_persistence::BoxError)?;
+            let mut document = text
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|error| Box::new(error) as crate::file_persistence::BoxError)?;
+            document.remove("auto");
+            if let Some(checks) = document
+                .get_mut("checks")
+                .and_then(toml_edit::Item::as_table_mut)
+            {
+                checks.remove("pre_pr");
+                checks.remove("pre_push");
+                checks.remove("review_fix");
+            }
+            if document
+                .get("checks")
+                .and_then(toml_edit::Item::as_table)
+                .is_some_and(toml_edit::Table::is_empty)
+            {
+                document.remove("checks");
+            }
+            let replacement = document.to_string();
+            Ok(((), (replacement != text).then(|| replacement.into_bytes())))
+        },
+    )
+    .map_err(|error| {
+        format!(
+            "remove migrated legacy keys from {}: {error}",
+            path.display()
+        )
+    })
 }
 
 fn run_agent_command(
@@ -236,7 +1057,72 @@ fn workspace_state(repo: Option<&std::path::Path>) -> Result<WorkspaceState, Str
     })
 }
 
+fn cutover_ledger() -> Result<Option<crate::run::RunLedger>, String> {
+    let path = crate::util::prism_config_dir().join("workflow.db");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let ledger = crate::run::RunLedger::open(path)?;
+    ledger
+        .cutover_complete()
+        .map(|complete| complete.then_some(ledger))
+}
+
+fn resolve_generic_run(
+    ledger: &crate::run::RunLedger,
+    repository: Option<&std::path::Path>,
+    selector: Option<&str>,
+) -> Result<crate::run::RunId, String> {
+    let runs = match repository {
+        Some(repository) => ledger.list_for_repository(repository, 1000)?,
+        None => ledger.list(1000)?,
+    };
+    match selector {
+        None => runs
+            .first()
+            .map(|run| run.id.clone())
+            .ok_or_else(|| "no Workflow Runs found".to_string()),
+        Some(selector) => {
+            let selector = selector.strip_prefix("run:").unwrap_or(selector);
+            let matches = runs
+                .iter()
+                .filter(|run| run.id.as_str() == selector || run.id.as_str().starts_with(selector))
+                .collect::<Vec<_>>();
+            match matches.as_slice() {
+                [run] => Ok(run.id.clone()),
+                [] => Err(format!("Workflow Run selector '{selector}' did not match")),
+                _ => Err(format!("Workflow Run selector '{selector}' is ambiguous")),
+            }
+        }
+    }
+}
+
 fn run_list_command(repo: Option<&std::path::Path>, options: InspectOptions) -> Result<(), String> {
+    if let Some(ledger) = cutover_ledger()? {
+        let runs = match repo {
+            Some(repository) => {
+                ledger.list_for_repository(repository, if options.all { 1000 } else { 200 })?
+            }
+            None => ledger.list(if options.all { 1000 } else { 200 })?,
+        };
+        if options.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({"schema_version":1,"runs":runs}))
+                    .map_err(|error| error.to_string())?
+            );
+        } else {
+            for run in runs {
+                println!(
+                    "{}  {}  {}",
+                    run.id.as_str(),
+                    run.state.label(),
+                    run.definition
+                );
+            }
+        }
+        return Ok(());
+    }
     let snapshot = workspace_state(repo)?.inspect(InspectRequest {
         include_hidden: options.all,
         include_terminal: options.all,
@@ -258,6 +1144,32 @@ fn run_status_command(
     repo: Option<&std::path::Path>,
     options: StatusOptions,
 ) -> Result<(), String> {
+    if let Some(ledger) = cutover_ledger()? {
+        let run_id = resolve_generic_run(&ledger, repo, options.selector.as_deref())?;
+        let projection = ledger.inspect(&run_id)?;
+        if options.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&projection).map_err(|error| error.to_string())?
+            );
+        } else {
+            println!(
+                "{}  {}  {}",
+                projection.run.id.as_str(),
+                projection.run.state.label(),
+                projection.run.definition
+            );
+            for step in projection.steps {
+                println!(
+                    "  {}  {}  {}",
+                    step.definition_step_id,
+                    step.state.label(),
+                    step.blocker.unwrap_or_default()
+                );
+            }
+        }
+        return Ok(());
+    }
     let state = workspace_state(repo)?;
     let snapshot = state.inspect(InspectRequest {
         include_hidden: true,
@@ -283,6 +1195,27 @@ fn run_control_command(
     action: ControlAction,
     selector: Option<String>,
 ) -> Result<(), String> {
+    if let Some(ledger) = cutover_ledger()? {
+        let run_id = resolve_generic_run(&ledger, repo, selector.as_deref())?;
+        let command = match action {
+            ControlAction::Pause => crate::operations::WorkflowCommand::Pause(run_id.clone()),
+            ControlAction::Resume => crate::operations::WorkflowCommand::Resume(run_id.clone()),
+            ControlAction::Stop => crate::operations::WorkflowCommand::Cancel(run_id.clone()),
+            ControlAction::Recover => return Err("generic recovery targets an exact Attempt; use `prism workflow recover-attempt <attempt-id>`".to_string()),
+        };
+        crate::operations::WorkflowOperations::new(ledger).execute(command)?;
+        println!(
+            "workflow = {}\nstate = {}",
+            run_id.as_str(),
+            match action {
+                ControlAction::Pause => "pause_requested",
+                ControlAction::Resume => "running",
+                ControlAction::Stop => "cancel_requested",
+                ControlAction::Recover => unreachable!(),
+            }
+        );
+        return Ok(());
+    }
     let receipt = workspace_state(repo)?.control(ControlRequest { action, selector })?;
     println!(
         "workflow = {}\nstate = {}",
@@ -298,6 +1231,21 @@ fn run_recover_command(
     repo: Option<&std::path::Path>,
     selector: Option<String>,
 ) -> Result<(), String> {
+    if let Some(ledger) = cutover_ledger()? {
+        if selector.is_some() {
+            return run_control_command(repo, ControlAction::Recover, selector);
+        }
+        let attention = ledger.attention(200)?;
+        for run in attention.runs {
+            println!(
+                "{}  {}  {}",
+                run.id.as_str(),
+                run.state.label(),
+                run.definition
+            );
+        }
+        return Ok(());
+    }
     if selector.is_some() {
         return run_control_command(repo, ControlAction::Recover, selector);
     }
@@ -728,6 +1676,9 @@ fn observer_options(args: &Args) -> ObserverOptions {
 }
 
 fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
+    if !crate::run::RunLedger::user()?.cutover_complete()? {
+        return Err("legacy TUI workflow actions are disabled; run `prism config migrate-workflows` before opening Prism".to_string());
+    }
     (|| {
         let (entries, selected_repo) = observability::phase("load_workspace", || {
             workspace::ensure_entries_for_tui(repo_arg)
@@ -812,215 +1763,83 @@ fn run_tui(repo_arg: Option<&std::path::Path>) -> Result<(), String> {
     })()
 }
 
-fn run_auto_command(
+fn launch_bundled_plan(
     repo: &Repository,
-    config: &Config,
-    mut command: AutoCommand,
+    path: Option<&std::path::Path>,
+    ledger: crate::run::RunLedger,
 ) -> Result<(), String> {
-    workspace::ensure_repo_entry(&repo.root)?;
-    let existing = observability::with_writable_db(repo, |conn| {
-        load_recent_active_runs_for_repo(conn, &repo.root, 1)
+    let path = path.ok_or_else(|| {
+        "after Workflow cutover, `prism run-plan` requires an explicit immutable Plan path; use `prism workflow launch builtin:plan` for other launch forms".to_string()
     })?;
-    if let Some(mut run) = existing.into_iter().next() {
-        let workflow = crate::execution::WorkflowIdentity::new(
-            crate::execution::WorkflowKind::Auto,
-            &run.run.id,
-        );
-        let dispatch = observability::with_writable_db(repo, |conn| {
-            crate::execution::dispatch_state(conn, &workflow)
-        })?;
-        if matches!(
-            dispatch,
-            Some(crate::execution::DispatchState::RecoveryPending)
-        ) {
-            return Err(format!(
-                "Auto Flow run {} was interrupted; open Prism to choose whether to resume it",
-                run.run.id
-            ));
-        }
-        if matches!(
-            dispatch,
-            Some(
-                crate::execution::DispatchState::Queued | crate::execution::DispatchState::Claimed
-            )
-        ) {
-            println!(
-                "auto_run_id = {}\nstatus = {:?}\nworktree = {}",
-                run.run.id,
-                run.run.status,
-                run.run.worktree_path.display()
-            );
-            return Ok(());
-        }
-        let should_execute = observability::with_writable_db(repo, |conn| {
-            prepare_auto_run_for_resume(
-                conn,
-                &mut run,
-                crate::plan_run::DEFAULT_OUTPUT_LINES_PER_STEP,
-            )
-        })?;
-        if should_execute {
-            crate::worker::ensure_running()?;
-            observability::with_writable_db(repo, |conn| {
-                crate::execution::enqueue(conn, &workflow)
-            })?;
-            crate::worker::wake()?;
-        }
-        println!(
-            "auto_run_id = {}\nstatus = {:?}\nworktree = {}",
-            run.run.id,
-            run.run.status,
-            run.run.worktree_path.display()
-        );
-        return Ok(());
-    }
-    if !config.selected_harness()?.describe().headless {
-        return Err(format!(
-            "harness '{}' does not support managed Auto Flow execution; configure headless_command and headless_prompt_transport",
-            config.default_harness
-        ));
-    }
-    validate_auto_command_before_launch(repo, &mut command)?;
-    let branch = current_branch_name(&repo.root, config)?
-        .ok_or_else(|| "Auto Flow cannot start on detached HEAD".to_string())?;
-    if config.is_default_branch(&branch) {
-        return Err("Auto Flow cannot start on the default branch".to_string());
-    }
-    if selected_dirty(&repo.root, config)? {
-        return Err("Auto Flow requires a clean worktree at launch".to_string());
-    }
-    let launch_options = auto_launch_options_for_command(repo, branch.clone(), command)?;
-    let worktree_session_id =
-        crate::session::ensure_worktree_session_identity(repo, &repo.root, &branch)?;
-    let launch = AutoLaunch::with_options(&repo.root, &repo.root, launch_options)?
-        .with_harness(
-            config.default_harness.clone(),
-            config.harness_adapter(&config.default_harness)?,
-        )
-        .with_worktree_session_id(worktree_session_id);
-    let mut persisted = launch.create_run();
-    if persisted.run.implementation_source == AutoImplementationSource::ExistingPullRequest {
-        crate::auto_flow::stabilization_observe::adopt_existing_pull_request(
-            repo,
-            config,
-            &mut persisted,
-        )?;
-    }
-    crate::worker::ensure_running()?;
-    observability::with_writable_db(repo, |conn| submit_auto_run(conn, &mut persisted))?;
-    crate::worker::wake()?;
-    println!(
-        "auto_run_id = {}\nstatus = {:?}\nworktree = {}",
-        persisted.run.id,
-        persisted.run.status,
-        persisted.run.worktree_path.display()
-    );
-    Ok(())
+    let task = crate::plan_artifact::PlanManifest::launch_task_from_file(path, None, 8)?;
+    launch_bundled(repo, ledger, "builtin:plan", vec![task])
 }
 
-fn validate_auto_command_before_launch(
+fn launch_bundled_coding(
     repo: &Repository,
-    command: &mut AutoCommand,
-) -> Result<(), String> {
-    if command.source != AutoCommandSource::ExistingPlan {
-        return Ok(());
-    }
-    let plan_path = command
-        .plan_path
-        .as_deref()
-        .ok_or_else(|| "auto run-plan requires a plan path".to_string())?;
-    let plan_path = resolve_cli_plan_path(&repo.root, plan_path);
-    let total = plan::infer_total_phases(&plan_path)?;
-    if total == 0 {
-        return Err("could not infer phases; add headings like 'Phase 1'".to_string());
-    }
-    command.plan_path = Some(plan_path);
-    Ok(())
-}
-
-fn auto_launch_options_for_command(
-    repo: &Repository,
-    branch: String,
     command: AutoCommand,
-) -> Result<AutoLaunchOptions, String> {
-    match command.source {
-        AutoCommandSource::Prompt => {
-            let initial_prompt = command
-                .prompt
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| "prism auto requires an initial prompt for a new run".to_string())?;
-            Ok(AutoLaunchOptions {
-                branch,
-                mode: AutoRunMode::Standard,
-                implementation_source: AutoImplementationSource::Prompt,
-                plan_path: None,
-                plan_run_mode: PlanRunMode::Sequential,
-                variant: "default".to_string(),
-                agent_profile: None,
-                initial_prompt: initial_prompt.to_string(),
-            })
-        }
-        AutoCommandSource::ExistingPlan => {
-            let plan_path = command
-                .plan_path
-                .ok_or_else(|| "auto run-plan requires a plan path".to_string())?;
-            let plan_path = resolve_cli_plan_path(&repo.root, &plan_path);
-            let total = plan::infer_total_phases(&plan_path)?;
-            if total == 0 {
-                return Err("could not infer phases; add headings like 'Phase 1'".to_string());
+    ledger: crate::run::RunLedger,
+) -> Result<(), String> {
+    let mut payload = serde_json::Map::new();
+    payload.insert(
+        "implementation_source".to_string(),
+        serde_json::Value::String(
+            match command.source {
+                AutoCommandSource::Prompt => "prompt",
+                AutoCommandSource::ExistingPlan => "existing_plan",
+                AutoCommandSource::DraftPlan => "draft_plan",
+                AutoCommandSource::ExistingPullRequest => "existing_change_request",
             }
-            Ok(AutoLaunchOptions {
-                branch,
-                mode: AutoRunMode::Standard,
-                implementation_source: AutoImplementationSource::ExistingPlan,
-                plan_path: Some(plan_path.clone()),
-                plan_run_mode: PlanRunMode::Sequential,
-                variant: "plan".to_string(),
-                agent_profile: None,
-                initial_prompt: format!("Run plan phases from {}", plan_path.display()),
-            })
-        }
-        AutoCommandSource::DraftPlan => {
-            let initial_prompt = command
-                .prompt
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| {
-                    "prism auto plan requires a task prompt for a new run".to_string()
-                })?;
-            Ok(AutoLaunchOptions {
-                branch,
-                mode: AutoRunMode::PlanFirst,
-                implementation_source: AutoImplementationSource::DraftPlan,
-                plan_path: Some(repo.root.join("plan.md")),
-                plan_run_mode: PlanRunMode::Sequential,
-                variant: "draft-plan".to_string(),
-                agent_profile: None,
-                initial_prompt: initial_prompt.to_string(),
-            })
-        }
-        AutoCommandSource::ExistingPullRequest => Ok(AutoLaunchOptions {
-            branch: branch.clone(),
-            mode: AutoRunMode::Standard,
-            implementation_source: AutoImplementationSource::ExistingPullRequest,
-            plan_path: None,
-            plan_run_mode: PlanRunMode::Sequential,
-            variant: "existing-pr".to_string(),
-            agent_profile: None,
-            initial_prompt: format!("Stabilize existing pull request for branch {branch}"),
-        }),
+            .to_string(),
+        ),
+    );
+    if let Some(prompt) = command.prompt {
+        payload.insert("task".to_string(), serde_json::Value::String(prompt));
     }
+    if let Some(path) = command.plan_path {
+        let content = std::fs::read_to_string(&path)
+            .map_err(|error| format!("read immutable Plan input {}: {error}", path.display()))?;
+        payload.insert("plan".to_string(), serde_json::Value::String(content));
+        payload.insert(
+            "plan_display".to_string(),
+            serde_json::Value::String(path.display().to_string()),
+        );
+    }
+    launch_bundled(
+        repo,
+        ledger,
+        "builtin:coding",
+        vec![crate::run::ArtifactInput {
+            name: "task".to_string(),
+            artifact_type: "builtin:task@1".to_string(),
+            payload: serde_json::Value::Object(payload),
+            trust: crate::run::TrustClass::Trusted,
+            sensitivity: crate::run::Sensitivity::Internal,
+        }],
+    )
 }
 
-fn resolve_cli_plan_path(cwd: &std::path::Path, path: &std::path::Path) -> std::path::PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    }
+fn launch_bundled(
+    repo: &Repository,
+    ledger: crate::run::RunLedger,
+    selector: &str,
+    inputs: Vec<crate::run::ArtifactInput>,
+) -> Result<(), String> {
+    let snapshot = crate::definition::DefinitionCatalog::discover(Some(&repo.root))
+        .resolve(selector)
+        .map_err(format_workflow_diagnostics)?;
+    let repository_id = ledger.repository_id(&repo.root)?;
+    let run = ledger.start(crate::run::StartRun {
+        actor_capabilities: snapshot.content.transitive_capabilities.clone(),
+        snapshot,
+        repository_id: Some(repository_id),
+        inputs,
+        idempotency_key: None,
+        actor: current_workflow_actor(),
+    })?;
+    println!("workflow_run_id = {}", run.run_id.as_str());
+    crate::worker::ensure_running()?;
+    crate::worker::wake()
 }
 
 fn discover_workspace_sessions(repos: &[ManagedRepo]) -> Result<Vec<session::Session>, String> {
@@ -1074,6 +1893,10 @@ fn run_debug_command(
                 "worker_lock_path = {}",
                 crate::worker::runtime_dir().join("worker.lock").display()
             );
+            println!(
+                "workflow_db_path = {}",
+                crate::run::RunLedger::user()?.path().display()
+            );
             Ok(())
         }
         DebugCommand::Info => {
@@ -1120,6 +1943,28 @@ fn run_debug_command(
                     println!("startup_can_move_branch = {}", setup.can_move_branch);
                 }
                 Err(error) => println!("startup_setup_error = {error}"),
+            }
+            match crate::run::RunLedger::user().and_then(|ledger| ledger.health()) {
+                Ok(health) => {
+                    println!("workflow_integrity_ok = {}", health.integrity_ok);
+                    println!("workflow_active_leases = {}", health.active_leases);
+                    println!("workflow_dangling_claims = {}", health.dangling_claims);
+                    println!(
+                        "workflow_quarantined_workspaces = {}",
+                        health.quarantined_workspaces
+                    );
+                    println!("workflow_overdue_waits = {}", health.overdue_waits);
+                    println!(
+                        "workflow_recovery_required_attempts = {}",
+                        health.recovery_required_attempts
+                    );
+                    println!(
+                        "workflow_unresolved_effects = {}",
+                        health.unresolved_effects
+                    );
+                    println!("workflow_enabled_triggers = {}", health.enabled_triggers);
+                }
+                Err(error) => println!("workflow_health_error = {error}"),
             }
             match crate::storage::passive_checkpoint_status(&observability::db_path(repo)) {
                 Ok(status) => {

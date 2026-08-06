@@ -1,0 +1,26 @@
+schema_version = 1
+name = "action"
+description = "Run one typed, read-only command action."
+capabilities = ["repository_read", "process_execute"]
+
+[inputs.task]
+artifact_type = "builtin:task@1"
+
+[budgets]
+max_attempts = 3
+max_fan_out = 1
+max_child_depth = 1
+max_mutations = 0
+
+[[steps]]
+id = "act"
+class = "action"
+implementation = "builtin:command@1"
+capabilities = ["repository_read", "process_execute"]
+
+[steps.inputs.task]
+from = "run.task"
+artifact_type = "builtin:task@1"
+
+[steps.outputs.result]
+artifact_type = "builtin:task@1"

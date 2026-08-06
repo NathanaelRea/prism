@@ -2013,6 +2013,7 @@ fn test_model<'a>(
         repo_filter: "",
         worktree_filter: "",
         leader_hint,
+        workflow_dashboard: None,
         auto_dashboard: None,
         plan_dashboard: None,
         tmux_portal: None,

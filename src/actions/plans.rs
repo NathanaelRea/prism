@@ -18,6 +18,7 @@ fn action_choice(key: &str, label: &str, enabled: bool) -> crate::view::KeyChoic
     }
 }
 
+#[cfg(test)]
 pub(super) fn plan_run_mode_from_parallel_confirmation(parallel: bool) -> PlanRunMode {
     if parallel {
         PlanRunMode::Parallel
@@ -62,57 +63,18 @@ impl Tui {
             "Run steps in parallel?",
             false,
         )?;
-        let mode = plan_run_mode_from_parallel_confirmation(parallel);
-        let launch = execution
-            .launch(&repo.root, mode)?
-            .with_harness(
-                config.default_harness.clone(),
-                config.harness_adapter(&config.default_harness)?,
-            )
-            .with_worktree_session_id(worktree_session_id);
-        let mut should_execute = true;
-        let mut submitted = false;
-        let persisted = crate::observability::with_writable_db(&repo, |conn| {
-            if let Some(mut persisted) = load_resumable_plan_run(conn, &launch)? {
-                should_execute = prepare_plan_run_for_resume(
-                    conn,
-                    &mut persisted,
-                    DEFAULT_OUTPUT_LINES_PER_STEP,
-                )?;
-                Ok(persisted)
-            } else {
-                let persisted = launch.create_run();
-                crate::plan_run::submit_plan_run(conn, &persisted)?;
-                submitted = true;
-                Ok(persisted)
-            }
-        })?;
-        let run_id = persisted.run.id.clone();
-        let scope_path = execution.cwd().to_path_buf();
-        self.plan_runs.insert(run_id.clone(), persisted.clone());
-        self.active_plan_runs
-            .insert(scope_path.clone(), run_id.clone());
-        self.selected_plan_step_by_run
-            .insert(run_id.clone(), persisted.run.selected_step);
-        self.manual_plan_step_selection_by_run.remove(&run_id);
-
-        if should_execute {
-            if submitted {
-                crate::worker::ensure_running()?;
-                crate::worker::wake()?;
-            } else {
-                self.spawn_plan_run_executor(repo, config, persisted)?;
-            }
-        }
-        if self.focused_panel == crate::tui::PanelFocus::Worktrees {
-            self.worktree_main_view = crate::view::WorktreeMainView::Plan;
-            self.main_focused = false;
-        }
-        if should_execute {
-            self.show_message("started plan run")?;
-        } else {
-            self.show_message("plan run is already running")?;
-        }
+        let artifact = execution.artifact(if parallel { 8 } else { 1 })?;
+        let run_id = crate::operations::WorkflowOperations::launch_named(
+            &repo.root,
+            "builtin:plan",
+            vec![artifact],
+            "local:tui".to_string(),
+        )?;
+        let _ = worktree_session_id;
+        crate::worker::ensure_running()?;
+        crate::worker::wake()?;
+        self.invalidate_workflow_snapshots();
+        self.show_message(&format!("started Workflow {}", run_id.as_str()))?;
         Ok(())
     }
 

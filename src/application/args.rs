@@ -21,6 +21,7 @@ pub enum CommandKind {
     DebugHelp,
     DbHelp,
     Doctor,
+    Workflow(WorkflowCommand),
     Config(ConfigCommand),
     Agent(AgentCommand),
     Auto(AutoCommand),
@@ -35,6 +36,91 @@ pub enum CommandKind {
     Stop(Option<String>),
     Recover(Option<String>),
     Daemon(DaemonCommand),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WorkflowCommand {
+    List {
+        json: bool,
+    },
+    Validate {
+        selector: Option<String>,
+        all: bool,
+        json: bool,
+    },
+    Preview {
+        selector: String,
+        json: bool,
+    },
+    Trust {
+        selector: String,
+    },
+    Launch {
+        selector: String,
+        inputs: Vec<String>,
+        idempotency_key: Option<String>,
+        actor: Option<String>,
+        json: bool,
+    },
+    Schema,
+    Example,
+    Runs {
+        json: bool,
+    },
+    Attention {
+        json: bool,
+    },
+    Status {
+        run_id: String,
+        json: bool,
+    },
+    History {
+        run_id: String,
+        after: i64,
+        limit: usize,
+        json: bool,
+    },
+    Pause {
+        run_id: String,
+    },
+    Resume {
+        run_id: String,
+    },
+    Cancel {
+        run_id: String,
+    },
+    Retry {
+        attempt_id: String,
+    },
+    RecoverAttempt {
+        attempt_id: String,
+        retry: bool,
+    },
+    Decide {
+        request_id: String,
+        approved: bool,
+        actor: Option<String>,
+        reason: Option<String>,
+        json: bool,
+    },
+    Doctor {
+        json: bool,
+    },
+    TriggerList {
+        json: bool,
+    },
+    TriggerEnable {
+        id: String,
+        enabled: bool,
+    },
+    TriggerRunNow {
+        id: String,
+        json: bool,
+    },
+    TriggerStatus {
+        id: Option<String>,
+        json: bool,
+    },
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -70,6 +156,7 @@ pub enum ConfigCommand {
     Example,
     Schema,
     Paths,
+    MigrateWorkflows { json: bool },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -144,6 +231,396 @@ impl Args {
                     })?);
                 }
                 "doctor" => command = CommandKind::Doctor,
+                "workflow" => {
+                    let subcommand = iter
+                        .next()
+                        .ok_or_else(|| "workflow requires a subcommand".to_string())?;
+                    let subcommand = subcommand.to_string_lossy().to_string();
+                    match subcommand.as_str() {
+                        "list" => {
+                            let mut json = false;
+                            while let Some(flag) = iter.next() {
+                                match flag.to_string_lossy().as_ref() {
+                                    "--json" => json = true,
+                                    "--repo" if repo.is_none() => {
+                                        repo =
+                                            Some(PathBuf::from(iter.next().ok_or_else(|| {
+                                                "--repo requires a path".to_string()
+                                            })?));
+                                    }
+                                    "--repo" => {
+                                        return Err("--repo accepts only one path".to_string());
+                                    }
+                                    other => {
+                                        return Err(format!(
+                                            "unknown workflow list argument: {other}"
+                                        ));
+                                    }
+                                }
+                            }
+                            command = CommandKind::Workflow(WorkflowCommand::List { json });
+                        }
+                        "validate" => {
+                            let mut selector = None;
+                            let mut all = false;
+                            let mut json = false;
+                            while let Some(value) = iter.next() {
+                                let value = value.to_string_lossy().to_string();
+                                match value.as_str() {
+                                    "--all" => all = true,
+                                    "--json" => json = true,
+                                    "--repo" if repo.is_none() => {
+                                        repo =
+                                            Some(PathBuf::from(iter.next().ok_or_else(|| {
+                                                "--repo requires a path".to_string()
+                                            })?))
+                                    }
+                                    "--repo" => {
+                                        return Err("--repo accepts only one path".to_string());
+                                    }
+                                    _ if selector.is_none() => selector = Some(value),
+                                    _ => {
+                                        return Err(format!(
+                                            "unknown workflow validate argument: {value}"
+                                        ));
+                                    }
+                                }
+                            }
+                            if all == selector.is_some() {
+                                return Err(
+                                    "workflow validate requires one selector or --all".to_string()
+                                );
+                            }
+                            command = CommandKind::Workflow(WorkflowCommand::Validate {
+                                selector,
+                                all,
+                                json,
+                            });
+                        }
+                        "preview" => {
+                            let selector = iter
+                                .next()
+                                .ok_or_else(|| "workflow preview requires a selector".to_string())?
+                                .to_string_lossy()
+                                .to_string();
+                            let mut json = false;
+                            while let Some(flag) = iter.next() {
+                                match flag.to_string_lossy().as_ref() {
+                                    "--json" => json = true,
+                                    "--repo" if repo.is_none() => {
+                                        repo =
+                                            Some(PathBuf::from(iter.next().ok_or_else(|| {
+                                                "--repo requires a path".to_string()
+                                            })?))
+                                    }
+                                    "--repo" => {
+                                        return Err("--repo accepts only one path".to_string());
+                                    }
+                                    other => {
+                                        return Err(format!(
+                                            "unknown workflow preview argument: {other}"
+                                        ));
+                                    }
+                                }
+                            }
+                            command =
+                                CommandKind::Workflow(WorkflowCommand::Preview { selector, json });
+                        }
+                        "trust" => {
+                            let selector = iter
+                                .next()
+                                .ok_or_else(|| "workflow trust requires a selector".to_string())?
+                                .to_string_lossy()
+                                .to_string();
+                            if iter.next().is_some() {
+                                return Err("workflow trust accepts one selector".to_string());
+                            }
+                            command = CommandKind::Workflow(WorkflowCommand::Trust { selector });
+                        }
+                        "launch" => {
+                            let selector = iter
+                                .next()
+                                .ok_or_else(|| "workflow launch requires a selector".to_string())?
+                                .to_string_lossy()
+                                .to_string();
+                            let mut inputs = Vec::new();
+                            let mut idempotency_key = None;
+                            let mut actor = None;
+                            let mut json = false;
+                            while let Some(flag) = iter.next() {
+                                match flag.to_string_lossy().as_ref() {
+                                    "--input" => inputs.push(
+                                        iter.next()
+                                            .ok_or_else(|| {
+                                                "--input requires name=<json>".to_string()
+                                            })?
+                                            .to_string_lossy()
+                                            .to_string(),
+                                    ),
+                                    "--idempotency-key" if idempotency_key.is_none() => {
+                                        idempotency_key = Some(
+                                            iter.next()
+                                                .ok_or_else(|| {
+                                                    "--idempotency-key requires a value".to_string()
+                                                })?
+                                                .to_string_lossy()
+                                                .to_string(),
+                                        )
+                                    }
+                                    "--actor" if actor.is_none() => {
+                                        actor = Some(
+                                            iter.next()
+                                                .ok_or_else(|| {
+                                                    "--actor requires a value".to_string()
+                                                })?
+                                                .to_string_lossy()
+                                                .to_string(),
+                                        )
+                                    }
+                                    "--json" => json = true,
+                                    other => {
+                                        return Err(format!(
+                                            "unknown workflow launch argument: {other}"
+                                        ));
+                                    }
+                                }
+                            }
+                            command = CommandKind::Workflow(WorkflowCommand::Launch {
+                                selector,
+                                inputs,
+                                idempotency_key,
+                                actor,
+                                json,
+                            });
+                        }
+                        "schema" => command = CommandKind::Workflow(WorkflowCommand::Schema),
+                        "example" => command = CommandKind::Workflow(WorkflowCommand::Example),
+                        "runs" => {
+                            command = CommandKind::Workflow(WorkflowCommand::Runs {
+                                json: iter.any(|value| value == "--json"),
+                            })
+                        }
+                        "attention" => {
+                            command = CommandKind::Workflow(WorkflowCommand::Attention {
+                                json: iter.any(|value| value == "--json"),
+                            })
+                        }
+                        "status" => {
+                            let run_id = iter
+                                .next()
+                                .ok_or_else(|| "workflow status requires a Run ID".to_string())?
+                                .to_string_lossy()
+                                .to_string();
+                            command = CommandKind::Workflow(WorkflowCommand::Status {
+                                run_id,
+                                json: iter.any(|value| value == "--json"),
+                            });
+                        }
+                        "history" => {
+                            let run_id = iter
+                                .next()
+                                .ok_or_else(|| "workflow history requires a Run ID".to_string())?
+                                .to_string_lossy()
+                                .to_string();
+                            let mut after = 0i64;
+                            let mut limit = 100usize;
+                            let mut json = false;
+                            while let Some(flag) = iter.next() {
+                                match flag.to_string_lossy().as_ref() {
+                                    "--json" => json = true,
+                                    "--after" => {
+                                        after = iter
+                                            .next()
+                                            .ok_or_else(|| {
+                                                "--after requires an event ID".to_string()
+                                            })?
+                                            .to_string_lossy()
+                                            .parse()
+                                            .map_err(|_| {
+                                                "--after requires an integer".to_string()
+                                            })?
+                                    }
+                                    "--limit" => {
+                                        limit = iter
+                                            .next()
+                                            .ok_or_else(|| "--limit requires a count".to_string())?
+                                            .to_string_lossy()
+                                            .parse()
+                                            .map_err(|_| {
+                                                "--limit requires an integer".to_string()
+                                            })?
+                                    }
+                                    other => {
+                                        return Err(format!(
+                                            "unknown workflow history argument: {other}"
+                                        ));
+                                    }
+                                }
+                            }
+                            command = CommandKind::Workflow(WorkflowCommand::History {
+                                run_id,
+                                after,
+                                limit,
+                                json,
+                            });
+                        }
+                        "pause" | "resume" | "cancel" => {
+                            let run_id = iter
+                                .next()
+                                .ok_or_else(|| format!("workflow {subcommand} requires a Run ID"))?
+                                .to_string_lossy()
+                                .to_string();
+                            if iter.next().is_some() {
+                                return Err(format!("workflow {subcommand} accepts one Run ID"));
+                            }
+                            command = CommandKind::Workflow(match subcommand.as_str() {
+                                "pause" => WorkflowCommand::Pause { run_id },
+                                "resume" => WorkflowCommand::Resume { run_id },
+                                _ => WorkflowCommand::Cancel { run_id },
+                            });
+                        }
+                        "retry" => {
+                            let attempt_id = iter
+                                .next()
+                                .ok_or_else(|| "workflow retry requires an Attempt ID".to_string())?
+                                .to_string_lossy()
+                                .to_string();
+                            if iter.next().is_some() {
+                                return Err("workflow retry accepts one Attempt ID".to_string());
+                            }
+                            command = CommandKind::Workflow(WorkflowCommand::Retry { attempt_id });
+                        }
+                        "recover-attempt" => {
+                            let attempt_id = iter
+                                .next()
+                                .ok_or_else(|| {
+                                    "workflow recover-attempt requires an Attempt ID".to_string()
+                                })?
+                                .to_string_lossy()
+                                .to_string();
+                            let mut retry = false;
+                            for flag in iter {
+                                if flag == "--retry" {
+                                    retry = true;
+                                } else {
+                                    return Err(format!(
+                                        "unknown workflow recover-attempt argument: {}",
+                                        flag.to_string_lossy()
+                                    ));
+                                }
+                            }
+                            command = CommandKind::Workflow(WorkflowCommand::RecoverAttempt {
+                                attempt_id,
+                                retry,
+                            });
+                        }
+                        "approve" | "reject" => {
+                            let request_id = iter
+                                .next()
+                                .ok_or_else(|| {
+                                    format!("workflow {subcommand} requires an Approval Request ID")
+                                })?
+                                .to_string_lossy()
+                                .to_string();
+                            let mut actor = None;
+                            let mut reason = None;
+                            let mut json = false;
+                            while let Some(flag) = iter.next() {
+                                match flag.to_string_lossy().as_ref() {
+                                    "--actor" if actor.is_none() => {
+                                        actor = Some(
+                                            iter.next()
+                                                .ok_or_else(|| {
+                                                    "--actor requires a value".to_string()
+                                                })?
+                                                .to_string_lossy()
+                                                .to_string(),
+                                        )
+                                    }
+                                    "--reason" if reason.is_none() => {
+                                        reason = Some(
+                                            iter.next()
+                                                .ok_or_else(|| {
+                                                    "--reason requires a value".to_string()
+                                                })?
+                                                .to_string_lossy()
+                                                .to_string(),
+                                        )
+                                    }
+                                    "--json" => json = true,
+                                    other => {
+                                        return Err(format!(
+                                            "unknown workflow {subcommand} argument: {other}"
+                                        ));
+                                    }
+                                }
+                            }
+                            command = CommandKind::Workflow(WorkflowCommand::Decide {
+                                request_id,
+                                approved: subcommand == "approve",
+                                actor,
+                                reason,
+                                json,
+                            });
+                        }
+                        "doctor" => {
+                            command = CommandKind::Workflow(WorkflowCommand::Doctor {
+                                json: iter.any(|value| value == "--json"),
+                            })
+                        }
+                        "triggers" => {
+                            command = CommandKind::Workflow(WorkflowCommand::TriggerList {
+                                json: iter.any(|value| value == "--json"),
+                            })
+                        }
+                        "trigger-enable" | "trigger-disable" => {
+                            let id = iter
+                                .next()
+                                .ok_or_else(|| {
+                                    format!("workflow {subcommand} requires a Trigger ID")
+                                })?
+                                .to_string_lossy()
+                                .to_string();
+                            command = CommandKind::Workflow(WorkflowCommand::TriggerEnable {
+                                id,
+                                enabled: subcommand == "trigger-enable",
+                            });
+                        }
+                        "trigger-run-now" => {
+                            let id = iter
+                                .next()
+                                .ok_or_else(|| {
+                                    "workflow trigger-run-now requires a Trigger ID".to_string()
+                                })?
+                                .to_string_lossy()
+                                .to_string();
+                            command = CommandKind::Workflow(WorkflowCommand::TriggerRunNow {
+                                id,
+                                json: iter.any(|value| value == "--json"),
+                            });
+                        }
+                        "trigger-status" => {
+                            let mut id = None;
+                            let mut json = false;
+                            for value in iter.by_ref() {
+                                if value == "--json" {
+                                    json = true;
+                                } else if id.is_none() {
+                                    id = Some(value.to_string_lossy().to_string());
+                                } else {
+                                    return Err(
+                                        "workflow trigger-status accepts at most one Trigger ID"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                            command =
+                                CommandKind::Workflow(WorkflowCommand::TriggerStatus { id, json });
+                        }
+                        other => return Err(format!("unknown workflow subcommand: {other}")),
+                    }
+                    break;
+                }
                 "config" => {
                     let Some(value) = iter.next() else {
                         command = CommandKind::Config(ConfigCommand::Show);
@@ -155,6 +632,20 @@ impl Args {
                         "example" => ConfigCommand::Example,
                         "schema" => ConfigCommand::Schema,
                         "paths" => ConfigCommand::Paths,
+                        "migrate-workflows" => {
+                            let mut json = false;
+                            for flag in iter.by_ref() {
+                                if flag == "--json" {
+                                    json = true;
+                                } else {
+                                    return Err(format!(
+                                        "unknown config migrate-workflows argument: {}",
+                                        flag.to_string_lossy()
+                                    ));
+                                }
+                            }
+                            ConfigCommand::MigrateWorkflows { json }
+                        }
                         other => return Err(format!("unknown config subcommand: {other}")),
                     });
                     break;
@@ -417,7 +908,7 @@ impl Args {
 }
 
 pub fn help_text() -> &'static str {
-    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] list [--all] [--json]\n  prism [--repo <path>] status [<selector>] [--json]\n  prism [--repo <path>] pause|resume|stop [<workflow-selector>]\n  prism [--repo <path>] recover [<workflow-selector>]\n  prism daemon status [--json]\n  prism daemon start|stop\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config [show|example|schema|paths]\n  prism [--repo <path>] agent ensure --branch <branch>\n  prism [--repo <path>] auto [prompt]\n  prism [--repo <path>] auto pr\n  prism [--repo <path>] auto run-plan <plan.md>\n  prism [--repo <path>] auto plan [prompt]\n  prism [--repo <path>] auto plan-first [prompt]\n  prism [--repo <path>] auto intensive [prompt]\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup|integrity\n  prism [--repo <path>] debug record [--before <seconds>] [--after <seconds>]\n  prism [--repo <path>] debug --help\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n  prism [--repo <path>] db --help\n\nSelectors:\n  a:<short-id>, p:<short-id>, auto:<full-id>, plan:<full-id>, repo:<name>,\n  wt:<branch>, or an absolute repository/worktree path.\n\nDebugging:\n  Use `debug record` while Prism is running to capture its in-memory flight recorder,\n  `debug paths` to find Prism state, `debug logs` to tail the runtime log, and\n  `debug integrity` for read-only database checks. Use `db path` or\n  `db <read-only-sql>` to inspect persisted repo state.\n  Use `--print-logs --log-level trace` to print detailed subprocess logs.\n\nAliases:\n  auto plan-first and auto intensive are aliases for auto plan."
+    "Usage:\n  prism [--repo <path>] [--debug] [--print-logs] [--log-level <level>]\n  prism [--repo <path>] workflow list [--json]\n  prism [--repo <path>] workflow validate <selector>|--all [--json]\n  prism [--repo <path>] workflow preview|trust <selector> [--json]\n  prism [--repo <path>] workflow launch <selector> --input <name=json>... [--idempotency-key <key>] [--json]\n  prism workflow schema|example\n  prism workflow runs|attention|status <run-id>|history <run-id> [--json]\n  prism workflow pause|resume|cancel <run-id>\n  prism workflow retry <attempt-id>|recover-attempt <attempt-id> [--retry]\n  prism workflow approve|reject <request-id> [--actor <actor>] [--reason <reason>] [--json]\n  prism workflow doctor|triggers [--json]\n  prism workflow trigger-enable|trigger-disable|trigger-run-now <trigger-id> [--json]\n  prism workflow trigger-status [<trigger-id>] [--json]\n  prism [--repo <path>] list [--all] [--json]\n  prism [--repo <path>] status [<selector>] [--json]\n  prism [--repo <path>] pause|resume|stop [<workflow-selector>]\n  prism [--repo <path>] recover [<workflow-selector>]\n  prism daemon status [--json]\n  prism daemon start|stop\n  prism [--repo <path>] doctor\n  prism [--repo <path>] config [show|example|schema|paths|migrate-workflows [--json]]\n  prism [--repo <path>] agent ensure --branch <branch>\n  prism [--repo <path>] auto [prompt]\n  prism [--repo <path>] auto pr\n  prism [--repo <path>] auto run-plan <plan.md>\n  prism [--repo <path>] auto plan [prompt]\n  prism [--repo <path>] auto plan-first [prompt]\n  prism [--repo <path>] auto intensive [prompt]\n  prism [--repo <path>] run-plan [plan.md]\n  prism [--repo <path>] plan [plan.md]\n  prism [--repo <path>] debug paths|info|logs|startup|integrity\n  prism [--repo <path>] debug record [--before <seconds>] [--after <seconds>]\n  prism [--repo <path>] debug --help\n  prism [--repo <path>] db\n  prism [--repo <path>] db path\n  prism [--repo <path>] db <read-only-sql>\n  prism [--repo <path>] db --help\n\nWorkflow definition selectors:\n  builtin:<name>, global:<name>, repository:<name>, or an unqualified unique name.\n\nSelectors:\n  a:<short-id>, p:<short-id>, auto:<full-id>, plan:<full-id>, repo:<name>,\n  wt:<branch>, or an absolute repository/worktree path.\n\nDebugging:\n  Use `debug record` while Prism is running to capture its in-memory flight recorder,\n  `debug paths` to find Prism state, `debug logs` to tail the runtime log, and\n  `debug integrity` for read-only database checks. Use `db path` or\n  `db <read-only-sql>` to inspect persisted repo state.\n  Use `--print-logs --log-level trace` to print detailed subprocess logs.\n\nAliases:\n  auto plan-first and auto intensive are aliases for auto plan."
 }
 
 pub fn debug_help_text() -> &'static str {
@@ -543,6 +1034,10 @@ mod tests {
         assert_eq!(
             parse(&["config", "paths"]),
             CommandKind::Config(ConfigCommand::Paths)
+        );
+        assert_eq!(
+            parse(&["config", "migrate-workflows", "--json"]),
+            CommandKind::Config(ConfigCommand::MigrateWorkflows { json: true })
         );
     }
 

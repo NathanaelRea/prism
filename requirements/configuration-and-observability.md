@@ -11,14 +11,18 @@
 - **Invariant**: Effective repository configuration applies built-in defaults,
   then global settings, then repository settings. Unspecified repository values
   inherit their effective global values.
+- **Invariant**: Workflow Definitions, Components, Step Implementations,
+  Triggers, and Admission Policies use explicit namespaced references and
+  composition. The ordinary settings precedence above never deep-merges or
+  silently replaces one of those definitions.
 - **Behavior**: Initial terminal presentation setup explains and offers Nerd Font
   icons or a Unicode fallback. It does not claim to detect font support
   automatically.
 - **Default**: Unicode is the compatibility fallback when Nerd Font support is
   not selected.
 - **Behavior**: Prism can generate a useful commented TOML configuration, publish
-  a JSON Schema applicable to that configuration, and expose CLI commands that
-  make configuration locations and options discoverable.
+  schemas applicable to settings and workflow source files, and expose CLI
+  commands that make configuration locations and options discoverable.
 - **Behavior**: `prism db` provides an interactive way to inspect Prism's SQLite
   state comparable to `opencode db`.
 - **Constraint**: Normal Prism operation does not require the external `sqlite3`
@@ -33,22 +37,26 @@
   before validating the selected harness.
 - **Invariant**: `opencode`, `codex`, `claude`, and `pi` are reserved harness IDs
   bound to their matching built-in adapters. Custom IDs use the generic adapter.
-- **Behavior**: Startup validates tools required for the selected mode and names
-  missing tools and relevant configuration locations. Optional tools are checked
-  only when their actions require them.
+- **Behavior**: Startup validates tools required for the selected action and
+  enabled Triggers and names missing tools and relevant configuration locations.
+  Optional tools are checked only when their Steps require them.
 - **Behavior**: `prism doctor` reports tool availability and versions; GitHub
   and GitLab CLI authentication; Forgejo credential-source availability; the
   resolved remote host/provider, capabilities, and server version when
   discoverable; configured checks; selected harness capabilities; and discovered
-  worktrees, without printing credential values.
+  worktrees; enabled Triggers; Workflow Definition validation; trusted
+  repository-definition revisions; and compatible local Execution Targets,
+  without printing credential values.
 - **Behavior**: Startup rejects Worktrunk versions below 0.58.0. Diagnostics
   report the detected Worktrunk version and minimum; observation failures use a
   bounded safe summary rather than raw command output or development URLs.
-- **Default**: Desktop notifications are disabled. When enabled, category switches
-  independently control input-required, completed, and failed/restart Agent
-  Session transitions and may be overridden per repository.
+- **Default**: Desktop notifications are disabled. When enabled, category
+  switches independently control Agent Session attention transitions; Workflow
+  Run input-required, completed, failed, and recovery-required transitions; and
+  admission events. Categories may be overridden per repository.
 - **Invariant**: Enabling or reloading notifications establishes current Agent
-  Session states as a baseline and never reports persisted attention states.
+  Session and Workflow Run states as a baseline and never reports persisted
+  attention states as new transitions.
 - **Behavior**: The Prism Worker observes interactive Agent Sessions and records
   accepted transitions in a durable per-repository outbox. New observations
   supersede obsolete pending notifications, and undelivered notifications expire
@@ -59,16 +67,38 @@
   workflow. A backend-accepted timestamp is delivery evidence; Prism cannot know
   whether the desktop displayed a notification or whether a user saw it.
 
-## Verification Commands
+## Workflow Authoring
 
-- **Customization**: Repositories can configure ordered `pre_push`, `pre_pr`, and
-  `review_fix` command lists. Commands run in the affected worktree and stop at
-  the first failure.
-- **Behavior**: Auto Flow local verification runs pre-push and pre-PR commands
-  plus a non-mutating merge-conflict check against the Default Branch. Review
-  repairs additionally run review-fix commands.
-- **Behavior**: An empty verification configuration is reported explicitly but
-  does not fail solely because no commands were configured.
+- **Customization**: Global workflow sources live under the user's Prism
+  configuration. A repository can additionally provide workflow sources from
+  its documented Prism configuration location after the user trusts their exact
+  revision and capability envelope.
+- **Behavior**: Validation and resolved-preview commands work without launching
+  a run. They report graph, type, condition, reference, capability, trust,
+  Trigger, target confinement, and Execution Target errors with source
+  locations.
+- **Invariant**: Reloading source files can update enabled Triggers and future
+  runs, but cannot change a persisted Definition Snapshot or reinterpret a
+  queued, active, waiting, paused, or historical run.
+- **Behavior**: An explicitly edited Trigger selector takes effect for later
+  occurrences only after successful validation. Namespace collisions, floating
+  definition updates, and source reloads never retarget an occurrence or run
+  that Prism has already recorded.
+- **Customization**: Repositories can define named verification command sets and
+  compose them into Action and Gate implementations. Commands run in the
+  declared repository or worktree scope, stop according to explicit policy, and
+  emit typed verification Artifacts.
+- **Behavior**: Bundled workflows provide useful local-verification and
+  merge-conflict components, but no command-set name such as pre-push, pre-PR, or
+  review-fix has hard-coded orchestration meaning.
+- **Behavior**: An empty verification implementation is reported explicitly and
+  follows the resolved Gate policy; absence is not silently represented as a
+  passing check.
+- **Invariant**: Secret values are resolved only for a Step Attempt whose
+  recorded capability grant permits that secret and whose trusted Execution
+  Target enforces its scope. Configuration, preview, validation, Definition
+  Snapshots, and diagnostics expose secret handles and required scope but never
+  their values.
 
 ## Command Line And Database
 
@@ -76,8 +106,10 @@
   resolves its root, and supplies repository context to repository-scoped
   commands. Repository-independent help and diagnostics remain available when no
   repository can be resolved.
-- **Invariant**: `prism auto` resumes the most recent active run for the selected
-  repository before considering a new prompt or plan.
+- **Behavior**: Workflow CLI commands can list definitions, validate and preview
+  a resolved definition, start a run with typed inputs, inspect status and
+  history, control execution, and answer an Approval Request without requiring
+  the TUI.
 - **Behavior**: Bare `prism db` initializes and migrates the selected database,
   then opens writable interactive access through `sqlite3`; `prism db path`
   prints its path; `prism db <query>` uses built-in read-only SQLite support and

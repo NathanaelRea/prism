@@ -23,9 +23,10 @@ use super::{
     Capabilities, ChangeRequest, ChangeRequestDetails, ChangeRequestId, ChangeRequestSummary,
     CheckContext, CheckState, Comment, CreateChangeRequest, GuardedMerge, LifecycleState,
     MergeMutationResult, MergeabilityState, NativeReviewThreadId, Observation, PolicyFacts,
-    ProviderKind, QueueState, RemoteError, RemoteErrorClass, RemoteOperation, RemoteRepositoryId,
-    RepositoryPolicy, ResolveReviewThread, RetryHint, Retryability, Review, ReviewDecision,
-    ReviewSubmissionKind, ReviewThread, SubmitReview,
+    ProviderItemId, ProviderItemKind, ProviderItemObservation, ProviderKind, QueueState,
+    RemoteError, RemoteErrorClass, RemoteOperation, RemoteRepositoryId, RepositoryPolicy,
+    ResolveReviewThread, RetryHint, Retryability, Review, ReviewDecision, ReviewSubmissionKind,
+    ReviewThread, SubmitReview,
 };
 
 const PR_MERGE_VERIFY_ATTEMPTS: usize = 6;
