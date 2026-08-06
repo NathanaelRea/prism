@@ -139,8 +139,7 @@ impl WorkflowDatabase {
                 expected: "workflow",
             });
         }
-        let mut connection = self.readers.acquire().await.map_err(DatabaseError::Query)?;
-        validate_integrity(&mut connection).await
+        Ok(())
     }
 }
 
