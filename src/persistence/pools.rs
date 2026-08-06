@@ -413,24 +413,23 @@ mod tests {
                     .await
                     .unwrap();
 
-                let reopen_path = path.clone();
-                let reopening = std::thread::spawn(move || {
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap()
-                        .block_on(WorkflowDatabase::open(&reopen_path))
-                });
-                std::thread::sleep(Duration::from_millis(50));
+                let mut reopening = Box::pin(WorkflowDatabase::open(&path));
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut reopening)
+                        .await
+                        .is_err(),
+                    "workflow open should remain pending while the SQLite lock is held"
+                );
+
                 sqlx::query("commit")
                     .execute(&mut blocker)
                     .await
                     .unwrap();
                 blocker.close().await.unwrap();
 
-                let reopened = reopening
-                    .join()
-                    .unwrap()
+                let reopened = tokio::time::timeout(WRITER_BUSY_TIMEOUT, reopening)
+                    .await
+                    .expect("workflow open should finish after the SQLite lock is released")
                     .expect("workflow open should wait for a transient SQLite lock");
                 reopened.close().await;
             });
