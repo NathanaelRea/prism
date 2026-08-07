@@ -670,15 +670,15 @@ fn serve_socket(
             return Err(format!("workflow control plane failed: {error}"));
         }
         match listener.accept() {
-            Ok((mut stream, _)) => {
-                if respond(
-                    &mut stream,
+            Ok((stream, _)) => {
+                if respond_to_accepted_stream(
+                    stream,
                     &instance_id,
                     &active,
                     &notification_subscriber,
                     Some(operations),
                     draining,
-                ) {
+                )? {
                     draining = true;
                     notification_stop.store(true, Ordering::Release);
                 }
@@ -699,6 +699,30 @@ fn serve_socket(
     notification_stop.store(true, Ordering::Release);
     log_daemon_lifecycle("daemon_stop", &instance_id);
     fs::remove_file(socket.as_path()).map_err(|error| format!("remove worker socket: {error}"))
+}
+
+fn respond_to_accepted_stream(
+    mut stream: UnixStream,
+    instance_id: &str,
+    active: &Arc<Mutex<BTreeSet<PathBuf>>>,
+    notification_subscriber: &Arc<Mutex<Vec<UnixStream>>>,
+    operations: Option<&crate::WorkflowOperations>,
+    draining: bool,
+) -> Result<bool, String> {
+    // Darwin copies the listener's O_NONBLOCK flag to accepted sockets. Normalize the stream
+    // before using the blocking request protocol so a client descheduled between connect and
+    // write is not rejected with WouldBlock and disconnected.
+    stream
+        .set_nonblocking(false)
+        .map_err(|error| format!("configure accepted Prism worker connection: {error}"))?;
+    Ok(respond(
+        &mut stream,
+        instance_id,
+        active,
+        notification_subscriber,
+        operations,
+        draining,
+    ))
 }
 
 fn respond(
@@ -1584,6 +1608,27 @@ mod tests {
         assert!(transient.is_err());
         assert_eq!(observe(AgentState::ExitedOk, 4_000), None);
         assert_eq!(coordinator.pending().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn accepted_nonblocking_stream_waits_for_complete_request() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        server.set_nonblocking(true).unwrap();
+        let active = Arc::new(Mutex::new(BTreeSet::new()));
+        let subscriber = Arc::new(Mutex::new(Vec::new()));
+        let responder = thread::spawn(move || {
+            respond_to_accepted_stream(server, "daemon-test", &active, &subscriber, None, false)
+        });
+
+        // Model a client descheduled between connect and write after Darwin inherits the
+        // listener's nonblocking flag onto the accepted stream.
+        thread::sleep(Duration::from_millis(20));
+        client.write_all(b"health\n").unwrap();
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+
+        assert!(response.starts_with("ok 1 daemon-test "), "{response}");
+        assert!(!responder.join().unwrap().unwrap());
     }
 
     #[test]
