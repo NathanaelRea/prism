@@ -19,6 +19,9 @@ members = [
 ]
 resolver = "3"
 
+[profile.test]
+debug = "line-tables-only"
+
 [package.metadata.prism]
 supported-operating-systems = ["linux", "macos"]
 

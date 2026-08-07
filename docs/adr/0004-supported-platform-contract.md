@@ -62,12 +62,17 @@ rg -n '#\[cfg\([^]]*(target_os|unix|target_family|target_arch)|cfg!\([^)]*(targe
 
 ## Verification Contract
 
-Run the Linux gate, including both explicit platform policies and the Darwin
-cross-check:
+Run the fast native gate during routine development and the exhaustive metadata
+gate before pushing:
 
 ```sh
+scripts/check.sh
 scripts/full-check.sh
 ```
+
+CI runs the exhaustive gate natively on both Linux and macOS. Explicit platform
+policy tests cover both supported operating systems on either host; native CI
+owns target-specific compilation and behavior.
 
 Run the focused native gate on macOS before the complete suite:
 
@@ -101,7 +106,7 @@ cargo test platform_contract_
 - Unsupported targets fail intentionally rather than reaching incomplete
   launch, process, durability, or socket fallbacks.
 - Linux development can verify Linux and macOS policy decisions.
-- Darwin cross-clippy remains useful for compilation, while native macOS smoke
-  owns syscall and real integration evidence.
+- Native Linux and macOS CI own platform compilation, syscall, and real
+  integration evidence without a redundant Darwin cross-check.
 - The full Linux/macOS CI suite remains the merge gate after the early macOS
   smoke signal.

@@ -18,7 +18,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-          targets: aarch64-apple-darwin
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.143
       - name: Install SQLx CLI 0.8.6
         run: cargo install sqlx-cli --version 0.8.6 --locked --no-default-features --features sqlite,rustls
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
@@ -27,11 +29,11 @@ jobs:
           node-version: 22
       - name: Install OpenCode
         run: npm install --global opencode-ai@1.17.20
-      - name: Install Linux cross-check dependencies
+      - name: Install Linux integration dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang pkg-config libsqlite3-dev tmux
+          sudo apt-get install -y tmux
       - name: Install macOS integration dependencies
         if: runner.os == 'macOS'
         run: brew install tmux
