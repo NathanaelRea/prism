@@ -8,13 +8,31 @@ use crate::remote::PrCache;
 use crate::view::RepoMainView;
 
 use super::super::{OpenTmuxSessionTarget, PanelFocus, Tui, WorktreeListMode};
-use super::support::{test_pr_summary, test_tui, unique_temp_dir};
+use super::support::{test_change_request_identity, test_pr_summary, test_tui, unique_temp_dir};
 
 #[test]
 fn tui_defaults_to_repos_panel_focus() {
     let tui = test_tui();
 
     assert_eq!(tui.focused_panel, PanelFocus::Repos);
+}
+
+#[test]
+fn workflow_context_uses_selected_worktree_pr_before_repository_poll_finishes() {
+    let mut tui = test_tui();
+    tui.focus_worktrees();
+    tui.select_worktree(1);
+    let mut summary = test_pr_summary(false);
+    summary.change_request_identity = Some(test_change_request_identity(
+        crate::remote::ProviderKind::GitHub,
+    ));
+    tui.sessions[1].pr = PrCache::observed(summary, None);
+    assert!(tui.repos[0].pr_summaries.is_empty());
+
+    let context = tui.workflow_context();
+
+    assert!(context.contains_key("worktree"));
+    assert!(context.contains_key("change_request"));
 }
 
 #[test]

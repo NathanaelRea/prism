@@ -460,7 +460,9 @@ async fn run_workflow_async(repo: Option<&Path>, arguments: &[String]) -> Result
             let operations = WorkflowOperations::open_default()
                 .await
                 .map_err(|error| error.to_string())?;
-            crate::install_definition_catalog(&operations, &catalog)
+            // Discovery happens for every launch. Registration only pins the freshly compiled
+            // filesystem state so this run remains reproducible after later edits.
+            crate::register_catalog_snapshots(&operations, &catalog)
                 .await
                 .map_err(|error| error.to_string())?;
             let now = now_ms();
@@ -838,6 +840,8 @@ impl ResourceContext {
     fn load(repo: Option<&Path>) -> Result<Self, String> {
         let global = crate::util::prism_config_dir();
         crate::package::bootstrap_standard_pack(&global).map_err(|error| error.to_string())?;
+        crate::resource::ensure_global_drop_in_directories(&global)
+            .map_err(|error| error.to_string())?;
         let repository = match repo {
             Some(path) => Some(crate::repo::Repository::discover(Some(path))?.root),
             None => crate::repo::Repository::discover(None)

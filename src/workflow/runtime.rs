@@ -4,19 +4,20 @@ use super::definition::DefinitionCatalog;
 use super::operations::{DefinitionSnapshot, WorkflowOperations};
 use crate::WorkflowOperationError;
 
-/// Register discovered loose and package workflows as immutable compiled snapshots.
+/// Register the catalog's current definitions as immutable snapshots for future runs.
 ///
-/// Definitions reach this seam through the same catalog used for user-owned resources; there are
-/// no hidden launch definitions or privileged implementation registrations here.
-pub async fn install(
+/// This is runtime snapshot registration, not resource installation. Callers rediscover the
+/// filesystem before invoking this function, so adding or editing a loose TOML is immediately
+/// reflected in future launches while existing runs keep their pinned snapshot.
+pub async fn register_catalog_snapshots(
     operations: &WorkflowOperations,
     catalog: &DefinitionCatalog,
-) -> Result<(), CatalogInstallError> {
+) -> Result<(), CatalogRegistrationError> {
     let now = now_ms();
     for definition in catalog.list() {
         let snapshot = catalog.compile(&definition.id)?;
         let body = serde_json::to_string(&snapshot)
-            .map_err(|error| CatalogInstallError::Serialization(error.to_string()))?;
+            .map_err(|error| CatalogRegistrationError::Serialization(error.to_string()))?;
         operations
             .register_definition(DefinitionSnapshot {
                 id: &snapshot.digest,
@@ -34,13 +35,13 @@ pub async fn install(
 }
 
 #[derive(Debug)]
-pub enum CatalogInstallError {
+pub enum CatalogRegistrationError {
     Definition(super::definition::DefinitionError),
     Operation(WorkflowOperationError),
     Serialization(String),
 }
 
-impl std::fmt::Display for CatalogInstallError {
+impl std::fmt::Display for CatalogRegistrationError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Definition(error) => error.fmt(formatter),
@@ -50,15 +51,15 @@ impl std::fmt::Display for CatalogInstallError {
     }
 }
 
-impl std::error::Error for CatalogInstallError {}
+impl std::error::Error for CatalogRegistrationError {}
 
-impl From<super::definition::DefinitionError> for CatalogInstallError {
+impl From<super::definition::DefinitionError> for CatalogRegistrationError {
     fn from(value: super::definition::DefinitionError) -> Self {
         Self::Definition(value)
     }
 }
 
-impl From<WorkflowOperationError> for CatalogInstallError {
+impl From<WorkflowOperationError> for CatalogRegistrationError {
     fn from(value: WorkflowOperationError) -> Self {
         Self::Operation(value)
     }

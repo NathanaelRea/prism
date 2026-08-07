@@ -154,6 +154,17 @@ struct IdentityHeader {
     id: String,
 }
 
+/// Ensure the user-owned global drop-in locations exist.
+///
+/// Loose resources placed here are discovered directly; they do not need a package manifest or
+/// installation record.
+pub fn ensure_global_drop_in_directories(global_root: &Path) -> Result<(), ResourceError> {
+    for directory in ["workflows", "extensions", "skills", "templates"] {
+        fs::create_dir_all(global_root.join(directory))?;
+    }
+    Ok(())
+}
+
 pub fn discover(
     global_root: &Path,
     repository_root: Option<&Path>,
@@ -366,6 +377,18 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn global_drop_in_directories_are_ready_for_uninstalled_resources() {
+        let global = temp("drop-ins");
+
+        ensure_global_drop_in_directories(&global).unwrap();
+
+        for directory in ["workflows", "extensions", "skills", "templates"] {
+            assert!(global.join(directory).is_dir());
+        }
+        fs::remove_dir_all(global).unwrap();
     }
 
     #[test]

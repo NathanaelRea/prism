@@ -32,7 +32,6 @@ pub(crate) use tui::{
 };
 mod view;
 mod workflow;
-pub use workflow::bundled::{CatalogInstallError, install as install_definition_catalog};
 pub use workflow::definition::{
     Binding as WorkflowBinding, CatalogDefinition, CompiledRepeat, CompiledStep, ConditionError,
     ConditionExpr, ConditionValue, DefinitionAuthoringOperations, DefinitionCatalog,
@@ -61,6 +60,7 @@ pub use workflow::operations::{
     WorkflowOperations, WorkflowOutputProjection, WorkflowProjection, WorkflowStep,
     WorkflowStepProjection,
 };
+pub use workflow::runtime::{CatalogRegistrationError, register_catalog_snapshots};
 pub use workflow::trigger::{
     AdmissionDecision as TriggerAdmissionDecision, AdmissionEvaluation, AdmissionOutcome,
     AdmissionPolicy, OverlapPolicy, ProviderItemKind as TriggerProviderItemKind,

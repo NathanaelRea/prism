@@ -6,6 +6,7 @@ mod trust;
 
 pub use identity::{
     DiscoveredResource, QualifiedIdentity, ResourceError, ResourceKind, ResourceScope, discover,
+    ensure_global_drop_in_directories,
 };
 pub use store::{
     ContentRevision, ContentStore, CorruptBlob, DanglingReference, Reference, StoreAudit,

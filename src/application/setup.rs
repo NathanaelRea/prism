@@ -17,7 +17,9 @@ pub(crate) fn ensure_user_owned_resources(config: &Config) -> Result<bool, Strin
             config.user_path.display()
         )
     })?;
-    bootstrap_standard_pack(root).map_err(|error| error.to_string())
+    let bootstrapped = bootstrap_standard_pack(root).map_err(|error| error.to_string())?;
+    crate::resource::ensure_global_drop_in_directories(root).map_err(|error| error.to_string())?;
+    Ok(bootstrapped)
 }
 
 #[derive(Debug, PartialEq, Eq)]

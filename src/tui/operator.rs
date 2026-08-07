@@ -109,32 +109,10 @@ impl Tui {
         let context = self.workflow_context();
         let global = crate::util::prism_config_dir();
         let local = self.repo.root.join(".prism");
-        let candidates = runtime.suspend_for(|| {
-            discover(&global, Some(&local))
-                .map_err(|error| error.to_string())
-                .map(|resources| {
-                    resources
-                        .into_iter()
-                        .filter(|resource| resource.kind == ResourceKind::Workflow)
-                        .filter_map(|resource| {
-                            let source = std::fs::read_to_string(resource.path).ok()?;
-                            let definition = WorkflowDefinition::parse(&source).ok()?;
-                            definition.launch.contains(&LaunchMode::Manual).then_some(
-                                LaunchCandidate {
-                                    definition,
-                                    scope: match resource.scope {
-                                        crate::resource::ResourceScope::Global => "global".into(),
-                                        crate::resource::ResourceScope::Repository => {
-                                            "repository".into()
-                                        }
-                                    },
-                                },
-                            )
-                        })
-                        .filter(|candidate| context_compatible(&candidate.definition, &context))
-                        .collect::<Vec<_>>()
-                })
-        })?;
+        // Rescan on every launcher opening. Workflow TOMLs are runtime resources, not an
+        // installed registry, so files added while the TUI is open are immediately available.
+        let candidates =
+            runtime.suspend_for(|| manual_workflow_candidates(&global, &local, &context))?;
         if candidates.is_empty() {
             return self.show_message("no manual workflow is compatible with the selected context");
         }
@@ -353,7 +331,7 @@ impl Tui {
         }
     }
 
-    fn workflow_context(&self) -> BTreeMap<String, ContextValue> {
+    pub(super) fn workflow_context(&self) -> BTreeMap<String, ContextValue> {
         let mut context = BTreeMap::from([(
             "repository".into(),
             ContextValue {
@@ -361,11 +339,11 @@ impl Tui {
                 value: serde_json::json!({"root": self.repo.root}),
             },
         )]);
-        if self.focused_panel == PanelFocus::Worktrees
-            && let Some(session) = self
-                .selected_worktree_index()
-                .and_then(|index| self.sessions.get(index))
-        {
+        let selected_worktree = (self.focused_panel == PanelFocus::Worktrees)
+            .then(|| self.selected_worktree_index())
+            .flatten()
+            .and_then(|index| self.sessions.get(index));
+        if let Some(session) = selected_worktree {
             context.insert(
                 "worktree".into(),
                 ContextValue {
@@ -374,7 +352,13 @@ impl Tui {
                 },
             );
         }
-        if let Some(change_request) = self.selected_repo_pr_identity() {
+        // The selected worktree's persisted association is available immediately at startup and
+        // is more specific than the repository-wide selection populated by an asynchronous poll.
+        let change_request = selected_worktree
+            .and_then(|session| session.pr.summary())
+            .and_then(|summary| summary.change_request_identity.as_ref())
+            .or_else(|| self.selected_repo_pr_identity());
+        if let Some(change_request) = change_request {
             context.insert(
                 "change_request".into(),
                 ContextValue {
@@ -489,9 +473,39 @@ fn management_arguments(prefix: &[&str], operation: &str, remainder: &str) -> Ve
         .collect()
 }
 
-struct ContextValue {
+pub(super) struct ContextValue {
     schema: String,
     value: serde_json::Value,
+}
+
+fn manual_workflow_candidates(
+    global_root: &std::path::Path,
+    repository_root: &std::path::Path,
+    context: &BTreeMap<String, ContextValue>,
+) -> Result<Vec<LaunchCandidate>, String> {
+    discover(global_root, Some(repository_root))
+        .map_err(|error| error.to_string())
+        .map(|resources| {
+            resources
+                .into_iter()
+                .filter(|resource| resource.kind == ResourceKind::Workflow)
+                .filter_map(|resource| {
+                    let source = std::fs::read_to_string(resource.path).ok()?;
+                    let definition = WorkflowDefinition::parse(&source).ok()?;
+                    definition
+                        .launch
+                        .contains(&LaunchMode::Manual)
+                        .then_some(LaunchCandidate {
+                            definition,
+                            scope: match resource.scope {
+                                crate::resource::ResourceScope::Global => "global".into(),
+                                crate::resource::ResourceScope::Repository => "repository".into(),
+                            },
+                        })
+                })
+                .filter(|candidate| context_compatible(&candidate.definition, context))
+                .collect()
+        })
 }
 
 fn context_compatible(
@@ -594,6 +608,54 @@ fn select_with_fzf(fzf: &str, candidates: &[LaunchCandidate]) -> Result<Option<S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launcher_rediscovers_loose_workflows_while_process_is_running() {
+        let root = std::env::temp_dir().join(format!(
+            "prism-hot-workflow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let global = root.join("global");
+        let repository = root.join("repository/.prism");
+        let context = BTreeMap::new();
+
+        assert!(
+            manual_workflow_candidates(&global, &repository, &context)
+                .unwrap()
+                .is_empty()
+        );
+
+        std::fs::create_dir_all(global.join("workflows")).unwrap();
+        let workflow = global.join("workflows/hot.toml");
+        std::fs::write(
+            &workflow,
+            "schema_version=2\nid='acme.test/hot'\nname='hot'\nlaunch=['manual']\n[[steps]]\nid='run'\nclass='action'\nuse='acme.test/run'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            manual_workflow_candidates(&global, &repository, &context).unwrap()[0]
+                .definition
+                .id,
+            "acme.test/hot"
+        );
+
+        std::fs::write(
+            &workflow,
+            "schema_version=2\nid='acme.test/hot'\nname='hot'\nlaunch=['trigger']\n[[steps]]\nid='run'\nclass='action'\nuse='acme.test/run'\n",
+        )
+        .unwrap();
+        assert!(
+            manual_workflow_candidates(&global, &repository, &context)
+                .unwrap()
+                .is_empty()
+        );
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn context_filter_requires_exact_schema_match() {

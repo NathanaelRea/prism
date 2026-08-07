@@ -432,26 +432,14 @@ fn take_u64(bytes: &mut &[u8]) -> Result<u64, InstallError> {
 
 pub fn bootstrap_standard_pack(global_root: &Path) -> Result<bool, InstallError> {
     if global_root.join("packages/prism.standard").exists() {
-        return Ok(false);
+        return promote_new_standard_workflows(global_root);
     }
     let executable = locate_standard_extension()?;
     bootstrap_standard_pack_with_extension(global_root, &executable)
 }
 
-fn bootstrap_standard_pack_with_extension(
-    global_root: &Path,
-    executable: &Path,
-) -> Result<bool, InstallError> {
-    let root = global_root.join("packages/prism.standard");
-    if root.exists() {
-        return Ok(false);
-    }
-    let candidate = global_root.join(format!(
-        "packages/.prism.standard-bootstrap-{}",
-        std::process::id()
-    ));
-    fs::create_dir_all(candidate.join("workflows"))?;
-    let workflows: BTreeMap<&str, &str> = [
+fn standard_workflows() -> BTreeMap<&'static str, &'static str> {
+    [
         ("plan", include_str!("../../assets/workflows/plan.toml")),
         (
             "implement",
@@ -472,7 +460,64 @@ fn bootstrap_standard_pack_with_extension(
         ),
     ]
     .into_iter()
-    .collect();
+    .collect()
+}
+
+/// Make workflows added by a newer Prism binary available to an older, user-owned Standard Pack
+/// without rewriting that package working copy. Each addition is promoted once into the ordinary
+/// global drop-in directory; later edits or deletion remain user-owned.
+fn promote_new_standard_workflows(global_root: &Path) -> Result<bool, InstallError> {
+    let manifest_path = global_root.join("packages/prism.standard/prism-package.toml");
+    let manifest = PackageManifest::parse(&fs::read_to_string(&manifest_path)?)?;
+    let packaged = manifest
+        .resources
+        .iter()
+        .map(|resource| resource.id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let discovered = crate::resource::discover(global_root, None)?
+        .into_iter()
+        .map(|resource| resource.identity.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    let marker_root = global_root.join("state/standard-workflow-promotions");
+    let workflow_root = global_root.join("workflows");
+    let mut changed = false;
+
+    for (name, source) in standard_workflows() {
+        let id = format!("prism.standard/{name}");
+        let marker = marker_root.join(name);
+        if packaged.contains(id.as_str()) || marker.exists() {
+            continue;
+        }
+        fs::create_dir_all(&marker_root)?;
+        if !discovered.contains(&id) {
+            fs::create_dir_all(&workflow_root)?;
+            fs::write(
+                workflow_root.join(format!("prism-standard-{name}.toml")),
+                format!(
+                    "# Standard workflow added by a Prism upgrade; this is an editable global drop-in.\nid = \"{id}\"\n{source}"
+                ),
+            )?;
+            changed = true;
+        }
+        fs::write(marker, format!("{id}\n"))?;
+    }
+    Ok(changed)
+}
+
+fn bootstrap_standard_pack_with_extension(
+    global_root: &Path,
+    executable: &Path,
+) -> Result<bool, InstallError> {
+    let root = global_root.join("packages/prism.standard");
+    if root.exists() {
+        return Ok(false);
+    }
+    let candidate = global_root.join(format!(
+        "packages/.prism.standard-bootstrap-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(candidate.join("workflows"))?;
+    let workflows = standard_workflows();
     let mut resources = String::new();
     for (name, source) in workflows {
         let editable = format!(
@@ -688,6 +733,43 @@ impl From<ResourceError> for InstallError {
 mod tests {
     use super::*;
     use crate::package::{SourceLimits, SourceResolver, WorkingCopy};
+    #[test]
+    fn newer_standard_workflows_are_promoted_once_for_an_older_pack() {
+        let root =
+            std::env::temp_dir().join(format!("prism-standard-promotion-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let package = root.join("packages/prism.standard");
+        fs::create_dir_all(package.join("workflows")).unwrap();
+        fs::write(
+            package.join("workflows/plan.toml"),
+            "id='prism.standard/plan'\n",
+        )
+        .unwrap();
+        fs::write(
+            package.join("prism-package.toml"),
+            "schema_version=1\nid='prism.standard'\nversion='old'\n[[resources]]\nid='prism.standard/plan'\nkind='workflow'\npath='workflows/plan.toml'\nsha256='0000000000000000000000000000000000000000000000000000000000000000'\n",
+        )
+        .unwrap();
+
+        assert!(promote_new_standard_workflows(&root).unwrap());
+        let stabilize = root.join("workflows/prism-standard-stabilize.toml");
+        assert!(stabilize.is_file());
+        assert!(
+            fs::read_to_string(&stabilize)
+                .unwrap()
+                .contains("id = \"prism.standard/stabilize\"")
+        );
+        assert!(!promote_new_standard_workflows(&root).unwrap());
+
+        fs::remove_file(&stabilize).unwrap();
+        assert!(!promote_new_standard_workflows(&root).unwrap());
+        assert!(
+            !stabilize.exists(),
+            "a user deletion must not be resurrected"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn standard_pack_is_editable_and_idempotent() {
         let root = std::env::temp_dir().join(format!("prism-bootstrap-{}", std::process::id()));
