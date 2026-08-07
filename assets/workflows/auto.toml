@@ -46,7 +46,7 @@ skippable = false
 id = "stabilize"
 class = "workflow_call"
 workflow = "prism.standard/stabilize-change-request"
-inputs = { candidate = "steps.change-request.outputs.candidate" }
+inputs = { candidate = "steps.change-request.outputs.candidate", worktree = "inputs.worktree" }
 skippable = false
 
 [steps.repeat]
@@ -106,6 +106,7 @@ skippable = false
 id = "revalidate"
 class = "action"
 use = "prism.standard/reobserve-change-request"
+depends_on = ["approve-exact-head"]
 inputs = { original = "steps.stabilize.outputs.candidate", successor = "steps.stabilize.outputs.candidate" }
 skippable = false
 
@@ -113,6 +114,7 @@ skippable = false
 id = "revalidate-gates"
 class = "gate"
 use = "prism.standard/revalidate-merge"
+depends_on = ["revalidate"]
 inputs = { observation = "steps.revalidate.outputs.observation" }
 skippable = false
 
@@ -120,6 +122,7 @@ skippable = false
 id = "squash-merge"
 class = "action"
 use = "prism.standard/squash-merge-exact-head"
+depends_on = ["revalidate-gates"]
 inputs = { candidate = "steps.stabilize.outputs.candidate", gates = "steps.revalidate-gates.outputs.result" }
 skippable = false
 
@@ -127,6 +130,7 @@ skippable = false
 id = "cleanup"
 class = "action"
 use = "prism.standard/delete-exact-worktree"
+depends_on = ["squash-merge"]
 inputs = { worktree = "inputs.worktree", merged = "steps.squash-merge.outputs.merged" }
 skippable = false
 

@@ -1780,6 +1780,24 @@ pub(crate) fn observe_workflow_change_request(
     let revision_source =
         format!("{subject_id}\n{expected_head}\n{operation}\n{summary:?}\n{details:?}\n{policy:?}");
     let revision = format!("sha256:{:x}", Sha256::digest(revision_source.as_bytes()));
+    let threads = details.as_ref().and_then(|details| match &details.review_threads {
+        Observation::Known(threads) => Some(threads.iter().filter(|thread| thread.resolvable).map(|thread| {
+            let comment = thread.comments.last();
+            let thread_revision = format!("sha256:{:x}", Sha256::digest(format!("{expected_head}\n{thread:?}").as_bytes()));
+            serde_json::json!({
+                "id": thread.native_id.to_string(),
+                "revision": thread_revision,
+                "resolved": thread.resolved,
+                "body": comment.map(|comment| comment.body.as_str()).unwrap_or_default(),
+                "author": comment.map(|comment| comment.author.as_str()),
+                "created_at": comment.and_then(|comment| comment.created_at.as_deref()),
+                "path": comment.and_then(|comment| comment.path.as_deref()),
+                "line": comment.and_then(|comment| comment.line),
+            })
+        }).collect::<Vec<_>>()),
+        Observation::EmptyKnown | Observation::AuthoritativelyAbsent => Some(Vec::new()),
+        _ => None,
+    });
     Ok(serde_json::json!({
         "quality": "current",
         "satisfied": satisfied,
@@ -1787,7 +1805,69 @@ pub(crate) fn observe_workflow_change_request(
         "subject": {"id": subject_id, "revision": expected_head},
         "revision": revision,
         "policy_revision": (operation == "policy").then_some(revision.clone()),
+        "threads": (operation == "review").then_some(threads).flatten(),
     }))
+}
+
+/// Resolve one exact review thread for an opaque workflow Change Request identity. The current
+/// head is reobserved immediately before mutation.
+pub(crate) fn resolve_workflow_review_thread(
+    path: &Path,
+    config: &Config,
+    subject_id: &str,
+    expected_head: &str,
+    thread_id: &str,
+) -> Result<(), String> {
+    let (adapter, discovered) = Adapter::resolve(path, config)?;
+    let (repository_key, native_id) = subject_id
+        .rsplit_once(":change_request:")
+        .ok_or_else(|| "opaque subject is not a Change Request identity".to_string())?;
+    let expected_repository_key = format!(
+        "{}:{}:{}",
+        discovered.repository.id.provider().config_label(),
+        discovered.repository.id.host(),
+        discovered.repository.id.project_path()
+    );
+    if repository_key != expected_repository_key {
+        return Err("opaque Change Request belongs to a different repository".into());
+    }
+    let native_id = super::NativeChangeRequestId::new(native_id.to_string())
+        .map_err(|error| error.to_string())?;
+    let summary = adapter
+        .list_change_requests(&discovered.repository.id, None)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|summary| summary.change_request.id.native_id() == &native_id)
+        .ok_or_else(|| "opaque Change Request is not open in the target repository".to_string())?;
+    if summary.change_request.head_sha != expected_head {
+        return Err("Change Request head changed before review-thread resolution".into());
+    }
+    let details = adapter
+        .change_request_details(&summary.change_request)
+        .map_err(|error| error.to_string())?;
+    let native_thread =
+        NativeReviewThreadId::new(thread_id.to_string()).map_err(|error| error.to_string())?;
+    let current = match details.review_threads {
+        Observation::Known(threads) => threads
+            .into_iter()
+            .find(|thread| thread.native_id == native_thread),
+        Observation::EmptyKnown | Observation::AuthoritativelyAbsent => None,
+        other => return known(other, "review threads").map(|_: Vec<super::ReviewThread>| ()),
+    }
+    .ok_or_else(|| "review thread is no longer present".to_string())?;
+    if current.resolved {
+        return Ok(());
+    }
+    if !current.resolvable {
+        return Err("review thread is not provider-resolvable".into());
+    }
+    adapter
+        .resolve_review_thread(&ResolveReviewThread {
+            id: summary.change_request.id,
+            thread_id: native_thread,
+            expected_head_sha: expected_head.to_string(),
+        })
+        .map_err(|error| error.to_string())
 }
 
 pub(crate) fn merge_workflow_change_request(

@@ -194,10 +194,12 @@ impl Extension for StandardExtension {
                 | "prism.standard/observe-merge-relation" => {
                     return semantic_observation(&context, &attempt.implementation_id, input).await;
                 }
-                "prism.standard/local-verification"
-                | "prism.standard/self-review"
-                | "prism.standard/verify-repair"
-                | "prism.standard/revalidate-merge" => return semantic_gate(input),
+                "prism.standard/local-verification" | "prism.standard/verify-repair" => {
+                    return semantic_verification(&context, input).await;
+                }
+                "prism.standard/self-review" | "prism.standard/revalidate-merge" => {
+                    return semantic_gate(input);
+                }
                 "prism.standard/commit-candidate"
                 | "prism.standard/commit-repair"
                 | "prism.standard/push-candidate"
@@ -581,11 +583,7 @@ async fn semantic_agent(
     let request = AgentRequest {
         harness: "default".into(),
         model: None,
-        prompt: format!(
-            "{}\n{}",
-            implementation.replace("prism.standard/", ""),
-            subject
-        ),
+        prompt: repair_prompt(implementation, &subject),
         working_scope,
         continuation: None,
         tool_policy: json!({"protected_effects":false}),
@@ -645,6 +643,59 @@ async fn semantic_observation(
         .await
         .map_err(|error| error.message)?;
     Ok(json!({"evidence":evidence}))
+}
+
+fn repair_prompt(implementation: &str, subject: &Value) -> String {
+    let task = implementation.replace("prism.standard/", "");
+    let output_contract = if implementation.ends_with("repair-review") {
+        "Finish with one JSON object containing summary (string) and addressed_thread_ids (an array containing only IDs you actually addressed)."
+    } else if implementation.ends_with("repair-ci") {
+        "Finish with one JSON object containing summary (string) and addressed_thread_ids (an empty array)."
+    } else {
+        "Finish with one JSON object containing summary (string)."
+    };
+    format!(
+        "{task}\nWork only on the supplied evidence. Do not commit, push, resolve provider threads, or perform any other protected effect. {output_contract}\n{subject}"
+    )
+}
+
+async fn semantic_verification(context: &ExecuteContext, input: Value) -> Result<Value, String> {
+    let candidate = input
+        .get("ci_candidate")
+        .filter(|candidate| !candidate.is_null())
+        .or_else(|| {
+            input
+                .get("review_candidate")
+                .filter(|candidate| !candidate.is_null())
+        })
+        .or_else(|| input.get("candidate"))
+        .ok_or_else(|| "local verification requires a repaired candidate".to_string())?;
+    let worktree = candidate
+        .get("worktree")
+        .ok_or_else(|| "local verification requires an exact Worktree Session".to_string())?;
+    let request = ProcessRequest {
+        executable: "/bin/sh".into(),
+        arguments: vec![
+            "-c".into(),
+            "git diff --check && if [ -x scripts/full-check.sh ]; then scripts/full-check.sh; elif [ -f Cargo.toml ]; then cargo test --all-targets; else git status --short; fi".into(),
+        ],
+        working_scope: serde_json::from_value(worktree.clone())
+            .map_err(|error| format!("invalid Worktree Session: {error}"))?,
+        environment: Default::default(),
+        timeout_ms: 3_600_000,
+        max_output_bytes: 1_048_576,
+    };
+    let process = context
+        .host_operation(HostOperation::RunProcess { request })
+        .await
+        .map_err(|error| error.message)?;
+    Ok(json!({"result":{
+        "status":"satisfied",
+        "quality":"current",
+        "subject":{"worktree":worktree,"head":candidate.get("head")},
+        "revision":format!("verification:{}", candidate.get("head").and_then(Value::as_str).unwrap_or("unknown")),
+        "process":process
+    }}))
 }
 
 fn semantic_gate(input: Value) -> Result<Value, String> {
@@ -763,7 +814,20 @@ async fn semantic_effect(
         }
         _ => unreachable!(),
     };
-    let successor = merge_objects(source, &result);
+    let mut successor = merge_objects(source, &result);
+    if effect_name == "push"
+        && let Some(head) = successor
+            .get("head")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        && let Some(object) = successor.as_object_mut()
+    {
+        for field in ["change_request", "subject"] {
+            if let Some(subject) = object.get_mut(field).and_then(Value::as_object_mut) {
+                subject.insert("revision".into(), Value::String(head.clone()));
+            }
+        }
+    }
     Ok(match effect_name {
         "create_change_request" => json!({"candidate":successor}),
         "squash_merge" => json!({"merged":successor}),
@@ -862,6 +926,56 @@ fn inferred_effect_request(
                 "parameters":{"expected_path":path,"branch":branch}
             }))
         }
+        "commit" | "push" => {
+            let worktree = source
+                .get("worktree")
+                .ok_or_else(|| format!("{effect_name} requires an exact Worktree Session"))?;
+            let repository = worktree
+                .get("repository")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Worktree Session has no Repository".to_string())?;
+            let id = worktree
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Worktree Session has no ID".to_string())?;
+            let revision = worktree
+                .get("revision")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Worktree Session has no revision".to_string())?;
+            let head = source
+                .get("head")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("{effect_name} candidate has no exact head"))?;
+            let branch = worktree
+                .get("branch")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Worktree Session has no branch".to_string())?;
+            let (expected_head, parameters) = if effect_name == "commit" {
+                (head, json!({"message":"Apply Prism workflow repair"}))
+            } else {
+                let expected_remote = source
+                    .get("previous_head")
+                    .or_else(|| source.get("remote_head"));
+                (
+                    head,
+                    json!({"branch":branch,"remote":"origin","expected_remote_head":expected_remote}),
+                )
+            };
+            Ok(json!({
+                "effect_id":format!("{effect_name}:{id}:{revision}:{expected_head}"),
+                "idempotency_key":format!("{effect_name}:{id}:{revision}:{expected_head}"),
+                "authority_scope":"git:write",
+                "preconditions":{
+                    "repository":{"id":repository,"revision":revision},
+                    "worktree_session":{"id":id,"revision":revision},
+                    "expected_head":expected_head,
+                    "target_repository":null,
+                    "policy_revision":null,
+                    "gate_revisions":{}
+                },
+                "parameters":parameters
+            }))
+        }
         _ => Err(format!(
             "candidate has no exact brokered {effect_name} intent"
         )),
@@ -900,15 +1014,18 @@ async fn resolve_addressed_threads(
     if current.get("quality").and_then(Value::as_str) != Some("current") {
         return Err("review threads must be current before resolution".into());
     }
-    let threads = addressed_threads(&current, &input["report"])?;
+    let threads = addressed_threads(&input["observation"], &current, &input["report"])?;
     if threads.is_empty() {
         return Ok(json!({"candidate":input["candidate"]}));
     }
-    let mut request = input["candidate"]
+    let mut request = match input["candidate"]
         .get("effects")
         .and_then(|effects| effects.get("resolve_review_threads"))
         .cloned()
-        .ok_or_else(|| "candidate has no exact brokered thread-resolution intent".to_string())?;
+    {
+        Some(request) => Ok(request),
+        None => inferred_thread_resolution(&input["candidate"]),
+    }?;
     request["parameters"]["threads"] = Value::Array(threads);
     let result = protected(context, request, |request| {
         HostOperation::ResolveReviewThreads { request }
@@ -917,13 +1034,59 @@ async fn resolve_addressed_threads(
     Ok(json!({"candidate":merge_objects(&input["candidate"], &result)}))
 }
 
-fn addressed_threads(observation: &Value, report: &Value) -> Result<Vec<Value>, String> {
+fn inferred_thread_resolution(candidate: &Value) -> Result<Value, String> {
+    let subject = candidate
+        .get("change_request")
+        .or_else(|| candidate.get("subject"))
+        .ok_or_else(|| "candidate has no Change Request identity".to_string())?;
+    let subject_id = subject
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "Change Request identity has no ID".to_string())?;
+    let repository = subject_id
+        .rsplit_once(":change_request:")
+        .map(|(repository, _)| repository)
+        .ok_or_else(|| "Change Request identity is not canonical".to_string())?;
+    let head = candidate
+        .get("head")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "candidate has no exact successor head".to_string())?;
+    Ok(json!({
+        "effect_id":format!("resolve-review-threads:{subject_id}:{head}"),
+        "idempotency_key":format!("resolve-review-threads:{subject_id}:{head}"),
+        "authority_scope":"provider:write",
+        "preconditions":{
+            "repository":{"id":repository,"revision":head},
+            "worktree_session":null,
+            "expected_head":head,
+            "target_repository":{"id":repository,"revision":head},
+            "policy_revision":null,
+            "gate_revisions":{}
+        },
+        "parameters":{"change_request":subject,"threads":[]}
+    }))
+}
+
+fn addressed_threads(
+    consumed: &Value,
+    observation: &Value,
+    report: &Value,
+) -> Result<Vec<Value>, String> {
     let addressed = report
         .get("addressed_thread_ids")
         .and_then(Value::as_array)
         .ok_or_else(|| "repair report has no addressed thread IDs".to_string())?;
-    let addressed: std::collections::BTreeSet<_> =
+    let mut addressed: std::collections::BTreeSet<_> =
         addressed.iter().filter_map(Value::as_str).collect();
+    let consumed_ids = consumed
+        .get("threads")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|thread| thread.get("resolved").and_then(Value::as_bool) == Some(false))
+        .filter_map(|thread| thread.get("id").and_then(Value::as_str))
+        .collect::<std::collections::BTreeSet<_>>();
+    addressed.retain(|id| consumed_ids.contains(id));
     let artifact = report
         .get("artifact_id")
         .and_then(Value::as_str)
@@ -1333,6 +1496,7 @@ fn semantic_implementations() -> Vec<ImplementationDescriptor> {
             &[
                 ("candidate", CHANGE_REQUEST),
                 ("evidence", PROVIDER_OBSERVATION),
+                ("worktree", WORKTREE),
             ],
             &[("candidate", CANDIDATE_CHANGE)],
             &["agent:run", "workspace:write"],
@@ -1344,6 +1508,7 @@ fn semantic_implementations() -> Vec<ImplementationDescriptor> {
             &[
                 ("candidate", CHANGE_REQUEST),
                 ("evidence", PROVIDER_OBSERVATION),
+                ("worktree", WORKTREE),
             ],
             &[("candidate", CANDIDATE_CHANGE), ("report", REPAIR_REPORT)],
             &["agent:run", "workspace:write"],
@@ -1847,14 +2012,21 @@ mod tests {
 
     #[test]
     fn thread_resolution_is_the_exact_addressed_still_unresolved_intersection() {
+        let consumed = json!({"threads":[
+            {"id":"T1","revision":"T1-r1","resolved":false},
+            {"id":"T2","revision":"T2-r1","resolved":false},
+            {"id":"T3","revision":"T3-r1","resolved":true}
+        ]});
+        let current = json!({"threads":[
+            {"id":"T1","revision":"T1-r1","resolved":false},
+            {"id":"T2","revision":"T2-r2","resolved":false},
+            {"id":"T3","revision":"T3-r1","resolved":true},
+            {"id":"T4","revision":"T4-r1","resolved":false}
+        ]});
         let threads = addressed_threads(
-            &json!({"threads":[
-                {"id":"T1","revision":"T1-r1","resolved":false},
-                {"id":"T2","revision":"T2-r2","resolved":false},
-                {"id":"T3","revision":"T3-r1","resolved":true},
-                {"id":"T4","revision":"T4-r1","resolved":false}
-            ]}),
-            &json!({"artifact_id":"repair-a7","addressed_thread_ids":["T2","T3","unknown"]}),
+            &consumed,
+            &current,
+            &json!({"artifact_id":"repair-a7","addressed_thread_ids":["T2","T3","T4","unknown"]}),
         )
         .unwrap();
         assert_eq!(

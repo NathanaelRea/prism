@@ -983,10 +983,14 @@ async fn scheduler_task(
                 for step in runnable {
                     let Some(registration) = registry.implementations.get(&step.implementation) else {
                         unsupported = unsupported.saturating_add(1);
+                        let reason = format!("pinned implementation '{}' is not registered; install or reload the package revision and retry the Run", step.implementation);
+                        coordinator.fail_unsupported(&step, &reason, now).await?;
                         continue;
                     };
                     if !registry.targets.contains_key(&step.target_id) {
                         unsupported = unsupported.saturating_add(1);
+                        let reason = format!("execution target '{}' required by pinned implementation '{}' is not registered", step.target_id, step.implementation);
+                        coordinator.fail_unsupported(&step, &reason, now).await?;
                         continue;
                     }
                     let class_capacity = match registration.class {

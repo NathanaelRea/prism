@@ -107,6 +107,36 @@ impl AsyncCoordinator {
         .map_err(DatabaseError::Query)
     }
 
+    /// Permanently fail a runnable Step which this Worker cannot execute. Unsupported pinned
+    /// bytes or targets are configuration errors, not transient capacity shortages.
+    pub(crate) async fn fail_unsupported(
+        &self,
+        step: &RunnableStep,
+        reason: &str,
+        now_unix_ms: i64,
+    ) -> Result<(), DatabaseError> {
+        let step_id = step.id.clone();
+        let run_id = step.run_id.clone();
+        let reason = reason.to_string();
+        self.database.write_immediate(|connection| Box::pin(async move {
+            let changed = sqlx::query("update workflow_step set status='failed', runtime_status='failed' where id=? and status='runnable'")
+                .bind(&step_id).execute(&mut *connection).await.map_err(DatabaseError::Query)?.rows_affected();
+            if changed == 0 { return Ok(()); }
+            append_run_event(
+                &mut *connection,
+                &run_id,
+                Some(&step_id),
+                "unsupported_runnable_step",
+                &serde_json::json!({"reason":reason}).to_string(),
+                now_unix_ms,
+            ).await?;
+            sqlx::query("update workflow_run set status='failed', runtime_status='failed', updated_unix_ms=?, completed_unix_ms=? where id=? and status in ('waiting','runnable','running')")
+                .bind(now_unix_ms).bind(now_unix_ms).bind(&run_id)
+                .execute(connection).await.map_err(DatabaseError::Query)?;
+            Ok(())
+        })).await
+    }
+
     /// Recompute the executable projection from durable dependency, binding, and condition
     /// state. Insertion order is deliberately absent from this transition.
     pub(crate) async fn refresh_readiness(&self, now_unix_ms: i64) -> Result<(), DatabaseError> {

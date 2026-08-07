@@ -100,7 +100,10 @@ fn worker_socket_owns_generalized_workflow_mutations_and_inspection() {
     assert_eq!(inspected["ok"], true);
     assert_eq!(inspected["run"]["id"], "run");
     assert_eq!(inspected["run"]["definition_name"], "socket-tracer");
-    assert_eq!(inspected["run"]["status"], "runnable");
+    assert!(matches!(
+        inspected["run"]["status"].as_str(),
+        Some("runnable" | "failed")
+    ));
     assert_eq!(inspected["run"]["steps"][0]["input_json"], "{}");
     assert_eq!(inspected["run"]["artifacts"], serde_json::json!([]));
     let listed = worker_request(
@@ -111,39 +114,28 @@ fn worker_socket_owns_generalized_workflow_mutations_and_inspection() {
     assert_eq!(listed["runs"].as_array().unwrap().len(), 1);
     assert_eq!(listed["runs"][0]["id"], "run");
 
-    assert_eq!(
-        worker_request(
+    // The production Worker must not leave an unsupported pinned implementation runnable.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let failed = worker_request(
             &runtime,
-            serde_json::json!({
-                "type": "workflow_request_approval",
-                "id": "approval",
-                "run_id": "run",
-                "step_id": "step",
-                "now_unix_ms": 3
-            }),
-        ),
-        serde_json::json!({"ok": true})
-    );
-    let waiting = worker_request(
-        &runtime,
-        serde_json::json!({"type": "workflow_inspect", "run_id": "run"}),
-    );
-    assert_eq!(waiting["run"]["status"], "waiting");
-    assert_eq!(waiting["run"]["approvals"][0]["status"], "pending");
-    assert_eq!(
-        worker_request(
-            &runtime,
-            serde_json::json!({
-                "type": "workflow_decide_approval",
-                "id": "approval",
-                "decision": "approve",
-                "decided_by": "user",
-                "note": null,
-                "now_unix_ms": 4
-            }),
-        ),
-        serde_json::json!({"ok": true})
-    );
+            serde_json::json!({"type": "workflow_inspect", "run_id": "run"}),
+        );
+        if failed["run"]["status"] == "failed" {
+            assert_eq!(failed["run"]["steps"][0]["status"], "failed");
+            assert!(failed["run"]["events"].as_array().is_some_and(|events| {
+                events
+                    .iter()
+                    .any(|event| event["kind"] == "unsupported_runnable_step")
+            }));
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "unsupported Step did not fail durably"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 
     assert!(
         run(&runtime, &home, &["worker", "shutdown"])

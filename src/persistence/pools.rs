@@ -247,6 +247,51 @@ impl WorkflowDatabase {
         .map_err(DatabaseError::Query)
     }
 
+    pub(crate) async fn claimed_host_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<(Option<String>, String, String, i64, i64)>, DatabaseError> {
+        sqlx::query_as("select run.repository, attempt.worker_id, attempt.target_id, attempt.fencing_token, attempt.lease_expires_unix_ms from step_attempt attempt join workflow_step step on step.id=attempt.step_id join workflow_run run on run.id=step.run_id where attempt.id=? and attempt.status='claimed'")
+            .bind(attempt_id)
+            .fetch_optional(&self.readers)
+            .await
+            .map_err(DatabaseError::Query)
+    }
+
+    pub(crate) async fn record_host_process(
+        &self,
+        attempt_id: &str,
+        worker_id: &str,
+        target_id: &str,
+        fencing_token: i64,
+        process: (u32, Option<i64>),
+        now_unix_ms: i64,
+    ) -> Result<bool, DatabaseError> {
+        let attempt_id = attempt_id.to_string();
+        let worker_id = worker_id.to_string();
+        let target_id = target_id.to_string();
+        self.write_immediate(|connection| Box::pin(async move {
+            let changed = sqlx::query("update step_attempt set process_id=?, process_start_time_ticks=? where id=? and status='claimed' and worker_id=? and target_id=? and fencing_token=? and lease_expires_unix_ms>?")
+                .bind(i64::from(process.0)).bind(process.1).bind(attempt_id)
+                .bind(worker_id).bind(target_id).bind(fencing_token).bind(now_unix_ms)
+                .execute(connection).await.map_err(DatabaseError::Query)?.rows_affected();
+            Ok(changed == 1)
+        })).await
+    }
+
+    pub(crate) async fn read_attempt_artifact(
+        &self,
+        attempt_id: &str,
+        artifact_id: &str,
+        revision: i64,
+        digest: &str,
+        schema: &str,
+    ) -> Result<Option<(String, i64, Option<Vec<u8>>, Option<String>)>, DatabaseError> {
+        sqlx::query_as("select artifact.digest, artifact.size_bytes, artifact.inline_body, artifact.file_path from artifact join workflow_run artifact_run on artifact_run.id=artifact.run_id join step_attempt attempt on attempt.id=? join workflow_step step on step.id=attempt.step_id where artifact.id=? and artifact.revision=? and artifact.digest=? and artifact_run.id=step.run_id and exists (select 1 from json_each(step.resolved_input_revisions_json) binding where json_extract(binding.value,'$.artifact_id')=artifact.id and json_extract(binding.value,'$.revision')=artifact.revision and json_extract(binding.value,'$.schema')=?)")
+            .bind(attempt_id).bind(artifact_id).bind(revision).bind(digest).bind(schema)
+            .fetch_optional(&self.readers).await.map_err(DatabaseError::Query)
+    }
+
     pub(crate) fn pool_utilization(&self) -> (u32, usize, u32, usize) {
         (
             self.writer.size(),
