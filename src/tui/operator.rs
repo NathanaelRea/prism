@@ -385,16 +385,15 @@ impl Tui {
         // is more specific than the repository-wide selection populated by an asynchronous poll.
         let change_request = selected_worktree
             .and_then(|session| session.pr.summary())
-            .and_then(|summary| summary.change_request_identity.as_ref())
-            .or_else(|| self.selected_repo_pr_identity());
-        if let Some(change_request) = change_request {
-            context.insert(
-                "change_request".into(),
-                ContextValue {
-                    schema: "prism.change-request/v1".into(),
-                    value: serde_json::json!({"provider": change_request.provider().to_string(), "host": change_request.canonical_host(), "project": change_request.project_path(), "native_id": change_request.native_id()}),
-                },
-            );
+            .filter(|summary| {
+                summary.change_request_identity.is_some() && !summary.head_sha.is_empty()
+            })
+            .cloned()
+            .or_else(|| self.selected_repo_pr_summary());
+        if let Some(change_request) = change_request.as_ref().and_then(|summary| {
+            change_request_context(summary.change_request_identity.as_ref()?, &summary.head_sha)
+        }) {
+            context.insert("change_request".into(), change_request);
         }
         context
     }
@@ -505,6 +504,29 @@ fn management_arguments(prefix: &[&str], operation: &str, remainder: &str) -> Ve
 pub(super) struct ContextValue {
     schema: String,
     value: serde_json::Value,
+}
+
+fn change_request_context(
+    identity: &crate::remote::CanonicalChangeRequestIdentity,
+    head_sha: &str,
+) -> Option<ContextValue> {
+    if head_sha.is_empty() {
+        return None;
+    }
+    let id = format!(
+        "{}:{}:{}:change_request:{}",
+        identity.provider().config_label(),
+        identity.canonical_host(),
+        identity.project_path(),
+        identity.native_id()
+    );
+    Some(ContextValue {
+        schema: "prism.change-request/v1".into(),
+        value: serde_json::json!({
+            "head": head_sha,
+            "change_request": {"id": id, "revision": head_sha}
+        }),
+    })
 }
 
 fn manual_workflow_candidates(
@@ -684,6 +706,27 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn change_request_context_matches_the_standard_workflow_input_shape() {
+        let identity = crate::remote::test_change_request_identity();
+        let context = change_request_context(&identity, "head-abc").unwrap();
+        assert_eq!(context.schema, "prism.change-request/v1");
+        crate::workflow::schema::validate_value(
+            &context.value,
+            &serde_json::json!({
+                "type":"object",
+                "anyOf":[{"required":["head"]},{"required":["change_request"]}]
+            }),
+        )
+        .unwrap();
+        assert_eq!(context.value["head"], "head-abc");
+        assert_eq!(
+            context.value["change_request"]["id"],
+            "github:github.com:example/repo:change_request:PR_test"
+        );
+        assert_eq!(context.value["change_request"]["revision"], "head-abc");
     }
 
     #[test]
