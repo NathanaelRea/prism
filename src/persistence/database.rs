@@ -511,7 +511,7 @@ mod tests {
         .unwrap()
         .len();
         assert_eq!(foreign_key_violations, 0);
-        drop(connection);
+        block_on(connection.close()).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -536,7 +536,7 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        drop(connection);
+        block_on(connection.close()).unwrap();
         let before = std::fs::read(&path).unwrap();
 
         let error = initialize(&path).unwrap_err();
@@ -571,13 +571,14 @@ mod tests {
             Ok(())
         })
         .unwrap();
-        drop(connection);
+        block_on(connection.close()).unwrap();
         let before = std::fs::read(&path).unwrap();
 
-        assert!(matches!(
-            initialize(&path),
-            Err(DatabaseError::UnknownHistoricalSchema { .. })
-        ));
+        let result = initialize(&path);
+        assert!(
+            matches!(result, Err(DatabaseError::UnknownHistoricalSchema { .. })),
+            "unexpected initialization result: {result:?}"
+        );
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert!(!path.with_extension("db.pre-sqlx-backup").exists());
         remove_database(&path);
@@ -624,7 +625,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(preserved, "yes");
-        drop(backup_connection);
+        block_on(backup_connection.close()).unwrap();
         let mut connection = open_readonly(&path).unwrap();
         let preserved_output: String = block_on(async {
             sqlx::query_scalar("select text from plan_output_line where run_id = 'v1-plan'")
@@ -640,7 +641,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(v2_tables, 4);
-        drop(connection);
+        block_on(connection.close()).unwrap();
         remove_database(&backup);
         remove_database(&path);
     }
@@ -693,7 +694,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(project_path_key, "owner/repo");
-        drop(connection);
+        block_on(connection.close()).unwrap();
         assert!(path.with_extension("db.pre-sqlx-backup").is_file());
         remove_database(&path.with_extension("db.pre-sqlx-backup"));
         remove_database(&path);
@@ -806,7 +807,7 @@ mod tests {
             user_version,
             super::super::adoption::SQLX_OWNED_USER_VERSION
         );
-        drop(connection);
+        block_on(connection.close()).unwrap();
         remove_database(&path.with_extension("db.pre-sqlx-backup"));
         remove_database(&path);
     }
@@ -881,7 +882,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(facts, (1, 1, 0));
-        drop(connection);
+        block_on(connection.close()).unwrap();
         assert!(path.with_extension("db.pre-sqlx-backup").is_file());
         remove_database(&path.with_extension("db.pre-sqlx-backup"));
         remove_database(&path);
