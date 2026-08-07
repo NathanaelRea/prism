@@ -662,10 +662,20 @@ fn semantic_gate(input: Value) -> Result<Value, String> {
                         && fact.get("satisfied").and_then(Value::as_bool) == Some(true)
                 })
             });
+        let gate_revisions = facts
+            .iter()
+            .filter_map(|(name, fact)| {
+                fact.get("revision")
+                    .and_then(Value::as_str)
+                    .map(|revision| (name.clone(), Value::String(revision.to_string())))
+            })
+            .collect::<serde_json::Map<_, _>>();
         return Ok(json!({"result":{
             "status":if satisfied { "satisfied" } else { "unsatisfied" },
             "subject":evidence.get("candidate"),
-            "evidence_revision":facts.values().filter_map(|fact| fact.get("revision")).collect::<Vec<_>>()
+            "evidence_revision":facts.values().filter_map(|fact| fact.get("revision")).collect::<Vec<_>>(),
+            "gate_revisions":gate_revisions,
+            "policy_revision":facts.get("policy").and_then(|fact| fact.get("policy_revision").or_else(|| fact.get("revision")))
         }}));
     }
     let evidence = evidence
@@ -697,7 +707,8 @@ async fn semantic_effect(
         .get("effects")
         .and_then(|effects| effects.get(effect_name))
         .cloned()
-        .ok_or_else(|| format!("candidate has no exact brokered {effect_name} intent"))?;
+        .map(Ok)
+        .unwrap_or_else(|| inferred_effect_request(effect_name, &input, source))?;
     if effect_name == "squash_merge" {
         if input["gates"].get("status").and_then(Value::as_str) != Some("satisfied") {
             return Err("exact-head Gates must be revalidated before squash merge".into());
@@ -715,7 +726,10 @@ async fn semantic_effect(
         ) {
             return Err("cleanup requires an authoritatively proven merge".into());
         }
-        if input["worktree"] != request["preconditions"]["worktree_session"] {
+        let requested_worktree = &request["preconditions"]["worktree_session"];
+        if input["worktree"].get("id") != requested_worktree.get("id")
+            || input["worktree"].get("revision") != requested_worktree.get("revision")
+        {
             return Err(
                 "cleanup intent belongs to a different Worktree Session incarnation".into(),
             );
@@ -758,6 +772,100 @@ async fn semantic_effect(
         }
         _ => json!({"candidate":successor}),
     })
+}
+
+fn inferred_effect_request(
+    effect_name: &str,
+    input: &Value,
+    source: &Value,
+) -> Result<Value, String> {
+    match effect_name {
+        "squash_merge" => {
+            let change_request = source
+                .get("change_request")
+                .or_else(|| source.get("subject"))
+                .ok_or_else(|| "candidate has no exact Change Request identity".to_string())?;
+            let subject_id = change_request
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Change Request identity has no ID".to_string())?;
+            let head = source
+                .get("head")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "candidate has no exact head".to_string())?;
+            let repository_id = subject_id
+                .rsplit_once(":change_request:")
+                .map(|(repository, _)| repository)
+                .ok_or_else(|| "Change Request identity is not canonical".to_string())?;
+            let gates = input
+                .get("gates")
+                .ok_or_else(|| "squash merge has no revalidated Gates".to_string())?;
+            let policy_revision = gates
+                .get("policy_revision")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "squash merge has no repository policy revision".to_string())?;
+            let gate_revisions = gates
+                .get("gate_revisions")
+                .cloned()
+                .ok_or_else(|| "squash merge has no exact Gate revisions".to_string())?;
+            Ok(json!({
+                "effect_id":format!("squash-merge:{subject_id}:{head}"),
+                "idempotency_key":format!("squash-merge:{subject_id}:{head}"),
+                "authority_scope":"provider:write",
+                "preconditions":{
+                    "repository":{"id":repository_id,"revision":head},
+                    "worktree_session":null,
+                    "expected_head":head,
+                    "target_repository":{"id":repository_id,"revision":policy_revision},
+                    "policy_revision":policy_revision,
+                    "gate_revisions":gate_revisions
+                },
+                "parameters":{"method":"squash","change_request":change_request}
+            }))
+        }
+        "delete_worktree" => {
+            let worktree = input
+                .get("worktree")
+                .ok_or_else(|| "cleanup requires an exact Worktree Session".to_string())?;
+            let repository = worktree
+                .get("repository")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Worktree Session has no Repository".to_string())?;
+            let revision = worktree
+                .get("revision")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Worktree Session has no revision".to_string())?;
+            let path = worktree
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Worktree Session has no path".to_string())?;
+            let branch = worktree
+                .get("branch")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Worktree Session has no branch".to_string())?;
+            let id = worktree
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Worktree Session has no ID".to_string())?;
+            Ok(json!({
+                "effect_id":format!("delete-worktree:{id}:{revision}"),
+                "idempotency_key":format!("delete-worktree:{id}:{revision}"),
+                "authority_scope":"worktrunk:write",
+                "preconditions":{
+                    "repository":{"id":repository,"revision":revision},
+                    "worktree_session":{"id":id,"revision":revision},
+                    "expected_head":null,
+                    "target_repository":null,
+                    "policy_revision":null,
+                    "gate_revisions":{}
+                },
+                "parameters":{"expected_path":path,"branch":branch}
+            }))
+        }
+        _ => Err(format!(
+            "candidate has no exact brokered {effect_name} intent"
+        )),
+    }
 }
 
 fn merge_objects(base: &Value, update: &Value) -> Value {
@@ -1755,6 +1863,46 @@ mod tests {
                 "id":"T2", "observed_revision":"T2-r2", "addressed_by_artifact":"repair-a7"
             })]
         );
+    }
+
+    #[test]
+    fn stabilization_infers_exact_brokered_merge_and_cleanup_intents() {
+        let candidate = json!({
+            "change_request":{"id":"github:github.com:acme/prism:change_request:PR_42","revision":"abc1234"},
+            "head":"abc1234"
+        });
+        let merge = inferred_effect_request(
+            "squash_merge",
+            &json!({"gates":{
+                "policy_revision":"policy-7",
+                "gate_revisions":{"ci":"ci-7","review":"review-7"}
+            }}),
+            &candidate,
+        )
+        .unwrap();
+        assert_eq!(merge["preconditions"]["expected_head"], "abc1234");
+        assert_eq!(merge["parameters"]["method"], "squash");
+        assert_eq!(merge["authority_scope"], "provider:write");
+
+        let worktree = json!({
+            "id":"/repo:/repo.fix",
+            "revision":"incarnation-7",
+            "repository":"/repo",
+            "path":"/repo.fix",
+            "branch":"fix/thing"
+        });
+        let cleanup = inferred_effect_request(
+            "delete_worktree",
+            &json!({"worktree":worktree}),
+            &json!({"status":"merged"}),
+        )
+        .unwrap();
+        assert_eq!(cleanup["parameters"]["expected_path"], "/repo.fix");
+        assert_eq!(
+            cleanup["preconditions"]["worktree_session"]["revision"],
+            "incarnation-7"
+        );
+        assert_eq!(cleanup["authority_scope"], "worktrunk:write");
     }
 
     #[test]

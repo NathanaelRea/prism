@@ -233,6 +233,20 @@ impl WorkflowDatabase {
         &self.readers
     }
 
+    pub(crate) async fn attempt_repository(
+        &self,
+        attempt_id: &str,
+    ) -> Result<Option<String>, DatabaseError> {
+        sqlx::query_scalar::<_, Option<String>>(
+            "select run.repository from step_attempt attempt join workflow_step step on step.id=attempt.step_id join workflow_run run on run.id=step.run_id where attempt.id=?",
+        )
+        .bind(attempt_id)
+        .fetch_optional(&self.readers)
+        .await
+        .map(|repository| repository.flatten())
+        .map_err(DatabaseError::Query)
+    }
+
     pub(crate) fn pool_utilization(&self) -> (u32, usize, u32, usize) {
         (
             self.writer.size(),

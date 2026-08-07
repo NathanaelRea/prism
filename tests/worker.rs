@@ -246,6 +246,84 @@ fn production_worker_executes_a_bundled_command_step() {
 }
 
 #[test]
+fn production_worker_executes_the_standard_extension() {
+    let _serial = serial_worker_test();
+    let temp = TempDir::new("worker-standard-extension");
+    let runtime = temp.runtime_path().to_path_buf();
+    let home = temp.path.join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    assert!(run(&runtime, &home, &["worker", "ensure"]).status.success());
+    assert_eq!(
+        worker_request(
+            &runtime,
+            serde_json::json!({
+                "type": "workflow_register_definition",
+                "definition": {
+                    "id": "standard-definition",
+                    "name": "standard",
+                    "revision": "1",
+                    "source": "test",
+                    "trusted": true,
+                    "body_json": "{}",
+                    "digest": "standard-digest",
+                    "now_unix_ms": 1
+                }
+            }),
+        ),
+        serde_json::json!({"ok": true})
+    );
+    assert_eq!(
+        worker_request(
+            &runtime,
+            serde_json::json!({
+                "type": "workflow_launch",
+                "run": {
+                    "run_id": "standard-run",
+                    "definition_snapshot_id": "standard-definition",
+                    "repository": null,
+                    "idempotency_key": "standard-run",
+                    "now_unix_ms": 2
+                },
+                "steps": [{
+                    "id": "standard-step",
+                    "key": "echo",
+                    "implementation": "prism.standard/echo",
+                    "target_id": "local",
+                    "input_json": "{}",
+                    "dependencies": [],
+                    "resources": []
+                }]
+            }),
+        ),
+        serde_json::json!({"ok": true, "run_id": "standard-run"})
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let response = worker_request(
+            &runtime,
+            serde_json::json!({"type": "workflow_inspect", "run_id": "standard-run"}),
+        );
+        if response["run"]["status"] == "succeeded" {
+            assert_eq!(response["run"]["attempts"][0]["status"], "succeeded");
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Standard Extension workflow did not finish: {response}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    assert!(
+        run(&runtime, &home, &["worker", "shutdown"])
+            .status
+            .success()
+    );
+}
+
+#[test]
 fn platform_smoke_native_worker_starts_once_reports_health_and_shuts_down() {
     let _serial = serial_worker_test();
     let temp = TempDir::new("worker-start");

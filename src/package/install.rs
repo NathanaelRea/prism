@@ -660,7 +660,7 @@ fn bootstrap_standard_pack_with_extension(
     }
 }
 
-fn locate_standard_extension() -> Result<PathBuf, InstallError> {
+pub(crate) fn locate_standard_extension() -> Result<PathBuf, InstallError> {
     let mut candidates = Vec::new();
     if let Some(path) = std::env::var_os("PRISM_STANDARD_EXTENSION") {
         candidates.push(PathBuf::from(path));

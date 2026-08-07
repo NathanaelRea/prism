@@ -4,5 +4,6 @@ pub mod engine;
 pub(crate) mod operations;
 pub mod runtime;
 pub(crate) mod schema;
+pub(crate) mod standard_host;
 pub mod trigger;
 pub(crate) mod worker;

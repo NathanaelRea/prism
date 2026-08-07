@@ -6,6 +6,7 @@ mod migration;
 mod source;
 mod working_copy;
 
+pub(crate) use install::locate_standard_extension;
 pub use install::{InstallError, InstallOutcome, PackageInstaller, bootstrap_standard_pack};
 pub use manifest::{
     Dependency, ExtensionArtifact, LockedPackage, PackageLock, PackageManifest, PackageResource,

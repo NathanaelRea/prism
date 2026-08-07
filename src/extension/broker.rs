@@ -45,6 +45,7 @@ pub trait EffectLedger: Send + Sync + 'static {
 pub trait ProtectedEffectBackend: Send + Sync + 'static {
     fn dispatch<'a>(
         &'a self,
+        attempt_id: &'a str,
         kind: ProtectedEffectKind,
         request: BrokeredEffectRequest,
     ) -> BrokerFuture<'a, Value>;
@@ -93,7 +94,7 @@ impl<L: EffectLedger, B: ProtectedEffectBackend> HostDispatcher for BrokeredHost
             // Returning from this call proves the dispatching transition is durable. No adapter
             // invocation may happen before it.
             self.ledger.mark_dispatching(&token).await?;
-            let result = self.backend.dispatch(kind, request).await;
+            let result = self.backend.dispatch(attempt_id, kind, request).await;
             let authoritative = self.ledger.record_result(&token, &result).await?;
             if !authoritative {
                 return Err(ProtocolError::new(
@@ -169,6 +170,7 @@ mod tests {
     impl ProtectedEffectBackend for FakeBackend {
         fn dispatch<'a>(
             &'a self,
+            _attempt_id: &'a str,
             _kind: ProtectedEffectKind,
             _request: BrokeredEffectRequest,
         ) -> BrokerFuture<'a, Value> {

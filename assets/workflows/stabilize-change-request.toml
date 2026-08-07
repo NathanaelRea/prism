@@ -9,6 +9,10 @@ capabilities = ["agent:run", "workspace:write", "process:run", "provider:read", 
 type = "prism.change-request/v1"
 required = true
 
+[inputs.worktree]
+type = "prism.worktree-session/v1"
+required = true
+
 [outputs.candidate]
 type = "prism.change-request/v1"
 from = "steps.summarize.outputs.candidate"
@@ -88,7 +92,7 @@ skippable = false
 id = "repair-ci"
 class = "action"
 use = "prism.standard/agent-repair-ci"
-inputs = { candidate = "inputs.candidate", evidence = "steps.observe-ci.outputs.evidence" }
+inputs = { candidate = "inputs.candidate", evidence = "steps.observe-ci.outputs.evidence", worktree = "inputs.worktree" }
 condition = "steps.choose-repair.outputs.repair_kind == 'ci'"
 on_unknown = "fail"
 resources = ["workspace"]
@@ -99,7 +103,7 @@ id = "repair-review"
 class = "action"
 use = "prism.standard/agent-repair-review"
 depends_on = ["choose-repair"]
-inputs = { candidate = "inputs.candidate", evidence = "steps.observe-review.outputs.evidence" }
+inputs = { candidate = "inputs.candidate", evidence = "steps.observe-review.outputs.evidence", worktree = "inputs.worktree" }
 condition = "steps.choose-repair.outputs.repair_kind == 'review'"
 on_unknown = "fail"
 resources = ["workspace"]

@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use sha2::{Digest as _, Sha256};
+
 use crate::config::Config;
 use crate::repo::Repository;
 
@@ -20,9 +22,9 @@ use super::gitlab::GitLabAdapter;
 use super::{
     CanonicalChangeRequestIdentity, Capabilities, ChangeRequest, ChangeRequestDetails,
     ChangeRequestId, ChangeRequestSummary, CheckState, CreateChangeRequest, DiscoveredRemote,
-    GuardedMerge, LifecycleState, MergeMethod, MergeMutationResult, MergeabilityState,
-    NativeReviewThreadId, Observation, ProviderItemObservation, ProviderKind, QueueState,
-    RemoteError, RemoteErrorClass, RemoteOperation, RemoteRepositoryId, RemoteUrlKind,
+    GuardedMerge, LifecycleState, MergeMethod, MergeMutationOutcome, MergeMutationResult,
+    MergeabilityState, NativeReviewThreadId, Observation, ProviderItemObservation, ProviderKind,
+    QueueState, RemoteError, RemoteErrorClass, RemoteOperation, RemoteRepositoryId, RemoteUrlKind,
     RepositoryPolicy, ResolveReviewThread, Retryability, ReviewDecision, ReviewSubmissionKind,
     SubmitReview, discover_git_remote,
 };
@@ -1690,6 +1692,226 @@ fn observe_exact_change_request(
         return Err("change request head changed during merge verification".to_string());
     }
     Ok(observed)
+}
+
+/// Resolve an opaque workflow Change Request reference through the repository's configured
+/// provider adapter and return one current, exact-head Gate observation. Extensions receive only
+/// the normalized value; provider credentials and adapter identities remain inside Prism.
+pub(crate) fn observe_workflow_change_request(
+    path: &Path,
+    config: &Config,
+    subject_id: &str,
+    expected_head: &str,
+    operation: &str,
+) -> Result<serde_json::Value, String> {
+    let (adapter, discovered) = Adapter::resolve(path, config)?;
+    let marker = ":change_request:";
+    let (repository_key, native_id) = subject_id
+        .rsplit_once(marker)
+        .ok_or_else(|| "opaque subject is not a Change Request identity".to_string())?;
+    let expected_repository_key = format!(
+        "{}:{}:{}",
+        discovered.repository.id.provider().config_label(),
+        discovered.repository.id.host(),
+        discovered.repository.id.project_path()
+    );
+    if repository_key != expected_repository_key {
+        return Err("opaque Change Request belongs to a different repository".into());
+    }
+    let native_id = super::NativeChangeRequestId::new(native_id.to_string())
+        .map_err(|error| error.to_string())?;
+    let summary = adapter
+        .list_change_requests(&discovered.repository.id, None)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|summary| summary.change_request.id.native_id() == &native_id)
+        .ok_or_else(|| "opaque Change Request is not open in the target repository".to_string())?;
+    if summary.change_request.head_sha != expected_head {
+        return Err("Change Request head changed before workflow observation".into());
+    }
+
+    let details = matches!(operation, "review" | "policy")
+        .then(|| adapter.change_request_details(&summary.change_request))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let policy = (operation == "policy")
+        .then(|| {
+            adapter.repository_policy(
+                &summary.change_request.target_repository,
+                &summary.change_request.target_branch,
+            )
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
+
+    let satisfied = match operation {
+        "ci" => matches!(
+            summary.check_state,
+            CheckState::Passed | CheckState::Skipped
+        ),
+        "review" => {
+            let no_rejection = !matches!(summary.review_decision, ReviewDecision::ChangesRequested);
+            let all_threads_resolved = details
+                .as_ref()
+                .map(|details| match &details.review_threads {
+                    Observation::Known(threads) => threads.iter().all(|thread| thread.resolved),
+                    Observation::EmptyKnown | Observation::AuthoritativelyAbsent => true,
+                    _ => false,
+                })
+                .unwrap_or(false);
+            no_rejection && all_threads_resolved
+        }
+        "policy" => {
+            let policy = policy
+                .as_ref()
+                .ok_or_else(|| "repository policy was not observed".to_string())?;
+            let details = details
+                .as_ref()
+                .ok_or_else(|| "Change Request details were not observed".to_string())?;
+            policy_satisfied(policy, details, &summary)
+        }
+        "mergeability" => matches!(summary.mergeability, MergeabilityState::Mergeable),
+        "merge_relation" => !matches!(
+            summary.mergeability,
+            MergeabilityState::Behind | MergeabilityState::Conflicting
+        ),
+        other => return Err(format!("unsupported provider observation '{other}'")),
+    };
+    let revision_source =
+        format!("{subject_id}\n{expected_head}\n{operation}\n{summary:?}\n{details:?}\n{policy:?}");
+    let revision = format!("sha256:{:x}", Sha256::digest(revision_source.as_bytes()));
+    Ok(serde_json::json!({
+        "quality": "current",
+        "satisfied": satisfied,
+        "head": expected_head,
+        "subject": {"id": subject_id, "revision": expected_head},
+        "revision": revision,
+        "policy_revision": (operation == "policy").then_some(revision.clone()),
+    }))
+}
+
+pub(crate) fn merge_workflow_change_request(
+    path: &Path,
+    config: &Config,
+    subject_id: &str,
+    expected_head: &str,
+) -> Result<serde_json::Value, String> {
+    let (adapter, discovered) = Adapter::resolve(path, config)?;
+    let marker = ":change_request:";
+    let (repository_key, native_id) = subject_id
+        .rsplit_once(marker)
+        .ok_or_else(|| "opaque subject is not a Change Request identity".to_string())?;
+    let expected_repository_key = format!(
+        "{}:{}:{}",
+        discovered.repository.id.provider().config_label(),
+        discovered.repository.id.host(),
+        discovered.repository.id.project_path()
+    );
+    if repository_key != expected_repository_key {
+        return Err("opaque Change Request belongs to a different repository".into());
+    }
+    let native_id = super::NativeChangeRequestId::new(native_id.to_string())
+        .map_err(|error| error.to_string())?;
+    let summary = adapter
+        .list_change_requests(&discovered.repository.id, None)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|summary| summary.change_request.id.native_id() == &native_id)
+        .ok_or_else(|| "opaque Change Request is not open in the target repository".to_string())?;
+    if summary.change_request.head_sha != expected_head {
+        return Err("Change Request identity or head changed before squash merge".into());
+    }
+    let request = GuardedMerge {
+        id: summary.change_request.id.clone(),
+        target_repository: summary.change_request.target_repository.clone(),
+        target_branch: summary.change_request.target_branch.clone(),
+        expected_source_sha: expected_head.to_string(),
+        method: MergeMethod::Squash,
+        native_guard: None,
+    };
+    request
+        .validate_observation(&summary)
+        .map_err(|error| error.to_string())?;
+    let result = adapter
+        .merge_change_request(&request)
+        .map_err(|error| error.to_string())?;
+    Ok(serde_json::json!({
+        "status": match result.outcome {
+            MergeMutationOutcome::Merged => "merged",
+            MergeMutationOutcome::Pending => "pending",
+            MergeMutationOutcome::Uncertain => "uncertain",
+        },
+        "head": expected_head,
+        "native_state": result.native_state,
+    }))
+}
+
+fn policy_satisfied(
+    policy: &RepositoryPolicy,
+    details: &ChangeRequestDetails,
+    summary: &ChangeRequestSummary,
+) -> bool {
+    let required_checks = match &policy.facts.required_checks {
+        Observation::Known(checks) => checks.as_slice(),
+        Observation::EmptyKnown | Observation::AuthoritativelyAbsent => &[],
+        _ => return false,
+    };
+    let observed_checks = match &details.checks {
+        Observation::Known(checks) => checks.as_slice(),
+        Observation::EmptyKnown | Observation::AuthoritativelyAbsent => &[],
+        _ => return false,
+    };
+    let checks_pass = required_checks.iter().all(|required| {
+        observed_checks.iter().any(|check| {
+            check.name == *required
+                && matches!(check.state, CheckState::Passed | CheckState::Skipped)
+        })
+    });
+    let required_approvals = match policy.facts.required_approvals {
+        Observation::Known(value) => value,
+        Observation::EmptyKnown | Observation::AuthoritativelyAbsent => 0,
+        _ => return false,
+    };
+    let approvals = match &details.reviews {
+        Observation::Known(reviews) => reviews
+            .iter()
+            .filter(|review| matches!(review.decision, ReviewDecision::Approved))
+            .map(|review| review.author.as_str())
+            .collect::<std::collections::BTreeSet<_>>()
+            .len() as u32,
+        Observation::EmptyKnown | Observation::AuthoritativelyAbsent => 0,
+        _ => return false,
+    };
+    let conversations_resolved = match policy.facts.conversations_must_be_resolved {
+        Observation::Known(true) => match &details.review_threads {
+            Observation::Known(threads) => threads.iter().all(|thread| thread.resolved),
+            Observation::EmptyKnown | Observation::AuthoritativelyAbsent => true,
+            _ => false,
+        },
+        Observation::Known(false)
+        | Observation::EmptyKnown
+        | Observation::AuthoritativelyAbsent => true,
+        _ => false,
+    };
+    let up_to_date = match policy.facts.source_must_be_up_to_date {
+        Observation::Known(true) => !matches!(summary.mergeability, MergeabilityState::Behind),
+        Observation::Known(false)
+        | Observation::EmptyKnown
+        | Observation::AuthoritativelyAbsent => true,
+        _ => false,
+    };
+    let queue_ready = match policy.facts.queue_required {
+        Observation::Known(true) => !matches!(summary.queue_state, QueueState::Blocked),
+        Observation::Known(false)
+        | Observation::EmptyKnown
+        | Observation::AuthoritativelyAbsent => true,
+        _ => false,
+    };
+    checks_pass
+        && approvals >= required_approvals
+        && conversations_resolved
+        && up_to_date
+        && queue_ready
 }
 
 pub(crate) fn observe_change_request_identity(

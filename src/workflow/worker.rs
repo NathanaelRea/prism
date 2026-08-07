@@ -541,6 +541,20 @@ pub fn serve() -> Result<(), String> {
         worker
             .register_builtins()
             .map_err(|error| format!("register workflow implementations: {error}"))?;
+        let standard_extension = crate::package::locate_standard_extension()
+            .map_err(|error| format!("locate Standard Extension: {error}"))?;
+        let standard_dispatcher = worker.standard_production_dispatcher();
+        // The Standard Extension may invoke provider CLIs that share credential/config files.
+        // Serialize one executable revision until those adapters provide a concurrency-safe
+        // transport; the generic Worker still schedules unrelated implementations concurrently.
+        let standard_limits = crate::extension::HostLimits {
+            max_concurrent_calls_per_revision: 1,
+            ..crate::extension::HostLimits::default()
+        };
+        worker
+            .register_extension(standard_extension, standard_dispatcher, standard_limits)
+            .await
+            .map_err(|error| format!("register Standard Extension: {error}"))?;
         let operations = worker.operations();
         let (shutdown, shutdown_receiver) = tokio::sync::watch::channel(false);
         let control_plane_failure = Arc::new(Mutex::new(None::<String>));

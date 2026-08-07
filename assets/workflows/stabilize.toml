@@ -19,7 +19,7 @@ from_context = true
 id = "stabilize"
 class = "workflow_call"
 workflow = "prism.standard/stabilize-change-request"
-inputs = { candidate = "inputs.candidate" }
+inputs = { candidate = "inputs.candidate", worktree = "inputs.worktree" }
 skippable = false
 
 [steps.repeat]

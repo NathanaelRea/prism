@@ -653,6 +653,20 @@ impl WorkflowWorker {
     /// Builds the production intent-first dispatcher for the Standard Extension. The supplied
     /// backend resolves opaque references and performs the provider/Git/Worktrunk operation;
     /// Prism owns durable intent, fencing, and result recording around it.
+    pub(crate) fn standard_production_dispatcher(
+        &self,
+    ) -> Arc<dyn crate::extension::HostDispatcher> {
+        let observational = crate::workflow::standard_host::dispatcher(self.database.clone());
+        self.standard_host_dispatcher(
+            Arc::new(
+                crate::workflow::standard_host::StandardProtectedEffects::new(
+                    self.database.clone(),
+                ),
+            ),
+            observational,
+        )
+    }
+
     pub fn standard_host_dispatcher<B: crate::extension::ProtectedEffectBackend>(
         &self,
         backend: Arc<B>,
