@@ -963,11 +963,17 @@ impl Tui {
                 Key::AbortOpencode => {
                     self.clear_leader_hint();
                     pending_g = false;
-                    if self.control_selected_workflow(runtime, "cancel")? {
-                    } else if self.focused_panel != PanelFocus::Worktrees {
-                        self.show_message("focus worktrees to abort an agent session")?;
-                    } else if let Err(error) = self.abort_selected_opencode_session(runtime) {
-                        self.show_error("abort failed", &error)?;
+                    match self.control_selected_workflow(runtime, "cancel") {
+                        Ok(true) => {}
+                        Ok(false) if self.focused_panel != PanelFocus::Worktrees => {
+                            self.show_message("focus worktrees to abort an agent session")?;
+                        }
+                        Ok(false) => {
+                            if let Err(error) = self.abort_selected_opencode_session(runtime) {
+                                self.show_error("abort failed", &error)?;
+                            }
+                        }
+                        Err(error) => self.show_error("Workflow control failed", &error)?,
                     }
                 }
                 Key::OpenRemotePrs => {

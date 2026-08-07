@@ -725,9 +725,40 @@ mod cutover_tests {
     }
 
     #[tokio::test]
-    async fn workflow_cutover_backs_up_then_deletes_import_journal() {
+    async fn workflow_cutover_backs_up_and_repairs_legacy_runtime_statuses() {
         let root = test_directory("workflow-cutover");
         let database = workflow_at_pre_cutover_baseline(&root).await;
+        let mut connection =
+            SqliteConnection::connect_with(&options(&database, false, false).unwrap())
+                .await
+                .unwrap();
+        sqlx::query("insert into definition_snapshot (id, definition_name, revision, source, trusted, body_json, digest, created_unix_ms) values ('legacy-definition', 'legacy', '1', 'test', 1, '{}', 'legacy-digest', 1)")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        for (status, completed) in [
+            ("cancelled", Some(2_i64)),
+            ("failed", Some(2)),
+            ("succeeded", Some(2)),
+            ("runnable", None),
+        ] {
+            let run_id = format!("legacy-{status}");
+            sqlx::query("insert into workflow_run (id, definition_snapshot_id, repository, status, created_unix_ms, updated_unix_ms, completed_unix_ms) values (?, 'legacy-definition', '/repo', ?, 1, 2, ?)")
+                .bind(&run_id)
+                .bind(status)
+                .bind(completed)
+                .execute(&mut connection)
+                .await
+                .unwrap();
+            sqlx::query("insert into workflow_step (id, run_id, step_key, implementation, target_id, status, available_unix_ms, input_json) values (?, ?, 'legacy-step', 'legacy', 'local', ?, 1, '{}')")
+                .bind(format!("{run_id}-step"))
+                .bind(&run_id)
+                .bind(if status == "runnable" { "runnable" } else { status })
+                .execute(&mut connection)
+                .await
+                .unwrap();
+        }
+        connection.close().await.unwrap();
 
         prepare_workflow_cutover_with_worker_socket(&database, &root.join("missing-worker.sock"))
             .await
@@ -749,8 +780,18 @@ mod cutover_tests {
         .fetch_one(&mut connection)
         .await
         .unwrap();
-        connection.close().await.unwrap();
         assert_eq!(count, 0);
+        let run_mismatches: i64 = sqlx::query_scalar("select count(*) from workflow_run where id like 'legacy-%' and runtime_status <> status")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        let step_mismatches: i64 = sqlx::query_scalar("select count(*) from workflow_step where id like 'legacy-%' and runtime_status <> status")
+            .fetch_one(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        assert_eq!(run_mismatches, 0);
+        assert_eq!(step_mismatches, 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 }
