@@ -499,7 +499,7 @@ fn doctor_reports_repository_and_tool_status() {
     assert!(stdout.contains("Prism doctor"));
     assert!(stdout.contains(&format!("repo: {}", canonical_display(&repo))));
     assert!(stdout.contains("selected harness: opencode"));
-    assert!(stdout.contains("checks: pre_pr=0 pre_push=0 review_fix=0"));
+    assert!(stdout.contains("workflow definitions:"));
 }
 
 #[test]

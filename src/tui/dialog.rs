@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -75,6 +75,28 @@ pub(super) fn selectable_choice_key(choices: &view::ChoiceList, key: &str) -> Op
         .iter()
         .find(|option| !option.disabled && option.key.eq_ignore_ascii_case(key))
         .map(|option| option.key.to_ascii_lowercase())
+}
+
+fn workflow_form_dialog(
+    form: &super::workflow_form::WorkflowInputForm,
+    error: Option<String>,
+) -> view::DialogModel {
+    view::DialogModel::Form {
+        title: "Workflow Inputs".into(),
+        fields: form
+            .fields()
+            .iter()
+            .map(|field| view::FormField {
+                section: field.section.clone(),
+                name: field.name.clone(),
+                value: field.value.clone(),
+                requirement: field.requirement.clone(),
+                kind: field.kind.clone(),
+            })
+            .collect(),
+        selected: form.selected(),
+        error,
+    }
 }
 
 pub(super) fn choice_list(title: &str, choices: &[(&str, &str)]) -> view::ChoiceList {
@@ -280,6 +302,70 @@ impl Tui {
             "Delete this session?",
             default,
         )
+    }
+
+    pub(crate) fn prompt_workflow_input_form(
+        &mut self,
+        runtime: &mut TerminalRuntime,
+        snapshot: &crate::workflow::definition::DefinitionSnapshot,
+        initial: BTreeMap<String, serde_json::Value>,
+    ) -> Result<Option<BTreeMap<String, serde_json::Value>>, String> {
+        let mut form = super::workflow_form::WorkflowInputForm::new(snapshot, initial)?;
+        if form.fields().is_empty() {
+            return form.submit().map(Some);
+        }
+        let mut error = None;
+        loop {
+            self.dialog = Some(workflow_form_dialog(&form, error.clone()));
+            self.draw(runtime)?;
+            if self.tick_tui_action_jobs().any() {
+                self.draw(runtime)?;
+            }
+            let Some(event) = runtime.poll_event(Duration::from_millis(100))? else {
+                continue;
+            };
+            let RuntimeEvent::Key(event) = event else {
+                self.draw(runtime)?;
+                continue;
+            };
+            if event.kind != KeyEventKind::Press {
+                continue;
+            }
+            match event.code {
+                KeyCode::Enter => match form.submit() {
+                    Ok(inputs) => {
+                        self.dialog = None;
+                        self.draw(runtime)?;
+                        return Ok(Some(inputs));
+                    }
+                    Err(message) => error = Some(message),
+                },
+                KeyCode::Tab | KeyCode::Down => {
+                    form.next();
+                    error = None;
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    form.previous();
+                    error = None;
+                }
+                KeyCode::Esc | KeyCode::Char('c')
+                    if event.code == KeyCode::Esc || ctrl_key(event) =>
+                {
+                    self.dialog = None;
+                    self.draw(runtime)?;
+                    return Ok(None);
+                }
+                KeyCode::Backspace => {
+                    form.pop();
+                    error = None;
+                }
+                KeyCode::Char(ch) if plain_key(event) && !ch.is_control() => {
+                    form.push(ch);
+                    error = None;
+                }
+                _ => {}
+            }
+        }
     }
 
     pub(crate) fn prompt_line_dialog(

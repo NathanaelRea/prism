@@ -1142,7 +1142,8 @@ fn typed_inputs(
             }
             let value = serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.into()));
             if let Some(schema) = schemas.get(&ports[name].schema) {
-                validate_typed_value(name, &value, schema)?;
+                crate::workflow::schema::validate_value(&value, schema)
+                    .map_err(|error| format!("workflow input '{name}': {error}"))?;
             }
             values.insert(name.into(), value);
             index += 2;
@@ -1162,56 +1163,6 @@ fn typed_inputs(
         ));
     }
     Ok(values)
-}
-
-fn validate_typed_value(name: &str, value: &Value, schema: &Value) -> Result<(), String> {
-    let valid_type = match schema.get("type").and_then(Value::as_str) {
-        Some("object") => value.is_object(),
-        Some("array") => value.is_array(),
-        Some("string") => value.is_string(),
-        Some("boolean") => value.is_boolean(),
-        Some("integer") => value.as_i64().is_some() || value.as_u64().is_some(),
-        Some("number") => value.is_number(),
-        Some("null") => value.is_null(),
-        Some(_) | None => true,
-    };
-    if !valid_type {
-        return Err(format!(
-            "workflow input '{name}' does not match schema type {}",
-            schema.get("type").and_then(Value::as_str).unwrap_or("any")
-        ));
-    }
-    if let Some(required) = schema.get("required").and_then(Value::as_array) {
-        let missing = required
-            .iter()
-            .filter_map(Value::as_str)
-            .filter(|field| value.get(*field).is_none())
-            .collect::<Vec<_>>();
-        if !missing.is_empty() {
-            return Err(format!(
-                "workflow input '{name}' is missing required fields: {}",
-                missing.join(", ")
-            ));
-        }
-    }
-    if let Some(alternatives) = schema.get("anyOf").and_then(Value::as_array)
-        && !alternatives.iter().any(|alternative| {
-            alternative
-                .get("required")
-                .and_then(Value::as_array)
-                .is_none_or(|required| {
-                    required
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .all(|field| value.get(field).is_some())
-                })
-        })
-    {
-        return Err(format!(
-            "workflow input '{name}' does not satisfy any required schema shape"
-        ));
-    }
-    Ok(())
 }
 
 fn edit(path: &Path) -> Result<(), String> {

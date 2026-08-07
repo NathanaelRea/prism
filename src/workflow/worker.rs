@@ -1510,7 +1510,7 @@ mod tests {
         let size = client.read(&mut acknowledgement).unwrap();
         assert_eq!(
             std::str::from_utf8(&acknowledgement[..size]).unwrap(),
-            "ok 1 subscribed\n"
+            format!("ok {PROTOCOL_VERSION} subscribed\n")
         );
 
         subscriber

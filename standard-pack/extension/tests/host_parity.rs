@@ -24,6 +24,10 @@ fn standard_workflow_sources() -> Vec<(String, String)> {
         ),
         ("auto", include_str!("../../../assets/workflows/auto.toml")),
         (
+            "stabilize",
+            include_str!("../../../assets/workflows/stabilize.toml"),
+        ),
+        (
             "stabilize-change-request",
             include_str!("../../../assets/workflows/stabilize-change-request.toml"),
         ),
@@ -76,7 +80,7 @@ async fn portable_shell_fixture_proves_language_neutral_protocol_conformance() {
 }
 
 #[tokio::test]
-async fn five_standard_workflows_compile_through_the_public_extension_contract() {
+async fn six_standard_workflows_compile_through_the_public_extension_contract() {
     let client = ExtensionClient::launch(
         env!("CARGO_BIN_EXE_prism-standard-extension"),
         Arc::new(NoHostOperations),
@@ -88,7 +92,20 @@ async fn five_standard_workflows_compile_through_the_public_extension_contract()
     registry.register(client.descriptor()).unwrap();
     let catalog =
         prism::DefinitionCatalog::from_sources(standard_workflow_sources(), registry).unwrap();
-    assert_eq!(catalog.list().len(), 5);
+    assert_eq!(catalog.list().len(), 6);
+    let stabilize = catalog.compile("prism.standard/stabilize").unwrap();
+    assert_eq!(
+        stabilize.definition.launch,
+        [prism::LaunchMode::Manual].into()
+    );
+    assert!(stabilize.definition.inputs["candidate"].from_context);
+    assert!(
+        stabilize
+            .definition
+            .steps
+            .iter()
+            .all(|step| step.id != "implement")
+    );
     let flagship = catalog.compile("prism.standard/auto").unwrap();
     let stabilization = flagship
         .definition

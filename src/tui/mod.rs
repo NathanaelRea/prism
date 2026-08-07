@@ -34,6 +34,7 @@ pub(crate) mod runtime;
 pub(crate) mod signal;
 pub(crate) mod state;
 mod workflow;
+mod workflow_form;
 
 #[cfg(test)]
 mod tests;

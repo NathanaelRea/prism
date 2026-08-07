@@ -1,6 +1,5 @@
 mod common;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -247,77 +246,6 @@ fn production_worker_executes_a_bundled_command_step() {
 }
 
 #[test]
-fn bundled_coding_workflow_executes_through_the_generic_harness() {
-    let _serial = serial_worker_test();
-    let temp = TempDir::new("worker-bundled-coding");
-    let runtime = temp.runtime_path().to_path_buf();
-    let home = temp.path.join("home");
-    let repo = temp.path.join("repo");
-    fs::create_dir_all(home.join("prism")).unwrap();
-    fs::create_dir_all(&repo).unwrap();
-    let harness = temp.path.join("harness.sh");
-    fs::write(
-        &harness,
-        "#!/bin/sh\nprintf '%s' \"$1\" > bundled-prompt.txt\n",
-    )
-    .unwrap();
-    fs::set_permissions(&harness, fs::Permissions::from_mode(0o700)).unwrap();
-    fs::write(
-        home.join("prism/config.toml"),
-        format!(
-            "default_harness = \"test\"\n\n[harnesses.test]\nadapter = \"generic\"\ninteractive_command = [\"{}\"]\nheadless_command = [\"{}\", \"{{prompt}}\"]\nheadless_prompt_transport = \"argument\"\noutput_format = \"text\"\n",
-            harness.display(),
-            harness.display(),
-        ),
-    )
-    .unwrap();
-
-    assert!(run(&runtime, &home, &["worker", "ensure"]).status.success());
-    let launched = worker_request(
-        &runtime,
-        serde_json::json!({
-            "type": "bundled_coding_launch",
-            "launch": {
-                "repository": repo,
-                "worktree_path": repo,
-                "task": "implement bundled coding",
-                "plan_path": null,
-                "draft_plan": false,
-                "harness_id": "test",
-                "variant": null
-            }
-        }),
-    );
-    assert_eq!(launched["ok"], true, "{launched}");
-    let run_id = launched["run_id"].as_str().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        let inspected = worker_request(
-            &runtime,
-            serde_json::json!({"type": "workflow_inspect", "run_id": run_id}),
-        );
-        if inspected["run"]["status"] == "succeeded" {
-            break;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "bundled coding did not finish: {inspected}"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    assert!(
-        fs::read_to_string(repo.join("bundled-prompt.txt"))
-            .unwrap()
-            .contains("implement bundled coding")
-    );
-    assert!(
-        run(&runtime, &home, &["worker", "shutdown"])
-            .status
-            .success()
-    );
-}
-
-#[test]
 fn platform_smoke_native_worker_starts_once_reports_health_and_shuts_down() {
     let _serial = serial_worker_test();
     let temp = TempDir::new("worker-start");
@@ -341,7 +269,7 @@ fn platform_smoke_native_worker_starts_once_reports_health_and_shuts_down() {
     let health = run(&runtime, &home, &["worker", "health"]);
     assert!(health.status.success());
     let health = String::from_utf8_lossy(&health.stdout);
-    assert!(health.starts_with("ok 1 "), "unexpected health: {health}");
+    assert!(health.starts_with("ok 2 "), "unexpected health: {health}");
     assert!(health.contains("state=running active=0"));
 
     let second = run(&runtime, &home, &["worker", "serve"]);

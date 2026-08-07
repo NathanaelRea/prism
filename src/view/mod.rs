@@ -104,6 +104,12 @@ pub(crate) enum DialogModel {
         prompt: String,
         input: String,
     },
+    Form {
+        title: String,
+        fields: Vec<FormField>,
+        selected: usize,
+        error: Option<String>,
+    },
     Choice {
         choices: ChoiceList,
     },
@@ -123,6 +129,15 @@ pub(crate) enum DialogModel {
 pub(crate) struct DialogLine {
     pub text: String,
     pub attention: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FormField {
+    pub section: String,
+    pub name: String,
+    pub value: String,
+    pub requirement: String,
+    pub kind: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

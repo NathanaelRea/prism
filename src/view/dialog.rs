@@ -54,6 +54,11 @@ pub(super) fn render_dialog(frame: &mut Frame<'_>, area: Rect, dialog: &crate::v
     frame.render_widget(paragraph, geometry.popup);
     if let crate::view::DialogModel::Prompt { prompt, input, .. } = dialog {
         set_prompt_cursor(frame, geometry.inner, prompt, input);
+    } else if let crate::view::DialogModel::Form {
+        fields, selected, ..
+    } = dialog
+    {
+        set_form_cursor(frame, geometry.inner, fields, *selected);
     } else if let crate::view::DialogModel::Confirm {
         prompt,
         input,
@@ -78,6 +83,13 @@ pub(super) fn dialog_geometry(area: Rect, dialog: &crate::view::DialogModel) -> 
         crate::view::DialogModel::Prompt { prompt, .. } => {
             prompt_dialog_content_width(prompt, title_width)
         }
+        crate::view::DialogModel::Form { .. } => raw_lines
+            .iter()
+            .map(|line| line.width() as u16)
+            .max()
+            .unwrap_or(0)
+            .max(64)
+            .max(title_width),
         crate::view::DialogModel::Help {
             items, info_lines, ..
         } => help_dialog_content_width(items, info_lines, title_width).max(
@@ -180,6 +192,7 @@ pub(super) fn dialog_title(dialog: &crate::view::DialogModel) -> String {
         crate::view::DialogModel::Confirm { title, .. }
         | crate::view::DialogModel::Notice { title, .. }
         | crate::view::DialogModel::Prompt { title, .. }
+        | crate::view::DialogModel::Form { title, .. }
         | crate::view::DialogModel::OrderedToggle { title, .. }
         | crate::view::DialogModel::Choice {
             choices: crate::view::ChoiceList { title, .. },
@@ -298,6 +311,12 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
             )));
             lines
         }
+        crate::view::DialogModel::Form {
+            fields,
+            selected,
+            error,
+            ..
+        } => form_lines(fields, *selected, error.as_deref()),
         crate::view::DialogModel::OrderedToggle {
             items,
             selected,
@@ -314,6 +333,94 @@ pub(super) fn dialog_lines(dialog: &crate::view::DialogModel) -> Vec<Line<'stati
             lines
         }
     }
+}
+
+fn set_form_cursor(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    fields: &[crate::view::FormField],
+    selected: usize,
+) {
+    let Some(field) = fields.get(selected) else {
+        return;
+    };
+    let mut line = 2usize;
+    let mut section = None;
+    for (index, candidate) in fields.iter().enumerate() {
+        if section != Some(candidate.section.as_str()) {
+            line += 1;
+            section = Some(candidate.section.as_str());
+        }
+        if index == selected {
+            let prefix = format!(
+                "▶ {} [{}] ({}): ",
+                candidate.name, candidate.requirement, candidate.kind
+            );
+            let input_width = area.width.saturating_sub(prefix.chars().count() as u16 + 1);
+            let cursor = candidate.value.chars().count().min(input_width as usize) as u16;
+            frame.set_cursor_position((
+                area.x
+                    + (prefix.chars().count() as u16)
+                        .saturating_add(cursor)
+                        .min(area.width.saturating_sub(1)),
+                area.y + (line as u16).min(area.height.saturating_sub(1)),
+            ));
+            return;
+        }
+        line += 1;
+    }
+    let _ = field;
+}
+
+pub(super) fn form_lines(
+    fields: &[crate::view::FormField],
+    selected: usize,
+    error: Option<&str>,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Complete the Workflow inputs",
+            title_style(true),
+        )),
+        Line::from(""),
+    ];
+    let mut section = None;
+    for (index, field) in fields.iter().enumerate() {
+        if section != Some(field.section.as_str()) {
+            lines.push(Line::from(Span::styled(
+                field.section.clone(),
+                selected_style(true),
+            )));
+            section = Some(field.section.as_str());
+        }
+        let focused = index == selected;
+        let prefix = format!(
+            "{} {} [{}] ({}): ",
+            if focused { "▶" } else { " " },
+            field.name,
+            field.requirement,
+            field.kind
+        );
+        lines.push(Line::from(vec![
+            Span::styled(prefix, title_style(focused)),
+            Span::raw(visible_prompt_input(
+                &field.value,
+                PROMPT_INPUT_DISPLAY_WIDTH,
+            )),
+        ]));
+    }
+    lines.push(Line::from(""));
+    if let Some(error) = error {
+        lines.push(Line::from(Span::styled(
+            format!("Error: {error}"),
+            attention_style(),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        "Tab/Shift-Tab move  Enter launch  Esc cancel",
+        muted_style(),
+    )));
+    lines
 }
 
 fn set_confirmation_cursor(

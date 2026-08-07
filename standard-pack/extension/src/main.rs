@@ -1447,8 +1447,30 @@ fn capabilities(id: &str) -> Vec<String> {
 
 fn artifact_schemas() -> Vec<ArtifactSchemaDescriptor> {
     [
-        (TASK, object_schema(&[], &["title", "body"])),
-        (PLAN_SOURCE, object_schema(&[], &["source", "steps"])),
+        (
+            TASK,
+            json!({
+                "type":"object",
+                "additionalProperties":true,
+                "properties":{
+                    "title":{"type":"string", "minLength":1},
+                    "body":{"type":"string", "minLength":1}
+                },
+                "anyOf":[{"required":["title"]},{"required":["body"]}]
+            }),
+        ),
+        (
+            PLAN_SOURCE,
+            json!({
+                "type":"object",
+                "additionalProperties":true,
+                "properties":{
+                    "source":{"type":"string", "minLength":1},
+                    "steps":{"type":"array", "minItems":1, "items":{"type":"object"}}
+                },
+                "anyOf":[{"required":["source"]},{"required":["steps"]}]
+            }),
+        ),
         (PLAN, object_schema(&["steps"], &[])),
         (WORKTREE, object_schema(&["id", "revision"], &[])),
         (
@@ -1534,7 +1556,15 @@ fn artifact_schemas() -> Vec<ArtifactSchemaDescriptor> {
         (REPAIR_REPORT, object_schema(&["addressed_thread_ids"], &[])),
         (REOBSERVATION, object_schema(&["candidate", "facts"], &[])),
         (MERGED_CHANGE, object_schema(&["status"], &[])),
-        (ISSUE_INTAKE, object_schema(&["issue"], &[])),
+        (
+            ISSUE_INTAKE,
+            json!({
+                "type":"object",
+                "additionalProperties":true,
+                "required":["issue"],
+                "properties":{"issue":{"type":"object"}}
+            }),
+        ),
         (
             ISSUE_CLASSIFICATION,
             object_schema(&["issue", "quarantined", "admission_required"], &[]),

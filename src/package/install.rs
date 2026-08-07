@@ -459,6 +459,10 @@ fn bootstrap_standard_pack_with_extension(
         ),
         ("auto", include_str!("../../assets/workflows/auto.toml")),
         (
+            "stabilize",
+            include_str!("../../assets/workflows/stabilize.toml"),
+        ),
+        (
             "stabilize-change-request",
             include_str!("../../assets/workflows/stabilize-change-request.toml"),
         ),

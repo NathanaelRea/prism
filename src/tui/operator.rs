@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use crate::resource::{ResourceKind, discover};
 use crate::tui_runtime::TerminalRuntime;
 use crate::view;
-use crate::workflow::definition::{LaunchMode, WorkflowDefinition};
+use crate::workflow::definition::{DefinitionSnapshot, LaunchMode, WorkflowDefinition};
 
 use super::{PanelFocus, Tui};
 
@@ -149,25 +149,13 @@ impl Tui {
             .find(|candidate| candidate.definition.id == id)
             .ok_or_else(|| "fzf returned an unknown workflow identity".to_string())?;
 
-        let mut inputs = context_inputs(&candidate.definition, &context);
-        for (name, port) in &candidate.definition.inputs {
-            if inputs.contains_key(name) || !port.required {
-                continue;
-            }
-            let Some(value) = self.prompt_line_dialog(
-                runtime,
-                "Workflow Input",
-                &format!("{name} ({} JSON): ", port.schema),
-                "",
-            )?
-            else {
-                return Ok(());
-            };
-            let parsed = serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value));
-            inputs.insert(name.clone(), parsed);
-        }
-
+        let inputs = context_inputs(&candidate.definition, &context);
         let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        let snapshot =
+            runtime.suspend_for(|| workflow_launch_snapshot(&executable, &self.repo.root, &id))?;
+        let Some(inputs) = self.prompt_workflow_input_form(runtime, &snapshot, inputs)? else {
+            return Ok(());
+        };
         let arguments = workflow_launch_arguments(&self.repo.root, &id, &inputs)?;
         let status = runtime.suspend_for(|| {
             Command::new(executable)
@@ -437,6 +425,36 @@ fn workflow_control_request(
         run_id: dashboard.run_id.clone(),
         step,
     })
+}
+
+fn workflow_launch_snapshot(
+    executable: &std::path::Path,
+    repository: &std::path::Path,
+    id: &str,
+) -> Result<DefinitionSnapshot, String> {
+    let output = Command::new(executable)
+        .arg("--repo")
+        .arg(repository)
+        .args(["workflow", "preview", id, "--json"])
+        .output()
+        .map_err(|error| format!("inspect Workflow inputs: {error}"))?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if message.is_empty() {
+            format!("Workflow preview exited with {}", output.status)
+        } else {
+            message
+        });
+    }
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .map_err(|error| format!("read Workflow preview: {error}"))?;
+    serde_json::from_value(
+        envelope
+            .get("data")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null),
+    )
+    .map_err(|error| format!("read Workflow input schemas: {error}"))
 }
 
 fn workflow_launch_arguments(

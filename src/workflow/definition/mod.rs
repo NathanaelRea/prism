@@ -2434,6 +2434,10 @@ mod tests {
             ),
             ("auto", include_str!("../../../assets/workflows/auto.toml")),
             (
+                "stabilize",
+                include_str!("../../../assets/workflows/stabilize.toml"),
+            ),
+            (
                 "stabilize-change-request",
                 include_str!("../../../assets/workflows/stabilize-change-request.toml"),
             ),
@@ -2449,7 +2453,7 @@ mod tests {
             )
         });
         let catalog = DefinitionCatalog::from_sources(sources, standard_registry).unwrap();
-        assert_eq!(catalog.list().len(), 5);
+        assert_eq!(catalog.list().len(), 6);
         assert!(
             catalog
                 .list()
@@ -2495,7 +2499,7 @@ mod tests {
             )]),
         )
         .unwrap();
-        assert_eq!(catalog.list().len(), 5);
+        assert_eq!(catalog.list().len(), 6);
         fs::remove_dir_all(root).unwrap();
     }
 
