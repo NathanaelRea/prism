@@ -448,6 +448,38 @@ pub fn list_workflows(
         .map_err(|error| format!("decode workflow list projection: {error}"))
 }
 
+pub fn inspect_workflows(run_ids: &[String]) -> Result<Vec<crate::WorkflowProjection>, String> {
+    if run_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    match workflow_request(serde_json::json!({
+        "type": "workflow_inspect_many",
+        "run_ids": run_ids,
+    })) {
+        Ok(response) => serde_json::from_value(response["runs"].clone())
+            .map_err(|error| format!("decode workflow inspection projections: {error}")),
+        // Protocol 2 workers from an earlier build already support singular inspection. Keep a
+        // rolling-upgrade fallback so a running worker need not be interrupted for this read path.
+        Err(_) => run_ids
+            .iter()
+            .filter_map(|run_id| match inspect_workflow(run_id) {
+                Ok(Some(run)) => Some(Ok(run)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect(),
+    }
+}
+
+fn inspect_workflow(run_id: &str) -> Result<Option<crate::WorkflowProjection>, String> {
+    let response = workflow_request(serde_json::json!({
+        "type": "workflow_inspect",
+        "run_id": run_id,
+    }))?;
+    serde_json::from_value(response["run"].clone())
+        .map_err(|error| format!("decode workflow inspection projection: {error}"))
+}
+
 pub fn command_workflow(run_id: &str, command: crate::WorkflowCommand) -> Result<(), String> {
     ensure_running()?;
     workflow_request(serde_json::json!({
@@ -732,6 +764,9 @@ enum WorkflowSocketRequest {
     WorkflowInspect {
         run_id: String,
     },
+    WorkflowInspectMany {
+        run_ids: Vec<String>,
+    },
     WorkflowCommand {
         run_id: String,
         command: SocketWorkflowCommand,
@@ -894,6 +929,15 @@ fn workflow_socket_response(operations: &crate::WorkflowOperations, request: &st
                 .inspect(&run_id)
                 .await
                 .map(|run| serde_json::json!({"ok": true, "run": run})),
+            WorkflowSocketRequest::WorkflowInspectMany { run_ids } => {
+                let mut runs = Vec::with_capacity(run_ids.len());
+                for run_id in run_ids {
+                    if let Some(run) = operations.inspect(&run_id).await? {
+                        runs.push(run);
+                    }
+                }
+                Ok(serde_json::json!({"ok": true, "runs": runs}))
+            }
             WorkflowSocketRequest::WorkflowCommand {
                 run_id,
                 command,

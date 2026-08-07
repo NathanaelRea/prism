@@ -40,6 +40,8 @@ pub(crate) struct NavigationSnapshot {
     selected_worktree_path: Option<PathBuf>,
     selected_comment: usize,
     worktree_list_mode: WorktreeListMode,
+    worktree_main_view: view::WorktreeMainView,
+    workflow_graph_expanded: bool,
 }
 
 fn worktree_sort_name(session: &Session) -> String {
@@ -80,6 +82,10 @@ fn point_in_rect(x: u16, y: u16, rect: Rect) -> bool {
 impl Tui {
     pub(super) fn move_down(&mut self) {
         if self.main_focused {
+            if self.move_workflow_step_selection(1) {
+                self.main_scroll = self.main_scroll.saturating_add(1);
+                return;
+            }
             if self.move_repo_pr_selection(1) {
                 return;
             }
@@ -96,6 +102,10 @@ impl Tui {
 
     pub(super) fn move_up(&mut self) {
         if self.main_focused {
+            if self.move_workflow_step_selection(-1) {
+                self.main_scroll = self.main_scroll.saturating_sub(1);
+                return;
+            }
             if self.move_repo_pr_selection(-1) {
                 return;
             }
@@ -174,6 +184,18 @@ impl Tui {
         self.main_focused = false;
         if self.worktree_list_mode == WorktreeListMode::Repo {
             self.restore_selected_worktree_for_repo();
+        }
+    }
+
+    pub(super) fn switch_worktree_main_view(&mut self, direction: isize) {
+        self.main_scroll = 0;
+        self.worktree_main_view = match (self.worktree_main_view, direction.signum()) {
+            (view::WorktreeMainView::Overview, 1) => view::WorktreeMainView::Workflow,
+            (view::WorktreeMainView::Workflow, -1) => view::WorktreeMainView::Overview,
+            (current, _) => current,
+        };
+        if self.worktree_main_view == view::WorktreeMainView::Workflow {
+            self.follow_current_workflow_step();
         }
     }
 
@@ -477,6 +499,10 @@ impl Tui {
         let path = session.path.clone();
         self.selected = index;
         self.selected_comment = 0;
+        self.selected_workflow_run = None;
+        self.selected_workflow_step = None;
+        self.workflow_step_selection_manual = false;
+        self.workflow_parent_stack.clear();
         if let Some(repo) = self.repos.get(repo_index) {
             let repo_root = repo.repo.root.clone();
             self.current_repo = repo_index;
@@ -502,11 +528,15 @@ impl Tui {
                 .map(|session| session.path.clone()),
             selected_comment: self.selected_comment,
             worktree_list_mode: self.worktree_list_mode,
+            worktree_main_view: self.worktree_main_view,
+            workflow_graph_expanded: self.workflow_graph_expanded,
         }
     }
 
     pub(crate) fn restore_navigation_snapshot(&mut self, snapshot: NavigationSnapshot) {
         self.worktree_list_mode = snapshot.worktree_list_mode;
+        self.worktree_main_view = snapshot.worktree_main_view;
+        self.workflow_graph_expanded = snapshot.workflow_graph_expanded;
         if let Some(root) = snapshot.current_repo_root.as_ref()
             && let Some(index) = self.repos.iter().position(|repo| repo.repo.root == *root)
         {

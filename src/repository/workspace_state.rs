@@ -714,6 +714,43 @@ impl WorkspaceState {
     }
 }
 
+fn select_ledger_run_summaries(
+    runs: Vec<crate::WorkflowProjection>,
+) -> Vec<crate::WorkflowProjection> {
+    let mut terminal = 0;
+    runs.into_iter()
+        .filter(|run| {
+            if run.completed_unix_ms.is_none() {
+                true
+            } else if terminal < RECENT_TERMINAL_WORKFLOWS {
+                terminal += 1;
+                true
+            } else {
+                false
+            }
+        })
+        .collect()
+}
+
+fn hydrate_ledger_workflows(
+    runs: Vec<crate::WorkflowProjection>,
+    inspect: impl FnOnce(&[String]) -> Result<Vec<crate::WorkflowProjection>, String>,
+) -> Result<Vec<crate::WorkflowProjection>, String> {
+    let selected = select_ledger_run_summaries(runs);
+    let ids = selected
+        .iter()
+        .map(|run| run.id.clone())
+        .collect::<Vec<_>>();
+    let mut details = inspect(&ids)?
+        .into_iter()
+        .map(|run| (run.id.clone(), run))
+        .collect::<BTreeMap<_, _>>();
+    Ok(selected
+        .into_iter()
+        .map(|summary| details.remove(&summary.id).unwrap_or(summary))
+        .collect())
+}
+
 fn list_ledger_workflows(sources: &[RepoSource]) -> Result<Vec<crate::WorkflowProjection>, String> {
     let repositories = sources
         .iter()
@@ -722,7 +759,11 @@ fn list_ledger_workflows(sources: &[RepoSource]) -> Result<Vec<crate::WorkflowPr
     let from_worker = repositories
         .iter()
         .try_fold(Vec::new(), |mut runs, repository| {
-            runs.extend(worker::list_workflows(Some(Path::new(repository)), 256)?);
+            let summaries = worker::list_workflows(Some(Path::new(repository)), 256)?;
+            runs.extend(hydrate_ledger_workflows(
+                summaries,
+                worker::inspect_workflows,
+            )?);
             Ok::<_, String>(runs)
         });
     match from_worker {
@@ -732,7 +773,13 @@ fn list_ledger_workflows(sources: &[RepoSource]) -> Result<Vec<crate::WorkflowPr
             let operations = crate::WorkflowOperations::open_default().await?;
             let mut runs = Vec::new();
             for repository in repositories {
-                runs.extend(operations.list(Some(&repository), 256).await?);
+                let summaries =
+                    select_ledger_run_summaries(operations.list(Some(&repository), 256).await?);
+                for id in summaries.into_iter().map(|run| run.id) {
+                    if let Some(run) = operations.inspect(&id).await? {
+                        runs.push(run);
+                    }
+                }
             }
             Ok::<_, crate::WorkflowOperationError>(runs)
         })
@@ -1081,11 +1128,8 @@ fn load_ledger_workflows(
                 .steps
                 .iter()
                 .find_map(|step| {
-                    serde_json::from_str::<serde_json::Value>(&step.input_json)
-                        .ok()?
-                        .get("cwd")?
-                        .as_str()
-                        .map(PathBuf::from)
+                    let input = serde_json::from_str::<serde_json::Value>(&step.input_json).ok()?;
+                    workflow_worktree_path(&input)
                 })
                 .unwrap_or_else(|| repo_root.to_path_buf());
             let worker_id = run
@@ -1137,6 +1181,23 @@ fn load_ledger_workflows(
             })
         })
         .collect()
+}
+
+fn workflow_worktree_path(input: &serde_json::Value) -> Option<PathBuf> {
+    input
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            input
+                .pointer("/worktree/path")
+                .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            input
+                .pointer("/candidate/worktree/path")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(PathBuf::from)
 }
 
 fn ledger_lifecycle(status: &str) -> Result<WorkflowLifecycle, String> {
@@ -1359,4 +1420,71 @@ fn paths_equal(left: &Path, right: &Path) -> bool {
 }
 fn path_contains(root: &Path, selected: &Path) -> bool {
     selected.is_absolute() && absolute_path(selected).starts_with(absolute_path(root))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hydrate_ledger_workflows, load_ledger_workflows, workflow_worktree_path};
+
+    fn workflow_projection(id: &str, steps: serde_json::Value) -> crate::WorkflowProjection {
+        serde_json::from_value(serde_json::json!({
+            "id": id,
+            "definition_name": "stabilize",
+            "status": "waiting",
+            "repository": "/repo",
+            "created_unix_ms": 1,
+            "updated_unix_ms": 2,
+            "completed_unix_ms": null,
+            "steps": steps,
+            "attempts": [],
+            "artifacts": [],
+            "approvals": [],
+            "effects": [],
+            "gates": [],
+            "events": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn list_summaries_are_hydrated_before_worktree_association() {
+        let summary = workflow_projection("run-1", serde_json::json!([]));
+        let detail = workflow_projection(
+            "run-1",
+            serde_json::json!([{
+                "id": "cleanup-id",
+                "key": "cleanup",
+                "implementation": "prism.standard/cleanup",
+                "target_id": "local",
+                "status": "waiting",
+                "input_json": "{\"worktree\":{\"path\":\"/repo/feature\"}}"
+            }]),
+        );
+
+        let hydrated = hydrate_ledger_workflows(vec![summary], |ids| {
+            assert_eq!(ids, ["run-1"]);
+            Ok(vec![detail])
+        })
+        .unwrap();
+        let workflows = load_ledger_workflows(&hydrated, std::path::Path::new("/repo")).unwrap();
+
+        assert_eq!(
+            workflows[0].worktree.path,
+            std::path::Path::new("/repo/feature")
+        );
+    }
+
+    #[test]
+    fn workflow_worktree_path_reads_resolved_standard_workflow_inputs() {
+        for input in [
+            serde_json::json!({"worktree":{"path":"/repo/feature"}}),
+            serde_json::json!({"candidate":{"worktree":{"path":"/repo/feature"}}}),
+            serde_json::json!({"cwd":"/repo/feature"}),
+        ] {
+            assert_eq!(
+                workflow_worktree_path(&input).unwrap(),
+                std::path::PathBuf::from("/repo/feature")
+            );
+        }
+    }
 }

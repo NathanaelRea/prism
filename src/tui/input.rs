@@ -43,6 +43,7 @@ impl KeyInput {
             KeyCode::Tab => Key::FocusNext,
             KeyCode::BackTab => Key::FocusPrevious,
             KeyCode::Enter => Key::OpenTmuxSession,
+            KeyCode::Backspace => Key::WorkflowParent,
             KeyCode::Up => Key::Up,
             KeyCode::Down => Key::Down,
             KeyCode::Left => Key::Left,
@@ -68,6 +69,7 @@ impl KeyInput {
             KeyCode::Char('3') if plain_char(event) => Key::FocusWorktrees,
             KeyCode::Char('4'..='9') if plain_char(event) => Key::Other,
             KeyCode::Char('p') if plain_char(event) => Key::PullDefault,
+            KeyCode::Char('v') if plain_char(event) => Key::WorkflowGraph,
             KeyCode::Char('W') if plain_char(event) => Key::WorkflowLauncher,
             KeyCode::Char('u') if plain_char(event) => Key::WorkflowPauseResume,
             KeyCode::Char('f') if plain_char(event) => Key::WorkflowRetry,
@@ -175,6 +177,8 @@ pub enum Key {
     Leader,
     LeaderGit,
     OpenTmuxSession,
+    WorkflowGraph,
+    WorkflowParent,
     WorkflowLauncher,
     WorkflowManagement,
     WorkflowPauseResume,
@@ -307,6 +311,18 @@ mod tests {
         assert_eq!(map(&mut input, key(KeyCode::Char(' '))), Key::Leader);
         assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LeaderGit);
         assert_eq!(map(&mut input, key(KeyCode::Char('g'))), Key::LazyGit);
+    }
+
+    #[test]
+    fn key_input_maps_workflow_view_navigation() {
+        let mut input = KeyInput::default();
+        assert_eq!(map(&mut input, key(KeyCode::Char('v'))), Key::WorkflowGraph);
+        assert_eq!(
+            map(&mut input, key(KeyCode::Backspace)),
+            Key::WorkflowParent
+        );
+        assert_eq!(map(&mut input, key(KeyCode::Char('{'))), Key::PreviousBlock);
+        assert_eq!(map(&mut input, key(KeyCode::Char('}'))), Key::NextBlock);
     }
 
     #[test]

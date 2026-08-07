@@ -10,7 +10,7 @@ use crate::{
     session::Session,
     view::{
         ChoiceList, DialogLine, DialogModel, FrameModel, KeyChoice, RepoMainView, RepoPrRow,
-        RepoRow, StatusRow, WorktreeKind, WorktreeRow,
+        RepoRow, StatusRow, WorktreeKind, WorktreeMainView, WorktreeRow,
     },
 };
 
@@ -1194,6 +1194,132 @@ fn worktree_main_panel_renders_opencode_workflow_states() {
 }
 
 #[test]
+fn workflow_main_view_renders_resolved_steps_and_selected_step_details() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Running)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.main_focused = true;
+    model.worktree_main_view = WorktreeMainView::Workflow;
+    model.workflow_dashboard = Some(test_workflow_dashboard());
+
+    let rendered = render_to_buffer(&model, 120, 30);
+    let buffer = buffer_to_string(&rendered);
+
+    assert!(buffer.contains("overview | workflow"));
+    assert!(!buffer.contains("[/]"));
+    let title_row = find_line(&rendered, "overview | workflow");
+    let title = line_text(&rendered, title_row);
+    let overview_offset = title.find("overview").unwrap();
+    let workflow_offset = title.find("workflow").unwrap();
+    let overview_x = title[..overview_offset].chars().count() as u16;
+    let workflow_x = title[..workflow_offset].chars().count() as u16;
+    assert_eq!(
+        rendered[(overview_x, title_row)].style().fg,
+        Some(Color::Gray)
+    );
+    assert_eq!(
+        rendered[(workflow_x, title_row)].style().fg,
+        Some(Color::Rgb(0, 255, 255))
+    );
+    assert!(buffer.contains("Run 1 of 1"));
+    assert!(buffer.contains("plan  [succeeded] action — complete"));
+    assert!(buffer.contains("implement  [claimed] action — active"));
+    assert!(buffer.contains("Step · implement"));
+    assert!(buffer.contains("depends on plan"));
+    assert!(buffer.contains("inputs task"));
+    assert!(!buffer.contains("secret task body"));
+}
+
+#[test]
+fn workflow_graph_view_renders_dependency_connectors_and_names() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Running)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.worktree_main_view = WorktreeMainView::Workflow;
+    model.workflow_graph_expanded = true;
+    model.workflow_dashboard = Some(test_workflow_dashboard());
+
+    let buffer = render_to_string(&model, 120, 30);
+
+    assert!(buffer.contains("Dependency graph"));
+    assert!(buffer.contains("● ✓ plan"));
+    assert!(buffer.contains("├─→ implement"));
+    assert!(buffer.contains("← plan"));
+}
+
+#[test]
+fn workflow_main_view_explains_how_to_launch_when_there_are_no_runs() {
+    let config = test_config();
+    let sessions = vec![test_session("feature", AgentState::Idle)];
+    let mut model = test_model(&config, &sessions, PanelFocus::Worktrees, None, None);
+    model.worktree_main_view = WorktreeMainView::Workflow;
+
+    let buffer = render_to_string(&model, 120, 20);
+
+    assert!(buffer.contains("No Workflow Runs"));
+    assert!(buffer.contains("W launches a compatible Workflow Definition"));
+}
+
+fn test_workflow_dashboard() -> crate::view::WorkflowDashboard {
+    let run = serde_json::from_value(serde_json::json!({
+        "id": "run-1",
+        "definition_name": "prism.standard/auto",
+        "status": "running",
+        "repository": "/repo",
+        "created_unix_ms": 1000,
+        "updated_unix_ms": 3000,
+        "completed_unix_ms": null,
+        "steps": [
+            {
+                "id": "plan-id",
+                "key": "plan",
+                "implementation": "prism.standard/plan",
+                "target_id": "local",
+                "status": "succeeded",
+                "input_json": "{}",
+                "class": "action",
+                "dependencies": []
+            },
+            {
+                "id": "implement-id",
+                "key": "implement",
+                "implementation": "prism.standard/implement",
+                "target_id": "worktree",
+                "status": "claimed",
+                "input_json": "{\"task\":\"secret task body\"}",
+                "class": "action",
+                "dependencies": ["plan-id"]
+            }
+        ],
+        "attempts": [],
+        "artifacts": [],
+        "approvals": [],
+        "effects": [],
+        "gates": [],
+        "events": []
+    }))
+    .unwrap();
+    crate::view::WorkflowDashboard {
+        run_id: "run-1".into(),
+        status: "running".into(),
+        current_step: Some("implement".into()),
+        selected_step: Some("implement".into()),
+        completed_steps: 1,
+        total_steps: 2,
+        run_position: 1,
+        run_count: 1,
+        parent_run_id: None,
+        children: Vec::new(),
+        detail: Some(run),
+        can_pause: true,
+        can_resume: false,
+        can_cancel: true,
+        can_retry: false,
+        current_step_skippable: false,
+    }
+}
+
+#[test]
 fn worktree_main_panel_renders_pr_comments_table() {
     let config = test_config();
     let mut session = test_session("feature", AgentState::Idle);
@@ -1520,6 +1646,8 @@ fn test_model<'a>(
         main_focused: false,
         main_scroll: 0,
         repo_main_view: RepoMainView::ChangeRequests,
+        worktree_main_view: WorktreeMainView::Overview,
+        workflow_graph_expanded: false,
         worktree_list_mode: WorktreeListMode::Repo,
         mode_label: "normal",
         status_message,

@@ -36,6 +36,8 @@ pub(crate) struct FrameModel<'a> {
     pub main_focused: bool,
     pub main_scroll: usize,
     pub repo_main_view: RepoMainView,
+    pub worktree_main_view: WorktreeMainView,
+    pub workflow_graph_expanded: bool,
     pub worktree_list_mode: WorktreeListMode,
     pub mode_label: &'a str,
     pub status_message: Option<&'a str>,
@@ -52,8 +54,11 @@ pub(crate) struct WorkflowDashboard {
     pub run_id: String,
     pub status: String,
     pub current_step: Option<String>,
+    pub selected_step: Option<String>,
     pub completed_steps: usize,
     pub total_steps: usize,
+    pub run_position: usize,
+    pub run_count: usize,
     pub parent_run_id: Option<String>,
     pub children: Vec<String>,
     pub detail: Option<crate::WorkflowProjection>,
@@ -300,6 +305,21 @@ impl RepoMainView {
         match self {
             Self::ChangeRequests => "requests",
             Self::Kanban => "kanban",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorktreeMainView {
+    Overview,
+    Workflow,
+}
+
+impl WorktreeMainView {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Workflow => "workflow",
         }
     }
 }

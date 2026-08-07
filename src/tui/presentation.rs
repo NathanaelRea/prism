@@ -182,6 +182,8 @@ impl Tui {
             main_focused: self.main_focused,
             main_scroll: self.main_scroll,
             repo_main_view: self.repo_main_view,
+            worktree_main_view: self.worktree_main_view,
+            workflow_graph_expanded: self.workflow_graph_expanded,
             worktree_list_mode: self.worktree_list_mode,
             mode_label: "normal",
             status_message: self.status_message.as_deref(),
@@ -199,26 +201,39 @@ impl Tui {
             .selected_worktree_index()
             .and_then(|index| self.sessions.get(index))
             .map(|session| &session.path);
-        let candidates = self
+        let all_runs = self
             .workspace_repositories
             .values()
             .flat_map(|repository| &repository.workflows)
+            .collect::<Vec<_>>();
+        let mut candidates = all_runs
+            .iter()
+            .copied()
             .filter(|workflow| selected_path.is_none_or(|path| &workflow.worktree.path == path))
             .collect::<Vec<_>>();
+        candidates.sort_by_key(|workflow| (workflow.updated_unix_ms, &workflow.identity.run_id));
         let workflow = self
             .selected_workflow_run
             .as_ref()
             .and_then(|selected| {
-                candidates
+                all_runs
                     .iter()
                     .copied()
                     .find(|workflow| &workflow.identity.run_id == selected)
             })
             .or_else(|| {
-                candidates
-                    .into_iter()
-                    .max_by_key(|workflow| workflow.updated_unix_ms)
-            })?;
+                candidates.iter().rev().copied().find(|workflow| {
+                    matches!(
+                        workflow.lifecycle.label(),
+                        "queued" | "running" | "paused" | "waiting" | "input required"
+                    )
+                })
+            })
+            .or_else(|| candidates.last().copied())?;
+        let run_position = candidates
+            .iter()
+            .position(|candidate| candidate.identity.run_id == workflow.identity.run_id)
+            .map_or(0, |index| index + 1);
         let children = self
             .workspace_repositories
             .values()
@@ -245,15 +260,30 @@ impl Tui {
                     .any(|step| step.key == current.label && step.skippable)
             })
         });
+        let current_step = workflow
+            .current_step
+            .as_ref()
+            .map(|step| step.label.clone());
+        let selected_step = self
+            .selected_workflow_step
+            .as_ref()
+            .filter(|selected| {
+                detail
+                    .as_ref()
+                    .is_some_and(|run| run.steps.iter().any(|step| &step.key == *selected))
+            })
+            .cloned()
+            .or_else(|| current_step.clone())
+            .or_else(|| detail.as_ref()?.steps.first().map(|step| step.key.clone()));
         Some(view::WorkflowDashboard {
             run_id: workflow.identity.run_id.clone(),
             status: workflow.lifecycle.label().into(),
-            current_step: workflow
-                .current_step
-                .as_ref()
-                .map(|step| step.label.clone()),
+            current_step,
+            selected_step,
             completed_steps: workflow.progress.completed,
             total_steps: workflow.progress.total,
+            run_position,
+            run_count: candidates.len(),
             parent_run_id: workflow.owner.as_ref().map(|owner| owner.run_id.clone()),
             children,
             detail,
@@ -288,6 +318,123 @@ impl Tui {
             .unwrap_or(runs.len() - 1);
         let next = (current as isize + direction).rem_euclid(runs.len() as isize) as usize;
         self.selected_workflow_run = Some(runs[next].identity.run_id.clone());
+        self.selected_workflow_step = runs[next]
+            .current_step
+            .as_ref()
+            .map(|step| step.label.clone());
+        self.workflow_step_selection_manual = false;
+        self.workflow_parent_stack.clear();
+        self.main_scroll = 0;
+    }
+
+    pub(super) fn follow_current_workflow_step(&mut self) {
+        if self.workflow_step_selection_manual {
+            return;
+        }
+        self.selected_workflow_step = self
+            .current_workflow_dashboard()
+            .and_then(|dashboard| dashboard.current_step.or(dashboard.selected_step));
+    }
+
+    pub(super) fn move_workflow_step_selection(&mut self, direction: isize) -> bool {
+        if self.focused_panel != PanelFocus::Worktrees
+            || self.worktree_main_view != view::WorktreeMainView::Workflow
+        {
+            return false;
+        }
+        let Some(dashboard) = self.current_workflow_dashboard() else {
+            return true;
+        };
+        let Some(run) = dashboard.detail else {
+            return true;
+        };
+        if run.steps.is_empty() {
+            return true;
+        }
+        let current = dashboard
+            .selected_step
+            .as_ref()
+            .and_then(|selected| run.steps.iter().position(|step| &step.key == selected))
+            .unwrap_or(0);
+        let next = (current as isize + direction).clamp(0, run.steps.len() as isize - 1) as usize;
+        self.selected_workflow_step = Some(run.steps[next].key.clone());
+        self.workflow_step_selection_manual = true;
+        true
+    }
+
+    pub(super) fn toggle_workflow_graph(&mut self) {
+        if self.main_focused
+            && self.focused_panel == PanelFocus::Worktrees
+            && self.worktree_main_view == view::WorktreeMainView::Workflow
+        {
+            self.workflow_graph_expanded = !self.workflow_graph_expanded;
+            self.main_scroll = 0;
+        }
+    }
+
+    pub(super) fn handle_workflow_enter(&mut self) -> bool {
+        if !self.main_focused
+            || self.focused_panel != PanelFocus::Worktrees
+            || self.worktree_main_view != view::WorktreeMainView::Workflow
+        {
+            return false;
+        }
+        self.open_selected_workflow_child();
+        true
+    }
+
+    pub(super) fn open_selected_workflow_child(&mut self) -> bool {
+        if !self.main_focused
+            || self.focused_panel != PanelFocus::Worktrees
+            || self.worktree_main_view != view::WorktreeMainView::Workflow
+        {
+            return false;
+        }
+        let Some(dashboard) = self.current_workflow_dashboard() else {
+            return false;
+        };
+        let Some(run) = dashboard.detail else {
+            return false;
+        };
+        let Some(selected) = dashboard.selected_step else {
+            return false;
+        };
+        let Some(step) = run.steps.iter().find(|step| step.key == selected) else {
+            return false;
+        };
+        let Some(child) = run
+            .children
+            .iter()
+            .rev()
+            .find(|child| child.step_id == step.id)
+        else {
+            return false;
+        };
+        self.workflow_parent_stack.push(dashboard.run_id);
+        self.selected_workflow_run = Some(child.run_id.clone());
+        self.selected_workflow_step = None;
+        self.workflow_step_selection_manual = false;
+        self.main_scroll = 0;
+        self.follow_current_workflow_step();
+        true
+    }
+
+    pub(super) fn return_to_parent_workflow(&mut self) -> bool {
+        if !self.main_focused
+            || self.focused_panel != PanelFocus::Worktrees
+            || self.worktree_main_view != view::WorktreeMainView::Workflow
+        {
+            return false;
+        }
+        let Some(parent) = self.workflow_parent_stack.pop() else {
+            return false;
+        };
+        self.selected_workflow_run = Some(parent);
+        self.selected_workflow_step = None;
+        self.workflow_step_selection_manual = false;
+        self.main_scroll = 0;
+        self.follow_current_workflow_step();
+        true
     }
 
     pub(super) fn tmux_portal_model(&self) -> Option<view::TmuxPortalModel<'_>> {

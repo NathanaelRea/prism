@@ -106,6 +106,11 @@ pub struct Tui {
     pub(crate) main_focused: bool,
     pub(crate) main_scroll: usize,
     pub(crate) repo_main_view: view::RepoMainView,
+    pub(crate) worktree_main_view: view::WorktreeMainView,
+    pub(crate) workflow_graph_expanded: bool,
+    pub(crate) selected_workflow_step: Option<String>,
+    pub(crate) workflow_step_selection_manual: bool,
+    pub(crate) workflow_parent_stack: Vec<String>,
     pub(crate) worktree_list_mode: WorktreeListMode,
     ui_state_path: Option<PathBuf>,
     pub(crate) selected_comment: usize,
@@ -328,6 +333,11 @@ impl Tui {
             main_focused: false,
             main_scroll: 0,
             repo_main_view: view::RepoMainView::ChangeRequests,
+            worktree_main_view: view::WorktreeMainView::Overview,
+            workflow_graph_expanded: false,
+            selected_workflow_step: None,
+            workflow_step_selection_manual: false,
+            workflow_parent_stack: Vec::new(),
             worktree_list_mode: WorktreeListMode::Repo,
             ui_state_path: None,
             selected_comment: 0,
@@ -678,12 +688,20 @@ impl Tui {
                 }
                 Key::PreviousView => {
                     self.clear_leader_hint();
-                    self.switch_worktree_list_mode(WorktreeListMode::Global);
+                    if self.main_focused && self.focused_panel == PanelFocus::Worktrees {
+                        self.switch_worktree_main_view(-1);
+                    } else {
+                        self.switch_worktree_list_mode(WorktreeListMode::Global);
+                    }
                     pending_g = false;
                 }
                 Key::NextView => {
                     self.clear_leader_hint();
-                    self.switch_worktree_list_mode(WorktreeListMode::Repo);
+                    if self.main_focused && self.focused_panel == PanelFocus::Worktrees {
+                        self.switch_worktree_main_view(1);
+                    } else {
+                        self.switch_worktree_list_mode(WorktreeListMode::Repo);
+                    }
                     pending_g = false;
                 }
                 Key::Leader => {
@@ -695,6 +713,10 @@ impl Tui {
                 Key::OpenTmuxSession => {
                     self.clear_leader_hint();
                     pending_g = false;
+                    if self.handle_workflow_enter() {
+                        self.draw(runtime)?;
+                        continue;
+                    }
                     if self.open_selected_comment_dialog(runtime)? {
                         self.draw(runtime)?;
                         continue;
@@ -709,6 +731,16 @@ impl Tui {
                         }
                         OpenTmuxSessionTarget::Blocked(message) => self.show_message(message)?,
                     }
+                }
+                Key::WorkflowGraph => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    self.toggle_workflow_graph();
+                }
+                Key::WorkflowParent => {
+                    self.clear_leader_hint();
+                    pending_g = false;
+                    self.return_to_parent_workflow();
                 }
                 Key::WorkflowLauncher => {
                     self.clear_leader_hint();

@@ -33,6 +33,9 @@ impl Tui {
         self.workspace_repositories
             .retain(|repository, _| repositories.contains(repository));
         changed |= previous != self.workspace_repositories.len();
+        if changed {
+            self.follow_current_workflow_step();
+        }
         self.start_workflow_polls(false);
         changed
     }
