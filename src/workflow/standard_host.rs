@@ -520,6 +520,62 @@ impl StandardProtectedEffects {
     }
 }
 
+/// Reconciles a result that was produced by the protected backend but could not be recorded under
+/// the original fence. Backend success values are authoritative because each operation verifies
+/// its postcondition before returning. Provider pending/uncertain outcomes and dispatches that
+/// produced no result remain indeterminate for operator-visible retry rather than being guessed.
+#[derive(Clone, Copy)]
+pub(crate) struct StandardEffectReconciler;
+
+impl crate::workflow::engine::EffectReconciler for StandardEffectReconciler {
+    fn reconcile<'a>(
+        &'a self,
+        intent: crate::workflow::engine::EffectReconciliation,
+    ) -> crate::workflow::engine::ReconciliationFuture<'a> {
+        Box::pin(async move {
+            let body = intent.previous_result_json.ok_or_else(|| {
+                format!(
+                    "{} effect '{}' has no authoritative adapter result; recovery is required",
+                    intent.kind, intent.id
+                )
+            })?;
+            let result: Value = serde_json::from_str(&body)
+                .map_err(|error| format!("invalid persisted effect result: {error}"))?;
+            if result.get("code").is_some() {
+                return Err(format!(
+                    "{} effect '{}' may have partially completed: {}",
+                    intent.kind, intent.id, body
+                ));
+            }
+            let status = result
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let proven = match intent.kind.as_str() {
+                "commit" => status == "committed",
+                "push" => status == "pushed",
+                "create_change_request" => status == "created",
+                "resolve_review_threads" => status == "resolved",
+                // Pending is an authoritative provider outcome, but it is deliberately not merge
+                // proof: the cleanup implementation rejects it and leaves the Run recoverable.
+                "squash_merge" => matches!(status, "merged" | "proven" | "pending"),
+                "delete_worktree" => status == "deleted",
+                _ => false,
+            };
+            if !proven {
+                return Err(format!(
+                    "{} effect '{}' is {status}; authoritative reconciliation is still required",
+                    intent.kind, intent.id
+                ));
+            }
+            Ok(crate::workflow::engine::ReconciliationResult {
+                succeeded: true,
+                result_json: body,
+            })
+        })
+    }
+}
+
 impl ProtectedEffectBackend for StandardProtectedEffects {
     fn dispatch<'a>(
         &'a self,
@@ -571,8 +627,33 @@ fn dispatch_protected_effect(
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("Apply Prism workflow repair");
+            let expected_tree = request
+                .parameters
+                .get("expected_tree")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        "invalid_effect",
+                        "commit requires an exact verified Git tree",
+                    )
+                })?;
+            let actual_tree = worktree_tree(&worktree, &config)?;
+            if actual_tree != expected_tree {
+                return Err(ProtocolError::new(
+                    "stale_worktree",
+                    "worktree changed after local verification",
+                ));
+            }
             run_git(&worktree, &config, &["diff", "--check"])?;
             run_git(&worktree, &config, &["add", "--all"])?;
+            let staged_tree = git_capture(&worktree, &config, &["write-tree"])?;
+            if staged_tree.trim() != expected_tree {
+                let _ = run_git(&worktree, &config, &["reset", "--mixed", &previous_head]);
+                return Err(ProtocolError::new(
+                    "stale_worktree",
+                    "worktree changed while the commit intent was being applied",
+                ));
+            }
             let status = git_capture(&worktree, &config, &["status", "--porcelain"])?;
             if status.trim().is_empty() {
                 return Err(ProtocolError::new(
@@ -681,12 +762,19 @@ fn dispatch_protected_effect(
                     .get("id")
                     .and_then(Value::as_str)
                     .ok_or_else(|| ProtocolError::new("invalid_effect", "thread has no ID"))?;
+                let revision = thread
+                    .get("observed_revision")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        ProtocolError::new("invalid_effect", "thread has no observed revision")
+                    })?;
                 crate::remote::dispatcher::resolve_workflow_review_thread(
                     &repository.root,
                     &config,
                     subject,
                     head,
                     id,
+                    revision,
                 )
                 .map_err(|error| ProtocolError::new("resolve_review_threads", error))?;
             }
@@ -751,10 +839,131 @@ fn dispatch_protected_effect(
             .map(|_| serde_json::json!({"status":"deleted","path":path}))
             .map_err(|error| ProtocolError::new("delete_worktree", error))
         }
-        ProtectedEffectKind::CreateChangeRequest => Err(ProtocolError::new(
-            "operation_unavailable",
-            "Change Request creation requires a prepared provider guard",
-        )),
+        ProtectedEffectKind::CreateChangeRequest => {
+            let worktree = effect_worktree(&repository.root, &request)?;
+            let expected_head =
+                request
+                    .preconditions
+                    .expected_head
+                    .as_deref()
+                    .ok_or_else(|| {
+                        ProtocolError::new(
+                            "invalid_effect",
+                            "Change Request creation requires an exact head",
+                        )
+                    })?;
+            ensure_head(&worktree, &config, Some(expected_head))?;
+            let branch = request
+                .parameters
+                .get("branch")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        "invalid_effect",
+                        "Change Request creation requires an exact branch",
+                    )
+                })?;
+            let current = crate::git::current_branch_name(&worktree, &config)
+                .map_err(effect_error("create Change Request"))?;
+            if current.as_deref() != Some(branch) {
+                return Err(ProtocolError::new(
+                    "stale_branch",
+                    "worktree branch changed before Change Request creation",
+                ));
+            }
+            let source_push =
+                crate::remote::dispatcher::prepare_push(&worktree, &config, branch)
+                    .map_err(|error| ProtocolError::new("create_change_request", error))?;
+            if source_push.expected_head_sha != expected_head {
+                return Err(ProtocolError::new(
+                    "stale_head",
+                    "pushed branch is not at the exact candidate head",
+                ));
+            }
+            let (origin, upstream) =
+                crate::remote::dispatcher::create_change_request_targets(&worktree, &config)
+                    .map_err(|error| ProtocolError::new("create_change_request", error))?;
+            let requested_target = request
+                .preconditions
+                .target_repository
+                .as_ref()
+                .map(|target| target.id.as_str())
+                .unwrap_or_default();
+            let target_key = |target: &crate::remote::RemoteRepositoryId| {
+                format!(
+                    "{}:{}:{}",
+                    target.provider().config_label(),
+                    target.host(),
+                    target.project_path()
+                )
+            };
+            let target = upstream
+                .filter(|target| requested_target == target_key(target))
+                .unwrap_or(origin);
+            if requested_target != request.preconditions.repository.id
+                && requested_target != target_key(&target)
+            {
+                return Err(ProtocolError::new(
+                    "stale_target",
+                    "Change Request target repository changed before creation",
+                ));
+            }
+            let guard = crate::remote::dispatcher::prepare_create_change_request(
+                &worktree,
+                &config,
+                branch,
+                &target,
+                &source_push,
+            )
+            .map_err(|error| ProtocolError::new("create_change_request", error))?;
+            if guard.expected_head_sha != expected_head {
+                return Err(ProtocolError::new(
+                    "stale_head",
+                    "Change Request guard is not bound to the exact candidate head",
+                ));
+            }
+            let body = request
+                .parameters
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or("Created by Prism workflow");
+            let mut cache = crate::remote::PrCache::default();
+            crate::remote::dispatcher::create_change_request(
+                &repository,
+                &config,
+                &worktree,
+                body,
+                &guard,
+                &mut cache,
+            )
+            .map_err(|error| ProtocolError::new("create_change_request", error))?;
+            let summary = cache.summary().ok_or_else(|| {
+                ProtocolError::new(
+                    "create_change_request",
+                    "provider did not authoritatively return the created Change Request",
+                )
+            })?;
+            let identity = summary.change_request_identity.as_ref().ok_or_else(|| {
+                ProtocolError::new(
+                    "create_change_request",
+                    "created Change Request has no canonical identity",
+                )
+            })?;
+            let subject_id = format!(
+                "{}:{}:{}:change_request:{}",
+                identity.provider().config_label(),
+                identity.canonical_host(),
+                identity.project_path(),
+                identity.native_id()
+            );
+            Ok(serde_json::json!({
+                "status":"created",
+                "head":summary.head_sha,
+                "change_request":{"id":subject_id,"revision":summary.head_sha},
+                "url":summary.url,
+                "number":summary.number
+            }))
+        }
     }
 }
 
@@ -809,6 +1018,40 @@ fn effect_worktree(
                 ProtocolError::new("invalid_effect", "effect requires a Worktree Session")
             })?,
     )
+}
+
+fn worktree_tree(path: &Path, config: &crate::config::Config) -> Result<String, ProtocolError> {
+    let index = std::env::temp_dir().join(format!(
+        "prism-workflow-index-{}-{}",
+        std::process::id(),
+        unix_ms()
+    ));
+    let invoke = |arguments: &[&str]| {
+        std::process::Command::new(config.tool("git"))
+            .arg("-C")
+            .arg(path)
+            .env("GIT_INDEX_FILE", &index)
+            .args(arguments)
+            .output()
+            .map_err(|error| ProtocolError::new("git", error.to_string()))
+            .and_then(|output| {
+                if output.status.success() {
+                    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+                } else {
+                    Err(ProtocolError::new(
+                        "git",
+                        truncate_message(&String::from_utf8_lossy(&output.stderr)),
+                    ))
+                }
+            })
+    };
+    let result = (|| {
+        invoke(&["read-tree", "HEAD"])?;
+        invoke(&["add", "--all"])?;
+        invoke(&["write-tree"])
+    })();
+    let _ = std::fs::remove_file(index);
+    result
 }
 
 fn ensure_head(
@@ -977,4 +1220,53 @@ pub(crate) fn dispatcher(database: WorkflowDatabase) -> Arc<dyn crate::extension
     Arc::new(crate::extension::AllowlistedHostDispatcher::new(
         StandardHostServices::new(database),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::workflow::engine::{EffectReconciler, EffectReconciliation};
+
+    #[tokio::test]
+    async fn late_authoritative_effect_result_reconciles_without_repeating_dispatch() {
+        let result = StandardEffectReconciler
+            .reconcile(EffectReconciliation {
+                id: "push-1".into(),
+                kind: "push".into(),
+                idempotency_key: "push-1".into(),
+                request_json: "{}".into(),
+                previous_result_json: Some(r#"{"status":"pushed","head":"abc"}"#.into()),
+            })
+            .await
+            .unwrap();
+        assert!(result.succeeded);
+        assert!(result.result_json.contains("pushed"));
+    }
+
+    #[tokio::test]
+    async fn uncertain_merge_stays_visible_for_authoritative_reconciliation() {
+        let error = StandardEffectReconciler
+            .reconcile(EffectReconciliation {
+                id: "merge-1".into(),
+                kind: "squash_merge".into(),
+                idempotency_key: "merge-1".into(),
+                request_json: "{}".into(),
+                previous_result_json: Some(r#"{"status":"uncertain"}"#.into()),
+            })
+            .await
+            .unwrap_err();
+        assert!(error.contains("authoritative reconciliation"));
+    }
+
+    #[test]
+    fn structured_agent_result_is_required_to_contain_contract_fields() {
+        assert!(extract_structured_agent_result("ordinary harness output").is_none());
+        assert_eq!(
+            extract_structured_agent_result(
+                "log\n{\"summary\":\"fixed\",\"addressed_thread_ids\":[\"T1\"]}"
+            )
+            .unwrap()["addressed_thread_ids"],
+            serde_json::json!(["T1"])
+        );
+    }
 }

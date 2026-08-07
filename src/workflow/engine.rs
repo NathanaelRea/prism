@@ -735,6 +735,23 @@ impl WorkflowWorker {
         Ok(())
     }
 
+    pub(crate) fn register_standard_reconcilers(&mut self) -> Result<(), WorkerError> {
+        for kind in [
+            crate::workflow::effect::ProtectedEffectKind::Commit,
+            crate::workflow::effect::ProtectedEffectKind::Push,
+            crate::workflow::effect::ProtectedEffectKind::CreateChangeRequest,
+            crate::workflow::effect::ProtectedEffectKind::ResolveReviewThreads,
+            crate::workflow::effect::ProtectedEffectKind::SquashMerge,
+            crate::workflow::effect::ProtectedEffectKind::DeleteWorktree,
+        ] {
+            self.register_reconciler(
+                kind.label(),
+                crate::workflow::standard_host::StandardEffectReconciler,
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn register_reconciler(
         &mut self,
         effect_kind: impl Into<String>,

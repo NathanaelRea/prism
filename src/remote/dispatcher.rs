@@ -1817,6 +1817,7 @@ pub(crate) fn resolve_workflow_review_thread(
     subject_id: &str,
     expected_head: &str,
     thread_id: &str,
+    expected_thread_revision: &str,
 ) -> Result<(), String> {
     let (adapter, discovered) = Adapter::resolve(path, config)?;
     let (repository_key, native_id) = subject_id
@@ -1855,6 +1856,13 @@ pub(crate) fn resolve_workflow_review_thread(
         other => return known(other, "review threads").map(|_: Vec<super::ReviewThread>| ()),
     }
     .ok_or_else(|| "review thread is no longer present".to_string())?;
+    let current_revision = format!(
+        "sha256:{:x}",
+        Sha256::digest(format!("{expected_head}\n{current:?}").as_bytes())
+    );
+    if current_revision != expected_thread_revision {
+        return Err("review thread changed after the resolution intent was prepared".into());
+    }
     if current.resolved {
         return Ok(());
     }

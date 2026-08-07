@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
 use prism::extension::{
-    ExtensionClient, ExtensionOperations, ExtensionSupervisor, HostLimits, NoHostOperations,
+    ExtensionClient, ExtensionOperations, ExtensionSupervisor, HostDispatcher, HostFuture,
+    HostLimits, NoHostOperations,
 };
-use prism_extension_sdk::protocol::{AttemptEnvelope, AttemptOutcome};
+use prism_extension_sdk::protocol::{
+    AttemptEnvelope, AttemptOutcome, HostOperation, ProtocolError,
+};
 
 fn attempt(id: &str, input: serde_json::Value) -> AttemptEnvelope {
     AttemptEnvelope {
@@ -607,6 +610,238 @@ async fn heartbeat_timeout_terminates_an_unresponsive_extension() {
     .await
     .unwrap();
     assert!(client.heartbeat().await.is_err());
+    client.shutdown().await.unwrap();
+}
+
+#[derive(Default)]
+struct StabilizationHost(std::sync::Mutex<Vec<String>>);
+
+impl HostDispatcher for StabilizationHost {
+    fn dispatch<'a>(
+        &'a self,
+        _attempt_id: &'a str,
+        _generation: u64,
+        operation: HostOperation,
+    ) -> HostFuture<'a> {
+        Box::pin(async move {
+            let mut calls = self.0.lock().unwrap();
+            match operation {
+                HostOperation::RunAgent { .. } => {
+                    calls.push("agent".into());
+                    Ok(serde_json::json!({"summary":"fixed T1","addressed_thread_ids":["T1"]}))
+                }
+                HostOperation::RunProcess { .. } => {
+                    calls.push("verify".into());
+                    Ok(
+                        serde_json::json!({"exit_code":0,"stdout":"ok\nPRISM_VERIFIED_TREE=tree-H1\n","stderr":""}),
+                    )
+                }
+                HostOperation::Commit { .. } => {
+                    calls.push("commit".into());
+                    Ok(serde_json::json!({"status":"committed","head":"H2","previous_head":"H1"}))
+                }
+                HostOperation::Push { .. } => {
+                    calls.push("push".into());
+                    Ok(serde_json::json!({"status":"pushed","head":"H2"}))
+                }
+                HostOperation::CreateChangeRequest { request } => {
+                    calls.push("create_change_request".into());
+                    assert_eq!(request.preconditions.expected_head.as_deref(), Some("H2"));
+                    assert!(request.preconditions.worktree_session.is_some());
+                    Ok(serde_json::json!({
+                        "status":"created","head":"H2",
+                        "change_request":{"id":"github:acme/prism:change_request:42","revision":"H2"}
+                    }))
+                }
+                HostOperation::ResolveReviewThreads { request } => {
+                    calls.push("resolve".into());
+                    let ids = request.parameters["threads"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|thread| thread["id"].clone())
+                        .collect::<Vec<_>>();
+                    Ok(serde_json::json!({"status":"resolved","thread_ids":ids}))
+                }
+                HostOperation::ObserveProvider { request } => {
+                    calls.push(format!("observe:{}", request.operation));
+                    Ok(serde_json::json!({
+                        "quality":"current","satisfied":true,"head":"H2",
+                        "revision":format!("{}-H2",request.operation),
+                        "threads":[{"id":"T1","revision":"T1-R2","resolved":false}]
+                    }))
+                }
+                other => Err(ProtocolError::new("unexpected", format!("{other:?}"))),
+            }
+        })
+    }
+}
+
+async fn execute_standard(
+    client: &ExtensionClient,
+    implementation: &str,
+    input: serde_json::Value,
+) -> serde_json::Value {
+    let (_owner, cancellation) = tokio::sync::watch::channel(false);
+    let result = client
+        .execute(
+            AttemptEnvelope {
+                attempt_id: format!("attempt-{implementation}"),
+                generation: 1,
+                implementation_id: implementation.into(),
+                input,
+                artifacts: Default::default(),
+            },
+            cancellation,
+        )
+        .await
+        .unwrap();
+    match result.outcome {
+        AttemptOutcome::Succeeded { outputs } => outputs,
+        outcome => panic!("{implementation} failed: {outcome:?}"),
+    }
+}
+
+#[tokio::test]
+async fn change_request_creation_builds_an_exact_brokered_intent() {
+    let host = Arc::new(StabilizationHost::default());
+    let client = ExtensionClient::launch(
+        env!("CARGO_BIN_EXE_prism-standard-extension"),
+        host.clone(),
+        HostLimits::default(),
+    )
+    .await
+    .unwrap();
+    let candidate = serde_json::json!({
+        "head":"H2",
+        "worktree":{
+            "id":"/repo:/repo/worktree","revision":"incarnation-1",
+            "repository":"/repo","path":"/repo/worktree","branch":"feature"
+        },
+        "target_repository":{"id":"github:acme/prism","revision":"base-1"}
+    });
+    let created = execute_standard(
+        &client,
+        "prism.standard/create-change-request",
+        serde_json::json!({"candidate":candidate}),
+    )
+    .await;
+    assert_eq!(created["candidate"]["head"], "H2");
+    assert_eq!(
+        created["candidate"]["change_request"]["id"],
+        "github:acme/prism:change_request:42"
+    );
+    assert_eq!(host.0.lock().unwrap().as_slice(), ["create_change_request"]);
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn review_repair_fixture_executes_through_the_standard_protocol() {
+    let host = Arc::new(StabilizationHost::default());
+    let client = ExtensionClient::launch(
+        env!("CARGO_BIN_EXE_prism-standard-extension"),
+        host.clone(),
+        HostLimits::default(),
+    )
+    .await
+    .unwrap();
+    let worktree = serde_json::json!({
+        "id":"/repo:/repo/worktree","revision":"incarnation-1",
+        "repository":"/repo","path":"/repo/worktree","branch":"repair"
+    });
+    let subject = serde_json::json!({"id":"github:acme/prism:change_request:42","revision":"H1"});
+    let candidate = serde_json::json!({
+        "head":"H1","worktree":worktree,"change_request":subject,
+        "target_repository":{"id":"github:acme/prism","revision":"base-1"}
+    });
+    let review = serde_json::json!({
+        "quality":"current","satisfied":false,"head":"H1","revision":"review-H1",
+        "threads":[{"id":"T1","revision":"T1-R1","resolved":false}]
+    });
+    let current = |name: &str| {
+        serde_json::json!({
+            "quality":"current","satisfied":true,"head":"H1","revision":format!("{name}-H1")
+        })
+    };
+    let choice = execute_standard(
+        &client,
+        "prism.standard/choose-stabilization-repair",
+        serde_json::json!({
+            "candidate":candidate,"ci":current("ci"),"review":review,
+            "policy":current("policy"),"mergeability":current("mergeability"),
+            "merge_relation":current("merge_relation")
+        }),
+    )
+    .await;
+    assert_eq!(choice["repair_kind"], "review");
+
+    let repair = execute_standard(
+        &client,
+        "prism.standard/agent-repair-review",
+        serde_json::json!({"candidate":candidate,"evidence":review,"worktree":worktree}),
+    )
+    .await;
+    let verified = execute_standard(
+        &client,
+        "prism.standard/verify-repair",
+        serde_json::json!({"review_candidate":repair["candidate"]}),
+    )
+    .await;
+    assert_eq!(verified["result"]["status"], "satisfied");
+    let committed = execute_standard(
+        &client,
+        "prism.standard/commit-repair",
+        serde_json::json!({"verification":verified["result"],"review_candidate":repair["candidate"]}),
+    )
+    .await;
+    let pushed = execute_standard(
+        &client,
+        "prism.standard/push-successor",
+        serde_json::json!({"candidate":committed["candidate"]}),
+    )
+    .await;
+    assert_eq!(pushed["candidate"]["head"], "H2");
+    let resolved = execute_standard(
+        &client,
+        "prism.standard/resolve-addressed-threads",
+        serde_json::json!({
+            "candidate":pushed["candidate"],"report":repair["report"],"observation":review
+        }),
+    )
+    .await;
+    assert_eq!(
+        resolved["candidate"]["thread_ids"],
+        serde_json::json!(["T1"])
+    );
+    let reobserved = execute_standard(
+        &client,
+        "prism.standard/reobserve-change-request",
+        serde_json::json!({"original":candidate,"successor":resolved["candidate"]}),
+    )
+    .await;
+    assert_eq!(
+        reobserved["observation"]["facts"]
+            .as_object()
+            .unwrap()
+            .len(),
+        5
+    );
+    assert_eq!(
+        host.0.lock().unwrap().as_slice(),
+        [
+            "agent",
+            "verify",
+            "commit",
+            "push",
+            "observe:review",
+            "resolve",
+            "observe:ci",
+            "observe:review",
+            "observe:policy",
+            "observe:mergeability",
+            "observe:merge_relation"
+        ]
+    );
     client.shutdown().await.unwrap();
 }
 

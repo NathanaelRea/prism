@@ -152,9 +152,25 @@ fn run_package_inner(repo: Option<&Path>, arguments: &[String]) -> Result<(), St
                 .map(String::as_str)
                 .unwrap_or(&locked.source);
             if source.starts_with("embedded:") {
-                return Err(format!(
-                    "package {id} uses embedded source {source}; provide an explicit update source"
-                ));
+                if id != "prism.standard" || arguments.get(2).is_some() {
+                    return Err(format!(
+                        "package {id} uses embedded source {source}; provide an explicit update source"
+                    ));
+                }
+                let updated = crate::package::bootstrap_standard_pack(&context.global)
+                    .map_err(|error| error.to_string())?;
+                return output(
+                    json_output,
+                    "package.update",
+                    &json!({"id":id,"updated":updated,"source":source}),
+                    || {
+                        if updated {
+                            "updated prism.standard from the bundled incoming revision".into()
+                        } else {
+                            "prism.standard is current or has preserved update conflicts".into()
+                        }
+                    },
+                );
             }
             let resolved =
                 SourceResolver::new(context.global.join("staging"), SourceLimits::default())

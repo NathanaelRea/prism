@@ -272,9 +272,16 @@ impl WorkflowDatabase {
         let target_id = target_id.to_string();
         self.write_immediate(|connection| Box::pin(async move {
             let changed = sqlx::query("update step_attempt set process_id=?, process_start_time_ticks=? where id=? and status='claimed' and worker_id=? and target_id=? and fencing_token=? and lease_expires_unix_ms>?")
-                .bind(i64::from(process.0)).bind(process.1).bind(attempt_id)
-                .bind(worker_id).bind(target_id).bind(fencing_token).bind(now_unix_ms)
-                .execute(connection).await.map_err(DatabaseError::Query)?.rows_affected();
+                .bind(i64::from(process.0)).bind(process.1).bind(&attempt_id)
+                .bind(&worker_id).bind(&target_id).bind(fencing_token).bind(now_unix_ms)
+                .execute(&mut *connection).await.map_err(DatabaseError::Query)?.rows_affected();
+            if changed == 1 {
+                sqlx::query("insert into audit_event (run_id, step_id, attempt_id, sequence, kind, time_unix_ms, data_json) select step.run_id, step.id, attempt.id, coalesce((select max(sequence) from audit_event where run_id=step.run_id),0)+1, 'process_recorded', ?, ? from step_attempt attempt join workflow_step step on step.id=attempt.step_id where attempt.id=?")
+                    .bind(now_unix_ms)
+                    .bind(serde_json::json!({"pid":process.0,"process_start_time_ticks":process.1}).to_string())
+                    .bind(&attempt_id)
+                    .execute(connection).await.map_err(DatabaseError::Query)?;
+            }
             Ok(changed == 1)
         })).await
     }

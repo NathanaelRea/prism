@@ -11,6 +11,7 @@ use crate::resource::{
 
 use super::manifest::{LockedPackage, PackageLock, PackageManifest, PackageValidationError};
 use super::source::{ResolvedSource, SourceLimits, canonical_tree};
+use super::working_copy::WorkingCopy;
 
 #[derive(Clone, Debug)]
 pub struct InstallOutcome {
@@ -431,9 +432,6 @@ fn take_u64(bytes: &mut &[u8]) -> Result<u64, InstallError> {
 }
 
 pub fn bootstrap_standard_pack(global_root: &Path) -> Result<bool, InstallError> {
-    if global_root.join("packages/prism.standard").exists() {
-        return promote_new_standard_workflows(global_root);
-    }
     let executable = locate_standard_extension()?;
     bootstrap_standard_pack_with_extension(global_root, &executable)
 }
@@ -463,59 +461,16 @@ fn standard_workflows() -> BTreeMap<&'static str, &'static str> {
     .collect()
 }
 
-/// Make workflows added by a newer Prism binary available to an older, user-owned Standard Pack
-/// without rewriting that package working copy. Each addition is promoted once into the ordinary
-/// global drop-in directory; later edits or deletion remain user-owned.
-fn promote_new_standard_workflows(global_root: &Path) -> Result<bool, InstallError> {
-    let manifest_path = global_root.join("packages/prism.standard/prism-package.toml");
-    let manifest = PackageManifest::parse(&fs::read_to_string(&manifest_path)?)?;
-    let packaged = manifest
-        .resources
-        .iter()
-        .map(|resource| resource.id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let discovered = crate::resource::discover(global_root, None)?
-        .into_iter()
-        .map(|resource| resource.identity.to_string())
-        .collect::<std::collections::BTreeSet<_>>();
-    let marker_root = global_root.join("state/standard-workflow-promotions");
-    let workflow_root = global_root.join("workflows");
-    let mut changed = false;
-
-    for (name, source) in standard_workflows() {
-        let id = format!("prism.standard/{name}");
-        let marker = marker_root.join(name);
-        if packaged.contains(id.as_str()) || marker.exists() {
-            continue;
-        }
-        fs::create_dir_all(&marker_root)?;
-        if !discovered.contains(&id) {
-            fs::create_dir_all(&workflow_root)?;
-            fs::write(
-                workflow_root.join(format!("prism-standard-{name}.toml")),
-                format!(
-                    "# Standard workflow added by a Prism upgrade; this is an editable global drop-in.\nid = \"{id}\"\n{source}"
-                ),
-            )?;
-            changed = true;
-        }
-        fs::write(marker, format!("{id}\n"))?;
-    }
-    Ok(changed)
-}
-
 fn bootstrap_standard_pack_with_extension(
     global_root: &Path,
     executable: &Path,
 ) -> Result<bool, InstallError> {
     let root = global_root.join("packages/prism.standard");
-    if root.exists() {
-        return Ok(false);
-    }
     let candidate = global_root.join(format!(
         "packages/.prism.standard-bootstrap-{}",
         std::process::id()
     ));
+    let _ = fs::remove_dir_all(&candidate);
     fs::create_dir_all(candidate.join("workflows"))?;
     let workflows = standard_workflows();
     let mut resources = String::new();
@@ -611,6 +566,9 @@ fn bootstrap_standard_pack_with_extension(
     );
     fs::write(candidate.join("prism-package.toml"), manifest)?;
     fs::create_dir_all(root.parent().unwrap())?;
+    if root.exists() {
+        return update_standard_pack(global_root, &root, &candidate);
+    }
     let canonical = canonical_tree(&candidate, SourceLimits::default())?;
     let store = ContentStore::new(global_root.join("store"));
     let revision = store.retain(&canonical)?;
@@ -639,6 +597,13 @@ fn bootstrap_standard_pack_with_extension(
     )?;
     match fs::rename(&candidate, &root) {
         Ok(()) => {
+            let base = global_root.join("state/package-bases/prism.standard");
+            fs::create_dir_all(&base)?;
+            if let Err(error) = copy_directory(&root, &base) {
+                let _ = fs::remove_dir_all(&root);
+                let _ = store.remove_reference(&reference);
+                return Err(error);
+            }
             if let Err(error) = replace_file(&lock_candidate, &lock_path) {
                 let _ = fs::remove_dir_all(&root);
                 let _ = store.remove_reference(&reference);
@@ -658,6 +623,87 @@ fn bootstrap_standard_pack_with_extension(
             Err(error.into())
         }
     }
+}
+
+fn update_standard_pack(
+    global_root: &Path,
+    root: &Path,
+    incoming: &Path,
+) -> Result<bool, InstallError> {
+    let lock_path = global_root.join("package.lock");
+    let mut lock = read_lock(&lock_path)?;
+    let installed = lock
+        .packages
+        .iter()
+        .find(|package| package.id == "prism.standard")
+        .cloned()
+        .ok_or_else(|| InstallError::Invalid("installed Standard Pack has no lock entry".into()))?;
+    let incoming_canonical = canonical_tree(incoming, SourceLimits::default())?;
+    let incoming_revision = ContentRevision::digest(&incoming_canonical);
+    if installed.revision == incoming_revision.as_str() {
+        let _ = fs::remove_dir_all(incoming);
+        return Ok(false);
+    }
+    let base = global_root.join("state/package-bases/prism.standard");
+    if !base.exists() {
+        let revision = ContentRevision::parse(installed.revision.clone())?;
+        PackageInstaller::new(
+            global_root,
+            global_root.join("state"),
+            global_root.join("store"),
+        )
+        .reconstruct(&revision, &base)?;
+    }
+    let working = WorkingCopy::new(
+        root,
+        &base,
+        global_root.join("state/package-updates/prism.standard"),
+    );
+    let plan = working
+        .plan_update(incoming)
+        .map_err(|error| InstallError::Invalid(error.to_string()))?;
+    if plan.updates.is_empty() {
+        let _ = fs::remove_dir_all(incoming);
+        return Ok(false);
+    }
+    let conflicts = plan.has_conflicts();
+    working
+        .apply_update(incoming, &plan, |candidate| {
+            let manifest_path = candidate.join("prism-package.toml");
+            let source = fs::read_to_string(&manifest_path).map_err(|error| error.to_string())?;
+            PackageManifest::parse(&source)
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        })
+        .map_err(|error| InstallError::Invalid(error.to_string()))?;
+    if conflicts {
+        let _ = fs::remove_dir_all(incoming);
+        return Ok(false);
+    }
+
+    let store = ContentStore::new(global_root.join("store"));
+    let revision = store.retain(&incoming_canonical)?;
+    store.add_reference(&Reference {
+        owner: "package-base-prism_standard".into(),
+        revision: revision.clone(),
+    })?;
+    let locked = lock
+        .packages
+        .iter_mut()
+        .find(|package| package.id == "prism.standard")
+        .expect("Standard Pack lock entry remains installed");
+    locked.source = "embedded:prism.standard".into();
+    locked.revision = revision.to_string();
+    locked.sha256 = revision.as_str().trim_start_matches("sha256:").into();
+    lock.validate()?;
+    let lock_candidate = global_root.join(format!(".package-lock-{}.tmp", std::process::id()));
+    fs::write(
+        &lock_candidate,
+        toml::to_string_pretty(&lock).map_err(|error| InstallError::Invalid(error.to_string()))?,
+    )?;
+    replace_file(&lock_candidate, &lock_path)?;
+    let _ = fs::remove_dir_all(incoming);
+    Ok(true)
 }
 
 pub(crate) fn locate_standard_extension() -> Result<PathBuf, InstallError> {
@@ -734,43 +780,6 @@ mod tests {
     use super::*;
     use crate::package::{SourceLimits, SourceResolver, WorkingCopy};
     #[test]
-    fn newer_standard_workflows_are_promoted_once_for_an_older_pack() {
-        let root =
-            std::env::temp_dir().join(format!("prism-standard-promotion-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let package = root.join("packages/prism.standard");
-        fs::create_dir_all(package.join("workflows")).unwrap();
-        fs::write(
-            package.join("workflows/plan.toml"),
-            "id='prism.standard/plan'\n",
-        )
-        .unwrap();
-        fs::write(
-            package.join("prism-package.toml"),
-            "schema_version=1\nid='prism.standard'\nversion='old'\n[[resources]]\nid='prism.standard/plan'\nkind='workflow'\npath='workflows/plan.toml'\nsha256='0000000000000000000000000000000000000000000000000000000000000000'\n",
-        )
-        .unwrap();
-
-        assert!(promote_new_standard_workflows(&root).unwrap());
-        let stabilize = root.join("workflows/prism-standard-stabilize.toml");
-        assert!(stabilize.is_file());
-        assert!(
-            fs::read_to_string(&stabilize)
-                .unwrap()
-                .contains("id = \"prism.standard/stabilize\"")
-        );
-        assert!(!promote_new_standard_workflows(&root).unwrap());
-
-        fs::remove_file(&stabilize).unwrap();
-        assert!(!promote_new_standard_workflows(&root).unwrap());
-        assert!(
-            !stabilize.exists(),
-            "a user deletion must not be resurrected"
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn standard_pack_is_editable_and_idempotent() {
         let root = std::env::temp_dir().join(format!("prism-bootstrap-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -784,7 +793,19 @@ mod tests {
         let path = root.join("packages/prism.standard/workflows/auto.toml");
         fs::write(&path, "customized").unwrap();
         assert!(!bootstrap_standard_pack_with_extension(&root, &executable).unwrap());
-        assert_eq!(fs::read_to_string(path).unwrap(), "customized");
+        fs::write(&executable, b"updated executable bytes").unwrap();
+        assert!(bootstrap_standard_pack_with_extension(&root, &executable).unwrap());
+        assert_eq!(fs::read(&launcher).unwrap(), b"updated executable bytes");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "customized");
+
+        let deleted = root.join("packages/prism.standard/workflows/stabilize.toml");
+        fs::remove_file(&deleted).unwrap();
+        fs::write(&executable, b"third executable revision").unwrap();
+        assert!(bootstrap_standard_pack_with_extension(&root, &executable).unwrap());
+        assert!(
+            !deleted.exists(),
+            "a local deletion must remain a tombstone"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -238,6 +238,95 @@ fn production_worker_executes_a_bundled_command_step() {
 }
 
 #[test]
+fn production_worker_executes_a_standard_process_in_the_exact_worktree() {
+    use std::os::unix::fs::MetadataExt;
+
+    let _serial = serial_worker_test();
+    let temp = TempDir::new("worker-standard-process");
+    let runtime = temp.runtime_path().to_path_buf();
+    let home = temp.path.join("home");
+    let repository = temp.path.join("repository");
+    fs::create_dir_all(repository.join(".git")).unwrap();
+    fs::create_dir_all(&home).unwrap();
+    let metadata = fs::metadata(repository.join(".git")).unwrap();
+    let incarnation = format!("directory:{}:{}", metadata.dev(), metadata.ino());
+    let scope_id = format!("{}:{}", repository.display(), repository.display());
+
+    assert!(run(&runtime, &home, &["worker", "ensure"]).status.success());
+    assert_eq!(
+        worker_request(
+            &runtime,
+            serde_json::json!({
+                "type":"workflow_register_definition",
+                "definition":{
+                    "id":"standard-process-definition","name":"standard-process",
+                    "revision":"1","source":"test","trusted":true,
+                    "body_json":"{}","digest":"standard-process-digest","now_unix_ms":1
+                }
+            })
+        ),
+        serde_json::json!({"ok":true})
+    );
+    assert_eq!(
+        worker_request(
+            &runtime,
+            serde_json::json!({
+                "type":"workflow_launch",
+                "run":{
+                    "run_id":"standard-process-run",
+                    "definition_snapshot_id":"standard-process-definition",
+                    "repository":repository,
+                    "idempotency_key":"standard-process-run","now_unix_ms":2
+                },
+                "steps":[{
+                    "id":"standard-process-step","key":"process",
+                    "implementation":"prism.standard/command","target_id":"local",
+                    "input_json":serde_json::json!({
+                        "executable":"/bin/sh",
+                        "arguments":["-c","printf workflow-host-process"],
+                        "working_scope":{"id":scope_id,"revision":incarnation},
+                        "environment":{},"timeout_ms":5000,"max_output_bytes":4096
+                    }).to_string(),
+                    "dependencies":[],"resources":[]
+                }]
+            })
+        ),
+        serde_json::json!({"ok":true,"run_id":"standard-process-run"})
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let response = worker_request(
+            &runtime,
+            serde_json::json!({"type":"workflow_inspect","run_id":"standard-process-run"}),
+        );
+        if response["run"]["status"] == "succeeded" {
+            assert!(
+                response["run"]["attempts"][0]["process_id"]
+                    .as_i64()
+                    .is_some_and(|pid| pid > 0)
+            );
+            assert!(response["run"]["events"].as_array().is_some_and(|events| {
+                events
+                    .iter()
+                    .any(|event| event["kind"] == "process_recorded")
+            }));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Standard process did not finish: {response}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        run(&runtime, &home, &["worker", "shutdown"])
+            .status
+            .success()
+    );
+}
+
+#[test]
 fn production_worker_executes_the_standard_extension() {
     let _serial = serial_worker_test();
     let temp = TempDir::new("worker-standard-extension");

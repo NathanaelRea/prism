@@ -541,6 +541,9 @@ pub fn serve() -> Result<(), String> {
         worker
             .register_builtins()
             .map_err(|error| format!("register workflow implementations: {error}"))?;
+        worker
+            .register_standard_reconcilers()
+            .map_err(|error| format!("register Standard effect reconcilers: {error}"))?;
         let standard_extension = crate::package::locate_standard_extension()
             .map_err(|error| format!("locate Standard Extension: {error}"))?;
         let standard_dispatcher = worker.standard_production_dispatcher();

@@ -478,7 +478,7 @@ fn verified_candidate(input: Value) -> Result<Value, String> {
             return Err(format!("{gate} Gate is not satisfied"));
         }
     }
-    let candidate = &input["candidate"];
+    let mut candidate = input["candidate"].clone();
     let task = candidate.get("task").cloned().unwrap_or_else(|| {
         json!({
             "title":"Completed Task", "body":"No additional Plan phase"
@@ -502,6 +502,13 @@ fn verified_candidate(input: Value) -> Result<Value, String> {
             "phase_index":next_index
         }),
     );
+    let verified_tree = input["local"]
+        .get("tree")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "local Gate has no exact verified Git tree".to_string())?;
+    if let Some(object) = candidate.as_object_mut() {
+        object.insert("verified_tree".into(), Value::String(verified_tree.into()));
+    }
     Ok(json!({
         "candidate": candidate,
         "next_task": next_task,
@@ -677,7 +684,7 @@ async fn semantic_verification(context: &ExecuteContext, input: Value) -> Result
         executable: "/bin/sh".into(),
         arguments: vec![
             "-c".into(),
-            "git diff --check && if [ -x scripts/full-check.sh ]; then scripts/full-check.sh; elif [ -f Cargo.toml ]; then cargo test --all-targets; else git status --short; fi".into(),
+            "git diff --check && if [ -x scripts/full-check.sh ]; then scripts/full-check.sh; elif [ -f Cargo.toml ]; then cargo test --all-targets; else git status --short; fi && index=$(mktemp) && trap 'rm -f \"$index\"' EXIT && GIT_INDEX_FILE=$index git read-tree HEAD && GIT_INDEX_FILE=$index git add -A && tree=$(GIT_INDEX_FILE=$index git write-tree) && printf '\\nPRISM_VERIFIED_TREE=%s\\n' \"$tree\"".into(),
         ],
         working_scope: serde_json::from_value(worktree.clone())
             .map_err(|error| format!("invalid Worktree Session: {error}"))?,
@@ -689,7 +696,19 @@ async fn semantic_verification(context: &ExecuteContext, input: Value) -> Result
         .host_operation(HostOperation::RunProcess { request })
         .await
         .map_err(|error| error.message)?;
+    let tree = process
+        .get("stdout")
+        .and_then(Value::as_str)
+        .and_then(|output| {
+            output
+                .lines()
+                .rev()
+                .find_map(|line| line.strip_prefix("PRISM_VERIFIED_TREE="))
+        })
+        .filter(|tree| !tree.trim().is_empty())
+        .ok_or_else(|| "local verification did not report the verified Git tree".to_string())?;
     Ok(json!({"result":{
+        "tree":tree,
         "status":"satisfied",
         "quality":"current",
         "subject":{"worktree":worktree,"head":candidate.get("head")},
@@ -753,6 +772,7 @@ async fn semantic_effect(
         .get("candidate")
         .or_else(|| input.get("merged"))
         .or_else(|| input.get("ci_candidate"))
+        .or_else(|| input.get("review_candidate"))
         .unwrap_or(&input);
     let request = source
         .get("effects")
@@ -887,6 +907,56 @@ fn inferred_effect_request(
                 "parameters":{"method":"squash","change_request":change_request}
             }))
         }
+        "create_change_request" => {
+            let worktree = source.get("worktree").ok_or_else(|| {
+                "Change Request creation requires an exact Worktree Session".to_string()
+            })?;
+            let repository = worktree
+                .get("repository")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Worktree Session has no Repository".to_string())?;
+            let id = worktree
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Worktree Session has no ID".to_string())?;
+            let revision = worktree
+                .get("revision")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Worktree Session has no revision".to_string())?;
+            let head = source
+                .get("head")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Change Request candidate has no exact head".to_string())?;
+            let branch = worktree
+                .get("branch")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "Worktree Session has no branch".to_string())?;
+            let target = source
+                .get("target_repository")
+                .cloned()
+                .unwrap_or_else(|| json!({"id":repository,"revision":head}));
+            let target_id = target
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "target Repository has no ID".to_string())?;
+            Ok(json!({
+                "effect_id":format!("create-change-request:{id}:{revision}:{head}"),
+                "idempotency_key":format!("create-change-request:{id}:{revision}:{head}"),
+                "authority_scope":"provider:write",
+                "preconditions":{
+                    "repository":{"id":repository,"revision":revision},
+                    "worktree_session":{"id":id,"revision":revision},
+                    "expected_head":head,
+                    "target_repository":{"id":target_id,"revision":target.get("revision").and_then(Value::as_str).unwrap_or(head)},
+                    "policy_revision":null,
+                    "gate_revisions":{}
+                },
+                "parameters":{
+                    "branch":branch,
+                    "body":source.get("description").or_else(|| source.get("body")).and_then(Value::as_str).unwrap_or("Created by Prism workflow")
+                }
+            }))
+        }
         "delete_worktree" => {
             let worktree = input
                 .get("worktree")
@@ -951,7 +1021,18 @@ fn inferred_effect_request(
                 .and_then(Value::as_str)
                 .ok_or_else(|| "Worktree Session has no branch".to_string())?;
             let (expected_head, parameters) = if effect_name == "commit" {
-                (head, json!({"message":"Apply Prism workflow repair"}))
+                let expected_tree = input
+                    .get("verification")
+                    .and_then(|verification| verification.get("tree"))
+                    .or_else(|| source.get("verified_tree"))
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        "commit requires the exact locally verified Git tree".to_string()
+                    })?;
+                (
+                    head,
+                    json!({"message":"Apply Prism workflow repair","expected_tree":expected_tree}),
+                )
             } else {
                 let expected_remote = source
                     .get("previous_head")

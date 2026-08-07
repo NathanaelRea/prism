@@ -96,6 +96,7 @@ pub fn validate_effect_request(
         kind,
         ProtectedEffectKind::Commit
             | ProtectedEffectKind::Push
+            | ProtectedEffectKind::CreateChangeRequest
             | ProtectedEffectKind::DeleteWorktree
     );
     if needs_worktree {
